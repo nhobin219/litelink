@@ -734,11 +734,11 @@ litelink.Stream(
 | column | type | purpose |
 |---|---|---|
 | `{name}` | `binary` | the bytes |
-| `{name}_size` | `int64` | prunes as an ordinary statistic without a fetch |
+| `{name}_size` | `int64` | optional. prunes as an ordinary statistic without a fetch |
 | `{name}_hash` | `binary` | optional. xxh3-128, integrity check without a fetch |
 
-`{name}_size` is **not optional** — see §15.3, where it doubles as the record of whether a
-blob was staged at all. `{name}_hash` is.
+Both siblings are optional and purely for the caller's benefit. Neither carries internal
+state — see §15.3.
 
 The siblings are ordinary columns, not metadata. They exist so a reader can filter or verify
 without paying to materialize the payload, and they prune from Iceberg statistics like
@@ -762,7 +762,7 @@ Amends §3. The buffer row never carries blob bytes.
 1. BEGIN. INSERT the buffer row (no blob column); take `offset` from lastrowid.
 2. Write bytes to {root}/staging/{offset}.{field}.bin
 3. fsync the file AND the directory entry
-4. Set {name}_size on the row. COMMIT.
+4. Set {name}_staged = 1 on the row. COMMIT.
 ```
 
 **Step 3 before step 4 is correctness, not durability hygiene (I12).** A committed row whose
@@ -792,9 +792,22 @@ The failure it would cause: a crash after step 3 leaves `staging/N.payload.bin` 
 committed row. A later row takes offset *N* again with **no** blob, and a seal that inferred
 "does this row have a blob?" from file existence would attach the stale bytes to it.
 
-**So blob presence is recorded on the row, never inferred from the filesystem.** That is
-`{name}_size`, which is why it is required rather than optional. A staging file whose row has
-a null size is an orphan by definition, and the §15.4 sweep removes it.
+**So blob presence is recorded on the row, never inferred from the filesystem** — by
+`{name}_staged`, a bit **in the buffer table only**. It is set in step 4, inside the same
+commit that makes the row visible, so it is true exactly when the bytes are durable.
+
+It is deliberately **not** `{name}_size`, and not any column in the published schema:
+
+- The bit is meaningless after seal. Once the bytes are inline in Parquet there is nothing to
+  indicate, so it has no business in a table other engines read.
+- Overloading a caller-facing column with internal state constrains it. If `size=True` is
+  declared, the caller reasonably expects to query it — and now its nulls carry two meanings
+  (no blob / not yet staged) that have to be disentangled forever.
+- `{name}_size` is optional, so it would have to be silently forced on to serve as the
+  sentinel, which is the sort of surprise that shows up as a schema diff nobody asked for.
+
+A staging file whose row has `{name}_staged = 0`, or no row at all, is an orphan by
+definition, and the §15.4 sweep removes it.
 
 Staging is local, buffer-scoped, and never uploaded.
 
@@ -806,7 +819,7 @@ Amends §4. One additional step, between choosing the range and writing Parquet:
 
 ```
 1. SQLite txn: choose [start, end), write it to `sealing`
-2. Read buffer rows; for each row with {name}_size non-null, read staging/{offset}.{field}.bin
+2. Read buffer rows; for each row with {name}_staged = 1, read staging/{offset}.{field}.bin
 3. Write Parquet locally with bytes inline; commit to the local Iceberg table
 4. SQLite txn: delete buffer rows < end; clear `sealing`
 5. Delete staging files for offsets < end
@@ -837,8 +850,9 @@ not tuning.
 **Row groups must be sized by bytes — which the library must compute.** pyarrow exposes
 `row_group_size` in **rows** and has no byte-based parameter; the default is unset, falling
 back to roughly a million rows. At 10 MB blobs that is a ten-terabyte row group, meaning
-every projection of the blob column reads the entire file. Derive a row count from observed
-`{name}_size` values so a row group holds roughly 10 to 50 blobs. The row group is also the
+every projection of the blob column reads the entire file. Derive a row count from the sizes of the
+staged files themselves — which the library always knows, whether or not `{name}_size` was
+declared — so a row group holds roughly 10 to 50 blobs. The row group is also the
 unit a reader materializes in memory, so it doubles as the per-reader allocation bound.
 
 **Use `large_binary`, or cap row groups well below the limit.** Arrow's `binary` uses 32-bit
@@ -1011,7 +1025,7 @@ metadata and small columns. Streams with blob fields should therefore get a sepa
 
 | Section | Change |
 |---|---|
-| §2 Layout | Buffer holds no blob bytes. Adds a required `{name}_size` column per blob field. |
+| §2 Layout | Buffer holds no blob bytes. Adds an internal `{name}_staged` bit per blob field, in the buffer table only — never in the Iceberg schema. |
 | §3 Write path | Adds the staging write and the fsync ordering (§15.3). |
 | §4 Seal | Adds materialization (step 2), the staging sweep (step 5), and sort-by-key-then-permute. |
 | §6 Compaction | Unchanged in logic; needs a separate `compact_below` for blob streams. |
@@ -1029,7 +1043,7 @@ Extends §10.
 |---|---|---|
 | **I12** | The staging file and its directory entry are fsynced before the buffer row commits. | A committed row whose bytes did not survive is unrecoverable. The bytes exist nowhere else. |
 | **I13** | A staging file is deleted only when its offset is below the local table's committed max offset. | Above the boundary it is still the only copy. |
-| **I14** | Blob presence is read from `{name}_size` on the row, never inferred from a staging file existing. | AUTOINCREMENT reuses an offset after a rollback, so a stale staging file can sit at an offset a later row legitimately takes. |
+| **I14** | Blob presence is read from `{name}_staged` in the buffer, never inferred from a staging file existing, and never from a column in the published schema. | AUTOINCREMENT reuses an offset after a rollback, so a stale staging file can sit at an offset a later row legitimately takes. Keeping the bit internal also stops a caller-facing column carrying two meanings for null. |
 | **I15** | Blob bytes are never written to any object storage location that no Iceberg manifest references. | The moment they are, lifetime becomes a hand-maintained refcount and expiry stops working. |
 
 I15 is a design constraint rather than a runtime check, and it is the one to revisit
@@ -1043,9 +1057,9 @@ Extends §11.
 
 | Failure | Outcome |
 |---|---|
-| Crash between staging write and buffer commit | Orphaned staging file at an offset with no committed row. Swept by the §15.4 rule; never mis-attached, because presence comes from `{name}_size` (I14). |
+| Crash between staging write and buffer commit | Orphaned staging file at an offset with no committed row. Swept by the §15.4 rule; never mis-attached, because presence comes from `{name}_staged` (I14). |
 | Crash between buffer commit and seal | Staging file survives; the row is durable and readable. This is the case I12 protects. |
-| Staging file missing for a row with non-null `{name}_size` | Unrecoverable data loss for that row. Detectable at seal; fail loudly rather than writing a null. |
+| Staging file missing for a row with `{name}_staged = 1` | Unrecoverable data loss for that row. Detectable at seal; fail loudly rather than writing a null. |
 | Crash mid-seal after Parquet commit | Staging files below the boundary are now redundant; recovery sweeps them. |
 | Local disk fills | Blobs dominate the bound, so §13's byte-based backpressure must count staging, not only buffer rows. |
 
@@ -1058,8 +1072,11 @@ Extends §11.
 - **Force an offset reuse**: roll back an insert that staged bytes, then insert a blob-less
   row that takes the same offset; assert the stale bytes are never attached (I14).
 - Kill between buffer commit and seal; assert the row reads back with correct bytes.
-- Delete a staging file behind a row with non-null `{name}_size`; assert seal fails loudly
+- Delete a staging file behind a row with `{name}_staged = 1`; assert seal fails loudly
   rather than writing a null or a short value.
+- Declare a blob field with `size=False`; assert the published schema contains no
+  `{name}_size`, that the staging bit appears nowhere in the Iceberg table, and that seal
+  still resolves blobs correctly.
 - Assert a projection excluding the blob column reads no blob bytes. Measure, do not assume.
 - Assert a single-blob fetch reads at most one row group's worth.
 - Write blobs totalling over 2 GB in one row group's worth of rows; assert no offset overflow.
