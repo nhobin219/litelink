@@ -1,0 +1,684 @@
+# Capture storage
+
+**v1.0** — durable append-only capture into Iceberg tables. Local-first, no service.
+
+---
+
+## 1. Architecture
+
+```
+SQLite buffer          durable on commit. unsealed rows only.
+      │                WAL, synchronous=FULL, one db per stream
+      │  seal at min(target_size, max_age)
+      ▼
+local Iceberg table    a rolling WINDOW of recent data.
+      │                SqlCatalog on SQLite, file:// warehouse
+      │  sync: upload data files, register into the archive
+      ▼
+remote Iceberg table   the full HISTORY. S3 warehouse.
+```
+
+**The archive is a superset of the local window, not a disjoint half of it.** Everything
+synced is in the archive, including data the local table still holds — that overlap is what
+makes losing the machine survivable. The local table is a read accelerator over the recent
+range, not a separate shard.
+
+A data file is written locally, uploaded, then registered in the archive; local eviction
+later shrinks the window without touching the archive.
+
+**No hot-path read touches the network.** A hot read is the local Iceberg table plus the
+SQLite buffer, both on local disk.
+
+**Everything Iceberg provides is used, not reimplemented** — manifests, per-file column
+statistics, schema with field IDs, atomic snapshot commits. The catalog is a SQLite file,
+not a service, so this costs no daemon.
+
+### Scope
+
+| Not doing | Why |
+|---|---|
+| Time travel | Append-only. Snapshots are a commit mechanism here, not a query feature. Point-in-time filtering is `ingest_ts <= as_of` on a column — bitemporal, and strictly more expressive. |
+| CDC | No updates, no deletes. A state change is a new row with a new `ingest_ts`. Sync is a watermark. |
+| Multi-writer per table | One writer per stream. Multiple machines write separate tables; readers union. |
+
+---
+
+## 2. Layout
+
+**One SQLite database per stream.** SQLite's write lock is per file, not per table, and one
+process per stream is the intended topology.
+
+```sql
+CREATE TABLE buffer (
+  offset      INTEGER PRIMARY KEY AUTOINCREMENT,   -- monotonic, never reused. see NOTE
+  event_ts    INTEGER NOT NULL,      -- when it happened
+  ingest_ts   INTEGER NOT NULL,      -- when we learned it
+  key         TEXT,
+  payload     BLOB NOT NULL
+);
+
+CREATE TABLE sealing (                -- in-flight seal intent; at most one row
+  start_offset INTEGER, end_offset INTEGER, rel_path TEXT
+);
+
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+```
+
+That is the entire hand-written catalog. File paths, row counts, byte sizes, per-column
+min/max, visibility and schema all live in Iceberg.
+
+**NOTE — `offset` must never be reused.** Iceberg's sequence numbers are per *snapshot*,
+not per row, and do not exist for buffer rows, so they cannot serve as the tier boundary.
+The writer assigns `offset`; Iceberg then computes its min/max as ordinary column
+statistics, which is what §7 reads.
+
+A bare `INTEGER PRIMARY KEY` is a rowid alias assigned as `max(rowid)+1` — and buffer rows
+are **deleted at every seal**. Once the table empties, the next insert reuses offsets
+already committed to Iceberg, silently destroying monotonicity and corrupting every
+boundary read.
+
+**Use `AUTOINCREMENT`.** It is backed by `sqlite_sequence` and never reuses a value, with no
+recovery logic to get wrong.
+
+Its reputation for being slow does not apply here. Measured at 50-row batches with
+`synchronous=FULL`:
+
+```
+AUTOINCREMENT                   12,956 rows/s   77.2 us/row
+explicit next_offset in meta    13,484 rows/s   74.2 us/row
+in-memory counter, no persist   12,241 rows/s   81.7 us/row
+```
+
+The spread is noise — the in-memory variant does strictly the least work and measured
+slowest. A ~1 ms fsync per commit swamps the bookkeeping at any batch size in use, so the
+choice is a correctness question, not a performance one.
+
+The alternatives are worse for reasons unrelated to speed. An in-memory counter must
+recompute `next_offset = max(iceberg_max, buffer_max) + 1` correctly at every startup, and
+getting that wrong produces the I9 failure silently. An explicit `meta` counter only earns
+its extra moving part if offset ranges must later be pre-allocated across producers, which
+one writer per stream does not require.
+
+**Table schema.** The library owns exactly **one** column:
+
+```
+offset   int64   required   -- monotonic, library-assigned, never reused
+```
+
+Everything else is the application's schema, declared at stream creation and treated as
+opaque. Iceberg computes statistics for every column, so all of them prune.
+
+```python
+litelink.Stream(
+    schema=pa.schema([...]),          # the application's columns
+    sort_by=("event_ts", "key"),      # names from that schema
+)
+```
+
+**Why `offset` is library-owned:** it is the tier-boundary mechanism. Sealing selects a
+contiguous range of it, compaction filters on it, and the three-way read in §7 derives every
+boundary from its extents. Monotonicity and non-reuse (I9) cannot be enforced if the
+application supplies it.
+
+**Why the library stamps nothing else — in particular not an ingest timestamp.** Nothing in
+the design needs one. Retention is the only time-based operation, and file age comes from
+the Iceberg snapshot's commit timestamp rather than any data column. Sorting is configurable.
+Statistics are automatic.
+
+More importantly, "ingest time" is ambiguous in a way a library cannot resolve: the moment a
+response arrived, the moment `append()` was called, or the moment the transaction committed
+— and those differ by up to a batch. Applications with point-in-time semantics have a
+specific, tested definition of which one they mean. A library that picks one is silently
+wrong for everyone who meant another, and stamping it would relocate a load-bearing
+invariant out of the application that specified it.
+
+Applications that want an ingest timestamp declare it as an ordinary column and stamp it
+themselves.
+
+**An example schema** for an event-capture workload:
+
+```
+event_ts   int64    required   -- when it happened
+ingest_ts  int64    required   -- when we learned it; stamped by the application
+key        string
+payload    binary
+<promoted columns, per stream>
+```
+
+with `sort_by=("event_ts", "key")`. Point-in-time reads clamp on `ingest_ts`; analytical
+predicates use `event_ts`; both prune from Iceberg statistics like any other column.
+
+**Catalogs:**
+
+```python
+local  = SqlCatalog("local",  uri=f"sqlite:///{root}/catalog.db", warehouse=f"file://{root}")
+remote = SqlCatalog("remote", uri=f"sqlite:///{root}/archive.db", warehouse=s3_prefix)
+```
+
+The archive catalog's SQLite file is itself replicated to S3, so other machines can attach.
+A REST catalog is a drop-in replacement once more than one machine needs to write.
+
+---
+
+## 3. Write path
+
+Rows append to `buffer`, one transaction per batch. Durable on commit — that is the whole
+durability story.
+
+Reference throughput on network-backed storage at a 2 KB row: 21,850 rows/s at
+`synchronous=FULL` (46 µs/row), against a raw `append+fdatasync` floor of 30,464 rows/s.
+Re-measure on target hardware; on local NVMe the fixed per-commit cost is a larger fraction.
+
+---
+
+## 3a. Optional: WAL replication for RPO
+
+Without it, unsealed rows exist only on local disk, so the data-loss window on machine
+failure is bounded by `max_age` — which means `max_age` is doing double duty as a file-size
+policy *and* an RPO policy. Shrinking it to reduce RPO produces small files, which is the
+problem sealing exists to solve.
+
+**Litestream (or equivalent WAL shipping) breaks that coupling.** It continuously replicates
+SQLite WAL frames to object storage, so `max_age` can stay large for good file sizes while
+RPO falls to the replication lag.
+
+Optional, and off by default. Three things to be clear about:
+
+**It covers append→seal only.** Once a seal deletes buffer rows, replication faithfully
+carries the delete; sealed-but-unuploaded Parquet is not its concern. So
+
+```
+RPO = max(WAL replication lag, Parquet upload lag)
+```
+
+Adding it is only worth it if uploads are also prompt — which they cheaply can be, since
+they are plain PUTs with no compute.
+
+**It cannot break writes.** It is a sidecar reading the WAL, not something in the write path.
+If it dies, SQLite is unaffected: you lose replication, not data. That is why it does not
+violate the no-network-in-the-write-path property.
+
+**Restore is correct by construction.** A restored buffer may contain rows already sealed
+into the table. No reconciliation is needed, because the read boundary (§7) is derived from
+the table's committed max offset, so those rows fall outside the buffer's contribution
+automatically.
+
+## 4. Seal
+
+Triggered on `min(target_size, max_age)`, evaluated by the writer at commit time. Entirely
+local.
+
+```
+1. SQLite txn: choose [start, end), write it to `sealing`.
+2. Write Parquet locally; commit it to the local Iceberg table.
+3. SQLite txn: delete buffer rows < end; clear `sealing`.
+```
+
+**Rows are sorted before writing**, by the configured `sort_by` (§12). This is declared as
+the table's Iceberg `sort_order` *and* actually applied at write time — the metadata records
+intent, it does not sort for you.
+
+Sorting only improves **row-group** statistics within a file; file-level statistics are
+already tight for `offset` and `ingest_ts`, because a sealed file covers a contiguous offset
+range and therefore a narrow ingest window. So sorting by `ingest_ts` buys nothing.
+
+`event_ts` is the column that needs it. On any stream that backfills — an API returning
+records far older than the moment they were fetched — a file's `event_ts` range spans that
+whole history, and
+without an internal sort every row group's min/max covers it too, so an `event_ts` predicate
+prunes nothing below the file. Note that leading with `ingest_ts` would defeat this: it
+sorts `event_ts` only within each identical-ingest batch, and values interleave again across
+the file.
+
+Default for capture workloads: **`(event_ts, key)`** — `event_ts` primary because the
+dominant access pattern is cross-sectional (every key at a timestamp), `key` secondary so a
+single-key scan clusters within a timestamp.
+
+The sort costs one in-memory sort of at most `target_size` rows per seal, and does not
+affect the tier boundaries in §7, which use min/max of `offset` and are order-independent.
+
+**Step 1 fixes the range before the file exists**, making the path deterministic:
+`{stream}/{date}/{start}-{end}.parquet`. A retry recomputes the identical path and
+overwrites rather than orphaning. Chosen after the write instead, a crash between write and
+commit lets new rows arrive, and the retry seals a wider range while the first file is
+stranded.
+
+**Step 3 is garbage collection, not correctness.** Read consistency comes from the offset
+boundary in §7, so the window between steps 2 and 3 is safe in both directions and needs no
+`sealed` flag.
+
+**Recovery.** On startup, if `sealing` holds a row: if the local table already contains that
+path, run step 3; otherwise redo step 2. Idempotent either way.
+
+Sealing never waits on the network. A machine with no connectivity keeps capturing and
+keeps serving reads; it accumulates unregistered files.
+
+---
+
+## 5. Sync
+
+Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
+
+```
+1. Upload data files not yet in the archive.
+2. remote.add_files([...s3 paths...])          -- register; no data movement
+3. Replicate compactions (§6) into the archive.
+4. Expire snapshots on both tables.
+5. Evict files older than local_retention from the LOCAL table only.
+```
+
+Step 5 removes files from the local table's current snapshot; the archive is untouched.
+**A file must never be evicted locally before step 2 has registered it** — the one ordering
+in sync that is correctness, not optimisation (I4).
+
+Sync records what it has registered in `meta`, keyed by the local table's snapshot ID.
+
+---
+
+## 6. Compaction
+
+Required: the `max_age` seal branch guarantees undersized files, so a quiet stream emits a
+small file every interval indefinitely.
+
+Hand-written, because `rewrite_data_files` is a Spark procedure with no pyiceberg
+equivalent.
+
+The table is unpartitioned (§13), so the compaction unit is a **contiguous offset range**.
+That works because sealed files already cover contiguous, non-overlapping ranges: pick
+adjacent files under `compact_below`, and their combined range is itself contiguous.
+
+```
+1. Select adjacent files under compact_below spanning [lo, hi]; require compact_min_files.
+2. Scan them into one Arrow table; re-sort by `sort_by`.
+3. Verify row count and per-column min/max against the sources.
+4. local.overwrite(table, overwrite_filter=(offset >= lo) & (offset <= hi))  -- one snapshot
+5. Upload the compacted file; replicate the same overwrite to the archive.
+```
+
+Using the offset range as the filter is what makes this safe without partitions: the
+predicate selects exactly the source files and nothing else, because no other file overlaps
+that range.
+
+Step 3 is atomic — Iceberg swaps the snapshot pointer — so readers never observe a gap or a
+double count. No grace window is needed for *correctness*.
+
+Snapshot expiry still needs one: expiring the pre-compaction snapshot deletes files a
+long-running scan may still hold open. Retain snapshots for at least `snapshot_retention`.
+
+**Compaction is local, which is what makes it affordable.** An object-store-native design
+downloads sources, merges, and uploads, paying egress on the download. Here each byte
+crosses the network at most twice over its life — once as a source, once compacted — and
+never inbound.
+
+---
+
+## 7. Read path
+
+### Resolving the table for a reader
+
+pyiceberg owns the catalog; the query engine does not attach to it. Verified against
+DuckDB 1.5.5 + pyiceberg 0.11.1:
+
+```
+iceberg_scan(metadata_location)   3 rows, OK
+iceberg_scan(table_directory)     fails -- "no version-hint could be found"
+ATTACH ... (TYPE ICEBERG)         fails -- "AUTHORIZATION_TYPE is 'oauth2'"
+```
+
+**DuckDB's Iceberg `ATTACH` assumes a REST catalog** and asks for OAuth2 credentials; it
+cannot attach a pyiceberg `SqlCatalog`. Path-based scanning also fails, because `SqlCatalog`
+keeps the current metadata pointer in the catalog rather than in a `version-hint.text` file
+the way a filesystem catalog would.
+
+So a read is a two-step handoff:
+
+```python
+meta = catalog.load_table("cap.stream").metadata_location   # pyiceberg resolves
+duckdb.sql(f"SELECT ... FROM iceberg_scan('{meta}') ...")   # engine reads
+```
+
+**Resolve per query, never pin.** Every commit writes a new metadata JSON, so a cached path
+silently serves a stale snapshot.
+
+**DuckDB does the reading.** pyiceberg resolves the pointer, DuckDB scans — both legs of the
+union then run in one engine. `table.scan().to_arrow()` is not used: its query planning
+happens in Python and costs roughly 100 ms per scan, growing with file count (measured: 94 ms
+at 20 files, 402 ms at 180). Read throughput is comparable, since both go through C++
+Parquet readers, but the planning overhead is paid on every hot-path query.
+
+### Hot read — local, bounded, offline-capable
+
+```sql
+SELECT * FROM <local iceberg table>  WHERE <predicates>
+UNION ALL
+SELECT * FROM buffer                 WHERE offset > :boundary AND <predicates>
+```
+
+**The boundary is derived from the Iceberg table, not from a flag:**
+`boundary = max(offset)` over the local table's current snapshot, read from manifest column
+statistics.
+
+This is self-consistent at every instant, which is why the seal needs no `sealed` column:
+
+- **before** the Iceberg commit — the boundary is the previous max, so in-flight rows are
+  still served from the buffer;
+- **after** the commit, before the buffer delete — the boundary has advanced past them, so
+  the buffer contribution excludes exactly the rows the table now holds.
+
+Neither window double-counts or drops.
+
+### Cost, measured
+
+1.02M rows (16 files x 64k) in the local table, 400-byte payloads, against a SQLite buffer
+of varying size:
+
+```
+boundary: resolve catalog + max(off) from statistics      0.6 ms
+iceberg leg, 1.02M rows, count                           10.8 ms
+iceberg leg, 1h predicate                                12.5 ms
+```
+
+```
+buffer rows   buffer scan   UNION (1h, all columns)   file size at seal
+      1,000        2.0 ms                  394.1 ms             0.4 MB
+      5,000        5.0 ms                  393.5 ms             2.0 MB
+     20,000       20.5 ms                  421.0 ms             8.0 MB
+     60,000      116.7 ms                  574.5 ms            24.0 MB
+    180,000      406.6 ms                1,002.3 ms            72.0 MB
+```
+
+**The Iceberg side is nearly free; the buffer is the entire variable cost.** Per row, 180k
+buffer rows cost roughly 40x what 1M Parquet rows do — SQLite is row-oriented, so there is
+no storage-level column pruning and no vectorised read. `ATTACH` and `sqlite_scan` measure
+identically (403 vs 408 ms) and going around DuckDB is slower (`sqlite3.fetchall` 496 ms),
+so there is no cheaper path to the buffer.
+
+Below ~20k rows the buffer vanishes into noise and the union floor is the Iceberg leg alone.
+Above it the cost goes superlinear: 1.0 us/row at 20k, 1.9 at 60k, 2.3 at 180k.
+
+Projecting only the needed columns roughly halves the buffer leg (216 ms vs 403 ms at 180k)
+— the one lever that does not require sealing more often.
+
+**Consequence: the seal threshold is a read-latency knob, not only a file-size knob**, and
+it separates cleanly from compaction:
+
+| knob | controls |
+|---|---|
+| seal threshold (`target_size` / `max_age`) | how many rows sit in the buffer, hence hot-read latency |
+| compaction | how large the files end up, hence scan cost |
+
+So **seal small and often, then compact** — rather than sealing at a large `target_size` to
+get large files directly. Both operations are local and cheap, and this is what makes a
+small seal threshold affordable. Size the threshold so the buffer stays under ~20k rows: at
+50 rows/s that is a ~5 minute seal, holding the buffer near 15k rows and its contribution
+under 5% of the read.
+
+### Read performance envelope
+
+**What this is:** a local, in-process, **real-time analytics** store. Ingest is durable at
+commit and queryable immediately, so freshness is sub-second *with* durability — which
+plain DuckDB-on-Parquet does not provide. "Real-time" means fresh, not point-lookup fast.
+
+**What it is not:** an OLTP or key-value store. Measured against an indexed row store, a
+point lookup is ~1,600x slower, and no configuration closes that gap.
+
+1.02M rows in the local table, 1,000 in the buffer, results fully materialised:
+
+```
+count(*) / group-by over the whole window          22 - 26 ms
+3 scalar columns, whole window (1.02M rows)           131 ms
+all columns incl. 400 B payload, last 1h              168 ms
+all columns incl. 400 B payload, whole window         611 ms
+point query anchored on offset or event_ts             16 ms
+point query on k + a time bound                        13 ms
+point query on k alone                                119 ms
+  catalog resolve                                       2 ms
+  buffer contribution at 1k rows                        2 ms
+```
+
+**~16 ms is a floor, not a lookup cost** — returning 1 row and 3,001 rows both cost ~16 ms.
+That is metadata resolution, file open and row-group decode, and it is largely serial.
+
+**Architecture overhead is ~4 ms** (catalog resolve + buffer), fixed rather than
+proportional. Everything else is the cost of reading Parquet, which is what a reader would
+pay anyway. That is the performance claim worth making: *the read speed of reading Parquet
+directly*.
+
+**Always bound on a prefix of `sort_by`.** Not merely on *a* sort column — on a leading one.
+With `sort_by=(a, b)`, values of `b` are ordered only *within* equal values of `a`, so a
+predicate on `b` alone leaves per-file min/max spanning nearly the whole range and nothing
+prunes.
+
+Measured with `sort_by=(event_ts, k)`: `k='C42'` alone costs 119 ms, while the same
+predicate plus a one-minute `event_ts` bound costs 13 ms. `k` is *in* the sort key and still
+does not prune on its own.
+
+The corollary is that `sort_by` is a **read-shape decision, not a tuning knob**: it declares
+which predicates will be cheap. A workload dominated by per-key lookups wants `(k, ...)`;
+one dominated by cross-sectional reads wants `(event_ts, ...)`. Changing it later requires
+rewriting the data.
+
+Note this is **not** fixable by registering more statistics — Iceberg already writes
+per-file min/max for every column. Pruning selectivity comes from **clustering**, not from
+the presence of statistics, and sort order is the only clustering lever available. Parquet
+bloom filters would be the other mechanism, but pyarrow 25 exposes no bloom-filter write
+parameters, so pyiceberg cannot emit them.
+
+**Measurement environment.** 2 vCPU (AMD EPYC 9554P under KVM), 7.7 GiB RAM with DuckDB
+capped at 6.1 GiB and `threads=2`, virtio-backed storage measuring ~1068 us per fsync. Every
+number here is a conservative floor. Scans parallelise, so the full-window figures should
+improve close to linearly with cores; the ~16 ms point-query floor is largely serial and
+will not move much; and the write throughput in §3 is the most understated, since local NVMe
+fsync is 20-50 us against ~1 ms here.
+
+### Full-stream read — all three tiers
+
+The archive overlaps the local window, so the tiers cannot simply be unioned. Bound each by
+its neighbour's **actual extent**, read at query time:
+
+```
+lo = min(offset) in the local table's current snapshot
+hi = max(offset) in the local table's current snapshot
+
+SELECT * FROM <remote iceberg>  WHERE offset <  lo   AND <predicates>
+UNION ALL
+SELECT * FROM <local iceberg>                        WHERE <predicates>
+UNION ALL
+SELECT * FROM buffer            WHERE offset >  hi   AND <predicates>
+```
+
+Correct at every instant regardless of transient overlap, because `offset` is monotonic and
+the local window is a contiguous range over it. This is the §7 hot-read boundary
+generalised, and it is why **no atomic handoff between the two catalogs is required** —
+which matters, since two Iceberg commits cannot be made atomic with each other.
+
+Both `lo` and `hi` come from manifest column statistics; neither requires opening a data
+file. If the local table is empty (everything evicted), it drops out and the read becomes
+archive plus buffer bounded by the archive's max offset.
+
+### Historical read
+
+Query the archive table directly. Ordinary Iceberg — any engine, no custom logic, no
+knowledge of the local tier.
+
+### Who reads what
+
+- The **writing machine** uses its local catalog, always.
+- **Other machines and engines** attach to the archive catalog. Whether a file happens to sit
+  on some machine's disk is not modelled and not published; the archive describes what is in
+  S3.
+
+---
+
+## 8. Retention
+
+| knob | governs | too low means |
+|---|---|---|
+| `local_retention` | how much history the local table keeps | hot reads fall through to the archive |
+| `snapshot_retention` | how long expired snapshots survive | long scans hit deleted files |
+
+`local_retention` must exceed the longest hot-path lookback **with margin** — equal leaves
+nothing for seal delay.
+
+**`local_retention = 0` is valid**: files are evicted from the local table as soon as they
+are registered in the archive, and the local table holds only what has not yet been
+uploaded. Hot reads are then limited to the buffer, and anything older goes to the archive
+over the network. That is the right setting for pure archival capture — litelink as a
+durable staging area into Iceberg — and the wrong one wherever a hot reader looks back
+further than `max_age`. It does not weaken I4: eviction still never precedes registration.
+
+Raising it is an operation, not a config change: `hydrate(since=…)` fetches archived files
+and re-registers them into the local table. Without it, a raised setting applies only to
+data captured afterwards.
+
+Buffer rows are deleted at seal. There is no SQLite retention knob.
+
+---
+
+## 9. Schema evolution
+
+Iceberg assigns each column a permanent field ID and writes it into every Parquet file as
+`PARQUET:field_id`. Resolution is by ID, not name, so **add, drop and rename are all safe at
+the storage layer**:
+
+- **add** — new ID; older files simply have no value and read null.
+- **drop** — the ID is retired; its data stops being projected, which is what dropping means.
+  Re-adding the same name later creates a *new* ID and cannot collide with the retired data.
+- **rename** — the ID is unchanged, so every existing file follows the new name with no
+  rewrite.
+
+**The constraint is the read contract, not the format.** Iceberg resolves by ID inside the
+table; it does not rewrite anyone's SQL. `SELECT qty` breaks the moment the column becomes
+`quantity`, and the archive exists so external engines can query it directly.
+
+So drops and renames are **supported but breaking for consumers**. Expose them as explicit,
+deliberate operations — never as a side effect of editing a schema dict — and treat them as
+a versioned change to the stream's public surface. Adds are non-breaking and need no
+ceremony.
+
+Apply any schema change to the archive **first**. The local table is a window and can be
+rebuilt; the archive cannot.
+
+Nothing is ever lost to a schema mistake: the raw `payload` is stored verbatim, so a column
+can be re-promoted under any name at any time.
+
+## 10. Invariants
+
+Each needs a test.
+
+| # | Invariant | Why |
+|---|---|---|
+| **I1** | The Parquet file is written and fsynced before the Iceberg commit. | The reverse publishes a manifest entry for a file that may not exist. |
+| **I2** | The seal range is persisted before the file is written. | Makes the path deterministic, so retries overwrite instead of orphaning. |
+| **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The archive overlaps the local window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
+| **I4** | A file is never evicted from the local table before it is registered in the archive. | Eviction before registration is data loss. |
+| **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
+| **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
+| **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
+| **I11** | `offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
+| **I9** | `offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
+| **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
+| **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
+
+---
+
+## 11. Failure modes
+
+| Failure | Outcome |
+|---|---|
+| Crash mid-batch | Uncommitted rows lost; committed rows durable. |
+| Crash between Parquet write and Iceberg commit | `sealing` row survives; recovery redoes the commit against the same path. |
+| Crash between Iceberg commit and buffer delete | The boundary has already advanced, so reads stay correct; recovery drops the stale rows. |
+| Network unavailable indefinitely | Capture, seal, compaction and hot reads all continue. Unregistered files accumulate; local eviction stalls (I4). Fails only when local disk fills. |
+| Two sync passes race | The Iceberg catalog commit is atomic; the loser refreshes and retries. |
+| Local disk fills | Backpressure — §13.4. |
+| Machine lost | Exposure is whatever was unregistered. The archive is intact and independently readable. |
+| Compaction crashes mid-write | No snapshot was committed; the orphaned file is unreferenced and swept. |
+
+---
+
+## 12. Configuration
+
+```
+target_size            seal at this buffer size           (size it for READ latency, not
+                                                          file size -- keep buffer <20k rows;
+                                                          compaction produces the big files)
+max_age                seal at this age regardless        (e.g. 5 min)
+local_retention        local table window                 (> longest hot lookback, with margin; 0 = evict on upload)
+wal_replication        continuous WAL shipping for RPO    (off by default; §3a)
+snapshot_retention     snapshot expiry floor              (> longest scan)
+compact_below          compact files under this size      (e.g. 0.5 x target_size)
+compact_min_files      minimum adjacent files to compact  (e.g. 4)
+sort_by                within-file sort order              (capture default: event_ts, key)
+```
+
+`maintain()` runs compaction **and** expiry together. Compaction alone increases storage,
+since superseded files stay referenced until their snapshots expire.
+
+---
+
+## 13. Open questions
+
+1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
+   data naturally clustered by ingest time, so `offset` and `ingest_ts` statistics are tight
+   and manifests prune without a partition spec. Partitioning by event date would be
+   actively harmful — a seal spanning many event dates emits one file *per partition*,
+   recreating the small-file problem sealing exists to prevent, and streams that backfill
+   (records arriving far older than their ingest time) would shred every seal.
+
+   The residual weakness is `event_ts` pruning on out-of-order streams, where per-file
+   min/max are genuinely wide. If that bites, sort rows by `event_ts` within each file so
+   row-group statistics stay tight — do not partition. Iceberg's hidden partitioning means a
+   spec can be added later without changing paths or breaking readers, so this stays
+   deferrable.
+2. **`payload` encoding.** Binary JSON is the simplest default. msgpack or Arrow IPC
+   would be smaller. Measure on real payloads first — this is a one-way door once data
+   exists, since re-encoding means rewriting the archive.
+3. **Local disk backpressure.** The failure that used to be "object storage is down" is now
+   "local disk fills." Bound the buffer on **bytes**, not row count — a row-count bound can
+   exceed a byte-based memory limit, letting the OOM killer win the race against the policy
+   meant to prevent it.
+
+---
+
+## 14. Test plan
+
+Beyond §10:
+
+- **Block all network access; assert writes, seals, compaction and hot reads all succeed.**
+  This is I5 and the central claim.
+- Kill between Parquet write and Iceberg commit; assert recovery reuses the same path and
+  leaves no orphan.
+- Kill between Iceberg commit and buffer delete; assert a read in that window returns each
+  row exactly once (I3).
+- With the archive deliberately overlapping the local window, assert a full three-tier read
+  returns every row exactly once (I3).
+- Evict the local table to empty; assert a full read still returns everything, from archive
+  plus buffer alone.
+- Seal until the buffer is empty, insert again, and assert the new offsets exceed every
+  offset already committed to Iceberg (I9). This fails with a bare `INTEGER PRIMARY KEY`.
+- Assert an unregistered file is never evicted locally, even past `local_retention` (I4).
+- Expire snapshots during a long scan; assert the scan completes (I6).
+- Add a column mid-stream; assert files written before and after union cleanly with nulls.
+- Drop a column, re-add the name with a different type; assert both files stay readable and
+  the columns do not merge (the retired ID's data is simply not projected).
+- Rename a column; assert files written before and after read back under the new name with
+  no rewrite, and that the operation is refused unless invoked explicitly (I10).
+- Attach an external engine to the archive; assert it sees exactly the expected rows with no
+  custom logic.
+- Assert written files are sorted by `sort_by`, and that an `event_ts` predicate over a
+  backfilling stream reads strictly fewer row groups than the same file written unsorted.
+- Assert compaction output is re-sorted, not merely concatenated.
+- Benchmark the hot read across buffer sizes; assert the buffer leg stays under a configured
+  fraction of total read time at the chosen seal threshold.
+- Create a stream whose schema has no timestamp column at all; assert seal, compaction, the
+  three-way read and retention all work — proving nothing depends on an ingest column.
+- Assert a caller-supplied `offset` is rejected (I11).
+- Commit twice, then assert a reader that cached `metadata_location` from the first commit
+  is detectably stale -- the reason §7 requires resolving it per query.
+- Run with `local_retention = 0`; assert seal, upload, archive reads and compaction all work
+  and that eviction still never precedes registration (I4).
+- Restore a WAL replica taken before a seal; assert the read returns each row exactly once
+  despite the restored buffer holding already-sealed rows.
+- Property test: for `t1 < t2`, `read(t1) ⊆ read(t2)`, across a seal, a compaction and an
+  expiry.
