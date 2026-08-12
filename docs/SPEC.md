@@ -682,3 +682,411 @@ Beyond §10:
   despite the restored buffer holding already-sealed rows.
 - Property test: for `t1 < t2`, `read(t1) ⊆ read(t2)`, across a seal, a compaction and an
   expiry.
+
+---
+
+# 15. Blob fields
+
+**Extension to capture storage v1.0.** Support for payloads too large to sit comfortably in
+the SQLite buffer: sensor frames, point clouds, raw response bodies.
+
+---
+
+## 15.1 The model
+
+**Bytes live beside SQLite while hot, and inside Iceberg once sealed.** The column is the
+same shape in both tiers: a plain Iceberg `binary` column holding the bytes themselves.
+
+There is no pointer in the schema. The hot-side staging path is derived from `offset` and
+the field name, so it exists only on the write side and never reaches the table. The archive
+is therefore ordinary Iceberg with a binary column, readable by any engine with no
+convention to know about and no dereference step.
+
+This is the one design decision worth stating explicitly, because the obvious alternative
+looks cheaper and is not. A sidecar object store with a `(path, offset, length)` struct
+column avoids inflating the Parquet files, but it puts a reference in the published schema,
+makes the archive unreadable without library-specific logic, and creates a class of object
+that Iceberg does not manage. Snapshot expiry, orphan cleanup and compaction all ignore
+files that no manifest references, so blob lifetime becomes a refcount the library maintains
+by hand across crashes. Inlining at seal removes that entire category: the bytes are inside a
+data file the manifest already tracks, so they inherit retention, expiry and compaction for
+free.
+
+The cost is read amplification on queries that project the blob column, which is bounded and
+tunable. See §15.5.
+
+---
+
+## 15.2 API
+
+Declared at stream creation, alongside the application schema:
+
+```python
+litelink.Stream(
+    schema=pa.schema([...]),
+    sort_by=("event_ts", "key"),
+    blob_fields=[litelink.blob_field("payload", hash=True, size=True)],
+)
+```
+
+`blob_field(name, ...)` declares:
+
+| column | type | purpose |
+|---|---|---|
+| `{name}` | `binary` | the bytes |
+| `{name}_size` | `int64` | prunes as an ordinary statistic without a fetch |
+| `{name}_hash` | `binary` | optional. xxh3-128, integrity check without a fetch |
+
+`{name}_size` is **not optional** — see §15.3, where it doubles as the record of whether a
+blob was staged at all. `{name}_hash` is.
+
+The siblings are ordinary columns, not metadata. They exist so a reader can filter or verify
+without paying to materialize the payload, and they prune from Iceberg statistics like
+anything else.
+
+`append()` accepts bytes, a file path, or a file-like object for each blob field. Paths and
+file objects are streamed rather than materialized, which matters at 100 MB point clouds.
+
+The declaration is what makes this an extension rather than a convention: the library needs
+to know which columns are blob-shaped so the write path routes around SQLite and the seal
+knows what to materialize. Applications may of course declare an ordinary `binary` column
+themselves for small payloads, and nothing here applies to it.
+
+---
+
+## 15.3 Write path
+
+Amends §3. The buffer row never carries blob bytes.
+
+```
+1. BEGIN. INSERT the buffer row (no blob column); take `offset` from lastrowid.
+2. Write bytes to {root}/staging/{offset}.{field}.bin
+3. fsync the file AND the directory entry
+4. Set {name}_size on the row. COMMIT.
+```
+
+**Step 3 before step 4 is correctness, not durability hygiene (I12).** A committed row whose
+staging file did not survive the crash is a row pointing at nothing, and it is unrecoverable
+because the bytes were never anywhere else. Syncing the directory entry matters as much as
+the file: on most filesystems the file can be durable while the name that reaches it is not.
+
+The per-blob fsync is affordable precisely because blobs are large. At 2 MB the fixed cost
+amortizes to nothing; this would be unacceptable at 2 KB, which is why small payloads should
+stay in an ordinary `binary` column and go through the normal buffer path.
+
+### Getting `offset` before the bytes are written
+
+The staging path derives from `offset`, so the offset must exist before step 2 — but §2 pins
+`INTEGER PRIMARY KEY AUTOINCREMENT`, which assigns at INSERT.
+
+Both hold at once by keeping the transaction open: `INSERT` inside `BEGIN` yields
+`lastrowid` immediately, and the row does not become visible until `COMMIT` in step 4. No
+separate reservation table and no pre-allocated runs are needed.
+
+**But AUTOINCREMENT reuses an offset after a rollback.** Verified: an `INSERT` that receives
+offset *N*, then rolls back, is followed by an `INSERT` that also receives *N*. That is
+harmless for I9, which governs *committed* offsets and therefore the tier boundaries — but
+it is not harmless here, because step 2 has already put a file on disk at that name.
+
+The failure it would cause: a crash after step 3 leaves `staging/N.payload.bin` with no
+committed row. A later row takes offset *N* again with **no** blob, and a seal that inferred
+"does this row have a blob?" from file existence would attach the stale bytes to it.
+
+**So blob presence is recorded on the row, never inferred from the filesystem.** That is
+`{name}_size`, which is why it is required rather than optional. A staging file whose row has
+a null size is an orphan by definition, and the §15.4 sweep removes it.
+
+Staging is local, buffer-scoped, and never uploaded.
+
+---
+
+## 15.4 Seal
+
+Amends §4. One additional step, between choosing the range and writing Parquet:
+
+```
+1. SQLite txn: choose [start, end), write it to `sealing`
+2. Read buffer rows; for each row with {name}_size non-null, read staging/{offset}.{field}.bin
+3. Write Parquet locally with bytes inline; commit to the local Iceberg table
+4. SQLite txn: delete buffer rows < end; clear `sealing`
+5. Delete staging files for offsets < end
+```
+
+**Step 5 is garbage collection, not correctness**, exactly like step 4. A staging file whose
+offset is below the local table's committed max offset is unreferenced by construction,
+because the bytes are now in a data file. The sweep is therefore idempotent and can run at
+any time, including on startup: delete every staging file whose offset is below the boundary
+that §7 already computes.
+
+That derivation is why no orphan window needs a time heuristic. A crash anywhere leaves
+staging files that are either still referenced (offset above the boundary, keep) or already
+materialized or orphaned (below it, sweep). There is no third state.
+
+**Sorting now moves bytes.** §4 sorts rows by `sort_by` before writing, which with inline
+blobs shuffles the payloads rather than a few scalar columns. Sort on a key column and
+permute, rather than sorting materialized rows, or the seal cost becomes proportional to
+total payload size.
+
+---
+
+## 15.5 Parquet write settings
+
+The defaults are wrong for this shape and the failure is silent, so these are requirements,
+not tuning.
+
+**Row groups must be sized by bytes — which the library must compute.** pyarrow exposes
+`row_group_size` in **rows** and has no byte-based parameter; the default is unset, falling
+back to roughly a million rows. At 10 MB blobs that is a ten-terabyte row group, meaning
+every projection of the blob column reads the entire file. Derive a row count from observed
+`{name}_size` values so a row group holds roughly 10 to 50 blobs. The row group is also the
+unit a reader materializes in memory, so it doubles as the per-reader allocation bound.
+
+**Use `large_binary`, or cap row groups well below the limit.** Arrow's `binary` uses 32-bit
+offsets, so a column chunk caps at 2 GB. Twenty 100 MB blobs overflow it. Verify how
+pyiceberg maps Iceberg `binary` on the way in rather than assuming.
+
+**Set `compression=NONE` on blob columns.** Sensor payloads and media are already compressed;
+the codec will spend CPU proving it.
+
+**Raise `target_size`.** The §12 default is a handful of rows once blobs are inline. Size it
+so a file still holds a useful number of rows. Note this pulls against §7's finding that the
+seal threshold bounds hot-read latency — with blobs, the buffer holds fewer, larger rows, so
+the row-count guidance there still governs.
+
+**Confirm the page index is written.** It is what would allow ranged reads below row group
+granularity later. Reader support is uneven enough not to design around today, but writing it
+costs nothing and keeps the option.
+
+---
+
+## 15.6 Read behaviour
+
+Unchanged in shape. The hot read joins staging by derivation, the sealed read reads the
+column directly, and both return the same schema, so callers see one thing.
+
+Degradation is confined to queries that project the blob column:
+
+- **Projections excluding it cost nothing.** Column chunks are contiguous per row group, so a
+  query over `event_ts` and `key` never fetches payload bytes. Analytical predicates and the
+  tier-boundary reads in §7 are unaffected.
+- **Projections including it read whole row groups.** A single-row fetch amplifies to the row
+  group size. This is the tunable in §15.5 and the reason to size row groups in blobs rather
+  than rows.
+- **`{name}_size` and `{name}_hash` are the escape hatch.** Filtering and integrity checking
+  work without touching the payload column at all.
+
+A dedicated `read_blob(row)` accessor is worth having so the common single-blob fetch can
+push a tight row filter rather than materializing a scan.
+
+### The reads, in full
+
+Both §7 reads with a blob field resolved. Expressible entirely in DuckDB, using `sqlite` to
+attach the buffer, `iceberg` to scan the tables, and `read_blob` for staging.
+
+`lo` and `hi` are §7's names: the min and max of `offset` over the local table's current
+snapshot, read from manifest column statistics. The hot read needs only `hi`, which is the
+value §7's hot-read prose calls `boundary`; it is the same number and this section uses `hi`
+throughout so one value carries one name.
+
+**`offset` must be quoted throughout.** It is a reserved word in DuckDB: `USING (offset)` is a
+parser error, while `USING ("offset")` and a qualified `b.offset` both parse. Verified.
+
+Staging resolution is identical in both reads, so it is factored out once:
+
+```sql
+INSTALL sqlite; INSTALL iceberg;
+ATTACH 'buffer.db' AS buf (TYPE sqlite, READ_ONLY);
+
+CREATE OR REPLACE TEMP VIEW staging AS
+  SELECT
+    regexp_extract(filename, '(\d+)\.payload\.bin$', 1)::BIGINT AS "offset",
+    content AS payload
+  FROM read_blob('staging/*.payload.bin');
+```
+
+**Hot read** (local table plus buffer):
+
+```sql
+SELECT "offset", event_ts, key, payload
+FROM iceberg_scan('<local metadata json>')
+WHERE <predicates>
+
+UNION ALL
+
+SELECT b."offset", b.event_ts, b.key, s.payload
+FROM buf.buffer b
+LEFT JOIN staging s USING ("offset")
+WHERE b."offset" > $hi AND <predicates>;
+```
+
+**Full-stream read** (archive plus local plus buffer). The archive holds no staging tier, so
+its blob column is read directly:
+
+```sql
+SELECT "offset", event_ts, key, payload
+FROM iceberg_scan('<archive metadata json>')
+WHERE "offset" < $lo AND <predicates>
+
+UNION ALL
+
+SELECT "offset", event_ts, key, payload
+FROM iceberg_scan('<local metadata json>')
+WHERE <predicates>
+
+UNION ALL
+
+SELECT b."offset", b.event_ts, b.key, s.payload
+FROM buf.buffer b
+LEFT JOIN staging s USING ("offset")
+WHERE b."offset" > $hi AND <predicates>;
+```
+
+The blob field changes nothing about the tier boundaries. Both queries bound each tier by its
+neighbour's committed extent exactly as §7 specifies, and the staging join sits entirely
+inside the buffer branch.
+
+**Explicit column lists, not `SELECT *`.** The buffer branch sources `payload` from a
+different relation than the other branches, so the union cannot be built positionally. This
+is the only structural difference from §7's pseudocode.
+
+**The staging join is a glob and a parse, not a per-row lookup.** `read_blob` returns
+`filename`, `content`, `size` and `last_modified`, so the directory is globbed once and
+joined on the offset parsed out of the name. Table functions cannot take correlated
+arguments, so a per-row path could not be passed in even if the pointer were stored; deriving
+the path from `offset` and joining is the only shape available, and it happens to be the
+faster one.
+
+`LEFT JOIN` rather than inner: a blob field may be null for some rows, and an inner join
+would silently drop them.
+
+**`$lo` and `$hi` are supplied, not computed in SQL.** Expressing either as a scalar subquery
+over `iceberg_scan` would read the offset column rather than manifest statistics, which is the
+opposite of the §7 design. Resolve them through pyiceberg and pass them as parameters.
+
+**The scan takes a metadata path, not a catalog, and this is deliberate.** DuckDB's `iceberg`
+extension attaches REST catalogs only; a pyiceberg `SqlCatalog` on SQLite cannot be attached,
+and the path-based `iceberg_scan` is the catalog-free read route. (Verified: `ATTACH … (TYPE
+ICEBERG)` against a SQLite catalog fails demanding OAuth2 credentials.) Note this is a
+different extension from `ducklake`, whose SQLite catalog support is unrelated.
+
+That constraint happens to coincide with what correctness requires. If DuckDB resolved the
+catalog itself, it would select its own snapshot independently of the one `lo` and `hi` were
+computed from. A seal committing between the two leaves `hi` stale-low against a newer scan,
+so every row in the gap appears in both the Iceberg branch and the buffer branch. Pinning the
+metadata file makes the boundary and the scan come from one snapshot by construction, which
+is the same argument as deriving boundaries from committed extents rather than flags (I3).
+
+So the library resolves the current metadata location through pyiceberg, reads the extents
+from that same metadata, and passes both into the query. Worth testing whether
+`iceberg_column_stats()` can supply the extents from manifest statistics against the pinned
+path, which would keep the whole read in one DuckDB call without weakening the pin.
+
+Cast the buffer side explicitly rather than relying on the `UNION ALL` to reconcile types.
+SQLite's per-value typing comes through the `sqlite` extension loosely, and a column that
+holds integers in every row but was declared without affinity can still surprise the union.
+
+With multiple blob fields, each gets its own staging view and its own `LEFT JOIN`, keyed on
+the field name in the glob pattern.
+
+---
+
+## 15.7 Retention and orphans
+
+**No new object-storage garbage collection.** Blob bytes are inside Iceberg data files, so
+snapshot expiry, compaction and orphan cleanup handle them with no additional machinery. This
+is the whole payoff of inlining and it should not be given up casually.
+
+**Staging is the only library-managed storage**, and it is local, offset-named, and swept
+against the same boundary the read path already computes. Nothing accumulates in object
+storage that Iceberg does not know about.
+
+Compaction (§6) needs no change in principle, since re-sorting an offset range carries the
+bytes along. It does change in cost: compaction now reads blob bytes rather than only Parquet
+metadata and small columns. Streams with blob fields should therefore get a separate, lower
+`compact_below`, or the pass will move far more data than the file-count problem justifies.
+
+---
+
+## 15.8 Amendments to existing sections
+
+| Section | Change |
+|---|---|
+| §2 Layout | Buffer holds no blob bytes. Adds a required `{name}_size` column per blob field. |
+| §3 Write path | Adds the staging write and the fsync ordering (§15.3). |
+| §4 Seal | Adds materialization (step 2), the staging sweep (step 5), and sort-by-key-then-permute. |
+| §6 Compaction | Unchanged in logic; needs a separate `compact_below` for blob streams. |
+| §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `offset` must be quoted. |
+| §8 Retention | Unchanged. Blobs inherit it. |
+| §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_below`; `target_size` raised. |
+
+---
+
+## 15.9 Invariants
+
+Extends §10.
+
+| # | Invariant | Why |
+|---|---|---|
+| **I12** | The staging file and its directory entry are fsynced before the buffer row commits. | A committed row whose bytes did not survive is unrecoverable. The bytes exist nowhere else. |
+| **I13** | A staging file is deleted only when its offset is below the local table's committed max offset. | Above the boundary it is still the only copy. |
+| **I14** | Blob presence is read from `{name}_size` on the row, never inferred from a staging file existing. | AUTOINCREMENT reuses an offset after a rollback, so a stale staging file can sit at an offset a later row legitimately takes. |
+| **I15** | Blob bytes are never written to any object storage location that no Iceberg manifest references. | The moment they are, lifetime becomes a hand-maintained refcount and expiry stops working. |
+
+I15 is a design constraint rather than a runtime check, and it is the one to revisit
+deliberately if the sidecar approach ever becomes necessary.
+
+---
+
+## 15.10 Failure modes
+
+Extends §11.
+
+| Failure | Outcome |
+|---|---|
+| Crash between staging write and buffer commit | Orphaned staging file at an offset with no committed row. Swept by the §15.4 rule; never mis-attached, because presence comes from `{name}_size` (I14). |
+| Crash between buffer commit and seal | Staging file survives; the row is durable and readable. This is the case I12 protects. |
+| Staging file missing for a row with non-null `{name}_size` | Unrecoverable data loss for that row. Detectable at seal; fail loudly rather than writing a null. |
+| Crash mid-seal after Parquet commit | Staging files below the boundary are now redundant; recovery sweeps them. |
+| Local disk fills | Blobs dominate the bound, so §13's byte-based backpressure must count staging, not only buffer rows. |
+
+---
+
+## 15.11 Tests
+
+- Kill between staging write and buffer commit; assert the orphan is swept and no row
+  references a missing file.
+- **Force an offset reuse**: roll back an insert that staged bytes, then insert a blob-less
+  row that takes the same offset; assert the stale bytes are never attached (I14).
+- Kill between buffer commit and seal; assert the row reads back with correct bytes.
+- Delete a staging file behind a row with non-null `{name}_size`; assert seal fails loudly
+  rather than writing a null or a short value.
+- Assert a projection excluding the blob column reads no blob bytes. Measure, do not assume.
+- Assert a single-blob fetch reads at most one row group's worth.
+- Write blobs totalling over 2 GB in one row group's worth of rows; assert no offset overflow.
+- Assert `{name}_size` and `{name}_hash` prune and verify without materializing the payload.
+- Compact a blob-bearing offset range; assert byte-for-byte identity of every payload,
+  alongside the existing row count and bounds checks.
+- Assert an external engine reads the archive's blob column with no library-specific logic.
+- Run a stream with a blob field declared but never populated; assert nulls throughout and no
+  staging files.
+
+---
+
+## 15.12 Open
+
+**Container swap.** Iceberg has been working toward a pluggable file-format API, with Lance
+discussed as a candidate container. **Both the release version and the timeline here are
+unverified — confirm against upstream before relying on them.** If and when it reaches
+pyiceberg, the data file container swaps and blob reads gain true random access. The column
+is already `binary`, so no schema change is implied and no data has to move; only newly
+written files change format. Nothing in this section should be designed around it arriving.
+
+**Small-blob threshold.** Everything here assumes payloads large enough to amortize a
+per-blob fsync. Below roughly 1 MB the staging round trip is pure overhead and an ordinary
+`binary` column through the normal buffer path is better. Whether the library should route
+this automatically by size, or require the application to choose, is unresolved. Automatic
+routing is friendlier and introduces a size-dependent write path, which is a durability
+behaviour that changes under the caller without warning.
+
+**Ranged reads.** Page-index-driven fetches below row group granularity would cut the fetch
+amplification substantially. Blocked on reader support, not on anything here.

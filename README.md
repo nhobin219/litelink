@@ -61,6 +61,14 @@ durability — but "real-time" means fresh, not point-lookup fast.
 
 Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
+## Extensions
+
+**Blob fields** ([`docs/SPEC.md`](docs/SPEC.md) §15) — payloads too large for the buffer
+(sensor frames, point clouds, raw response bodies). Bytes stage beside SQLite while hot and
+are inlined into Iceberg at seal, so the archive stays ordinary Iceberg with a `binary`
+column: no pointers in the published schema, and blob lifetime inherits snapshot expiry and
+compaction rather than becoming a hand-maintained refcount.
+
 ## Open questions
 
 Payload encoding, and local-disk backpressure. Both in [`docs/SPEC.md`](docs/SPEC.md) §13.
