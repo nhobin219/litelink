@@ -75,4 +75,4 @@ Payload encoding, and local-disk backpressure. Both in [`docs/SPEC.md`](docs/SPE
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
