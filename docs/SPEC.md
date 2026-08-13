@@ -40,6 +40,7 @@ not a service, so this costs no daemon.
 | Time travel | Append-only. Snapshots are a commit mechanism here, not a query feature. Point-in-time filtering is `ingest_ts <= as_of` on a column — bitemporal, and strictly more expressive. |
 | CDC | No updates, no deletes. A state change is a new row with a new `ingest_ts`. Sync is a watermark. |
 | Multi-writer per table | One writer per stream. Multiple machines write separate tables; readers union. |
+| A transaction / commit ID column | The library's commit boundary is batching, not meaning — whether 50 rows landed in one transaction or five is an implementation detail. See below. |
 
 ---
 
@@ -98,6 +99,36 @@ recompute `next_offset = max(iceberg_max, buffer_max) + 1` correctly at every st
 getting that wrong produces the I9 failure silently. An explicit `meta` counter only earns
 its extra moving part if offset ranges must later be pre-allocated across producers, which
 one writer per stream does not require.
+
+### Why there is no transaction ID
+
+Grouping rows by the transaction that wrote them looks useful and is not, because the
+boundary the library could label is the wrong one.
+
+**The library's commit boundary is batching.** It decides when to flush a batch to SQLite;
+that grouping carries no information about the data. The boundary that *means* something
+belongs to the application, and splits by how the stream arrives:
+
+- **Streamed sources have no grouping at all.** Each message is independent and is committed
+  as it arrives. There is nothing to label.
+- **Polled sources do have one** — a fetch of 200 entities is a single observation of that
+  universe at one instant. But the application knows that; the library only sees 200 appends.
+  An application that wants it declares an ordinary column, or leans on the shared
+  `ingest_ts` those rows already carry.
+
+That places it on the application side for the same reason as `ingest_ts` (see below), and it
+is why the one-column rule survives: the only serious candidate for a second library column
+turned out to be application semantics.
+
+**No reader can observe a partial transaction regardless**, so nothing is being given up. A
+seal may split a batch across two files, but the boundary read in §7 returns the table's rows
+plus every buffer row above `hi` — so the union yields the whole batch either way, before or
+after a crash.
+
+**And the truncate argument dissolves with it.** "Revert should land on a transaction
+boundary" presumes rows within a transaction are jointly meaningful. In an append-only log of
+independent rows, *every* offset is a safe cut point. A cut is only unsafe where the
+application defined a group, in which case the application aligns it.
 
 **Table schema.** The library owns exactly **one** column:
 
