@@ -669,6 +669,49 @@ since superseded files stay referenced until their snapshots expire.
    "local disk fills." Bound the buffer on **bytes**, not row count — a row-count bound can
    exceed a byte-based memory limit, letting the OOM killer win the race against the policy
    meant to prevent it.
+4. **Bulk ingest.** Loading an existing corpus — a backfill, an archive import — through
+   `append()` row by row wastes the point of already having Parquet. The wanted path is to
+   lock writes, reserve a contiguous offset range, materialise `offset` into the file, and
+   commit. Four things it meets, none blocking, none free.
+
+   **It is a rewrite, not a registration.** I11 forbids a caller-supplied `offset` and §7
+   derives every tier boundary from its extents, so a file lacking the column cannot be
+   registered — `add_files` zero-copy is unavailable. §4's sort applies equally, or
+   row-group statistics are junk. Budget a full pass over the input, not a PUT.
+
+   **The file is staged, not sealed.** It is raw input to the same local
+   normalise-then-upload path as a seal's output, so an oversized one is split before it is
+   ever registered — the mirror of a quiet stream's undersized file being merged before
+   upload. §6 is merge-only, selecting files *under* `compact_below`, so the split is an
+   addition: the same `overwrite` on the same offset-range filter, emitting N files instead
+   of one, with step 3's row-count-and-min/max verification unchanged. Bulk ingest is what
+   creates the requirement — a seal cannot emit an oversized file, since `target_size`
+   already bounds it.
+
+   **A reservation is a hole in the offset space.** A seal spanning it writes a file whose
+   `offset` statistics cover `[lo, hi]` while containing none of it; when the staged file
+   commits, the two overlap, which is exactly what §6's *"no other file overlaps that
+   range"* forbids. Sealing the buffer empty before reserving closes it — every subsequent
+   live row is then above `hi`, so no seal has rows on both sides. This holds only if the
+   seal takes `start` from the buffer's own minimum rather than the previous file's `end`.
+   The weaker property is also the correct one: §6 needs files non-overlapping and adjacent
+   in offset order, not free of integer gaps, and gaps already arise from rolled-back
+   batches (§15.3).
+
+   **The orphan sweep does not transfer.** §15.4 sweeps by offset against the §7 boundary,
+   which works because every staged blob has a buffer row carrying `{name}_staged`. A bulk
+   file has no buffer row and sits *above* the boundary until it commits, so an abandoned
+   ingest reads as still-referenced forever. It needs its own table parallel to `sealing`,
+   holding `(lo, hi, rel_path)` — not a row in `buffer`, which §7's hot read would union
+   into reader output, and not `sealing` itself, which holds one row and would block seals
+   for the length of a rewrite. The sweep rule then mirrors §15.3: a staged file with no
+   row is an orphan by definition.
+
+   Reserving needs no new counter. Bumping `sqlite_sequence` by N inside the write
+   transaction reserves `[old+1, old+N]`, preserves I9, and lands above everything ever
+   assigned. §2's note that an explicit `meta` counter *"only earns its extra moving part
+   if offset ranges must later be pre-allocated across producers"* is the clause this
+   trips; the `sqlite_sequence` bump is the cheaper way to satisfy it.
 
 ---
 
