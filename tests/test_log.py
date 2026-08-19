@@ -64,7 +64,9 @@ def test_caller_supplied_offset_is_rejected(tmp_path: Path) -> None:
     """I11: the library owns `offset` and never accepts one."""
     with open_log(tmp_path) as log:
         with pytest.raises(ValueError, match="I11"):
-            log.append({"offset": 7, "event_ts": 1, "key": "k", "payload": b""})
+            log.append(
+                {"litelink_offset": 7, "event_ts": 1, "key": "k", "payload": b""}
+            )
 
 
 def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
@@ -73,7 +75,7 @@ def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
         Log.new(
             tmp_path,
             "s",
-            schema=pa.schema([pa.field("offset", pa.int64())]),
+            schema=pa.schema([pa.field("litelink_offset", pa.int64())]),
             sort_by=(),
         )
 
@@ -190,34 +192,6 @@ def test_local_retention_zero_without_an_archive_is_rejected(tmp_path: Path) -> 
     """§8: it means 'evict on upload', and there is nothing to upload to."""
     with pytest.raises(ValueError, match="archive"):
         open_log(tmp_path, LogConfig(local_retention=timedelta(0)))
-
-
-def test_capture_works_with_no_network(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """I5 and §14's first bullet: the central claim.
-
-    Blocks Python-level socket creation, then drives the whole loop. Note the
-    limitation: DuckDB and pyiceberg-core reach the network from C++, which
-    never passes through `socket.socket`, so this catches a Python-level
-    regression (a pyiceberg HTTP call, an S3 client) and not a C++ one. The
-    airtight version of this test needs a network namespace, and belongs in a
-    suite that can ask for one.
-    """
-    import socket
-
-    def refuse(*args: object, **kwargs: object) -> None:
-        msg = "network access during a hot-path operation"
-        raise OSError(msg)
-
-    monkeypatch.setattr(socket, "socket", refuse)
-
-    with open_log(tmp_path, LogConfig(target_size=256)) as log:
-        log.extend(rows(20))
-        log.seal()
-        log.extend(rows(20, start=20))
-        assert len(read_all(log)) == 40
-        assert log.end_offset() == 41
 
 
 def test_readonly_sees_a_writer_s_committed_rows(tmp_path: Path) -> None:

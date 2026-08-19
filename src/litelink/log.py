@@ -44,6 +44,11 @@ if TYPE_CHECKING:
 
 # Keys in the buffer's `meta` table (§2). These hold what the Iceberg table
 # cannot: deployment policy rather than data shape.
+# The one column the library owns (§2). Named rather than spelled inline so a
+# schema change has something to check against, and prefixed so it can never
+# collide with a column §9 lets an application add.
+OFFSET = "litelink_offset"
+
 _CONFIG_KEY = "config"
 _ARCHIVE_KEY = "archive"
 _SCHEMA_KEY = "arrow_schema"
@@ -162,8 +167,10 @@ class Log:
         layout: Layout,
         table: LogTable,
         buffer: Buffer,
+        reader: Reader,
+        maintenance: Maintenance,
         schema: pa.Schema,
-        sort_by: Sequence[str],
+        sort_by: tuple[str, ...],
         config: LogConfig,
         archive: str | None = None,
         readonly: bool = False,
@@ -177,12 +184,10 @@ class Log:
         self._table = table
         self._buffer = buffer
         self._schema = schema
-        self._sort_by = tuple(sort_by)
+        self._sort_by = sort_by
         self._archive = archive
-        self._table_schema = table_schema(schema)
-
-        self._reader = Reader(layout, table, self._table_schema)
-        self._maintenance = Maintenance(table, buffer, layout, config, self._sort_by)
+        self._reader = reader
+        self._maintenance = maintenance
         # One lock over every operation, so a maintenance thread and an append
         # loop can share a Log. Coarse on purpose: a seal and a compaction both
         # span several statements plus an Iceberg commit, and interleaving them
@@ -233,8 +238,9 @@ class Log:
         None means local-only: capture, seal, compaction, retention and reads
         all work with no network, forever (§11).
         """
+        order = tuple(sort_by)
         settings = config or LogConfig()
-        validate(schema, sort_by, settings, archive)
+        validate(schema, order, settings, archive)
 
         layout = Layout(Path(root), name)
         if layout.buffer_db.exists():
@@ -242,7 +248,7 @@ class Log:
             raise FileExistsError(msg)
 
         layout.create()
-        table = LogTable.create(layout, table_schema(schema), sort_by)
+        table = LogTable.create(layout, table_schema(schema), order)
         buffer = Buffer(layout.buffer_db, schema)
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
@@ -258,8 +264,10 @@ class Log:
             layout=layout,
             table=table,
             buffer=buffer,
+            reader=Reader(layout, table, table_schema(schema)),
+            maintenance=Maintenance(table, buffer, layout, settings, order),
             schema=schema,
-            sort_by=sort_by,
+            sort_by=order,
             config=settings,
             archive=archive,
         )
@@ -303,13 +311,17 @@ class Log:
             msg = f"log at {layout.root}/{name} has no stored config; it is corrupt"
             raise ValueError(msg)
 
+        config = LogConfig.from_json(encoded)
+        sort_by = table.sort_by()
         log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
+            reader=Reader(layout, table, table_schema(schema)),
+            maintenance=Maintenance(table, buffer, layout, config, sort_by),
             schema=schema,
-            sort_by=table.sort_by(),
-            config=LogConfig.from_json(encoded),
+            sort_by=sort_by,
+            config=config,
             # `or None`: detaching stores an empty string rather than deleting
             # the row, and an empty archive is no archive. Without this it reads
             # back truthy enough to make maintain() refuse to run.
@@ -335,9 +347,7 @@ class Log:
             validate(self._schema, self._sort_by, config, self._archive)
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
             self.config = config
-            self._maintenance = Maintenance(
-                self._table, self._buffer, self._layout, config, self._sort_by
-            )
+            self._maintenance.set_config(config)
 
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5)."""
@@ -376,9 +386,7 @@ class Log:
 
             self._table.set_sort_order(requested)
             self._sort_by = requested
-            self._maintenance = Maintenance(
-                self._table, self._buffer, self._layout, self.config, requested
-            )
+            self._maintenance.set_sort_by(requested)
             self._maintenance.rewrite_sorted()
 
     def _writable(self) -> None:
@@ -443,25 +451,27 @@ class Log:
         a 400-byte payload column is 611 ms and proportional to the data, so
         materialising it is the caller's choice to make.
         """
-        projection = ", ".join(f'"{c}"' for c in (columns or self._table_schema.names))
+        projection = ", ".join(
+            f'"{c}"' for c in (columns or ("litelink_offset", *self._schema.names))
+        )
         predicates = [f"({where})"] if where else []
         if start_offset is not None:
-            predicates.append(f'"offset" >= {int(start_offset)}')
+            predicates.append(f'"litelink_offset" >= {int(start_offset)}')
 
         if end_offset is not None:
-            predicates.append(f'"offset" < {int(end_offset)}')
+            predicates.append(f'"litelink_offset" < {int(end_offset)}')
 
         clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
 
         return self.sql(
-            f'SELECT {projection} FROM log{clause} ORDER BY "offset"',
+            f'SELECT {projection} FROM log{clause} ORDER BY "litelink_offset"',
             include_archive=include_archive,
         )
 
     def sql(self, query: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
         """Run arbitrary DuckDB SQL against the log, exposed as `log`.
 
-        The escape hatch for what `scan` cannot express. Quote `"offset"` — it
+        The escape hatch for what `scan` cannot express. Quote `"litelink_offset"` — it
         is a DuckDB reserved word.
         """
         if include_archive:
@@ -692,17 +702,30 @@ class Log:
     # declared spelling of the column just added.
 
     def add_column(self, name: str, type_: pa.DataType) -> None:
-        """Add a column. Non-breaking: older files read null (§9)."""
+        """Add a column. Non-breaking: older files read null (§9).
+
+        Must reject `litelink_offset` (I11), which `validate` enforces at
+        creation and this has to enforce again: a schema change is the other
+        way a caller could introduce it, and the prefix makes the collision
+        unlikely rather than impossible.
+        """
+        reject_reserved(name)
         raise NotImplementedError
 
     def rename_column(self, old: str, new: str, *, breaking_ok: bool) -> None:
         """Rename a column. Safe for the data, BREAKING for consumers (§9).
+
+        Renaming TO `litelink_offset` is refused for the same reason as adding
+        it, and renaming it away would retire the column §7 derives every tier
+        boundary from.
 
         Iceberg resolves by field ID, so no file is rewritten — and no engine's
         SQL is rewritten either, so `SELECT qty` breaks the moment the column
         becomes `quantity`. `breaking_ok` must be passed explicitly: the format
         will not stop you, so the API has to (I10).
         """
+        reject_reserved(new)
+        reject_reserved(old)
         raise NotImplementedError
 
     def drop_column(self, name: str, *, breaking_ok: bool) -> None:
@@ -711,6 +734,7 @@ class Log:
         Re-adding the name later creates a NEW field ID and cannot collide with
         the retired data.
         """
+        reject_reserved(name)
         raise NotImplementedError
 
     # -- lifecycle ---------------------------------------------------------
@@ -768,12 +792,24 @@ def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
 
 def application_schema(schema: pa.Schema) -> pa.Schema:
     """The caller's columns — the table's schema with `offset` removed."""
-    return pa.schema([f for f in schema if f.name != "offset"])
+    return pa.schema([f for f in schema if f.name != "litelink_offset"])
 
 
 def table_schema(schema: pa.Schema) -> pa.Schema:
     """The caller's columns with `offset` in front — the table's real schema."""
-    return pa.schema([pa.field("offset", pa.int64(), nullable=False), *schema])
+    return pa.schema([pa.field("litelink_offset", pa.int64(), nullable=False), *schema])
+
+
+def reject_reserved(name: str) -> None:
+    """Refuse any operation that would touch the library's own column (I11).
+
+    Checked at schema-change time as well as at creation: those are the two
+    ways a caller could reach it, and monotonicity and non-reuse cannot be
+    enforced on a column an application controls.
+    """
+    if name == OFFSET:
+        msg = f"`{OFFSET}` is owned by the library and cannot be added, renamed or dropped (I11)"
+        raise ValueError(msg)
 
 
 def validate(
@@ -787,8 +823,8 @@ def validate(
     Separate from construction so the rules read as a list rather than as
     guards scattered through a constructor.
     """
-    if "offset" in schema.names:
-        msg = "`offset` is owned by the library and must not be in the schema (I11)"
+    if OFFSET in schema.names:
+        msg = f"`{OFFSET}` is owned by the library and must not be in the schema (I11)"
         raise ValueError(msg)
 
     # Before anything else: a column the library cannot carry end-to-end must

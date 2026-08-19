@@ -68,7 +68,7 @@ def open_raw(db: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute(
-        'CREATE TABLE buffer ("offset" INTEGER PRIMARY KEY AUTOINCREMENT,'
+        'CREATE TABLE buffer ("litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,'
         " event_ts INTEGER, ingest_ts INTEGER, key TEXT, payload BLOB)"
     )
 

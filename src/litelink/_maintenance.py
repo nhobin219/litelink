@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable
 
     import pyarrow as pa
 
@@ -41,13 +41,20 @@ class Maintenance:
         buffer: Buffer,
         layout: Layout,
         config: LogConfig,
-        sort_by: Sequence[str],
+        sort_by: tuple[str, ...],
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
         self._config = config
-        self._sort_by = tuple(sort_by)
+        self._sort_by = sort_by
+
+    def set_config(self, config: LogConfig) -> None:
+        """Adopt new policy in place, rather than being rebuilt around it."""
+        self._config = config
+
+    def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
+        self._sort_by = sort_by
 
     def run(self) -> None:
         self.compact()
@@ -237,7 +244,7 @@ def _verify(merged: pa.Table, run: list[DataFile], lo: int, hi: int) -> None:
     # Python's min/max over the materialised column, not pyarrow.compute: pc's
     # kernels are generated from a runtime registry, so no static checker can
     # see them. §6 step 2 already holds the whole merge in memory.
-    offsets = merged["offset"].to_pylist()
+    offsets = merged["litelink_offset"].to_pylist()
     if min(offsets) != lo or max(offsets) != hi:
         msg = "compaction changed the offset extent"
         raise RuntimeError(msg)
