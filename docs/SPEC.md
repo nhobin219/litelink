@@ -401,7 +401,8 @@ so raising the duckdb floor invalidates it and every machine downloads again.
 
 This is a provisioning obligation, not a dependency — no package pins it, so nothing fails at
 install time. Install the extensions at build or deploy time, or vendor them and point
-`DUCKDB_EXTENSION_DIRECTORY` at the directory, which is the air-gapped route. The blob
+`DUCKDB_EXTENSION_DIRECTORY` at the directory, which is the air-gapped route. How an
+*embedding application* discharges it, as opposed to this repo, is §13.5. The blob
 workloads in §15 — sensor frames and point clouds — are edge deployments by nature, which is
 what makes this load-bearing rather than a note about developer laptops.
 
@@ -740,6 +741,29 @@ since superseded files stay referenced until their snapshots expire.
    assigned. §2's note that an explicit `meta` counter *"only earns its extra moving part
    if offset ranges must later be pre-allocated across producers"* is the clause this
    trips; the `sqlite_sequence` bump is the cheaper way to satisfy it.
+5. **Extension provisioning for embedders.** §7 makes the extension download a provisioning
+   obligation. A repo can discharge it in its bootstrap and its CI; an application that
+   `pip install`s the library runs neither. It gets the read path and no extensions, so its
+   first read is the network read the design says it is not — and the offline claim is about
+   that application, not about this repo.
+
+   **Installing at import time is the option that needs no API, and it is the wrong one.**
+   Network I/O inside `import litelink` fires in test suites, in processes that only ever
+   write, and in anything that imports the module for an unrelated reason. It charges every
+   consumer to fix the one that reads, and it fails in exactly the air-gapped environment it
+   was meant to serve.
+
+   **Vendoring the binaries into the wheel** closes it outright and costs the most.
+   Extensions are per-platform and per-DuckDB-version, so the project inherits
+   platform-specific wheels and a re-vendor on every duckdb bump. That is the right trade
+   only if air-gapped installs become the common case rather than the interesting one.
+
+   The likely shape is an explicit call — run at deploy or at startup, doing what
+   `scripts/install_duckdb_extensions.py` does — with DuckDB's autoinstall left as the
+   documented fallback for callers who have network and do not care. It stays deferrable
+   because it is additive and changes nothing about the read path's design. What is not
+   deferrable is writing it down, since the alternative is an embedder discovering it from a
+   device already in the field.
 
 ---
 
