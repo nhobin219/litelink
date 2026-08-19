@@ -89,7 +89,9 @@ def bench_reads(
         # compare the difference, not the ratio.
         wide = best_of(3, lambda: log.scan().read_all()) * 1000
         narrow = (
-            best_of(3, lambda: log.scan(columns=["offset", "event_ts"]).read_all())
+            best_of(
+                3, lambda: log.scan(columns=["litelink_offset", "event_ts"]).read_all()
+            )
             * 1000
         )
         print(

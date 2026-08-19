@@ -23,11 +23,13 @@ from litelink import Log
 def snapshot(log: Log) -> tuple[int, int, int, int]:
     """(total rows, table rows, buffer rows, data files) — one read, one moment."""
     extent = log.table_extent()
-    total = log.scan(columns=["offset"]).read_all().num_rows
+    total = log.scan(columns=["litelink_offset"]).read_all().num_rows
     table = (
         0
         if extent is None
-        else log.scan(columns=["offset"], end_offset=extent[1] + 1).read_all().num_rows
+        else log.scan(columns=["litelink_offset"], end_offset=extent[1] + 1)
+        .read_all()
+        .num_rows
     )
 
     return total, table, total - table, len(log._table.data_files())  # noqa: SLF001

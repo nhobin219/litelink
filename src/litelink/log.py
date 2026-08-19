@@ -44,6 +44,11 @@ if TYPE_CHECKING:
 
 # Keys in the buffer's `meta` table (§2). These hold what the Iceberg table
 # cannot: deployment policy rather than data shape.
+# The one column the library owns (§2). Named rather than spelled inline so a
+# schema change has something to check against, and prefixed so it can never
+# collide with a column §9 lets an application add.
+OFFSET = "litelink_offset"
+
 _CONFIG_KEY = "config"
 _ARCHIVE_KEY = "archive"
 _SCHEMA_KEY = "arrow_schema"
@@ -447,26 +452,26 @@ class Log:
         materialising it is the caller's choice to make.
         """
         projection = ", ".join(
-            f'"{c}"' for c in (columns or ("offset", *self._schema.names))
+            f'"{c}"' for c in (columns or ("litelink_offset", *self._schema.names))
         )
         predicates = [f"({where})"] if where else []
         if start_offset is not None:
-            predicates.append(f'"offset" >= {int(start_offset)}')
+            predicates.append(f'"litelink_offset" >= {int(start_offset)}')
 
         if end_offset is not None:
-            predicates.append(f'"offset" < {int(end_offset)}')
+            predicates.append(f'"litelink_offset" < {int(end_offset)}')
 
         clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
 
         return self.sql(
-            f'SELECT {projection} FROM log{clause} ORDER BY "offset"',
+            f'SELECT {projection} FROM log{clause} ORDER BY "litelink_offset"',
             include_archive=include_archive,
         )
 
     def sql(self, query: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
         """Run arbitrary DuckDB SQL against the log, exposed as `log`.
 
-        The escape hatch for what `scan` cannot express. Quote `"offset"` — it
+        The escape hatch for what `scan` cannot express. Quote `"litelink_offset"` — it
         is a DuckDB reserved word.
         """
         if include_archive:
@@ -697,17 +702,30 @@ class Log:
     # declared spelling of the column just added.
 
     def add_column(self, name: str, type_: pa.DataType) -> None:
-        """Add a column. Non-breaking: older files read null (§9)."""
+        """Add a column. Non-breaking: older files read null (§9).
+
+        Must reject `litelink_offset` (I11), which `validate` enforces at
+        creation and this has to enforce again: a schema change is the other
+        way a caller could introduce it, and the prefix makes the collision
+        unlikely rather than impossible.
+        """
+        reject_reserved(name)
         raise NotImplementedError
 
     def rename_column(self, old: str, new: str, *, breaking_ok: bool) -> None:
         """Rename a column. Safe for the data, BREAKING for consumers (§9).
+
+        Renaming TO `litelink_offset` is refused for the same reason as adding
+        it, and renaming it away would retire the column §7 derives every tier
+        boundary from.
 
         Iceberg resolves by field ID, so no file is rewritten — and no engine's
         SQL is rewritten either, so `SELECT qty` breaks the moment the column
         becomes `quantity`. `breaking_ok` must be passed explicitly: the format
         will not stop you, so the API has to (I10).
         """
+        reject_reserved(new)
+        reject_reserved(old)
         raise NotImplementedError
 
     def drop_column(self, name: str, *, breaking_ok: bool) -> None:
@@ -716,6 +734,7 @@ class Log:
         Re-adding the name later creates a NEW field ID and cannot collide with
         the retired data.
         """
+        reject_reserved(name)
         raise NotImplementedError
 
     # -- lifecycle ---------------------------------------------------------
@@ -773,12 +792,24 @@ def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
 
 def application_schema(schema: pa.Schema) -> pa.Schema:
     """The caller's columns — the table's schema with `offset` removed."""
-    return pa.schema([f for f in schema if f.name != "offset"])
+    return pa.schema([f for f in schema if f.name != "litelink_offset"])
 
 
 def table_schema(schema: pa.Schema) -> pa.Schema:
     """The caller's columns with `offset` in front — the table's real schema."""
-    return pa.schema([pa.field("offset", pa.int64(), nullable=False), *schema])
+    return pa.schema([pa.field("litelink_offset", pa.int64(), nullable=False), *schema])
+
+
+def reject_reserved(name: str) -> None:
+    """Refuse any operation that would touch the library's own column (I11).
+
+    Checked at schema-change time as well as at creation: those are the two
+    ways a caller could reach it, and monotonicity and non-reuse cannot be
+    enforced on a column an application controls.
+    """
+    if name == OFFSET:
+        msg = f"`{OFFSET}` is owned by the library and cannot be added, renamed or dropped (I11)"
+        raise ValueError(msg)
 
 
 def validate(
@@ -792,8 +823,8 @@ def validate(
     Separate from construction so the rules read as a list rather than as
     guards scattered through a constructor.
     """
-    if "offset" in schema.names:
-        msg = "`offset` is owned by the library and must not be in the schema (I11)"
+    if OFFSET in schema.names:
+        msg = f"`{OFFSET}` is owned by the library and must not be in the schema (I11)"
         raise ValueError(msg)
 
     # Before anything else: a column the library cannot carry end-to-end must

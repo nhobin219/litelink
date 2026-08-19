@@ -54,7 +54,7 @@ class Reader:
         # surprise the union (§7).
         #
         # Aliased back to the bare name: without it the buffer-only leg
-        # (nothing sealed yet) exposes columns called `CAST(b."offset" AS
+        # (nothing sealed yet) exposes columns called `CAST(b."litelink_offset" AS
         # BIGINT)`, and only an Iceberg leg naming them first hides it.
         buffer_leg = (
             "SELECT "
@@ -75,7 +75,7 @@ class Reader:
 
         return (
             f"SELECT {projection} FROM iceberg_scan('{self._table.metadata_location}')"
-            f' UNION ALL {buffer_leg} WHERE b."offset" > {extent[1]}'
+            f' UNION ALL {buffer_leg} WHERE b."litelink_offset" > {extent[1]}'
         )
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
