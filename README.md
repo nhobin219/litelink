@@ -69,15 +69,16 @@ Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
 Not implemented; specified.
 
-**Blob fields** ([`docs/SPEC.md`](docs/SPEC.md) §15) — and `binary` columns are
-unsupported until it lands, which is not the compromise it sounds like. The read path
-pushes its boundary predicate into SQLite, and the mechanism that allows it cannot carry
-blob bytes. §15's design has payloads bypass the buffer entirely rather than travel through
-it, so the constraint and the extension point the same way. — payloads too large for the buffer
+**Blob fields** ([`docs/SPEC.md`](docs/SPEC.md) §15) — payloads too large for the buffer
 (sensor frames, point clouds, raw response bodies). Bytes stage beside SQLite while hot and
 are inlined into Iceberg at seal, so the archive stays ordinary Iceberg with a `binary`
 column: no pointers in the published schema, and blob lifetime inherits snapshot expiry and
 compaction rather than becoming a hand-maintained refcount.
+
+Until it lands, `binary` columns are refused outright. The read path pushes its boundary
+predicate down into SQLite — which is what stops cleanup costing query latency — and the
+mechanism that allows it cannot carry blob bytes. That constraint and the extension point
+the same way: §15 has payloads bypass the buffer rather than travel through it.
 
 ## Open questions
 
