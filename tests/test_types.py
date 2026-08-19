@@ -51,8 +51,10 @@ SAMPLE: dict[str, object] = {
     "bool": True,
     "string": "x",
     "large_string": "x",
-    "binary": b"x",
-    "large_binary": b"x",
+    # Not valid UTF-8, on purpose: an ASCII sample makes a binary column
+    # indistinguishable from a text one on the way back.
+    "binary": b"\xd3\x00\xff",
+    "large_binary": b"\xd3\x00\xff",
 }
 
 

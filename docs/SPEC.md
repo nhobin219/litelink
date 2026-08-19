@@ -984,8 +984,24 @@ The consequence worth planning for is that local disk holds roughly
    - **The size counter is per-process.** The seal trigger reads an in-memory byte count the
      appending process maintains; rows removed by another process would not decrement it.
    - **Deferring step 3 widens a window that is currently narrow.** It is safe by §7's
-     boundary at any width, but the buffer holds sealed rows for longer, and §7 measures the
-     buffer as the entire variable cost of a read.
+     boundary at any width, and it *should* be free: the boundary already excludes sealed
+     rows, so a row awaiting deletion is one the read has no reason to touch. Persistence,
+     query planning and cleanup are separable concerns and this is where they separate.
+
+     They do not separate today. Measured with 1,000 unsealed rows behind a boundary:
+     15.4 ms with 20,000 sealed rows deleted, 29.9 ms with the same rows still present,
+     48.5 ms at 60,000 — so the cost tracks what the buffer *holds*, not what the read
+     *returns*. DuckDB's sqlite scanner does not turn `litelink_offset > hi` into a rowid
+     range; SQLite given the same predicate answers with
+     `SEARCH buffer USING INTEGER PRIMARY KEY (rowid>?)` in 1.0 ms against 17.1 ms attached.
+
+     **The obvious fix does not work.** `sqlite_query('buf', …)` pushes the predicate down
+     and is 14x faster on a 61,000-row buffer — and cannot carry a `binary` column at all,
+     decoding blob bytes as UTF-8 and failing, with or without an explicit CAST. Since the
+     payload column is the point, that route is closed until DuckDB fixes it or the buffer
+     leg is read some other way. Until then, deferring step 3 costs read latency
+     proportional to what is deferred, and §7's claim that the buffer is the entire variable
+     cost of a read stays true for the wrong reason.
 
    ### What `max_age` needs to know, and how little that is
 
