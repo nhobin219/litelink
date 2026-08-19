@@ -96,6 +96,6 @@ def best_of_setup(
 def fresh_log(root: Path, config: LogConfig | None = None) -> Log:
     shutil.rmtree(root, ignore_errors=True)
 
-    return Log.open(
+    return Log.new(
         root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config or NEVER_SEAL
     )

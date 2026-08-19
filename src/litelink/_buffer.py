@@ -310,6 +310,25 @@ class Buffer:
         self._con.execute("COMMIT")
         self._bytes = self._measure()
 
+    # -- meta ---------------------------------------------------------------
+    #
+    # §2's `meta` table. Holds the settings that cannot be recovered from the
+    # Iceberg table — deployment policy rather than data shape — so that `open`
+    # can reconstruct a log from what it actually is instead of asking the
+    # caller to restate it and hoping they match.
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+
+        return None if row is None else str(row[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._con.execute(
+            "INSERT INTO meta (k, v) VALUES (?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            (key, value),
+        )
+
     # -- compaction bookkeeping -------------------------------------------
 
     def claim_compaction(self, lo: int, hi: int, rel_path: str) -> None:

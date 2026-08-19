@@ -115,6 +115,21 @@ class Maintenance:
         # is still reading them (I6).
         self._enqueue(f.path for f in run)
 
+    def rewrite_sorted(self) -> None:
+        """Re-cluster every data file under the current sort order (§7).
+
+        File boundaries are preserved rather than merged: a rewrite is already
+        the expensive operation, and folding compaction into it would change
+        the file layout at the same time as the clustering, leaving no way to
+        attribute a later regression to either.
+
+        Each file goes through the same claim-write-replace path a compaction
+        uses, so a crash mid-rewrite leaves one named file to remove and a
+        table still holding the original.
+        """
+        for data_file in self._table.data_files():
+            self._compact_run([data_file])
+
     # -- eviction -----------------------------------------------------------
 
     def evict(self) -> None:

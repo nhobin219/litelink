@@ -80,6 +80,27 @@ compaction rather than becoming a hand-maintained refcount.
 Payload encoding, local-disk backpressure, bulk ingest, and extension provisioning for
 embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 
+## Using it
+
+```python
+import pyarrow as pa
+from litelink import Log
+
+schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("payload", pa.large_binary())])
+
+# new() takes the shape; it is fixed at creation.
+log = Log.new("data", "sensors", schema=schema, sort_by=("event_ts",))
+log.append({"event_ts": 1, "payload": b"..."})     # durable when this returns
+
+# open() takes none of it — schema, sort order, config and archive all come
+# from the log itself.
+log = Log.open("data", "sensors")
+log = Log.open("data", "sensors", read_only=True)  # alongside a live writer
+
+rows = log.scan(where="event_ts > 1000").read_all()
+log.maintain()                                     # compact, evict, expire
+```
+
 ## Try it
 
 ```

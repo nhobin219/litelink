@@ -57,7 +57,7 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
     import pyarrow.parquet as pq
 
     config = LogConfig(compact_below=1 << 30, compact_min_files=2)
-    with Log.open(
+    with Log.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
         for ts in (500, 100, 400, 200):
@@ -128,7 +128,7 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
 
 def test_maintain_refuses_when_an_archive_is_configured(tmp_path: Path) -> None:
     """I4 needs sync's registration watermark, and sync does not exist yet."""
-    log = Log.open(
+    log = Log.new(
         tmp_path,
         "s",
         schema=SCHEMA,
