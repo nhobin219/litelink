@@ -789,6 +789,32 @@ Each needs a test.
 | Local disk fills | Backpressure — §13.4. |
 | Machine lost | Exposure is whatever was unregistered. The archive is intact and independently readable. |
 | Compaction crashes mid-write | No snapshot was committed; the orphaned file is unreferenced and swept. |
+| A second process opens a live log | **Currently unsafe.** Opening runs recovery, and recovery does not know which operations belong to the opener — see below. |
+
+### Recovery ownership, and why a second process is not yet safe
+
+SQLite handles the data locking a second process would need — measured: a capture process
+took 20,100 rows beside a maintenance process with no lock contention at all — and the
+Iceberg commit races are covered by refreshing and retrying, as this section already
+required. What is not covered is recovery.
+
+**Opening a log runs recovery, and recovery claims every interrupted operation, including
+another process's.** Verified in both directions:
+
+- a maintenance process opening a live log redoes the writer's in-flight seal, and fails
+  re-registering a file the writer is about to register itself
+- a writer opening a log deletes a maintenance process's half-written compaction and clears
+  its claim, while that process is still writing it
+
+The hazard is symmetric, so suppressing recovery in the second process fixes one direction
+and leaves the other. **Recovery ownership follows operation ownership**: `sealing` belongs
+to the writer, `compacting` to whoever runs maintenance, and each recovers only its own.
+
+That wants a lease per role, held in SQLite beside the rest of the bookkeeping (I16). A
+single-process deployment takes both and behaves exactly as it does now, which matters
+because that remains the default topology. The lease would also make §1's one writer per
+stream mechanical rather than conventional: today two capture processes would both write
+`buffer` and overwrite each other's single-row `sealing` claim, and nothing stops them.
 
 ---
 
