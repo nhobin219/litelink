@@ -547,6 +547,25 @@ proportional. Everything else is the cost of reading Parquet, which is what a re
 pay anyway. That is the performance claim worth making: *the read speed of reading Parquet
 directly*.
 
+**Fixed is a property of the implementation, not of the design, and it has to be earned.**
+The boundary comes from manifest statistics, and reading those costs time proportional to
+*file count*: measured at 1.0 ms over one file and 44 ms over 64, which at the small-file
+counts a `max_age` seal produces is most of a read. Two things bring it back to fixed.
+
+Read the offset bounds off the manifest entries rather than through a full file-metadata
+materialisation — pyiceberg's `inspect.files()` builds an eighteen-column Arrow table,
+including `readable_metrics`, which decodes the bounds of every column to answer a question
+about one. Roughly half the cost, and it still opens no data file.
+
+Then cache the extent against `metadata_location`. That pointer is the table version, so an
+unchanged pointer is the same snapshot and the extent cannot have moved; a changed one is
+exactly when the manifests must be read again. This does not weaken *"resolve per query,
+never pin"* — the resolve still happens, at ~0.5 ms, and is what decides whether the cache
+stands. Measured warm: 0.38 ms at one file, 1.05 ms at 64, against 44 ms uncached.
+
+What remains proportional after that is the scan itself opening each file, which is the
+cost compaction exists to bound.
+
 **Always bound on a prefix of `sort_by`.** Not merely on *a* sort column — on a leading one.
 With `sort_by=(a, b)`, values of `b` are ordered only *within* equal values of `a`, so a
 predicate on `b` alone leaves per-file min/max spanning nearly the whole range and nothing
