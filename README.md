@@ -71,7 +71,34 @@ compaction rather than becoming a hand-maintained refcount.
 
 ## Open questions
 
-Payload encoding, and local-disk backpressure. Both in [`docs/SPEC.md`](docs/SPEC.md) §13.
+Payload encoding, local-disk backpressure, bulk ingest, and extension provisioning for
+embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
+
+## Development
+
+```
+just bootstrap          # uv sync + git hooks + DuckDB extensions
+just check              # lint + format-check + typecheck + tests, same as CI
+```
+
+`just bootstrap` provisions the `iceberg` and `sqlite` DuckDB extensions, which are
+downloaded rather than bundled — see [`docs/SPEC.md`](docs/SPEC.md) §7. `just
+duckdb-extensions --check` verifies a machine can read offline.
+
+`just --list` has the rest. Tooling is uv + ruff + [ty](https://github.com/astral-sh/ty)
++ pytest; the style gate in `scripts/check_blank_lines.py` requires a blank line after
+every compound-statement block.
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org), enforced by a
+`commit-msg` hook (`scripts/check_commit_msg.py`):
+
+```
+<type>(<scope>): <lowercase description, no trailing period, subject <= 72 chars>
+
+types   feat fix refactor perf test docs build chore
+scopes  the subsystems in docs/SPEC.md — buffer, write, seal, sync, compaction, read,
+        retention, schema, blob, catalog, config, replication — plus spec, ci, deps
+```
 
 ## License
 

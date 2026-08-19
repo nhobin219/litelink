@@ -1,0 +1,31 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Run ruff check via uv
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: ruff-format
+        name: Format with ruff via uv
+        entry: uv run ruff format
+        language: system
+        types: [python]
+      - id: ty-check
+        name: Run ty type checker
+        entry: uv run ty check
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: blank-lines
+        name: Check blank lines after compound statements
+        entry: python scripts/check_blank_lines.py --fix
+        language: system
+        types: [python]
+      - id: commit-msg-check
+        name: Validate conventional commit message
+        entry: python scripts/check_commit_msg.py
+        language: system
+        stages: [commit-msg]
+        always_run: true

@@ -1,0 +1,90 @@
+[project]
+name = "litelink"
+version = "0.0.0"
+description = "Durable append-only capture into Iceberg tables. Local-first, in-process, no service."
+readme = "README.md"
+authors = [
+    { name = "Nico Bautista Hobin", email = "nico@penca.io" }
+]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+# 3.11, not 3.10: 3.10 reaches end of life in October 2026, and nothing here
+# needs to run on it. pyiceberg 0.11 caps at <3.14, so that is the live range.
+requires-python = ">=3.11,<3.14"
+keywords = ["iceberg", "capture", "sqlite", "parquet", "append-only"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database :: Database Engines/Servers",
+    "Typing :: Typed",
+]
+# The floors docs/SPEC.md measured against. Nothing is implemented yet, so these
+# are the spec's declared substrate rather than an observed import graph — the
+# first module to import one of them is what will start holding them honest.
+#   sql-sqlite: SqlCatalog on SQLite (§1). pyarrow: the seal path (§15.4).
+dependencies = [
+    "duckdb>=1.5.5",
+    "pyarrow>=17.0.0",
+    "pyiceberg[pyarrow,sql-sqlite]>=0.11.1",
+    "xxhash>=3.6.0",
+]
+
+[project.optional-dependencies]
+# The remote tier (§1). Local-first capture never resolves this.
+s3 = ["pyiceberg[s3fs]>=0.11.1"]
+
+[project.urls]
+Source = "https://github.com/nhobin219/litelink"
+Specification = "https://github.com/nhobin219/litelink/blob/main/docs/SPEC.md"
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+    "ruff>=0.15.0",
+    "ty>=0.0.15",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+# force-exclude keeps exclusions in force when paths are passed explicitly —
+# pre-commit and `ruff format <path>` both do that.
+force-exclude = true
+# ruff's default `include` carries `*.md`, so it formats Python code blocks
+# inside Markdown. docs/SPEC.md's snippets are illustrative and aligned by hand
+# — column-aligned trailing comments, a catalog pair written on two lines so it
+# reads as a pair — and the formatter rewrites every one of them. This list is
+# ruff's default verbatim minus `*.md`, so prose is left alone while any real
+# Python under docs/ would still be covered.
+include = [
+    "*.py",
+    "*.pyi",
+    "*.pyw",
+    "*.ipynb",
+    "**/pyproject.toml",
+    "**/ruff.toml",
+    "**/.ruff.toml",
+]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Must be the ini form, not `addopts = ["--strict-markers"]`: on pytest 9 the
+# flag only appends to `override_ini`, and `Config.parse` builds `_inicfg` from
+# the command line before injecting `addopts` and never recomputes it — so the
+# `MarkGenerator` check reads the unset default and a typo'd mark degrades to a
+# warning. The ini key below is read from `_inicfg` and does fail collection.
+strict_markers = true
+markers = [
+    "slow: exercises real fsync volume or file counts — the ~1 ms per-commit fsync in docs/SPEC.md §2 means these are wall-clock bound, not CPU bound. Deselect with -m 'not slow'.",
+]
