@@ -11,6 +11,13 @@ The set is deliberately conservative. Iceberg narrows silently where it cannot
 represent a type — `int8` and `int16` become `int32`, and `uint32`/`uint64`
 become *signed* `int32`/`int64`, which loses the top half of the range — so
 rather than pass those through, they are refused with the reason.
+
+`binary` is absent for a different reason, and a temporary one: the read path
+pushes its boundary predicate into SQLite, which is 14x faster and is what
+keeps cleanup from costing query latency, and the mechanism that allows it
+cannot carry blob bytes. §15 is where binary payloads belong anyway — they
+bypass the buffer rather than travelling through it, which is precisely the
+constraint met here.
 """
 
 from __future__ import annotations
@@ -73,11 +80,6 @@ _SUPPORTED: tuple[tuple[Callable[[pa.DataType], bool], ColumnType], ...] = (
         pa.types.is_large_string,
         ColumnType("TEXT", "VARCHAR", variable_length=True),
     ),
-    (pa.types.is_binary, ColumnType("BLOB", "BLOB", variable_length=True)),
-    (
-        pa.types.is_large_binary,
-        ColumnType("BLOB", "BLOB", variable_length=True),
-    ),
 )
 
 # Types worth refusing with a reason rather than a lookup failure.
@@ -90,6 +92,14 @@ _REASONS: tuple[tuple[Callable[[pa.DataType], bool], str], ...] = (
     (
         lambda t: pa.types.is_int8(t) or pa.types.is_int16(t),
         "Iceberg widens this to int32 without saying so. Declare int32.",
+    ),
+    (
+        lambda t: pa.types.is_binary(t) or pa.types.is_large_binary(t),
+        "not supported yet. The buffer leg of a read pushes its boundary into "
+        "SQLite through `sqlite_query`, which cannot carry blob bytes — it "
+        "decodes them as UTF-8 and fails, with or without a CAST. Encode as "
+        "text for now; SPEC §15 is where binary payloads are designed to live, "
+        "and they bypass the buffer entirely there.",
     ),
     (
         pa.types.is_temporal,

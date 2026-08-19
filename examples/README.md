@@ -19,6 +19,10 @@ so the window grows without bound. Roughly 25 MB per 30 seconds at the default r
 deployment sets a retention and lets `maintain()` hold the size; the benchmarks, which have
 nothing to inspect afterwards, run in a temp directory and clean up on exit.
 
+The stream is an ADS-B position feed over a websocket, parsed into columns rather than
+stored as raw frames — which is the point of declaring a schema, since every field then
+prunes from Iceberg statistics.
+
 `capture.py` is the operational shape of a litelink process: a main thread appending —
 durable when `extend()` returns, with no buffer to flush — and a daemon thread calling
 `maintain()`. Both share one `Log`, because §1's single-writer rule is about processes.
@@ -27,7 +31,7 @@ durable when `extend()` returns, with no buffer to flush — and a daemon thread
 are. The column worth watching is the split: rows move from the buffer into the Iceberg
 table at each seal, and the total never double-counts across that boundary because both
 legs derive from one committed extent (§7, I3). It counts in DuckDB rather than
-materialising rows, which is what §7 means about a query over `offset` never touching the
-payload column.
+materialising rows, which is what §7 means about a query over `litelink_offset` never
+touching the columns it did not ask for.
 
 Neither script needs an archive, a service, or a network.

@@ -130,7 +130,7 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
         schema = pa.schema([
             pa.field("event_ts", pa.int64()),
             pa.field("key", pa.string()),
-            pa.field("payload", pa.large_binary()),
+            pa.field("payload", pa.string()),
         ])
         config = LogConfig(
             target_size=4096,
@@ -139,7 +139,7 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
             snapshot_retention=timedelta(microseconds=1),
         )
         rows = [
-            {{"event_ts": i, "key": f"k{{i % 3}}", "payload": b"x" * 64}}
+            {{"event_ts": i, "key": f"k{{i % 3}}", "payload": '{{"seq":%d}}' % i}}
             for i in range(400)
         ]
 

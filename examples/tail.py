@@ -1,4 +1,4 @@
-"""The reader: watch a live log accumulate.
+"""The reader: watch a live position feed accumulate.
 
     uv run python examples/tail.py [--root DIR] [--every SECONDS]
 

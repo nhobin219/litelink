@@ -37,7 +37,7 @@ def maintain_forever(log: Log, every: float, stop: threading.Event) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
-    parser.add_argument("--rate", type=float, default=200.0, help="rows per second")
+    parser.add_argument("--rate", type=float, default=2000.0, help="reports per second")
     parser.add_argument("--batch", type=int, default=20, help="rows per transaction")
     parser.add_argument("--maintain-every", type=float, default=10.0, help="seconds")
     args = parser.parse_args()
@@ -67,7 +67,7 @@ def main() -> None:
     )
     maintainer.start()
 
-    print(f"capturing into {args.root}/{NAME} at ~{args.rate:.0f} rows/s")
+    print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
     print(f"maintain() every {args.maintain_every:.0f}s in a daemon thread")
     print("run examples/tail.py in another terminal. Ctrl-C to stop.\n")
 
@@ -85,7 +85,7 @@ def main() -> None:
             if tick % 50 == 0:
                 elapsed = time.monotonic() - started
                 print(
-                    f"  {written:>9,} rows  {written / max(elapsed, 1e-9):>7,.0f}/s"
+                    f"  {written:>9,} reports  {written / max(elapsed, 1e-9):>7,.0f}/s"
                     f"  end_offset={log.end_offset():,}"
                 )
 
@@ -99,7 +99,7 @@ def main() -> None:
         log.close()
 
     on_disk = sum(f.stat().st_size for f in args.root.rglob("*") if f.is_file())
-    print(f"{written:,} rows appended, all durable at commit")
+    print(f"{written:,} reports appended, all durable at commit")
     print(f"{args.root}/ holds {on_disk / 1e6:.1f} MB — `just demo-clean` to remove it")
     # Nothing deletes this on exit, deliberately: tail.py reads it after the
     # writer stops, and a demo you cannot inspect afterwards is not much of one.
