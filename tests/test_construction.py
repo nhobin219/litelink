@@ -361,3 +361,50 @@ def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
         unquoted = log.sql("SELECT max(litelink_offset) FROM log").read_all()
 
         assert unquoted.column(0)[0].as_py() == 1
+
+
+def test_a_relative_root_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`Log.new("litelink-data", …)` — what the demo scripts actually pass.
+
+    A relative root produced `file://litelink-data/…`, which is not a relative
+    file URI: it parses as host `litelink-data`, and DuckDB reports a missing
+    file naming a path that plainly exists. It survived every test because they
+    all pass tmp_path, which is absolute, and surfaced the first time someone
+    ran `just demo-tail` with the default root.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    with Log.new("data", "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        assert log.root.is_absolute()
+        assert log._layout.warehouse_uri.startswith("file:///")
+        assert log._layout.catalog_uri.startswith("sqlite:////")
+
+        log.extend([{"event_ts": 1, "key": "a"}, {"event_ts": 2, "key": "b"}])
+        log.seal()
+        log.append({"event_ts": 3, "key": "c"})
+
+        # The seal is what breaks it: before one, the read never touches an
+        # Iceberg metadata path at all.
+        assert log.scan().read_all().num_rows == 3
+
+    with Log.open("data", "s") as reopened:
+        assert reopened.scan().read_all().num_rows == 3
+
+
+def test_a_relative_root_is_resolved_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolved at construction, so a later chdir cannot move the log."""
+    monkeypatch.chdir(tmp_path)
+    log = Log.new("data", "s", schema=SCHEMA, sort_by=("event_ts",))
+    root = log.root
+
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+
+    log.append({"event_ts": 1, "key": "a"})
+    log.seal()
+
+    assert log.root == root
+    assert log.scan().read_all().num_rows == 1
+    log.close()
