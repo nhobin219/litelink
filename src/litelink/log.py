@@ -662,6 +662,19 @@ class Log:
         raise NotImplementedError
 
     # -- schema evolution --------------------------------------------------
+    #
+    # Each of these changes the table's schema, and therefore has to write two
+    # records: the Iceberg schema, and the declared Arrow spelling in `meta`.
+    # An Iceberg catalog commit and a SQLite write are separate transactions and
+    # cannot be made atomic with each other — the same reason §7 gives for not
+    # requiring an atomic handoff between two catalogs — so a crash can land
+    # between them.
+    #
+    # Commit to Iceberg FIRST. The table is authoritative for which columns
+    # exist, and `open` falls back to the table's own view when the two
+    # disagree, so a crash after the commit degrades to the pre-`meta` behaviour
+    # rather than serving a schema the data does not have. The reverse order
+    # leaves `meta` describing a column the table never gained.
 
     def add_column(self, name: str, type_: pa.DataType) -> None:
         """Add a column. Non-breaking: older files read null (§9)."""
