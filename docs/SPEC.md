@@ -807,14 +807,13 @@ another process's.** Verified in both directions:
   its claim, while that process is still writing it
 
 The hazard is symmetric, so suppressing recovery in the second process fixes one direction
-and leaves the other. **Recovery ownership follows operation ownership**: `sealing` belongs
-to the writer, `compacting` to whoever runs maintenance, and each recovers only its own.
+and leaves the other. Recovery has to know which operations belong to the opener, and
+nothing today records that.
 
-That wants a lease per role, held in SQLite beside the rest of the bookkeeping (I16). A
-single-process deployment takes both and behaves exactly as it does now, which matters
-because that remains the default topology. The lease would also make §1's one writer per
-stream mechanical rather than conventional: today two capture processes would both write
-`buffer` and overwrite each other's single-row `sealing` claim, and nothing stops them.
+Whatever answers it would also make §1's one writer per stream mechanical rather than
+conventional: today two capture processes would both write `buffer` and overwrite each
+other's single-row `sealing` claim, and nothing stops them. The options are §13.6, and none
+of them is chosen.
 
 ---
 
@@ -932,6 +931,48 @@ The consequence worth planning for is that local disk holds roughly
    because it is additive and changes nothing about the read path's design. What is not
    deferrable is writing it down, since the alternative is an embedder discovering it from a
    device already in the field.
+6. **Coordinating more than one process.** Two facts are established and the design is not.
+
+   **Recovery ownership is unsolved and the hazard is symmetric** (§11). Opening a log runs
+   recovery, and recovery claims every interrupted operation including another process's —
+   verified in both directions. Everything else a second process needs already works: SQLite
+   handles the data locking (measured: 20,100 rows appended beside a maintenance process
+   with no contention), and lost Iceberg commits refresh and retry.
+
+   **A seal costs the append that triggers it.** Measured over 600 appends of 25 rows at a
+   256 KiB threshold: median append 0.73 ms, p99 2.90 ms, and the 24 appends that sealed
+   between 30.83 and 93.21 ms — up to 127x. Whichever caller crosses the threshold pays for
+   the sort, the Parquet write, the fsync and the Iceberg commit.
+
+   That second fact is what makes the first worth solving, and it also unsettles who should
+   seal at all. §4 assigns it to the writer and step 3 justifies that — the seal deletes
+   buffer rows. But only step 3 writes the buffer, and it is explicitly garbage collection
+   rather than correctness; the expensive step *reads*, which WAL permits alongside a writer.
+
+   Options, none chosen:
+
+   - **Leave it in-process and seal on a background thread.** No coordination at all, and it
+     takes the spike off the append path, which is most of the prize. The lock already
+     exists. Does not address recovery ownership, because there is only one process.
+   - **A lease per role**, writer and maintainer, each recovering its own intents. Simple to
+     state, but the split is coarser than what is actually exclusive, and it forces sealing
+     to sit on whichever side owns the buffer.
+   - **A lease per resource** — buffer writes, the seal, the compaction — matching the intent
+     tables that already exist (I16). Finer and it composes, at the cost of more moving parts
+     in the single-process case that remains the default topology.
+   - **Move sealing to maintenance entirely**, handing step 3 back to whoever holds the buffer
+     write lease.
+
+   Open sub-questions the last option raises, and probably the reason to be careful:
+
+   - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
+     free because the writer already knows the buffer grew. A maintainer would poll. The
+     `max_age` branch is time-based and would not care, but it is not wired up at all today.
+   - **The size counter is per-process.** The seal trigger reads an in-memory byte count the
+     appending process maintains; rows removed by another process would not decrement it.
+   - **Deferring step 3 widens a window that is currently narrow.** It is safe by §7's
+     boundary at any width, but the buffer holds sealed rows for longer, and §7 measures the
+     buffer as the entire variable cost of a read.
 
 ---
 
