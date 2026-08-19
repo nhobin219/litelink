@@ -306,6 +306,13 @@ in sync that is correctness, not optimisation (I4).
 
 Sync records what it has registered in `meta`, keyed by the local table's snapshot ID.
 
+**Steps 4 and 5 do not belong to sync.** Snapshot expiry and local eviction are local
+storage work; they are listed here because eviction must respect the registration watermark
+step 2 writes. But every other step is archive work, so a log configured with no archive
+never runs this pass at all — and would then never expire a snapshot or honour
+`local_retention`, leaving the knob silently inert. They are owned by `maintain()` (§12),
+which reads that same watermark to enforce I4 and runs with or without an archive.
+
 ---
 
 ## 6. Compaction
@@ -587,6 +594,20 @@ over the network. That is the right setting for pure archival capture — liteli
 durable staging area into Iceberg — and the wrong one wherever a hot reader looks back
 further than `max_age`. It does not weaken I4: eviction still never precedes registration.
 
+**With no archive, retention is deletion, and that is the intended contract.** I4 forbids
+evicting a file the archive still lacks — but nothing is owed to an archive that does not
+exist, so the invariant is vacuous and `local_retention` becomes an ordinary retention
+policy over the only copy. Data past the window is gone for good.
+
+That is the right shape for a bounded local capture window, and it is worth stating plainly
+because I4's rationale is literally *"eviction before registration is data loss."* Here the
+loss is the operator's instruction rather than a bug, and the two are distinguishable only
+by whether an archive was configured. `local_retention = None` is the setting that keeps
+everything, at unbounded local growth.
+
+`local_retention = 0` presupposes an archive: with none, it would delete each file as it
+sealed. Reject the pair at construction rather than honouring it.
+
 Raising it is an operation, not a config change: `hydrate(since=…)` fetches archived files
 and re-registers them into the local table. Without it, a raised setting applies only to
 data captured afterwards.
@@ -631,7 +652,7 @@ Each needs a test.
 | **I1** | The Parquet file is written and fsynced before the Iceberg commit. | The reverse publishes a manifest entry for a file that may not exist. |
 | **I2** | The seal range is persisted before the file is written. | Makes the path deterministic, so retries overwrite instead of orphaning. |
 | **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The archive overlaps the local window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
-| **I4** | A file is never evicted from the local table before it is registered in the archive. | Eviction before registration is data loss. |
+| **I4** | A file is never evicted from the local table while a configured archive still lacks it. Vacuous when no archive is configured (§8). | Eviction before registration is data loss. With no archive nothing is owed, and `local_retention` is then a deletion policy the operator asked for — see §8. |
 | **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
 | **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
@@ -672,8 +693,15 @@ compact_min_files      minimum adjacent files to compact  (e.g. 4)
 sort_by                within-file sort order              (capture default: event_ts, key)
 ```
 
-`maintain()` runs compaction **and** expiry together. Compaction alone increases storage,
-since superseded files stay referenced until their snapshots expire.
+`maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no
+archive. Each is a no-op or a regression without the others: compaction alone increases
+storage, since superseded files stay referenced until their snapshots expire; eviction alone
+frees no disk, since it removes a file from the current snapshot while the previous one still
+references it; and expiry is what actually deletes bytes, held back by `snapshot_retention`
+so a running scan does not lose files underneath it (I6).
+
+The consequence worth planning for is that local disk holds roughly
+`local_retention + snapshot_retention` of data, not `local_retention`.
 
 ---
 
