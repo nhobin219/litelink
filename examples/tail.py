@@ -30,7 +30,7 @@ def snapshot(log: Log) -> tuple[int, int, int, int]:
         else log.scan(columns=["offset"], end_offset=extent[1] + 1).read_all().num_rows
     )
 
-    return total, table, total - table, len(log._data_files())  # noqa: SLF001
+    return total, table, total - table, len(log._table.data_files())  # noqa: SLF001
 
 
 def main() -> None:
@@ -41,7 +41,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log = Log(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, readonly=True)
+    log = Log.open_readonly(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY)
     print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.\n")
     print(f"{'total':>12} {'in table':>12} {'in buffer':>12} {'files':>7} {'read':>8}")
 

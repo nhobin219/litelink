@@ -52,7 +52,7 @@ def main() -> None:
         snapshot_retention=timedelta(seconds=30),
     )
 
-    log = Log(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
+    log = Log.open(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
     stop = threading.Event()
     maintainer = threading.Thread(
         target=maintain_forever, args=(log, args.maintain_every, stop), daemon=True
