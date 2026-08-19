@@ -73,6 +73,28 @@ compaction rather than becoming a hand-maintained refcount.
 
 Payload encoding, and local-disk backpressure. Both in [`docs/SPEC.md`](docs/SPEC.md) §13.
 
+## Development
+
+```
+uv sync                 # or: just bootstrap, which also installs the git hooks
+just check              # lint + format-check + typecheck + tests, same as CI
+```
+
+`just --list` has the rest. Tooling is uv + ruff + [ty](https://github.com/astral-sh/ty)
++ pytest; the style gate in `scripts/check_blank_lines.py` requires a blank line after
+every compound-statement block.
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org), enforced by a
+`commit-msg` hook (`scripts/check_commit_msg.py`):
+
+```
+<type>(<scope>): <lowercase description, no trailing period, subject <= 72 chars>
+
+types   feat fix refactor perf test docs build chore
+scopes  the subsystems in docs/SPEC.md — buffer, write, seal, sync, compaction, read,
+        retention, schema, blob, catalog, config, replication — plus spec, ci, deps
+```
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
