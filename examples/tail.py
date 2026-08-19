@@ -21,18 +21,26 @@ from litelink import Log
 
 
 def snapshot(log: Log) -> tuple[int, int, int, int]:
-    """(total rows, table rows, buffer rows, data files) — one read, one moment."""
-    extent = log.table_extent()
-    total = log.scan(columns=["litelink_offset"]).read_all().num_rows
-    table = (
-        0
-        if extent is None
-        else log.scan(columns=["litelink_offset"], end_offset=extent[1] + 1)
-        .read_all()
-        .num_rows
-    )
+    """(total rows, table rows, buffer rows, data files) — one read, one moment.
 
-    return total, table, total - table, len(log._table.data_files())  # noqa: SLF001
+    Counted in DuckDB. Materialising the rows to call `len` on them would pull
+    the whole log across the process boundary to produce four integers — at
+    200,000 rows that was 403,000 rows per poll, since the sealed portion was
+    scanned a second time to be counted separately.
+
+    One query rather than two, so both numbers come from a single boundary and
+    cannot disagree if a seal lands between them.
+    """
+    extent = log.table_extent()
+    boundary = 0 if extent is None else extent[1]
+    counts = log.sql(
+        "SELECT count(*) AS total, "
+        f'count(*) FILTER (WHERE "litelink_offset" <= {boundary}) AS sealed FROM log'
+    ).read_all()
+    total = counts.column("total")[0].as_py()
+    sealed = counts.column("sealed")[0].as_py()
+
+    return total, sealed, total - sealed, len(log._table.data_files())  # noqa: SLF001
 
 
 def main() -> None:
