@@ -53,7 +53,7 @@ process per stream is the intended topology.
 
 ```sql
 CREATE TABLE buffer (
-  offset      INTEGER PRIMARY KEY AUTOINCREMENT,   -- monotonic, never reused. see NOTE
+  litelink_offset  INTEGER PRIMARY KEY AUTOINCREMENT,  -- monotonic, never reused. see NOTE
   event_ts    INTEGER NOT NULL,      -- when it happened
   ingest_ts   INTEGER NOT NULL,      -- when we learned it
   key         TEXT,
@@ -70,9 +70,9 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
 That is the entire hand-written catalog. File paths, row counts, byte sizes, per-column
 min/max, visibility and schema all live in Iceberg.
 
-**NOTE — `offset` must never be reused.** Iceberg's sequence numbers are per *snapshot*,
+**NOTE — `litelink_offset` must never be reused.** Iceberg's sequence numbers are per *snapshot*,
 not per row, and do not exist for buffer rows, so they cannot serve as the tier boundary.
-The writer assigns `offset`; Iceberg then computes its min/max as ordinary column
+The writer assigns `litelink_offset`; Iceberg then computes its min/max as ordinary column
 statistics, which is what §7 reads.
 
 A bare `INTEGER PRIMARY KEY` is a rowid alias assigned as `max(rowid)+1` — and buffer rows
@@ -135,7 +135,7 @@ application defined a group, in which case the application aligns it.
 **Table schema.** The library owns exactly **one** column:
 
 ```
-offset   int64   required   -- monotonic, library-assigned, never reused
+litelink_offset   int64   required   -- monotonic, library-assigned, never reused
 ```
 
 Everything else is the application's schema, declared at stream creation and treated as
@@ -148,7 +148,7 @@ litelink.Stream(
 )
 ```
 
-**Why `offset` is library-owned:** it is the tier-boundary mechanism. Sealing selects a
+**Why `litelink_offset` is library-owned:** it is the tier-boundary mechanism. Sealing selects a
 contiguous range of it, compaction filters on it, and the three-way read in §7 derives every
 boundary from its extents. Monotonicity and non-reuse (I9) cannot be enforced if the
 application supplies it.
@@ -252,7 +252,7 @@ the table's Iceberg `sort_order` *and* actually applied at write time — the me
 intent, it does not sort for you.
 
 Sorting only improves **row-group** statistics within a file; file-level statistics are
-already tight for `offset` and `ingest_ts`, because a sealed file covers a contiguous offset
+already tight for `litelink_offset` and `ingest_ts`, because a sealed file covers a contiguous offset
 range and therefore a narrow ingest window. So sorting by `ingest_ts` buys nothing.
 
 `event_ts` is the column that needs it. On any stream that backfills — an API returning
@@ -268,7 +268,7 @@ dominant access pattern is cross-sectional (every key at a timestamp), `key` sec
 single-key scan clusters within a timestamp.
 
 The sort costs one in-memory sort of at most `target_size` rows per seal, and does not
-affect the tier boundaries in §7, which use min/max of `offset` and are order-independent.
+affect the tier boundaries in §7, which use min/max of `litelink_offset` and are order-independent.
 
 **Step 1 fixes the range before the file exists**, making the path deterministic:
 `{stream}/{date}/{start}-{end}.parquet`. A retry recomputes the identical path and
@@ -443,9 +443,18 @@ The cache is keyed by DuckDB version and platform (`~/.duckdb/extensions/v1.5.5/
 so raising the duckdb floor invalidates it and every machine downloads again.
 
 This is a provisioning obligation, not a dependency — no package pins it, so nothing fails at
-install time. Install the extensions at build or deploy time, or vendor them and point
-`DUCKDB_EXTENSION_DIRECTORY` at the directory, which is the air-gapped route. How an
-*embedding application* discharges it, as opposed to this repo, is §13.5. The blob
+install time. Install the extensions at build or deploy time, or vendor them for the
+air-gapped case. How an *embedding application* discharges it, as opposed to this repo, is
+§13.5.
+
+Two details that are easy to get wrong, both verified against duckdb 1.5.5. **The extension
+directory is not settable by environment variable** — `DUCKDB_EXTENSION_DIRECTORY` is
+silently ignored, and `current_setting('extension_directory')` still reports the default with
+it set. `HOME` moves the whole default, and
+`duckdb.connect(config={"extension_directory": …})` sets it properly, which means only the
+process opening the connection can relocate it. **And `iceberg` depends on `avro`**, which its
+init function auto-installs, so a machine with network never notices it missing. A vendored
+directory without it fails at `LOAD` asking for an extension nobody mentioned. The blob
 workloads in §15 — sensor frames and point clouds — are edge deployments by nature, which is
 what makes this load-bearing rather than a note about developer laptops.
 
@@ -609,7 +618,7 @@ UNION ALL
 SELECT * FROM buffer            WHERE offset >  hi   AND <predicates>
 ```
 
-Correct at every instant regardless of transient overlap, because `offset` is monotonic and
+Correct at every instant regardless of transient overlap, because `litelink_offset` is monotonic and
 the local window is a contiguous range over it. This is the §7 hot-read boundary
 generalised, and it is why **no atomic handoff between the two catalogs is required** —
 which matters, since two Iceberg commits cannot be made atomic with each other.
@@ -760,8 +769,8 @@ Each needs a test.
 | **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
 | **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
-| **I11** | `offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
-| **I9** | `offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
+| **I11** | `litelink_offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
+| **I9** | `litelink_offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
 | **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
 | **I16** | Every operation spanning Iceberg and local state records its intent in SQLite before acting, and is complete only once SQLite records completion. | Iceberg's atomicity stops at one table, so nothing spanning two systems can be committed at once. Without the intent record a crash leaves work half-applied and unattributable; without the completion record the library cannot tell a finished operation from an interrupted one. |
@@ -780,6 +789,31 @@ Each needs a test.
 | Local disk fills | Backpressure — §13.4. |
 | Machine lost | Exposure is whatever was unregistered. The archive is intact and independently readable. |
 | Compaction crashes mid-write | No snapshot was committed; the orphaned file is unreferenced and swept. |
+| A second process opens a live log | **Currently unsafe.** Opening runs recovery, and recovery does not know which operations belong to the opener — see below. |
+
+### Recovery ownership, and why a second process is not yet safe
+
+SQLite handles the data locking a second process would need — measured: a capture process
+took 20,100 rows beside a maintenance process with no lock contention at all — and the
+Iceberg commit races are covered by refreshing and retrying, as this section already
+required. What is not covered is recovery.
+
+**Opening a log runs recovery, and recovery claims every interrupted operation, including
+another process's.** Verified in both directions:
+
+- a maintenance process opening a live log redoes the writer's in-flight seal, and fails
+  re-registering a file the writer is about to register itself
+- a writer opening a log deletes a maintenance process's half-written compaction and clears
+  its claim, while that process is still writing it
+
+The hazard is symmetric, so suppressing recovery in the second process fixes one direction
+and leaves the other. Recovery has to know which operations belong to the opener, and
+nothing today records that.
+
+Whatever answers it would also make §1's one writer per stream mechanical rather than
+conventional: today two capture processes would both write `buffer` and overwrite each
+other's single-row `sealing` claim, and nothing stops them. The options are §13.6, and none
+of them is chosen.
 
 ---
 
@@ -813,7 +847,7 @@ The consequence worth planning for is that local disk holds roughly
 ## 13. Open questions
 
 1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
-   data naturally clustered by ingest time, so `offset` and `ingest_ts` statistics are tight
+   data naturally clustered by ingest time, so `litelink_offset` and `ingest_ts` statistics are tight
    and manifests prune without a partition spec. Partitioning by event date would be
    actively harmful — a seal spanning many event dates emits one file *per partition*,
    recreating the small-file problem sealing exists to prevent, and streams that backfill
@@ -833,10 +867,10 @@ The consequence worth planning for is that local disk holds roughly
    meant to prevent it.
 4. **Bulk ingest.** Loading an existing corpus — a backfill, an archive import — through
    `append()` row by row wastes the point of already having Parquet. The wanted path is to
-   lock writes, reserve a contiguous offset range, materialise `offset` into the file, and
+   lock writes, reserve a contiguous offset range, materialise `litelink_offset` into the file, and
    commit. Four things it meets, none blocking, none free.
 
-   **It is a rewrite, not a registration.** I11 forbids a caller-supplied `offset` and §7
+   **It is a rewrite, not a registration.** I11 forbids a caller-supplied `litelink_offset` and §7
    derives every tier boundary from its extents, so a file lacking the column cannot be
    registered — `add_files` zero-copy is unavailable. §4's sort applies equally, or
    row-group statistics are junk. Budget a full pass over the input, not a PUT.
@@ -851,7 +885,7 @@ The consequence worth planning for is that local disk holds roughly
    already bounds it.
 
    **A reservation is a hole in the offset space.** A seal spanning it writes a file whose
-   `offset` statistics cover `[lo, hi]` while containing none of it; when the staged file
+   `litelink_offset` statistics cover `[lo, hi]` while containing none of it; when the staged file
    commits, the two overlap, which is exactly what §6's *"no other file overlaps that
    range"* forbids. Sealing the buffer empty before reserving closes it — every subsequent
    live row is then above `hi`, so no seal has rows on both sides. This holds only if the
@@ -897,6 +931,92 @@ The consequence worth planning for is that local disk holds roughly
    because it is additive and changes nothing about the read path's design. What is not
    deferrable is writing it down, since the alternative is an embedder discovering it from a
    device already in the field.
+6. **Coordinating more than one process.** Two facts are established and the design is not.
+
+   **Recovery ownership is unsolved and the hazard is symmetric** (§11). Opening a log runs
+   recovery, and recovery claims every interrupted operation including another process's —
+   verified in both directions. Everything else a second process needs already works: SQLite
+   handles the data locking (measured: 20,100 rows appended beside a maintenance process
+   with no contention), and lost Iceberg commits refresh and retry.
+
+   **A seal costs the append that triggers it.** Measured over 600 appends of 25 rows at a
+   256 KiB threshold: median append 0.73 ms, p99 2.90 ms, and the 24 appends that sealed
+   between 30.83 and 93.21 ms — up to 127x. Whichever caller crosses the threshold pays for
+   the sort, the Parquet write, the fsync and the Iceberg commit.
+
+   That second fact is what makes the first worth solving, and it also unsettles who should
+   seal at all. §4 assigns it to the writer and step 3 justifies that — the seal deletes
+   buffer rows. But only step 3 writes the buffer, and it is explicitly garbage collection
+   rather than correctness; the expensive step *reads*, which WAL permits alongside a writer.
+
+   Options, none chosen:
+
+   - **Leave it in-process and seal on a background thread.** No coordination at all, and it
+     takes the spike off the append path, which is most of the prize. The lock already
+     exists. Does not address recovery ownership, because there is only one process.
+   - **A lease per role**, writer and maintainer, each recovering its own intents. Simple to
+     state, but the split is coarser than what is actually exclusive, and it forces sealing
+     to sit on whichever side owns the buffer.
+   - **A lease per resource** — buffer writes, the seal, the compaction — matching the intent
+     tables that already exist (I16). Finer and it composes, at the cost of more moving parts
+     in the single-process case that remains the default topology.
+   - **Move sealing to maintenance entirely**, handing step 3 back to whoever holds the buffer
+     write lease.
+
+   Open sub-questions the last option raises, and probably the reason to be careful:
+
+   - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
+     free because the writer already knows the buffer grew. A maintainer would poll. The
+     `max_age` branch is time-based and would not care, but it is not wired up at all today.
+   - **The size counter is per-process.** The seal trigger reads an in-memory byte count the
+     appending process maintains; rows removed by another process would not decrement it.
+   - **Deferring step 3 widens a window that is currently narrow.** It is safe by §7's
+     boundary at any width, but the buffer holds sealed rows for longer, and §7 measures the
+     buffer as the entire variable cost of a read.
+
+   ### What `max_age` needs to know, and how little that is
+
+   A maintainer cannot evaluate `max_age` without knowing how old the unsealed data is, and
+   the buffer records nothing temporal. The obvious move is a library-stamped timestamp
+   column, and §2 refuses one at length: *"ingest time" is ambiguous in a way a library
+   cannot resolve*, and stamping it relocates a load-bearing invariant out of the
+   application. That objection is about a column applications **read**, though — its harm is
+   a published meaning nobody agreed on. It does not obviously reach bookkeeping the library
+   keeps for itself.
+
+   §15.3 already settled the analogous case in that direction. The staged bit is
+   *"deliberately **not** `{name}_size`, and not any column in the published schema"* —
+   internal state stays in the buffer, because *"overloading a caller-facing column with
+   internal state constrains it"*. A `litelink_ts` in the buffer table only, never in the
+   Iceberg schema, sits on the same side of that line.
+
+   **But it may not be needed at all.** §12 does not say what `max_age` is the age *of*, and
+   the cheapest reading needs no per-row data: it bounds how long data may sit unsealed, so
+   the quantity is the age of the **oldest unsealed row** — one value, written when the
+   buffer goes from empty to non-empty, cleared at seal. A `meta` key, O(1), no column
+   anywhere, no §2 argument to have.
+
+   The per-row version buys exactly one thing over that: a **partial** seal, cutting at the
+   last row older than `max_age` instead of sealing everything present. Sealing everything is
+   not wrong — `max_age` is an upper bound on staleness and sealing early cannot violate it —
+   and §4's step 1 already fixes `[start, end)` against the current maximum, so rows arriving
+   during the seal simply land above it. So the per-row column buys precision the policy does
+   not appear to need, at the cost of the §2 conversation. Worth confirming against a real
+   workload before deciding, because it is a one-way door once data exists.
+
+   ### Signalling the maintainer
+
+   SQLite has no notification mechanism, so anything cross-process is polling; the only
+   question is what gets polled. A queue table the writer pushes to is the general answer,
+   and it is the shape I16 already uses — `sealing`, `compacting` and `pending_delete` are
+   all coordination through tables. A watermark is the cheap answer: one `meta` value, read
+   with the same query the age check needs anyway, no rows to insert on the write path and
+   none to retire.
+
+   The tradeoff is whether the maintainer needs to know *what* happened or only *that
+   something is due*. Nothing identified so far needs the former, and adding an insert to the
+   append path to deliver it would spend write latency — the thing this whole line of
+   thinking is trying to reclaim.
 
 ---
 
@@ -932,7 +1052,7 @@ Beyond §10:
   fraction of total read time at the chosen seal threshold.
 - Create a stream whose schema has no timestamp column at all; assert seal, compaction, the
   three-way read and retention all work — proving nothing depends on an ingest column.
-- Assert a caller-supplied `offset` is rejected (I11).
+- Assert a caller-supplied `litelink_offset` is rejected (I11).
 - Commit twice, then assert a reader that cached `metadata_location` from the first commit
   is detectably stale -- the reason §7 requires resolving it per query.
 - Run with `local_retention = 0`; assert seal, upload, archive reads and compaction all work
@@ -956,7 +1076,7 @@ the SQLite buffer: sensor frames, point clouds, raw response bodies.
 **Bytes live beside SQLite while hot, and inside Iceberg once sealed.** The column is the
 same shape in both tiers: a plain Iceberg `binary` column holding the bytes themselves.
 
-There is no pointer in the schema. The hot-side staging path is derived from `offset` and
+There is no pointer in the schema. The hot-side staging path is derived from `litelink_offset` and
 the field name, so it exists only on the write side and never reaches the table. The archive
 is therefore ordinary Iceberg with a binary column, readable by any engine with no
 convention to know about and no dereference step.
@@ -1018,7 +1138,7 @@ themselves for small payloads, and nothing here applies to it.
 Amends §3. The buffer row never carries blob bytes.
 
 ```
-1. BEGIN. INSERT the buffer row (no blob column); take `offset` from lastrowid.
+1. BEGIN. INSERT the buffer row (no blob column); take `litelink_offset` from lastrowid.
 2. Write bytes to {root}/staging/{offset}.{field}.bin
 3. fsync the file AND the directory entry
 4. Set {name}_staged = 1 on the row. COMMIT.
@@ -1033,9 +1153,9 @@ The per-blob fsync is affordable precisely because blobs are large. At 2 MB the 
 amortizes to nothing; this would be unacceptable at 2 KB, which is why small payloads should
 stay in an ordinary `binary` column and go through the normal buffer path.
 
-### Getting `offset` before the bytes are written
+### Getting `litelink_offset` before the bytes are written
 
-The staging path derives from `offset`, so the offset must exist before step 2 — but §2 pins
+The staging path derives from `litelink_offset`, so the offset must exist before step 2 — but §2 pins
 `INTEGER PRIMARY KEY AUTOINCREMENT`, which assigns at INSERT.
 
 Both hold at once by keeping the transaction open: `INSERT` inside `BEGIN` yields
@@ -1156,13 +1276,22 @@ push a tight row filter rather than materializing a scan.
 Both §7 reads with a blob field resolved. Expressible entirely in DuckDB, using `sqlite` to
 attach the buffer, `iceberg` to scan the tables, and `read_blob` for staging.
 
-`lo` and `hi` are §7's names: the min and max of `offset` over the local table's current
+`lo` and `hi` are §7's names: the min and max of `litelink_offset` over the local table's current
 snapshot, read from manifest column statistics. The hot read needs only `hi`, which is the
 value §7's hot-read prose calls `boundary`; it is the same number and this section uses `hi`
 throughout so one value carries one name.
 
-**`offset` must be quoted throughout.** It is a reserved word in DuckDB: `USING (offset)` is a
-parser error, while `USING ("offset")` and a qualified `b.offset` both parse. Verified.
+**The column is named `litelink_offset`, not `offset`.** Two reasons, and the second is the
+one that forced it. `offset` is a plausible application column — a byte offset, a page
+offset, an offset from a reference time — and reserving it taxes every caller. More
+decisively, **`offset` is a reserved word in DuckDB**: `SELECT offset FROM t` and
+`max(offset)` are both parser errors, so every query the library wrote and every query a
+reader wrote against the archive would have to quote it, forever, with the failure being a
+syntax error rather than anything that says why. Verified in both directions —
+`max(litelink_offset)` parses unquoted, `max(offset)` does not.
+
+The prefix also namespaces it. §9 lets an application add columns freely, and a collision
+with the one column the library owns would be a schema change that cannot be made.
 
 Staging resolution is identical in both reads, so it is factored out once:
 
@@ -1226,7 +1355,7 @@ is the only structural difference from §7's pseudocode.
 `filename`, `content`, `size` and `last_modified`, so the directory is globbed once and
 joined on the offset parsed out of the name. Table functions cannot take correlated
 arguments, so a per-row path could not be passed in even if the pointer were stored; deriving
-the path from `offset` and joining is the only shape available, and it happens to be the
+the path from `litelink_offset` and joining is the only shape available, and it happens to be the
 faster one.
 
 `LEFT JOIN` rather than inner: a blob field may be null for some rows, and an inner join
@@ -1288,7 +1417,7 @@ metadata and small columns. Streams with blob fields should therefore get a sepa
 | §3 Write path | Adds the staging write and the fsync ordering (§15.3). |
 | §4 Seal | Adds materialization (step 2), the staging sweep (step 5), and sort-by-key-then-permute. |
 | §6 Compaction | Unchanged in logic; needs a separate `compact_below` for blob streams. |
-| §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `offset` must be quoted. |
+| §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `litelink_offset` must be quoted. |
 | §8 Retention | Unchanged. Blobs inherit it. |
 | §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_below`; `target_size` raised. |
 

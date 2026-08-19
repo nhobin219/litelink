@@ -53,7 +53,7 @@ durability — but "real-time" means fresh, not point-lookup fast.
 
 - **Iceberg is used, not reimplemented.** Manifests, per-file column statistics, schema with
   field IDs, and atomic snapshot commits all come from it.
-- **The library owns exactly one column**, `offset` — monotonic, never reused. It is the
+- **The library owns exactly one column**, `litelink_offset` — monotonic, never reused. It is the
   boundary mechanism between tiers. Everything else is the caller's schema.
 - **Sync is a watermark, not CDC.** There are no updates or deletes to replicate.
 - **Parts are sealed once and never rewritten.** Rewriting a growing partition costs ~144x

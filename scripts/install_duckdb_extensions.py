@@ -20,9 +20,15 @@ Usage:
               nothing; exits non-zero if a fetch would have been required.
 
 The cache is keyed by DuckDB version and platform (`v1.5.5/linux_amd64`), so a
-duckdb upgrade invalidates it and every machine re-downloads. Set
-DUCKDB_EXTENSION_DIRECTORY to point at a vendored directory instead — that is
-the offline install route, and this script honours it either way.
+duckdb upgrade invalidates it and every machine re-downloads.
+
+Relocating it is not an environment variable. `DUCKDB_EXTENSION_DIRECTORY` is
+silently ignored — verified: with it set, `current_setting('extension_directory')`
+is still the default. The only levers are `HOME`, which moves the whole default
+`~/.duckdb`, and `duckdb.connect(config={"extension_directory": ...})`, which
+only the process opening the connection can set. An air-gapped deployment
+therefore vendors into a directory and points litelink at it, rather than
+exporting a variable and expecting it to be read.
 """
 
 from __future__ import annotations
@@ -34,7 +40,11 @@ import duckdb
 
 # The §7 read path: iceberg_scan for the table leg, the sqlite scanner for the
 # buffer leg. Both legs run in one engine, so both are needed for any read.
-READ_PATH = ("iceberg", "sqlite_scanner")
+# `avro` is iceberg's dependency, not a choice: iceberg's init function
+# auto-installs it, so a machine with network never notices it is missing.
+# Installing it explicitly is what makes a vendored directory complete —
+# without it, `LOAD iceberg` with autoinstall disabled fails asking for avro.
+READ_PATH = ("iceberg", "avro", "sqlite_scanner")
 
 # The archive tier (§5). Local-first capture never loads this, which is why it
 # is opt-in rather than part of the required set.

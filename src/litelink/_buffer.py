@@ -73,7 +73,7 @@ class Buffer:
         # tier boundary in §7 (I9, §2).
         self._con.execute(f"""
             CREATE TABLE IF NOT EXISTS buffer (
-              "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
+              "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,
               {columns}
             )
         """)
@@ -202,7 +202,7 @@ class Buffer:
     @staticmethod
     def _reject_offset(row: Mapping[str, object]) -> None:
         """I11: `offset` is assigned by the library, never accepted."""
-        if "offset" in row:
+        if "litelink_offset" in row:
             msg = "`offset` is assigned by the library and cannot be supplied (I11)"
             raise ValueError(msg)
 
@@ -225,22 +225,23 @@ class Buffer:
     def extent(self) -> tuple[int, int] | None:
         """`(min, max)` offset currently buffered, or None if empty."""
         lo, hi = self._con.execute(
-            'SELECT min("offset"), max("offset") FROM buffer'
+            'SELECT min("litelink_offset"), max("litelink_offset") FROM buffer'
         ).fetchone()
 
         return None if lo is None else (int(lo), int(hi))
 
     def rows_below(self, end: int) -> pa.Table:
         """Buffered rows with `offset < end`, as Arrow."""
-        names = ", ".join(f'"{c}"' for c in ("offset", *self._columns))
+        names = ", ".join(f'"{c}"' for c in ("litelink_offset", *self._columns))
         cursor = self._con.execute(
-            f'SELECT {names} FROM buffer WHERE "offset" < ? ORDER BY "offset"', (end,)
+            f'SELECT {names} FROM buffer WHERE "litelink_offset" < ? ORDER BY "litelink_offset"',
+            (end,),
         )
         columns = list(zip(*cursor.fetchall(), strict=True)) or [
             () for _ in range(len(self._columns) + 1)
         ]
         schema = pa.schema(
-            [pa.field("offset", pa.int64(), nullable=False), *self._schema]
+            [pa.field("litelink_offset", pa.int64(), nullable=False), *self._schema]
         )
 
         # Built loosely, then cast to the declared schema — the SQLite edge.
@@ -289,7 +290,7 @@ class Buffer:
         between that commit and this call is safe in both directions.
         """
         self._con.execute("BEGIN")
-        self._con.execute('DELETE FROM buffer WHERE "offset" < ?', (end,))
+        self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
         self._con.execute("DELETE FROM sealing")
         self._con.execute("COMMIT")
         self._bytes = self._measure()

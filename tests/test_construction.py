@@ -17,6 +17,8 @@ import pytest
 from litelink import Log, LogConfig
 from litelink._buffer import Buffer
 from litelink._layout import Layout
+from litelink._maintenance import Maintenance
+from litelink._read import Reader
 from litelink._table import LogTable
 from litelink.log import table_schema, validate
 
@@ -49,8 +51,8 @@ def test_zero_retention_is_fine_with_an_archive() -> None:
 
 def test_table_schema_puts_offset_first() -> None:
     """§2: the library owns exactly one column, and it leads."""
-    assert table_schema(SCHEMA).names == ["offset", "event_ts", "key"]
-    assert not table_schema(SCHEMA).field("offset").nullable
+    assert table_schema(SCHEMA).names == ["litelink_offset", "event_ts", "key"]
+    assert not table_schema(SCHEMA).field("litelink_offset").nullable
 
 
 def test_init_does_no_io(tmp_path: Path) -> None:
@@ -64,13 +66,16 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
     buffer = Buffer(layout.buffer_db, SCHEMA)
 
+    config = LogConfig()
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
+        reader=Reader(layout, table, table_schema(SCHEMA)),
+        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
         schema=SCHEMA,
         sort_by=("event_ts",),
-        config=LogConfig(),
+        config=config,
     )
 
     assert log.name == "s"
@@ -92,14 +97,19 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
 
     layout = Layout(tmp_path, "s")
     layout.create()
+    table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
+    buffer = StubBuffer(layout.buffer_db, SCHEMA)
+    config = LogConfig()
 
     log = Log(
         layout=layout,
-        table=LogTable.create(layout, table_schema(SCHEMA), ("event_ts",)),
-        buffer=StubBuffer(layout.buffer_db, SCHEMA),
+        table=table,
+        buffer=buffer,
+        reader=Reader(layout, table, table_schema(SCHEMA)),
+        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
         schema=SCHEMA,
         sort_by=("event_ts",),
-        config=LogConfig(),
+        config=config,
     )
 
     assert log.end_offset() == 4_242
@@ -308,8 +318,46 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
         assert pq.read_table(merged)["key"].to_pylist() == ["a", "b", "c"]
         # Reads are unaffected: order is by offset, and every row survives.
         rows = log.scan().read_all()
-        assert rows["offset"].to_pylist() == [1, 2, 3]
+        assert rows["litelink_offset"].to_pylist() == [1, 2, 3]
         assert rows.num_rows == 3
 
     with Log.open(tmp_path, "s") as reopened:
         assert reopened._sort_by == ("key",), "the new order must survive a reopen"
+
+
+def test_the_reserved_column_is_refused_at_schema_change_time(tmp_path: Path) -> None:
+    """I11 has two doors, not one.
+
+    `validate` covers creation. A schema change is the other way a caller could
+    introduce or retire the library's column, and monotonicity and non-reuse
+    cannot be enforced on a column the application controls.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        with pytest.raises(ValueError, match="litelink_offset"):
+            log.add_column("litelink_offset", pa.int64())
+
+        with pytest.raises(ValueError, match="litelink_offset"):
+            log.rename_column("event_ts", "litelink_offset", breaking_ok=True)
+
+        with pytest.raises(ValueError, match="litelink_offset"):
+            log.drop_column("litelink_offset", breaking_ok=True)
+
+        # An ordinary column still reaches the unimplemented body.
+        with pytest.raises(NotImplementedError):
+            log.add_column("extra", pa.int64())
+
+
+def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
+    """Why it is not called `offset`.
+
+    `SELECT offset` and `max(offset)` are DuckDB parser errors, so the old name
+    forced every query — the library's and any reader's against the archive —
+    to quote it forever, failing with a syntax error that says nothing about
+    why.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        log.append({"event_ts": 1, "key": "a"})
+
+        unquoted = log.sql("SELECT max(litelink_offset) FROM log").read_all()
+
+        assert unquoted.column(0)[0].as_py() == 1

@@ -12,13 +12,14 @@ from typing import TYPE_CHECKING
 
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
+from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
 
 from litelink._predicates import offset_at_or_below, offset_between
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from datetime import datetime
 
     import pyarrow as pa
@@ -30,6 +31,10 @@ if TYPE_CHECKING:
 # a stream that seals every few minutes is a file per seal, forever. These bound
 # it to the current version plus a few for rollback. Manifests are NOT covered —
 # see `expire_snapshots`.
+# Bounded: a commit that keeps losing is contention worth surfacing, not
+# something to retry forever behind a caller's back.
+_COMMIT_ATTEMPTS = 5
+
 METADATA_PROPERTIES = {
     "write.metadata.delete-after-commit.enabled": "true",
     "write.metadata.previous-versions-max": "10",
@@ -126,11 +131,12 @@ class LogTable:
         if not sort_by:
             return
 
+        self._commit(lambda: self._apply_sort_order(sort_by))
+
+    def _apply_sort_order(self, sort_by: Sequence[str]) -> None:
         with self._table.update_sort_order() as update:
             for column in sort_by:
                 update.asc(column, IdentityTransform())
-
-        self.reload()
 
     # -- state ------------------------------------------------------------
 
@@ -153,7 +159,7 @@ class LogTable:
         return int(self._table.inspect.snapshots().num_rows)
 
     def offset_field_id(self) -> int:
-        return self._table.schema().find_field("offset").field_id
+        return self._table.schema().find_field("litelink_offset").field_id
 
     # -- reads from statistics --------------------------------------------
 
@@ -168,7 +174,7 @@ class LogTable:
             return []
 
         files = self._table.inspect.files()
-        field = self._table.schema().find_field("offset")
+        field = self._table.schema().find_field("litelink_offset")
         found = [
             DataFile(
                 path=_local(path),
@@ -223,7 +229,7 @@ class LogTable:
         if snapshot is None:
             return None
 
-        field = self._table.schema().find_field("offset")
+        field = self._table.schema().find_field("litelink_offset")
         lows: list[int] = []
         highs: list[int] = []
         for manifest in snapshot.manifests(self._table.io):
@@ -312,6 +318,36 @@ class LogTable:
         return ages
 
     # -- commits ------------------------------------------------------------
+    #
+    # Iceberg commits are optimistic: the commit asserts the branch has not
+    # moved, and pyiceberg raises rather than retrying. §11 already says what
+    # should happen instead — "the loser refreshes and retries" — so that lives
+    # here rather than in each caller.
+    #
+    # This is what makes a second process possible. A manager process running
+    # maintenance beside a capturing writer loses the race whenever a seal
+    # commits mid-compaction; without the retry it dies on
+    # CommitFailedException, which is exactly what it did before this existed.
+
+    def _commit(self, operation: Callable[[], None]) -> None:
+        """Run a commit, refreshing and retrying if the branch moved under it.
+
+        Safe to replay because a failed commit landed nothing: the range a
+        compaction rewrites sits below the boundary a concurrent seal appends
+        above, so the second attempt selects the same files as the first.
+        """
+        for attempt in range(_COMMIT_ATTEMPTS):
+            try:
+                operation()
+            except CommitFailedException:
+                if attempt == _COMMIT_ATTEMPTS - 1:
+                    raise
+
+                self.reload()
+            else:
+                self.reload()
+
+                return
 
     def register(self, path: str) -> None:
         """Add an already-written file to the table (§4 step 2).
@@ -320,8 +356,7 @@ class LogTable:
         itself and commits afterwards, so a crash in between orphans a file
         under a name nothing recorded — exactly what I2 exists to prevent.
         """
-        self._table.add_files([path])
-        self.reload()
+        self._commit(lambda: self._table.add_files([path]))
 
     def replace_range(self, lo: int, hi: int, path: str) -> None:
         """Swap `[lo, hi]` for one already-written file, in one snapshot (§6).
@@ -330,21 +365,27 @@ class LogTable:
         itself — putting a path on disk this process only learns about
         afterwards, which is what the deletion queue exists to avoid.
         """
-        with self._table.transaction() as transaction:
-            transaction.delete(delete_filter=offset_between(lo, hi))
-            transaction.add_files([path])
 
-        self.reload()
+        def swap() -> None:
+            with self._table.transaction() as transaction:
+                transaction.delete(delete_filter=offset_between(lo, hi))
+                transaction.add_files([path])
+
+        self._commit(swap)
 
     def evict_through(self, boundary: int) -> None:
         """Drop every file at or below `boundary` from the current snapshot (§8)."""
-        self._table.delete(delete_filter=offset_at_or_below(boundary))
-        self.reload()
+        self._commit(
+            lambda: self._table.delete(delete_filter=offset_at_or_below(boundary))
+        )
 
     def expire_snapshots_older_than(self, cutoff: datetime) -> None:
         """Expire snapshot METADATA. Does not delete any file — see §6."""
-        self._table.maintenance.expire_snapshots().older_than(cutoff).commit()
-        self.reload()
+        self._commit(
+            lambda: (
+                self._table.maintenance.expire_snapshots().older_than(cutoff).commit()
+            )
+        )
 
     def scan_range(self, lo: int, hi: int) -> pa.Table:
         return self._table.scan(row_filter=offset_between(lo, hi)).to_arrow()
@@ -359,10 +400,11 @@ class LogTable:
         if not missing:
             return
 
-        with self._table.transaction() as transaction:
-            transaction.set_properties(missing)
+        self._commit(lambda: self._set_properties(missing))
 
-        self.reload()
+    def _set_properties(self, properties: dict[str, str]) -> None:
+        with self._table.transaction() as transaction:
+            transaction.set_properties(properties)
 
 
 def _local(path: object) -> str:
