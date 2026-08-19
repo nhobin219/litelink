@@ -17,28 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from pathlib import Path
 
-# Arrow type -> SQLite column affinity. Affinity is advisory in SQLite, but
-# declaring it keeps the values round-tripping as the type the Iceberg schema
-# will demand at seal, rather than as whatever Python handed in.
-_AFFINITY = (
-    (pa.types.is_boolean, "INTEGER"),
-    (pa.types.is_integer, "INTEGER"),
-    (pa.types.is_floating, "REAL"),
-    (pa.types.is_temporal, "INTEGER"),
-    (pa.types.is_string, "TEXT"),
-    (pa.types.is_large_string, "TEXT"),
-    (pa.types.is_binary, "BLOB"),
-    (pa.types.is_large_binary, "BLOB"),
-)
-
-
-def _affinity(type_: pa.DataType) -> str:
-    for predicate, affinity in _AFFINITY:
-        if predicate(type_):
-            return affinity
-
-    msg = f"no SQLite affinity for Arrow type {type_}"
-    raise TypeError(msg)
+from litelink._types import column_type
 
 
 class Buffer:
@@ -85,7 +64,7 @@ class Buffer:
 
     def _create(self) -> None:
         columns = ",\n  ".join(
-            f'"{name}" {_affinity(self._schema.field(name).type)}'
+            f'"{name}" {column_type(self._schema.field(name).type).sqlite}'
             for name in self._columns
         )
         # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
@@ -148,10 +127,9 @@ class Buffer:
     def _measure(self) -> int:
         terms = ["8"]  # offset
         for name in self._columns:
-            affinity = _affinity(self._schema.field(name).type)
             terms.append(
                 f'coalesce(octet_length("{name}"), 0)'
-                if affinity in ("TEXT", "BLOB")
+                if column_type(self._schema.field(name).type).variable_length
                 else "8"
             )
 
