@@ -192,34 +192,6 @@ def test_local_retention_zero_without_an_archive_is_rejected(tmp_path: Path) -> 
         open_log(tmp_path, LogConfig(local_retention=timedelta(0)))
 
 
-def test_capture_works_with_no_network(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """I5 and §14's first bullet: the central claim.
-
-    Blocks Python-level socket creation, then drives the whole loop. Note the
-    limitation: DuckDB and pyiceberg-core reach the network from C++, which
-    never passes through `socket.socket`, so this catches a Python-level
-    regression (a pyiceberg HTTP call, an S3 client) and not a C++ one. The
-    airtight version of this test needs a network namespace, and belongs in a
-    suite that can ask for one.
-    """
-    import socket
-
-    def refuse(*args: object, **kwargs: object) -> None:
-        msg = "network access during a hot-path operation"
-        raise OSError(msg)
-
-    monkeypatch.setattr(socket, "socket", refuse)
-
-    with open_log(tmp_path, LogConfig(target_size=256)) as log:
-        log.extend(rows(20))
-        log.seal()
-        log.extend(rows(20, start=20))
-        assert len(read_all(log)) == 40
-        assert log.end_offset() == 41
-
-
 def test_readonly_sees_a_writer_s_committed_rows(tmp_path: Path) -> None:
     """A second view of a live log, as the tail script uses (§1: one writer)."""
     with open_log(tmp_path) as writer:

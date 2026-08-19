@@ -49,6 +49,13 @@ class Maintenance:
         self._config = config
         self._sort_by = tuple(sort_by)
 
+    def set_config(self, config: LogConfig) -> None:
+        """Adopt new policy in place, rather than being rebuilt around it."""
+        self._config = config
+
+    def set_sort_by(self, sort_by: Sequence[str]) -> None:
+        self._sort_by = tuple(sort_by)
+
     def run(self) -> None:
         self.compact()
         self.evict()

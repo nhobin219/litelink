@@ -443,9 +443,18 @@ The cache is keyed by DuckDB version and platform (`~/.duckdb/extensions/v1.5.5/
 so raising the duckdb floor invalidates it and every machine downloads again.
 
 This is a provisioning obligation, not a dependency — no package pins it, so nothing fails at
-install time. Install the extensions at build or deploy time, or vendor them and point
-`DUCKDB_EXTENSION_DIRECTORY` at the directory, which is the air-gapped route. How an
-*embedding application* discharges it, as opposed to this repo, is §13.5. The blob
+install time. Install the extensions at build or deploy time, or vendor them for the
+air-gapped case. How an *embedding application* discharges it, as opposed to this repo, is
+§13.5.
+
+Two details that are easy to get wrong, both verified against duckdb 1.5.5. **The extension
+directory is not settable by environment variable** — `DUCKDB_EXTENSION_DIRECTORY` is
+silently ignored, and `current_setting('extension_directory')` still reports the default with
+it set. `HOME` moves the whole default, and
+`duckdb.connect(config={"extension_directory": …})` sets it properly, which means only the
+process opening the connection can relocate it. **And `iceberg` depends on `avro`**, which its
+init function auto-installs, so a machine with network never notices it missing. A vendored
+directory without it fails at `LOAD` asking for an extension nobody mentioned. The blob
 workloads in §15 — sensor frames and point clouds — are edge deployments by nature, which is
 what makes this load-bearing rather than a note about developer laptops.
 
