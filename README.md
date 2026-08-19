@@ -2,7 +2,11 @@
 
 Durable append-only capture into Iceberg tables. Local-first, in-process, no service.
 
-**Status: specification only.** Nothing is implemented yet. See [`docs/SPEC.md`](docs/SPEC.md).
+**Status: early.** The local capture loop works — append, seal, read, compact, evict,
+expire — against a local Iceberg table. The archive tier does not: `sync()` and archive
+reads raise `NotImplementedError`, so today this is durable local capture into Iceberg
+rather than the full three-tier design. Schema evolution is likewise unimplemented. The
+design is [`docs/SPEC.md`](docs/SPEC.md), and it is ahead of the code.
 
 ---
 
@@ -62,6 +66,8 @@ durability — but "real-time" means fresh, not point-lookup fast.
 Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
 ## Extensions
+
+Not implemented; specified.
 
 **Blob fields** ([`docs/SPEC.md`](docs/SPEC.md) §15) — payloads too large for the buffer
 (sensor frames, point clouds, raw response bodies). Bytes stage beside SQLite while hot and
