@@ -35,6 +35,9 @@ class Reader:
         self._table = table
         self._schema = schema
         self._connection: duckdb.DuckDBPyConnection | None = None
+        # The view text last installed. Rebuilding it costs a DuckDB statement
+        # per query, and it can only change when the snapshot does.
+        self._view: str | None = None
 
     def query(self, sql: str) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
@@ -46,7 +49,15 @@ class Reader:
         """
         self._table.reload()
         connection = self._connect()
-        connection.execute(f"CREATE OR REPLACE TEMP VIEW {VIEW} AS {self._union()}")
+        # Resolving per query is §7's rule and still happens above. What is
+        # skipped is reinstalling an identical view: the union text is derived
+        # entirely from the metadata pointer and the extent, so unchanged text
+        # means an unchanged snapshot.
+        union = self._union()
+        if union != self._view:
+            connection.execute(f"CREATE OR REPLACE TEMP VIEW {VIEW} AS {union}")
+            self._view = union
+
         reader = connection.execute(sql).to_arrow_reader()
 
         return _cast_to(reader, self._schema)

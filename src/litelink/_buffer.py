@@ -230,6 +230,19 @@ class Buffer:
 
         return None if lo is None else (int(lo), int(hi))
 
+    def count_above(self, boundary: int) -> int:
+        """How many buffered rows sit above `boundary` — the unsealed tail.
+
+        `litelink_offset` is the INTEGER PRIMARY KEY, so SQLite answers this
+        with a rowid range rather than a scan, and rows already sealed but not
+        yet deleted cost nothing.
+        """
+        row = self._con.execute(
+            'SELECT count(*) FROM buffer WHERE "litelink_offset" > ?', (boundary,)
+        ).fetchone()
+
+        return int(row[0])
+
     def rows_below(self, end: int) -> pa.Table:
         """Buffered rows with `offset < end`, as Arrow."""
         names = ", ".join(f'"{c}"' for c in ("litelink_offset", *self._columns))
