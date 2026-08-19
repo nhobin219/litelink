@@ -159,7 +159,7 @@ class LogTable:
         return int(self._table.inspect.snapshots().num_rows)
 
     def offset_field_id(self) -> int:
-        return self._table.schema().find_field("offset").field_id
+        return self._table.schema().find_field("litelink_offset").field_id
 
     # -- reads from statistics --------------------------------------------
 
@@ -174,7 +174,7 @@ class LogTable:
             return []
 
         files = self._table.inspect.files()
-        field = self._table.schema().find_field("offset")
+        field = self._table.schema().find_field("litelink_offset")
         found = [
             DataFile(
                 path=_local(path),
@@ -229,7 +229,7 @@ class LogTable:
         if snapshot is None:
             return None
 
-        field = self._table.schema().find_field("offset")
+        field = self._table.schema().find_field("litelink_offset")
         lows: list[int] = []
         highs: list[int] = []
         for manifest in snapshot.manifests(self._table.io):

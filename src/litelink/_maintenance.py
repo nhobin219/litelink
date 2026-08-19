@@ -244,7 +244,7 @@ def _verify(merged: pa.Table, run: list[DataFile], lo: int, hi: int) -> None:
     # Python's min/max over the materialised column, not pyarrow.compute: pc's
     # kernels are generated from a runtime registry, so no static checker can
     # see them. §6 step 2 already holds the whole merge in memory.
-    offsets = merged["offset"].to_pylist()
+    offsets = merged["litelink_offset"].to_pylist()
     if min(offsets) != lo or max(offsets) != hi:
         msg = "compaction changed the offset extent"
         raise RuntimeError(msg)

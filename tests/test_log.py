@@ -64,7 +64,9 @@ def test_caller_supplied_offset_is_rejected(tmp_path: Path) -> None:
     """I11: the library owns `offset` and never accepts one."""
     with open_log(tmp_path) as log:
         with pytest.raises(ValueError, match="I11"):
-            log.append({"offset": 7, "event_ts": 1, "key": "k", "payload": b""})
+            log.append(
+                {"litelink_offset": 7, "event_ts": 1, "key": "k", "payload": b""}
+            )
 
 
 def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
@@ -73,7 +75,7 @@ def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
         Log.new(
             tmp_path,
             "s",
-            schema=pa.schema([pa.field("offset", pa.int64())]),
+            schema=pa.schema([pa.field("litelink_offset", pa.int64())]),
             sort_by=(),
         )
 

@@ -19,9 +19,12 @@ if TYPE_CHECKING:
 
 def offset_between(lo: int, hi: int) -> BooleanExpression:
     """`lo <= offset <= hi` — the compaction unit (§6)."""
-    return And(GreaterThanOrEqual("offset", lo), LessThanOrEqual("offset", hi))
+    return And(
+        GreaterThanOrEqual("litelink_offset", lo),
+        LessThanOrEqual("litelink_offset", hi),
+    )
 
 
 def offset_at_or_below(hi: int) -> BooleanExpression:
     """`offset <= hi` — the eviction prefix (§8)."""
-    return LessThanOrEqual("offset", hi)
+    return LessThanOrEqual("litelink_offset", hi)
