@@ -30,6 +30,7 @@ from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
 
 from litelink._buffer import Buffer
+from litelink._predicates import offset_at_or_below, offset_between
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -40,6 +41,17 @@ if TYPE_CHECKING:
     Row = Mapping[str, object]
 
 _NAMESPACE = "litelink"
+
+
+@dataclass(frozen=True, slots=True)
+class _DataFile:
+    """One Iceberg data file, as the maintenance passes need to see it."""
+
+    path: str
+    size: int
+    rows: int
+    lo: int
+    hi: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +397,7 @@ class Log:
         _fsync(dest)
 
         self._table.add_files([str(dest)])
-        self._table = self._catalog.load_table(f"{_NAMESPACE}.{self.name}")
+        self._reload()
 
     def _maybe_seal(self) -> None:
         """Seal when the buffer crosses `target_size`.
@@ -501,7 +513,206 @@ class Log:
         silent is open — §11 treats stalled eviction as an operational
         condition, and returning None says nothing about it.
         """
-        raise NotImplementedError
+        if self._archive is not None:
+            # I4 needs sync's registration watermark to decide what is safe to
+            # evict, and sync does not exist yet. Refusing beats evicting a file
+            # no archive has — that failure is silent and permanent.
+            msg = "maintain() with an archive configured requires sync(), which is not implemented"
+            raise NotImplementedError(msg)
+
+        self._compact()
+        self._evict()
+        self._expire()
+
+    def _data_files(self) -> list[_DataFile]:
+        """Current data files with their offset extents, ordered by offset."""
+        if self._table.current_snapshot() is None:
+            return []
+
+        files = self._table.inspect.files()
+        field = self._table.schema().find_field("offset")
+        out = [
+            _DataFile(
+                path=str(path).removeprefix("file://"),
+                size=int(size),
+                rows=int(rows),
+                lo=from_bytes(field.field_type, dict(lower)[field.field_id]),
+                hi=from_bytes(field.field_type, dict(upper)[field.field_id]),
+            )
+            for path, size, rows, lower, upper in zip(
+                files["file_path"].to_pylist(),
+                files["file_size_in_bytes"].to_pylist(),
+                files["record_count"].to_pylist(),
+                files["lower_bounds"].to_pylist(),
+                files["upper_bounds"].to_pylist(),
+                strict=True,
+            )
+        ]
+
+        return sorted(out, key=lambda f: f.lo)
+
+    def _compact(self) -> None:
+        """Merge runs of undersized adjacent files (§6).
+
+        Required, not opportunistic: the `max_age` seal branch guarantees a
+        quiet stream emits a small file every interval indefinitely.
+
+        The table is unpartitioned, so the compaction unit is a contiguous
+        offset range — which is safe precisely because sealed files already
+        cover contiguous, non-overlapping ranges, so the range filter selects
+        exactly the sources and nothing else.
+        """
+        threshold = self.config.compact_below or self.config.target_size // 2
+
+        run: list[_DataFile] = []
+        for data_file in [*self._data_files(), None]:
+            # Adjacency is in offset order, so a large file between two small
+            # ones ends the run — merging across it would pull an already-sized
+            # file through the rewrite for nothing.
+            if data_file is not None and data_file.size < threshold:
+                run.append(data_file)
+                continue
+
+            if len(run) >= self.config.compact_min_files:
+                self._compact_run(run)
+
+            run = []
+
+    def _compact_run(self, run: list[_DataFile]) -> None:
+        lo, hi = run[0].lo, run[-1].hi
+        offset_range = offset_between(lo, hi)
+        merged = self._table.scan(row_filter=offset_range).to_arrow()
+        if self._sort_by:
+            # Re-sorted, not merely concatenated: concatenation would leave the
+            # row groups carrying each source file's range, which is the
+            # statistic the sort exists to tighten.
+            merged = merged.sort_by([(c, "ascending") for c in self._sort_by])
+
+        # §6 step 3. Row count and the offset extent are checked exactly; both
+        # are what the overwrite's safety argument rests on.
+        #
+        # Per-column min/max is NOT checked, and cannot be by equality: Iceberg
+        # truncates string and binary bounds, so a source bound is a prefix
+        # rather than a value and would compare unequal to a correct merge.
+        expected = sum(f.rows for f in run)
+        if merged.num_rows != expected:
+            msg = f"compaction would lose rows: {merged.num_rows} != {expected}"
+            raise RuntimeError(msg)
+
+        # Python's min/max over the materialised column, not pyarrow.compute:
+        # pc's kernels are generated from a runtime registry, so no static
+        # checker can see them. §6 step 2 already holds the whole merge in
+        # memory, so one int64 column as a list is a rounding error on that.
+        offsets = merged["offset"].to_pylist()
+        if min(offsets) != lo or max(offsets) != hi:
+            msg = "compaction changed the offset extent"
+            raise RuntimeError(msg)
+
+        # One snapshot: readers never observe a gap or a double count, so no
+        # grace window is needed for correctness (§6).
+        self._table.overwrite(merged, overwrite_filter=offset_range)
+        self._reload()
+
+    def _evict(self) -> None:
+        """Drop files older than `local_retention` from the local table (§8).
+
+        Age comes from the snapshot that added the file, not from any data
+        column — the library stamps no timestamp (§2).
+
+        With no archive this is deletion of the only copy. That is the contract
+        a local-only log with a retention asks for; see §8.
+        """
+        retention = self.config.local_retention
+        if retention is None:
+            return
+
+        cutoff = datetime.now(UTC) - retention
+        committed = {
+            int(snapshot_id): committed_at
+            for snapshot_id, committed_at in zip(
+                self._table.inspect.snapshots()["snapshot_id"].to_pylist(),
+                self._table.inspect.snapshots()["committed_at"].to_pylist(),
+                strict=True,
+            )
+        }
+
+        entries = self._table.inspect.entries()
+        expired_paths = {
+            str(data_file["file_path"]).removeprefix("file://")
+            for snapshot_id, data_file in zip(
+                entries["snapshot_id"].to_pylist(),
+                entries["data_file"].to_pylist(),
+                strict=True,
+            )
+            if (added := committed.get(int(snapshot_id))) is not None
+            and added.replace(tzinfo=UTC) < cutoff
+        }
+        if not expired_paths:
+            return
+
+        stale = [f for f in self._data_files() if f.path in expired_paths]
+        if not stale:
+            return
+
+        # Files cover contiguous non-overlapping ranges, so evicting a prefix is
+        # a single upper bound. Anything newer is untouched.
+        boundary = max(f.hi for f in stale)
+        self._table.delete(delete_filter=offset_at_or_below(boundary))
+        self._reload()
+
+    def _expire(self) -> None:
+        """Expire snapshots past `snapshot_retention` (§6, §8).
+
+        This is what actually deletes bytes — eviction only removed the file
+        from the current snapshot. Held back by `snapshot_retention` so a
+        running scan does not lose files underneath it (I6).
+        """
+        cutoff = datetime.now(UTC) - self.config.snapshot_retention
+        self._table.maintenance.expire_snapshots().older_than(cutoff).commit()
+        self._reload()
+        self._sweep()
+
+    def _sweep(self) -> None:
+        """Delete data files no live snapshot references.
+
+        **pyiceberg's expire_snapshots is metadata-only.** Verified against
+        0.11.1: expiring three snapshots leaves `inspect.all_files()` empty and
+        all three Parquet files on disk. So expiry alone reclaims nothing, and
+        without this pass `local_retention` and `snapshot_retention` would both
+        be inert as disk-space controls.
+
+        §11 already assumes a sweep exists — a compaction that crashes mid-write
+        leaves "the orphaned file unreferenced and swept" — so this is the same
+        pass, doing double duty.
+
+        Safe because it deletes only what no live snapshot names, and I6 keeps
+        snapshots alive for `snapshot_retention` past a scan's start. The one
+        file that is unreferenced and must NOT be deleted is an in-flight seal's
+        output, written but not yet committed; `sealing` names it, which is
+        exactly what that table is for.
+        """
+        referenced = {
+            str(path).removeprefix("file://")
+            for path in self._table.inspect.all_files()["file_path"].to_pylist()
+        }
+
+        pending = self._buffer.pending_seal()
+        if pending is not None:
+            referenced.add(str(self.root / pending[2]))
+
+        # Only this log's territory: its own seal output, and the warehouse
+        # directory pyiceberg writes compaction results into. A sweep rooted at
+        # `root` would delete a sibling log's files.
+        for directory in (
+            self.root / self.name,
+            self.root / f"{_NAMESPACE}.db" / self.name,
+        ):
+            for data_file in directory.rglob("*.parquet"):
+                if str(data_file) not in referenced:
+                    data_file.unlink()
+
+    def _reload(self) -> None:
+        self._table = self._catalog.load_table(f"{_NAMESPACE}.{self.name}")
 
     def hydrate(self, since: timedelta) -> None:
         """Re-register archived files into the local table (§8).

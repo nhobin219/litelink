@@ -345,6 +345,19 @@ double count. No grace window is needed for *correctness*.
 Snapshot expiry still needs one: expiring the pre-compaction snapshot deletes files a
 long-running scan may still hold open. Retain snapshots for at least `snapshot_retention`.
 
+**Expiry does not delete the files, and the library must.** Verified against pyiceberg
+0.11.1: `maintenance.expire_snapshots()` drops the snapshot metadata and nothing else — after
+expiring three snapshots, `inspect.all_files()` is empty and all three Parquet files are still
+on disk. So an expiry-only implementation reclaims no space at all, and both retention knobs
+become inert as disk controls.
+
+The sweep that fixes it is already implied by §11's *"the orphaned file is unreferenced and
+swept"*, and does double duty: delete every data file under the table's own directories that
+no live snapshot references. Two things bound it. It must be scoped to one table's
+directories, or it deletes a sibling stream's files out from under it. And it must spare the
+file named in `sealing` — written but not yet committed, so unreferenced by construction and
+about to be registered by the very next step.
+
 **Compaction is local, which is what makes it affordable.** An object-store-native design
 downloads sources, merges, and uploads, paying egress on the download. Here each byte
 crosses the network at most twice over its life — once as a source, once compacted — and
