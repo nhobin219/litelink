@@ -71,7 +71,8 @@ compaction rather than becoming a hand-maintained refcount.
 
 ## Open questions
 
-Payload encoding, and local-disk backpressure. Both in [`docs/SPEC.md`](docs/SPEC.md) §13.
+Payload encoding, local-disk backpressure, bulk ingest, and extension provisioning for
+embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 
 ## Development
 
