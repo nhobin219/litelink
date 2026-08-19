@@ -27,8 +27,6 @@ CARRIED = [
     pa.bool_(),
     pa.string(),
     pa.large_string(),
-    pa.binary(),
-    pa.large_binary(),
 ]
 
 
@@ -50,9 +48,7 @@ SAMPLE: dict[str, object] = {
     "double": 1.5,
     "bool": True,
     "string": "x",
-    "large_string": "x",
-    "binary": b"x",
-    "large_binary": b"x",
+    "large_string": "unicode ☃, and a quote'''s worth of trouble",
 }
 
 
@@ -79,6 +75,8 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
         (pa.uint64(), "unsigned"),
         (pa.int8(), "widens"),
         (pa.int16(), "widens"),
+        (pa.binary(), "not supported yet"),
+        (pa.large_binary(), "not supported yet"),
         (pa.timestamp("us"), "not yet supported"),
         (pa.decimal128(10, 2), "not yet supported"),
         (pa.list_(pa.int64()), "not yet supported"),
@@ -122,27 +120,27 @@ def test_declared_types_come_back_as_declared(tmp_path: Path) -> None:
         [
             pa.field("event_ts", pa.int64()),
             pa.field("key", pa.large_string()),
-            pa.field("payload", pa.large_binary()),
+            pa.field("payload", pa.string()),
         ]
     )
 
     with Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        log.append({"event_ts": 1, "key": "a", "payload": b"p"})
+        log.append({"event_ts": 1, "key": "a", "payload": "p"})
 
         from_buffer = log.scan().read_all().schema
         assert from_buffer.field("key").type == pa.large_string()
-        assert from_buffer.field("payload").type == pa.large_binary()
+        assert from_buffer.field("payload").type == pa.string()
 
         log.seal()
 
         from_table = log.scan().read_all().schema
         assert from_table.field("key").type == pa.large_string()
-        assert from_table.field("payload").type == pa.large_binary()
+        assert from_table.field("payload").type == pa.string()
 
     with Log.open(tmp_path, "s") as reopened:
         reopened_schema = reopened.scan().read_all().schema
         assert reopened_schema.field("key").type == pa.large_string()
-        assert reopened_schema.field("payload").type == pa.large_binary()
+        assert reopened_schema.field("payload").type == pa.string()
 
 
 def test_a_log_with_no_stored_schema_refuses_to_open(tmp_path: Path) -> None:

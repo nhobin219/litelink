@@ -27,9 +27,7 @@ from _bench import best_of, fresh_log, observations
 
 
 def bench_writes(root: Path, payload: int, batches: list[int], rows_each: int) -> None:
-    print(
-        f"\nwrite — {rows_each:,} rows per run, {payload} B payload, synchronous=FULL"
-    )
+    print(f"\nwrite — {rows_each:,} rows per run, {payload} B wide, synchronous=FULL")
     print(f"  {'batch':>7} {'rows/s':>12} {'us/row':>10} {'commits':>9}")
 
     for batch in batches:
@@ -83,10 +81,10 @@ def bench_reads(
                 f" {total / elapsed:>12,.0f}"
             )
 
-        # The projection lever from §7: excluding the payload column roughly
-        # halves the buffer leg, and is the only one that does not require
-        # sealing more often. Both timings carry the fixed overhead above, so
-        # compare the difference, not the ratio.
+        # The projection lever from §7: excluding the wide column roughly halves
+        # the buffer leg, and is the only lever that does not require sealing
+        # more often. Both timings carry the fixed overhead above, so compare
+        # the difference, not the ratio.
         wide = best_of(3, lambda: log.scan().read_all()) * 1000
         narrow = (
             best_of(

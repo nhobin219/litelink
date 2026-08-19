@@ -951,9 +951,22 @@ The consequence worth planning for is that local disk holds roughly
 
    Options, none chosen:
 
-   - **Leave it in-process and seal on a background thread.** No coordination at all, and it
-     takes the spike off the append path, which is most of the prize. The lock already
-     exists. Does not address recovery ownership, because there is only one process.
+   - **Leave it in-process and seal on a background thread.** Avoids every open item above —
+     no leases, no recovery-ownership question, no signalling — because there is still one
+     process. But *moving* the seal to a thread wins nothing on its own: it would take the
+     same lock for the same duration, relocating the stall from the triggering append to
+     every append during the seal.
+
+     It works only if the seal stops holding the write lock for its expensive part, and §4's
+     steps divide cleanly for that. Step 1 claims the range and step 3 deletes the sealed
+     rows — both brief writes. Step 2 is all of the cost and **reads only**, so it can run on
+     a second SQLite connection while appends continue. Measured: a 19,999-row scan on one
+     connection took 22.6 ms while 21 appends completed on another at 0.64 ms median, with no
+     lock contention.
+
+     So: a second connection, the lock held only for steps 1 and 3, and a guard against two
+     seals in flight. The cost is that step 3 is deferred by one seal's duration rather than
+     by a poll interval, which is the narrowest version of the window below.
    - **A lease per role**, writer and maintainer, each recovering its own intents. Simple to
      state, but the split is coarser than what is actually exclusive, and it forces sealing
      to sit on whichever side owns the buffer.
@@ -971,8 +984,30 @@ The consequence worth planning for is that local disk holds roughly
    - **The size counter is per-process.** The seal trigger reads an in-memory byte count the
      appending process maintains; rows removed by another process would not decrement it.
    - **Deferring step 3 widens a window that is currently narrow.** It is safe by §7's
-     boundary at any width, but the buffer holds sealed rows for longer, and §7 measures the
-     buffer as the entire variable cost of a read.
+     boundary at any width, and it *should* be free: the boundary already excludes sealed
+     rows, so a row awaiting deletion is one the read has no reason to touch. Persistence,
+     query planning and cleanup are separable concerns and this is where they separate.
+
+     They do not separate today. Measured with 1,000 unsealed rows behind a boundary:
+     15.4 ms with 20,000 sealed rows deleted, 29.9 ms with the same rows still present,
+     48.5 ms at 60,000 — so the cost tracks what the buffer *holds*, not what the read
+     *returns*. DuckDB's sqlite scanner does not turn `litelink_offset > hi` into a rowid
+     range; SQLite given the same predicate answers with
+     `SEARCH buffer USING INTEGER PRIMARY KEY (rowid>?)` in 1.0 ms against 17.1 ms attached.
+
+     **Fixed by pushing the predicate down.** `sqlite_query('buf', …)` hands the boundary to
+     SQLite instead of filtering above the scan: measured on the buffer leg in isolation,
+     31.6 ms against 8.1 ms returning 1,000 rows from a 61,000-row buffer. End to end the
+     win is smaller and easily lost in noise, because the Iceberg leg dominates at these
+     sizes — the point is not the average read, it is that a deferred delete no longer
+     inflates one.
+
+     The cost is that `binary` columns are unsupported until §15 lands, because
+     `sqlite_query` decodes blob bytes as UTF-8 and fails, with or without a CAST. That is a
+     smaller loss than it appears and arguably a signal: the target workload is tabular JSON
+     off a websocket, where the payload is text, and §15's design already has binary payloads
+     **bypass** the buffer rather than travel through it. The mechanism refusing to carry
+     blobs through SQLite and the extension routing them around SQLite point the same way.
 
    ### What `max_age` needs to know, and how little that is
 

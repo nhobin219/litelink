@@ -75,6 +75,11 @@ are inlined into Iceberg at seal, so the archive stays ordinary Iceberg with a `
 column: no pointers in the published schema, and blob lifetime inherits snapshot expiry and
 compaction rather than becoming a hand-maintained refcount.
 
+Until it lands, `binary` columns are refused outright. The read path pushes its boundary
+predicate down into SQLite — which is what stops cleanup costing query latency — and the
+mechanism that allows it cannot carry blob bytes. That constraint and the extension point
+the same way: §15 has payloads bypass the buffer rather than travel through it.
+
 ## Open questions
 
 Payload encoding, local-disk backpressure, bulk ingest, and extension provisioning for
@@ -86,19 +91,27 @@ embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 import pyarrow as pa
 from litelink import Log
 
-schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("payload", pa.large_binary())])
+# An ADS-B position feed: durable the moment it arrives, queryable a moment later.
+schema = pa.schema([
+    pa.field("event_ts", pa.int64()),    # when the aircraft transmitted
+    pa.field("ingest_ts", pa.int64()),   # stamped by you, never by the library
+    pa.field("icao24", pa.string()),
+    pa.field("altitude_ft", pa.int64()),
+    pa.field("speed_kt", pa.float64()),
+])
 
 # new() takes the shape; it is fixed at creation.
-log = Log.new("data", "sensors", schema=schema, sort_by=("event_ts",))
-log.append({"event_ts": 1, "payload": b"..."})     # durable when this returns
+log = Log.new("data", "positions", schema=schema, sort_by=("event_ts", "icao24"))
+log.append({"event_ts": 1, "ingest_ts": 2, "icao24": "a0f31c",
+            "altitude_ft": 37000, "speed_kt": 461.2})   # durable when this returns
 
 # open() takes none of it — schema, sort order, config and archive all come
 # from the log itself.
-log = Log.open("data", "sensors")
-log = Log.open("data", "sensors", read_only=True)  # alongside a live writer
+log = Log.open("data", "positions")
+log = Log.open("data", "positions", read_only=True)   # alongside a live writer
 
-rows = log.scan(where="event_ts > 1000").read_all()
-log.maintain()                                     # compact, evict, expire
+recent = log.scan(where="event_ts > 1000").read_all()
+log.maintain()                                        # compact, evict, expire
 ```
 
 ## Try it
