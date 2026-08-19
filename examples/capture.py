@@ -90,7 +90,13 @@ def main() -> None:
         stop.set()
         log.close()
 
+    on_disk = sum(f.stat().st_size for f in args.root.rglob("*") if f.is_file())
     print(f"{written:,} rows appended, all durable at commit")
+    print(f"{args.root}/ holds {on_disk / 1e6:.1f} MB — `just demo-clean` to remove it")
+    # Nothing deletes this on exit, deliberately: tail.py reads it after the
+    # writer stops, and a demo you cannot inspect afterwards is not much of one.
+    # Note the demo leaves local_retention unset, so the window grows without
+    # bound; a real deployment sets it and lets maintain() hold the size.
 
 
 if __name__ == "__main__":

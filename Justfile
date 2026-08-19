@@ -70,6 +70,19 @@ demo-capture *args:
 demo-tail *args:
     uv run python examples/tail.py {{args}}
 
+# Delete a demo's captured data. The demo keeps it on purpose — tail.py reads
+# it after the writer stops, and it is there to poke at — so nothing removes it
+# automatically. The benchmarks do clean up: they run in a temp directory.
+demo-clean root="litelink-data":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -e "{{root}}" ]; then
+        echo "nothing at {{root}}"
+        exit 0
+    fi
+    echo "removing {{root}} ($(du -sh "{{root}}" | cut -f1))"
+    rm -rf "{{root}}"
+
 # Write and read throughput on this machine. --quick for a smaller run.
 bench *args:
     uv run python benchmarks/throughput.py {{args}}
