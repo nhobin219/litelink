@@ -162,6 +162,8 @@ class Log:
         layout: Layout,
         table: LogTable,
         buffer: Buffer,
+        reader: Reader,
+        maintenance: Maintenance,
         schema: pa.Schema,
         sort_by: Sequence[str],
         config: LogConfig,
@@ -179,10 +181,8 @@ class Log:
         self._schema = schema
         self._sort_by = tuple(sort_by)
         self._archive = archive
-        self._table_schema = table_schema(schema)
-
-        self._reader = Reader(layout, table, self._table_schema)
-        self._maintenance = Maintenance(table, buffer, layout, config, self._sort_by)
+        self._reader = reader
+        self._maintenance = maintenance
         # One lock over every operation, so a maintenance thread and an append
         # loop can share a Log. Coarse on purpose: a seal and a compaction both
         # span several statements plus an Iceberg commit, and interleaving them
@@ -258,6 +258,8 @@ class Log:
             layout=layout,
             table=table,
             buffer=buffer,
+            reader=Reader(layout, table, table_schema(schema)),
+            maintenance=Maintenance(table, buffer, layout, settings, sort_by),
             schema=schema,
             sort_by=sort_by,
             config=settings,
@@ -303,13 +305,17 @@ class Log:
             msg = f"log at {layout.root}/{name} has no stored config; it is corrupt"
             raise ValueError(msg)
 
+        config = LogConfig.from_json(encoded)
+        sort_by = table.sort_by()
         log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
+            reader=Reader(layout, table, table_schema(schema)),
+            maintenance=Maintenance(table, buffer, layout, config, sort_by),
             schema=schema,
-            sort_by=table.sort_by(),
-            config=LogConfig.from_json(encoded),
+            sort_by=sort_by,
+            config=config,
             # `or None`: detaching stores an empty string rather than deleting
             # the row, and an empty archive is no archive. Without this it reads
             # back truthy enough to make maintain() refuse to run.
@@ -335,9 +341,7 @@ class Log:
             validate(self._schema, self._sort_by, config, self._archive)
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
             self.config = config
-            self._maintenance = Maintenance(
-                self._table, self._buffer, self._layout, config, self._sort_by
-            )
+            self._maintenance.set_config(config)
 
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5)."""
@@ -376,9 +380,7 @@ class Log:
 
             self._table.set_sort_order(requested)
             self._sort_by = requested
-            self._maintenance = Maintenance(
-                self._table, self._buffer, self._layout, self.config, requested
-            )
+            self._maintenance.set_sort_by(requested)
             self._maintenance.rewrite_sorted()
 
     def _writable(self) -> None:
@@ -443,7 +445,9 @@ class Log:
         a 400-byte payload column is 611 ms and proportional to the data, so
         materialising it is the caller's choice to make.
         """
-        projection = ", ".join(f'"{c}"' for c in (columns or self._table_schema.names))
+        projection = ", ".join(
+            f'"{c}"' for c in (columns or ("offset", *self._schema.names))
+        )
         predicates = [f"({where})"] if where else []
         if start_offset is not None:
             predicates.append(f'"offset" >= {int(start_offset)}')
