@@ -351,12 +351,35 @@ expiring three snapshots, `inspect.all_files()` is empty and all three Parquet f
 on disk. So an expiry-only implementation reclaims no space at all, and both retention knobs
 become inert as disk controls.
 
-The sweep that fixes it is already implied by §11's *"the orphaned file is unreferenced and
-swept"*, and does double duty: delete every data file under the table's own directories that
-no live snapshot references. Two things bound it. It must be scoped to one table's
-directories, or it deletes a sibling stream's files out from under it. And it must spare the
-file named in `sealing` — written but not yet committed, so unreferenced by construction and
-about to be registered by the very next step.
+**Reclamation is a queue in SQLite, not a scan of the filesystem.** §11's *"the orphaned
+file is unreferenced and swept"* invites a sweep, and a sweep is the wrong mechanism: finding
+orphans by listing directories costs a walk proportional to everything retained, and becomes a
+paginated LIST against object storage — priced per request, and eventually consistent, so it
+can report a file that no longer exists or miss one that does.
+
+The alternative is to make orphans impossible rather than discoverable. Every data file the
+library creates has its path written to SQLite *before* it is written to disk:
+
+| table | names | so that |
+|---|---|---|
+| `sealing` | a seal's output | I2 — a retry overwrites in place |
+| `compacting` | a compaction's output | a crash mid-write is removable by name |
+| `pending_delete` | superseded files | the grace period outlives the commit that ended them |
+
+Compaction therefore writes its own Parquet at a claimed path and commits `delete` +
+`add_files` in **one Iceberg transaction**, rather than calling `overwrite()`. Both produce a
+single snapshot; only the first leaves the process knowing the filename in advance.
+
+A file is then always in exactly one of four states — referenced by a live snapshot, claimed
+by an in-flight seal, claimed by an in-flight compaction, or queued for deletion — and each is
+a keyed read. Reclaiming space is draining `pending_delete` for rows superseded longer ago
+than `snapshot_retention`, checking each against the live references, unlinking, and only then
+forgetting the row: a crash between the unlink and the forget retries a no-op, whereas the
+reverse order loses the path with the file still on disk.
+
+Store when a file was superseded, not a precomputed deadline. The grace period is
+`snapshot_retention`, and freezing it at enqueue time means a lowered setting never applies to
+anything already queued.
 
 **Compaction is local, which is what makes it affordable.** An object-store-native design
 downloads sources, merges, and uploads, paying egress on the download. Here each byte
