@@ -663,18 +663,31 @@ class Log:
 
     # -- schema evolution --------------------------------------------------
     #
-    # Each of these changes the table's schema, and therefore has to write two
-    # records: the Iceberg schema, and the declared Arrow spelling in `meta`.
-    # An Iceberg catalog commit and a SQLite write are separate transactions and
-    # cannot be made atomic with each other — the same reason §7 gives for not
-    # requiring an atomic handoff between two catalogs — so a crash can land
-    # between them.
+    # Each of these writes two records: the Iceberg schema, and the declared
+    # Arrow spelling in `meta`. An Iceberg catalog commit and a SQLite write are
+    # separate transactions and cannot be made atomic with each other — the same
+    # reason §7 gives for not requiring an atomic handoff between two catalogs —
+    # so a crash can land between them.
     #
-    # Commit to Iceberg FIRST. The table is authoritative for which columns
-    # exist, and `open` falls back to the table's own view when the two
-    # disagree, so a crash after the commit degrades to the pre-`meta` behaviour
-    # rather than serving a schema the data does not have. The reverse order
-    # leaves `meta` describing a column the table never gained.
+    # **The change is complete when the Arrow schema lands in SQLite, not when
+    # the Iceberg commit does.** That is the same completion boundary every
+    # other multi-step operation here uses: a seal completes at its final SQLite
+    # transaction (§4 step 3), a compaction at `clear_compaction`, a deletion at
+    # `forget_deletion`. Iceberg holds the data; SQLite holds the record of what
+    # this library has finished doing.
+    #
+    # So these follow §4's shape rather than relying on `open`'s fallback:
+    #
+    #   1. record the intended Arrow schema in SQLite, before anything changes
+    #   2. commit the schema update to Iceberg
+    #   3. write the Arrow schema to `meta` and clear the intent
+    #
+    # Recovery replays it. An intent whose Iceberg commit already landed
+    # finishes at step 3; one whose commit did not is redone or abandoned, and
+    # the columns in the table say which. The fallback in `open` is then what it
+    # should be — an upgrade path for logs written before the Arrow schema was
+    # stored — rather than the crash handler, which would silently drop the
+    # declared spelling of the column just added.
 
     def add_column(self, name: str, type_: pa.DataType) -> None:
         """Add a column. Non-breaking: older files read null (§9)."""

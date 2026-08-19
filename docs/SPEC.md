@@ -695,10 +695,59 @@ ceremony.
 Apply any schema change to the archive **first**. The local table is a window and can be
 rebuilt; the archive cannot.
 
+**A schema change is complete when SQLite says so, not when Iceberg does.** Iceberg cannot
+hold the whole declaration: it has one string type and one binary type, so a column declared
+as a wide Arrow type comes back narrow, and the declared spelling has to live in the local
+database beside the buffer. That makes a schema change two writes — an Iceberg commit and a
+SQLite write — which cannot be made atomic with each other, for the same reason §7 gives for
+not requiring an atomic handoff between two catalogs.
+
+Use §4's shape, not a best-effort ordering: record the intended schema in SQLite before
+anything changes, commit to Iceberg, then write the schema and clear the intent. Recovery
+replays it, and the table's columns say which half already landed.
+
+This is the same completion boundary every other multi-step operation here uses — a seal
+completes at its final SQLite transaction, a compaction when its claim is cleared, a deletion
+when its queue row is forgotten. **Iceberg holds the data; SQLite holds the record of what the
+library has finished doing.** Treating the Iceberg commit as completion would leave a crash
+having added a column whose declared type is gone, with nothing to indicate it.
+
 Nothing is ever lost to a schema mistake: the raw `payload` is stored verbatim, so a column
 can be re-promoted under any name at any time.
 
 ## 10. Invariants
+
+### SQLite is the coordinator
+
+Iceberg gives an atomic commit **to one table**, and that is worth relying on — §6's
+compaction rests on it, swapping the snapshot pointer so readers never observe a gap or a
+double count. What it gives across systems is nothing, and every operation here spans
+systems: a seal touches the buffer, a file and the table; a compaction touches a file, the
+table and the deletion queue; a schema change touches the table and the declared Arrow
+schema. There is no commit that covers a pair of those.
+
+So the local database is the coordinator, and the protocol is the same one four times over:
+
+```
+1. record the intent in SQLite        -- before anything observable changes
+2. do the work, ending in the Iceberg commit
+3. record completion in SQLite        -- and clear the intent
+```
+
+`sealing` is step 1 for a seal, `compacting` for a compaction, `pending_delete` for a
+deletion, and a schema change needs its own. **An operation is complete when step 3 lands,
+not when the Iceberg commit does.**
+
+This is not two-phase commit, and it is better suited than 2PC would be: there is no vote and
+no participant that can veto, because **the true state is always derivable**. Recovery asks
+the table which half already happened — does it contain this path, does it hold this column —
+and drives forward or gives up accordingly. Every step is idempotent, so replaying costs a
+rewrite at worst.
+
+The rule that follows: **never treat an Iceberg commit as the completion of anything that
+also touched local state.** Doing so leaves a crash having half-applied an operation with
+nothing recording that it was ever attempted, which is the one situation none of the
+recovery paths below can repair.
 
 Each needs a test.
 
@@ -715,6 +764,7 @@ Each needs a test.
 | **I9** | `offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
 | **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
+| **I16** | Every operation spanning Iceberg and local state records its intent in SQLite before acting, and is complete only once SQLite records completion. | Iceberg's atomicity stops at one table, so nothing spanning two systems can be committed at once. Without the intent record a crash leaves work half-applied and unattributable; without the completion record the library cannot tell a finished operation from an interrupted one. |
 
 ---
 
