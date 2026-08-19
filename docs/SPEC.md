@@ -974,6 +974,50 @@ The consequence worth planning for is that local disk holds roughly
      boundary at any width, but the buffer holds sealed rows for longer, and §7 measures the
      buffer as the entire variable cost of a read.
 
+   ### What `max_age` needs to know, and how little that is
+
+   A maintainer cannot evaluate `max_age` without knowing how old the unsealed data is, and
+   the buffer records nothing temporal. The obvious move is a library-stamped timestamp
+   column, and §2 refuses one at length: *"ingest time" is ambiguous in a way a library
+   cannot resolve*, and stamping it relocates a load-bearing invariant out of the
+   application. That objection is about a column applications **read**, though — its harm is
+   a published meaning nobody agreed on. It does not obviously reach bookkeeping the library
+   keeps for itself.
+
+   §15.3 already settled the analogous case in that direction. The staged bit is
+   *"deliberately **not** `{name}_size`, and not any column in the published schema"* —
+   internal state stays in the buffer, because *"overloading a caller-facing column with
+   internal state constrains it"*. A `litelink_ts` in the buffer table only, never in the
+   Iceberg schema, sits on the same side of that line.
+
+   **But it may not be needed at all.** §12 does not say what `max_age` is the age *of*, and
+   the cheapest reading needs no per-row data: it bounds how long data may sit unsealed, so
+   the quantity is the age of the **oldest unsealed row** — one value, written when the
+   buffer goes from empty to non-empty, cleared at seal. A `meta` key, O(1), no column
+   anywhere, no §2 argument to have.
+
+   The per-row version buys exactly one thing over that: a **partial** seal, cutting at the
+   last row older than `max_age` instead of sealing everything present. Sealing everything is
+   not wrong — `max_age` is an upper bound on staleness and sealing early cannot violate it —
+   and §4's step 1 already fixes `[start, end)` against the current maximum, so rows arriving
+   during the seal simply land above it. So the per-row column buys precision the policy does
+   not appear to need, at the cost of the §2 conversation. Worth confirming against a real
+   workload before deciding, because it is a one-way door once data exists.
+
+   ### Signalling the maintainer
+
+   SQLite has no notification mechanism, so anything cross-process is polling; the only
+   question is what gets polled. A queue table the writer pushes to is the general answer,
+   and it is the shape I16 already uses — `sealing`, `compacting` and `pending_delete` are
+   all coordination through tables. A watermark is the cheap answer: one `meta` value, read
+   with the same query the age check needs anyway, no rows to insert on the write path and
+   none to retire.
+
+   The tradeoff is whether the maintainer needs to know *what* happened or only *that
+   something is due*. Nothing identified so far needs the former, and adding an insert to the
+   append path to deliver it would spend write latency — the thing this whole line of
+   thinking is trying to reclaim.
+
 ---
 
 ## 14. Test plan
