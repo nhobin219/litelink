@@ -27,7 +27,9 @@ A data file is written locally, uploaded, then registered in the archive; local 
 later shrinks the window without touching the archive.
 
 **No hot-path read touches the network.** A hot read is the local Iceberg table plus the
-SQLite buffer, both on local disk.
+SQLite buffer, both on local disk. This holds once the machine is provisioned — DuckDB's
+`iceberg` and `sqlite` extensions are downloaded rather than bundled, and the first read on
+a fresh machine fetches them. See §7.
 
 **Everything Iceberg provides is used, not reimplemented** — manifests, per-file column
 statistics, schema with field IDs, atomic snapshot commits. The catalog is a SQLite file,
@@ -376,6 +378,32 @@ union then run in one engine. `table.scan().to_arrow()` is not used: its query p
 happens in Python and costs roughly 100 ms per scan, growing with file count (measured: 94 ms
 at 20 files, 402 ms at 180). Read throughput is comparable, since both go through C++
 Parquet readers, but the planning overhead is paid on every hot-path query.
+
+### The read path's extensions are downloaded, not bundled
+
+Of the DuckDB extensions a read touches, only `parquet` is compiled into the wheel. Verified
+against duckdb 1.5.5 on PyPI:
+
+```
+parquet          STATICALLY_LINKED
+iceberg          REPOSITORY
+sqlite_scanner   REPOSITORY
+httpfs           REPOSITORY
+```
+
+A `REPOSITORY` extension is fetched from extensions.duckdb.org the first time a query names
+it, and the fetch is silent. **So the first read on a fresh machine is a network read** — at
+precisely the point the design claims to be offline. It does not degrade gracefully either:
+with autoinstall disabled and nothing cached, `LOAD iceberg` fails with an IO error.
+
+The cache is keyed by DuckDB version and platform (`~/.duckdb/extensions/v1.5.5/linux_amd64`),
+so raising the duckdb floor invalidates it and every machine downloads again.
+
+This is a provisioning obligation, not a dependency — no package pins it, so nothing fails at
+install time. Install the extensions at build or deploy time, or vendor them and point
+`DUCKDB_EXTENSION_DIRECTORY` at the directory, which is the air-gapped route. The blob
+workloads in §15 — sensor frames and point clouds — are edge deployments by nature, which is
+what makes this load-bearing rather than a note about developer laptops.
 
 ### Hot read — local, bounded, offline-capable
 

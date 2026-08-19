@@ -62,6 +62,14 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync
+      # The read path's DuckDB extensions are downloaded, not bundled. Doing it
+      # as its own step means a fetch failure reads as a provisioning failure
+      # rather than as a mysterious IO error inside a test.
+      - run: uv run python scripts/install_duckdb_extensions.py
+      # Then assert the box can load them with autoinstall off — the same check
+      # an offline deployment target would run. This is what catches a new
+      # extension being added to the read path without being added here.
+      - run: uv run python scripts/install_duckdb_extensions.py --check
       - run: uv run pytest -q
 
   ci-success:

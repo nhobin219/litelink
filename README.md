@@ -76,9 +76,13 @@ Payload encoding, and local-disk backpressure. Both in [`docs/SPEC.md`](docs/SPE
 ## Development
 
 ```
-uv sync                 # or: just bootstrap, which also installs the git hooks
+just bootstrap          # uv sync + git hooks + DuckDB extensions
 just check              # lint + format-check + typecheck + tests, same as CI
 ```
+
+`just bootstrap` provisions the `iceberg` and `sqlite` DuckDB extensions, which are
+downloaded rather than bundled — see [`docs/SPEC.md`](docs/SPEC.md) §7. `just
+duckdb-extensions --check` verifies a machine can read offline.
 
 `just --list` has the rest. Tooling is uv + ruff + [ty](https://github.com/astral-sh/ty)
 + pytest; the style gate in `scripts/check_blank_lines.py` requires a blank line after
