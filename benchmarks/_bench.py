@@ -29,7 +29,7 @@ SCHEMA = pa.schema(
         pa.field("event_ts", pa.int64(), nullable=False),
         pa.field("ingest_ts", pa.int64(), nullable=False),
         pa.field("key", pa.string()),
-        pa.field("payload", pa.large_binary()),
+        pa.field("payload", pa.string()),
     ]
 )
 SORT_BY = ("event_ts", "key")
@@ -53,7 +53,9 @@ def observations(
             "event_ts": now,
             "ingest_ts": now,
             "key": rng.choice(keys),
-            "payload": rng.randbytes(payload_bytes),
+            # Text, not bytes: the payload column is a string, and the
+            # shape a JSON-over-websocket capture actually produces.
+            "payload": f'{{"v":"{rng.getrandbits(4 * payload_bytes):0{payload_bytes}x}"}}',
         }
 
 

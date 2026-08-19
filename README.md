@@ -69,7 +69,11 @@ Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
 Not implemented; specified.
 
-**Blob fields** ([`docs/SPEC.md`](docs/SPEC.md) §15) — payloads too large for the buffer
+**Blob fields** ([`docs/SPEC.md`](docs/SPEC.md) §15) — and `binary` columns are
+unsupported until it lands, which is not the compromise it sounds like. The read path
+pushes its boundary predicate into SQLite, and the mechanism that allows it cannot carry
+blob bytes. §15's design has payloads bypass the buffer entirely rather than travel through
+it, so the constraint and the extension point the same way. — payloads too large for the buffer
 (sensor frames, point clouds, raw response bodies). Bytes stage beside SQLite while hot and
 are inlined into Iceberg at seal, so the archive stays ordinary Iceberg with a `binary`
 column: no pointers in the published schema, and blob lifetime inherits snapshot expiry and
@@ -86,18 +90,26 @@ embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 import pyarrow as pa
 from litelink import Log
 
-schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("payload", pa.large_binary())])
+# A websocket trade feed: durable the moment it arrives, queryable a moment later.
+schema = pa.schema([
+    pa.field("event_ts", pa.int64()),   # exchange timestamp
+    pa.field("ingest_ts", pa.int64()),  # stamped by you, never by the library
+    pa.field("symbol", pa.string()),
+    pa.field("price", pa.float64()),
+    pa.field("payload", pa.string()),   # the raw frame, verbatim
+])
 
 # new() takes the shape; it is fixed at creation.
-log = Log.new("data", "sensors", schema=schema, sort_by=("event_ts",))
-log.append({"event_ts": 1, "payload": b"..."})     # durable when this returns
+log = Log.new("data", "trades", schema=schema, sort_by=("event_ts", "symbol"))
+log.append({"event_ts": 1, "ingest_ts": 2, "symbol": "AAPL",
+            "price": 231.5, "payload": '{"T":"t"}'})   # durable when this returns
 
 # open() takes none of it — schema, sort order, config and archive all come
 # from the log itself.
-log = Log.open("data", "sensors")
-log = Log.open("data", "sensors", read_only=True)  # alongside a live writer
+log = Log.open("data", "trades")
+log = Log.open("data", "trades", read_only=True)   # alongside a live writer
 
-rows = log.scan(where="event_ts > 1000").read_all()
+recent = log.scan(where="event_ts > 1000").read_all()
 log.maintain()                                     # compact, evict, expire
 ```
 

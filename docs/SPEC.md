@@ -995,13 +995,19 @@ The consequence worth planning for is that local disk holds roughly
      range; SQLite given the same predicate answers with
      `SEARCH buffer USING INTEGER PRIMARY KEY (rowid>?)` in 1.0 ms against 17.1 ms attached.
 
-     **The obvious fix does not work.** `sqlite_query('buf', …)` pushes the predicate down
-     and is 14x faster on a 61,000-row buffer — and cannot carry a `binary` column at all,
-     decoding blob bytes as UTF-8 and failing, with or without an explicit CAST. Since the
-     payload column is the point, that route is closed until DuckDB fixes it or the buffer
-     leg is read some other way. Until then, deferring step 3 costs read latency
-     proportional to what is deferred, and §7's claim that the buffer is the entire variable
-     cost of a read stays true for the wrong reason.
+     **Fixed by pushing the predicate down.** `sqlite_query('buf', …)` hands the boundary to
+     SQLite instead of filtering above the scan: measured on the buffer leg in isolation,
+     31.6 ms against 8.1 ms returning 1,000 rows from a 61,000-row buffer. End to end the
+     win is smaller and easily lost in noise, because the Iceberg leg dominates at these
+     sizes — the point is not the average read, it is that a deferred delete no longer
+     inflates one.
+
+     The cost is that `binary` columns are unsupported until §15 lands, because
+     `sqlite_query` decodes blob bytes as UTF-8 and fails, with or without a CAST. That is a
+     smaller loss than it appears and arguably a signal: the target workload is tabular JSON
+     off a websocket, where the payload is text, and §15's design already has binary payloads
+     **bypass** the buffer rather than travel through it. The mechanism refusing to carry
+     blobs through SQLite and the extension routing them around SQLite point the same way.
 
    ### What `max_age` needs to know, and how little that is
 

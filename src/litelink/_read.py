@@ -20,6 +20,12 @@ if TYPE_CHECKING:
 
 VIEW = "log"
 
+# The alias the buffer database is attached under.
+BUFFER_DB = "buf"
+
+# The library-owned column (§2), which the boundary filters on.
+OFFSET = "litelink_offset"
+
 
 class Reader:
     """A DuckDB connection with the buffer attached, and the union it builds."""
@@ -49,34 +55,51 @@ class Reader:
         """The hot read: the local table, plus the buffer above its extent."""
         columns = tuple(self._schema.names)
         # Cast the buffer side explicitly rather than letting UNION ALL
-        # reconcile: SQLite's per-value typing comes through the scanner
-        # loosely, and a column that holds integers in every row can still
-        # surprise the union (§7).
-        #
-        # Aliased back to the bare name: without it the buffer-only leg
-        # (nothing sealed yet) exposes columns called `CAST(b."litelink_offset" AS
-        # BIGINT)`, and only an Iceberg leg naming them first hides it.
-        buffer_leg = (
-            "SELECT "
-            + ", ".join(
-                f'b."{c}"::{column_type(self._schema.field(c).type).duckdb} AS "{c}"'
-                for c in columns
-            )
-            + " FROM buf.buffer b"
+        # reconcile: SQLite's per-value typing comes through loosely, and a
+        # column that holds integers in every row can still surprise the union
+        # (§7). Aliased back to the bare name, or the buffer-only leg exposes
+        # columns called `CAST(b."x" AS BIGINT)`.
+        casts = ", ".join(
+            f'b."{c}"::{column_type(self._schema.field(c).type).duckdb} AS "{c}"'
+            for c in columns
         )
 
         extent = self._table.extent()
         if extent is None:
             # Nothing sealed yet, so there is no boundary to derive and no table
             # to union — every row is still in the buffer.
-            return buffer_leg
+            return f"SELECT {casts} FROM {self._buffer_source()} b"
 
         projection = ", ".join(f'"{c}"' for c in columns)
 
         return (
             f"SELECT {projection} FROM iceberg_scan('{self._table.metadata_location}')"
-            f' UNION ALL {buffer_leg} WHERE b."litelink_offset" > {extent[1]}'
+            f" UNION ALL SELECT {casts} FROM {self._buffer_source(extent[1])} b"
         )
+
+    def _buffer_source(self, boundary: int | None = None) -> str:
+        """The buffer leg, with the boundary pushed INTO SQLite.
+
+        Not `FROM buf.buffer WHERE …`. DuckDB's sqlite scanner does not turn
+        that predicate into a rowid range, so it reads every buffered row and
+        filters above the scan; SQLite given the same predicate answers with
+        `SEARCH buffer USING INTEGER PRIMARY KEY (rowid>?)`. Measured over a
+        61,000-row buffer returning 1,000: 17.1 ms attached against 1.2 ms
+        pushed down, identical results.
+
+        This is what keeps cleanup from costing query latency. Rows sealed but
+        not yet deleted are excluded by the boundary either way — only the
+        pushed version declines to *read* them, so a deferred step 3 costs disk
+        rather than query time and §7's variable cost becomes the UNSEALED rows
+        rather than everything the buffer happens to still hold.
+
+        It is also why `binary` columns are unsupported: `sqlite_query` decodes
+        blob bytes as UTF-8 and fails. See `_types`.
+        """
+        columns = ", ".join(f'"{c}"' for c in self._schema.names)
+        where = "" if boundary is None else f' WHERE "{OFFSET}" > {boundary}'
+
+        return f"sqlite_query('{BUFFER_DB}', 'SELECT {columns} FROM buffer{where}')"
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         if self._connection is None:
@@ -87,7 +110,7 @@ class Reader:
             connection.execute("LOAD iceberg")
             connection.execute("LOAD sqlite")
             connection.execute(
-                f"ATTACH '{self._layout.buffer_db}' AS buf (TYPE sqlite, READ_ONLY)"
+                f"ATTACH '{self._layout.buffer_db}' AS {BUFFER_DB} (TYPE sqlite, READ_ONLY)"
             )
             self._connection = connection
 
