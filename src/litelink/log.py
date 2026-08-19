@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 # cannot: deployment policy rather than data shape.
 _CONFIG_KEY = "config"
 _ARCHIVE_KEY = "archive"
+_SCHEMA_KEY = "arrow_schema"
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,11 +243,13 @@ class Log:
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), sort_by)
-        # The schema the log carries is the one the TABLE will report, not the
-        # one that was passed: `open` must see the same thing this does, and
-        # Arrow's string and binary types do not survive Iceberg unchanged.
-        stored = application_schema(table.arrow_schema())
-        buffer = Buffer(layout.buffer_db, stored)
+        buffer = Buffer(layout.buffer_db, schema)
+        # Arrow is the interchange type at every edge — SQLite to Parquet,
+        # Iceberg to Arrow — so the declared Arrow schema is what those edges
+        # cast to. It is kept here because Iceberg cannot represent it: one
+        # string type and one binary type, so `large_binary` would come back
+        # `binary` and the declaration would be quietly overruled.
+        buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
         buffer.set_meta(_CONFIG_KEY, settings.to_json())
         if archive is not None:
             buffer.set_meta(_ARCHIVE_KEY, archive)
@@ -255,7 +258,7 @@ class Log:
             layout=layout,
             table=table,
             buffer=buffer,
-            schema=stored,
+            schema=schema,
             sort_by=sort_by,
             config=settings,
             archive=archive,
@@ -271,11 +274,12 @@ class Log:
     ) -> Self:
         """Open an existing log, and recover it.
 
-        Takes none of the shape: the schema comes from the Iceberg table, the
-        sort order from the table's declared sort order (§4), and the config
-        and archive from the buffer's `meta` table (§2). Restating them here
-        would invite a caller to state something the log does not agree with,
-        and the log is the one that is right.
+        Takes none of the shape: the columns come from the Iceberg table, their
+        declared Arrow types and the config and archive from the buffer's
+        `meta` table (§2), and the sort order from the table's declared sort
+        order (§4). Restating any of it here would invite a caller to state
+        something the log does not agree with, and the log is the one that is
+        right.
 
         `read_only=True` opens a second view of a log another process is
         writing. It runs no recovery and refuses every mutation, so it cannot
@@ -287,8 +291,14 @@ class Log:
             raise FileNotFoundError(msg)
 
         table = LogTable.load(layout, readonly=read_only)
-        schema = application_schema(table.arrow_schema())
-        buffer = Buffer(layout.buffer_db, schema, readonly=read_only)
+        # Structure from Iceberg, spelling from `meta`. The table is
+        # authoritative for which columns exist; the stored Arrow schema only
+        # records how their types were declared, and is checked against the
+        # table rather than trusted blindly.
+        from_table = application_schema(table.arrow_schema())
+        buffer = Buffer(layout.buffer_db, from_table, readonly=read_only)
+        schema = _declared_schema(buffer, from_table)
+        buffer.adopt_schema(schema)
 
         encoded = buffer.get_meta(_CONFIG_KEY)
         log = cls(
@@ -697,6 +707,23 @@ class Log:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def _declared_schema(buffer: Buffer, from_table: pa.Schema) -> pa.Schema:
+    """The Arrow schema as declared, if `meta` still agrees with the table.
+
+    Falls back to the table's own view when the record is missing (a log
+    created before this was stored) or when the columns no longer match (a
+    schema change reached Iceberg but not here). The table is the one that
+    cannot be wrong about which columns exist, so it wins any disagreement.
+    """
+    encoded = buffer.get_meta(_SCHEMA_KEY)
+    if encoded is None:
+        return from_table
+
+    declared = pa.ipc.read_schema(pa.BufferReader(bytes.fromhex(encoded)))
+
+    return declared if declared.names == from_table.names else from_table
 
 
 def application_schema(schema: pa.Schema) -> pa.Schema:

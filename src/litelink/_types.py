@@ -45,15 +45,39 @@ class ColumnType(NamedTuple):
 
 # Matched in order, because Arrow's predicates overlap.
 _SUPPORTED: tuple[tuple[Callable[[pa.DataType], bool], ColumnType], ...] = (
-    (pa.types.is_boolean, ColumnType("INTEGER", "BOOLEAN", variable_length=False)),
-    (pa.types.is_int32, ColumnType("INTEGER", "INTEGER", variable_length=False)),
-    (pa.types.is_int64, ColumnType("INTEGER", "BIGINT", variable_length=False)),
-    (pa.types.is_float32, ColumnType("REAL", "FLOAT", variable_length=False)),
-    (pa.types.is_float64, ColumnType("REAL", "DOUBLE", variable_length=False)),
-    (pa.types.is_string, ColumnType("TEXT", "VARCHAR", variable_length=True)),
-    (pa.types.is_large_string, ColumnType("TEXT", "VARCHAR", variable_length=True)),
+    (
+        pa.types.is_boolean,
+        ColumnType("INTEGER", "BOOLEAN", variable_length=False),
+    ),
+    (
+        pa.types.is_int32,
+        ColumnType("INTEGER", "INTEGER", variable_length=False),
+    ),
+    (
+        pa.types.is_int64,
+        ColumnType("INTEGER", "BIGINT", variable_length=False),
+    ),
+    (
+        pa.types.is_float32,
+        ColumnType("REAL", "FLOAT", variable_length=False),
+    ),
+    (
+        pa.types.is_float64,
+        ColumnType("REAL", "DOUBLE", variable_length=False),
+    ),
+    (
+        pa.types.is_string,
+        ColumnType("TEXT", "VARCHAR", variable_length=True),
+    ),
+    (
+        pa.types.is_large_string,
+        ColumnType("TEXT", "VARCHAR", variable_length=True),
+    ),
     (pa.types.is_binary, ColumnType("BLOB", "BLOB", variable_length=True)),
-    (pa.types.is_large_binary, ColumnType("BLOB", "BLOB", variable_length=True)),
+    (
+        pa.types.is_large_binary,
+        ColumnType("BLOB", "BLOB", variable_length=True),
+    ),
 )
 
 # Types worth refusing with a reason rather than a lookup failure.
