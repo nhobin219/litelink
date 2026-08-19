@@ -828,28 +828,6 @@ The consequence worth planning for is that local disk holds roughly
    because it is additive and changes nothing about the read path's design. What is not
    deferrable is writing it down, since the alternative is an embedder discovering it from a
    device already in the field.
-6. **Maintenance as a second writer.** §1 excludes multi-writer per table, so compaction and
-   expiry run inside the capturing process — a background thread, with one lock over every
-   operation. That works, and it couples two things with different failure profiles: a
-   compaction that stalls or leaks holds a lock the append loop needs, and restarting
-   maintenance means restarting capture.
-
-   **The mechanism for splitting them exists.** `BEGIN IMMEDIATE` on the buffer database is a
-   cross-process write lock, held by SQLite and honoured by anything that opens the file. A
-   maintenance process would take it around the operations that must not interleave.
-
-   **What needs working out is which operations those are, and how long the lock is held.**
-   It cannot span a whole compaction — that reads and rewrites files and can run for seconds,
-   and appends would block for all of it. So it wants a short lease taken at the claim and
-   commit boundaries rather than a lock over the work. And the conflicts may be narrower than
-   they look: a seal appends above the table's committed maximum while a compaction rewrites a
-   range below it, so the two do not overlap in offset space, and §11 already has the catalog
-   commit racing safely (*"the loser refreshes and retries"*). The parts that genuinely
-   conflict are the single-row `sealing` and `compacting` claims, and the drain deciding a file
-   is unreferenced while another process registers one.
-
-   Worth doing when a compaction grows long enough that its latency reaches the append path.
-   Until then the thread is the smaller mechanism, and it is the one §1 already describes.
 
 ---
 
