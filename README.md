@@ -80,6 +80,16 @@ compaction rather than becoming a hand-maintained refcount.
 Payload encoding, local-disk backpressure, bulk ingest, and extension provisioning for
 embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 
+## Try it
+
+```
+just demo-capture      # append continuously, maintaining on a background thread
+just demo-tail         # in another terminal: watch the log accumulate
+just bench --quick     # write and read throughput on your hardware
+```
+
+See [`examples/`](examples/).
+
 ## Development
 
 ```

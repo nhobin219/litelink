@@ -43,14 +43,37 @@ def _affinity(type_: pa.DataType) -> str:
 class Buffer:
     """The unsealed tail of a log."""
 
-    def __init__(self, path: Path, schema: pa.Schema) -> None:
+    def __init__(
+        self, path: Path, schema: pa.Schema, *, readonly: bool = False
+    ) -> None:
         """Open or create the buffer at `path`.
 
         `schema` is the application's columns, without `offset`.
+
+        A readonly buffer opens the same file through SQLite's `mode=ro` URI so
+        the handle cannot write even by mistake, and creates nothing. WAL allows
+        any number of these alongside the single writer (§1).
         """
         self._schema = schema
         self._columns = tuple(schema.names)
-        self._con = sqlite3.connect(path, isolation_level=None)
+
+        if readonly:
+            self._con = sqlite3.connect(
+                f"file:{path}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            self._bytes = 0
+            return
+
+        # check_same_thread=False because scheduling maintenance on a background
+        # thread is the ordinary operational shape, and Python's guard would
+        # otherwise forbid it. The C library is built serialized here
+        # (`sqlite3.threadsafety == 3`), so the connection itself is safe; Log
+        # holds a lock to serialise its own multi-statement sequences, which is
+        # the part SQLite cannot know about.
+        self._con = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self._con.execute("PRAGMA journal_mode=WAL")
         # §3's durability claim rests on this line. WAL alone fsyncs at
         # checkpoint, not at commit, which would put committed rows back in the

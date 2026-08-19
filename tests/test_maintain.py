@@ -332,3 +332,46 @@ def test_a_referenced_file_is_never_deleted_by_the_drain(tmp_path: Path) -> None
 
         assert Path(live.path).exists()
         assert len(read_all(log)) == 4
+
+
+def test_iceberg_metadata_does_not_grow_without_bound(tmp_path: Path) -> None:
+    """Iceberg's own bookkeeping leaks in two ways, neither self-correcting.
+
+    metadata.json is written per commit and kept forever unless the table
+    properties say otherwise. Manifest and manifest-list avro accumulate two
+    per commit and survive expire_snapshots — verified against pyiceberg
+    0.11.1. On a stream sealing every five minutes that is ~576 avro files a
+    day that nothing would ever remove.
+    """
+    config = LogConfig(
+        compact_min_files=99, snapshot_retention=timedelta(microseconds=1)
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 8)
+        avro_before = len(list(tmp_path.rglob("*.avro")))
+        assert avro_before >= 8, "one manifest list per commit, at least"
+
+        log.maintain()
+        log.maintain()  # the second pass retires what the first only queued
+
+        metadata = list(tmp_path.rglob("*.metadata.json"))
+        assert len(metadata) <= 11, f"{len(metadata)} metadata files for 8 commits"
+        assert len(list(tmp_path.rglob("*.avro"))) < avro_before, (
+            "expired snapshots' manifests were never reclaimed"
+        )
+        assert len(read_all(log)) == 32, "the data is still readable"
+
+
+def test_metadata_properties_are_applied_to_an_existing_table(tmp_path: Path) -> None:
+    """A table created before these properties existed must pick them up."""
+    with open_log(tmp_path) as log:
+        with log._table.transaction() as transaction:
+            transaction.remove_properties("write.metadata.delete-after-commit.enabled")
+
+        assert "write.metadata.delete-after-commit.enabled" not in log._table.properties
+
+    with open_log(tmp_path) as reopened:
+        assert (
+            reopened._table.properties["write.metadata.delete-after-commit.enabled"]
+            == "true"
+        )

@@ -27,6 +27,10 @@ def open_log(root: Path, config: LogConfig | None = None) -> Log:
     return Log(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), config=config)
 
 
+def open_log_readonly(root: Path) -> Log:
+    return Log(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), readonly=True)
+
+
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
     return [
         {"event_ts": 1000 + i, "key": f"k{i % 3}", "payload": b"x" * 16}
@@ -203,3 +207,79 @@ def test_capture_works_with_no_network(
         log.extend(rows(20, start=20))
         assert len(read_all(log)) == 40
         assert log.end_offset() == 41
+
+
+def test_readonly_sees_a_writer_s_committed_rows(tmp_path: Path) -> None:
+    """A second view of a live log, as the tail script uses (§1: one writer)."""
+    with open_log(tmp_path) as writer:
+        writer.extend(rows(3))
+
+        with open_log_readonly(tmp_path) as reader:
+            assert len(read_all(reader)) == 3
+
+            writer.extend(rows(2, start=3))
+            assert len(read_all(reader)) == 5, "reads are not pinned to open time"
+
+            writer.seal()
+            assert len(read_all(reader)) == 5, "still exactly once across the seal"
+
+
+def test_readonly_refuses_every_mutation(tmp_path: Path) -> None:
+    with open_log(tmp_path) as writer:
+        writer.extend(rows(2))
+
+    with open_log_readonly(tmp_path) as reader:
+        for mutate in (
+            lambda: reader.append(rows(1)[0]),
+            lambda: reader.extend(rows(1)),
+            reader.seal,
+            reader.maintain,
+        ):
+            with pytest.raises(RuntimeError, match="readonly"):
+                mutate()
+
+
+def test_readonly_will_not_create_a_log(tmp_path: Path) -> None:
+    """Opening a log that does not exist must fail rather than quietly make one."""
+    with pytest.raises(FileNotFoundError, match="no litelink log at"):
+        open_log_readonly(tmp_path / "nothing-here")
+
+
+def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
+    """The shape examples/capture.py uses (§1: one process, threads within it).
+
+    Python's sqlite3 defaults to check_same_thread=True, so without the
+    connection flag and the lock, every background maintain() raises and the
+    log grows forever while looking healthy.
+    """
+    import threading
+
+    config = LogConfig(target_size=2048, compact_below=1 << 30, compact_min_files=2)
+    failures: list[BaseException] = []
+    stop = threading.Event()
+
+    with open_log(tmp_path, config) as log:
+
+        def maintain_until_stopped() -> None:
+            while not stop.wait(0.01):
+                try:
+                    log.maintain()
+                except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
+                    failures.append(exc)
+                    return
+
+        worker = threading.Thread(target=maintain_until_stopped, daemon=True)
+        worker.start()
+        try:
+            for batch in range(40):
+                log.extend(rows(25, start=batch * 25))
+        finally:
+            stop.set()
+            worker.join(timeout=10)
+
+        assert failures == [], (
+            f"maintenance failed on the worker thread: {failures[0]!r}"
+        )
+        assert len(read_all(log)) == 1000, (
+            "concurrent maintenance lost or duplicated rows"
+        )
