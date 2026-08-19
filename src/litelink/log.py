@@ -18,6 +18,7 @@ not as documentation of working code.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,9 +39,20 @@ if TYPE_CHECKING:
     from types import TracebackType
     from typing import Self
 
+    from pyiceberg.table.snapshots import Snapshot
+
     Row = Mapping[str, object]
 
 _NAMESPACE = "litelink"
+
+# Iceberg keeps every metadata.json ever written unless told otherwise, which on
+# a stream that seals every few minutes is a file per seal, forever. These bound
+# it to the current version plus a few for rollback. Manifests are NOT covered —
+# see `_expire`.
+_METADATA_PROPERTIES = {
+    "write.metadata.delete-after-commit.enabled": "true",
+    "write.metadata.previous-versions-max": "10",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +124,12 @@ class Log:
     Single writer per log (§1): SQLite's write lock is per file, and one
     process per stream is the intended topology.
 
+    Threads within that process are fine, and scheduling `maintain()` on a
+    background thread is the expected shape — every public method takes one
+    lock. A second *process* is not: maintenance commits to the catalog and
+    writes the buffer database, so it is a writer, and two of those is the case
+    §1 excludes.
+
     Opening runs recovery — §4's `sealing` replay, which is idempotent — so a
     crashed process is repaired by the next open rather than by an operator.
     """
@@ -125,6 +143,7 @@ class Log:
         sort_by: Sequence[str],
         config: LogConfig | None = None,
         archive: str | None = None,
+        readonly: bool = False,
     ) -> None:
         """Open (or create) the log rooted at `root`.
 
@@ -135,6 +154,11 @@ class Log:
         decision, not a tuning knob: it declares which predicates prune, only a
         LEADING column prunes, and changing it later means rewriting the data.
         A capture workload usually wants `("event_ts", "key")`.
+
+        `readonly` opens a second view of a log another process is writing.
+        It runs no recovery and refuses every mutation, so it cannot disturb
+        the single writer §1 assumes. Reads see committed data only, which is
+        what durable-at-commit already means.
 
         `archive` is the remote warehouse prefix (e.g. `s3://bucket/prefix`).
         None means local-only: capture, seal, compaction, retention and reads
@@ -152,6 +176,7 @@ class Log:
 
         self.name = name
         self.root = Path(root)
+        self.readonly = readonly
         self.config = config or LogConfig()
         self._archive = archive
         self._sort_by = tuple(sort_by)
@@ -164,30 +189,59 @@ class Log:
             )
             raise ValueError(msg)
 
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / name).mkdir(parents=True, exist_ok=True)
+        if not readonly:
+            self.root.mkdir(parents=True, exist_ok=True)
+            (self.root / name).mkdir(parents=True, exist_ok=True)
 
         # `offset` leads the table schema; everything after it is the caller's
         # and is treated as opaque (§2).
         self._table_schema = pa.schema(
             [pa.field("offset", pa.int64(), nullable=False), *schema]
         )
+        if readonly and not (self.root / "catalog.db").exists():
+            msg = f"no litelink log at {self.root} (readonly opens, never creates)"
+            raise FileNotFoundError(msg)
+
         self._catalog = SqlCatalog(
             "local",
             uri=f"sqlite:///{self.root / 'catalog.db'}",
             warehouse=f"file://{self.root}",
         )
-        self._catalog.create_namespace_if_not_exists(_NAMESPACE)
+        if not readonly:
+            self._catalog.create_namespace_if_not_exists(_NAMESPACE)
+
         try:
             self._table = self._catalog.load_table(f"{_NAMESPACE}.{name}")
         except Exception:
+            if readonly:
+                raise
+
             self._table = self._catalog.create_table(
-                f"{_NAMESPACE}.{name}", schema=self._table_schema
+                f"{_NAMESPACE}.{name}",
+                schema=self._table_schema,
+                properties=_METADATA_PROPERTIES,
             )
 
-        self._buffer = Buffer(self.root / name / "buffer.db", schema)
+        if not readonly:
+            self._ensure_metadata_properties()
+
+        self._buffer = Buffer(self.root / name / "buffer.db", schema, readonly=readonly)
         self._duck: duckdb.DuckDBPyConnection | None = None
-        self._recover()
+        # One lock over every operation, so a maintenance thread and an append
+        # loop can share a Log. Coarse on purpose: a seal and a compaction both
+        # span several statements plus an Iceberg commit, and interleaving them
+        # would let a compaction supersede a range a seal is still writing into.
+        # The cost is that a read blocks behind a running compaction — worth
+        # revisiting when compaction gets long enough to notice.
+        self._lock = threading.RLock()
+
+        if not readonly:
+            self._recover()
+
+    def _writable(self) -> None:
+        if self.readonly:
+            msg = "this Log was opened readonly"
+            raise RuntimeError(msg)
 
     # -- write ------------------------------------------------------------
 
@@ -200,7 +254,10 @@ class Log:
 
         A caller-supplied `offset` is rejected (I11).
         """
-        return self.extend([row])[0]
+        with self._lock:
+            self._writable()
+
+            return self.extend([row])[0]
 
     def extend(self, rows: Iterable[Row]) -> list[int]:
         """Append many rows in ONE transaction. Returns the assigned offsets.
@@ -209,10 +266,12 @@ class Log:
         which is the whole of §3's throughput story. It carries no meaning
         beyond that — see §1 on why there is no transaction id column.
         """
-        offsets = self._buffer.append(rows)
-        self._maybe_seal()
+        with self._lock:
+            self._writable()
+            offsets = self._buffer.append(rows)
+            self._maybe_seal()
 
-        return offsets
+            return offsets
 
     # -- read -------------------------------------------------------------
 
@@ -274,6 +333,17 @@ class Log:
         if include_archive:
             msg = "archive reads are not implemented"
             raise NotImplementedError(msg)
+
+        with self._lock:
+            return self._sql_locked(query)
+
+    def _sql_locked(self, query: str) -> pa.RecordBatchReader:
+        # Resolve the table per query, never pin (§7). Reloading only after
+        # this process's own commits is not enough: a reader in another process
+        # would hold the snapshot it opened with forever, and after the writer's
+        # first seal it would see an empty buffer, an empty table, and report
+        # the log as having no rows at all.
+        self._reload()
 
         connection = self._duckdb()
         # Rebuilt per call, never cached. Every commit writes a new metadata
@@ -358,9 +428,11 @@ class Log:
         Normally automatic at `min(target_size, max_age)` (§4). Explicit seals
         are for shutdown and tests.
         """
-        extent = self._buffer.extent()
-        if extent is None:
-            return None
+        with self._lock:
+            self._writable()
+            extent = self._buffer.extent()
+            if extent is None:
+                return None
 
         start, last = extent
         end = last + 1
@@ -535,16 +607,21 @@ class Log:
         silent is open — §11 treats stalled eviction as an operational
         condition, and returning None says nothing about it.
         """
-        if self._archive is not None:
-            # I4 needs sync's registration watermark to decide what is safe to
-            # evict, and sync does not exist yet. Refusing beats evicting a file
-            # no archive has — that failure is silent and permanent.
-            msg = "maintain() with an archive configured requires sync(), which is not implemented"
-            raise NotImplementedError(msg)
+        with self._lock:
+            self._writable()
+            if self._archive is not None:
+                # I4 needs sync's registration watermark to decide what is safe
+                # to evict, and sync does not exist yet. Refusing beats evicting
+                # a file no archive has — that failure is silent and permanent.
+                msg = (
+                    "maintain() with an archive configured requires sync(), "
+                    "which is not implemented"
+                )
+                raise NotImplementedError(msg)
 
-        self._compact()
-        self._evict()
-        self._expire()
+            self._compact()
+            self._evict()
+            self._expire()
 
     def _data_files(self) -> list[_DataFile]:
         """Current data files with their offset extents, ordered by offset."""
@@ -726,9 +803,66 @@ class Log:
         running scan does not lose files underneath it (I6).
         """
         cutoff = datetime.now(UTC) - self.config.snapshot_retention
+
+        # Collect the doomed snapshots' manifest lists and manifests BEFORE
+        # expiring them. Afterwards their names exist nowhere: the metadata that
+        # referenced them is gone, and the only remaining way to find the files
+        # would be to list the directory — the thing this design refuses to do.
+        doomed = self._metadata_paths(
+            snapshot
+            for snapshot in self._table.snapshots()
+            if snapshot.timestamp_ms / 1000 < cutoff.timestamp()
+            and snapshot.snapshot_id != self._current_snapshot_id()
+        )
+
         self._table.maintenance.expire_snapshots().older_than(cutoff).commit()
         self._reload()
+
+        # Manifests are shared across snapshots, so a doomed snapshot's manifest
+        # may still be live. Filtering here rather than leaning on the drain's
+        # veto keeps permanently-referenced paths out of the queue, which would
+        # otherwise accumulate rows that can never be retired.
+        survivors = self._metadata_paths(self._table.snapshots())
+        self._enqueue(doomed - survivors)
         self._drain_deletions()
+
+    def _current_snapshot_id(self) -> int | None:
+        snapshot = self._table.current_snapshot()
+
+        return None if snapshot is None else snapshot.snapshot_id
+
+    def _metadata_paths(self, snapshots: Iterable[Snapshot]) -> set[str]:
+        """Manifest lists and manifests belonging to `snapshots`.
+
+        Iceberg's own bookkeeping, which `expire_snapshots` does not delete
+        either — verified against 0.11.1: expiring four of five snapshots left
+        all ten avro files on disk. Two per commit accumulates fast on a stream
+        that seals every few minutes.
+        """
+        paths: set[str] = set()
+        for snapshot in snapshots:
+            paths.add(str(snapshot.manifest_list).removeprefix("file://"))
+            paths.update(
+                str(manifest.manifest_path).removeprefix("file://")
+                for manifest in snapshot.manifests(self._table.io)
+            )
+
+        return paths
+
+    def _ensure_metadata_properties(self) -> None:
+        """Apply the metadata-retention properties to a table that predates them."""
+        missing = {
+            key: value
+            for key, value in _METADATA_PROPERTIES.items()
+            if self._table.properties.get(key) != value
+        }
+        if not missing:
+            return
+
+        with self._table.transaction() as transaction:
+            transaction.set_properties(missing)
+
+        self._reload()
 
     def _drain_deletions(self) -> None:
         """Delete files whose grace period has passed (§6, §8).
@@ -755,7 +889,7 @@ class Log:
         referenced = {
             str(path).removeprefix("file://")
             for path in self._table.inspect.all_files()["file_path"].to_pylist()
-        }
+        } | self._metadata_paths(self._table.snapshots())
 
         for rel_path in due:
             path = self.root / rel_path

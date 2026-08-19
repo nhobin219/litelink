@@ -61,3 +61,15 @@ check: lint format-check typecheck test
 # Build the wheel + sdist into dist/
 build:
     uv build
+
+# Capture into ./litelink-data, maintaining on a background thread. Ctrl-C to stop.
+demo-capture *args:
+    uv run python examples/capture.py {{args}}
+
+# Watch a running capture accumulate. Run alongside `just demo-capture`.
+demo-tail *args:
+    uv run python examples/tail.py {{args}}
+
+# Write and read throughput on this machine. --quick for a smaller run.
+bench *args:
+    uv run python examples/benchmark.py {{args}}
