@@ -77,6 +77,17 @@ ignore = ["E501"]
 
 [tool.ruff.format]
 
+# pyiceberg's LiteralPredicate takes (term, literal) at runtime — verified —
+# but ty resolves a different __init__ through the expression hierarchy and
+# reports every construction as missing its arguments. Scoped to the one module
+# that builds predicates so the suppression cannot hide a real call error
+# anywhere else.
+[[tool.ty.overrides]]
+include = ["src/litelink/_predicates.py"]
+[tool.ty.overrides.rules]
+missing-argument = "ignore"
+too-many-positional-arguments = "ignore"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Must be the ini form, not `addopts = ["--strict-markers"]`: on pytest 9 the
