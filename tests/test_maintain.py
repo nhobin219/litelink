@@ -387,3 +387,71 @@ def test_metadata_properties_are_applied_to_an_existing_table(tmp_path: Path) ->
             reopened._table.properties["write.metadata.delete-after-commit.enabled"]
             == "true"
         )
+
+
+def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
+    """The summaries are a shortcut, so they have to agree with the long way.
+
+    `file_count` and `record_count` read the manifest LIST, which summarises
+    each manifest — one file, rather than opening every manifest to walk its
+    entries. The risk is the arithmetic: live files are ADDED plus EXISTING, and
+    compaction and eviction both leave DELETED tombstones behind that must not
+    be counted.
+    """
+    config = LogConfig(
+        target_size=1 << 40,
+        compact_below=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+    )
+
+    with open_log(tmp_path, config) as log:
+        table = log._table
+
+        def agrees(stage: str) -> None:
+            table._counts_at = table._extent_at = None
+            files = table.data_files()
+
+            assert table.file_count() == len(files), stage
+            assert table.record_count() == sum(f.rows for f in files), stage
+
+        for i in range(4):
+            log.extend(rows(50, start=i * 50))
+            log.seal()
+
+        agrees("after seals")
+
+        log._maintenance.compact()
+        agrees("after compaction")
+
+        log.extend(rows(50, start=200))
+        log.seal()
+        agrees("seal after compaction")
+
+        log._maintenance.evict()
+        agrees("after eviction")
+
+        assert table.file_count() == 0, "eviction removed everything"
+
+
+def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
+    """One manifest per seal is what made the boundary read expensive.
+
+    Each commit writes its own manifest, so N data files became N manifest avro
+    files and deriving the boundary meant opening every one. Measured at 60
+    files: 60 manifests and a 45 ms read, against 1 manifest and 2.3 ms merged.
+    """
+    with open_log(tmp_path, LogConfig(compact_min_files=99)) as log:
+        for i in range(8):
+            log.extend(rows(20, start=i * 20))
+            log.seal()
+
+        table = log._table._table
+        snapshot = table.current_snapshot()
+        assert snapshot is not None
+        manifests = snapshot.manifests(table.io)
+
+        assert log.table_files() == 8, "eight seals, eight data files"
+        assert len(manifests) < 8, (
+            f"{len(manifests)} manifests for 8 files — not merging"
+        )

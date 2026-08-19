@@ -38,6 +38,23 @@ _COMMIT_ATTEMPTS = 5
 METADATA_PROPERTIES = {
     "write.metadata.delete-after-commit.enabled": "true",
     "write.metadata.previous-versions-max": "10",
+    # Each commit otherwise writes its own manifest, and litelink commits one
+    # file per seal — so a table of N data files becomes N manifest avro files,
+    # and deriving the tier boundary means opening every one of them. Measured
+    # at 60 files: 60 manifests and a 45 ms boundary read, against 1 manifest
+    # and 2.3 ms with merging on.
+    #
+    # It is not a trade against write cost, which is what makes the choice easy.
+    # Accumulated manifests slow every later commit too, since each rewrites a
+    # manifest list naming all of them: the same 60 seals ran at a 110 ms median
+    # unmerged and 65 ms merged.
+    #
+    # min-count 2 merges on essentially every commit, which is as close as this
+    # property gets to the one manifest a stream actually wants. Iceberg's
+    # default is 100 — sized for batch jobs, and hours of accumulation for a
+    # stream that seals every few minutes.
+    "commit.manifest-merge.enabled": "true",
+    "commit.manifest.min-count-to-merge": "2",
 }
 
 
@@ -68,8 +85,13 @@ class LogTable:
         # `extent`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
         # materialising every file's metadata.
+        # Two caches, both keyed by the metadata pointer, because they come from
+        # different depths of the metadata tree. Counts are summarised in the
+        # manifest list; per-file bounds are only in the manifest entries, which
+        # means opening each manifest.
         self._extent_at: str | None = None
         self._extent: tuple[int, int] | None = None
+        self._counts_at: str | None = None
         self._file_count = 0
         self._record_count = 0
 
@@ -222,34 +244,53 @@ class LogTable:
     def file_count(self) -> int:
         """How many data files the current snapshot holds.
 
-        Counted while reading the manifests for the extent, not by way of
-        `data_files()` — that materialises an eighteen-column Arrow table per
-        file, measured at 8.7 ms over six files to answer a question that is one
-        integer.
+        From the manifest list, which summarises each manifest — so this reads
+        one file rather than opening every manifest. Measured at 60 files:
+        0.65 ms against 42.9 ms for the entry walk.
         """
-        self._refresh()
+        self._refresh_counts()
 
         return self._file_count
 
     def record_count(self) -> int:
         """How many rows the current snapshot holds.
 
-        Iceberg tracks this per file, so it comes off the same manifest read as
-        the extent. Counting the sealed rows by scanning instead reads the
-        offset column out of every Parquet file — correct, and proportional to
-        the data, which is the wrong shape for anything polling.
+        Also summarised in the manifest list. Counting by scanning instead reads
+        the offset column out of every Parquet file — correct, and proportional
+        to the data, which is the wrong shape for anything polling.
         """
-        self._refresh()
+        self._refresh_counts()
 
         return self._record_count
+
+    def _refresh_counts(self) -> None:
+        location = self.metadata_location
+        if location == self._counts_at:
+            return
+
+        snapshot = self._table.current_snapshot()
+        files = records = 0
+        if snapshot is not None:
+            for manifest in snapshot.manifests(self._table.io):
+                # Live entries are ADDED plus EXISTING; DELETED are tombstones
+                # a compaction or eviction left behind.
+                files += (manifest.added_files_count or 0) + (
+                    manifest.existing_files_count or 0
+                )
+                records += (manifest.added_rows_count or 0) + (
+                    manifest.existing_rows_count or 0
+                )
+
+        self._file_count, self._record_count = files, records
+        self._counts_at = location
 
     def _refresh(self) -> None:
         location = self.metadata_location
         if location != self._extent_at:
-            self._extent, self._file_count, self._record_count = self._read_snapshot()
+            self._extent = self._read_extent()
             self._extent_at = location
 
-    def _read_snapshot(self) -> tuple[tuple[int, int] | None, int, int]:
+    def _read_extent(self) -> tuple[int, int] | None:
         """Offset bounds straight off the manifest entries.
 
         Deliberately not `inspect.files()`, which materialises an 18-column
@@ -259,17 +300,15 @@ class LogTable:
         """
         snapshot = self._table.current_snapshot()
         if snapshot is None:
-            return None, 0, 0
+            return None
 
         field = self._table.schema().find_field("litelink_offset")
         lows: list[int] = []
         highs: list[int] = []
-        records = 0
         for manifest in snapshot.manifests(self._table.io):
             for entry in manifest.fetch_manifest_entry(
                 self._table.io, discard_deleted=True
             ):
-                records += entry.data_file.record_count
                 lows.append(
                     from_bytes(
                         field.field_type, entry.data_file.lower_bounds[field.field_id]
@@ -281,9 +320,7 @@ class LogTable:
                     )
                 )
 
-        extent = None if not lows else (min(lows), max(highs))
-
-        return extent, len(lows), records
+        return None if not lows else (min(lows), max(highs))
 
     def file_paths(self) -> set[str]:
         return {f.path for f in self.data_files()}
