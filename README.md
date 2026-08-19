@@ -2,7 +2,11 @@
 
 Durable append-only capture into Iceberg tables. Local-first, in-process, no service.
 
-**Status: specification only.** Nothing is implemented yet. See [`docs/SPEC.md`](docs/SPEC.md).
+**Status: early.** The local capture loop works — append, seal, read, compact, evict,
+expire — against a local Iceberg table. The archive tier does not: `sync()` and archive
+reads raise `NotImplementedError`, so today this is durable local capture into Iceberg
+rather than the full three-tier design. Schema evolution is likewise unimplemented. The
+design is [`docs/SPEC.md`](docs/SPEC.md), and it is ahead of the code.
 
 ---
 
@@ -63,6 +67,8 @@ Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
 ## Extensions
 
+Not implemented; specified.
+
 **Blob fields** ([`docs/SPEC.md`](docs/SPEC.md) §15) — payloads too large for the buffer
 (sensor frames, point clouds, raw response bodies). Bytes stage beside SQLite while hot and
 are inlined into Iceberg at seal, so the archive stays ordinary Iceberg with a `binary`
@@ -73,6 +79,37 @@ compaction rather than becoming a hand-maintained refcount.
 
 Payload encoding, local-disk backpressure, bulk ingest, and extension provisioning for
 embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
+
+## Using it
+
+```python
+import pyarrow as pa
+from litelink import Log
+
+schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("payload", pa.large_binary())])
+
+# new() takes the shape; it is fixed at creation.
+log = Log.new("data", "sensors", schema=schema, sort_by=("event_ts",))
+log.append({"event_ts": 1, "payload": b"..."})     # durable when this returns
+
+# open() takes none of it — schema, sort order, config and archive all come
+# from the log itself.
+log = Log.open("data", "sensors")
+log = Log.open("data", "sensors", read_only=True)  # alongside a live writer
+
+rows = log.scan(where="event_ts > 1000").read_all()
+log.maintain()                                     # compact, evict, expire
+```
+
+## Try it
+
+```
+just demo-capture      # append continuously, maintaining on a background thread
+just demo-tail         # in another terminal: watch the log accumulate
+just bench --quick     # write and read throughput on your hardware
+```
+
+See [`examples/`](examples/).
 
 ## Development
 

@@ -306,6 +306,13 @@ in sync that is correctness, not optimisation (I4).
 
 Sync records what it has registered in `meta`, keyed by the local table's snapshot ID.
 
+**Steps 4 and 5 do not belong to sync.** Snapshot expiry and local eviction are local
+storage work; they are listed here because eviction must respect the registration watermark
+step 2 writes. But every other step is archive work, so a log configured with no archive
+never runs this pass at all — and would then never expire a snapshot or honour
+`local_retention`, leaving the knob silently inert. They are owned by `maintain()` (§12),
+which reads that same watermark to enforce I4 and runs with or without an archive.
+
 ---
 
 ## 6. Compaction
@@ -337,6 +344,42 @@ double count. No grace window is needed for *correctness*.
 
 Snapshot expiry still needs one: expiring the pre-compaction snapshot deletes files a
 long-running scan may still hold open. Retain snapshots for at least `snapshot_retention`.
+
+**Expiry does not delete the files, and the library must.** Verified against pyiceberg
+0.11.1: `maintenance.expire_snapshots()` drops the snapshot metadata and nothing else — after
+expiring three snapshots, `inspect.all_files()` is empty and all three Parquet files are still
+on disk. So an expiry-only implementation reclaims no space at all, and both retention knobs
+become inert as disk controls.
+
+**Reclamation is a queue in SQLite, not a scan of the filesystem.** §11's *"the orphaned
+file is unreferenced and swept"* invites a sweep, and a sweep is the wrong mechanism: finding
+orphans by listing directories costs a walk proportional to everything retained, and becomes a
+paginated LIST against object storage — priced per request, and eventually consistent, so it
+can report a file that no longer exists or miss one that does.
+
+The alternative is to make orphans impossible rather than discoverable. Every data file the
+library creates has its path written to SQLite *before* it is written to disk:
+
+| table | names | so that |
+|---|---|---|
+| `sealing` | a seal's output | I2 — a retry overwrites in place |
+| `compacting` | a compaction's output | a crash mid-write is removable by name |
+| `pending_delete` | superseded files | the grace period outlives the commit that ended them |
+
+Compaction therefore writes its own Parquet at a claimed path and commits `delete` +
+`add_files` in **one Iceberg transaction**, rather than calling `overwrite()`. Both produce a
+single snapshot; only the first leaves the process knowing the filename in advance.
+
+A file is then always in exactly one of four states — referenced by a live snapshot, claimed
+by an in-flight seal, claimed by an in-flight compaction, or queued for deletion — and each is
+a keyed read. Reclaiming space is draining `pending_delete` for rows superseded longer ago
+than `snapshot_retention`, checking each against the live references, unlinking, and only then
+forgetting the row: a crash between the unlink and the forget retries a no-op, whereas the
+reverse order loses the path with the file still on disk.
+
+Store when a file was superseded, not a precomputed deadline. The grace period is
+`snapshot_retention`, and freezing it at enqueue time means a lowered setting never applies to
+anything already queued.
 
 **Compaction is local, which is what makes it affordable.** An object-store-native design
 downloads sources, merges, and uploads, paying egress on the download. Here each byte
@@ -504,6 +547,25 @@ proportional. Everything else is the cost of reading Parquet, which is what a re
 pay anyway. That is the performance claim worth making: *the read speed of reading Parquet
 directly*.
 
+**Fixed is a property of the implementation, not of the design, and it has to be earned.**
+The boundary comes from manifest statistics, and reading those costs time proportional to
+*file count*: measured at 1.0 ms over one file and 44 ms over 64, which at the small-file
+counts a `max_age` seal produces is most of a read. Two things bring it back to fixed.
+
+Read the offset bounds off the manifest entries rather than through a full file-metadata
+materialisation — pyiceberg's `inspect.files()` builds an eighteen-column Arrow table,
+including `readable_metrics`, which decodes the bounds of every column to answer a question
+about one. Roughly half the cost, and it still opens no data file.
+
+Then cache the extent against `metadata_location`. That pointer is the table version, so an
+unchanged pointer is the same snapshot and the extent cannot have moved; a changed one is
+exactly when the manifests must be read again. This does not weaken *"resolve per query,
+never pin"* — the resolve still happens, at ~0.5 ms, and is what decides whether the cache
+stands. Measured warm: 0.38 ms at one file, 1.05 ms at 64, against 44 ms uncached.
+
+What remains proportional after that is the scan itself opening each file, which is the
+cost compaction exists to bound.
+
 **Always bound on a prefix of `sort_by`.** Not merely on *a* sort column — on a leading one.
 With `sort_by=(a, b)`, values of `b` are ordered only *within* equal values of `a`, so a
 predicate on `b` alone leaves per-file min/max spanning nearly the whole range and nothing
@@ -587,6 +649,20 @@ over the network. That is the right setting for pure archival capture — liteli
 durable staging area into Iceberg — and the wrong one wherever a hot reader looks back
 further than `max_age`. It does not weaken I4: eviction still never precedes registration.
 
+**With no archive, retention is deletion, and that is the intended contract.** I4 forbids
+evicting a file the archive still lacks — but nothing is owed to an archive that does not
+exist, so the invariant is vacuous and `local_retention` becomes an ordinary retention
+policy over the only copy. Data past the window is gone for good.
+
+That is the right shape for a bounded local capture window, and it is worth stating plainly
+because I4's rationale is literally *"eviction before registration is data loss."* Here the
+loss is the operator's instruction rather than a bug, and the two are distinguishable only
+by whether an archive was configured. `local_retention = None` is the setting that keeps
+everything, at unbounded local growth.
+
+`local_retention = 0` presupposes an archive: with none, it would delete each file as it
+sealed. Reject the pair at construction rather than honouring it.
+
 Raising it is an operation, not a config change: `hydrate(since=…)` fetches archived files
 and re-registers them into the local table. Without it, a raised setting applies only to
 data captured afterwards.
@@ -619,10 +695,59 @@ ceremony.
 Apply any schema change to the archive **first**. The local table is a window and can be
 rebuilt; the archive cannot.
 
+**A schema change is complete when SQLite says so, not when Iceberg does.** Iceberg cannot
+hold the whole declaration: it has one string type and one binary type, so a column declared
+as a wide Arrow type comes back narrow, and the declared spelling has to live in the local
+database beside the buffer. That makes a schema change two writes — an Iceberg commit and a
+SQLite write — which cannot be made atomic with each other, for the same reason §7 gives for
+not requiring an atomic handoff between two catalogs.
+
+Use §4's shape, not a best-effort ordering: record the intended schema in SQLite before
+anything changes, commit to Iceberg, then write the schema and clear the intent. Recovery
+replays it, and the table's columns say which half already landed.
+
+This is the same completion boundary every other multi-step operation here uses — a seal
+completes at its final SQLite transaction, a compaction when its claim is cleared, a deletion
+when its queue row is forgotten. **Iceberg holds the data; SQLite holds the record of what the
+library has finished doing.** Treating the Iceberg commit as completion would leave a crash
+having added a column whose declared type is gone, with nothing to indicate it.
+
 Nothing is ever lost to a schema mistake: the raw `payload` is stored verbatim, so a column
 can be re-promoted under any name at any time.
 
 ## 10. Invariants
+
+### SQLite is the coordinator
+
+Iceberg gives an atomic commit **to one table**, and that is worth relying on — §6's
+compaction rests on it, swapping the snapshot pointer so readers never observe a gap or a
+double count. What it gives across systems is nothing, and every operation here spans
+systems: a seal touches the buffer, a file and the table; a compaction touches a file, the
+table and the deletion queue; a schema change touches the table and the declared Arrow
+schema. There is no commit that covers a pair of those.
+
+So the local database is the coordinator, and the protocol is the same one four times over:
+
+```
+1. record the intent in SQLite        -- before anything observable changes
+2. do the work, ending in the Iceberg commit
+3. record completion in SQLite        -- and clear the intent
+```
+
+`sealing` is step 1 for a seal, `compacting` for a compaction, `pending_delete` for a
+deletion, and a schema change needs its own. **An operation is complete when step 3 lands,
+not when the Iceberg commit does.**
+
+This is not two-phase commit, and it is better suited than 2PC would be: there is no vote and
+no participant that can veto, because **the true state is always derivable**. Recovery asks
+the table which half already happened — does it contain this path, does it hold this column —
+and drives forward or gives up accordingly. Every step is idempotent, so replaying costs a
+rewrite at worst.
+
+The rule that follows: **never treat an Iceberg commit as the completion of anything that
+also touched local state.** Doing so leaves a crash having half-applied an operation with
+nothing recording that it was ever attempted, which is the one situation none of the
+recovery paths below can repair.
 
 Each needs a test.
 
@@ -631,7 +756,7 @@ Each needs a test.
 | **I1** | The Parquet file is written and fsynced before the Iceberg commit. | The reverse publishes a manifest entry for a file that may not exist. |
 | **I2** | The seal range is persisted before the file is written. | Makes the path deterministic, so retries overwrite instead of orphaning. |
 | **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The archive overlaps the local window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
-| **I4** | A file is never evicted from the local table before it is registered in the archive. | Eviction before registration is data loss. |
+| **I4** | A file is never evicted from the local table while a configured archive still lacks it. Vacuous when no archive is configured (§8). | Eviction before registration is data loss. With no archive nothing is owed, and `local_retention` is then a deletion policy the operator asked for — see §8. |
 | **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
 | **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
@@ -639,6 +764,7 @@ Each needs a test.
 | **I9** | `offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
 | **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
+| **I16** | Every operation spanning Iceberg and local state records its intent in SQLite before acting, and is complete only once SQLite records completion. | Iceberg's atomicity stops at one table, so nothing spanning two systems can be committed at once. Without the intent record a crash leaves work half-applied and unattributable; without the completion record the library cannot tell a finished operation from an interrupted one. |
 
 ---
 
@@ -672,8 +798,15 @@ compact_min_files      minimum adjacent files to compact  (e.g. 4)
 sort_by                within-file sort order              (capture default: event_ts, key)
 ```
 
-`maintain()` runs compaction **and** expiry together. Compaction alone increases storage,
-since superseded files stay referenced until their snapshots expire.
+`maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no
+archive. Each is a no-op or a regression without the others: compaction alone increases
+storage, since superseded files stay referenced until their snapshots expire; eviction alone
+frees no disk, since it removes a file from the current snapshot while the previous one still
+references it; and expiry is what actually deletes bytes, held back by `snapshot_retention`
+so a running scan does not lose files underneath it (I6).
+
+The consequence worth planning for is that local disk holds roughly
+`local_retention + snapshot_retention` of data, not `local_retention`.
 
 ---
 
