@@ -7,6 +7,7 @@ loss a SIGKILL could expose.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from typing import TYPE_CHECKING
 
@@ -200,7 +201,20 @@ class Buffer:
 
             cursor.execute("COMMIT")
         except BaseException:
-            cursor.execute("ROLLBACK")
+            # Best-effort, and it must not raise over the original. An
+            # interrupt landing inside COMMIT leaves no transaction to roll
+            # back, and the bare version turned a Ctrl-C into
+            # "cannot rollback - no transaction is active" with the real cause
+            # buried underneath it.
+            #
+            # Note what that case means: the COMMIT had already succeeded, so
+            # the rows ARE durable while this reports failure. That direction is
+            # the safe one — the caller retrying would duplicate rows, whereas
+            # believing a durable append failed costs only a redundant retry
+            # that AUTOINCREMENT will assign fresh offsets to.
+            with contextlib.suppress(sqlite3.OperationalError):
+                cursor.execute("ROLLBACK")
+
             raise
 
         self._bytes += added

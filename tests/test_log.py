@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -286,3 +288,53 @@ def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
         assert len(read_all(log)) == 1000, (
             "concurrent maintenance lost or duplicated rows"
         )
+
+
+def test_an_interrupt_inside_commit_is_not_masked(tmp_path: Path) -> None:
+    """Cleanup must not raise over the exception that caused it.
+
+    An interrupt landing inside COMMIT leaves no transaction to roll back, and
+    a bare ROLLBACK in the handler then raises OperationalError with the real
+    cause buried underneath — which is how a Ctrl-C during `just demo-capture`
+    became a crash instead of a clean stop.
+    """
+
+    class InterruptingCursor:
+        """Commits for real, then raises as an interrupt would."""
+
+        def __init__(self, cursor: sqlite3.Cursor) -> None:
+            self._cursor = cursor
+
+        # `Any` for the parameters: this only forwards, and sqlite3's own
+        # accepted type is a union of protocols not worth restating in a proxy.
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            result = self._cursor.execute(sql, parameters)
+            if sql == "COMMIT":
+                raise KeyboardInterrupt
+
+            return result
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._cursor, name)
+
+    class InterruptingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def cursor(self) -> InterruptingCursor:
+            return InterruptingCursor(self._connection.cursor())
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+    with open_log(tmp_path) as log:
+        real = log._buffer._con
+        log._buffer._con = cast("sqlite3.Connection", InterruptingConnection(real))
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                log.append(rows(1)[0])
+        finally:
+            log._buffer._con = real
+
+        # The COMMIT did land, so the row is durable despite the raise.
+        assert len(read_all(log)) == 1

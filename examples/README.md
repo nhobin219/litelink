@@ -7,7 +7,17 @@ just demo-capture      # append continuously, maintain on a daemon thread
 just demo-tail         # in another terminal: watch it accumulate
 ```
 
+```
+just demo-clean        # delete the captured data when you are done
+```
+
 Benchmarks live in [`benchmarks/`](../benchmarks/).
+
+The demo keeps its data on purpose — `tail.py` reads it after the writer stops, and it is
+there to poke at — so nothing removes it automatically, and `local_retention` is left unset
+so the window grows without bound. Roughly 25 MB per 30 seconds at the default rate. A real
+deployment sets a retention and lets `maintain()` hold the size; the benchmarks, which have
+nothing to inspect afterwards, run in a temp directory and clean up on exit.
 
 `capture.py` is the operational shape of a litelink process: a main thread appending —
 durable when `extend()` returns, with no buffer to flush — and a daemon thread calling
