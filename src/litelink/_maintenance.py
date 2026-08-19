@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable
 
     import pyarrow as pa
 
@@ -41,20 +41,20 @@ class Maintenance:
         buffer: Buffer,
         layout: Layout,
         config: LogConfig,
-        sort_by: Sequence[str],
+        sort_by: tuple[str, ...],
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
         self._config = config
-        self._sort_by = tuple(sort_by)
+        self._sort_by = sort_by
 
     def set_config(self, config: LogConfig) -> None:
         """Adopt new policy in place, rather than being rebuilt around it."""
         self._config = config
 
-    def set_sort_by(self, sort_by: Sequence[str]) -> None:
-        self._sort_by = tuple(sort_by)
+    def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
+        self._sort_by = sort_by
 
     def run(self) -> None:
         self.compact()

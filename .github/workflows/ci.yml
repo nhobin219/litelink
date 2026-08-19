@@ -70,6 +70,13 @@ jobs:
       # an offline deployment target would run. This is what catches a new
       # extension being added to the read path without being added here.
       - run: uv run python scripts/install_duckdb_extensions.py --check
+      # tests/test_offline.py proves I5 by running the capture loop inside a
+      # network namespace, which Ubuntu blocks for unprivileged users through
+      # AppArmor. Without this the suite still passes — the tests skip — and
+      # the library's central claim quietly stops being checked anywhere.
+      # Tolerated if the knob is absent, since the skip is then correct.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: uv run pytest -q
 
   ci-success:
