@@ -1,19 +1,20 @@
 """Shared shape for the example scripts, so writer and reader agree.
 
-A market-data feed of the kind litelink is for: a websocket delivering tabular
-JSON faster than anyone wants to think about, which has to be durable the
-moment it arrives and queryable a moment later.
+An ADS-B feed: aircraft broadcasting their position, arriving over a websocket
+as tabular JSON faster than anyone wants to think about, and needing to be
+durable the moment it arrives and queryable a moment later.
 
 The frame is parsed into columns rather than stored whole. That is the point of
-declaring a schema — every field prunes from Iceberg statistics, and a query for
-one symbol in one minute never reads the rest.
+declaring a schema — every field prunes from Iceberg statistics, so a query for
+one aircraft over one minute never reads the rest.
 
-`ingest_ts` is stamped by the application, never by the library — §2 is
-explicit that a library cannot know which of several defensible "ingest times"
-a caller meant, and a market feed is exactly where that matters: the exchange
-timestamp, the moment the frame arrived, and the moment it was committed are
-three different numbers and only the application knows which one its analytics
-mean.
+`ingest_ts` is stamped by the application, never by the library. §2 is explicit
+that a library cannot know which of several defensible "ingest times" a caller
+meant, and a position feed is exactly where it matters: the moment the aircraft
+transmitted, the moment the receiver decoded it, and the moment it was committed
+are three different numbers, and only the application knows which its analytics
+mean. Keeping both is what makes a point-in-time read possible — `event_ts` for
+"where was it", `ingest_ts` for "what did we know, and when".
 """
 
 from __future__ import annotations
@@ -31,42 +32,54 @@ SCHEMA = pa.schema(
     [
         pa.field("event_ts", pa.int64(), nullable=False),
         pa.field("ingest_ts", pa.int64(), nullable=False),
-        pa.field("symbol", pa.string()),
-        pa.field("price", pa.float64()),
-        pa.field("size", pa.int64()),
-        pa.field("exchange", pa.string()),
+        pa.field("icao24", pa.string()),
+        pa.field("callsign", pa.string()),
+        pa.field("altitude_ft", pa.int64()),
+        pa.field("speed_kt", pa.float64()),
+        pa.field("heading_deg", pa.float64()),
     ]
 )
 
 # §7: predicates prune only on a LEADING sort column, so this declares that
-# time-bounded reads are the cheap ones and per-symbol scans are not. A desk
-# that mostly asks "everything in this minute" wants exactly this; one that
-# mostly asks "this symbol, all day" wants ("symbol", "event_ts") instead.
-SORT_BY = ("event_ts", "symbol")
+# time-bounded reads are the cheap ones and per-aircraft scans are not. A feed
+# mostly asked "everything in this minute" wants exactly this; one mostly asked
+# "this tail number, all day" wants ("icao24", "event_ts") instead — and
+# changing it later rewrites every file.
+SORT_BY = ("event_ts", "icao24")
 
-NAME = "trades"
+NAME = "positions"
 
-SYMBOLS = ["AAPL", "MSFT", "NVDA", "SPY", "TSLA", "AMZN", "GOOG", "META"]
-EXCHANGES = ["XNAS", "XNYS", "ARCX", "BATS", "EDGX"]
+# Real ICAO 24-bit addresses are hex; these are made up.
+AIRCRAFT = [(f"{0xA00000 + i * 7919:06x}", f"UAL{100 + i}") for i in range(48)]
 
 
 def observations(seed: int | None = None) -> Iterator[dict[str, object]]:
-    """An endless stream of plausible trade prints."""
+    """An endless stream of plausible position reports."""
     rng = random.Random(seed)
-    last = dict.fromkeys(SYMBOLS, 100.0)
+    state = {
+        icao: (
+            rng.randrange(28_000, 41_000),
+            rng.uniform(380, 520),
+            rng.uniform(0, 360),
+        )
+        for icao, _ in AIRCRAFT
+    }
 
     while True:
-        symbol = rng.choice(SYMBOLS)
-        last[symbol] = max(1.0, last[symbol] * (1 + rng.gauss(0, 0.0004)))
-        price = round(last[symbol], 4)
-        size = rng.choice((100, 200, 300, 500, 1_000))
-        event = time.time_ns() - rng.randrange(0, 5_000_000)
+        icao, callsign = rng.choice(AIRCRAFT)
+        altitude, speed, heading = state[icao]
+        altitude = max(1_000, altitude + rng.choice((-100, 0, 0, 100)))
+        speed = max(120.0, speed + rng.gauss(0, 1.5))
+        heading = (heading + rng.gauss(0, 0.4)) % 360
+        state[icao] = (altitude, speed, heading)
 
         yield {
-            "event_ts": event,
+            # Transmitted a moment before we saw it, as a real feed is.
+            "event_ts": time.time_ns() - rng.randrange(0, 900_000_000),
             "ingest_ts": time.time_ns(),
-            "symbol": symbol,
-            "price": price,
-            "size": size,
-            "exchange": rng.choice(EXCHANGES),
+            "icao24": icao,
+            "callsign": callsign,
+            "altitude_ft": altitude,
+            "speed_kt": round(speed, 1),
+            "heading_deg": round(heading, 1),
         }

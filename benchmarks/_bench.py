@@ -28,20 +28,20 @@ SCHEMA = pa.schema(
     [
         pa.field("event_ts", pa.int64(), nullable=False),
         pa.field("ingest_ts", pa.int64(), nullable=False),
-        pa.field("symbol", pa.string()),
-        pa.field("price", pa.float64()),
-        pa.field("size", pa.int64()),
+        pa.field("icao24", pa.string()),
+        pa.field("altitude_ft", pa.int64()),
+        pa.field("speed_kt", pa.float64()),
         # Sized by --payload, and present only to vary the row width these
         # benchmarks measure throughput against. A real schema would not carry
         # it; §3's numbers are stated per row, so the width has to be a knob.
         pa.field("note", pa.string()),
     ]
 )
-SORT_BY = ("event_ts", "symbol")
+SORT_BY = ("event_ts", "icao24")
 
 # The column list the raw-SQLite comparison has to mirror exactly, or it is not
 # measuring the same insert.
-COLUMNS = ("event_ts", "ingest_ts", "symbol", "price", "size", "note")
+COLUMNS = ("event_ts", "ingest_ts", "icao24", "altitude_ft", "speed_kt", "note")
 
 # Large enough that nothing seals underneath a measurement by accident.
 NEVER_SEAL = LogConfig(target_size=1 << 40, snapshot_retention=timedelta(days=1))
@@ -51,15 +51,15 @@ def observations(
     payload_bytes: int = 400, seed: int = 0
 ) -> Iterator[dict[str, object]]:
     rng = random.Random(seed)
-    symbols = ["AAPL", "MSFT", "NVDA", "SPY", "TSLA", "AMZN", "GOOG", "META"]
+    aircraft = [f"{0xA00000 + i * 7919:06x}" for i in range(48)]
     while True:
         now = time.time_ns()
         yield {
             "event_ts": now,
             "ingest_ts": now,
-            "symbol": rng.choice(symbols),
-            "price": round(rng.uniform(10, 500), 4),
-            "size": rng.choice((100, 200, 500, 1_000)),
+            "icao24": rng.choice(aircraft),
+            "altitude_ft": rng.randrange(1_000, 41_000),
+            "speed_kt": round(rng.uniform(120, 520), 1),
             "note": f"{rng.getrandbits(4 * payload_bytes):0{payload_bytes}x}",
         }
 
