@@ -280,6 +280,24 @@ stranded.
 boundary in §7, so the window between steps 2 and 3 is safe in both directions and needs no
 `sealed` flag.
 
+**Every commit writes a manifest, so the table must be told to merge them.** A seal is one
+commit, so without merging a table of N data files accumulates N manifest avro files — and
+§7's boundary, which reads per-file bounds out of the manifest entries, has to open every one
+of them. Measured at 60 files: 60 manifests and a 45 ms boundary read, against 1 manifest and
+2.3 ms with `commit.manifest-merge.enabled` and a `min-count-to-merge` of 2. Iceberg defaults
+the property off with a threshold of 100, which suits batch jobs and means hours of
+accumulation for a stream sealing every few minutes.
+
+Merging is not a trade against write cost. Accumulated manifests slow every later commit too,
+since each rewrites a manifest list naming all of them: 60 seals ran at a 110 ms median
+unmerged against 65 ms merged.
+
+**It does couple the seal to the file count**, because merging rewrites a manifest holding
+every live file. That is what compaction already bounds — with compaction running the file
+count peaked at 11 and seals held a 82 ms median, while the same workload with compaction
+disabled reached 400 files and 426 ms seals. Worth knowing as a feedback loop: compaction
+falling behind makes sealing more expensive, not just reads.
+
 **Recovery.** On startup, if `sealing` holds a row: if the local table already contains that
 path, run step 3; otherwise redo step 2. Idempotent either way.
 
