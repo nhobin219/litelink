@@ -52,7 +52,15 @@ def main() -> None:
         snapshot_retention=timedelta(seconds=30),
     )
 
-    log = Log.open(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
+    # new() creates and takes the shape; open() recovers it. A service that
+    # restarts wants the second, and must not fail because the log is already
+    # there — so the choice is made by whether it exists.
+    if (args.root / "catalog.db").exists():
+        log = Log.open(args.root, NAME)
+        log.set_config(config)
+    else:
+        log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
+
     stop = threading.Event()
     maintainer = threading.Thread(
         target=maintain_forever, args=(log, args.maintain_every, stop), daemon=True

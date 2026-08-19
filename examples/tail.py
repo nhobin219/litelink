@@ -15,7 +15,7 @@ import argparse
 import time
 from pathlib import Path
 
-from _stream import NAME, SCHEMA, SORT_BY
+from _stream import NAME
 
 from litelink import Log
 
@@ -41,7 +41,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log = Log.open_readonly(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY)
+    log = Log.open(args.root, NAME, read_only=True)
     print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.\n")
     print(f"{'total':>12} {'in table':>12} {'in buffer':>12} {'files':>7} {'read':>8}")
 
@@ -60,6 +60,15 @@ def main() -> None:
             previous = total
             time.sleep(args.every)
     except KeyboardInterrupt:
+        print("\nstopped")
+    except RuntimeError as exc:
+        # Ctrl-C landing inside a DuckDB call comes back as
+        # RuntimeError("Query interrupted") rather than KeyboardInterrupt —
+        # DuckDB unwinds its own execution first. Matched narrowly rather than
+        # catching RuntimeError outright, which would swallow a real failure.
+        if "interrupted" not in str(exc).lower():
+            raise
+
         print("\nstopped")
     finally:
         log.close()

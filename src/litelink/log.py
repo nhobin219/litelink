@@ -16,6 +16,7 @@ are the design, and they raise.
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -39,6 +40,11 @@ if TYPE_CHECKING:
     from typing import Self
 
     Row = Mapping[str, object]
+
+# Keys in the buffer's `meta` table (§2). These hold what the Iceberg table
+# cannot: deployment policy rather than data shape.
+_CONFIG_KEY = "config"
+_ARCHIVE_KEY = "archive"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +98,44 @@ class LogConfig:
     # §3a. Continuous SQLite WAL shipping. Off by default; decouples RPO from
     # max_age at the cost of a sidecar.
     wal_replication: bool = False
+
+    def to_json(self) -> str:
+        """Serialised for the `meta` table, so `open` recovers the policy.
+
+        Durations as seconds rather than any richer encoding: this is read by
+        the next process to open the log, and a float is the one representation
+        that cannot drift between library versions.
+        """
+        return json.dumps(
+            {
+                "target_size": self.target_size,
+                "max_age": self.max_age.total_seconds(),
+                "local_retention": (
+                    None
+                    if self.local_retention is None
+                    else self.local_retention.total_seconds()
+                ),
+                "snapshot_retention": self.snapshot_retention.total_seconds(),
+                "compact_below": self.compact_below,
+                "compact_min_files": self.compact_min_files,
+                "wal_replication": self.wal_replication,
+            }
+        )
+
+    @classmethod
+    def from_json(cls, encoded: str) -> LogConfig:
+        raw = json.loads(encoded)
+        retention = raw["local_retention"]
+
+        return cls(
+            target_size=raw["target_size"],
+            max_age=timedelta(seconds=raw["max_age"]),
+            local_retention=None if retention is None else timedelta(seconds=retention),
+            snapshot_retention=timedelta(seconds=raw["snapshot_retention"]),
+            compact_below=raw["compact_below"],
+            compact_min_files=raw["compact_min_files"],
+            wal_replication=raw["wal_replication"],
+        )
 
 
 class Log:
@@ -148,7 +192,7 @@ class Log:
     # -- construction ------------------------------------------------------
 
     @classmethod
-    def open(
+    def new(
         cls,
         root: PathLike[str] | str,
         name: str,
@@ -158,69 +202,155 @@ class Log:
         config: LogConfig | None = None,
         archive: str | None = None,
     ) -> Self:
-        """Open (or create) the log rooted at `root`, and recover it.
+        """Create a log. Raises if one already exists at `root/name`.
+
+        This is the only call that takes the log's shape, because the shape is
+        fixed at creation and recovered by `open` thereafter.
 
         `schema` is the application's columns. The library adds `offset` and
         owns nothing else — no ingest timestamp, no transaction id (§2).
 
         `sort_by` is required on purpose. §7 measures it as a read-shape
         decision, not a tuning knob: it declares which predicates prune, only a
-        LEADING column prunes, and changing it later means rewriting the data.
-        A capture workload usually wants `("event_ts", "key")`.
+        LEADING column prunes, and changing it later rewrites every file — see
+        `set_sort_by`. A capture workload usually wants `("event_ts", "key")`.
 
         `archive` is the remote warehouse prefix (e.g. `s3://bucket/prefix`).
         None means local-only: capture, seal, compaction, retention and reads
-        all work with no network, forever (§11). On a local-only log `sync` is
-        an error and `maintain` is the whole storage story — see both.
+        all work with no network, forever (§11).
         """
         settings = config or LogConfig()
         validate(schema, sort_by, settings, archive)
 
         layout = Layout(Path(root), name)
-        layout.create()
+        if layout.buffer_db.exists():
+            msg = f"a log already exists at {layout.root}/{name} — use open()"
+            raise FileExistsError(msg)
 
-        log = cls(
+        layout.create()
+        table = LogTable.create(layout, table_schema(schema), sort_by)
+        buffer = Buffer(layout.buffer_db, schema)
+        buffer.set_meta(_CONFIG_KEY, settings.to_json())
+        if archive is not None:
+            buffer.set_meta(_ARCHIVE_KEY, archive)
+
+        return cls(
             layout=layout,
-            table=LogTable.open(layout, table_schema(schema), readonly=False),
-            buffer=Buffer(layout.buffer_db, schema),
+            table=table,
+            buffer=buffer,
             schema=schema,
             sort_by=sort_by,
             config=settings,
             archive=archive,
         )
-        log.recover()
-
-        return log
 
     @classmethod
-    def open_readonly(
+    def open(
         cls,
         root: PathLike[str] | str,
         name: str,
         *,
-        schema: pa.Schema,
-        sort_by: Sequence[str] = (),
+        read_only: bool = False,
     ) -> Self:
-        """Open a second view of a log another process is writing.
+        """Open an existing log, and recover it.
 
-        Runs no recovery and refuses every mutation, so it cannot disturb the
-        single writer §1 assumes. Reads see committed data only, which is what
-        durable-at-commit already means.
+        Takes none of the shape: the schema comes from the Iceberg table, the
+        sort order from the table's declared sort order (§4), and the config
+        and archive from the buffer's `meta` table (§2). Restating them here
+        would invite a caller to state something the log does not agree with,
+        and the log is the one that is right.
+
+        `read_only=True` opens a second view of a log another process is
+        writing. It runs no recovery and refuses every mutation, so it cannot
+        disturb the single writer §1 assumes.
         """
         layout = Layout(Path(root), name)
         if not layout.catalog_db.exists():
-            msg = f"no litelink log at {layout.root} (readonly opens, never creates)"
+            msg = f"no litelink log at {layout.root} — use new() to create one"
             raise FileNotFoundError(msg)
 
-        return cls(
+        table = LogTable.load(layout, readonly=read_only)
+        schema = application_schema(table.arrow_schema())
+        buffer = Buffer(layout.buffer_db, schema, readonly=read_only)
+
+        encoded = buffer.get_meta(_CONFIG_KEY)
+        log = cls(
             layout=layout,
-            table=LogTable.open(layout, table_schema(schema), readonly=True),
-            buffer=Buffer(layout.buffer_db, schema, readonly=True),
+            table=table,
+            buffer=buffer,
             schema=schema,
-            sort_by=sort_by,
-            config=LogConfig(),
-            readonly=True,
+            sort_by=table.sort_by(),
+            config=LogConfig() if encoded is None else LogConfig.from_json(encoded),
+            # `or None`: detaching stores an empty string rather than deleting
+            # the row, and an empty archive is no archive. Without this it reads
+            # back truthy enough to make maintain() refuse to run.
+            archive=buffer.get_meta(_ARCHIVE_KEY) or None,
+            readonly=read_only,
         )
+        if not read_only:
+            log.recover()
+
+        return log
+
+    # -- settings ----------------------------------------------------------
+
+    def set_config(self, config: LogConfig) -> None:
+        """Replace the operational policy (§12).
+
+        Every knob here governs future work only — when to seal, how long to
+        keep, what to compact — so this needs no rewrite. `sort_by` and the
+        schema are not in here precisely because they do.
+        """
+        with self._lock:
+            self._writable()
+            validate(self._schema, self._sort_by, config, self._archive)
+            self._buffer.set_meta(_CONFIG_KEY, config.to_json())
+            self.config = config
+            self._maintenance = Maintenance(
+                self._table, self._buffer, self._layout, config, self._sort_by
+            )
+
+    def set_archive(self, archive: str | None) -> None:
+        """Point the log at an archive, or detach it (§5)."""
+        with self._lock:
+            self._writable()
+            validate(self._schema, self._sort_by, self.config, archive)
+            self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
+            self._archive = archive or None
+
+    def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
+        """Change the sort order, rewriting every existing file.
+
+        §7 calls `sort_by` a read-shape decision rather than a tuning knob:
+        it declares which predicates prune, and the clustering that makes them
+        prune is baked into each file when it is written. So a new order that
+        is only declared would apply to future seals and silently leave every
+        existing file clustered the old way — the same predicate fast on recent
+        data and slow on older data, with nothing to indicate why.
+
+        `rewrite` must be passed explicitly. It is the honest name for the
+        cost: every data file is read, re-sorted and replaced.
+        """
+        with self._lock:
+            self._writable()
+            requested = tuple(sort_by)
+            validate(self._schema, requested, self.config, self._archive)
+            if requested == self._sort_by:
+                return
+
+            if not rewrite:
+                msg = (
+                    "changing sort_by re-clusters every existing file; "
+                    "pass rewrite=True to accept that cost"
+                )
+                raise ValueError(msg)
+
+            self._table.set_sort_order(requested)
+            self._sort_by = requested
+            self._maintenance = Maintenance(
+                self._table, self._buffer, self._layout, self.config, requested
+            )
+            self._maintenance.rewrite_sorted()
 
     def _writable(self) -> None:
         if self.readonly:
@@ -550,6 +680,11 @@ class Log:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def application_schema(schema: pa.Schema) -> pa.Schema:
+    """The caller's columns — the table's schema with `offset` removed."""
+    return pa.schema([f for f in schema if f.name != "offset"])
 
 
 def table_schema(schema: pa.Schema) -> pa.Schema:

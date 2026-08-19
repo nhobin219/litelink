@@ -23,9 +23,15 @@ SCHEMA = pa.schema(
 
 
 def open_log(root: Path, config: LogConfig | None = None) -> Log:
-    return Log.open(
-        root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), config=config
-    )
+    """Create the log, or reopen it — the shape is only stated once."""
+    if (root / "catalog.db").exists():
+        log = Log.open(root, "s")
+        if config is not None:
+            log.set_config(config)
+
+        return log
+
+    return Log.new(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), config=config)
 
 
 def _today() -> date:
@@ -33,7 +39,7 @@ def _today() -> date:
 
 
 def open_log_readonly(root: Path) -> Log:
-    return Log.open_readonly(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"))
+    return Log.open(root, "s", read_only=True)
 
 
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
@@ -64,7 +70,7 @@ def test_caller_supplied_offset_is_rejected(tmp_path: Path) -> None:
 def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
     """I11 again, one layer earlier."""
     with pytest.raises(ValueError, match="I11"):
-        Log.open(
+        Log.new(
             tmp_path,
             "s",
             schema=pa.schema([pa.field("offset", pa.int64())]),
@@ -247,7 +253,7 @@ def test_readonly_refuses_every_mutation(tmp_path: Path) -> None:
 def test_readonly_will_not_create_a_log(tmp_path: Path) -> None:
     """Opening a log that does not exist must fail rather than quietly make one."""
     with pytest.raises(FileNotFoundError, match="no litelink log at"):
-        open_log_readonly(tmp_path / "nothing-here")
+        Log.open(tmp_path / "nothing-here", "s", read_only=True)
 
 
 def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:

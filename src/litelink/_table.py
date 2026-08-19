@@ -12,11 +12,13 @@ from typing import TYPE_CHECKING
 
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
+from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.transforms import IdentityTransform
 
 from litelink._predicates import offset_at_or_below, offset_between
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
     from datetime import datetime
 
     import pyarrow as pa
@@ -62,29 +64,73 @@ class LogTable:
         self._extent: tuple[int, int] | None = None
 
     @classmethod
-    def open(cls, layout: Layout, schema: pa.Schema, *, readonly: bool) -> LogTable:
-        """Load the table, creating it and its namespace unless readonly."""
-        catalog = SqlCatalog(
-            "local", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
+    def create(
+        cls, layout: Layout, schema: pa.Schema, sort_by: Sequence[str]
+    ) -> LogTable:
+        """Create the table and declare its sort order.
+
+        §4 wants the order declared as table metadata AND applied at write
+        time. The declaration is what makes `sort_by` recoverable by `open`,
+        rather than something the caller has to restate identically forever.
+        """
+        catalog = cls._catalog_for(layout)
+        catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
+        catalog.create_table(
+            layout.table_id, schema=schema, properties=METADATA_PROPERTIES
         )
-        if not readonly:
-            catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
-
-        try:
-            catalog.load_table(layout.table_id)
-        except Exception:
-            if readonly:
-                raise
-
-            catalog.create_table(
-                layout.table_id, schema=schema, properties=METADATA_PROPERTIES
-            )
 
         table = cls(catalog, layout)
+        table.set_sort_order(sort_by)
+
+        return table
+
+    @classmethod
+    def load(cls, layout: Layout, *, readonly: bool) -> LogTable:
+        """Load an existing table. Raises if there is none."""
+        table = cls(cls._catalog_for(layout), layout)
         if not readonly:
             table.ensure_metadata_properties()
 
         return table
+
+    @staticmethod
+    def _catalog_for(layout: Layout) -> SqlCatalog:
+        return SqlCatalog(
+            "local", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
+        )
+
+    def exists(self) -> bool:
+        return True
+
+    # -- shape --------------------------------------------------------------
+
+    def arrow_schema(self) -> pa.Schema:
+        """The table's schema as pyarrow, `offset` included.
+
+        Not byte-identical to what was passed to `create`: Iceberg has one
+        string type, so a pyarrow `string` comes back as `large_string`. The
+        logical schema is the same, and both map to the same SQLite affinity
+        and the same DuckDB cast, but an equality assertion against the
+        original will fail.
+        """
+        return schema_to_pyarrow(self._table.schema())
+
+    def sort_by(self) -> tuple[str, ...]:
+        """The declared sort order, as column names (§4)."""
+        names = {f.field_id: f.name for f in self._table.schema().fields}
+
+        return tuple(names[f.source_id] for f in self._table.sort_order().fields)
+
+    def set_sort_order(self, sort_by: Sequence[str]) -> None:
+        """Declare the sort order. Does NOT reorder existing data."""
+        if not sort_by:
+            return
+
+        with self._table.update_sort_order() as update:
+            for column in sort_by:
+                update.asc(column, IdentityTransform())
+
+        self.reload()
 
     # -- state ------------------------------------------------------------
 
