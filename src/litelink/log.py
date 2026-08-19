@@ -17,9 +17,19 @@ not as documentation of working code.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.conversions import from_bytes
+
+from litelink._buffer import Buffer
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -27,9 +37,9 @@ if TYPE_CHECKING:
     from types import TracebackType
     from typing import Self
 
-    import pyarrow as pa
-
     Row = Mapping[str, object]
+
+_NAMESPACE = "litelink"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +129,53 @@ class Log:
         all work with no network, forever (§11). On a local-only log `sync` is
         an error and `maintain` is the whole storage story — see both.
         """
-        raise NotImplementedError
+        if "offset" in schema.names:
+            msg = "`offset` is owned by the library and must not be in the schema (I11)"
+            raise ValueError(msg)
+
+        missing = [c for c in sort_by if c not in schema.names]
+        if missing:
+            msg = f"sort_by names columns not in the schema: {missing}"
+            raise ValueError(msg)
+
+        self.name = name
+        self.root = Path(root)
+        self.config = config or LogConfig()
+        self._archive = archive
+        self._sort_by = tuple(sort_by)
+        self._schema = schema
+
+        if self._archive is None and self.config.local_retention == timedelta(0):
+            msg = (
+                "local_retention=0 means 'evict on upload' and presupposes an "
+                "archive; with archive=None it would delete each file as it sealed"
+            )
+            raise ValueError(msg)
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / name).mkdir(parents=True, exist_ok=True)
+
+        # `offset` leads the table schema; everything after it is the caller's
+        # and is treated as opaque (§2).
+        self._table_schema = pa.schema(
+            [pa.field("offset", pa.int64(), nullable=False), *schema]
+        )
+        self._catalog = SqlCatalog(
+            "local",
+            uri=f"sqlite:///{self.root / 'catalog.db'}",
+            warehouse=f"file://{self.root}",
+        )
+        self._catalog.create_namespace_if_not_exists(_NAMESPACE)
+        try:
+            self._table = self._catalog.load_table(f"{_NAMESPACE}.{name}")
+        except Exception:
+            self._table = self._catalog.create_table(
+                f"{_NAMESPACE}.{name}", schema=self._table_schema
+            )
+
+        self._buffer = Buffer(self.root / name / "buffer.db", schema)
+        self._duck: duckdb.DuckDBPyConnection | None = None
+        self._recover()
 
     # -- write ------------------------------------------------------------
 
@@ -132,7 +188,7 @@ class Log:
 
         A caller-supplied `offset` is rejected (I11).
         """
-        raise NotImplementedError
+        return self.extend([row])[0]
 
     def extend(self, rows: Iterable[Row]) -> list[int]:
         """Append many rows in ONE transaction. Returns the assigned offsets.
@@ -141,7 +197,10 @@ class Log:
         which is the whole of §3's throughput story. It carries no meaning
         beyond that — see §1 on why there is no transaction id column.
         """
-        raise NotImplementedError
+        offsets = self._buffer.append(rows)
+        self._maybe_seal()
+
+        return offsets
 
     # -- read -------------------------------------------------------------
 
@@ -173,7 +232,24 @@ class Log:
         a 400-byte payload column is 611 ms and proportional to the data, so
         materialising it is the caller's choice to make.
         """
-        raise NotImplementedError
+        projection = ", ".join(f'"{c}"' for c in (columns or self._table_schema.names))
+        predicates = [where] if where else []
+        if start_offset is not None:
+            predicates.append(f'"offset" >= {int(start_offset)}')
+
+        if end_offset is not None:
+            predicates.append(f'"offset" < {int(end_offset)}')
+
+        return self.sql(
+            f"SELECT {projection} FROM log"
+            + (
+                f" WHERE {' AND '.join(f'({p})' for p in predicates)}"
+                if predicates
+                else ""
+            )
+            + ' ORDER BY "offset"',
+            include_archive=include_archive,
+        )
 
     def sql(self, query: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
         """Run arbitrary DuckDB SQL against the log, exposed as `log`.
@@ -183,7 +259,63 @@ class Log:
         metadata JSON, so a cached pointer silently serves a stale snapshot
         (§7). Quote `"offset"` — it is a DuckDB reserved word.
         """
-        raise NotImplementedError
+        if include_archive:
+            msg = "archive reads are not implemented"
+            raise NotImplementedError(msg)
+
+        connection = self._duckdb()
+        # Rebuilt per call, never cached. Every commit writes a new metadata
+        # JSON, so a view holding yesterday's pointer serves a stale snapshot —
+        # and the boundary below must come from the SAME metadata the scan
+        # reads, or a seal landing between the two double-counts the gap (I3).
+        connection.execute(f"CREATE OR REPLACE TEMP VIEW log AS {self._union_sql()}")
+
+        return connection.execute(query).to_arrow_reader()
+
+    def _union_sql(self) -> str:
+        """The §7 hot read: local table, plus the buffer above its extent."""
+        columns = tuple(self._table_schema.names)
+        # Aliased back to the bare column name: without it the buffer-only leg
+        # (nothing sealed yet) exposes columns called `CAST(b."offset" AS
+        # BIGINT)`, and only the presence of an Iceberg leg to name them first
+        # hides it.
+        buffer_side = ", ".join(
+            f'b."{c}"::{_DUCKDB_TYPES[str(self._table_schema.field(c).type)]} AS "{c}"'
+            for c in columns
+        )
+        # Cast the buffer side explicitly rather than letting UNION ALL
+        # reconcile: SQLite's per-value typing comes through the scanner
+        # loosely, and a column that holds integers in every row can still
+        # surprise the union (§7).
+        buffer_leg = f"SELECT {buffer_side} FROM buf.buffer b"
+
+        extent = self.table_extent()
+        if extent is None:
+            # Nothing sealed yet, so there is no boundary to derive and no
+            # table to union — every row is still in the buffer.
+            return buffer_leg
+
+        projection = ", ".join(f'"{c}"' for c in columns)
+
+        return (
+            f"SELECT {projection} FROM iceberg_scan('{self._table.metadata_location}')"
+            f' UNION ALL {buffer_leg} WHERE b."offset" > {extent[1]}'
+        )
+
+    def _duckdb(self) -> duckdb.DuckDBPyConnection:
+        if self._duck is None:
+            connection = duckdb.connect()
+            # Provisioned, not autoinstalled — see scripts/install_duckdb_extensions.py
+            # and §7 on why the first read must not be a network read.
+            connection.execute("LOAD iceberg")
+            connection.execute("LOAD sqlite")
+            connection.execute(
+                f"ATTACH '{self.root / self.name / 'buffer.db'}' AS buf "
+                "(TYPE sqlite, READ_ONLY)"
+            )
+            self._duck = connection
+
+        return self._duck
 
     def end_offset(self) -> int:
         """The offset the next append will receive — an EXCLUSIVE upper bound.
@@ -199,8 +331,12 @@ class Log:
         Iceberg table's committed maximum and excludes everything still in the
         buffer. A consumer resuming from here sees every durable row; one
         resuming from `hi` silently skips the unsealed tail.
+
+        Cheaper than the design assumed: AUTOINCREMENT's `sqlite_sequence` is
+        the highest offset ever assigned and survives the buffer emptying, so
+        no catalog resolve is needed at all.
         """
-        raise NotImplementedError
+        return self._buffer.next_offset()
 
     # -- maintenance ------------------------------------------------------
 
@@ -210,7 +346,115 @@ class Log:
         Normally automatic at `min(target_size, max_age)` (§4). Explicit seals
         are for shutdown and tests.
         """
-        raise NotImplementedError
+        extent = self._buffer.extent()
+        if extent is None:
+            return None
+
+        start, last = extent
+        end = last + 1
+        rel_path = self._seal_path(start, end)
+        # I2: the range and its path are fixed BEFORE the file exists, so a
+        # retry recomputes nothing and overwrites in place rather than
+        # stranding the first attempt under a different name.
+        self._buffer.claim_seal(start, end, rel_path)
+        self._write_and_commit(end, rel_path)
+        self._buffer.finish_seal(end)
+
+        return end
+
+    def _seal_path(self, start: int, end: int) -> str:
+        day = datetime.now(UTC).date().isoformat()
+
+        return f"{self.name}/data/{day}/{start}-{end}.parquet"
+
+    def _write_and_commit(self, end: int, rel_path: str) -> None:
+        """Write the Parquet file, fsync it, then commit it to the table.
+
+        I1 in this order: committing first would publish a manifest entry for
+        a file that may not survive the crash.
+        """
+        rows = self._buffer.rows_below(end)
+        if self._sort_by:
+            # §4: the sort order is declared as table metadata AND applied here.
+            # Metadata records intent; it does not sort for you.
+            rows = rows.sort_by([(c, "ascending") for c in self._sort_by])
+
+        dest = self.root / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(rows, dest)
+        _fsync(dest)
+
+        self._table.add_files([str(dest)])
+        self._table = self._catalog.load_table(f"{_NAMESPACE}.{self.name}")
+
+    def _maybe_seal(self) -> None:
+        """Seal when the buffer crosses `target_size`.
+
+        The `max_age` branch is not wired up: it needs a clock the caller does
+        not drive, and §4 evaluates both triggers at commit time. Sealing on
+        age therefore has to be driven by the application calling `seal()`
+        until this grows a timer.
+        """
+        extent = self._buffer.extent()
+        if extent is None:
+            return
+
+        if self._buffer.byte_size() >= self.config.target_size:
+            self.seal()
+
+    def _recover(self) -> None:
+        """Finish an interrupted seal (§4).
+
+        Idempotent in both directions: if the commit landed, only the buffer
+        delete is outstanding; if it did not, the whole file is rewritten to
+        the same path.
+        """
+        pending = self._buffer.pending_seal()
+        if pending is None:
+            return
+
+        _, end, rel_path = pending
+        if str(self.root / rel_path) in self._file_paths():
+            self._buffer.finish_seal(end)
+            return
+
+        self._write_and_commit(end, rel_path)
+        self._buffer.finish_seal(end)
+
+    def _file_paths(self) -> set[str]:
+        snapshot = self._table.current_snapshot()
+        if snapshot is None:
+            return set()
+
+        paths = self._table.inspect.files()["file_path"].to_pylist()
+
+        return {p.removeprefix("file://") for p in paths}
+
+    def table_extent(self) -> tuple[int, int] | None:
+        """`(lo, hi)` offset extent of the local table, from statistics.
+
+        §7's tier boundary. Read from manifest column statistics — no data file
+        is opened, which is what makes it ~0.6 ms rather than a scan.
+        """
+        snapshot = self._table.current_snapshot()
+        if snapshot is None:
+            return None
+
+        files = self._table.inspect.files()
+        if files.num_rows == 0:
+            return None
+
+        field = self._table.schema().find_field("offset")
+        lows = [
+            from_bytes(field.field_type, dict(b)[field.field_id])
+            for b in files["lower_bounds"].to_pylist()
+        ]
+        highs = [
+            from_bytes(field.field_type, dict(b)[field.field_id])
+            for b in files["upper_bounds"].to_pylist()
+        ]
+
+        return (min(lows), max(highs))
 
     def sync(self) -> None:
         """Push to the archive: upload, register, replicate compactions (§5).
@@ -294,11 +538,20 @@ class Log:
     # -- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
-        """Release the buffer and catalog handles. Does not seal."""
-        raise NotImplementedError
+        """Release the buffer and catalog handles. Does not seal.
+
+        Not sealing is deliberate: committed rows are already durable, and an
+        implicit seal on close would emit an undersized file every time a
+        process restarted.
+        """
+        if self._duck is not None:
+            self._duck.close()
+            self._duck = None
+
+        self._buffer.close()
 
     def __enter__(self) -> Self:
-        raise NotImplementedError
+        return self
 
     def __exit__(
         self,
@@ -306,4 +559,40 @@ class Log:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        raise NotImplementedError
+        self.close()
+
+
+# Arrow type -> the DuckDB type the buffer leg is cast to.
+_DUCKDB_TYPES = {
+    "int64": "BIGINT",
+    "int32": "INTEGER",
+    "int16": "SMALLINT",
+    "int8": "TINYINT",
+    "double": "DOUBLE",
+    "float": "FLOAT",
+    "bool": "BOOLEAN",
+    "string": "VARCHAR",
+    "large_string": "VARCHAR",
+    "binary": "BLOB",
+    "large_binary": "BLOB",
+}
+
+
+def _fsync(path: Path) -> None:
+    """Fsync a file AND the directory entry that reaches it (I1).
+
+    On most filesystems the file contents can be durable while the name is
+    not, so syncing only the file leaves a manifest entry pointing at a path
+    that may not exist after a crash.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
