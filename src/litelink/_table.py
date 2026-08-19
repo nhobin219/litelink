@@ -64,9 +64,14 @@ class LogTable:
         self._catalog = catalog
         self._layout = layout
         self._table = catalog.load_table(layout.table_id)
-        # Extent cache, keyed by the metadata pointer. See `extent`.
+        # Snapshot-derived facts, cached against the metadata pointer. See
+        # `extent`. The file count rides along because reading the manifests
+        # produces it for free, and counting files any other way means
+        # materialising every file's metadata.
         self._extent_at: str | None = None
         self._extent: tuple[int, int] | None = None
+        self._file_count = 0
+        self._record_count = 0
 
     @classmethod
     def create(
@@ -210,14 +215,41 @@ class LogTable:
         entirely redundant, and on a read-heavy log it was nearly all of the
         per-query overhead.
         """
-        location = self.metadata_location
-        if location != self._extent_at:
-            self._extent = self._read_extent()
-            self._extent_at = location
+        self._refresh()
 
         return self._extent
 
-    def _read_extent(self) -> tuple[int, int] | None:
+    def file_count(self) -> int:
+        """How many data files the current snapshot holds.
+
+        Counted while reading the manifests for the extent, not by way of
+        `data_files()` — that materialises an eighteen-column Arrow table per
+        file, measured at 8.7 ms over six files to answer a question that is one
+        integer.
+        """
+        self._refresh()
+
+        return self._file_count
+
+    def record_count(self) -> int:
+        """How many rows the current snapshot holds.
+
+        Iceberg tracks this per file, so it comes off the same manifest read as
+        the extent. Counting the sealed rows by scanning instead reads the
+        offset column out of every Parquet file — correct, and proportional to
+        the data, which is the wrong shape for anything polling.
+        """
+        self._refresh()
+
+        return self._record_count
+
+    def _refresh(self) -> None:
+        location = self.metadata_location
+        if location != self._extent_at:
+            self._extent, self._file_count, self._record_count = self._read_snapshot()
+            self._extent_at = location
+
+    def _read_snapshot(self) -> tuple[tuple[int, int] | None, int, int]:
         """Offset bounds straight off the manifest entries.
 
         Deliberately not `inspect.files()`, which materialises an 18-column
@@ -227,15 +259,17 @@ class LogTable:
         """
         snapshot = self._table.current_snapshot()
         if snapshot is None:
-            return None
+            return None, 0, 0
 
         field = self._table.schema().find_field("litelink_offset")
         lows: list[int] = []
         highs: list[int] = []
+        records = 0
         for manifest in snapshot.manifests(self._table.io):
             for entry in manifest.fetch_manifest_entry(
                 self._table.io, discard_deleted=True
             ):
+                records += entry.data_file.record_count
                 lows.append(
                     from_bytes(
                         field.field_type, entry.data_file.lower_bounds[field.field_id]
@@ -247,7 +281,9 @@ class LogTable:
                     )
                 )
 
-        return None if not lows else (min(lows), max(highs))
+        extent = None if not lows else (min(lows), max(highs))
+
+        return extent, len(lows), records
 
     def file_paths(self) -> set[str]:
         return {f.path for f in self.data_files()}
