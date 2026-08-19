@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  # Fold the commit in for pushes, so every main push gets its own group and
+  # can never displace another. github.sha is empty on pull_request, so PRs
+  # keep superseding themselves; merge_group is unaffected.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
+  # Only a pull_request supersedes itself. Cancelling a merge_group entry can
+  # eject the PR from the queue.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint + format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: python scripts/check_blank_lines.py
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run ty check
+
+  test:
+    name: Tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The declared floor and the current top of the supported range. The
+        # floor is what .python-version pins locally, so a 3.13-only regression
+        # is the one CI catches that a dev machine does not.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync
+      # The read path's DuckDB extensions are downloaded, not bundled. Doing it
+      # as its own step means a fetch failure reads as a provisioning failure
+      # rather than as a mysterious IO error inside a test.
+      - run: uv run python scripts/install_duckdb_extensions.py
+      # Then assert the box can load them with autoinstall off — the same check
+      # an offline deployment target would run. This is what catches a new
+      # extension being added to the read path without being added here.
+      - run: uv run python scripts/install_duckdb_extensions.py --check
+      - run: uv run pytest -q
+
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [lint, typecheck, test]
+    runs-on: ubuntu-latest
+    steps:
+      # One required check for branch protection / the merge queue. Reading the
+      # aggregate result rather than each `needs.*.result` means a job added
+      # later is covered without editing this gate.
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
