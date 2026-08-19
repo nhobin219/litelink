@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pytest
-from pyiceberg.schema import Schema
-from pyiceberg.types import LongType, NestedField, StringType
 
 from litelink import Log
 from litelink._types import column_type, validate_schema
@@ -92,23 +90,6 @@ def test_validate_schema_names_the_offending_column() -> None:
         validate_schema(schema)
 
 
-def test_an_iceberg_schema_can_be_passed_directly(tmp_path: Path) -> None:
-    """The table is Iceberg, so stating its schema exactly is allowed."""
-    schema = Schema(
-        NestedField(field_id=1, name="event_ts", field_type=LongType(), required=True),
-        NestedField(field_id=2, name="key", field_type=StringType(), required=False),
-    )
-
-    with Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        log.append({"event_ts": 7, "key": "a"})
-        log.seal()
-
-        assert log.scan().read_all()["event_ts"].to_pylist() == [7]
-
-    with Log.open(tmp_path, "s") as reopened:
-        assert reopened._schema.names == ["event_ts", "key"]
-
-
 def test_the_schema_a_log_carries_is_the_one_the_table_reports(tmp_path: Path) -> None:
     """Arrow `string` is stored as Iceberg string and reads back `large_string`.
 
@@ -125,28 +106,14 @@ def test_the_schema_a_log_carries_is_the_one_the_table_reports(tmp_path: Path) -
         assert created_schema.field("key").type == pa.large_string()
 
 
-def test_duplicate_iceberg_field_ids_are_refused(tmp_path: Path) -> None:
-    """pyiceberg accepts them; §9 cannot.
-
-    Field IDs are what add, drop and rename resolve by, so two columns sharing
-    one breaks evolution for both — and pyiceberg constructs such a schema
-    without complaint.
-    """
-    schema = Schema(
-        NestedField(field_id=1, name="event_ts", field_type=LongType(), required=True),
-        NestedField(field_id=1, name="key", field_type=StringType(), required=False),
-    )
-
-    with pytest.raises(ValueError, match="duplicate field ids"):
-        Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",))
-
-
 def test_arrow_schemas_get_their_field_ids_assigned(tmp_path: Path) -> None:
     """Why Arrow is the default: the numbering is not the caller's job.
 
-    An Iceberg schema requires a hand-written id per column, and a wrong one is
-    accepted silently. Passing Arrow hands that bookkeeping to pyiceberg, which
-    assigns unique ids by construction.
+    Stating the Iceberg schema directly would mean a hand-written id per
+    column, and pyiceberg accepts duplicates silently — which breaks §9's add,
+    drop and rename, since those resolve by id. Arrow hands that bookkeeping to
+    pyiceberg, which assigns unique ids by construction. That is why there is
+    one schema type and it is this one.
     """
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
 

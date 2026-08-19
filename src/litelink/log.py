@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pyiceberg.io.pyarrow import schema_to_pyarrow
 
 from litelink._buffer import Buffer
 from litelink._fs import fsync
@@ -40,8 +39,6 @@ if TYPE_CHECKING:
     from os import PathLike
     from types import TracebackType
     from typing import Self
-
-    from pyiceberg.schema import Schema as IcebergSchema
 
     Row = Mapping[str, object]
 
@@ -201,7 +198,7 @@ class Log:
         root: PathLike[str] | str,
         name: str,
         *,
-        schema: pa.Schema | IcebergSchema,
+        schema: pa.Schema,
         sort_by: Sequence[str],
         config: LogConfig | None = None,
         archive: str | None = None,
@@ -214,12 +211,17 @@ class Log:
         `schema` is the application's columns. The library adds `offset` and
         owns nothing else — no ingest timestamp, no transaction id (§2).
 
-        Either an Arrow schema or an Iceberg one. Arrow is the default because
-        it is what the caller's data already is and it needs no field IDs, but
-        the table is an Iceberg table and Arrow does not map onto it exactly:
-        `string` becomes `large_string`, and several types are refused outright
-        rather than silently narrowed (see `_types`). Pass an Iceberg schema
-        when you want to state precisely what will be stored.
+        Arrow, always. The table underneath is Iceberg and its schema could be
+        stated directly, but every Iceberg field needs an explicit `field_id`
+        and pyiceberg accepts duplicates without complaint — two fields
+        numbered 1 construct fine. Field IDs are what §9's add, drop and rename
+        resolve by, so a duplicate quietly breaks evolution for both columns.
+        That numbering is library bookkeeping, the same argument §2 makes for
+        `offset`, so it is pyiceberg's job and not the caller's.
+
+        The cost of one schema type is that Arrow does not map onto Iceberg
+        exactly: `string` is stored and returned as `large_string`, and types
+        Iceberg would narrow silently are refused instead (see `_types`).
 
         `sort_by` is required on purpose. §7 measures it as a read-shape
         decision, not a tuning knob: it declares which predicates prune, only a
@@ -230,9 +232,8 @@ class Log:
         None means local-only: capture, seal, compaction, retention and reads
         all work with no network, forever (§11).
         """
-        arrow = schema if isinstance(schema, pa.Schema) else _from_iceberg(schema)
         settings = config or LogConfig()
-        validate(arrow, sort_by, settings, archive)
+        validate(schema, sort_by, settings, archive)
 
         layout = Layout(Path(root), name)
         if layout.buffer_db.exists():
@@ -240,7 +241,7 @@ class Log:
             raise FileExistsError(msg)
 
         layout.create()
-        table = LogTable.create(layout, table_schema(arrow), sort_by)
+        table = LogTable.create(layout, table_schema(schema), sort_by)
         # The schema the log carries is the one the TABLE will report, not the
         # one that was passed: `open` must see the same thing this does, and
         # Arrow's string and binary types do not survive Iceberg unchanged.
@@ -696,24 +697,6 @@ class Log:
         tb: TracebackType | None,
     ) -> None:
         self.close()
-
-
-def _from_iceberg(schema: IcebergSchema) -> pa.Schema:
-    """Convert a caller-supplied Iceberg schema, checking its field IDs.
-
-    pyiceberg requires an explicit `field_id` on every column and accepts
-    duplicates without complaint — verified: two fields numbered 1 construct
-    fine. That is worth catching here, because §9's whole evolution model
-    resolves by field ID, so a duplicate quietly breaks add, drop and rename
-    for both columns involved.
-    """
-    ids = [field.field_id for field in schema.fields]
-    duplicates = sorted({i for i in ids if ids.count(i) > 1})
-    if duplicates:
-        msg = f"duplicate field ids in schema: {duplicates} — ids must be unique (§9)"
-        raise ValueError(msg)
-
-    return schema_to_pyarrow(schema)
 
 
 def application_schema(schema: pa.Schema) -> pa.Schema:
