@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
-from typing import TYPE_CHECKING
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from litelink.log import Log, LogConfig
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 SCHEMA = pa.schema(
     [
@@ -24,11 +21,17 @@ SCHEMA = pa.schema(
 
 
 def open_log(root: Path, config: LogConfig | None = None) -> Log:
-    return Log(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), config=config)
+    return Log.open(
+        root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), config=config
+    )
+
+
+def _today() -> date:
+    return datetime.now(UTC).date()
 
 
 def open_log_readonly(root: Path) -> Log:
-    return Log(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), readonly=True)
+    return Log.open_readonly(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"))
 
 
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
@@ -59,7 +62,7 @@ def test_caller_supplied_offset_is_rejected(tmp_path: Path) -> None:
 def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
     """I11 again, one layer earlier."""
     with pytest.raises(ValueError, match="I11"):
-        Log(
+        Log.open(
             tmp_path,
             "s",
             schema=pa.schema([pa.field("offset", pa.int64())]),
@@ -139,7 +142,7 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
         extent = log._buffer.extent()
         assert extent is not None
         end = extent[1] + 1
-        rel_path = log._seal_path(1, end)
+        rel_path = log._layout.seal_path(1, end, _today())
         log._buffer.claim_seal(1, end, rel_path)
         log._write_and_commit(end, rel_path)
         # deliberately NOT finish_seal: this is the crash window
@@ -159,7 +162,7 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
     """
     with open_log(tmp_path) as log:
         log.extend(rows(3))
-        log._buffer.claim_seal(1, 4, log._seal_path(1, 4))
+        log._buffer.claim_seal(1, 4, log._layout.seal_path(1, 4, _today()))
 
     with open_log(tmp_path) as recovered:
         assert recovered._buffer.pending_seal() is None

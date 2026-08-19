@@ -6,9 +6,10 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pyiceberg.catalog.sql import SqlCatalog
 
 from litelink.log import Log, LogConfig
-from tests.test_log import SCHEMA, open_log, read_all, rows
+from tests.test_log import SCHEMA, _today, open_log, read_all, rows
 
 
 def seal_files(log: Log, count: int, per_file: int = 4) -> None:
@@ -23,11 +24,11 @@ def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
         tmp_path, LogConfig(compact_below=1 << 30, compact_min_files=2)
     ) as log:
         seal_files(log, 4)
-        assert len(log._data_files()) == 4
+        assert len(log._table.data_files()) == 4
 
         log.maintain()
 
-        assert len(log._data_files()) == 1
+        assert len(log._table.data_files()) == 1
         assert len(read_all(log)) == 16
         assert log.table_extent() == (1, 16)
 
@@ -40,7 +41,7 @@ def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
         seal_files(log, 4)
         log.maintain()
 
-        assert len(log._data_files()) == 4
+        assert len(log._table.data_files()) == 4
 
 
 def test_compaction_skips_files_over_compact_below(tmp_path: Path) -> None:
@@ -48,7 +49,7 @@ def test_compaction_skips_files_over_compact_below(tmp_path: Path) -> None:
         seal_files(log, 3)
         log.maintain()
 
-        assert len(log._data_files()) == 3
+        assert len(log._table.data_files()) == 3
 
 
 def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
@@ -56,14 +57,16 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
     import pyarrow.parquet as pq
 
     config = LogConfig(compact_below=1 << 30, compact_min_files=2)
-    with Log(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config) as log:
+    with Log.open(
+        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
+    ) as log:
         for ts in (500, 100, 400, 200):
             log.append({"event_ts": ts, "key": "k", "payload": b""})
             log.seal()
 
         log.maintain()
 
-        merged = log._data_files()
+        merged = log._table.data_files()
         assert len(merged) == 1
         written = pq.read_table(merged[0].path)["event_ts"].to_pylist()
         assert written == [100, 200, 400, 500]
@@ -89,11 +92,11 @@ def test_eviction_drops_files_past_local_retention(tmp_path: Path) -> None:
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.extend(rows(2, start=12))
-        assert len(log._data_files()) == 3
+        assert len(log._table.data_files()) == 3
 
         log.maintain()
 
-        assert log._data_files() == []
+        assert log._table.data_files() == []
         # The buffer is untouched: retention governs the table, and buffer rows
         # are removed at seal and nowhere else (§8).
         assert len(read_all(log)) == 2
@@ -104,7 +107,7 @@ def test_no_eviction_without_local_retention(tmp_path: Path) -> None:
         seal_files(log, 3)
         log.maintain()
 
-        assert len(log._data_files()) == 3
+        assert len(log._table.data_files()) == 3
         assert len(read_all(log)) == 12
 
 
@@ -114,18 +117,18 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        assert log._table.inspect.snapshots().num_rows == 3
+        assert log._table.snapshot_count() == 3
 
         log.maintain()
 
         # The current snapshot is never expired, whatever its age.
-        assert log._table.inspect.snapshots().num_rows == 1
+        assert log._table.snapshot_count() == 1
         assert len(read_all(log)) == 12
 
 
 def test_maintain_refuses_when_an_archive_is_configured(tmp_path: Path) -> None:
     """I4 needs sync's registration watermark, and sync does not exist yet."""
-    log = Log(
+    log = Log.open(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -172,7 +175,7 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
 
         log.maintain()
 
-        assert log._data_files() == [], "evicted from the table"
+        assert log._table.data_files() == [], "evicted from the table"
         assert {p.name for p in tmp_path.rglob("*.parquet")} == on_disk, (
             "still on disk, held by the pre-eviction snapshot"
         )
@@ -199,7 +202,7 @@ def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(3))
-        rel_path = log._seal_path(1, 4)
+        rel_path = log._layout.seal_path(1, 4, _today())
         log._buffer.claim_seal(1, 4, rel_path)
 
         written = tmp_path / rel_path
@@ -220,7 +223,7 @@ def test_recovery_removes_a_crashed_compaction_by_name(tmp_path: Path) -> None:
     config = LogConfig(compact_min_files=99)
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
-        rel_path = log._compaction_path(1, 4)
+        rel_path = log._layout.compaction_path(1, 4)
         log._buffer.claim_compaction(1, 4, rel_path)
         half_written = tmp_path / rel_path
         half_written.parent.mkdir(parents=True, exist_ok=True)
@@ -240,10 +243,7 @@ def tracked_paths(log: Log) -> set[Path]:
     or queued for deletion. If a file on disk is in none of these, nothing
     short of a filesystem walk could ever find it again.
     """
-    tracked = {
-        Path(str(path).removeprefix("file://"))
-        for path in log._table.inspect.all_files()["file_path"].to_pylist()
-    }
+    tracked = {Path(path) for path in log._table.referenced_paths()}
     for pending in (log._buffer.pending_seal(), log._buffer.pending_compaction()):
         if pending is not None:
             tracked.add(log.root / pending[2])
@@ -286,7 +286,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
 
         # Mid-seal: written, not yet committed, claimed by `sealing`.
         log.extend(rows(3, start=16))
-        rel_path = log._seal_path(17, 20)
+        rel_path = log._layout.seal_path(17, 20, _today())
         log._buffer.claim_seal(17, 20, rel_path)
         log._write_and_commit(20, rel_path)
         assert_nothing_untracked(log)
@@ -323,10 +323,10 @@ def test_a_referenced_file_is_never_deleted_by_the_drain(tmp_path: Path) -> None
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
-        live = log._data_files()[0]
+        live = log._table.data_files()[0]
         # Queue a file that is still referenced, which the grace period alone
         # would happily let through.
-        log._enqueue([live.path])
+        log._maintenance._enqueue([live.path])
 
         log.maintain()
 
@@ -364,11 +364,23 @@ def test_iceberg_metadata_does_not_grow_without_bound(tmp_path: Path) -> None:
 
 def test_metadata_properties_are_applied_to_an_existing_table(tmp_path: Path) -> None:
     """A table created before these properties existed must pick them up."""
-    with open_log(tmp_path) as log:
-        with log._table.transaction() as transaction:
-            transaction.remove_properties("write.metadata.delete-after-commit.enabled")
+    open_log(tmp_path).close()
 
-        assert "write.metadata.delete-after-commit.enabled" not in log._table.properties
+    # Reach past litelink to strip the property, standing in for a table created
+    # before these defaults existed.
+    catalog = SqlCatalog(
+        "local",
+        uri=f"sqlite:///{tmp_path / 'catalog.db'}",
+        warehouse=f"file://{tmp_path}",
+    )
+    table = catalog.load_table("litelink.s")
+    with table.transaction() as transaction:
+        transaction.remove_properties("write.metadata.delete-after-commit.enabled")
+
+    assert (
+        "write.metadata.delete-after-commit.enabled"
+        not in catalog.load_table("litelink.s").properties
+    )
 
     with open_log(tmp_path) as reopened:
         assert (
