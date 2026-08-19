@@ -479,10 +479,11 @@ class Log:
         age therefore has to be driven by the application calling `seal()`
         until this grows a timer.
         """
-        extent = self._buffer.extent()
-        if extent is None:
-            return
-
+        # Deliberately only the O(1) counter. This runs after every append, and
+        # asking SQLite for min/max to check emptiness first — which is what it
+        # used to do — put a query on the write path to learn something the
+        # counter already knew. An empty buffer has size zero, and `seal()`
+        # rechecks the extent anyway.
         if self._buffer.byte_size() >= self.config.target_size:
             self.seal()
 

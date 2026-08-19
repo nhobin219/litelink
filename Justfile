@@ -72,4 +72,8 @@ demo-tail *args:
 
 # Write and read throughput on this machine. --quick for a smaller run.
 bench *args:
-    uv run python examples/benchmark.py {{args}}
+    uv run python benchmarks/throughput.py {{args}}
+
+# What litelink costs on top of the raw SQLite write it is built on.
+bench-floor *args:
+    uv run python benchmarks/vs_sqlite.py {{args}}

@@ -1,6 +1,6 @@
 """Write and read throughput, on this machine.
 
-    uv run python examples/benchmark.py [--payload BYTES] [--quick]
+    uv run python benchmarks/throughput.py [--payload BYTES] [--quick]
 
 SPEC §3 and §7 carry numbers from a 2 vCPU box with ~1068 us fsyncs; every one
 of them says to re-measure on target hardware. This is that measurement.
@@ -19,42 +19,11 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import shutil
 import tempfile
 import time
-from collections.abc import Callable
-from datetime import timedelta
 from pathlib import Path
 
-from _stream import NAME, SCHEMA, SORT_BY, observations
-
-from litelink import Log, LogConfig
-
-# Large enough that nothing seals underneath a measurement by accident.
-NEVER_SEAL = LogConfig(target_size=1 << 40, snapshot_retention=timedelta(days=1))
-
-
-def best_of(runs: int, fn: Callable[[], object]) -> float:
-    """Minimum of `runs` timings.
-
-    Minimum rather than mean: the measurement noise here is all additive
-    (scheduling, page cache misses), so the fastest run is the closest estimate
-    of the real cost.
-    """
-    return min(_once(fn) for _ in range(runs))
-
-
-def _once(fn: Callable[[], object]) -> float:
-    started = time.perf_counter()
-    fn()
-
-    return time.perf_counter() - started
-
-
-def fresh(root: Path) -> Log:
-    shutil.rmtree(root, ignore_errors=True)
-
-    return Log(root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=NEVER_SEAL)
+from _bench import best_of, fresh_log, observations
 
 
 def bench_writes(root: Path, payload: int, batches: list[int], rows_each: int) -> None:
@@ -64,7 +33,7 @@ def bench_writes(root: Path, payload: int, batches: list[int], rows_each: int) -
     print(f"  {'batch':>7} {'rows/s':>12} {'us/row':>10} {'commits':>9}")
 
     for batch in batches:
-        log = fresh(root)
+        log = fresh_log(root)
         source = observations(payload, seed=batch)
         commits = rows_each // batch
         try:
@@ -86,7 +55,7 @@ def bench_writes(root: Path, payload: int, batches: list[int], rows_each: int) -
 def bench_reads(
     root: Path, payload: int, buffer_sizes: list[int], sealed_rows: int
 ) -> None:
-    log = fresh(root)
+    log = fresh_log(root)
     source = observations(payload, seed=7)
     try:
         log.extend(itertools.islice(source, sealed_rows))
