@@ -1098,6 +1098,21 @@ The consequence worth planning for is that local disk holds roughly
    manifest layout that makes a commit independent of table size, or the honest possibility
    that unbounded local retention is not a supported configuration.
 
+   **The archive has the same commit cost and it does not matter in the same way.** Its file
+   count is unbounded by design — it is the full history — so registering into it rewrites
+   manifests against a table that only grows. But that happens in §5, which is lazy,
+   restartable and arbitrarily far behind, and no read depends on it. The same work that
+   stalls an append when a seal does it is absorbed by a background pass when sync does. That
+   is the argument for eviction as the bounding mechanism: it does not remove the cost, it
+   moves it to the tier that can wait.
+
+   One coupling survives the move, and it closes a loop worth watching. Eviction may not
+   precede registration (I4), so if archive commits slow enough that sync falls behind,
+   eviction stalls, the local file count grows, and local seals degrade — the write path
+   feeling a cost that was supposed to have been moved off it. The remote table wants the same
+   manifest-merge properties as the local one for that reason, and §5's throughput is worth a
+   number rather than an assumption.
+
 ---
 
 ## 14. Test plan
