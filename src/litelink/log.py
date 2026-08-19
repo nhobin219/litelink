@@ -165,7 +165,7 @@ class Log:
         reader: Reader,
         maintenance: Maintenance,
         schema: pa.Schema,
-        sort_by: Sequence[str],
+        sort_by: tuple[str, ...],
         config: LogConfig,
         archive: str | None = None,
         readonly: bool = False,
@@ -179,7 +179,7 @@ class Log:
         self._table = table
         self._buffer = buffer
         self._schema = schema
-        self._sort_by = tuple(sort_by)
+        self._sort_by = sort_by
         self._archive = archive
         self._reader = reader
         self._maintenance = maintenance
@@ -233,8 +233,9 @@ class Log:
         None means local-only: capture, seal, compaction, retention and reads
         all work with no network, forever (§11).
         """
+        order = tuple(sort_by)
         settings = config or LogConfig()
-        validate(schema, sort_by, settings, archive)
+        validate(schema, order, settings, archive)
 
         layout = Layout(Path(root), name)
         if layout.buffer_db.exists():
@@ -242,7 +243,7 @@ class Log:
             raise FileExistsError(msg)
 
         layout.create()
-        table = LogTable.create(layout, table_schema(schema), sort_by)
+        table = LogTable.create(layout, table_schema(schema), order)
         buffer = Buffer(layout.buffer_db, schema)
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
@@ -259,9 +260,9 @@ class Log:
             table=table,
             buffer=buffer,
             reader=Reader(layout, table, table_schema(schema)),
-            maintenance=Maintenance(table, buffer, layout, settings, sort_by),
+            maintenance=Maintenance(table, buffer, layout, settings, order),
             schema=schema,
-            sort_by=sort_by,
+            sort_by=order,
             config=settings,
             archive=archive,
         )

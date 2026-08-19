@@ -32,9 +32,32 @@ if TYPE_CHECKING:
 # nothing outside the test is affected.
 UNSHARE = ("unshare", "--map-root-user", "--net")
 
+
+def _namespaces_work() -> bool:
+    """Whether an unprivileged network namespace can actually be created.
+
+    Probed rather than inferred from the binary existing. GitHub's runners ship
+    `unshare` and refuse to use it — Ubuntu restricts unprivileged user
+    namespaces through AppArmor, so the call fails with
+    `write failed /proc/self/uid_map: Operation not permitted`. Checking
+    `which unshare` reported these tests as runnable and then failed all three.
+    """
+    if sys.platform != "linux" or shutil.which("unshare") is None:
+        return False
+
+    probe = subprocess.run(
+        [*UNSHARE, "true"], capture_output=True, timeout=30, check=False
+    )
+
+    return probe.returncode == 0
+
+
 pytestmark = pytest.mark.skipif(
-    shutil.which("unshare") is None or sys.platform != "linux",
-    reason="needs Linux network namespaces",
+    not _namespaces_work(),
+    reason=(
+        "needs unprivileged Linux network namespaces; on Ubuntu enable with "
+        "sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+    ),
 )
 
 
