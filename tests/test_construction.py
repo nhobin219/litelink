@@ -217,17 +217,20 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
         assert reopened.end_offset() == 2
 
 
-def test_open_defaults_config_for_a_log_that_never_stored_one(tmp_path: Path) -> None:
-    """A log written before `meta` carried config must still open."""
+def test_a_log_with_no_stored_config_refuses_to_open(tmp_path: Path) -> None:
+    """Same argument as the schema: new() always writes it.
+
+    Substituting defaults would quietly change how a log seals and what it
+    retains, which is worse than refusing to open it.
+    """
     Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)).close()
 
     log = Log.open(tmp_path, "s")
-    log._buffer._con.execute("DELETE FROM meta")
+    log._buffer._con.execute("DELETE FROM meta WHERE k = 'config'")
     log.close()
 
-    with Log.open(tmp_path, "s") as reopened:
-        assert reopened.config == LogConfig()
-        assert reopened._archive is None
+    with pytest.raises(ValueError, match="no stored config"):
+        Log.open(tmp_path, "s")
 
 
 def test_set_config_persists(tmp_path: Path) -> None:
