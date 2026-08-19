@@ -145,11 +145,13 @@ def test_declared_types_come_back_as_declared(tmp_path: Path) -> None:
         assert reopened_schema.field("payload").type == pa.large_binary()
 
 
-def test_a_log_without_a_stored_schema_falls_back_to_the_table(tmp_path: Path) -> None:
-    """The stored Arrow schema records spelling; the table records structure.
+def test_a_log_with_no_stored_schema_refuses_to_open(tmp_path: Path) -> None:
+    """No fallback to the table's own view.
 
-    A log written before the spelling was stored must still open, taking the
-    table's view of its own columns.
+    Under I16 a schema change records its intent before acting and is replayed
+    on recovery, so a log missing its Arrow schema has not been interrupted —
+    it is damaged. Guessing from the table would serve reads under a schema the
+    data does not have.
     """
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
     Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
@@ -158,13 +160,12 @@ def test_a_log_without_a_stored_schema_falls_back_to_the_table(tmp_path: Path) -
     log._buffer._con.execute("DELETE FROM meta WHERE k = 'arrow_schema'")
     log.close()
 
-    with Log.open(tmp_path, "s") as reopened:
-        assert reopened._schema.names == ["event_ts", "key"]
-        assert reopened.scan().read_all().num_rows == 0
+    with pytest.raises(ValueError, match="no stored Arrow schema"):
+        Log.open(tmp_path, "s")
 
 
-def test_a_stale_stored_schema_defers_to_the_table(tmp_path: Path) -> None:
-    """If the two disagree on columns, the table is the one that cannot be wrong."""
+def test_a_schema_disagreeing_with_the_table_refuses_to_open(tmp_path: Path) -> None:
+    """The two records disagreeing means something wrote outside litelink."""
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
     Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
 
@@ -173,5 +174,5 @@ def test_a_stale_stored_schema_defers_to_the_table(tmp_path: Path) -> None:
     log._buffer.set_meta("arrow_schema", stale.serialize().to_pybytes().hex())
     log.close()
 
-    with Log.open(tmp_path, "s") as reopened:
-        assert reopened._schema.names == ["event_ts", "key"], "table wins"
+    with pytest.raises(ValueError, match="disagrees with the Iceberg table"):
+        Log.open(tmp_path, "s")

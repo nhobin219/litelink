@@ -291,23 +291,25 @@ class Log:
             raise FileNotFoundError(msg)
 
         table = LogTable.load(layout, readonly=read_only)
-        # Structure from Iceberg, spelling from `meta`. The table is
-        # authoritative for which columns exist; the stored Arrow schema only
-        # records how their types were declared, and is checked against the
-        # table rather than trusted blindly.
-        from_table = application_schema(table.arrow_schema())
-        buffer = Buffer(layout.buffer_db, from_table, readonly=read_only)
-        schema = _declared_schema(buffer, from_table)
-        buffer.adopt_schema(schema)
+        schema = _declared_schema(layout, application_schema(table.arrow_schema()))
+        buffer = Buffer(layout.buffer_db, schema, readonly=read_only)
 
+        # Required, not defaulted, for the same reason as the schema: new()
+        # always writes it, so its absence is a damaged log rather than an
+        # older one, and quietly substituting defaults would change how a log
+        # seals and what it retains without saying so.
         encoded = buffer.get_meta(_CONFIG_KEY)
+        if encoded is None:
+            msg = f"log at {layout.root}/{name} has no stored config; it is corrupt"
+            raise ValueError(msg)
+
         log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
             schema=schema,
             sort_by=table.sort_by(),
-            config=LogConfig() if encoded is None else LogConfig.from_json(encoded),
+            config=LogConfig.from_json(encoded),
             # `or None`: detaching stores an empty string rather than deleting
             # the row, and an empty archive is no archive. Without this it reads
             # back truthy enough to make maintain() refuse to run.
@@ -735,21 +737,33 @@ class Log:
         self.close()
 
 
-def _declared_schema(buffer: Buffer, from_table: pa.Schema) -> pa.Schema:
-    """The Arrow schema as declared, if `meta` still agrees with the table.
+def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
+    """The Arrow schema as declared, checked against the table's columns.
 
-    Falls back to the table's own view when the record is missing (a log
-    created before this was stored) or when the columns no longer match (a
-    schema change reached Iceberg but not here). The table is the one that
-    cannot be wrong about which columns exist, so it wins any disagreement.
+    Both records must exist and agree. There is no fall back to the table's own
+    view: under I16 a schema change records its intent before acting and is
+    replayed on recovery, so a log whose two records disagree has not been
+    interrupted — it has been corrupted, or written to behind the library's
+    back. Continuing with a guess would serve reads under a schema the data
+    does not have.
     """
-    encoded = buffer.get_meta(_SCHEMA_KEY)
+    encoded = Buffer.peek_meta(layout.buffer_db, _SCHEMA_KEY)
     if encoded is None:
-        return from_table
+        msg = (
+            f"log at {layout.root}/{layout.name} has no stored Arrow schema; "
+            "its buffer database is missing or corrupt"
+        )
+        raise ValueError(msg)
 
     declared = pa.ipc.read_schema(pa.BufferReader(bytes.fromhex(encoded)))
+    if declared.names != from_table.names:
+        msg = (
+            f"stored schema {declared.names} disagrees with the Iceberg table "
+            f"{from_table.names} — the log has been modified outside litelink"
+        )
+        raise ValueError(msg)
 
-    return declared if declared.names == from_table.names else from_table
+    return declared
 
 
 def application_schema(schema: pa.Schema) -> pa.Schema:

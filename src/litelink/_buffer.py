@@ -294,22 +294,32 @@ class Buffer:
         self._con.execute("COMMIT")
         self._bytes = self._measure()
 
-    def adopt_schema(self, schema: pa.Schema) -> None:
-        """Use `schema` for the types this buffer reads back.
-
-        Opening has a chicken-and-egg shape: the declared schema lives in a
-        table only an open buffer can read. The column NAMES are identical
-        either way — this only changes which Arrow types the SQLite edge casts
-        to.
-        """
-        self._schema = schema
-
     # -- meta ---------------------------------------------------------------
     #
     # §2's `meta` table. Holds the settings that cannot be recovered from the
     # Iceberg table — deployment policy rather than data shape — so that `open`
     # can reconstruct a log from what it actually is instead of asking the
     # caller to restate it and hoping they match.
+
+    @staticmethod
+    def peek_meta(path: Path, key: str) -> str | None:
+        """Read one `meta` value without opening a full buffer.
+
+        Opening a log has a chicken-and-egg shape: the declared Arrow schema
+        lives in a table only an open buffer can read, and the buffer needs
+        that schema to cast what it reads back. One read-only connection
+        resolves it, which is cheaper than constructing a buffer twice and
+        leaves the schema immutable for the buffer's whole life.
+        """
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT v FROM meta WHERE k = ?", (key,)
+            ).fetchone()
+        finally:
+            connection.close()
+
+        return None if row is None else str(row[0])
 
     def get_meta(self, key: str) -> str | None:
         row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
