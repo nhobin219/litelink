@@ -25,6 +25,22 @@ class Layout:
     root: Path
     name: str
 
+    def __post_init__(self) -> None:
+        """Force `root` absolute.
+
+        Both URIs below are broken by a relative path, in different ways.
+        `file://litelink-data/x` is not a relative file URI — it parses as host
+        `litelink-data` and path `/x`, and DuckDB reports a missing file naming
+        a path that plainly exists. `sqlite:///litelink-data/catalog.db` does
+        work, but only relative to the process's cwd, so the same log resolves
+        to different databases depending on where it was opened from.
+
+        Resolved here rather than at each call site because the URIs are
+        properties: anything that constructs a Layout gets it, and there is no
+        way to hold one that is relative.
+        """
+        object.__setattr__(self, "root", Path(self.root).resolve())
+
     @property
     def buffer_db(self) -> Path:
         """One SQLite database per stream — SQLite's write lock is per file."""
