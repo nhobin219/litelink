@@ -1070,6 +1070,33 @@ The consequence worth planning for is that local disk holds roughly
    something is due*. Nothing identified so far needs the former, and adding an insert to the
    append path to deliver it would spend write latency — the thing this whole line of
    thinking is trying to reclaim.
+7. **Seal cost grows with the table, and compaction cannot arrest it.** A seal commits, and a
+   commit's cost tracks the number of **live data files**, not the number added since the last
+   one. Measured with compaction disabled, one file per seal: 46.7 ms at 20 files, 103.3 ms at
+   80, 301.8 ms at 320. Roughly linear.
+
+   Manifests are not the unbounded part, which is worth saying because they are the obvious
+   suspect. They cap at `commit.manifest.target-size-bytes` and split rather than growing —
+   verified by lowering the target until the split was reachable, after which the largest
+   manifest held at ~61 KB against a 64 KB target. `add_files`' duplicate check contributes
+   about 18% (272 ms against 224 ms at 240 files with it off). The rest is pyiceberg's commit
+   path doing work proportional to what the table holds.
+
+   **The file count is what has no bound.** §6 selects files *under* `compact_below`, so a
+   file compaction has already produced at or above that size is never revisited. Compaction
+   bounds how many *small* files exist; it cannot reduce the total.
+
+   Eviction is then the only mechanism that removes a large file, and §8 makes
+   `local_retention = None` — keep everything — the default. So a long-running local-only
+   capture that keeps its history accumulates files indefinitely and its seals degrade
+   indefinitely, with compaction running and unable to help. Archival configurations are fine,
+   because eviction is doing the bounding; it is the "just keep it all locally" case that
+   walks into this.
+
+   Worth measuring before choosing a fix, since the options differ in shape: raising
+   `compact_below` over time so yesterday's output is tomorrow's input, tiered compaction, a
+   manifest layout that makes a commit independent of table size, or the honest possibility
+   that unbounded local retention is not a supported configuration.
 
 ---
 
