@@ -96,13 +96,13 @@ schema = pa.schema([
     pa.field("ingest_ts", pa.int64()),  # stamped by you, never by the library
     pa.field("symbol", pa.string()),
     pa.field("price", pa.float64()),
-    pa.field("payload", pa.string()),   # the raw frame, verbatim
+    pa.field("size", pa.int64()),
 ])
 
 # new() takes the shape; it is fixed at creation.
 log = Log.new("data", "trades", schema=schema, sort_by=("event_ts", "symbol"))
 log.append({"event_ts": 1, "ingest_ts": 2, "symbol": "AAPL",
-            "price": 231.5, "payload": '{"T":"t"}'})   # durable when this returns
+            "price": 231.5, "size": 100})      # durable when this returns
 
 # open() takes none of it — schema, sort order, config and archive all come
 # from the log itself.

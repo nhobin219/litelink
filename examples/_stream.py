@@ -4,6 +4,10 @@ A market-data feed of the kind litelink is for: a websocket delivering tabular
 JSON faster than anyone wants to think about, which has to be durable the
 moment it arrives and queryable a moment later.
 
+The frame is parsed into columns rather than stored whole. That is the point of
+declaring a schema — every field prunes from Iceberg statistics, and a query for
+one symbol in one minute never reads the rest.
+
 `ingest_ts` is stamped by the application, never by the library — §2 is
 explicit that a library cannot know which of several defensible "ingest times"
 a caller meant, and a market feed is exactly where that matters: the exchange
@@ -14,7 +18,6 @@ mean.
 
 from __future__ import annotations
 
-import json
 import random
 import time
 from typing import TYPE_CHECKING
@@ -31,9 +34,7 @@ SCHEMA = pa.schema(
         pa.field("symbol", pa.string()),
         pa.field("price", pa.float64()),
         pa.field("size", pa.int64()),
-        # The raw frame, kept verbatim. §9: nothing is ever lost to a schema
-        # mistake, because a column can be re-promoted out of this at any time.
-        pa.field("payload", pa.string()),
+        pa.field("exchange", pa.string()),
     ]
 )
 
@@ -46,6 +47,7 @@ SORT_BY = ("event_ts", "symbol")
 NAME = "trades"
 
 SYMBOLS = ["AAPL", "MSFT", "NVDA", "SPY", "TSLA", "AMZN", "GOOG", "META"]
+EXCHANGES = ["XNAS", "XNYS", "ARCX", "BATS", "EDGX"]
 
 
 def observations(seed: int | None = None) -> Iterator[dict[str, object]]:
@@ -66,7 +68,5 @@ def observations(seed: int | None = None) -> Iterator[dict[str, object]]:
             "symbol": symbol,
             "price": price,
             "size": size,
-            "payload": json.dumps(
-                {"T": "t", "S": symbol, "p": price, "s": size, "t": event}
-            ),
+            "exchange": rng.choice(EXCHANGES),
         }
