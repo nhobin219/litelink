@@ -140,6 +140,15 @@ class Buffer:
         return int(row[0])
 
     def _row_bytes(self, row: Mapping[str, object]) -> int:
+        """Approximate bytes for one row, and refuse what SQLite cannot store.
+
+        The NaN check lives here because this loop already visits every value,
+        so it costs a comparison rather than a pass. SQLite has no NaN — it
+        stores one as NULL, verified — so a float column would take a NaN and
+        return a null, silently, with no error anywhere. That is the same
+        failure `_types` refuses whole types for, one level down: the library
+        declines what it cannot carry faithfully rather than changing it.
+        """
         total = 8
         for name in self._columns:
             value = row.get(name)
@@ -148,6 +157,16 @@ class Buffer:
             elif isinstance(value, str):
                 total += len(value.encode())
             elif value is not None:
+                # `!=` on itself is the NaN test that needs no import and does
+                # not trip over ints, bools or Decimals.
+                if isinstance(value, float) and value != value:
+                    msg = (
+                        f"column {name!r}: SQLite stores NaN as NULL, so the value "
+                        "would come back null rather than NaN. Use None if that is "
+                        "what you mean."
+                    )
+                    raise ValueError(msg)
+
                 total += 8
 
         return total
