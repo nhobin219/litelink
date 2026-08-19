@@ -951,9 +951,22 @@ The consequence worth planning for is that local disk holds roughly
 
    Options, none chosen:
 
-   - **Leave it in-process and seal on a background thread.** No coordination at all, and it
-     takes the spike off the append path, which is most of the prize. The lock already
-     exists. Does not address recovery ownership, because there is only one process.
+   - **Leave it in-process and seal on a background thread.** Avoids every open item above —
+     no leases, no recovery-ownership question, no signalling — because there is still one
+     process. But *moving* the seal to a thread wins nothing on its own: it would take the
+     same lock for the same duration, relocating the stall from the triggering append to
+     every append during the seal.
+
+     It works only if the seal stops holding the write lock for its expensive part, and §4's
+     steps divide cleanly for that. Step 1 claims the range and step 3 deletes the sealed
+     rows — both brief writes. Step 2 is all of the cost and **reads only**, so it can run on
+     a second SQLite connection while appends continue. Measured: a 19,999-row scan on one
+     connection took 22.6 ms while 21 appends completed on another at 0.64 ms median, with no
+     lock contention.
+
+     So: a second connection, the lock held only for steps 1 and 3, and a guard against two
+     seals in flight. The cost is that step 3 is deferred by one seal's duration rather than
+     by a poll interval, which is the narrowest version of the window below.
    - **A lease per role**, writer and maintainer, each recovering its own intents. Simple to
      state, but the split is coarser than what is actually exclusive, and it forces sealing
      to sit on whichever side owns the buffer.
