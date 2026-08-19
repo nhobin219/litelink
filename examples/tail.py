@@ -23,24 +23,20 @@ from litelink import Log
 def snapshot(log: Log) -> tuple[int, int, int, int]:
     """(total rows, table rows, buffer rows, data files) — one read, one moment.
 
-    Counted in DuckDB. Materialising the rows to call `len` on them would pull
-    the whole log across the process boundary to produce four integers — at
-    200,000 rows that was 403,000 rows per poll, since the sealed portion was
-    scanned a second time to be counted separately.
+    Nothing here scans data. Iceberg tracks a row count per file, so the table's
+    total comes off the manifest read that produced the boundary; the buffer is
+    counted in SQLite as a rowid range above it.
 
-    One query rather than two, so both numbers come from a single boundary and
-    cannot disagree if a seal lands between them.
+    The difference is the shape, not the constant. A `count(*)` over the log
+    reads the offset column out of every Parquet file, so the poll got slower as
+    the log grew — 24 ms at 50,000 rows and climbing. This is flat.
     """
-    extent = log.table_extent()
-    boundary = 0 if extent is None else extent[1]
-    counts = log.sql(
-        "SELECT count(*) AS total, "
-        f'count(*) FILTER (WHERE "litelink_offset" <= {boundary}) AS sealed FROM log'
-    ).read_all()
-    total = counts.column("total")[0].as_py()
-    sealed = counts.column("sealed")[0].as_py()
-
-    return total, sealed, total - sealed, len(log._table.data_files())  # noqa: SLF001
+    return (
+        log.table_rows() + log.buffered_rows(),
+        log.table_rows(),
+        log.buffered_rows(),
+        log.table_files(),
+    )
 
 
 def main() -> None:
