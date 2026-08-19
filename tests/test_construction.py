@@ -124,3 +124,58 @@ def test_layout_paths_are_derived_not_discovered(tmp_path: Path) -> None:
 def test_open_readonly_refuses_a_missing_log(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="no litelink log at"):
         Log.open_readonly(tmp_path / "nothing", "s", schema=SCHEMA)
+
+
+def test_the_extent_cache_follows_the_metadata_pointer(tmp_path: Path) -> None:
+    """A stale extent would double-count across the tier boundary (I3).
+
+    The cache is keyed on `metadata_location`, so every commit must move it.
+    This asserts the invalidation directly rather than trusting the read tests
+    to notice: a cache that never invalidated would still pass most of them,
+    because most do not commit between two reads.
+    """
+    log = Log.open(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    table = log._table
+
+    assert table.extent() is None, "nothing sealed yet"
+
+    log.extend([{"event_ts": 1, "key": "a"}, {"event_ts": 2, "key": "b"}])
+    log.seal()
+    table.reload()
+    first = table.metadata_location
+    assert table.extent() == (1, 2)
+
+    log.extend([{"event_ts": 3, "key": "c"}])
+    log.seal()
+    table.reload()
+
+    assert table.metadata_location != first, "a commit must move the pointer"
+    assert table.extent() == (1, 3), "cache served a stale extent across a seal"
+    log.close()
+
+
+def test_the_extent_cache_is_reused_while_the_pointer_holds(tmp_path: Path) -> None:
+    """The point of the cache: no manifest read when nothing has committed.
+
+    Asserted by object identity — `_read_extent` builds a fresh tuple every
+    time, so the same object coming back proves the manifests were not touched.
+    """
+    log = Log.open(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    log.extend([{"event_ts": 1, "key": "a"}])
+    log.seal()
+
+    table = log._table
+    table.reload()
+    first = table.extent()
+    assert first == (1, 1)
+
+    for _ in range(5):
+        table.reload()
+        assert table.extent() is first, "recomputed with the pointer unchanged"
+
+    log.extend([{"event_ts": 2, "key": "b"}])
+    log.seal()
+    table.reload()
+
+    assert table.extent() is not first, "a commit must force a re-read"
+    log.close()
