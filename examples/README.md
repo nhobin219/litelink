@@ -19,9 +19,9 @@ so the window grows without bound. Roughly 25 MB per 30 seconds at the default r
 deployment sets a retention and lets `maintain()` hold the size; the benchmarks, which have
 nothing to inspect afterwards, run in a temp directory and clean up on exit.
 
-The stream is a websocket trade feed, parsed into columns rather than stored as raw frames —
-which is the point of declaring a schema, since every field then prunes from Iceberg
-statistics.
+The stream is an ADS-B position feed over a websocket, parsed into columns rather than
+stored as raw frames — which is the point of declaring a schema, since every field then
+prunes from Iceberg statistics.
 
 `capture.py` is the operational shape of a litelink process: a main thread appending —
 durable when `extend()` returns, with no buffer to flush — and a daemon thread calling

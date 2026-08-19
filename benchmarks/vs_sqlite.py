@@ -69,8 +69,8 @@ def open_raw(db: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute(
         'CREATE TABLE buffer ("litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,'
-        " event_ts INTEGER, ingest_ts INTEGER, symbol TEXT, price REAL,"
-        " size INTEGER, note TEXT)"
+        " event_ts INTEGER, ingest_ts INTEGER, icao24 TEXT, altitude_ft INTEGER,"
+        " speed_kt REAL, note TEXT)"
     )
 
     return connection

@@ -91,27 +91,27 @@ embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 import pyarrow as pa
 from litelink import Log
 
-# A websocket trade feed: durable the moment it arrives, queryable a moment later.
+# An ADS-B position feed: durable the moment it arrives, queryable a moment later.
 schema = pa.schema([
-    pa.field("event_ts", pa.int64()),   # exchange timestamp
-    pa.field("ingest_ts", pa.int64()),  # stamped by you, never by the library
-    pa.field("symbol", pa.string()),
-    pa.field("price", pa.float64()),
-    pa.field("size", pa.int64()),
+    pa.field("event_ts", pa.int64()),    # when the aircraft transmitted
+    pa.field("ingest_ts", pa.int64()),   # stamped by you, never by the library
+    pa.field("icao24", pa.string()),
+    pa.field("altitude_ft", pa.int64()),
+    pa.field("speed_kt", pa.float64()),
 ])
 
 # new() takes the shape; it is fixed at creation.
-log = Log.new("data", "trades", schema=schema, sort_by=("event_ts", "symbol"))
-log.append({"event_ts": 1, "ingest_ts": 2, "symbol": "AAPL",
-            "price": 231.5, "size": 100})      # durable when this returns
+log = Log.new("data", "positions", schema=schema, sort_by=("event_ts", "icao24"))
+log.append({"event_ts": 1, "ingest_ts": 2, "icao24": "a0f31c",
+            "altitude_ft": 37000, "speed_kt": 461.2})   # durable when this returns
 
 # open() takes none of it — schema, sort order, config and archive all come
 # from the log itself.
-log = Log.open("data", "trades")
-log = Log.open("data", "trades", read_only=True)   # alongside a live writer
+log = Log.open("data", "positions")
+log = Log.open("data", "positions", read_only=True)   # alongside a live writer
 
 recent = log.scan(where="event_ts > 1000").read_all()
-log.maintain()                                     # compact, evict, expire
+log.maintain()                                        # compact, evict, expire
 ```
 
 ## Try it
