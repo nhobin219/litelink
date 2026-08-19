@@ -79,6 +79,27 @@ class Buffer:
               start_offset INTEGER, end_offset INTEGER, rel_path TEXT
             )
         """)
+        # The same intent record as `sealing`, for the other operation that
+        # creates a data file. Both exist so that no file is ever written whose
+        # path this database does not already hold — see `pending_delete`.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS compacting (
+              lo INTEGER, hi INTEGER, rel_path TEXT
+            )
+        """)
+        # The deletion queue. A file leaves the current snapshot long before it
+        # may be deleted (I6), so the interval has to be remembered somewhere;
+        # remembering it here is what makes reclamation a keyed read of this
+        # table rather than a directory walk looking for things nobody claimed.
+        #
+        # `superseded_at`, not a precomputed deadline: the grace period is
+        # `snapshot_retention`, and freezing it at enqueue time would mean a
+        # lowered setting never applied to anything already queued.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS pending_delete (
+              rel_path TEXT PRIMARY KEY, superseded_at INTEGER NOT NULL
+            )
+        """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
@@ -251,6 +272,72 @@ class Buffer:
         self._con.execute("DELETE FROM sealing")
         self._con.execute("COMMIT")
         self._bytes = self._measure()
+
+    # -- compaction bookkeeping -------------------------------------------
+
+    def claim_compaction(self, lo: int, hi: int, rel_path: str) -> None:
+        """Record a compaction's output path before the file exists.
+
+        The seal's I2 argument applied to the other writer: a compaction that
+        crashes between writing and committing leaves a file on disk, and the
+        only way to find it without a directory scan is to have written its
+        name down first.
+        """
+        self._con.execute("BEGIN")
+        self._con.execute("DELETE FROM compacting")
+        self._con.execute(
+            "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
+            (lo, hi, rel_path),
+        )
+        self._con.execute("COMMIT")
+
+    def pending_compaction(self) -> tuple[int, int, str] | None:
+        row = self._con.execute("SELECT lo, hi, rel_path FROM compacting").fetchone()
+
+        return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
+
+    def clear_compaction(self) -> None:
+        self._con.execute("DELETE FROM compacting")
+
+    # -- deletion queue ---------------------------------------------------
+
+    def enqueue_deletions(self, rel_paths: Iterable[str], superseded_at: int) -> None:
+        """Queue superseded files, stamped with when they left the table.
+
+        Enqueued in the same breath as the commit that superseded them, which
+        is the only moment their paths are known without going to look.
+        """
+        self._con.execute("BEGIN")
+        self._con.executemany(
+            "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at) VALUES (?, ?)",
+            [(p, superseded_at) for p in rel_paths],
+        )
+        self._con.execute("COMMIT")
+
+    def due_deletions(self, cutoff: int) -> list[str]:
+        """Files superseded at or before `cutoff` — now minus the grace period."""
+        return [
+            str(row[0])
+            for row in self._con.execute(
+                "SELECT rel_path FROM pending_delete WHERE superseded_at <= ?",
+                (cutoff,),
+            )
+        ]
+
+    def forget_deletion(self, rel_path: str) -> None:
+        """Drop a queue entry, after its file is gone.
+
+        Called after the unlink, never before: a crash in between leaves the
+        row and the next drain retries an unlink that is already a no-op. The
+        reverse order loses the path and leaks the file permanently.
+        """
+        self._con.execute("DELETE FROM pending_delete WHERE rel_path = ?", (rel_path,))
+
+    def queued_deletions(self) -> list[str]:
+        return [
+            str(row[0])
+            for row in self._con.execute("SELECT rel_path FROM pending_delete")
+        ]
 
     # -- lifecycle --------------------------------------------------------
 

@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 from litelink.log import Log, LogConfig
 from tests.test_log import SCHEMA, open_log, read_all, rows
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def seal_files(log: Log, count: int, per_file: int = 4) -> None:
@@ -214,17 +211,124 @@ def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
         assert written.exists(), "sweep deleted a file `sealing` had claimed"
 
 
-def test_sweep_removes_a_crashed_compaction_orphan(tmp_path: Path) -> None:
-    """§11: no snapshot was committed, so the file is unreferenced and swept."""
+def test_recovery_removes_a_crashed_compaction_by_name(tmp_path: Path) -> None:
+    """§11: no snapshot was committed, so the output is dead — and it is named.
+
+    The point is that recovery unlinks one known path. Nothing scans a
+    directory to discover that this file was garbage.
+    """
+    config = LogConfig(compact_min_files=99)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 1)
+        rel_path = log._compaction_path(1, 4)
+        log._buffer.claim_compaction(1, 4, rel_path)
+        half_written = tmp_path / rel_path
+        half_written.parent.mkdir(parents=True, exist_ok=True)
+        half_written.write_bytes(b"a compaction that never committed")
+
+    with open_log(tmp_path, config) as recovered:
+        assert not half_written.exists()
+        assert recovered._buffer.pending_compaction() is None
+        # The inputs were never superseded, so the table is already correct.
+        assert len(read_all(recovered)) == 4
+
+
+def tracked_paths(log: Log) -> set[Path]:
+    """Every file the log can account for without listing a directory.
+
+    Referenced by a live snapshot, claimed by an in-flight seal or compaction,
+    or queued for deletion. If a file on disk is in none of these, nothing
+    short of a filesystem walk could ever find it again.
+    """
+    tracked = {
+        Path(str(path).removeprefix("file://"))
+        for path in log._table.inspect.all_files()["file_path"].to_pylist()
+    }
+    for pending in (log._buffer.pending_seal(), log._buffer.pending_compaction()):
+        if pending is not None:
+            tracked.add(log.root / pending[2])
+
+    tracked |= {log.root / p for p in log._buffer.queued_deletions()}
+
+    return tracked
+
+
+def assert_nothing_untracked(log: Log) -> set[Path]:
+    on_disk = set(log.root.rglob("*.parquet"))
+    untracked = on_disk - tracked_paths(log)
+    assert untracked == set(), f"{len(untracked)} file(s) findable only by scanning"
+
+    return on_disk
+
+
+def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> None:
+    """The property that lets reclamation be a keyed read instead of a walk.
+
+    Every Parquet file this library creates must be findable from SQLite or
+    from a live snapshot at all times — including mid-seal, mid-compaction, and
+    while superseded files await their grace period. The test is allowed to
+    walk the filesystem; the library is not.
+    """
+    config = LogConfig(
+        compact_below=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(days=365),
+        snapshot_retention=timedelta(days=365),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)
+        assert_nothing_untracked(log)
+
+        log.maintain()  # compacts; sources are superseded but not yet deletable
+        on_disk = assert_nothing_untracked(log)
+        assert len(on_disk) == 5, "4 sources awaiting deletion, plus the merge"
+        assert len(log._buffer.queued_deletions()) == 4
+
+        # Mid-seal: written, not yet committed, claimed by `sealing`.
+        log.extend(rows(3, start=16))
+        rel_path = log._seal_path(17, 20)
+        log._buffer.claim_seal(17, 20, rel_path)
+        log._write_and_commit(20, rel_path)
+        assert_nothing_untracked(log)
+
+
+def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -> None:
+    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        log.maintain()
+        assert len(log._buffer.queued_deletions()) == 3
+        assert len(list(tmp_path.rglob("*.parquet"))) == 4
+
+    # Reopen with a grace period short enough that the queue is due. The
+    # deadline is evaluated against the CURRENT setting, not one frozen at
+    # enqueue time, so lowering it takes effect on what is already queued.
+    impatient = LogConfig(
+        compact_below=1 << 30,
+        compact_min_files=2,
+        snapshot_retention=timedelta(microseconds=1),
+    )
+    with open_log(tmp_path, impatient) as log:
+        log.maintain()
+
+        assert log._buffer.queued_deletions() == []
+        assert len(list(tmp_path.rglob("*.parquet"))) == 1
+        assert len(read_all(log)) == 12
+
+
+def test_a_referenced_file_is_never_deleted_by_the_drain(tmp_path: Path) -> None:
+    """Belt and braces: the queue is a hint, a live reference is a veto."""
     config = LogConfig(
         compact_min_files=99, snapshot_retention=timedelta(microseconds=1)
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
-        orphan = tmp_path / "s" / "data" / "orphan.parquet"
-        orphan.write_bytes(b"leftover from a compaction that never committed")
+        live = log._data_files()[0]
+        # Queue a file that is still referenced, which the grace period alone
+        # would happily let through.
+        log._enqueue([live.path])
 
         log.maintain()
 
-        assert not orphan.exists()
-        assert len(read_all(log)) == 4, "the live file is untouched"
+        assert Path(live.path).exists()
+        assert len(read_all(log)) == 4

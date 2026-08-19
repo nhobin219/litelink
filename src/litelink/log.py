@@ -421,6 +421,8 @@ class Log:
         delete is outstanding; if it did not, the whole file is rewritten to
         the same path.
         """
+        self._recover_compaction()
+
         pending = self._buffer.pending_seal()
         if pending is None:
             return
@@ -432,6 +434,26 @@ class Log:
 
         self._write_and_commit(end, rel_path)
         self._buffer.finish_seal(end)
+
+    def _recover_compaction(self) -> None:
+        """Resolve a compaction interrupted before its commit (§11).
+
+        Unlike a seal, an interrupted compaction is not redone. Its inputs are
+        still live — the transaction that would have superseded them never
+        committed — so the table is already correct and the next `maintain()`
+        will pick the same run up again. All that is owed is the half-written
+        output, and `compacting` names it, so removing it costs one unlink
+        rather than a directory scan.
+        """
+        pending = self._buffer.pending_compaction()
+        if pending is None:
+            return
+
+        _, _, rel_path = pending
+        if str(self.root / rel_path) not in self._file_paths():
+            (self.root / rel_path).unlink(missing_ok=True)
+
+        self._buffer.clear_compaction()
 
     def _file_paths(self) -> set[str]:
         snapshot = self._table.current_snapshot()
@@ -580,6 +602,20 @@ class Log:
 
     def _compact_run(self, run: list[_DataFile]) -> None:
         lo, hi = run[0].lo, run[-1].hi
+        rel_path = self._compaction_path(lo, hi)
+        # Claimed before the file exists, exactly as a seal claims its path
+        # (I2). A compaction that dies between the write and the commit is then
+        # recoverable by name, instead of being a file nobody can identify
+        # without listing the directory.
+        self._buffer.claim_compaction(lo, hi, rel_path)
+        self._compact_claimed(run, rel_path)
+        self._buffer.clear_compaction()
+
+    def _compaction_path(self, lo: int, hi: int) -> str:
+        return f"{self.name}/data/compacted/{lo}-{hi}.parquet"
+
+    def _compact_claimed(self, run: list[_DataFile], rel_path: str) -> None:
+        lo, hi = run[0].lo, run[-1].hi
         offset_range = offset_between(lo, hi)
         merged = self._table.scan(row_filter=offset_range).to_arrow()
         if self._sort_by:
@@ -608,10 +644,24 @@ class Log:
             msg = "compaction changed the offset extent"
             raise RuntimeError(msg)
 
-        # One snapshot: readers never observe a gap or a double count, so no
-        # grace window is needed for correctness (§6).
-        self._table.overwrite(merged, overwrite_filter=offset_range)
+        dest = self.root / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(merged, dest)
+        _fsync(dest)
+
+        # One snapshot, so readers never observe a gap or a double count (§6) —
+        # and the file is one we named, rather than one pyiceberg placed for us.
+        # `overwrite()` would do the same job in a single call, but it writes
+        # the output itself, which puts a path on disk that this process only
+        # learns about afterwards. That is the whole thing being avoided.
+        with self._table.transaction() as transaction:
+            transaction.delete(delete_filter=offset_range)
+            transaction.add_files([str(dest)])
+
         self._reload()
+        # Superseded, not yet deletable: a scan that started before this commit
+        # is still reading them (I6).
+        self._enqueue(f.path for f in run)
 
     def _evict(self) -> None:
         """Drop files older than `local_retention` from the local table (§8).
@@ -659,6 +709,14 @@ class Log:
         boundary = max(f.hi for f in stale)
         self._table.delete(delete_filter=offset_at_or_below(boundary))
         self._reload()
+        self._enqueue(f.path for f in stale)
+
+    def _enqueue(self, paths: Iterable[str]) -> None:
+        """Queue superseded files, deletable once no live snapshot can hold them."""
+        self._buffer.enqueue_deletions(
+            (str(Path(p).relative_to(self.root)) for p in paths),
+            int(datetime.now(UTC).timestamp()),
+        )
 
     def _expire(self) -> None:
         """Expire snapshots past `snapshot_retention` (§6, §8).
@@ -670,46 +728,48 @@ class Log:
         cutoff = datetime.now(UTC) - self.config.snapshot_retention
         self._table.maintenance.expire_snapshots().older_than(cutoff).commit()
         self._reload()
-        self._sweep()
+        self._drain_deletions()
 
-    def _sweep(self) -> None:
-        """Delete data files no live snapshot references.
+    def _drain_deletions(self) -> None:
+        """Delete files whose grace period has passed (§6, §8).
+
+        A keyed read of `pending_delete`, not a directory walk. Every file this
+        library creates has its path written to SQLite before it is written to
+        disk — seals through `sealing`, compactions through `compacting` — so
+        there is no category of file that could only be found by looking. That
+        matters more the moment this points at object storage, where the walk
+        is a paginated LIST that costs money and can lag reality.
 
         **pyiceberg's expire_snapshots is metadata-only.** Verified against
         0.11.1: expiring three snapshots leaves `inspect.all_files()` empty and
-        all three Parquet files on disk. So expiry alone reclaims nothing, and
-        without this pass `local_retention` and `snapshot_retention` would both
-        be inert as disk-space controls.
-
-        §11 already assumes a sweep exists — a compaction that crashes mid-write
-        leaves "the orphaned file unreferenced and swept" — so this is the same
-        pass, doing double duty.
-
-        Safe because it deletes only what no live snapshot names, and I6 keeps
-        snapshots alive for `snapshot_retention` past a scan's start. The one
-        file that is unreferenced and must NOT be deleted is an in-flight seal's
-        output, written but not yet committed; `sealing` names it, which is
-        exactly what that table is for.
+        all three Parquet files on disk. So the deletion is ours to do; the
+        queue is what makes it cheap.
         """
+        # Read against the CURRENT snapshot_retention, so lowering it takes
+        # effect on files already queued.
+        cutoff = datetime.now(UTC) - self.config.snapshot_retention
+        due = self._buffer.due_deletions(int(cutoff.timestamp()))
+        if not due:
+            return
+
         referenced = {
             str(path).removeprefix("file://")
             for path in self._table.inspect.all_files()["file_path"].to_pylist()
         }
 
-        pending = self._buffer.pending_seal()
-        if pending is not None:
-            referenced.add(str(self.root / pending[2]))
+        for rel_path in due:
+            path = self.root / rel_path
+            if str(path) in referenced:
+                # A compaction can re-register a path the queue still holds.
+                # Deleting a referenced file is unrecoverable, so the check is
+                # worth its cost even though the grace period should preclude it.
+                continue
 
-        # Only this log's territory: its own seal output, and the warehouse
-        # directory pyiceberg writes compaction results into. A sweep rooted at
-        # `root` would delete a sibling log's files.
-        for directory in (
-            self.root / self.name,
-            self.root / f"{_NAMESPACE}.db" / self.name,
-        ):
-            for data_file in directory.rglob("*.parquet"):
-                if str(data_file) not in referenced:
-                    data_file.unlink()
+            # Unlink first, forget second. A crash between them leaves a row
+            # whose unlink is already a no-op; the reverse leaks the file with
+            # nothing left pointing at it.
+            path.unlink(missing_ok=True)
+            self._buffer.forget_deletion(rel_path)
 
     def _reload(self) -> None:
         self._table = self._catalog.load_table(f"{_NAMESPACE}.{self.name}")
