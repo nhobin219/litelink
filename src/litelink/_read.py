@@ -11,26 +11,13 @@ from typing import TYPE_CHECKING
 
 import duckdb
 
+from litelink._types import column_type
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
     from litelink._layout import Layout
     from litelink._table import LogTable
-
-# Arrow type -> the DuckDB type the buffer leg is cast to.
-DUCKDB_TYPES = {
-    "int64": "BIGINT",
-    "int32": "INTEGER",
-    "int16": "SMALLINT",
-    "int8": "TINYINT",
-    "double": "DOUBLE",
-    "float": "FLOAT",
-    "bool": "BOOLEAN",
-    "string": "VARCHAR",
-    "large_string": "VARCHAR",
-    "binary": "BLOB",
-    "large_binary": "BLOB",
-}
 
 VIEW = "log"
 
@@ -72,7 +59,7 @@ class Reader:
         buffer_leg = (
             "SELECT "
             + ", ".join(
-                f'b."{c}"::{DUCKDB_TYPES[str(self._schema.field(c).type)]} AS "{c}"'
+                f'b."{c}"::{column_type(self._schema.field(c).type).duckdb} AS "{c}"'
                 for c in columns
             )
             + " FROM buf.buffer b"
