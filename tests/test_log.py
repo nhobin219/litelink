@@ -43,8 +43,15 @@ def open_log_readonly(root: Path) -> Log:
 
 
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
+    # Payloads are deliberately NOT valid UTF-8. `b"x" * 16` decodes cleanly,
+    # so it never exercises a binary column as binary — which let a read-path
+    # change that could not carry blobs pass the entire suite.
     return [
-        {"event_ts": 1000 + i, "key": f"k{i % 3}", "payload": b"x" * 16}
+        {
+            "event_ts": 1000 + i,
+            "key": f"k{i % 3}",
+            "payload": bytes((0xD3, 0x00, 0xFF, i % 256)) * 4,
+        }
         for i in range(start, start + n)
     ]
 
