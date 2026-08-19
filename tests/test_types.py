@@ -40,17 +40,36 @@ def test_carried_types_map_through_every_layer(type_: pa.DataType) -> None:
     assert mapping.duckdb
 
 
+# A real value per type. Passing None for every column looks like coverage and
+# is not: a null never exercises the conversion from SQLite's storage class to
+# the Arrow type the seal writes, which is where booleans were broken.
+SAMPLE: dict[str, object] = {
+    "int32": 7,
+    "int64": 7,
+    "float": 1.5,
+    "double": 1.5,
+    "bool": True,
+    "string": "x",
+    "large_string": "x",
+    "binary": b"x",
+    "large_binary": b"x",
+}
+
+
 @pytest.mark.parametrize("type_", CARRIED, ids=str)
 def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) -> None:
-    """Create, append, seal, read — the path the KeyError used to hide in."""
+    """Create, append, seal, read — with a real value AND a null."""
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("c", type_)])
     root = tmp_path / str(type_).replace("[", "_").replace("]", "")
+    sample = SAMPLE[str(type_)]
 
     with Log.new(root, "s", schema=schema, sort_by=("event_ts",)) as log:
-        log.append({"event_ts": 1, "c": None})
-        assert log.scan().read_all().num_rows == 1, "readable from the buffer"
+        log.extend([{"event_ts": 1, "c": sample}, {"event_ts": 2, "c": None}])
+        assert log.scan().read_all()["c"].to_pylist() == [sample, None], "from buffer"
+
         log.seal()
-        assert log.scan().read_all().num_rows == 1, "readable from the table"
+
+        assert log.scan().read_all()["c"].to_pylist() == [sample, None], "from table"
 
 
 @pytest.mark.parametrize(
@@ -90,35 +109,69 @@ def test_validate_schema_names_the_offending_column() -> None:
         validate_schema(schema)
 
 
-def test_the_schema_a_log_carries_is_the_one_the_table_reports(tmp_path: Path) -> None:
-    """Arrow `string` is stored as Iceberg string and reads back `large_string`.
+def test_declared_types_come_back_as_declared(tmp_path: Path) -> None:
+    """Arrow is the interchange type at every edge, and the declaration wins.
 
-    The log adopts the stored type immediately, so a fresh log and a reopened
-    one agree — otherwise the DuckDB cast differs between them.
+    Iceberg has one string type and one binary type, and DuckDB returns the
+    32-bit-offset Arrow forms for both — so without casting at the edges, a
+    column declared `large_binary` comes back `binary`. The declared schema is
+    stored and cast to instead, which is why this holds for the wide forms and
+    not only the narrow ones.
     """
-    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
-
-    with Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as created:
-        created_schema = created._schema
-
-    with Log.open(tmp_path, "s") as reopened:
-        assert created_schema == reopened._schema
-        assert created_schema.field("key").type == pa.large_string()
-
-
-def test_arrow_schemas_get_their_field_ids_assigned(tmp_path: Path) -> None:
-    """Why Arrow is the default: the numbering is not the caller's job.
-
-    Stating the Iceberg schema directly would mean a hand-written id per
-    column, and pyiceberg accepts duplicates silently — which breaks §9's add,
-    drop and rename, since those resolve by id. Arrow hands that bookkeeping to
-    pyiceberg, which assigns unique ids by construction. That is why there is
-    one schema type and it is this one.
-    """
-    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
+    schema = pa.schema(
+        [
+            pa.field("event_ts", pa.int64()),
+            pa.field("key", pa.large_string()),
+            pa.field("payload", pa.large_binary()),
+        ]
+    )
 
     with Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        ids = [f.field_id for f in log._table._table.schema().fields]
+        log.append({"event_ts": 1, "key": "a", "payload": b"p"})
 
-        assert len(set(ids)) == len(ids), "assigned ids must be unique"
-        assert log._table.offset_field_id() in ids
+        from_buffer = log.scan().read_all().schema
+        assert from_buffer.field("key").type == pa.large_string()
+        assert from_buffer.field("payload").type == pa.large_binary()
+
+        log.seal()
+
+        from_table = log.scan().read_all().schema
+        assert from_table.field("key").type == pa.large_string()
+        assert from_table.field("payload").type == pa.large_binary()
+
+    with Log.open(tmp_path, "s") as reopened:
+        reopened_schema = reopened.scan().read_all().schema
+        assert reopened_schema.field("key").type == pa.large_string()
+        assert reopened_schema.field("payload").type == pa.large_binary()
+
+
+def test_a_log_without_a_stored_schema_falls_back_to_the_table(tmp_path: Path) -> None:
+    """The stored Arrow schema records spelling; the table records structure.
+
+    A log written before the spelling was stored must still open, taking the
+    table's view of its own columns.
+    """
+    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
+    Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
+
+    log = Log.open(tmp_path, "s")
+    log._buffer._con.execute("DELETE FROM meta WHERE k = 'arrow_schema'")
+    log.close()
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._schema.names == ["event_ts", "key"]
+        assert reopened.scan().read_all().num_rows == 0
+
+
+def test_a_stale_stored_schema_defers_to_the_table(tmp_path: Path) -> None:
+    """If the two disagree on columns, the table is the one that cannot be wrong."""
+    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
+    Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
+
+    stale = pa.schema([pa.field("event_ts", pa.int64()), pa.field("gone", pa.string())])
+    log = Log.open(tmp_path, "s")
+    log._buffer.set_meta("arrow_schema", stale.serialize().to_pybytes().hex())
+    log.close()
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._schema.names == ["event_ts", "key"], "table wins"

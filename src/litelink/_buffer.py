@@ -243,13 +243,19 @@ class Buffer:
             [pa.field("offset", pa.int64(), nullable=False), *self._schema]
         )
 
-        return pa.table(
-            [
-                pa.array(values, type=field.type)
-                for values, field in zip(columns, schema, strict=True)
-            ],
-            schema=schema,
+        # Built loosely, then cast to the declared schema — the SQLite edge.
+        # SQLite has no boolean and no distinction between string widths, so
+        # its values come back as whatever storage class it chose; casting is
+        # what turns them back into the types the caller declared. Constructing
+        # directly with `type=` instead refuses rather than converting: a bool
+        # column comes back as 1 and 0, and `pa.array([1], type=bool_())`
+        # raises.
+        loose = pa.table(
+            [pa.array(values) for values in columns],
+            names=list(schema.names),
         )
+
+        return loose.cast(schema)
 
     # -- seal bookkeeping -------------------------------------------------
 
@@ -287,6 +293,16 @@ class Buffer:
         self._con.execute("DELETE FROM sealing")
         self._con.execute("COMMIT")
         self._bytes = self._measure()
+
+    def adopt_schema(self, schema: pa.Schema) -> None:
+        """Use `schema` for the types this buffer reads back.
+
+        Opening has a chicken-and-egg shape: the declared schema lives in a
+        table only an open buffer can read. The column NAMES are identical
+        either way — this only changes which Arrow types the SQLite edge casts
+        to.
+        """
+        self._schema = schema
 
     # -- meta ---------------------------------------------------------------
     #
