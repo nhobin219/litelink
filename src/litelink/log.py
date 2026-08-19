@@ -496,6 +496,40 @@ class Log:
         with self._lock:
             return self._buffer.next_offset()
 
+    def buffered_rows(self) -> int:
+        """Rows durable in the buffer but not yet sealed.
+
+        The unsealed tail, which is what §7 measures as the variable cost of a
+        read — so it is the number to watch when tuning the seal threshold.
+
+        Counted in SQLite against the tier boundary rather than through the
+        union: a `count(*)` over the log would make DuckDB evaluate the same
+        predicate against the Iceberg leg too, reading the offset column out of
+        every Parquet file to establish that none of them qualify.
+        """
+        with self._lock:
+            extent = self.table_extent()
+
+            return self._buffer.count_above(0 if extent is None else extent[1])
+
+    def table_rows(self) -> int:
+        """Rows in the local Iceberg table.
+
+        From the manifests, which track a count per file, so this costs nothing
+        beyond the snapshot read the boundary already needs.
+        """
+        with self._lock:
+            self._table.reload()
+
+            return self._table.record_count()
+
+    def table_files(self) -> int:
+        """Data files in the local table — what compaction is bringing down."""
+        with self._lock:
+            self._table.reload()
+
+            return self._table.file_count()
+
     def table_extent(self) -> tuple[int, int] | None:
         """`(lo, hi)` offset extent of the local table, from statistics.
 
