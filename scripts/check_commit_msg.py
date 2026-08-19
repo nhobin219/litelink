@@ -38,6 +38,8 @@ SCOPES = {
     "spec",  # docs/SPEC.md itself
     "ci",  # workflows, hooks, Justfile
     "deps",  # dependency floors and the lockfile
+    "examples",  # the demo scripts
+    "benchmarks",  # the performance harness
 }
 
 # Matches: type[(scope)][!]: description
