@@ -667,3 +667,75 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         assert log._table.data_files() == [], (
             "a file whose adding snapshot has expired must still be evictable"
         )
+
+
+def test_local_rows_keeps_recent_data_a_time_window_would_drop(
+    tmp_path: Path,
+) -> None:
+    """The case a window alone cannot express.
+
+    An hour of a quiet stream is a handful of rows. A retention window sized
+    for a busy stream then evicts almost everything the moment it goes quiet,
+    and the next hot read — the thing `local_retention` exists to serve — goes
+    to the network for data written minutes ago.
+    """
+    config = LogConfig(
+        target_size=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        local_rows=8,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)  # 4 rows each, all older than the window
+        log._maintenance.evict()
+
+        kept = log._table.data_files()
+        assert sum(f.rows for f in kept) >= 8, (
+            "the row floor must hold data the window would have dropped"
+        )
+        assert kept[-1].hi == 16, "the newest rows are the ones kept"
+
+
+def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> None:
+    """Floors, not ceilings.
+
+    Both say what must stay readable without a network round trip, so the
+    binding one is whichever retains more — the opposite of how the seal
+    combines its limits, where they are ceilings and the tighter wins.
+    """
+    config = LogConfig(
+        target_size=1 << 30,
+        compact_min_files=2,
+        # Retains everything: nothing is an hour old.
+        local_retention=timedelta(hours=1),
+        # Retains almost nothing on its own.
+        local_rows=1,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)
+        log._maintenance.evict()
+
+        assert len(log._table.data_files()) == 4, (
+            "the window retains everything, so the row floor must not evict"
+        )
+
+
+def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
+    """`local_retention=None` used to mean "never evict", full stop. With a row
+    floor set it means "no limit from TIME", and the floor still applies."""
+    config = LogConfig(
+        target_size=1 << 30,
+        compact_min_files=2,
+        local_retention=None,
+        local_rows=4,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)
+        log._maintenance.evict()
+
+        kept = log._table.data_files()
+        assert sum(f.rows for f in kept) == 4
+        assert kept[-1].hi == 16

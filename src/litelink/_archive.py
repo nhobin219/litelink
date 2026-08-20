@@ -46,15 +46,15 @@ class Archive:
     def __init__(
         self,
         layout: Layout,
-        uri: str | None,
-        s3: S3Options,
-        schema: pa.Schema,
+        uri: str | None = None,
+        s3: S3Options | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         self._layout = layout
         # `or None` throughout: detaching writes an empty string to `meta`
         # rather than deleting the row, and an empty archive is no archive.
         self._uri = uri or None
-        self._s3 = s3
+        self._s3 = s3 or S3Options()
         self._schema = schema
         self._handle: LogTable | None = None
         # Guards all three fields together, because they are one fact. The
@@ -118,6 +118,10 @@ class Archive:
                 return None
 
             if self._handle is None:
+                if self._schema is None:
+                    msg = "archive was constructed without a schema"
+                    raise ValueError(msg)
+
                 # Held across the open, which is a round trip. Deliberate: a
                 # second caller arriving mid-open should wait for that handle
                 # rather than start a second one, and `set_uri` should wait

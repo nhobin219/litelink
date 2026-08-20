@@ -138,6 +138,22 @@ class LogConfig:
     # soon as it sealed, so the pair is rejected at construction rather than
     # honoured.
     local_retention: timedelta | None = None
+    # §8, the other half of the same policy. A window in time and a count of
+    # rows bound different things, and which one binds depends on a rate the
+    # library cannot know: an hour of a quiet stream is a handful of rows, and
+    # an hour of a busy one is more local disk than the machine has. Set both
+    # and eviction keeps whichever retains MORE — they are floors on what must
+    # stay readable without touching the network, so the binding one is the one
+    # that keeps more.
+    #
+    # The mirror image of the seal's `min(target_size, target_rows)` in §12,
+    # deliberately: there the two are ceilings and the tighter wins, here they
+    # are floors and the looser does.
+    #
+    # Rows, not files, because it is a statement about the data — "the last
+    # million entries stay local" survives a change to `target_size`, and "the
+    # last ten files" does not.
+    local_rows: int | None = None
     # §6/§8. Must exceed the longest scan: expiry deletes files an open scan is
     # still reading (I6).
     snapshot_retention: timedelta = timedelta(hours=1)
@@ -165,6 +181,7 @@ class LogConfig:
                     if self.local_retention is None
                     else self.local_retention.total_seconds()
                 ),
+                "local_rows": self.local_rows,
                 "snapshot_retention": self.snapshot_retention.total_seconds(),
                 "compact_min_files": self.compact_min_files,
                 "wal_replication": self.wal_replication,
@@ -179,6 +196,7 @@ class LogConfig:
         return cls(
             target_size=raw["target_size"],
             local_retention=None if retention is None else timedelta(seconds=retention),
+            local_rows=raw["local_rows"],
             snapshot_retention=timedelta(seconds=raw["snapshot_retention"]),
             compact_min_files=raw["compact_min_files"],
             wal_replication=raw["wal_replication"],
@@ -328,7 +346,7 @@ class Log:
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, archive, s3 or S3Options(), table_schema(schema))
+        remote = Archive(layout, archive, s3, table_schema(schema))
 
         return cls(
             layout=layout,
@@ -405,7 +423,7 @@ class Log:
         # row, and an empty archive is no archive. Read once here because both
         # the Log and its maintainer need it.
         archive = buffer.get_meta(_ARCHIVE_KEY) or None
-        remote = Archive(layout, archive, s3 or S3Options(), table_schema(schema))
+        remote = Archive(layout, archive, s3, table_schema(schema))
         log = cls(
             layout=layout,
             table=table,
@@ -1500,9 +1518,17 @@ def validate(
         msg = f"sort_by names columns not in the schema: {missing}"
         raise ValueError(msg)
 
-    if archive is None and config.local_retention == timedelta(0):
+    if (
+        archive is None
+        and config.local_retention == timedelta(0)
+        and not config.local_rows
+    ):
         msg = (
             "local_retention=0 means 'evict on upload' and presupposes an "
             "archive; with archive=None it would delete each file as it sealed"
         )
+        raise ValueError(msg)
+
+    if config.local_rows is not None and config.local_rows < 0:
+        msg = f"local_rows must not be negative: {config.local_rows}"
         raise ValueError(msg)
