@@ -406,3 +406,37 @@ def test_a_relative_root_is_resolved_once(
     assert log.root == root
     assert log.scan().read_all().num_rows == 1
     log.close()
+
+
+def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
+    """§3's durability claim, read back off the connection.
+
+    `synchronous=FULL` is the whole product: WAL alone fsyncs at checkpoint
+    rather than at commit, which puts committed rows back in the OS page cache
+    — the exact loss this library exists to prevent. 2 is SQLite's code for
+    FULL.
+    """
+    buffer = Buffer.open(tmp_path / "b.db", SCHEMA, target_size=1 << 20)
+    try:
+        assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 2
+    finally:
+        buffer.close()
+
+
+def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
+    """For a buffer whose rows still exist somewhere else.
+
+    The archive rewrite re-cuts through a scratch buffer whose every row came
+    from the archive and is still in it until the rewrite's final commit, so a
+    crash there costs a re-run rather than data. 0 is OFF. WAL stays either
+    way: the read-only handle is a second connection to the same file, which is
+    what WAL is for here — not durability.
+    """
+    buffer = Buffer.open(
+        tmp_path / "scratch.db", SCHEMA, target_size=1 << 20, durable=False
+    )
+    try:
+        assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 0
+        assert buffer._con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        buffer.close()

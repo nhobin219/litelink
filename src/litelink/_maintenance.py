@@ -457,14 +457,10 @@ class Maintenance:
         holds roughly one file at a time however long the range is, and it is
         removed at the end either way.
 
-        FOLLOW-UP: it is opened with the log's own durability, and does not
-        need it. Everything in it is derived from the archive, which stays
-        intact until the single commit at the end, so a crash costs a re-run
-        rather than data — `synchronous=FULL` and the WAL are paying for a
-        guarantee nothing here depends on. Left as it is because it is the
-        same `Buffer` the appender uses and an operation that runs by hand is
-        the wrong place to introduce a second configuration of it. Rows already
-        arrive one source file per transaction rather than one per row.
+        It is also opened without durability, because everything in it is
+        derived from the archive and the archive is still there until the final
+        commit. Rows arrive one source file per transaction rather than one per
+        row, for the same reason.
 
         One commit swaps the whole range. Committing each new file as it is
         written would have each commit delete a sub-range of a file the next
@@ -519,10 +515,16 @@ class Maintenance:
     ) -> None:
         """Append `stale` back through a buffer and seal it out again."""
         lo, hi = stale[0].lo, stale[-1].hi
+        # Not durable, deliberately. Every row in here came from the archive
+        # and is still in the archive until the single commit at the end, so a
+        # crash costs a re-run rather than data — and this does one transaction
+        # per source file plus a few per sealed one, every one of which would
+        # otherwise fsync for a guarantee nothing here depends on.
         scratch = Buffer.open(
             self._layout.rewrite_db,
             self._buffer.schema,
             target_size=self._config.target_size,
+            durable=False,
         )
         written: list[str] = []
         expected = 0
