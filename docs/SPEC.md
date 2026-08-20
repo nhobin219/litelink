@@ -1112,6 +1112,12 @@ The consequence worth planning for is that local disk holds roughly
    `compact_below` over time so yesterday's output is tomorrow's input, tiered compaction, or
    the honest possibility that unbounded local retention is not a supported configuration.
 
+   ### Owning the writer
+
+   §16 takes this up as a staged plan rather than an open question, because the two costs it
+   removes — the commit path here, and the v3 block in §13.8 — turn out to be the same piece
+   of work.
+
    ### Registering files without pyiceberg's commit path
 
    The cost above is pyiceberg's, not Iceberg's, which makes a fourth option available: write
@@ -1232,6 +1238,81 @@ Beyond §10:
   despite the restored buffer holding already-sealed rows.
 - Property test: for `t1 < t2`, `read(t1) ⊆ read(t2)`, across a seal, a compaction and an
   expiry.
+
+
+---
+
+# 16. Owning the Iceberg writer
+
+**Status: planned, not built.** A staging plan, and the test that gates every stage.
+
+## 16.1 Why
+
+Two problems that look separate share a cause and a fix.
+
+**Commit cost (§13.7).** pyiceberg deep-copies the whole `TableMetadata` model on every
+metadata update — twenty-seven copies per commit, 80% of a commit at 300 files. Table
+metadata is JSON and appending a snapshot to it is a dictionary edit; the copying is how
+`update_table_metadata` happens to be written, not something the format requires.
+
+**Format version (§13.8).** pyiceberg will not write v3 at 0.11.1 or 0.12.0rc1 —
+`NotImplementedError`, apache/iceberg-python#1551. Nothing else blocks it: **DuckDB's iceberg
+extension reads format-version 3**, verified, and DuckDB is the read path.
+
+So the writer is the constraint in both cases, and the writer is the smaller half of what
+pyiceberg does here. The library already writes its own Parquet, at a path claimed before the
+bytes exist (I2) and fsynced before the commit (I1). Registration is a manifest, a manifest
+list, a `metadata.json` and a pointer swap — three documented file formats and a SQLite row
+update the library already makes atomically (I16).
+
+**This does not contradict §1.** *"Everything Iceberg provides is used, not reimplemented"* is
+about the format: manifests, per-file statistics, field IDs, atomic snapshot commits. Files
+that conform are still Iceberg however they were produced. What changes is which code writes
+them.
+
+## 16.2 The risk, and the test that answers it
+
+The risk is not purity, it is **drift**. Metadata that is subtly wrong still opens locally,
+still passes litelink's own tests, and breaks in someone else's engine — later, and far from
+the change that caused it. §7 makes external readability the archive's whole purpose.
+
+So every stage is gated on the same test, and it is a test before it is a design:
+
+- **pyiceberg reads what litelink wrote.** It is the compatibility oracle precisely because it
+  is a different implementation.
+- **DuckDB reads it**, since it is the read path.
+- **Differentially**: the same logical operation performed through pyiceberg and through
+  litelink must produce tables that agree on schema, snapshot count, file set, row count and
+  offset extent.
+
+A stage that cannot pass those does not land.
+
+## 16.3 Stages
+
+**Stage 1 — the append.** Register one already-written Parquet file: build the `DataFile` from
+the footer, write one manifest holding one entry, write a manifest list carrying the existing
+manifests forward, edit `metadata.json`, swap the pointer under a compare-and-swap on the old
+location. Stay on v2. pyiceberg keeps the catalog, the reads and all maintenance.
+
+This alone fixes §13.7's seal cost, and by two mechanisms. It skips the deep copy, and it
+stops merging manifests at commit time — a seal writes one small manifest and leaves the rest
+alone, so its cost tracks the manifest list rather than the table. Consolidating manifests
+becomes maintenance work, off the write path, which is where §13.7 wanted it.
+
+**Stage 2 — maintenance commits.** Compaction's delete-plus-add, eviction's delete, snapshot
+expiry. Larger surface, no latency pressure, and the same tests.
+
+**Stage 3 — v3.** Once the writer is ours, `format-version` is a choice rather than a
+constraint. §13.8 lists what it buys: variant for the tabular-JSON case, nanosecond timestamps,
+default column values. Row lineage still does not replace `litelink_offset`, for the reason
+given there.
+
+## 16.4 What stays on pyiceberg
+
+Reading. The catalog, `metadata_location` resolution, manifest reads for the extent and the
+counts, schema and field-ID management. Those are not on any hot path, and each is a place
+where a second implementation would add drift risk for no measured gain. **Removing the
+dependency is not a goal**; removing it from the write path is.
 
 ---
 
