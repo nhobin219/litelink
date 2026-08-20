@@ -50,11 +50,11 @@ data is durable at commit and queryable immediately, so freshness is sub-second 
 durability — but "real-time" means fresh, not point-lookup fast.
 
 Nor is it an unbounded local archive. **Keeping everything on one machine — `archive=None`
-with no `local_retention` — degrades as the table grows.** A seal's cost tracks the number of
-live data files rather than the number it adds, and compaction cannot arrest that: it merges
-files *below* `compact_below`, so a file it has already produced at that size is never
-revisited. Only eviction removes one, and with no retention set nothing evicts. The seal is
-on the write path, so the cost lands on appends.
+with no `local_retention` — degrades as the table grows.** A seal's cost tracks what the
+table's metadata holds, and while running `maintain()` bounds the largest part of that, a
+residue grows with the file count: compaction merges files *below* `compact_below`, so one it
+has already produced at that size is never revisited, and only eviction removes it. With no
+retention set nothing evicts. The seal is on the write path, so the cost lands on appends.
 
 Configure a retention, or an archive to evict into, for anything long-running. Both bound the
 file count, which is what bounds the cost. Details and the options for fixing it properly are
