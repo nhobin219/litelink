@@ -24,7 +24,7 @@ from litelink._archive import Archive
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     import pyarrow as pa
 
@@ -46,30 +46,99 @@ def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
         raise RuntimeError(msg)
 
 
-def settled_size(target_size: int) -> int:
-    """The size at which a file is done: big enough to archive, not worth
-    merging. Half the target.
+def runs(
+    files: Sequence[DataFile], budget: int, memory: Mapping[str, int]
+) -> list[list[DataFile]]:
+    """Adjacent files grouped into merge candidates, each within `budget`.
 
-    Not a knob, and deliberately not a second one. It was `compact_below`, and
-    a separate setting for it could be — was — set above `target_size`, which
-    silently wedges the log: compaction caps its output AT the target, so above
-    it every file compaction produces is still a merge candidate, and none is
-    ever large enough for `sync` to push. Compact forever, archive never.
+    The one definition of what compaction considers a run, because two
+    collaborators act on it and they must not disagree: `compact` merges these
+    groups, and `sync` refuses to archive a file that appears in one, since a
+    file pushed and then merged locally leaves the archive holding rows that
+    have been rewritten underneath it.
 
-    The fraction is not arbitrary either. `target_size` is measured on the
-    BUFFER, in uncompressed SQLite bytes, while this is measured on the sealed
-    Parquet FILE — so the same data is smaller here by whatever compression
-    achieved, and a settled file simply never reaches `target_size` on disk.
-    Anything at half the target is close enough that rewriting it would move
-    most of a file to gain a little of one.
+    Sizes come from `memory` — what each file holds uncompressed, as the
+    appender counted it — and the budget is `target_size`, which is stated in
+    those same units. That correspondence is the point. Sizing this by the
+    files' size on disk is what the code here used to do, and on data that
+    compresses 8:1 it merged eight files that were each already full, into one
+    holding eight times the memory the target allows.
 
-    One definition rather than two call sites computing their own, because
-    compaction consumes files below this line and `sync` pushes files above it,
-    and those two rules are only complementary while the line is the same. Let
-    them drift and a file can be both a merge candidate and archived, which is
-    the one thing §5 and §6 must never both believe.
+    A file whose size was never recorded counts as full. Unknown is not zero:
+    treating it as small is what would pull an already-correct file into a
+    rewrite, and the cost of leaving it alone is nothing but a merge that did
+    not happen.
+
+    The budget caps the OUTPUT. Merging every adjacent small file without one
+    puts no ceiling on the result — a hundred files just under the line become
+    one file a hundred times the target, which is the same defect as an
+    undersized file with the sign flipped. A run therefore closes when the next
+    file would take it past the budget, and the pass emits several correctly
+    sized files instead of one enormous one.
     """
-    return target_size // 2
+    grouped: list[list[DataFile]] = []
+    run: list[DataFile] = []
+    held = 0
+    for data_file in files:
+        size = memory.get(data_file.path, budget)
+        # A file already at the budget on its own closes the previous run and
+        # forms one of its own, which then closes on the next file. No special
+        # case needed: it simply never has room for a neighbour.
+        if run and held + size > budget:
+            grouped.append(run)
+            run, held = [], 0
+
+        run.append(data_file)
+        held += size
+
+    if run:
+        grouped.append(run)
+
+    return grouped
+
+
+def stable_prefix(
+    files: Sequence[DataFile],
+    budget: int,
+    min_files: int,
+    memory: Mapping[str, int],
+) -> int:
+    """How many leading files compaction will never touch again.
+
+    What `sync` needs to know, asked directly. It used to ask a proxy question
+    — "is this file at least half the target?" — and measure it on disk, which
+    fails outright on compressible data: a 64 KiB buffer of repetitive rows
+    seals to under 8 KiB, so no file ever reached half of 64 KiB, `sync` pushed
+    nothing, and the archive stayed empty with nothing to indicate why.
+    Compaction's own rule has no such blind spot, and it is the rule that
+    actually matters, since the only reason to hold a file back is that
+    compaction might rewrite it.
+
+    Two things disqualify a file. It sits in a run compaction would merge right
+    now; or it sits in the trailing run, which is under budget and so still has
+    room for files that have not been written yet. Everything before the first
+    such file is settled: no run containing it can also contain anything new,
+    because the files between them already fill the budget.
+
+    A small file in the MIDDLE is therefore pushed, not held. It is under the
+    target and always will be — its neighbours are too big to merge with, so
+    compaction will not touch it and waiting achieves nothing. Holding it was
+    the old behaviour and it meant a single explicit `seal()` blocked the
+    archive permanently: everything after it is newer, so the watermark never
+    advanced again and I4 then pinned local disk too. Not "later" — never.
+    """
+    settled = 0
+    for run in runs(files, budget, memory):
+        if len(run) >= min_files:
+            break
+
+        held = sum(memory.get(f.path, budget) for f in run)
+        if run[-1] is files[-1] and held < budget:
+            break
+
+        settled += len(run)
+
+    return settled
 
 
 class Maintenance:
@@ -156,49 +225,26 @@ class Maintenance:
         # FRESH table, committing evicted data back into the log.
         self._table.reload()
 
-        # Never merge what the archive already has. Marking compaction output
-        # archivable is not enough on its own: an output can still fall under
-        # `settled_size` and be merged again, and a merge spanning the archive
-        # watermark either duplicates the rows already pushed or strands the
-        # ones above them. Skipping archived files makes that unreachable —
-        # they are simply never inputs.
         archived = self.archived_through()
 
-        threshold = settled_size(self._config.target_size)
-        # An upper bound as well as a lower one. Selecting every adjacent file
-        # under the threshold and merging the lot puts no ceiling on the
-        # result: a hundred files just under it become one file a hundred times
-        # `target_size`. That is the same defect as an undersized file with the
-        # sign flipped — `target_size` is a statement about how big a file
-        # should be, and a compaction that ignores it produces exactly the
-        # layout §6 exists to correct.
-        #
-        # So a run closes when the next file would take it past the target, and
-        # the pass emits several correctly sized files instead of one enormous
-        # one. Seal output and compaction output then converge on the same size
-        # rather than diverging with every pass.
-        budget = self._config.target_size
+        # Archived files are never inputs. Marking compaction output archivable
+        # is not enough on its own: a merge spanning the archive watermark
+        # either duplicates the rows already pushed or strands the ones above
+        # them. Skipping them makes that unreachable. They are a prefix — the
+        # watermark is contiguous — so dropping them cannot break adjacency.
+        pending = [f for f in self._table.data_files() if f.hi > archived]
 
-        run: list[DataFile] = []
-        size = 0
-        for data_file in self._table.data_files():
-            if data_file.hi <= archived or data_file.size >= threshold:
-                # Final: already archived, or already the size it should be.
-                # Ends any run rather than joining it.
-                self._merge(run, heartbeat)
-                run, size = [], 0
-                continue
+        for run in runs(pending, self._config.target_size, self.memory()):
+            self._merge(run, heartbeat)
 
-            if run and size + data_file.size > budget:
-                # Adjacency is in offset order, so closing here and starting a
-                # new run leaves both contiguous.
-                self._merge(run, heartbeat)
-                run, size = [], 0
-
-            run.append(data_file)
-            size += data_file.size
-
-        self._merge(run, heartbeat)
+    def memory(self) -> dict[str, int]:
+        """What each data file holds uncompressed, keyed by the path a
+        `DataFile` carries. The buffer records it against a relative path; the
+        table names files absolutely."""
+        return {
+            str(self._layout.absolute(rel_path)): size
+            for rel_path, size in self._buffer.file_bytes().items()
+        }
 
     def _merge(self, run: list[DataFile], heartbeat: Callable[[], bool] | None) -> None:
         """Compact a run, if there is enough of it to be worth a rewrite."""
@@ -259,6 +305,12 @@ class Maintenance:
         # this commit is still reading them (I6).
         self._enqueue(f.path for f in run)
         self._table.replace_range(lo, hi, str(dest))
+        # After the commit: until it lands the sources are still the live
+        # files, and moving their sizes onto an output that never became real
+        # would leave every one of them unmeasured.
+        self._buffer.record_merge(
+            rel_path, (self._layout.relative(f.path) for f in run)
+        )
 
     def rewrite_sorted(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Re-cluster every data file under the current sort order (§7).

@@ -284,6 +284,23 @@ class Buffer:
               bytes        INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # What each data file holds, measured the way `target_size` is stated:
+        # in memory, before Parquet compressed it. The seal is the only thing
+        # that can know this — it is the buffer's own byte count for the rows
+        # that went into the file — and nothing recoverable from the file
+        # afterwards is a substitute. Its size on disk is whatever compression
+        # achieved, which on repetitive rows is a factor of eight out, and
+        # `target_size` is a bound on memory: on what a reader pays to hold a
+        # file, and on what N of them cost when a scan opens N in parallel.
+        #
+        # So it is carried, not re-derived. A merge adds up its inputs, and the
+        # entry is dropped when the file is finally unlinked.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS file_bytes (
+              rel_path TEXT PRIMARY KEY,
+              bytes    INTEGER NOT NULL
+            )
+        """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
@@ -823,9 +840,73 @@ class Buffer:
                 return False
 
             self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
+            # Before the group is retired, because the group row IS the
+            # measurement: these are the bytes the appender counted for exactly
+            # the rows this file now holds. Same transaction, so a file can
+            # never be committed with its size lost.
+            self._con.execute(
+                "INSERT INTO file_bytes (rel_path, bytes)"
+                " SELECT ?, bytes FROM seal_group WHERE end_offset = ?"
+                " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
+                (rel_path, end),
+            )
             self._con.execute("DELETE FROM seal_group WHERE end_offset = ?", (end,))
 
         return True
+
+    # -- file sizes ---------------------------------------------------------
+
+    def file_bytes(self) -> dict[str, int]:
+        """What every known data file holds in memory, keyed by relative path.
+
+        All of it at once: the callers are compaction and sync, both of which
+        walk the whole file list, and one indexed read of a table with a row
+        per file beats a query per file.
+
+        A file missing from this is not an error. It means the log has files
+        this database never recorded — one written by a version that did not
+        keep them, say — and the callers treat an unknown size as "full", so
+        an unmeasured file is never merged on a guess about what it holds.
+        """
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, bytes FROM file_bytes"
+            ).fetchall()
+
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def record_merge(self, rel_path: str, sources: Iterable[str]) -> None:
+        """Attribute the sources' bytes to the file that replaced them.
+
+        Addition, not re-measurement: a merge writes exactly the rows it read,
+        so the output holds what the inputs held. That keeps the number in the
+        same currency as the seal that first measured it, however many rewrites
+        later — which is the whole reason it is carried rather than derived
+        from whatever the merged file happens to compress to.
+        """
+        paths = list(sources)
+        with self._transaction():
+            placeholders = ",".join("?" * len(paths))
+            total = self._con.execute(
+                f"SELECT sum(bytes), count(*) FROM file_bytes"  # noqa: S608 — count-bound
+                f" WHERE rel_path IN ({placeholders})",
+                paths,
+            ).fetchone()
+            # Only when every source was measured. Summing a subset would
+            # understate the output and invite a merge of something already
+            # full; leaving it absent marks it unknown, which every caller
+            # treats as "do not touch".
+            if total[1] == len(paths) and paths:
+                self._con.execute(
+                    "INSERT INTO file_bytes (rel_path, bytes) VALUES (?, ?)"
+                    " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
+                    (rel_path, int(total[0])),
+                )
+
+            self._con.execute(
+                f"DELETE FROM file_bytes WHERE rel_path IN ({placeholders})",  # noqa: S608
+                paths,
+            )
 
     # -- meta ---------------------------------------------------------------
     #
@@ -933,6 +1014,11 @@ class Buffer:
             self._con.execute(
                 "DELETE FROM pending_delete WHERE rel_path = ?", (rel_path,)
             )
+            # The file is gone from disk, so what it held is no longer a fact
+            # about anything. Dropped here rather than when the table stopped
+            # referencing it: until the grace period passes an open scan may
+            # still be reading it (I6).
+            self._con.execute("DELETE FROM file_bytes WHERE rel_path = ?", (rel_path,))
 
     def queued_deletions(self) -> list[str]:
         with self._lock:

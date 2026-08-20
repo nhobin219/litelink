@@ -17,7 +17,7 @@ import pytest
 from litelink import Log, LogConfig
 from litelink._buffer import Buffer
 from litelink._layout import Layout
-from litelink._maintenance import Maintenance, settled_size
+from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
 from litelink._table import LogTable
 from litelink.log import table_schema, validate
@@ -406,19 +406,3 @@ def test_a_relative_root_is_resolved_once(
     assert log.root == root
     assert log.scan().read_all().num_rows == 1
     log.close()
-
-
-def test_the_settled_size_is_under_the_compaction_budget() -> None:
-    """The property that used to be a validated relationship between two knobs.
-
-    Compaction consumes files under the settled size and caps its output at
-    `target_size`; `sync` pushes files at or above the settled size. Those are
-    only complementary while settled <= budget. When `compact_below` was its
-    own setting it could be raised above `target_size`, and then compaction
-    produced nothing it would not immediately reconsider and `sync` found
-    nothing it was allowed to push — the log compacted forever and archived
-    never. With one knob that pair is unrepresentable, so this asserts the
-    relationship directly rather than asserting a rejection.
-    """
-    for target in (2, 4096, 8 * 1024 * 1024, 1 << 30):
-        assert settled_size(target) <= target

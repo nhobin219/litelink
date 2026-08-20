@@ -261,6 +261,30 @@ transaction closes a group at the row that crosses it. Nothing else produces a f
 normal operation **every file in the system is the size it was asked to be**, and the
 things that exist to repair sizing have nothing to repair.
 
+**It is measured in uncompressed bytes, in memory — not in the size of the file on disk.**
+That is the single most important thing to know before setting it. A file holding 8 MiB of
+rows is 8 MiB on disk if they are incompressible and under 1 MiB if they repeat, so on-disk
+size is an output here, never the target. Set it larger than an on-disk file target would
+be, and expect smaller files than the number suggests.
+
+The reason is that the uncompressed size is the one that bounds anything real. It is what a
+reader pays to hold a file whatever the file cost to store, so bounding it per file is what
+lets a scan bound its total — N files open at once cost N times this, which is the number
+to divide a memory budget by when choosing read parallelism. It is also the only size
+knowable at the moment the seal has to decide, since what compression will achieve is not
+known until after the write. Sizing by the file instead would be sizing by the compression
+ratio: rows per file would swing with the data, and memory per file would be unbounded.
+
+**Everything downstream is stated in the same currency.** A file's uncompressed size is
+recorded by the seal that measured it — the appender's own byte count for exactly those
+rows — carried in the buffer beside the file, added up across a merge, and dropped when the
+file is finally unlinked. Compaction and sync both read it, so neither ever compares a
+compressed size to a memory bound. That mistake is not hypothetical: measuring on disk, the
+system merged eight already-full files into one holding eight times the target and, because
+sync refuses anything compaction may still rewrite, archived nothing at all while doing it.
+A file whose size was never recorded counts as full, so an unmeasured file is never
+rewritten on a guess.
+
 That holds only because there is no time-based seal. A timer sealing a quiet stream emits
 a small file every interval for ever, which is what compaction was built to clean up
 after — and it coupled RPO to file size, so shrinking the window to lose less data on a
@@ -277,11 +301,17 @@ a run worth merging. It is a no-op the rest of the time — measured at 19.3 ms 
 files, which is the cost of *asking* (`data_files()` opens every manifest) rather than of
 doing.
 
-**Sync holds back the trailing undersized files, and only those.** A small file in the
-middle can never grow: files are immutable and its neighbours are over the threshold, so
-compaction will not touch it. Stopping at the first one blocked the archive permanently —
-everything after it is newer, so the watermark never advanced, and I4 pinned local disk
-with it.
+**Sync holds back exactly what compaction might still rewrite**, which it decides by asking
+compaction's own rule rather than a size of its own — a file pushed and then merged locally
+would leave the archive holding rows that have been rewritten underneath it, so the two
+must agree, and the only way to guarantee that is to share the function. Disqualified are
+files in a run compaction would merge now, and files in the trailing run, which is under
+budget and so still has room for files not yet written.
+
+A small file in the middle is therefore pushed, not held. It can never grow — files are
+immutable and its neighbours are too big to merge with — so waiting achieves nothing.
+Holding it blocked the archive permanently: everything after it is newer, so the watermark
+never advanced, and I4 pinned local disk with it.
 
 So the archive can gain one small file per explicit seal. `rewrite_archive` is the tool
 for that, ad-hoc, and the same one that recompacts after a `target_size` change.
@@ -407,11 +437,14 @@ independent connection over the same database, with its own registrations and vi
 costs 0.0055 ms.
 
 **Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
-{`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
+{`Archive._lock`, `LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
 acquiring one another, and nothing below reaches back up, so there is no cycle to
 deadlock on. A read takes `Reader._lock` then briefly `LogTable._lock` and
 `Buffer._tail_lock`; a seal takes `Buffer._lock` and `LogTable._lock` at different
-moments and never together.
+moments and never together. `Archive._lock` guards the archive URI, its credentials and
+the handle they open as one fact, so a re-point cannot race an open in flight and two
+threads cannot each pay the round trip; it is held across that open, and never while
+calling back into anything above it.
 
 **The rule the lock actually encodes.** Every statement on the buffer's write connection
 takes that lock, reads included. A statement issued while another thread has a
