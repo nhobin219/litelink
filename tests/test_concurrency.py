@@ -169,3 +169,30 @@ def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
             f"expected offsets 1..400, got {len(offsets)} rows "
             f"spanning {min(offsets)}..{max(offsets)}"
         )
+
+
+def test_a_reader_is_not_destroyed_by_the_next_query(tmp_path: Path) -> None:
+    """A scan returns a LAZY reader, so the caller drains it after we return.
+
+    On a shared DuckDB connection the next query's `register` and
+    `CREATE OR REPLACE TEMP VIEW` land underneath a reader still streaming from
+    those same names. Measured before the fix: a reader over 200 rows returned
+    ZERO after another query ran on the connection — not perturbed, destroyed.
+
+    That is why a concurrent `scan()` could report a row count unrelated to
+    what was appended, in either direction. Each query now gets its own cursor:
+    an independent connection over the same database, with its own
+    registrations and temp views.
+    """
+    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(200))
+
+        held = log.scan()  # deliberately not drained yet
+
+        log.extend(rows(300, start=200))
+
+        assert len(log.scan().read_all()) == 500, "the second scan is wrong"
+        assert len(held.read_all()) == 200, (
+            "the first reader saw the second query's relation"
+        )

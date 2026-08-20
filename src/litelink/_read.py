@@ -77,9 +77,6 @@ class Reader:
         # `register` below is connection-global, so two concurrent scans on one
         # connection would swap each other's buffer leg.
         self._lock = threading.Lock()
-        # The view text last installed. Rebuilding it costs a DuckDB statement
-        # per query, and it can only change when the snapshot does.
-        self._view: str | None = None
 
     def query(self, sql: str) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
@@ -88,12 +85,19 @@ class Reader:
         Resolving the table per query is §7's rule, not an optimisation: every
         commit writes a new metadata JSON, so a reader holding the snapshot it
         opened with reports an empty log after the writer's first seal.
-        """
-        with self._lock:
-            return self._query(sql)
 
-    def _query(self, sql: str) -> pa.RecordBatchReader:
-        connection = self._connect()
+        **Each query gets its own cursor**, and that is what makes the returned
+        reader safe to hold. A reader is lazy — `_cast_to` keeps it streaming —
+        so the caller drains it after this returns. On one shared connection,
+        the next query's `register` and `CREATE OR REPLACE TEMP VIEW` land
+        underneath a reader still streaming from those same names. Measured: a
+        reader over 200 rows returned 0 after another query ran on the
+        connection. Not perturbed — destroyed.
+
+        A DuckDB cursor is an independent connection over the same database,
+        with its own registrations and temp views, so one query cannot reach
+        into another's. Verified directly rather than assumed.
+        """
         # Buffer first, table second, and the order is the correctness
         # argument. A seal commits its file and THEN deletes the rows it
         # covered, so between those two moments a row is in both tiers and
@@ -109,24 +113,25 @@ class Reader:
         floor = self._table.extent()
         tail = self._buffer.rows_above(None if floor is None else floor[1])
 
-        # Re-registered every query, because the buffer has moved on since the
-        # last one. Replacing the relation leaves the view valid: the view
-        # names it and DuckDB resolves that name at execution.
-        connection.register(BUFFER_REL, tail)
+        with self._lock:
+            # The lock covers building the cursor, not the query. Creating one
+            # touches the shared connection; running on it does not.
+            cursor = self._connect().cursor()
+
+        cursor.register(BUFFER_REL, tail)
 
         # Resolving per query is §7's rule. Both halves in one call, or a
         # commit between them pairs a new snapshot with an old boundary.
         self._table.reload()
         location, extent = self._table.snapshot()
-        # What is skipped is reinstalling an identical view: the union text is
-        # derived entirely from the metadata pointer and the extent, so
-        # unchanged text means an unchanged snapshot.
-        union = self._union(location, extent)
-        if union != self._view:
-            connection.execute(f"CREATE OR REPLACE TEMP VIEW {VIEW} AS {union}")
-            self._view = union
-
-        reader = connection.execute(sql).to_arrow_reader()
+        # Built every query now rather than cached against its own text. The
+        # cache existed to skip reinstalling an identical view on a shared
+        # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
+        # over an already-registered relation is cheap.
+        cursor.execute(
+            f"CREATE OR REPLACE TEMP VIEW {VIEW} AS {self._union(location, extent)}"
+        )
+        reader = cursor.execute(sql).to_arrow_reader()
 
         return _cast_to(reader, self._schema)
 

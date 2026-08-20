@@ -355,6 +355,14 @@ arriving after the winner never attempts at all. The lease fence remains as the 
 that stops the work early; this is what makes a failure of that fence harmless rather
 than a duplicate.
 
+**Each query gets its own DuckDB cursor**, and that is what makes a returned reader safe
+to hold. A reader is lazy — it streams — so the caller drains it after `query` returns.
+On one shared connection the next query's `register` and `CREATE OR REPLACE TEMP VIEW`
+land underneath a reader still reading from those names: measured, a reader over 200 rows
+returned **zero** once another query ran. Not perturbed, destroyed. A cursor is an
+independent connection over the same database, with its own registrations and views, and
+costs 0.0055 ms.
+
 **Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
 {`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
 acquiring one another, and nothing below reaches back up, so there is no cycle to
