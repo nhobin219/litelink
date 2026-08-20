@@ -447,7 +447,7 @@ class Log:
                 self._table.set_sort_order(requested)
                 self._sort_by = requested
                 self._maintenance.set_sort_by(requested)
-                self._maintenance.rewrite_sorted()
+                self._maintenance.rewrite_sorted(heartbeat=lease.renew)
             finally:
                 lease.release()
 

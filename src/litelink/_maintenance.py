@@ -14,6 +14,7 @@ pyiceberg's is metadata-only. Draining is what actually unlinks, and it waits
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -108,7 +109,9 @@ class Maintenance:
 
     def _compact_run(self, run: list[DataFile]) -> None:
         lo, hi = run[0].lo, run[-1].hi
-        rel_path = self._layout.compaction_path(lo, hi)
+        # Unique per attempt. See `compaction_path`: a fixed name made a
+        # rewrite of a previous compaction write over the file it was reading.
+        rel_path = self._layout.compaction_path(lo, hi, uuid.uuid4().hex[:8])
         # Claimed before the file exists, exactly as a seal claims its path
         # (I2). A compaction that dies between the write and the commit is then
         # recoverable by name, instead of being a file nobody can identify
@@ -138,7 +141,7 @@ class Maintenance:
         # is still reading them (I6).
         self._enqueue(f.path for f in run)
 
-    def rewrite_sorted(self) -> None:
+    def rewrite_sorted(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Re-cluster every data file under the current sort order (§7).
 
         File boundaries are preserved rather than merged: a rewrite is already
@@ -150,8 +153,15 @@ class Maintenance:
         uses, so a crash mid-rewrite leaves one named file to remove and a
         table still holding the original.
         """
+        # Between files, for the same reason `run` checkpoints between phases:
+        # this rewrites the WHOLE table, which outlasts a 30 s lease long
+        # before it outlasts a user's patience. Per file rather than per pass,
+        # because a pass here has no phases to sit between.
         for data_file in self._table.data_files():
             self._compact_run([data_file])
+            if heartbeat is not None and not heartbeat():
+                msg = "lost the maintenance lease mid-rewrite"
+                raise RuntimeError(msg)
 
     # -- eviction -----------------------------------------------------------
 

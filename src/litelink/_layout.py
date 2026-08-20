@@ -81,9 +81,23 @@ class Layout:
         """
         return f"{self.name}/data/{day.isoformat()}/{start}-{end}.parquet"
 
-    def compaction_path(self, lo: int, hi: int) -> str:
-        """Root-relative path for the merge of the offset range `[lo, hi]` (§6)."""
-        return f"{self.name}/data/compacted/{lo}-{hi}.parquet"
+    def compaction_path(self, lo: int, hi: int, token: str) -> str:
+        """Root-relative path for the merge of the offset range `[lo, hi]` (§6).
+
+        `token` makes it unique per attempt, and unlike a seal's path it does
+        NOT need to be derivable: `compacting` records it before the file
+        exists, so recovery reads the name rather than recomputing it.
+
+        Uniqueness is the point. A deterministic `{lo}-{hi}` meant a compaction
+        whose inputs were themselves a previous compaction of the same range
+        wrote to the path it was reading — `set_sort_by(rewrite=True)` after
+        any compaction truncated the live, table-referenced file, and a crash
+        mid-write destroyed the only copy of those rows. It also meant two
+        owners racing the role wrote one file. A seal can overwrite in place
+        because its source is the buffer, which is still there; a compaction's
+        source is the file it is replacing.
+        """
+        return f"{self.name}/data/compacted/{lo}-{hi}-{token}.parquet"
 
     def absolute(self, rel_path: str) -> Path:
         return self.root / rel_path

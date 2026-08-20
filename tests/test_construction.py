@@ -125,7 +125,9 @@ def test_layout_paths_are_derived_not_discovered(tmp_path: Path) -> None:
     assert layout.seal_path(1, 51, date(2026, 8, 19)) == (
         "sensors/data/2026-08-19/1-51.parquet"
     )
-    assert layout.compaction_path(1, 200) == "sensors/data/compacted/1-200.parquet"
+    assert layout.compaction_path(1, 200, "abc123") == (
+        "sensors/data/compacted/1-200-abc123.parquet"
+    )
     assert (
         layout.relative(f"file://{tmp_path}/sensors/x.parquet") == "sensors/x.parquet"
     )
