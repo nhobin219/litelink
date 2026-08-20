@@ -192,6 +192,20 @@ Nothing in Python. Every arrow in the diagram is a SQLite row:
 The one in-process shortcut is a `threading.Event` used to stop the sealer at `close()`.
 Nothing about correctness depends on it.
 
+**Concurrency, by axis.** Any number of *processes* may read at once, each with its own
+SQLite and DuckDB connections, sharing only files — which is what WAL is for, and what
+the corruption fix restored by keeping DuckDB out of the buffer database entirely (327
+concurrent scans from a second process, clean). Within one process, each `Log` has its
+own `Reader`, so two handles read in parallel; only concurrent `scan()` calls on the
+*same* handle serialise, on that reader's lock.
+
+Making those parallel too — a thread-local DuckDB connection per `Log` — was measured and
+rejected. On a 2-core box DuckDB already uses both cores for a single query, so 1, 2 and
+4 concurrent readers gave 35, 28 and 7 scans/s: more readers, less throughput. It is the
+right lever on many-core hardware and the wrong one here. The SQLite side does not have
+the option at all, since one writer at a time is a property of the database, not of our
+locking — a mutex wait simply becomes a `SQLITE_BUSY` wait of the same length.
+
 A lease statement runs under the buffer's lock, not just on its connection. Without it
 the statement joins whatever transaction another thread has open and is undone by that
 transaction's rollback — a claim that can evaporate is not a claim, and two sealers wrote

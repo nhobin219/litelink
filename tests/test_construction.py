@@ -18,7 +18,7 @@ from litelink import Log, LogConfig
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
-from litelink._read import Reader
+from litelink._read import Reader, duckdb_connection
 from litelink._table import LogTable
 from litelink.log import table_schema, validate
 
@@ -64,14 +64,14 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     layout = Layout(tmp_path / "does-not-exist", "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = Buffer(layout.buffer_db, SCHEMA, target_size=1 << 20)
+    buffer = Buffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
 
     config = LogConfig()
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, table_schema(SCHEMA)),
+        reader=Reader(layout, table, buffer, table_schema(SCHEMA), duckdb_connection),
         maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
         schema=SCHEMA,
         sort_by=("event_ts",),
@@ -98,14 +98,14 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     layout = Layout(tmp_path, "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = StubBuffer(layout.buffer_db, SCHEMA, target_size=1 << 20)
+    buffer = StubBuffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
     config = LogConfig()
 
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, table_schema(SCHEMA)),
+        reader=Reader(layout, table, buffer, table_schema(SCHEMA), duckdb_connection),
         maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
         schema=SCHEMA,
         sort_by=("event_ts",),

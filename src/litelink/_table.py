@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     import pyarrow as pa
+    from pyiceberg.table import Table
     from pyiceberg.table.snapshots import Snapshot
 
     from litelink._layout import Layout
@@ -78,7 +79,12 @@ class LogTable:
     silently serves a stale snapshot.
     """
 
-    def __init__(self, catalog: SqlCatalog, layout: Layout) -> None:
+    def __init__(self, catalog: SqlCatalog, layout: Layout, table: Table) -> None:
+        """Take the loaded table. `create` and `load` are what load it.
+
+        Assigning only, so that a caller holding a `Table` from anywhere — a
+        fixture, a different catalog — can build one of these around it.
+        """
         self._catalog = catalog
         self._layout = layout
         # Guards the handle below and the caches keyed off it — NOT the work
@@ -91,7 +97,7 @@ class LogTable:
         # against the snapshot it read, and `reload` only changes which
         # snapshot the NEXT caller sees.
         self._lock = threading.RLock()
-        self._table = catalog.load_table(layout.table_id)
+        self._table = table
         # Snapshot-derived facts, cached against the metadata pointer. See
         # `extent`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
@@ -122,7 +128,7 @@ class LogTable:
             layout.table_id, schema=schema, properties=METADATA_PROPERTIES
         )
 
-        table = cls(catalog, layout)
+        table = cls(catalog, layout, catalog.load_table(layout.table_id))
         table.set_sort_order(sort_by)
 
         return table
@@ -130,7 +136,8 @@ class LogTable:
     @classmethod
     def load(cls, layout: Layout, *, readonly: bool) -> LogTable:
         """Load an existing table. Raises if there is none."""
-        table = cls(cls._catalog_for(layout), layout)
+        catalog = cls._catalog_for(layout)
+        table = cls(catalog, layout, catalog.load_table(layout.table_id))
         if not readonly:
             table.ensure_metadata_properties()
 

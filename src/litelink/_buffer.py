@@ -71,80 +71,111 @@ class Buffer:
 
     def __init__(
         self,
-        path: Path,
+        writer: sqlite3.Connection,
+        reader: sqlite3.Connection,
         schema: pa.Schema,
+        columns: tuple[str, ...],
         *,
         target_size: int,
-        readonly: bool = False,
     ) -> None:
-        """Open or create the buffer at `path`.
+        """Take built collaborators. `open` is what builds and validates them.
 
-        `schema` is the application's columns, without `offset`.
+        `writer` is the connection every transaction here runs on; `reader` is
+        a second, read-only handle for the rows a seal is about to write out.
+        That read is the expensive half of a seal, and on the write connection
+        it would serialise against the appends a seal exists to stay out of the
+        way of. WAL allows it: one writer, any number of readers.
 
-        `target_size` is here rather than only on the seal because the cut it
-        describes is made on the append path — see `seal_group`.
-
-        A readonly buffer opens the same file through SQLite's `mode=ro` URI so
-        the handle cannot write even by mistake, and creates nothing. WAL allows
-        any number of these alongside the single writer (§1).
+        `schema` is the application's columns, without `offset`; `columns` is
+        their names, passed rather than derived so this assigns and nothing
+        else. `target_size` is here rather than only on the seal because the
+        cut it describes is made on the append path — see `seal_group`.
         """
+        self._con = writer
+        self._reader = reader
         self._schema = schema
-        self._columns = tuple(schema.names)
+        self._columns = columns
         self._target_size = target_size
-        # The read cache — see `rows_above`. Guarded by its own lock rather
-        # than `_lock`, which appends hold: a read must not wait behind a write
-        # to look at a table the write cannot invalidate.
-        self._tail_lock = threading.Lock()
-        self._tail: pa.Table | None = None
-        self._tail_lo = 0
-        self._tail_hi = 0
-
-        if readonly:
-            self._con = sqlite3.connect(
-                f"file:{path}?mode=ro",
-                uri=True,
-                isolation_level=None,
-                check_same_thread=False,
-            )
-            self._reader = self._con
-            return
-
-        # check_same_thread=False because scheduling maintenance on a background
-        # thread is the ordinary operational shape, and Python's guard would
-        # otherwise forbid it. The C library is built serialized here
-        # (`sqlite3.threadsafety == 3`), so the connection itself is safe; Log
-        # holds a lock to serialise its own multi-statement sequences, which is
-        # the part SQLite cannot know about.
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
         # an append, a seal claiming and clearing its range, a maintenance pass
         # queuing deletions — and two BEGINs at once is "cannot start a
         # transaction within a transaction". Worse than the error: with
-        # autocommit suspended by someone else's BEGIN, an unrelated INSERT
-        # joins their transaction and commits or rolls back with it.
+        # autocommit suspended by someone else's BEGIN, an unrelated statement
+        # joins their transaction and commits or rolls back with it, which is
+        # how a lease once evaporated under its own holder.
+        #
+        # Assigned unconditionally, including for a readonly buffer. It used to
+        # be skipped there, which left `lease()` raising AttributeError on a
+        # handle that had every right to ask.
         self._lock = threading.RLock()
+        # The read cache — see `rows_above`. Its own lock rather than the one
+        # above, which appends hold: a read must not wait behind a write to
+        # look at a table the write cannot invalidate.
+        self._tail_lock = threading.Lock()
+        self._tail: pa.Table | None = None
+        self._tail_lo = 0
+        self._tail_hi = 0
 
-        self._con = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self._con.execute("PRAGMA journal_mode=WAL")
-        self._con.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        schema: pa.Schema,
+        *,
+        target_size: int,
+        readonly: bool = False,
+    ) -> Buffer:
+        """Connect, configure, and create the tables. Then hand them to `cls`.
+
+        The I/O half, kept out of `__init__` for the same reason `Log.open` is
+        kept out of `Log.__init__`: a constructor that opens files cannot be
+        handed a substitute, and a test that wants one should not have to
+        monkeypatch its way in.
+
+        A readonly buffer opens the same file through SQLite's `mode=ro` URI so
+        the handle cannot write even by mistake, and creates nothing. WAL allows
+        any number of these alongside the single writer (§1).
+        """
+        columns = tuple(schema.names)
+        if readonly:
+            con = cls._connect_readonly(path)
+
+            return cls(con, con, schema, columns, target_size=target_size)
+
+        # check_same_thread=False because scheduling maintenance on a background
+        # thread is the ordinary operational shape, and Python's guard would
+        # otherwise forbid it. The C library is built serialized here
+        # (`sqlite3.threadsafety == 3`), so the connection itself is safe; the
+        # lock is for the multi-statement sequences SQLite cannot know about.
+        writer = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         # §3's durability claim rests on this line. WAL alone fsyncs at
         # checkpoint, not at commit, which would put committed rows back in the
         # OS page cache — the exact loss this library exists to prevent.
-        self._con.execute("PRAGMA synchronous=FULL")
+        writer.execute("PRAGMA synchronous=FULL")
 
-        # A second connection for the rows a seal is about to write out. That
-        # read is the expensive half of a seal, and on the write connection it
-        # would serialise against the appends a background seal exists to stay
-        # out of the way of. WAL allows it: one writer, any number of readers.
-        # It deliberately does NOT take the lock above.
-        self._reader = sqlite3.connect(
+        buffer = cls(
+            writer,
+            cls._connect_readonly(path),
+            schema,
+            columns,
+            target_size=target_size,
+        )
+        buffer._create()
+        buffer._seed_group()
+
+        return buffer
+
+    @staticmethod
+    def _connect_readonly(path: Path) -> sqlite3.Connection:
+        return sqlite3.connect(
             f"file:{path}?mode=ro",
             uri=True,
             isolation_level=None,
             check_same_thread=False,
         )
-        self._create()
-        self._seed_group()
 
     def _create(self) -> None:
         columns = ",\n  ".join(
