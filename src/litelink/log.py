@@ -737,7 +737,7 @@ class Log:
             # so the drain loop above exited with groups still queued and
             # nobody able to take them.
             try:
-                self._recover_seal()
+                self._recover_seal(lease)
             finally:
                 lease.release()
 
@@ -766,13 +766,8 @@ class Log:
                 msg = "lost the seal lease before writing"
                 raise RuntimeError(msg)
 
-            self._write_and_commit(end, rel_path)
-
-            if not lease.renew():
-                msg = "lost the seal lease before clearing the buffer"
-                raise RuntimeError(msg)
-
-            self._buffer.finish_seal(end)
+            self._write_and_commit(end, rel_path, lease)
+            self._buffer.finish_seal(end, rel_path)
         finally:
             lease.release()
 
@@ -811,7 +806,9 @@ class Log:
 
             time.sleep(_AWAIT_POLL)
 
-    def _write_and_commit(self, end: int, rel_path: str) -> None:
+    def _write_and_commit(
+        self, end: int, rel_path: str, lease: Lease | None = None
+    ) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
 
         I1 in this order: committing first would publish a manifest entry for a
@@ -827,6 +824,25 @@ class Log:
         dest.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(rows, dest)
         fsync(dest)
+
+        # Checked immediately before the commit, because this is the moment a
+        # lapsed owner does real damage. Its file now has a name of its own, so
+        # `register` no longer collides with the owner that took over — it
+        # succeeds, and the range lands in the table twice. The shared name
+        # used to refuse that by accident; nothing does now except this.
+        #
+        # A narrow window remains between the check and the commit. It cannot
+        # be closed from here — Iceberg's CAS knows nothing of our lease — and
+        # it is milliseconds against a 30 s TTL.
+        if lease is not None and not lease.renew():
+            # The file exists and will never be registered, so it has to stay
+            # nameable: queue it before raising, or it is a file on disk that
+            # this database cannot find.
+            self._buffer.enqueue_deletions(
+                [rel_path], int(datetime.now(UTC).timestamp())
+            )
+            msg = "lost the seal lease before committing"
+            raise RuntimeError(msg)
 
         self._table.register(str(dest))
 
@@ -888,11 +904,11 @@ class Log:
         seal = self._lease(SEAL_ROLE)
         if seal.acquire():
             try:
-                self._recover_seal()
+                self._recover_seal(seal)
             finally:
                 seal.release()
 
-    def _recover_seal(self) -> None:
+    def _recover_seal(self, lease: Lease | None = None) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
         did not, the whole file is rewritten to the same path.
 
@@ -910,7 +926,7 @@ class Log:
 
         start, end, rel_path = pending
         if str(self._layout.absolute(rel_path)) in self._table.file_paths():
-            self._buffer.finish_seal(end)
+            self._buffer.finish_seal(end, rel_path)
 
             return
 
@@ -927,8 +943,8 @@ class Log:
         self._buffer.enqueue_deletions([rel_path], int(datetime.now(UTC).timestamp()))
         retry = self._layout.seal_path(start, end, uuid.uuid4().hex[:8])
         self._buffer.claim_seal(start, end, retry)
-        self._write_and_commit(end, retry)
-        self._buffer.finish_seal(end)
+        self._write_and_commit(end, retry, lease)
+        self._buffer.finish_seal(end, retry)
 
     def _recover_compaction(self) -> None:
         """Resolve a compaction interrupted before its commit (§11).

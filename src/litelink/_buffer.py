@@ -805,12 +805,16 @@ class Buffer:
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
-    def finish_seal(self, end: int) -> None:
+    def finish_seal(self, end: int, rel_path: str) -> bool:
         """Delete sealed rows, retire the group, and clear the intent.
 
         Garbage collection, not correctness: the read boundary in §7 already
         excludes these rows the moment the Iceberg commit lands, so the window
         between that commit and this call is safe in both directions.
+
+        Returns whether this caller's claim was the live one. False means it
+        was superseded while it worked, and finishing belongs to whoever holds
+        the claim now.
 
         The group is keyed by `end` rather than an id threaded through the
         seal. Groups are consecutive and non-overlapping, so an exclusive end
@@ -818,9 +822,21 @@ class Buffer:
         group without `sealing` having had to remember which one it was.
         """
         with self._transaction():
+            # Only OUR claim, and only if it is still the one recorded. A
+            # writer stalled past its lease wakes up believing it owns this
+            # seal; clearing unconditionally let it wipe the claim of the
+            # owner that took over, stranding that owner's half-written file
+            # under a name nothing recorded any more.
+            cursor = self._con.execute(
+                "DELETE FROM sealing WHERE rel_path = ?", (rel_path,)
+            )
+            if not cursor.rowcount:
+                return False
+
             self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
             self._con.execute("DELETE FROM seal_group WHERE end_offset = ?", (end,))
-            self._con.execute("DELETE FROM sealing")
+
+        return True
 
     # -- meta ---------------------------------------------------------------
     #
