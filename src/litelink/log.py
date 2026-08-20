@@ -198,17 +198,17 @@ class Log:
         self._archive = archive
         self._reader = reader
         self._maintenance = maintenance
-        # Sequences Log's own multi-step mutations. It is NOT what makes the
-        # collaborators safe — each owns that: the buffer serialises its
-        # connection, `LogTable` guards its handle and caches, `Reader` guards
-        # its DuckDB connection, and the leases decide who may seal or maintain
-        # across processes, which no in-memory lock could.
+        # Sequences the only thing left that needs it: Log mutating several
+        # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
+        # where a SQLite row and a Python object have to change together.
         #
-        # There used to be a second lock here, held across a whole maintenance
-        # pass and taken by every read, on the theory that a compaction and a
-        # seal must not interleave. They must not, and the lease is what says
-        # so; the lock only added the cost. Measured: one read waited 21.5 s
-        # behind a compaction of 540 files.
+        # Nothing on the append, seal or read paths takes it. Each collaborator
+        # owns its own safety — the buffer serialises its connection,
+        # `LogTable` guards its handle and caches, `Reader` guards its DuckDB
+        # connection — and the leases decide who may seal or maintain across
+        # processes, which no in-memory lock could. A lock on top of those is a
+        # second answer to a settled question, and it was not free: one held
+        # across a whole maintenance pass made a read wait 21.5 s.
         self._lock = threading.RLock()
 
         # Who may seal, and who may maintain. Durable rather than in-memory,
@@ -465,14 +465,15 @@ class Log:
         which is the whole of §3's throughput story. It carries no meaning
         beyond that — see §1 on why there is no transaction id column.
         """
-        with self._lock:
-            self._writable()
-            # The append decides nothing about sealing beyond the cut it
-            # records (see `seal_group`). It does not measure, compare, signal,
-            # or start anything: a maintainer calls `seal_due` and finds the
-            # work waiting, exactly as it calls `maintain` and finds files to
-            # compact. Nothing here spawns a thread on the caller's behalf.
-            return self._buffer.append(rows)
+        self._writable()
+
+        # No lock. `Buffer` serialises its own connection, which is the only
+        # thing two appending threads share — and the append decides nothing
+        # beyond the cut it records (see `seal_group`). It does not measure,
+        # compare, signal, or start anything: a maintainer calls `seal_due` and
+        # finds the work waiting, exactly as it calls `maintain` and finds
+        # files to compact.
+        return self._buffer.append(rows)
 
     # -- read --------------------------------------------------------------
 
@@ -548,8 +549,7 @@ class Log:
         buffer. A consumer resuming from here sees every durable row; one
         resuming from `hi` silently skips the unsealed tail.
         """
-        with self._lock:
-            return self._buffer.next_offset()
+        return self._buffer.next_offset()
 
     def buffered_rows(self) -> int:
         """Rows durable in the buffer but not yet sealed.
@@ -562,10 +562,13 @@ class Log:
         predicate against the Iceberg leg too, reading the offset column out of
         every Parquet file to establish that none of them qualify.
         """
-        with self._lock:
-            extent = self.table_extent()
+        extent = self.table_extent()
 
-            return self._buffer.count_above(0 if extent is None else extent[1])
+        # Deliberately unlocked, and therefore approximate: a seal landing
+        # between the two reads shifts the boundary under the count. This is a
+        # number to watch, not one to derive anything from, and locking it
+        # would put a metric on the path of every append.
+        return self._buffer.count_above(0 if extent is None else extent[1])
 
     def table_rows(self) -> int:
         """Rows in the local Iceberg table.
@@ -622,20 +625,24 @@ class Log:
         One seal at a time. A second would claim a range overlapping the first,
         and `sealing` holds one row by design (§2).
         """
-        with self._lock:
-            self._writable()
-            # Unconditionally, and that is the whole contract. Cutting only
-            # when the queue happened to be empty made this method's effect
-            # depend on how far behind a sealer was: the rows the caller had
-            # just appended went uncut, an older group was sealed instead, and
-            # the call could return None having sealed nothing at all. Two
-            # appends and two seals could then produce one file, not two.
-            #
-            # The background loop does NOT come through here — it drains queued
-            # groups only — or a quiet stream would emit a stub file every
-            # poll, which is the pathology §6 exists to clean up after.
-            self._buffer.close_open_group()
-            target = self._buffer.last_queued_end()
+        self._writable()
+        # Cut unconditionally, and that is the whole contract. Cutting only
+        # when the queue happened to be empty made this method's effect depend
+        # on how far behind a sealer was: the rows the caller had just appended
+        # went uncut, an older group was sealed instead, and the call could
+        # return None having sealed nothing at all. Two appends and two seals
+        # could then produce one file, not two.
+        #
+        # Unlocked, because the two calls need not be atomic together: another
+        # sealer cutting between them leaves `last_queued_end` HIGHER, so this
+        # drains a superset of its own rows, which is harmless. What must never
+        # happen is failing to cut.
+        #
+        # `seal_due` does NOT come through here — it drains queued groups only
+        # — or a quiet stream would emit a stub file every poll, which is the
+        # pathology §6 exists to clean up after.
+        self._buffer.close_open_group()
+        target = self._buffer.last_queued_end()
 
         if target is None:
             return None
@@ -675,28 +682,30 @@ class Log:
         if not lease.acquire():
             return None
 
-        with self._lock:
-            # The range comes from the queue, not from whatever the buffer
-            # happens to hold now. That is the difference between a file of
-            # `target_size` and a file of however much arrived while the sealer
-            # was getting here — and it costs one indexed row read instead of
-            # the SCAN that asking the buffer for its extent used to.
-            group = self._buffer.pending_group()
-            if group is None:
-                lease.release()
-                return None
+        # No lock here either: the lease is the exclusion, and it already
+        # refuses every other owner in this process and any other. A lock would
+        # be a second answer to a question already settled.
+        #
+        # The range comes from the queue, not from whatever the buffer happens
+        # to hold now. That is the difference between a file of `target_size`
+        # and a file of however much arrived while the sealer was getting here
+        # — and it costs one indexed row read instead of the SCAN that asking
+        # the buffer for its extent used to.
+        group = self._buffer.pending_group()
+        if group is None:
+            lease.release()
+            return None
 
-            start, end = group
-            rel_path = self._layout.seal_path(start, end, datetime.now(UTC).date())
-            # I2: the range and its path are fixed BEFORE the file exists, so a
-            # retry recomputes nothing and overwrites in place rather than
-            # stranding the first attempt under a different name.
-            self._buffer.claim_seal(start, end, rel_path)
+        start, end = group
+        rel_path = self._layout.seal_path(start, end, datetime.now(UTC).date())
+        # I2: the range and its path are fixed BEFORE the file exists, so a
+        # retry recomputes nothing and overwrites in place rather than
+        # stranding the first attempt under a different name.
+        self._buffer.claim_seal(start, end, rel_path)
 
         try:
             self._write_and_commit(end, rel_path)
-            with self._lock:
-                self._buffer.finish_seal(end)
+            self._buffer.finish_seal(end)
         finally:
             lease.release()
 
