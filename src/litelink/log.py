@@ -108,7 +108,7 @@ class LogConfig:
     # So expect files smaller than this on disk, and set it larger than an
     # on-disk file target would be. Everything downstream is stated in the same
     # currency — compaction sizes a merge by what its inputs HOLD, carried in
-    # `file_bytes` from the seal that measured it, never by what they compressed
+    # the `extent` row the seal measured it into, never by what they compressed
     # to (see `_maintenance.runs`).
     #
     # The 8 MiB default is §7's row guidance restated — its table puts a 20k-row
@@ -539,7 +539,7 @@ class Log:
 
         # No lock. `Buffer` serialises its own connection, which is the only
         # thing two appending threads share — and the append decides nothing
-        # beyond the cut it records (see `seal_group`). It does not measure,
+        # beyond the cut it records (see `extent`). It does not measure,
         # compare, signal, or start anything: a maintainer calls `seal_due` and
         # finds the work waiting, exactly as it calls `maintain` and finds
         # files to compact.
@@ -1091,12 +1091,13 @@ class Log:
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
 
+        memory = self._maintenance.memory()
         pending = [f for f in self._table.data_files() if f.hi > floor]
         settled = stable_prefix(
             pending,
             self.config.target_size,
             self.config.compact_min_files,
-            self._maintenance.memory(),
+            memory,
         )
 
         for data_file in pending[:settled]:
@@ -1104,6 +1105,20 @@ class Log:
             rel_path = self._layout.relative(data_file.path)
             archive.put(self._layout.absolute(rel_path), rel_path)
             archive.register(archive.uri(rel_path), sealed_through=data_file.hi + 1)
+            # The archive's copy holds what the local one did, and this is the
+            # only moment both names are known. Nothing could re-derive it
+            # afterwards: the local entry goes when the local file is unlinked,
+            # and a Parquet footer records what the rows compressed from, not
+            # what the appender counted them as.
+            held = memory.get(data_file.path)
+            if held is not None:
+                # Same extent, second location. `end_offset` is exclusive, as
+                # it is on every other extent — the cut is recorded as the
+                # offset AFTER the last row.
+                self._buffer.record_file(
+                    archive.uri(rel_path), data_file.lo, data_file.hi + 1, held
+                )
+
             # After the register, never before: the watermark is a promise that
             # the archive HAS the range, and I4 lets `maintain` delete the local
             # copy on the strength of it.
@@ -1217,7 +1232,7 @@ class Log:
         read twice.
 
         A hydrated file is not measured: nothing local counted its rows, and
-        `file_bytes` therefore has no entry. That is deliberate and it is what
+        its extent carries no size. That is deliberate and it is what
         an unknown size means everywhere else — the file counts as full, so
         compaction will not merge it and `sync` will not push it back to the
         archive it just came from. Eviction still applies to it, which is the

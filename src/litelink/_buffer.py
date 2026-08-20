@@ -30,7 +30,7 @@ OFFSET = "litelink_offset"
 _MAX_TAIL_CHUNKS = 32
 
 # IMMEDIATE, never a bare BEGIN. Every transaction here writes, and several read
-# first — an append reads the open `seal_group` row before inserting anything.
+# first — an append reads the open `extent` row before inserting anything.
 # A deferred transaction that reads first takes a read snapshot, and if another
 # process has written since, SQLite refuses to upgrade it to a writer and
 # returns "database is locked" IMMEDIATELY: `busy_timeout` does not apply,
@@ -48,7 +48,7 @@ _BUSY_TIMEOUT_MS = 30_000
 
 @dataclass(slots=True)
 class _Group:
-    """The open `seal_group` row, while an append transaction fills it.
+    """The open `extent` row, while an append transaction fills it.
 
     Read once per transaction and written back once, so the per-row accounting
     that decides the cut is arithmetic rather than a statement per row.
@@ -82,7 +82,7 @@ class Buffer:
         `schema` is the application's columns, without `offset`; `columns` is
         their names, passed rather than derived so this assigns and nothing
         else. `target_size` is here rather than only on the seal because the
-        cut it describes is made on the append path — see `seal_group`.
+        cut it describes is made on the append path — see `extent`.
         """
         self._con = writer
         self._reader = reader
@@ -277,29 +277,21 @@ class Buffer:
         # The same shape as `pending_delete`: work that must not be rediscovered
         # by scanning is recorded when it is created.
         self._con.execute("""
-            CREATE TABLE IF NOT EXISTS seal_group (
+            CREATE TABLE IF NOT EXISTS extent (
               group_id     INTEGER PRIMARY KEY AUTOINCREMENT,
               start_offset INTEGER,
               end_offset   INTEGER,
-              bytes        INTEGER NOT NULL DEFAULT 0
+              bytes        INTEGER NOT NULL DEFAULT 0,
+              rel_path     TEXT UNIQUE
             )
         """)
-        # What each data file holds, measured the way `target_size` is stated:
-        # in memory, before Parquet compressed it. The seal is the only thing
-        # that can know this — it is the buffer's own byte count for the rows
-        # that went into the file — and nothing recoverable from the file
-        # afterwards is a substitute. Its size on disk is whatever compression
-        # achieved, which on repetitive rows is a factor of eight out, and
-        # `target_size` is a bound on memory: on what a reader pays to hold a
-        # file, and on what N of them cost when a scan opens N in parallel.
-        #
-        # So it is carried, not re-derived. A merge adds up its inputs, and the
-        # entry is dropped when the file is finally unlinked.
+        # The two states that are still work, which is what every hot query
+        # wants and what stays small however many files the log accumulates.
+        # Without it `_read_group` — once per append transaction — degrades
+        # into a scan of one row per file ever written.
         self._con.execute("""
-            CREATE TABLE IF NOT EXISTS file_bytes (
-              rel_path TEXT PRIMARY KEY,
-              bytes    INTEGER NOT NULL
-            )
+            CREATE INDEX IF NOT EXISTS extent_unsealed ON extent (group_id)
+            WHERE rel_path IS NULL
         """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
@@ -315,7 +307,7 @@ class Buffer:
 
     # -- size accounting --------------------------------------------------
     #
-    # The running total lives in the open `seal_group` row and is written in the
+    # The running total lives in the open `extent` row and is written in the
     # same transaction as the rows it accounts for. That is what lets any
     # process read it — a keyed read of one row, rather than a SUM() over the
     # table being appended to — and what makes it impossible for the count and
@@ -334,13 +326,13 @@ class Buffer:
         open group was closed by a sealer just before the process died.
         """
         if self._con.execute(
-            "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
+            "SELECT 1 FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
         ).fetchone():
             return
 
         covered = int(
             self._con.execute(
-                "SELECT coalesce(max(end_offset), 0) FROM seal_group"
+                "SELECT coalesce(max(end_offset), 0) FROM extent"
             ).fetchone()[0]
         )
         start = self._con.execute(
@@ -352,7 +344,7 @@ class Buffer:
         # inventing an age, and inventing an old one seals a stub file on every
         # restart, which is the failure §6 exists to clean up after.
         self._con.execute(
-            "INSERT INTO seal_group (start_offset, bytes) VALUES (?, ?)",
+            "INSERT INTO extent (start_offset, bytes) VALUES (?, ?)",
             (start, self._measure_from(covered)),
         )
 
@@ -472,8 +464,8 @@ class Buffer:
     def _read_group(self, cursor: sqlite3.Cursor) -> _Group:
         """The open group, once per transaction rather than once per row."""
         row = cursor.execute(
-            "SELECT group_id, start_offset, bytes FROM seal_group"
-            " WHERE end_offset IS NULL"
+            "SELECT group_id, start_offset, bytes FROM extent"
+            " WHERE end_offset IS NULL AND rel_path IS NULL"
         ).fetchone()
 
         return _Group(int(row[0]), row[1], int(row[2]))
@@ -488,7 +480,7 @@ class Buffer:
         large enough crosses several times and comes through here each time.
         """
         self._write_group(cursor, group, end_offset=offset + 1)
-        cursor.execute("INSERT INTO seal_group (bytes) VALUES (0)")
+        cursor.execute("INSERT INTO extent (bytes) VALUES (0)")
 
         return _Group(int(cursor.lastrowid or 0), None, 0)
 
@@ -501,7 +493,7 @@ class Buffer:
         just the running total being persisted for other processes to read.
         """
         cursor.execute(
-            "UPDATE seal_group SET start_offset = ?, bytes = ?,"
+            "UPDATE extent SET start_offset = ?, bytes = ?,"
             " end_offset = ? WHERE group_id = ?",
             (
                 group.start_offset,
@@ -727,8 +719,9 @@ class Buffer:
         """
         with self._lock:
             row = self._con.execute(
-                "SELECT start_offset, end_offset FROM seal_group"
-                " WHERE end_offset IS NOT NULL ORDER BY group_id LIMIT 1"
+                "SELECT start_offset, end_offset FROM extent"
+                " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
+                " ORDER BY group_id LIMIT 1"
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]))
@@ -741,7 +734,8 @@ class Buffer:
         """
         with self._lock:
             row = self._con.execute(
-                "SELECT max(end_offset) FROM seal_group WHERE end_offset IS NOT NULL"
+                "SELECT max(end_offset) FROM extent"
+                " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
             ).fetchone()
 
         return None if row[0] is None else int(row[0])
@@ -768,22 +762,23 @@ class Buffer:
         # timer, for every log, forever. The read is a single row.
         with self._lock:
             if not self._con.execute(
-                "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
-                " AND start_offset IS NOT NULL",
+                "SELECT 1 FROM extent WHERE end_offset IS NULL"
+                " AND rel_path IS NULL AND start_offset IS NOT NULL",
                 (),
             ).fetchone():
                 return False
 
         with self._transaction():
             cursor = self._con.execute(
-                "UPDATE seal_group SET end_offset ="
+                "UPDATE extent SET end_offset ="
                 ' (SELECT max("litelink_offset") + 1 FROM buffer)'
-                " WHERE end_offset IS NULL AND start_offset IS NOT NULL",
+                " WHERE end_offset IS NULL AND rel_path IS NULL"
+                " AND start_offset IS NOT NULL",
                 (),
             )
             closed = bool(cursor.rowcount)
             if closed:
-                self._con.execute("INSERT INTO seal_group (bytes) VALUES (0)")
+                self._con.execute("INSERT INTO extent (bytes) VALUES (0)")
 
         return closed
 
@@ -840,71 +835,107 @@ class Buffer:
                 return False
 
             self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
-            # Before the group is retired, because the group row IS the
-            # measurement: these are the bytes the appender counted for exactly
-            # the rows this file now holds. Same transaction, so a file can
-            # never be committed with its size lost.
+            # NAMED, not deleted. The row is the same fact before and after —
+            # this range, these bytes — and sealing only settles where it
+            # lives. Deleting it and writing the size to a second table was
+            # half of this one reinvented, and left the two able to disagree.
+            # Same transaction as the rows it retires, so a file can never be
+            # committed with the count of what it holds lost.
             self._con.execute(
-                "INSERT INTO file_bytes (rel_path, bytes)"
-                " SELECT ?, bytes FROM seal_group WHERE end_offset = ?"
-                " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
+                "UPDATE extent SET rel_path = ?"
+                " WHERE end_offset = ? AND rel_path IS NULL",
                 (rel_path, end),
             )
-            self._con.execute("DELETE FROM seal_group WHERE end_offset = ?", (end,))
 
         return True
 
     # -- file sizes ---------------------------------------------------------
 
     def file_bytes(self) -> dict[str, int]:
-        """What every known data file holds in memory, keyed by relative path.
+        """What every known data file holds in memory, keyed by location.
 
-        All of it at once: the callers are compaction and sync, both of which
-        walk the whole file list, and one indexed read of a table with a row
-        per file beats a query per file.
+        Root-relative for local files, so a log directory stays movable; the
+        full URI for archived ones, which have no root to be relative to. A
+        named extent is a file; an unnamed one is still buffered.
+
+        All of it at once: the callers are compaction, sync and the archive
+        rewrite, all of which walk the whole file list, and one indexed read
+        beats a query per file.
 
         A file missing from this is not an error. It means the log has files
         this database never recorded — one written by a version that did not
-        keep them, say — and the callers treat an unknown size as "full", so
-        an unmeasured file is never merged on a guess about what it holds.
+        keep them, or an archive whose local extents were lost — and the
+        callers treat an unknown size as "full", so an unmeasured file is never
+        merged on a guess about what it holds.
         """
         with self._lock:
             rows = self._con.execute(
-                "SELECT rel_path, bytes FROM file_bytes"
+                "SELECT rel_path, bytes FROM extent WHERE rel_path IS NOT NULL"
             ).fetchall()
 
         return {str(row[0]): int(row[1]) for row in rows}
 
+    def record_file(self, rel_path: str, start: int, end: int, held: int) -> None:
+        """Record a second file holding an extent the log already has.
+
+        What `sync` calls when it pushes: the archive's copy covers the same
+        offsets and holds the same bytes, so it gets its own row under its own
+        URI rather than a measurement of its own. It could not be measured
+        again anyway — nothing recoverable from a Parquet file is the
+        appender's count of what those rows cost in memory, and the local row
+        goes when the local file is unlinked.
+
+        This is why the mapping lives here. Iceberg has no per-file field to
+        hang it on: v2's data-file metadata is a fixed set — column sizes,
+        value counts, encryption key metadata — with nothing user-extensible,
+        and `add_files` offers no way to attach one. Table properties are per
+        table. So the coordinator that already records every path before its
+        file exists (I16) records this too, for both tiers, in one shape.
+        """
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO extent (start_offset, end_offset, bytes, rel_path)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
+                (start, end, held, rel_path),
+            )
+
     def record_merge(self, rel_path: str, sources: Iterable[str]) -> None:
-        """Attribute the sources' bytes to the file that replaced them.
+        """Replace the sources' extents with one covering all of them.
 
         Addition, not re-measurement: a merge writes exactly the rows it read,
-        so the output holds what the inputs held. That keeps the number in the
-        same currency as the seal that first measured it, however many rewrites
-        later — which is the whole reason it is carried rather than derived
-        from whatever the merged file happens to compress to.
+        so the output holds what the inputs held and spans what they spanned.
+        That keeps the number in the same currency as the seal that first
+        measured it, however many rewrites later — which is the whole reason it
+        is carried rather than derived from whatever the merged file compresses
+        to. It is also what lets the archive rewrite build its extents with the
+        same arithmetic a local compaction uses.
         """
         paths = list(sources)
+        if not paths:
+            return
+
+        placeholders = ",".join("?" * len(paths))
         with self._transaction():
-            placeholders = ",".join("?" * len(paths))
-            total = self._con.execute(
-                f"SELECT sum(bytes), count(*) FROM file_bytes"  # noqa: S608 — count-bound
-                f" WHERE rel_path IN ({placeholders})",
+            summed = self._con.execute(
+                "SELECT sum(bytes), count(*), min(start_offset), max(end_offset)"  # noqa: S608
+                f" FROM extent WHERE rel_path IN ({placeholders})",
                 paths,
             ).fetchone()
-            # Only when every source was measured. Summing a subset would
+            # Only when every source was recorded. Summing a subset would
             # understate the output and invite a merge of something already
             # full; leaving it absent marks it unknown, which every caller
             # treats as "do not touch".
-            if total[1] == len(paths) and paths:
+            if summed[1] == len(paths):
                 self._con.execute(
-                    "INSERT INTO file_bytes (rel_path, bytes) VALUES (?, ?)"
+                    "INSERT INTO extent"
+                    " (start_offset, end_offset, bytes, rel_path) VALUES (?, ?, ?, ?)"
                     " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
-                    (rel_path, int(total[0])),
+                    (summed[2], summed[3], int(summed[0]), rel_path),
                 )
 
             self._con.execute(
-                f"DELETE FROM file_bytes WHERE rel_path IN ({placeholders})",  # noqa: S608
+                f"DELETE FROM extent WHERE rel_path IN ({placeholders})",  # noqa: S608
                 paths,
             )
 
@@ -1018,7 +1049,9 @@ class Buffer:
             # about anything. Dropped here rather than when the table stopped
             # referencing it: until the grace period passes an open scan may
             # still be reading it (I6).
-            self._con.execute("DELETE FROM file_bytes WHERE rel_path = ?", (rel_path,))
+            # The extent goes with the file. It described where those rows
+            # live, and they no longer live anywhere by that name.
+            self._con.execute("DELETE FROM extent WHERE rel_path = ?", (rel_path,))
 
     def queued_deletions(self) -> list[str]:
         with self._lock:

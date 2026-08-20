@@ -52,12 +52,17 @@ def _today() -> date:
 
 
 def groups(log: Log) -> list[tuple[int, int | None, int | None, int]]:
-    """Every queue row: `(group_id, start, end, bytes)`, oldest first."""
+    """Every queue row: `(group_id, start, end, bytes)`, oldest first.
+
+    Unnamed extents only. A row keeps its identity after it seals — it gains
+    the file's name and stops being queue — so the queue is the extents that
+    have no file yet.
+    """
     return [
         (int(g), s, e, int(b))
         for g, s, e, b in log._buffer._con.execute(
-            "SELECT group_id, start_offset, end_offset, bytes FROM seal_group"
-            " ORDER BY group_id"
+            "SELECT group_id, start_offset, end_offset, bytes FROM extent"
+            " WHERE rel_path IS NULL ORDER BY group_id"
         ).fetchall()
     ]
 
