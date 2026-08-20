@@ -77,14 +77,14 @@ caller is refused and returns rather than duplicating it.
           running total += row bytes ......... in the same txn
           crossed target_size?  ──► freeze the cut HERE, at this row,
                                     and open the next group
-          UPDATE seal_group  ................. once per batch
+          UPDATE extent  ..................... once per batch
      ◄─ returns offsets; rows are ALREADY DURABLE (synchronous=FULL)
                               │
                               │ nothing but rows in SQLite.
                               │ no queue object, no event, no signal
                               ▼
  ┌──────────────────── buffer.db  (SQLite, WAL) ────────────────────────┐
- │  buffer │ seal_group │ sealing │ compacting │ pending_delete │ lease │
+ │  buffer │ extent │ sealing │ compacting │ pending_delete │ lease │
  │                                                                      │
  │  the coordinator (I16). every hand-off below is a row in here, so    │
  │  it works between THREADS and between PROCESSES on identical terms   │
@@ -93,7 +93,7 @@ caller is refused and returns rather than duplicating it.
         │                                        │
  ═══════╧═══════════════ MAINTAINER PROCESS ══════╧══════════════════════
   ─────── seal lease ───────────           ─────── maintain lease ────────
-  poll seal_group (one indexed          maintain() in a loop
+  poll extent (one indexed            maintain() in a loop
   row read; no lock taken if
   there is nothing queued)                _table_lock + lease
                                             ├─ compact()
@@ -111,7 +111,7 @@ caller is refused and returns rather than duplicating it.
                                       │          unlink files whose grace
   §4 step 3   with _lock:             │          has passed, in the SAME
     DELETE buffer rows < end          │          txn that clears the queue
-    DELETE the seal_group row         │
+    NAME the extent's row          │
     lease.release()                   ▼
                     ┌─────────────────────────────┐
                     │  local Iceberg table        │
@@ -183,7 +183,8 @@ Nothing in Python. Every arrow in the diagram is a SQLite row:
 
 | hand-off | the row |
 |---|---|
-| "this range should become a file" | `seal_group` with `end_offset` set |
+| "this range should become a file" | `extent`, `end_offset` set, unnamed |
+| "this range IS a file, holding this much" | `extent` with `rel_path` set |
 | "I am writing that file, at this path" | `sealing` |
 | "I am rewriting these files" | `compacting` |
 | "this file may be deleted after its grace" | `pending_delete` |
@@ -445,6 +446,21 @@ moments and never together. `Archive._lock` guards the archive URI, its credenti
 the handle they open as one fact, so a re-point cannot race an open in flight and two
 threads cannot each pay the round trip; it is held across that open, and never while
 calling back into anything above it.
+
+**One extent, four states.** `extent` is the only record of where a range of the stream
+lives, and a row keeps its identity through every stage: open while the appender fills it,
+closed when the cut is frozen, named when the seal commits the file, and re-pointed at an
+S3 URI when `sync` pushes a second copy. `bytes` — what the appender counted those rows as
+in memory — is written once, at the cut, and carried by everything downstream: compaction
+adds up the runs it merges, `sync` copies the number to the archive's name for the file,
+and the archive rewrite sizes its merges from the same column. Nothing re-derives it,
+because nothing can: a Parquet footer records what the rows compressed from, not what they
+cost to hold, and Iceberg has no per-file field to keep it in — v2's data-file metadata is
+a fixed set with nothing user-extensible, and `add_files` cannot attach one.
+
+Sealing therefore names a row rather than deleting one. It was two tables, a queue and a
+size map, which is this one split at the moment a file appears — and two tables that could
+disagree about the same range.
 
 **The rule the lock actually encodes.** Every statement on the buffer's write connection
 takes that lock, reads included. A statement issued while another thread has a

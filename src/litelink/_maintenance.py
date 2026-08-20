@@ -252,11 +252,16 @@ class Maintenance:
 
     def memory(self) -> dict[str, int]:
         """What each data file holds uncompressed, keyed by the path a
-        `DataFile` carries. The buffer records it against a relative path; the
-        table names files absolutely."""
+        `DataFile` carries.
+
+        Covers both tiers, because both are measured the same way and the
+        archive's entries are the local ones carried across the push. A local
+        file is recorded root-relative and named absolutely by the table; a
+        remote one is recorded and named by the same URI.
+        """
         return {
-            str(self._layout.absolute(rel_path)): size
-            for rel_path, size in self._buffer.file_bytes().items()
+            key if _is_remote(key) else str(self._layout.absolute(key)): size
+            for key, size in self._buffer.file_bytes().items()
         }
 
     def _merge(self, run: list[DataFile], heartbeat: Callable[[], bool] | None) -> None:
@@ -414,10 +419,12 @@ class Maintenance:
         undersized — the archive is immutable history, so a size change applies
         to the future and this is what applies it to the past.
 
-        Sizes come from Parquet footers rather than from `file_bytes`: the
-        entries that measured these files went with the local copies when they
-        were evicted. See `LogTable.held` for why that measure is good enough
-        here and would not be locally.
+        Sizes are the same ones the seal measured. `sync` carries each entry
+        over to the archive's name for the file when it pushes it, so nothing
+        here re-derives a size from the file — which could not be done anyway,
+        since a Parquet footer records what it held before compression and not
+        what the appender counted. An archived file with no entry counts as
+        full, exactly as a local one does.
 
         Runs of one are skipped, and `compact_min_files` does not apply. It is
         a throughput heuristic for a pass that runs continuously — worth
@@ -435,7 +442,7 @@ class Maintenance:
 
         archive.reload()
         files = archive.data_files()
-        held = {data_file.path: archive.held(data_file.path) for data_file in files}
+        held = self.memory()
         for run in runs(files, self._config.target_size, held):
             if len(run) < 2:
                 continue
@@ -471,6 +478,9 @@ class Maintenance:
         # old snapshot, but nothing this process holds would re-derive them.
         self._enqueue(data_file.path for data_file in run)
         archive.replace_range(lo, hi, archive.uri(rel_path))
+        self._buffer.record_merge(
+            archive.uri(rel_path), (data_file.path for data_file in run)
+        )
 
     # -- expiry and the deletion queue --------------------------------------
 

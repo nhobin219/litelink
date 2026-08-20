@@ -1119,7 +1119,7 @@ The consequence worth planning for is that local disk holds roughly
    - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
      free because the writer already knows the buffer grew. A maintainer would poll. The
      `max_age` branch is time-based and would not care, but it is not wired up at all today.
-   - ~~**The size counter is per-process.**~~ **Resolved by `seal_group`.** The running
+   - ~~**The size counter is per-process.**~~ **Resolved by `extent`.** The running
      total lives in the open queue row and is written in the same transaction as the rows
      it accounts for, so any process reads it with a keyed read of one row — and there is
      no second, in-memory copy to disagree with it.
@@ -1197,7 +1197,7 @@ The consequence worth planning for is that local disk holds roughly
    written when the buffer goes from empty to non-empty, cleared at seal. O(1), no column
    anywhere, no §2 argument to have.
 
-   That value is `seal_group.opened_at`, stamped by the **first row** to land in a group and
+   That value is `extent.opened_at`, stamped by the **first row** to land in a group and
    null while the group is empty. A sealer closes an aged group on its own poll, which is
    what a quiet stream needs: until this existed `max_age` was dead config — a field that
    was validated, persisted and round-tripped through `open`, and that nothing ever read —
