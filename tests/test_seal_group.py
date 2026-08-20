@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -45,6 +45,10 @@ def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
         {"event_ts": 1000 + i, "key": f"k{i % 3}", "payload": PAYLOAD}
         for i in range(start, start + n)
     ]
+
+
+def _today() -> date:
+    return datetime.now(UTC).date()
 
 
 def groups(log: Log) -> list[tuple[int, int | None, int | None, int]]:
@@ -192,6 +196,47 @@ def test_an_explicit_seal_cuts_its_own_rows_whatever_else_is_running(
         assert log.await_seal(timeout=30), "a queued cut was never written"
         assert log.table_files() == 8, "eight appends and eight seals, eight files"
         assert log.table_rows() == 160
+
+
+def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
+    tmp_path: Path,
+) -> None:
+    """Replay has to be idempotent on the ORDINARY path, not just at open.
+
+    A seal commits its file and then retires its group. Dying between those
+    two leaves the file in the table and the group at the head of the queue.
+    Replaying it blindly re-registers a file the table already holds, pyiceberg
+    refuses with "already referenced by table", `finish_seal` never runs — and
+    every later seal fails on the same group. Sealing wedges permanently and
+    the buffer grows without bound.
+
+    `recover()` handles this at open, but only if it can take the lease; a
+    holder that died inside its TTL means it cannot, and nothing retries.
+    """
+    # A target nothing crosses, so the only cut is the explicit one below and
+    # the group covers every row.
+    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(100))
+
+        # Everything a seal does, stopping short of retiring the group.
+        log._buffer.close_open_group()
+        group = log._buffer.pending_group()
+
+        assert group is not None
+        start, end = group
+        path = log._layout.seal_path(start, end, _today())
+        log._buffer.claim_seal(start, end, path)
+        log._write_and_commit(end, path)
+
+        assert log.table_rows() == 100, "the commit did not land"
+        assert log._buffer.pending_group() == group, "the group was retired early"
+
+        # The next sealer must finish it rather than redo it.
+        assert log.seal_due() == end
+        assert log._buffer.pending_group() is None, "the queue never drained"
+        assert log.table_files() == 1, "the file was written twice"
+        assert log.table_rows() == 100
 
 
 def test_an_empty_group_is_never_closed(tmp_path: Path) -> None:

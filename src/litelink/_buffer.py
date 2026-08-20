@@ -124,6 +124,15 @@ class Buffer:
         self._tail_lo = 0
         self._tail_hi = 0
 
+    def set_target_size(self, target_size: int) -> None:
+        """Adopt a new cut size in place, rather than being rebuilt around it.
+
+        Policy can change under a running log (§12), and the cut is made here,
+        so it has to arrive here. `Maintenance` takes the same shape.
+        """
+        with self._lock:
+            self._target_size = target_size
+
     @classmethod
     def open(
         cls,
