@@ -32,7 +32,7 @@ from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._lease import Lease, new_owner
 from litelink._maintenance import Maintenance
-from litelink._read import Reader
+from litelink._read import Reader, duckdb_connection
 from litelink._table import LogTable
 from litelink._types import validate_schema
 
@@ -278,7 +278,7 @@ class Log:
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
-        buffer = Buffer(layout.buffer_db, schema, target_size=settings.target_size)
+        buffer = Buffer.open(layout.buffer_db, schema, target_size=settings.target_size)
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
         # cast to. It is kept here because Iceberg cannot represent it: one
@@ -293,7 +293,9 @@ class Log:
             layout=layout,
             table=table,
             buffer=buffer,
-            reader=Reader(layout, table, buffer, table_schema(schema)),
+            reader=Reader(
+                layout, table, buffer, table_schema(schema), duckdb_connection
+            ),
             maintenance=Maintenance(table, buffer, layout, settings, order),
             schema=schema,
             sort_by=order,
@@ -344,7 +346,7 @@ class Log:
             raise ValueError(msg)
 
         config = LogConfig.from_json(encoded)
-        buffer = Buffer(
+        buffer = Buffer.open(
             layout.buffer_db,
             schema,
             target_size=config.target_size,
@@ -355,7 +357,9 @@ class Log:
             layout=layout,
             table=table,
             buffer=buffer,
-            reader=Reader(layout, table, buffer, table_schema(schema)),
+            reader=Reader(
+                layout, table, buffer, table_schema(schema), duckdb_connection
+            ),
             maintenance=Maintenance(table, buffer, layout, config, sort_by),
             schema=schema,
             sort_by=sort_by,

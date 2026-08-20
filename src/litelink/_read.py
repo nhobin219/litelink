@@ -16,6 +16,8 @@ import pyarrow as pa
 from litelink._types import column_type
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from litelink._buffer import Buffer
     from litelink._layout import Layout
     from litelink._table import LogTable
@@ -31,16 +33,42 @@ BUFFER_REL = "buf_tail"
 OFFSET = "litelink_offset"
 
 
+def duckdb_connection() -> duckdb.DuckDBPyConnection:
+    """A connection with the read path's extensions loaded.
+
+    Provisioned, not autoinstalled — see scripts/install_duckdb_extensions.py
+    and §7 on why the first read must not be a network read.
+
+    A module function rather than something `Reader` does for itself, so a
+    caller can hand it a different one. It stays a factory rather than a
+    connection because building one costs ~140 ms, which a log that only ever
+    appends should not pay at `open`.
+    """
+    connection = duckdb.connect()
+    connection.execute("LOAD iceberg")
+    # No ATTACH of the buffer database. `Buffer.rows_above` records what that
+    # cost: two SQLite libraries in one process is silent corruption, not a
+    # slow path.
+
+    return connection
+
+
 class Reader:
     """A DuckDB connection with the buffer attached, and the union it builds."""
 
     def __init__(
-        self, layout: Layout, table: LogTable, buffer: Buffer, schema: pa.Schema
+        self,
+        layout: Layout,
+        table: LogTable,
+        buffer: Buffer,
+        schema: pa.Schema,
+        connect: Callable[[], duckdb.DuckDBPyConnection],
     ) -> None:
         self._layout = layout
         self._table = table
         self._buffer = buffer
         self._schema = schema
+        self._connect_to = connect
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -113,16 +141,12 @@ class Reader:
         )
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
+        """The connection, built on first read and kept.
+
+        Lazily, so a log that only ever appends never pays for one.
+        """
         if self._connection is None:
-            connection = duckdb.connect()
-            # Provisioned, not autoinstalled — see
-            # scripts/install_duckdb_extensions.py and §7 on why the first read
-            # must not be a network read.
-            connection.execute("LOAD iceberg")
-            # No ATTACH of the buffer database. `Buffer.rows_above` records
-            # what that cost: two SQLite libraries in one process is silent
-            # corruption, not a slow path.
-            self._connection = connection
+            self._connection = self._connect_to()
 
         return self._connection
 
