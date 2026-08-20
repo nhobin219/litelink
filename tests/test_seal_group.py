@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import shutil
 import threading
-import time
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -247,54 +246,34 @@ def test_an_empty_group_is_never_closed(tmp_path: Path) -> None:
         assert log._table.data_files() == []
 
 
-def test_max_age_seals_a_stream_that_never_fills_a_group(tmp_path: Path) -> None:
-    """§4's other trigger, which was dead config until the queue existed.
+def test_a_quiet_stream_keeps_its_rows_in_the_buffer(tmp_path: Path) -> None:
+    """There is no timer, and that is the point (§3a).
 
-    Without it a quiet stream never reaches Iceberg at all: it sits in SQLite
-    indefinitely, because the only trigger was a byte threshold it never met.
+    A `max_age` seal emitted a small file every interval for ever on a quiet
+    stream — the layout §6 exists to repair — and made one knob serve as both a
+    file-size and an RPO policy, so shrinking it to lose less on a crash
+    produced worse files. Freshness in the cloud belongs to WAL replication.
+
+    So a stream that never fills a group never writes a file, and its rows stay
+    where they are: durable at commit, readable through the union, and waiting.
     """
-    config = quiet(max_age=timedelta(0))
-    with open_log(tmp_path, config) as log:
-        log.extend(rows(3))
-
-        assert log._table.data_files() == [], "nothing should have crossed the target"
-
-        closed = log._buffer.close_open_group(int(time.time()))
-
-        assert closed, "an aged group was not closed"
-        assert log.seal() == 4
-        assert log.table_rows() == 3
-
-
-def test_max_age_leaves_a_young_group_alone(tmp_path: Path) -> None:
-    """Or every poll would emit a stub file, which is §6's whole complaint."""
     with open_log(tmp_path, quiet()) as log:
         log.extend(rows(3))
 
-        assert not log._buffer.close_open_group(int(time.time()) - 3600)
-        assert log.seal() is not None, "an explicit seal still cuts"
+        assert log.seal_due() is None, "sealed without reaching target_size"
+        assert log._table.data_files() == [], "wrote an undersized file"
+        assert log.buffered_rows() == 3, "the rows went somewhere else"
+        assert len(log.scan().read_all()) == 3, "buffered rows must still read"
 
 
-def test_the_age_clock_starts_with_the_first_row_not_the_group(tmp_path: Path) -> None:
-    """An idle group would otherwise seal a one-row file the moment it filled."""
+def test_only_an_explicit_seal_cuts_short(tmp_path: Path) -> None:
+    """The one way this library writes an undersized file, and it takes a call."""
     with open_log(tmp_path, quiet()) as log:
-        log.extend(rows(1))
-        log.seal()
+        log.extend(rows(3))
 
-        # A fresh, empty group now exists and is about to sit idle.
-        time.sleep(1.1)
-        opened_before = log._buffer._con.execute(
-            "SELECT opened_at FROM seal_group WHERE end_offset IS NULL"
-        ).fetchone()[0]
-
-        assert opened_before is None, "an empty group carries no age"
-
-        log.extend(rows(1, start=50))
-        opened_after = log._buffer._con.execute(
-            "SELECT opened_at FROM seal_group WHERE end_offset IS NULL"
-        ).fetchone()[0]
-
-        assert opened_after >= int(time.time()) - 1, "clock started before the row"
+        assert log.seal_due() is None, "something cut without being asked"
+        assert log.seal() is not None, "an explicit seal must still cut"
+        assert log.table_files() == 1
 
 
 def test_a_reopened_log_adopts_the_rows_it_finds(tmp_path: Path) -> None:

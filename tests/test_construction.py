@@ -204,9 +204,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
     Schema comes from the Iceberg table, sort order from its declared sort
     order (§4), config and archive from the buffer's `meta` table (§2).
     """
-    config = LogConfig(
-        target_size=4096, compact_min_files=7, max_age=timedelta(seconds=90)
-    )
+    config = LogConfig(target_size=4096, compact_min_files=7)
     with Log.new(
         tmp_path,
         "s",
