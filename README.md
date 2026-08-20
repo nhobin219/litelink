@@ -134,8 +134,9 @@ log.maintain()                                        # compact, evict, expire
 ## Try it
 
 ```
-just demo-capture      # append continuously, maintaining on a background thread
-just demo-tail         # in another terminal: watch the log accumulate
+just demo-capture      # append continuously — the hot path, and nothing else
+just demo-maintain     # in another terminal: seal, compact, evict, expire
+just demo-tail         # in a third: watch where the rows are
 just bench --quick     # write and read throughput on your hardware
 ```
 

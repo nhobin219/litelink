@@ -1,18 +1,18 @@
 """The writer: append, and nothing else.
 
     uv run python examples/capture.py [--root DIR] [--rate ROWS_PER_SECOND]
-    uv run python examples/capture.py --no-seal    # alongside examples/sealer.py
+    uv run python examples/capture.py --no-seal    # alongside examples/maintainer.py
 
 One thread appending, and every append durable when `extend()` returns — there
 is no in-memory buffer to flush, which is the failure the README opens with.
 
-**Sealing and maintenance are separate processes**, in `sealer.py` and
-`maintainer.py`. They are separate from each other too: different roles, holding
-different leases, so either can be restarted or crash without stopping the
-other, and a compaction that takes seconds cannot delay a seal.
+**Everything else is `maintainer.py`**, a separate process: sealing the buffer
+into Parquet, then compacting, evicting and expiring what that produces.
+Sealing is maintenance, not a third role — it is the first thing done with what
+this process leaves behind.
 
 By default this still seals on a background thread, so the demo does something
-on its own. Start `examples/sealer.py` and that thread begins losing the lease
+on its own. Start `examples/maintainer.py` and that thread begins losing the lease
 immediately — no restart here, no flag, no coordination. `--no-seal` skips
 starting a thread that would only lose, which is what a real deployment wants
 once it runs a dedicated sealer.
@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument(
         "--no-seal",
         action="store_true",
-        help="do not seal here; run examples/sealer.py instead",
+        help="do not seal here; run examples/maintainer.py instead",
     )
     args = parser.parse_args()
 
@@ -72,11 +72,11 @@ def main() -> None:
 
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
     if args.no_seal:
-        print("not sealing here — run `just demo-seal`")
+        print("not sealing here — run `just demo-maintain`")
     else:
-        print("sealing on a background thread until `just demo-seal` takes over")
+        print("sealing on a background thread until `just demo-maintain` takes over")
 
-    print("`just demo-maintain` reclaims disk; `just demo-tail` watches. Ctrl-C.\n")
+    print("`just demo-maintain` seals and reclaims disk; `just demo-tail` watches.\n")
 
     source = observations()
     interval = args.batch / args.rate

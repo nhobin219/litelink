@@ -605,8 +605,11 @@ class Buffer:
             return pa.array(values).cast(declared)
 
     def lease(self, role: str, owner: str, ttl_ms: int = DEFAULT_TTL_MS) -> Lease:
-        """A claim on `role`, backed by this database."""
-        return Lease(self._con, role, owner, ttl_ms)
+        """A claim on `role`, backed by this database.
+
+        Handed the connection AND the lock that guards it — see `Lease`.
+        """
+        return Lease(self._con, self._lock, role, owner, ttl_ms)
 
     # -- the seal queue ---------------------------------------------------
 
@@ -624,6 +627,18 @@ class Buffer:
         ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]))
+
+    def last_queued_end(self) -> int | None:
+        """The highest cut recorded but not yet sealed, or None if none is.
+
+        What an explicit `seal()` must drain to. Taken under the same lock that
+        made the cut, so it cannot miss one that call just recorded.
+        """
+        row = self._con.execute(
+            "SELECT max(end_offset) FROM seal_group WHERE end_offset IS NOT NULL"
+        ).fetchone()
+
+        return None if row[0] is None else int(row[0])
 
     def close_open_group(self, cutoff: int | None = None) -> bool:
         """Cut the open group short so a sealer can pick it up.

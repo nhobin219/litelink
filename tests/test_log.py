@@ -233,7 +233,12 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
     import threading
     import time
 
-    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+    # seal_mode="none", or this measures the wrong thing. The wrapper times from
+    # BEFORE acquire, so it counts waiting as holding — and a background sealer
+    # would be contending for the same lock over the group this test just
+    # queued, inflating exactly the number being asserted on.
+    config = LogConfig(target_size=1 << 30, seal_mode="none")
+    with open_log(tmp_path, config) as log:
         log.extend(rows(400))
 
         held: list[float] = []
@@ -264,15 +269,18 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
 
 def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
     """`sealing` holds one row by design (§2), and two seals would overlap."""
-    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+    with open_log(tmp_path, LogConfig(target_size=1 << 30, seal_mode="none")) as log:
         log.extend(rows(50))
         held = log._lease("seal")
         assert held.acquire(), "could not simulate a seal in flight"
 
-        assert log.seal() is None, "sealed while another seal was in flight"
+        # Recording the cut is unconditional; writing the file is not.
+        assert log.seal() == 51
+        assert log.table_files() == 0, "sealed while another seal was in flight"
 
         held.release()
         assert log.seal() == 51
+        assert log.table_files() == 1
 
 
 def test_close_waits_for_an_in_flight_seal(tmp_path: Path) -> None:

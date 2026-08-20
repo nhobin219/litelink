@@ -62,15 +62,11 @@ check: lint format-check typecheck test
 build:
     uv build
 
-# Appends only. Seals on a thread until demo-seal takes over; --no-seal skips that.
+# Appends only. Seals on a thread until demo-maintain takes over; --no-seal skips that.
 demo-capture *args:
     uv run python examples/capture.py {{args}}
 
-# Seal in a dedicated process — off the writer's GIL. Run with demo-capture.
-demo-seal *args:
-    uv run python examples/sealer.py {{args}}
-
-# Compact, evict and expire in a dedicated process. A separate lease from the sealer.
+# Seal, compact, evict and expire — the second role. Run with demo-capture.
 demo-maintain *args:
     uv run python examples/maintainer.py {{args}}
 

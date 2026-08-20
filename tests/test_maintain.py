@@ -441,7 +441,11 @@ def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
     files and deriving the boundary meant opening every one. Measured at 60
     files: 60 manifests and a 45 ms read, against 1 manifest and 2.3 ms merged.
     """
-    with open_log(tmp_path, LogConfig(compact_min_files=99)) as log:
+    # seal_mode="none": every seal here is explicit, and a background sealer
+    # racing for the lease changes how many commits land and therefore how
+    # pyiceberg merges manifests — which is the thing being measured.
+    config = LogConfig(compact_min_files=99, seal_mode="none")
+    with open_log(tmp_path, config) as log:
         for i in range(8):
             log.extend(rows(20, start=i * 20))
             log.seal()
