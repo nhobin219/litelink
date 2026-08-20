@@ -152,7 +152,7 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
         extent = log._buffer.extent()
         assert extent is not None
         end = extent[1] + 1
-        rel_path = log._layout.seal_path(1, end, _today())
+        rel_path = log._layout.seal_path(1, end, _today(), "tok")
         log._buffer.claim_seal(1, end, rel_path)
         log._write_and_commit(end, rel_path)
         # deliberately NOT finish_seal: this is the crash window
@@ -172,7 +172,7 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
     """
     with open_log(tmp_path) as log:
         log.extend(rows(3))
-        log._buffer.claim_seal(1, 4, log._layout.seal_path(1, 4, _today()))
+        log._buffer.claim_seal(1, 4, log._layout.seal_path(1, 4, _today(), "tok"))
 
     with open_log(tmp_path) as recovered:
         assert recovered._buffer.pending_seal() is None

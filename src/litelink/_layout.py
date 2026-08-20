@@ -72,14 +72,27 @@ class Layout:
         """
         return (self.root / self.name, self.root / f"{NAMESPACE}.db" / self.name)
 
-    def seal_path(self, start: int, end: int, day: date) -> str:
+    def seal_path(self, start: int, end: int, day: date, token: str) -> str:
         """Root-relative path for a seal covering `[start, end)` (§4).
 
         The date is passed in rather than read from the clock, so the caller
         that persists this path is the one that chose it. Recomputing it later
         could land in a different day's directory and strand the first file.
+
+        `token` makes it unique per ATTEMPT, not per range. The name was once
+        derived from the range alone, on the reasoning that a retry should
+        overwrite in place and strand nothing — but recovery never recomputes
+        it, it reads it back from `sealing`, so determinism bought nothing and
+        cost the one thing it appeared to prevent. A writer stalled past its
+        lease and the owner that took over both wrote that single name, and
+        `pq.write_table` truncates on open, so the file became a blend of two
+        writers with one of them committing it.
+
+        Unique names alone would trade that for an untracked file, which is
+        worse. They come with the rule that a superseded attempt is queued in
+        `pending_delete` before its claim is replaced — see `_recover_seal`.
         """
-        return f"{self.name}/data/{day.isoformat()}/{start}-{end}.parquet"
+        return f"{self.name}/data/{day.isoformat()}/{start}-{end}-{token}.parquet"
 
     def compaction_path(self, lo: int, hi: int, token: str) -> str:
         """Root-relative path for the merge of the offset range `[lo, hi]` (§6).
