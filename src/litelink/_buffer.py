@@ -161,6 +161,7 @@ class Buffer:
         *,
         target_size: int,
         readonly: bool = False,
+        durable: bool = True,
     ) -> Buffer:
         """Connect, configure, and create the tables. Then hand them to `cls`.
 
@@ -172,6 +173,14 @@ class Buffer:
         A readonly buffer opens the same file through SQLite's `mode=ro` URI so
         the handle cannot write even by mistake, and creates nothing. WAL allows
         any number of these alongside the single writer (§1).
+
+        `durable=False` is for a buffer whose contents are derived from
+        something that still exists — the scratch buffer an archive rewrite
+        re-cuts through, whose every row came from the archive and is still
+        there until the rewrite's final commit. A crash costs a re-run rather
+        than data, so the fsync per commit is paying for a guarantee nothing
+        depends on. Never for a log's own buffer: there, the fsync IS the
+        product (§3).
         """
         columns = tuple(schema.names)
         if readonly:
@@ -185,12 +194,14 @@ class Buffer:
         # (`sqlite3.threadsafety == 3`), so the connection itself is safe; the
         # lock is for the multi-statement sequences SQLite cannot know about.
         writer = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        # WAL either way, and not for durability: the reader below is a second
+        # connection to the same file, which is what WAL exists to allow.
         writer.execute("PRAGMA journal_mode=WAL")
         writer.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         # §3's durability claim rests on this line. WAL alone fsyncs at
         # checkpoint, not at commit, which would put committed rows back in the
         # OS page cache — the exact loss this library exists to prevent.
-        writer.execute("PRAGMA synchronous=FULL")
+        writer.execute(f"PRAGMA synchronous={'FULL' if durable else 'OFF'}")
 
         buffer = cls(
             writer,
