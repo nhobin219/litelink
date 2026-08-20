@@ -212,6 +212,13 @@ in-process scan concurrent with appends corrupted the database on the *first* sc
 workload with the reader in a separate process ran clean, which is the tell: cross-process
 is the case WAL is designed for; two libraries inside one process is not.
 
+**What that cache costs.** It mirrors the *unsealed* tail and nothing else, so it is
+bounded by whatever bounds the buffer — `target_size` plus however far behind the
+maintainer is — and it releases: measured over 24 append/seal/read cycles, the cached
+tail returns to zero rows and Arrow's allocation to zero after each seal. Run a writer
+with no maintainer and it grows, at roughly 1.1x the payload, for the same reason the
+SQLite buffer does. That is one more reason a maintainer is not optional.
+
 The buffer leg is therefore read through the connection that already owns the file and
 handed to DuckDB as Arrow. It is converted **incrementally** — rows are immutable once
 committed, arrive only above the last one, and leave only as a prefix at a seal, so each

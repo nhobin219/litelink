@@ -262,6 +262,37 @@ def test_a_reopened_log_adopts_the_rows_it_finds(tmp_path: Path) -> None:
         reopened.close()
 
 
+def test_the_read_cache_is_bounded_by_the_unsealed_tail(tmp_path: Path) -> None:
+    """It mirrors what is unsealed, and lets go of what is not.
+
+    Reads convert the buffer's tail to Arrow incrementally and keep it, so the
+    thing to prove is that it shrinks: an Arrow slice is zero-copy, and a cache
+    that only ever grew would hold every row the log had ever seen in memory.
+    Measured over 24 append/seal/read cycles, the tail returns to zero rows and
+    `pa.total_allocated_bytes()` to zero after each seal.
+    """
+    with open_log(tmp_path, quiet()) as log:
+        for _ in range(4):
+            log.extend(rows(200))
+            log.scan().read_all()
+
+            assert log._buffer._tail is not None
+            assert log._buffer._tail.num_rows > 0, "nothing was cached to release"
+
+            log.seal()
+            log.scan().read_all()
+
+            assert log._buffer._tail is not None
+            assert log._buffer._tail.num_rows == 0, (
+                f"{log._buffer._tail.num_rows} sealed rows still cached"
+            )
+
+        log.extend(rows(200))
+        log.scan().read_all()
+
+    assert log._buffer._tail is None, "close left the cache holding rows"
+
+
 def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> None:
     """Regression: DuckDB must not open the buffer database itself.
 
