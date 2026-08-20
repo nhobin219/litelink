@@ -17,7 +17,7 @@ import pytest
 from litelink import Log, LogConfig
 from litelink._buffer import Buffer
 from litelink._layout import Layout
-from litelink._maintenance import Maintenance
+from litelink._maintenance import Maintenance, settled_size
 from litelink._read import Reader, duckdb_connection
 from litelink._table import LogTable
 from litelink.log import table_schema, validate
@@ -217,7 +217,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
 
     with Log.open(tmp_path, "s") as reopened:
         assert reopened._sort_by == ("key", "event_ts")
-        assert reopened._archive == "s3://bucket/prefix"
+        assert reopened._archive.uri == "s3://bucket/prefix"
         assert reopened.config == config
         # Logically the same schema, not byte-identical: Iceberg has one string
         # type, so `string` comes back as `large_string`.
@@ -264,11 +264,11 @@ def test_set_archive_persists(tmp_path: Path) -> None:
         log.set_archive("s3://bucket/x")
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened._archive == "s3://bucket/x"
+        assert reopened._archive.uri == "s3://bucket/x"
         reopened.set_archive(None)
 
     with Log.open(tmp_path, "s") as detached:
-        assert detached._archive is None
+        assert detached._archive.uri is None
 
 
 def test_sort_by_is_declared_on_the_table(tmp_path: Path) -> None:
@@ -406,3 +406,19 @@ def test_a_relative_root_is_resolved_once(
     assert log.root == root
     assert log.scan().read_all().num_rows == 1
     log.close()
+
+
+def test_the_settled_size_is_under_the_compaction_budget() -> None:
+    """The property that used to be a validated relationship between two knobs.
+
+    Compaction consumes files under the settled size and caps its output at
+    `target_size`; `sync` pushes files at or above the settled size. Those are
+    only complementary while settled <= budget. When `compact_below` was its
+    own setting it could be raised above `target_size`, and then compaction
+    produced nothing it would not immediately reconsider and `sync` found
+    nothing it was allowed to push — the log compacted forever and archived
+    never. With one knob that pair is unrepresentable, so this asserts the
+    relationship directly rather than asserting a rejection.
+    """
+    for target in (2, 4096, 8 * 1024 * 1024, 1 << 30):
+        assert settled_size(target) <= target

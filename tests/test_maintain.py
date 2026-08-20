@@ -19,9 +19,7 @@ def seal_files(log: Log, count: int, per_file: int = 4) -> None:
 
 
 def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
-    with open_log(
-        tmp_path, LogConfig(compact_below=1 << 30, compact_min_files=2)
-    ) as log:
+    with open_log(tmp_path, LogConfig(target_size=1 << 30, compact_min_files=2)) as log:
         seal_files(log, 4)
         assert len(log._table.data_files()) == 4
 
@@ -34,17 +32,21 @@ def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
 
 def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
     """Below the threshold the pass must leave the files alone."""
-    with open_log(
-        tmp_path, LogConfig(compact_below=1 << 30, compact_min_files=5)
-    ) as log:
+    with open_log(tmp_path, LogConfig(target_size=1 << 30, compact_min_files=5)) as log:
         seal_files(log, 4)
         log.maintain()
 
         assert len(log._table.data_files()) == 4
 
 
-def test_compaction_skips_files_over_compact_below(tmp_path: Path) -> None:
-    with open_log(tmp_path, LogConfig(compact_below=1, compact_min_files=2)) as log:
+def test_compaction_skips_settled_files(tmp_path: Path) -> None:
+    """Every file already at or above the settled size, so nothing is a
+    candidate — the pass must leave all three alone rather than merge them.
+
+    A 4-row Parquet file runs to roughly 1.3 kB, so a 2 kB target puts the
+    settled size at 1 kB, under every one of them.
+    """
+    with open_log(tmp_path, LogConfig(target_size=2048, compact_min_files=2)) as log:
         seal_files(log, 3)
         log.maintain()
 
@@ -55,7 +57,7 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
     """§6 step 2: re-sorted, not merely concatenated."""
     import pyarrow.parquet as pq
 
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_size=1 << 30, compact_min_files=2)
     with Log.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
@@ -72,7 +74,7 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
 
 
 def test_compaction_preserves_every_row(tmp_path: Path) -> None:
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 5, per_file=3)
         before = read_all(log)
@@ -168,7 +170,7 @@ def test_eviction_waits_for_the_archive_watermark(tmp_path: Path) -> None:
 
 def test_reads_stay_correct_across_a_compaction(tmp_path: Path) -> None:
     """I8: once readable, a row stays readable."""
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.extend(rows(4, start=12))
@@ -295,7 +297,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
     walk the filesystem; the library is not.
     """
     config = LogConfig(
-        compact_below=1 << 30,
+        target_size=1 << 30,
         compact_min_files=2,
         local_retention=timedelta(days=365),
         snapshot_retention=timedelta(days=365),
@@ -318,7 +320,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
 
 
 def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -> None:
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.maintain()
@@ -329,7 +331,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
     # deadline is evaluated against the CURRENT setting, not one frozen at
     # enqueue time, so lowering it takes effect on what is already queued.
     impatient = LogConfig(
-        compact_below=1 << 30,
+        target_size=1 << 30,
         compact_min_files=2,
         snapshot_retention=timedelta(microseconds=1),
     )
@@ -425,7 +427,6 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
     """
     config = LogConfig(
         target_size=1 << 40,
-        compact_below=1 << 30,
         compact_min_files=2,
         local_retention=timedelta(microseconds=1),
     )
@@ -493,7 +494,7 @@ def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> N
     table-referenced file, and a crash mid-write destroyed the only copy of
     those rows. Two owners racing the role hit the same collision.
     """
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.maintain()

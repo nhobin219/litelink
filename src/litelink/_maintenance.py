@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 
+from litelink._archive import Archive
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
@@ -45,6 +46,32 @@ def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
         raise RuntimeError(msg)
 
 
+def settled_size(target_size: int) -> int:
+    """The size at which a file is done: big enough to archive, not worth
+    merging. Half the target.
+
+    Not a knob, and deliberately not a second one. It was `compact_below`, and
+    a separate setting for it could be — was — set above `target_size`, which
+    silently wedges the log: compaction caps its output AT the target, so above
+    it every file compaction produces is still a merge candidate, and none is
+    ever large enough for `sync` to push. Compact forever, archive never.
+
+    The fraction is not arbitrary either. `target_size` is measured on the
+    BUFFER, in uncompressed SQLite bytes, while this is measured on the sealed
+    Parquet FILE — so the same data is smaller here by whatever compression
+    achieved, and a settled file simply never reaches `target_size` on disk.
+    Anything at half the target is close enough that rewriting it would move
+    most of a file to gain a little of one.
+
+    One definition rather than two call sites computing their own, because
+    compaction consumes files below this line and `sync` pushes files above it,
+    and those two rules are only complementary while the line is the same. Let
+    them drift and a file can be both a merge candidate and archived, which is
+    the one thing §5 and §6 must never both believe.
+    """
+    return target_size // 2
+
+
 class Maintenance:
     """The reclamation passes for one log."""
 
@@ -55,14 +82,14 @@ class Maintenance:
         layout: Layout,
         config: LogConfig,
         sort_by: tuple[str, ...],
-        archive: str | None = None,
+        archive: Archive | None = None,
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
         self._config = config
         self._sort_by = sort_by
-        self._archive = archive
+        self._archive = archive if archive is not None else Archive(layout)
 
     def set_config(self, config: LogConfig) -> None:
         """Adopt new policy in place, rather than being rebuilt around it."""
@@ -70,10 +97,6 @@ class Maintenance:
 
     def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
         self._sort_by = sort_by
-
-    def set_archive(self, archive: str | None) -> None:
-        """Adopt a changed archive in place, like the config above it."""
-        self._archive = archive
 
     def run(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """The three passes, with a checkpoint between them.
@@ -135,13 +158,13 @@ class Maintenance:
 
         # Never merge what the archive already has. Marking compaction output
         # archivable is not enough on its own: an output can still fall under
-        # `compact_below` and be merged again, and a merge spanning the archive
+        # `settled_size` and be merged again, and a merge spanning the archive
         # watermark either duplicates the rows already pushed or strands the
         # ones above them. Skipping archived files makes that unreachable —
         # they are simply never inputs.
         archived = self.archived_through()
 
-        threshold = self._config.compact_below or self._config.target_size // 2
+        threshold = settled_size(self._config.target_size)
         # An upper bound as well as a lower one. Selecting every adjacent file
         # under the threshold and merging the lot puts no ceiling on the
         # result: a hundred files just under it become one file a hundred times
@@ -299,7 +322,7 @@ class Maintenance:
         # With no archive there is no watermark and none is owed: §8 says
         # `local_retention` is then a deletion policy over the only copy, which
         # is the contract the operator asked for.
-        if self._archive is not None:
+        if self._archive.configured():
             boundary = min(boundary, self.archived_through())
             if boundary <= 0:
                 return

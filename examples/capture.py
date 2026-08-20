@@ -48,7 +48,6 @@ def main() -> None:
     # argument, not to make a demo lively.
     config = LogConfig(
         target_size=256 * 1024,
-        compact_below=1024 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
     )

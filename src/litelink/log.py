@@ -28,11 +28,12 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from litelink._archive import Archive
 from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._lease import Lease, new_owner
-from litelink._maintenance import Maintenance, checkpoint
+from litelink._maintenance import Maintenance, checkpoint, settled_size
 from litelink._read import Reader, duckdb_connection
 from litelink._s3 import S3Options
 from litelink._table import LogTable
@@ -118,8 +119,8 @@ class LogConfig:
     # still reading (I6).
     snapshot_retention: timedelta = timedelta(hours=1)
 
-    # §6. compact_below defaults to half of target_size when None.
-    compact_below: int | None = None
+    # §6. What counts as "big enough to leave alone" is `settled_size` of the
+    # target, not its own setting — see `_maintenance.settled_size`.
     compact_min_files: int = 4
 
     # §3a. Continuous SQLite WAL shipping. Off by default; decouples RPO from
@@ -142,7 +143,6 @@ class LogConfig:
                     else self.local_retention.total_seconds()
                 ),
                 "snapshot_retention": self.snapshot_retention.total_seconds(),
-                "compact_below": self.compact_below,
                 "compact_min_files": self.compact_min_files,
                 "wal_replication": self.wal_replication,
             }
@@ -157,7 +157,6 @@ class LogConfig:
             target_size=raw["target_size"],
             local_retention=None if retention is None else timedelta(seconds=retention),
             snapshot_retention=timedelta(seconds=raw["snapshot_retention"]),
-            compact_below=raw["compact_below"],
             compact_min_files=raw["compact_min_files"],
             wal_replication=raw["wal_replication"],
         )
@@ -190,8 +189,7 @@ class Log:
         schema: pa.Schema,
         sort_by: tuple[str, ...],
         config: LogConfig,
-        archive: str | None = None,
-        s3: S3Options | None = None,
+        archive: Archive | None = None,
         readonly: bool = False,
     ) -> None:
         self.name = layout.name
@@ -204,10 +202,11 @@ class Log:
         self._buffer = buffer
         self._schema = schema
         self._sort_by = sort_by
-        self._archive = archive
-        self._s3 = s3 or S3Options()
-        # Opened on first sync, not at construction — see `_archive_table`.
-        self._archive_handle: LogTable | None = None
+        # One object, shared with the reader and the maintainer that were
+        # handed the same one. See `_archive.Archive`: it owns the URI, the
+        # credentials and the lazily opened handle, so `set_archive` re-points
+        # all three at once instead of fanning out to each.
+        self._archive = archive if archive is not None else Archive(layout)
         self._reader = reader
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
@@ -302,19 +301,27 @@ class Log:
         if archive is not None:
             buffer.set_meta(_ARCHIVE_KEY, archive)
 
+        # Built here and handed to all three, so each is given its archive at
+        # construction rather than having one pushed into it afterwards.
+        remote = Archive(layout, archive, s3, table_schema(schema))
+
         return cls(
             layout=layout,
             table=table,
             buffer=buffer,
             reader=Reader(
-                layout, table, buffer, table_schema(schema), duckdb_connection
+                layout,
+                table,
+                buffer,
+                table_schema(schema),
+                duckdb_connection,
+                archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, settings, order, archive),
+            maintenance=Maintenance(table, buffer, layout, settings, order, remote),
             schema=schema,
             sort_by=order,
             config=settings,
-            archive=archive,
-            s3=s3,
+            archive=remote,
         )
 
     @classmethod
@@ -373,19 +380,24 @@ class Log:
         # row, and an empty archive is no archive. Read once here because both
         # the Log and its maintainer need it.
         archive = buffer.get_meta(_ARCHIVE_KEY) or None
+        remote = Archive(layout, archive, s3, table_schema(schema))
         log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
             reader=Reader(
-                layout, table, buffer, table_schema(schema), duckdb_connection
+                layout,
+                table,
+                buffer,
+                table_schema(schema),
+                duckdb_connection,
+                archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, config, sort_by, archive),
+            maintenance=Maintenance(table, buffer, layout, config, sort_by, remote),
             schema=schema,
             sort_by=sort_by,
             config=config,
-            archive=archive,
-            s3=s3,
+            archive=remote,
             readonly=read_only,
         )
         if not read_only:
@@ -404,7 +416,7 @@ class Log:
         """
         with self._lock:
             self._writable()
-            validate(self._schema, self._sort_by, config, self._archive)
+            validate(self._schema, self._sort_by, config, self._archive.uri)
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
             self.config = config
             self._maintenance.set_config(config)
@@ -419,12 +431,11 @@ class Log:
             self._writable()
             validate(self._schema, self._sort_by, self.config, archive)
             self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
-            self._archive = archive or None
-            # The maintainer too. `evict` reads this to decide whether I4 is
-            # owed anything, and a setting that stopped at `Log` would leave it
-            # deleting the only copy of rows an archive was just configured to
-            # receive. Same fan-out `target_size` needed.
-            self._maintenance.set_archive(self._archive)
+            # Reaches the maintainer and the reader because all three hold
+            # this object. `evict` asks it whether I4 is owed anything, and a
+            # setting that stopped at `Log` would leave the maintainer deleting
+            # the only copy of rows an archive was just configured to receive.
+            self._archive.set_uri(archive)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.
@@ -442,7 +453,7 @@ class Log:
         with self._lock:
             self._writable()
             requested = tuple(sort_by)
-            validate(self._schema, requested, self.config, self._archive)
+            validate(self._schema, requested, self.config, self._archive.uri)
             if requested == self._sort_by:
                 return
 
@@ -569,14 +580,10 @@ class Log:
         The escape hatch for what `scan` cannot express. Quote `"litelink_offset"` — it
         is a DuckDB reserved word.
         """
-        if include_archive:
-            msg = "archive reads are not implemented"
-            raise NotImplementedError(msg)
-
         # No lock here. `Reader` guards its own connection and `LogTable` its
         # own cache, both briefly — whereas this used to be the SAME lock a
         # whole maintenance pass held, so a read waited out a compaction.
-        return self._reader.query(query)
+        return self._reader.query(query, include_archive=include_archive)
 
     def end_offset(self) -> int:
         """The offset the next append will receive — an EXCLUSIVE upper bound.
@@ -1031,7 +1038,7 @@ class Log:
         watermark it records in `meta`, which is what lets `maintain` enforce I4.
         """
         self._writable()
-        if self._archive is None:
+        if not self._archive.configured():
             msg = "sync() needs an archive; this log is local-only"
             raise ValueError(msg)
 
@@ -1044,24 +1051,6 @@ class Log:
             self._push(lease)
         finally:
             lease.release()
-
-    def _archive_table(self) -> LogTable:
-        """The remote table, opened on first use and kept.
-
-        Built lazily and cached: creating it costs a round trip to object
-        storage, which a log that never syncs should not pay, and rebuilding it
-        per pass would pay it every time.
-        """
-        if self._archive_handle is None:
-            if self._archive is None:
-                msg = "no archive configured"
-                raise ValueError(msg)
-
-            self._archive_handle = LogTable.open_archive(
-                self._layout, self._archive, self._s3, table_schema(self._schema)
-            )
-
-        return self._archive_handle
 
     def _push(self, lease: Lease) -> None:
         """Upload and register everything above the archive's extent.
@@ -1082,12 +1071,12 @@ class Log:
         cosmetic cost with a deliberate cause, and `rewrite_archive` is the
         tool for it.
         """
-        archive = self._archive_table()
+        archive = self._archive.require()
         self._table.reload()
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
-        threshold = self.config.compact_below or self.config.target_size // 2
+        threshold = settled_size(self.config.target_size)
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
         # Drop the trailing run of undersized files, and only that run.
