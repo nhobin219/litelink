@@ -302,6 +302,20 @@ a run worth merging. It is a no-op the rest of the time — measured at 19.3 ms 
 files, which is the cost of *asking* (`data_files()` opens every manifest) rather than of
 doing.
 
+**Retention has two floors, and the looser one binds.** `local_retention` is a window in
+time, `local_rows` a count of recent rows, and which of them actually bounds local disk
+depends on a rate the library cannot know — an hour of a quiet stream is a handful of rows,
+an hour of a busy one is more disk than the machine has. Both say what must stay readable
+without a network round trip, so eviction keeps whichever retains MORE. That is the mirror
+of how the seal combines its limits, where they are ceilings and the tighter wins.
+
+A file's age for this purpose is when it was WRITTEN, recorded by the log itself in
+`extent`. It is deliberately not the Iceberg snapshot that added it: expiry deletes that
+snapshot, and a file dated by one that no longer exists has no age at all — which is how
+retention came to silently stop reclaiming anything. The grace period before a file is
+actually unlinked is a different clock again, stamped on `pending_delete` when the file
+left the table, because that one is about readers still holding it (I6).
+
 **Sync holds back exactly what compaction might still rewrite**, which it decides by asking
 compaction's own rule rather than a size of its own — a file pushed and then merged locally
 would leave the archive holding rows that have been rewritten underneath it, so the two

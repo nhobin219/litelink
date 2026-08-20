@@ -857,7 +857,8 @@ target_size            uncompressed bytes per file        (size it for READ late
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
                                                           whatever compression achieved)
-local_retention        local table window                 (> longest hot lookback, with margin; 0 = evict on upload)
+local_retention        local table window, by TIME        (> longest hot lookback, with margin; 0 = evict on upload)
+local_rows             local table window, by ROWS        (floor: keep at least this many recent rows)
 wal_replication        continuous WAL shipping for RPO    (off by default; §3a)
 snapshot_retention     snapshot expiry floor              (> longest scan)
 compact_min_files      minimum adjacent files to compact  (e.g. 4)

@@ -391,7 +391,8 @@ class Maintenance:
         a local-only log with a retention asks for; see §8.
         """
         retention = self._config.local_retention
-        if retention is None:
+        keep_rows = self._config.local_rows
+        if retention is None and keep_rows is None:
             return
 
         # Same reason as `compact`: this decides what to drop from the ages a
@@ -399,14 +400,31 @@ class Maintenance:
         self._table.reload()
         self._age_cache = None
 
-        cutoff = datetime.now(UTC) - retention
-        stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
-        if not stale:
+        # Files cover contiguous non-overlapping ranges, so evicting a prefix
+        # is a single upper bound. Anything newer is untouched — and each
+        # policy is one such bound, so honouring both is taking the lower.
+        # They are floors on what stays readable locally, so the one that
+        # retains MORE wins, which is the opposite of how the seal combines its
+        # two limits (§12).
+        limits: list[int] = []
+        if retention is not None:
+            cutoff = datetime.now(UTC) - retention
+            stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
+            # Nothing old enough is a limit of zero, not an absent one: it
+            # means this policy would keep everything.
+            limits.append(max((f.hi for f in stale), default=0))
+
+        if keep_rows is not None:
+            # Offsets are contiguous, so the newest `keep_rows` of them start
+            # here. AUTOINCREMENT can leave a gap where a transaction rolled
+            # back, which makes this retain slightly more than asked rather
+            # than less — the safe direction for a floor.
+            limits.append(self._buffer.next_offset() - 1 - keep_rows)
+
+        boundary = min(limits)
+        if boundary <= 0:
             return
 
-        # Files cover contiguous non-overlapping ranges, so evicting a prefix is
-        # a single upper bound. Anything newer is untouched.
-        boundary = max(f.hi for f in stale)
         # I4, and the only line in this pass that is correctness rather than
         # housekeeping: a file the archive still lacks must not leave the local
         # table, because with an archive configured the local copy is not the
