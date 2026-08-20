@@ -977,9 +977,13 @@ The consequence worth planning for is that local disk holds roughly
    if it dies its lease lapses and the writer takes the role back. `background_seal=False`
    only avoids starting a thread that would lose.
 
-   In-process exclusion is still a flag under a lock, because a lease re-entered by its own
-   owner succeeds — a retry needs that. Neither substitutes for the other: the flag says
-   nothing about another process, and the lease says nothing about another thread.
+   **The lease is the only exclusion mechanism**, threads included. It works for both
+   because an owner is a UUID minted per acquisition rather than per `Log`, so two threads
+   calling `seal()` are two owners and the second loses on the same row that would refuse
+   another process. An owner fixed per `Log` would be re-entered by every thread sharing it,
+   and an owner derived from the pid or thread ident would be worse than useless: both are
+   reused after their holder exits, so a new arrival could inherit a dead one's identity and
+   re-enter a lease it never took.
 
    The remaining options, none chosen:
 

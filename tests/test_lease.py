@@ -40,7 +40,7 @@ def rows(n: int, start: int = 0) -> list[dict[str, object]]:
 
 def test_a_second_owner_is_refused(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
-        ours = log._seal_lease
+        ours = log._lease("seal")
         theirs = Lease(log._buffer._con, "seal", new_owner())
 
         assert ours.acquire()
@@ -51,16 +51,19 @@ def test_a_second_owner_is_refused(tmp_path: Path) -> None:
         assert theirs.acquire(), "release did not free it"
 
 
-def test_our_own_owner_re_acquires(tmp_path: Path) -> None:
-    """Which is why the lease cannot be the in-process guard.
+def test_one_log_hands_out_a_distinct_owner_every_time(tmp_path: Path) -> None:
+    """Which is what lets the lease be the only guard.
 
-    Re-entering is what a retry or a second call in the same Log needs. Threads
-    are excluded by the flag under `_lock`; processes by the lease. Neither
-    substitutes for the other.
+    An owner fixed per Log would be re-entered by every thread sharing it, and
+    the role would exclude nothing inside a process. Minting per attempt means
+    the second caller is a stranger to the row, wherever it is running.
     """
     with open_log(tmp_path) as log:
-        assert log._seal_lease.acquire()
-        assert log._seal_lease.acquire(), "an owner could not re-take its own lease"
+        ours = log._lease("seal")
+
+        assert ours.acquire()
+        assert not log._lease("seal").acquire(), "a second attempt re-entered"
+        assert ours.acquire(), "a retry could not re-take the lease it holds"
 
 
 def test_an_expired_lease_can_be_taken_over(tmp_path: Path) -> None:
@@ -75,7 +78,7 @@ def test_an_expired_lease_can_be_taken_over(tmp_path: Path) -> None:
 
         assert dying.acquire()
         time.sleep(0.05)
-        assert log._seal_lease.acquire(), "an expired lease blocked its successor"
+        assert log._lease("seal").acquire(), "an expired lease blocked its successor"
 
 
 def test_recovery_leaves_another_owners_seal_alone(tmp_path: Path) -> None:
@@ -137,7 +140,11 @@ def test_a_rejected_maintain_does_not_strand_the_lease(tmp_path: Path) -> None:
 
 
 def test_threads_in_one_process_still_exclude_each_other(tmp_path: Path) -> None:
-    """The lease re-enters for its own owner, so the flag is what stops this."""
+    """The lease alone, with no in-process flag behind it.
+
+    Two threads calling `seal` are two owners, so one loses on the same row that
+    would refuse another process — nothing here knows it is in one process.
+    """
     with open_log(tmp_path, config=LogConfig(target_size=1 << 30)) as log:
         log.extend(rows(200))
         started = threading.Event()

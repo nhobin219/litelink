@@ -24,8 +24,9 @@ says what was being attempted, and someone has to be entitled to finish it.
 from __future__ import annotations
 
 import os
-import secrets
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -39,12 +40,23 @@ DEFAULT_TTL_MS = 30_000
 
 
 def new_owner() -> str:
-    """An identity for one Log instance.
+    """A fresh identity for one attempt to hold a role.
 
-    Process id alone is not enough: pids are reused, and two Logs in one process
-    are two owners. The random half makes both cases unambiguous.
+    A UUID, because being unique is the whole job and nothing derived does it
+    safely: process ids are reused once a process exits, thread idents once a
+    thread does. An owner built from either could be inherited by something new,
+    which would let a stranger re-enter a lease as though it were its own.
+
+    Being unique per attempt is also what lets one mechanism cover both cases.
+    Callers mint an owner per acquisition rather than per Log, so two threads
+    sharing a Log are two owners, and the row that refuses a second holder in
+    another process refuses one in another thread on the same terms.
+
+    The pid and thread are for whoever reads the table wanting to know who is
+    holding it. They are diagnostic, not identity: nothing compares them, and
+    two owners differing only there are still two owners.
     """
-    return f"{os.getpid()}-{secrets.token_hex(8)}"
+    return f"{uuid.uuid4()}:pid={os.getpid()}:thread={threading.get_ident()}"
 
 
 @dataclass(frozen=True, slots=True)
