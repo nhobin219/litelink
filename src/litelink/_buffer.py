@@ -840,6 +840,13 @@ class Buffer:
     # -- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
+        # The cache goes too. It is bounded by the unsealed tail and falls to
+        # nothing once that is sealed, but a closed buffer holds no tail at
+        # all, and a caller keeping the object alive should not keep the rows.
+        with self._tail_lock:
+            self._tail = None
+            self._tail_lo = self._tail_hi = 0
+
         self._con.close()
         if self._reader is not self._con:
             self._reader.close()
