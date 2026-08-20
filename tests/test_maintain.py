@@ -223,7 +223,7 @@ def test_recovery_removes_a_crashed_compaction_by_name(tmp_path: Path) -> None:
     config = LogConfig(compact_min_files=99)
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
-        rel_path = log._layout.compaction_path(1, 4)
+        rel_path = log._layout.compaction_path(1, 4, "deadbeef")
         log._buffer.claim_compaction(1, 4, rel_path)
         half_written = tmp_path / rel_path
         half_written.parent.mkdir(parents=True, exist_ok=True)
@@ -456,3 +456,30 @@ def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
         assert len(manifests) < 8, (
             f"{len(manifests)} manifests for 8 files — not merging"
         )
+
+
+def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> None:
+    """A compaction's source is the file it replaces. A seal's is the buffer.
+
+    That difference is why a seal may overwrite its path on retry and a
+    compaction may not. With a deterministic `{lo}-{hi}` name, re-compacting a
+    range that had already been compacted wrote to the path it was reading:
+    `set_sort_by(rewrite=True)` after any compaction truncated the live,
+    table-referenced file, and a crash mid-write destroyed the only copy of
+    those rows. Two owners racing the role hit the same collision.
+    """
+    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        log.maintain()
+
+        before = [f.path for f in log._table.data_files()]
+
+        assert len(before) == 1, "expected one compacted file to rewrite"
+
+        log.set_sort_by(("key", "event_ts"), rewrite=True)
+        after = [f.path for f in log._table.data_files()]
+
+        assert len(after) == 1
+        assert after[0] != before[0], "the rewrite reused the live file's path"
+        assert len(read_all(log)) == 12

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
 from litelink._lease import DEFAULT_TTL_MS, Lease
@@ -123,6 +123,29 @@ class Buffer:
         self._tail: pa.Table | None = None
         self._tail_lo = 0
         self._tail_hi = 0
+
+    @contextlib.contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """One write transaction, rolled back if the body raises.
+
+        Every multi-statement write here goes through this. Four of them used
+        to open a transaction and commit with no rollback, which is worse than
+        it sounds: an error between BEGIN and COMMIT leaves the connection
+        inside a transaction with the lock released, and the next statement any
+        thread issues joins it — the mechanism that once erased a lease from
+        under its holder.
+        """
+        with self._lock:
+            self._con.execute(_BEGIN)
+            try:
+                yield
+            except BaseException:
+                with contextlib.suppress(sqlite3.OperationalError):
+                    self._con.execute("ROLLBACK")
+
+                raise
+
+            self._con.execute("COMMIT")
 
     def set_target_size(self, target_size: int) -> None:
         """Adopt a new cut size in place, rather than being rebuilt around it.
@@ -741,26 +764,18 @@ class Buffer:
             ).fetchone():
                 return False
 
-            self._con.execute(_BEGIN)
-            try:
-                cursor = self._con.execute(
-                    "UPDATE seal_group SET end_offset ="
-                    ' (SELECT max("litelink_offset") + 1 FROM buffer)'
-                    " WHERE end_offset IS NULL AND start_offset IS NOT NULL" + stale,
-                    () if cutoff is None else (cutoff,),
-                )
-                closed = bool(cursor.rowcount)
-                if closed:
-                    self._con.execute("INSERT INTO seal_group (bytes) VALUES (0)")
+        with self._transaction():
+            cursor = self._con.execute(
+                "UPDATE seal_group SET end_offset ="
+                ' (SELECT max("litelink_offset") + 1 FROM buffer)'
+                " WHERE end_offset IS NULL AND start_offset IS NOT NULL" + stale,
+                () if cutoff is None else (cutoff,),
+            )
+            closed = bool(cursor.rowcount)
+            if closed:
+                self._con.execute("INSERT INTO seal_group (bytes) VALUES (0)")
 
-                self._con.execute("COMMIT")
-            except BaseException:
-                with contextlib.suppress(sqlite3.OperationalError):
-                    self._con.execute("ROLLBACK")
-
-                raise
-
-            return closed
+        return closed
 
     # -- seal bookkeeping -------------------------------------------------
 
@@ -770,14 +785,12 @@ class Buffer:
         The path is persisted, not recomputed: a retry that recomputed it could
         land on a different date directory and strand the first file.
         """
-        with self._lock:
-            self._con.execute(_BEGIN)
+        with self._transaction():
             self._con.execute("DELETE FROM sealing")
             self._con.execute(
                 "INSERT INTO sealing (start_offset, end_offset, rel_path) VALUES (?, ?, ?)",
                 (start, end, rel_path),
             )
-            self._con.execute("COMMIT")
 
     def pending_seal(self) -> tuple[int, int, str] | None:
         """The in-flight seal, if a crash left one."""
@@ -800,12 +813,10 @@ class Buffer:
         identifies exactly one — which also means a recovered seal retires its
         group without `sealing` having had to remember which one it was.
         """
-        with self._lock:
-            self._con.execute(_BEGIN)
+        with self._transaction():
             self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
             self._con.execute("DELETE FROM seal_group WHERE end_offset = ?", (end,))
             self._con.execute("DELETE FROM sealing")
-            self._con.execute("COMMIT")
 
     # -- meta ---------------------------------------------------------------
     #
@@ -858,14 +869,12 @@ class Buffer:
         only way to find it without a directory scan is to have written its
         name down first.
         """
-        with self._lock:
-            self._con.execute(_BEGIN)
+        with self._transaction():
             self._con.execute("DELETE FROM compacting")
             self._con.execute(
                 "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
                 (lo, hi, rel_path),
             )
-            self._con.execute("COMMIT")
 
     def pending_compaction(self) -> tuple[int, int, str] | None:
         with self._lock:
@@ -887,13 +896,11 @@ class Buffer:
         Enqueued in the same breath as the commit that superseded them, which
         is the only moment their paths are known without going to look.
         """
-        with self._lock:
-            self._con.execute(_BEGIN)
+        with self._transaction():
             self._con.executemany(
                 "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at) VALUES (?, ?)",
                 [(p, superseded_at) for p in rel_paths],
             )
-            self._con.execute("COMMIT")
 
     def due_deletions(self, cutoff: int) -> list[str]:
         """Files superseded at or before `cutoff` — now minus the grace period."""
