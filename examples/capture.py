@@ -51,10 +51,6 @@ def main() -> None:
         compact_below=1024 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
-        # Seal a quiet stream on a timer as well as by size, or a feed slower
-        # than the target would sit in SQLite indefinitely. Read by whoever
-        # holds the seal lease, which is never this process.
-        max_age=timedelta(seconds=15),
     )
 
     # new() creates and takes the shape; open() recovers it. A service that

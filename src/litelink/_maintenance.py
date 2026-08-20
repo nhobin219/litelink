@@ -142,31 +142,45 @@ class Maintenance:
         archived = self.archived_through()
 
         threshold = self._config.compact_below or self._config.target_size // 2
+        # An upper bound as well as a lower one. Selecting every adjacent file
+        # under the threshold and merging the lot puts no ceiling on the
+        # result: a hundred files just under it become one file a hundred times
+        # `target_size`. That is the same defect as an undersized file with the
+        # sign flipped — `target_size` is a statement about how big a file
+        # should be, and a compaction that ignores it produces exactly the
+        # layout §6 exists to correct.
+        #
+        # So a run closes when the next file would take it past the target, and
+        # the pass emits several correctly sized files instead of one enormous
+        # one. Seal output and compaction output then converge on the same size
+        # rather than diverging with every pass.
+        budget = self._config.target_size
 
         run: list[DataFile] = []
-        for data_file in [*self._table.data_files(), None]:
-            # Adjacency is in offset order, so a large file between two small
-            # ones ends the run — merging across it would pull an already-sized
-            # file through the rewrite for nothing.
-            if data_file is not None and data_file.hi <= archived:
-                # Below the watermark and therefore final. Ends any run in
-                # progress rather than joining it, exactly as an oversized file
-                # does — adjacency is in offset order, so a run cannot reach
-                # past this one.
-                if len(run) >= self._config.compact_min_files:
-                    self._compact_run(run, heartbeat)
-
-                run = []
+        size = 0
+        for data_file in self._table.data_files():
+            if data_file.hi <= archived or data_file.size >= threshold:
+                # Final: already archived, or already the size it should be.
+                # Ends any run rather than joining it.
+                self._merge(run, heartbeat)
+                run, size = [], 0
                 continue
 
-            if data_file is not None and data_file.size < threshold:
-                run.append(data_file)
-                continue
+            if run and size + data_file.size > budget:
+                # Adjacency is in offset order, so closing here and starting a
+                # new run leaves both contiguous.
+                self._merge(run, heartbeat)
+                run, size = [], 0
 
-            if len(run) >= self._config.compact_min_files:
-                self._compact_run(run, heartbeat)
+            run.append(data_file)
+            size += data_file.size
 
-            run = []
+        self._merge(run, heartbeat)
+
+    def _merge(self, run: list[DataFile], heartbeat: Callable[[], bool] | None) -> None:
+        """Compact a run, if there is enough of it to be worth a rewrite."""
+        if len(run) >= self._config.compact_min_files:
+            self._compact_run(run, heartbeat)
 
     def _compact_run(
         self, run: list[DataFile], heartbeat: Callable[[], bool] | None = None

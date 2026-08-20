@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -47,11 +46,6 @@ _BEGIN = "BEGIN IMMEDIATE"
 _BUSY_TIMEOUT_MS = 30_000
 
 
-def _now() -> int:
-    """Unix seconds. Whole seconds because `max_age` is a coarse policy."""
-    return int(time.time())
-
-
 @dataclass(slots=True)
 class _Group:
     """The open `seal_group` row, while an append transaction fills it.
@@ -63,7 +57,6 @@ class _Group:
     group_id: int
     start_offset: int | None
     bytes: int
-    opened_at: int | None
 
 
 class Buffer:
@@ -288,8 +281,7 @@ class Buffer:
               group_id     INTEGER PRIMARY KEY AUTOINCREMENT,
               start_offset INTEGER,
               end_offset   INTEGER,
-              bytes        INTEGER NOT NULL DEFAULT 0,
-              opened_at    INTEGER
+              bytes        INTEGER NOT NULL DEFAULT 0
             )
         """)
         self._con.execute(
@@ -343,8 +335,8 @@ class Buffer:
         # inventing an age, and inventing an old one seals a stub file on every
         # restart, which is the failure §6 exists to clean up after.
         self._con.execute(
-            "INSERT INTO seal_group (start_offset, bytes, opened_at) VALUES (?, ?, ?)",
-            (start, self._measure_from(covered), None if start is None else _now()),
+            "INSERT INTO seal_group (start_offset, bytes) VALUES (?, ?)",
+            (start, self._measure_from(covered)),
         )
 
     def _measure_from(self, floor: int) -> int:
@@ -433,12 +425,7 @@ class Buffer:
                 offsets.append(offset)
 
                 if group.start_offset is None:
-                    # Stamped by the first row, not by the group's creation:
-                    # `max_age` measures how long data has waited, and a group
-                    # that sat empty for an hour would otherwise seal a one-row
-                    # file the moment it filled.
                     group.start_offset = offset
-                    group.opened_at = _now()
 
                 group.bytes += row_bytes(row)
                 if group.bytes >= target:
@@ -468,11 +455,11 @@ class Buffer:
     def _read_group(self, cursor: sqlite3.Cursor) -> _Group:
         """The open group, once per transaction rather than once per row."""
         row = cursor.execute(
-            "SELECT group_id, start_offset, bytes, opened_at FROM seal_group"
+            "SELECT group_id, start_offset, bytes FROM seal_group"
             " WHERE end_offset IS NULL"
         ).fetchone()
 
-        return _Group(int(row[0]), row[1], int(row[2]), row[3])
+        return _Group(int(row[0]), row[1], int(row[2]))
 
     def _cut(self, cursor: sqlite3.Cursor, group: _Group, offset: int) -> _Group:
         """Close the group at `offset` and open the next. Once per FILE.
@@ -486,7 +473,7 @@ class Buffer:
         self._write_group(cursor, group, end_offset=offset + 1)
         cursor.execute("INSERT INTO seal_group (bytes) VALUES (0)")
 
-        return _Group(int(cursor.lastrowid or 0), None, 0, None)
+        return _Group(int(cursor.lastrowid or 0), None, 0)
 
     def _write_group(
         self, cursor: sqlite3.Cursor, group: _Group, end_offset: int | None = None
@@ -497,12 +484,11 @@ class Buffer:
         just the running total being persisted for other processes to read.
         """
         cursor.execute(
-            "UPDATE seal_group SET start_offset = ?, bytes = ?, opened_at = ?,"
+            "UPDATE seal_group SET start_offset = ?, bytes = ?,"
             " end_offset = ? WHERE group_id = ?",
             (
                 group.start_offset,
                 group.bytes,
-                group.opened_at,
                 end_offset,
                 group.group_id,
             ),
@@ -743,19 +729,22 @@ class Buffer:
 
         return None if row[0] is None else int(row[0])
 
-    def close_open_group(self, cutoff: int | None = None) -> bool:
+    def close_open_group(self) -> bool:
         """Cut the open group short so a sealer can pick it up.
 
-        With `cutoff`, only if its first row landed at or before then. That is
-        `max_age` (§4), and it belongs to the sealer rather than the appender:
-        a quiet stream is one that is not appending, so the appender has no
-        moment at which to notice. Harmless to race — the predicate matches
-        nothing once another poller has closed it.
+        Only `seal()` calls this, and cutting short is exactly what "seal now"
+        means — the resulting file is under `target_size` by definition. It is
+        the one way this library writes an undersized file, and it takes a
+        deliberate call to do it.
 
-        Without one, unconditionally, which is what an explicit `seal()` means.
+        With `cutoff`, only if the group's first row landed at or before then.
+        That was `max_age`, which no longer exists; the parameter is kept
+        because the offline archive rewrite needs the same conditional cut.
+
         An empty group is never closed either way; there would be no file.
+        Harmless to race — the predicate matches nothing once another caller
+        has closed it.
         """
-        stale = "" if cutoff is None else " AND opened_at <= ?"
         # Asked before it is written. The sealer calls this on every poll, and
         # the answer is almost always "nothing to close" — issuing a write
         # transaction to discover that would put a commit and an fsync on a
@@ -763,8 +752,8 @@ class Buffer:
         with self._lock:
             if not self._con.execute(
                 "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
-                " AND start_offset IS NOT NULL" + stale,
-                () if cutoff is None else (cutoff,),
+                " AND start_offset IS NOT NULL",
+                (),
             ).fetchone():
                 return False
 
@@ -772,8 +761,8 @@ class Buffer:
             cursor = self._con.execute(
                 "UPDATE seal_group SET end_offset ="
                 ' (SELECT max("litelink_offset") + 1 FROM buffer)'
-                " WHERE end_offset IS NULL AND start_offset IS NOT NULL" + stale,
-                () if cutoff is None else (cutoff,),
+                " WHERE end_offset IS NULL AND start_offset IS NOT NULL",
+                (),
             )
             closed = bool(cursor.rowcount)
             if closed:

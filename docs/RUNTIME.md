@@ -254,6 +254,49 @@ query.
 
 ---
 
+## File sizing, and where undersized files are allowed to be
+
+`target_size` is the size a file should be, and the seal cut is exact — the appending
+transaction closes a group at the row that crosses it. Nothing else produces a file, so in
+normal operation **every file in the system is the size it was asked to be**, and the
+things that exist to repair sizing have nothing to repair.
+
+That holds only because there is no time-based seal. A timer sealing a quiet stream emits
+a small file every interval for ever, which is what compaction was built to clean up
+after — and it coupled RPO to file size, so shrinking the window to lose less data on a
+crash produced worse files. §3a names that trade; WAL replication is what breaks it, and
+freshness in the cloud is its job rather than the seal's.
+
+**One undersized file may exist, and only at the frontier.** The buffer's trailing rows
+have not reached `target_size` yet; they stay in SQLite, readable, until they do. Anything
+already written as a file is full.
+
+**Where compaction still earns its place.** An explicit `seal()` cuts short by definition,
+so a caller who wants the table to move now produces a small file. Four adjacent ones make
+a run worth merging. It is a no-op the rest of the time — measured at 19.3 ms over 216
+files, which is the cost of *asking* (`data_files()` opens every manifest) rather than of
+doing.
+
+**Sync holds back the trailing undersized files, and only those.** A small file in the
+middle can never grow: files are immutable and its neighbours are over the threshold, so
+compaction will not touch it. Stopping at the first one blocked the archive permanently —
+everything after it is newer, so the watermark never advanced, and I4 pinned local disk
+with it.
+
+So the archive can gain one small file per explicit seal. `rewrite_archive` is the tool
+for that, ad-hoc, and the same one that recompacts after a `target_size` change.
+
+**What would change this.** Compaction rewriting everything downstream of an undersized
+file would keep the archive perfect — merging `[0.1][8][8]` and splitting at the cap moves
+the remainder to the tail, where an undersized file is allowed to be. It is not done
+online because the rewrite window is everything unarchived, so the work is largest exactly
+when sync is furthest behind, and it charges a full rewrite for a rare deliberate act.
+
+That reasoning depends on `seal()` being exceptional. **If it turns out to be common in
+real use, small files will accumulate in the archive faster than anyone runs the offline
+tool, and this belongs online after all.** It is a threshold change rather than a redesign:
+the mechanism is the same, only the trigger moves.
+
 ## The concurrency contract
 
 What is safe, stated rather than inferred. Everything below is a promise; anything not

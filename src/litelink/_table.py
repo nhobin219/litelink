@@ -120,6 +120,15 @@ class LogTable:
         self._extent_at: str | None = None
         self._extent: tuple[int, int] | None = None
         self._counts_at: str | None = None
+        # The entry walk, cached against the same pointer. Manifest MERGING
+        # already collapses one manifest per commit into one for the table —
+        # measured at 216 data files in a single manifest — but that is the
+        # wrong axis: the cost is decoding one entry per data FILE, each
+        # carrying per-column statistics, and merging cannot reduce their
+        # number. Measured 14.4 ms at 216 files against 0.0 ms for the manifest
+        # list, and a `maintain` pass asks three times over.
+        self._files_at: str | None = None
+        self._files: list[DataFile] = []
         self._file_count = 0
         self._record_count = 0
 
@@ -275,6 +284,18 @@ class LogTable:
         opened — which is what makes the tier boundary cheap enough for §7 to
         derive it on every read.
         """
+        with self._lock:
+            location = self.metadata_location
+            if location == self._files_at:
+                return self._files
+
+            self._files = self._read_files()
+            self._files_at = location
+
+            return self._files
+
+    def _read_files(self) -> list[DataFile]:
+        """The entry walk itself. Cached by `data_files`."""
         if self.is_empty():
             return []
 

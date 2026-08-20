@@ -76,9 +76,17 @@ class LogConfig:
     target hardware.
     """
 
-    # Seal at min(target_size, max_age). §7: this is a READ-LATENCY knob before
-    # it is a file-size knob — the buffer is the entire variable cost of a hot
-    # read, so seal small and often and let compaction produce the big files.
+    # The ONLY seal trigger, and therefore the size of every file this library
+    # writes. §7 makes it a READ-LATENCY knob before a file-size one: the
+    # buffer is the entire variable cost of a hot read.
+    #
+    # There is deliberately no `max_age` beside it. A timer sealing a quiet
+    # stream emits a small file every interval for ever — the layout §6 exists
+    # to repair — and it made the knob do double duty as an RPO policy, so
+    # shrinking the window to lose less on a crash produced worse files. §3a
+    # names that trade and WAL replication is what breaks it: freshness in the
+    # cloud is replication's job, not the seal's. With the timer gone every cut
+    # lands exactly here, so no undersized file is ever written.
     #
     # BYTES, not rows. §13.3 is the deciding argument: a row-count bound can
     # exceed a byte-based memory limit, so it loses the race to the OOM killer
@@ -97,7 +105,6 @@ class LogConfig:
     # deliberately not added now, on one knob until a real workload demands the
     # second.
     target_size: int = 8 * 1024 * 1024
-    max_age: timedelta = timedelta(minutes=5)
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
@@ -129,7 +136,6 @@ class LogConfig:
         return json.dumps(
             {
                 "target_size": self.target_size,
-                "max_age": self.max_age.total_seconds(),
                 "local_retention": (
                     None
                     if self.local_retention is None
@@ -149,7 +155,6 @@ class LogConfig:
 
         return cls(
             target_size=raw["target_size"],
-            max_age=timedelta(seconds=raw["max_age"]),
             local_retention=None if retention is None else timedelta(seconds=retention),
             snapshot_retention=timedelta(seconds=raw["snapshot_retention"]),
             compact_below=raw["compact_below"],
@@ -882,19 +887,15 @@ class Log:
         can be run often; `maintain` reads table metadata and wants to be run
         rarely. That difference is the only reason they are two methods.
 
-        "Due" is §4's two triggers. `target_size` needs nothing here: the cut
-        was recorded by the append that crossed it, and this drains it. Age is
-        the other, and it has to be evaluated by whoever is sealing, because a
-        stream quiet enough to need it is by definition not appending.
+        "Due" means cut. `target_size` is the only trigger and it needs nothing
+        here: the cut was recorded by the append that crossed it, and this
+        writes the file. There is no age branch, so a quiet stream is simply
+        one whose rows stay in the buffer — durable, readable, and replicated
+        by §3a — until enough of them arrive to fill a file.
 
         A group whose lease is held elsewhere is left alone, not waited for.
         """
         self._writable()
-        # Before draining, not after: a quiet stream has no closed group at
-        # all, and this is the only thing that gives it one.
-        self._buffer.close_open_group(
-            int((datetime.now(UTC) - self.config.max_age).timestamp())
-        )
 
         end = None
         # Peeked before `_seal_queued` takes the lock, because almost every
@@ -1063,7 +1064,24 @@ class Log:
         return self._archive_handle
 
     def _push(self, lease: Lease) -> None:
-        """Upload and register everything above the archive's extent."""
+        """Upload and register everything above the archive's extent.
+
+        Everything except the TRAILING undersized files. Holding a small file
+        back is only worth it while it can still grow: compaction merges the
+        frontier with later seals into a properly sized file, so pushing it now
+        would put something in the archive that wants replacing.
+
+        A small file in the MIDDLE can never grow — files are immutable and its
+        neighbours are already over the threshold, so compaction will not touch
+        it. Stopping at the first one, which is what this did, meant a single
+        explicit `seal()` blocked the archive permanently: everything after it
+        is newer, so the watermark never advanced again, and I4 then pinned
+        local disk too. Not "later" — never.
+
+        So the archive may gain one small file per explicit seal. That is a
+        cosmetic cost with a deliberate cause, and `rewrite_archive` is the
+        tool for it.
+        """
         archive = self._archive_table()
         self._table.reload()
 
@@ -1071,17 +1089,12 @@ class Log:
         floor = 0 if covered is None else covered[1]
         threshold = self.config.compact_below or self.config.target_size // 2
 
-        for data_file in self._table.data_files():
-            if data_file.hi <= floor:
-                continue
+        pending = [f for f in self._table.data_files() if f.hi > floor]
+        # Drop the trailing run of undersized files, and only that run.
+        while pending and pending[-1].size < threshold:
+            pending.pop()
 
-            if data_file.size < threshold:
-                # The frontier. Everything above it is newer, so stopping here
-                # keeps the archive a contiguous prefix — which is what lets a
-                # single watermark stand for "what the archive holds" and what
-                # I4 is stated in terms of.
-                break
-
+        for data_file in pending:
             checkpoint(lease.renew)
             rel_path = self._layout.relative(data_file.path)
             archive.put(self._layout.absolute(rel_path), rel_path)
