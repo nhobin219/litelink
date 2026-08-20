@@ -300,6 +300,30 @@ def test_the_read_cache_is_bounded_by_the_unsealed_tail(tmp_path: Path) -> None:
     assert log._buffer._tail is None, "close left the cache holding rows"
 
 
+def test_the_read_cache_never_hides_rows_a_seal_raced_past(tmp_path: Path) -> None:
+    """The boundary and the first buffered row are not the same number.
+
+    A reader resolves the tier boundary, then reads the buffer above it. A seal
+    landing between those two steps deletes the rows in between, so the cache
+    gets built from a boundary lower than its own first row. Recording the
+    boundary as though it were the row before the first made the slice
+    arithmetic count from a row that no longer existed — and an over-long Arrow
+    slice comes back EMPTY rather than raising, so the miscount was returned as
+    "nothing buffered" and every row above the boundary vanished from queries.
+    """
+    with open_log(tmp_path, quiet()) as log:
+        buffer = log._buffer
+        buffer.append(rows(300))
+        buffer.finish_seal(201)  # a seal committed and dropped offsets 1..200
+
+        # A reader whose boundary was still 100 when it looked.
+        assert buffer.rows_above(100).num_rows == 100
+
+        # The next query, with the boundary caught up.
+        assert buffer.rows_above(200).num_rows == buffer._rows("> ?", (200,)).num_rows
+        assert buffer.rows_above(200).num_rows == 100, "the cache hid buffered rows"
+
+
 def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> None:
     """Regression: DuckDB must not open the buffer database itself.
 
