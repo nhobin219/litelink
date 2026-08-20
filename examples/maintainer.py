@@ -15,6 +15,12 @@ the appending one through the GIL even while holding no lock. Appends measured
 45.2 ms behind an in-process seal. A separate process does not share the GIL,
 and the `lease` table is what makes handing the role over safe.
 
+Both are plain methods called on this loop's own schedule — `seal_due` often,
+because it is an indexed read of one row when there is nothing to do, and
+`maintain` rarely, because it reads table metadata. The library owns neither
+the thread nor the interval; it has no business deciding how often your
+storage process wakes up.
+
 **Why sealing is not its own process.** It is the same kind of work as the
 rest: off the hot path, writing to the same Iceberg table, not
 latency-critical the way an append is. Sharing a GIL with compaction costs
@@ -36,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import threading
 import time
 from pathlib import Path
 
@@ -48,6 +53,7 @@ from litelink import Log
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
+    parser.add_argument("--seal-every", type=float, default=0.25, help="seconds")
     parser.add_argument("--maintain-every", type=float, default=10.0, help="seconds")
     args = parser.parse_args()
 
@@ -63,31 +69,35 @@ def main() -> None:
     log = Log.open(args.root, NAME)
 
     print(f"maintaining {NAME} in {args.root} — pid {os.getpid()}")
-    print(f"sealing continuously, maintaining every {args.maintain_every:.0f}s")
+    print(
+        f"sealing every {args.seal_every:.2f}s, maintaining every "
+        f"{args.maintain_every:.0f}s"
+    )
     print("run alongside `just demo-capture`. Ctrl-C to hand the leases back.\n")
 
-    stop = threading.Event()
-    # The seal loop blocks, so it takes the thread and the rest takes the main
-    # loop. Which way round does not matter; both are this one role's work.
-    sealer = threading.Thread(target=log.run_sealer, args=(stop,), daemon=True)
-    sealer.start()
-
+    # One thread, one loop, two calls at two cadences. Nothing here is a
+    # daemon, nothing is signalled, and stopping is just leaving the loop.
+    due = 0.0
     try:
-        while not stop.wait(args.maintain_every):
-            _maintain(log, args.root)
+        while True:
+            log.seal_due()
+            due += args.seal_every
+            if due >= args.maintain_every:
+                due = 0.0
+                _maintain(log, args.root)
+
+            time.sleep(args.seal_every)
     except KeyboardInterrupt:
         print("\nreleasing the seal and maintain leases")
     finally:
-        stop.set()
-        sealer.join(timeout=30)
-        # Raises anything the sealing thread recorded — it has no caller of its
-        # own to raise to, so this is where a failed seal surfaces.
         log.close()
 
 
 def _maintain(log: Log, root: Path) -> None:
     started = time.monotonic()
     try:
+        # Seals too — sealing is maintenance. The loop calls `seal_due`
+        # separately only because it is cheap enough to run far more often.
         log.maintain()
     except RuntimeError as exc:
         # Another process holds the maintain lease. Not worth dying over: it

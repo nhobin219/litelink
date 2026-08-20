@@ -10,9 +10,10 @@ into Parquet, then compacting, evicting and expiring what that produces.
 Sealing is maintenance, not a third role — it is the first thing done with what
 this process leaves behind.
 
-`seal_mode="none"`, with no option to change it, because there is nothing to
-decide: this process appends. Run it alone and the rows stay in SQLite, durable
-and readable — `scan()` unions the buffer with the table, so a reader sees them
+Nothing here seals, and there is no setting that would make it. Appending
+records where the next file should be cut and stops; writing that file is the
+maintainer's job. Run this alone and the rows stay in SQLite, durable and
+readable — `scan()` unions the buffer with the table, so a reader sees them
 whether or not anything has sealed yet. They reach Parquet when the maintainer
 starts, at exactly the cuts recorded while it was not running. Only the buffer
 grows in the meantime, which is worth seeing.
@@ -54,7 +55,6 @@ def main() -> None:
         # than the target would sit in SQLite indefinitely. Read by whoever
         # holds the seal lease, which is never this process.
         max_age=timedelta(seconds=15),
-        seal_mode="none",
     )
 
     # new() creates and takes the shape; open() recovers it. A service that
