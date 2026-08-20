@@ -59,11 +59,14 @@ def main() -> None:
 
     # new() creates and takes the shape; open() recovers it. A service that
     # restarts wants the second, and must not fail because the log is already
-    # there — so the choice is made by whether it exists.
-    if (args.root / "catalog.db").exists():
+    # there — so the choice is made by whether open() finds one. Asked of the
+    # library rather than of the filesystem: which file proves a log exists is
+    # the library's business, and an example that checked for it itself would
+    # be wrong the day that changes.
+    try:
         log = Log.open(args.root, NAME)
         log.set_config(config)
-    else:
+    except FileNotFoundError:
         log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
 
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")

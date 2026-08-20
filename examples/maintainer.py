@@ -57,16 +57,17 @@ def main() -> None:
     parser.add_argument("--maintain-every", type=float, default=10.0, help="seconds")
     args = parser.parse_args()
 
-    if not (args.root / "catalog.db").exists():
-        raise SystemExit(
-            f"no log at {args.root} — start `just demo-capture` first, "
-            "which is what creates it"
-        )
-
     # open(), never new(): the shape, the sort order and the config all come
     # from the log itself. A maintainer that restated them could disagree with
     # the writer, and the log is the one that is right.
-    log = Log.open(args.root, NAME)
+    #
+    # No "does it exist" check either — open() already refuses a missing log,
+    # and repeating that here would mean an example knowing which file to look
+    # for, which is the library's business and not the caller's.
+    try:
+        log = Log.open(args.root, NAME)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 
     print(f"maintaining {NAME} in {args.root} — pid {os.getpid()}")
     print(

@@ -7,6 +7,7 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -80,6 +81,16 @@ class LogTable:
     def __init__(self, catalog: SqlCatalog, layout: Layout) -> None:
         self._catalog = catalog
         self._layout = layout
+        # Guards the handle below and the caches keyed off it — NOT the work
+        # done with them. A compaction reads files, writes Parquet and commits;
+        # only the commit and the cache reads belong in here. Holding it across
+        # the whole pass is what made a read wait 21.5 s behind one.
+        #
+        # Safe to hold so briefly because a pyiceberg table is an immutable
+        # view of one snapshot: a caller that took the handle keeps working
+        # against the snapshot it read, and `reload` only changes which
+        # snapshot the NEXT caller sees.
+        self._lock = threading.RLock()
         self._table = catalog.load_table(layout.table_id)
         # Snapshot-derived facts, cached against the metadata pointer. See
         # `extent`. The file count rides along because reading the manifests
@@ -168,7 +179,9 @@ class LogTable:
     # -- state ------------------------------------------------------------
 
     def reload(self) -> None:
-        self._table = self._catalog.load_table(self._layout.table_id)
+        table = self._catalog.load_table(self._layout.table_id)
+        with self._lock:
+            self._table = table
 
     @property
     def metadata_location(self) -> str:
@@ -237,9 +250,10 @@ class LogTable:
         entirely redundant, and on a read-heavy log it was nearly all of the
         per-query overhead.
         """
-        self._refresh()
+        with self._lock:
+            self._refresh()
 
-        return self._extent
+            return self._extent
 
     def file_count(self) -> int:
         """How many data files the current snapshot holds.
@@ -248,9 +262,10 @@ class LogTable:
         one file rather than opening every manifest. Measured at 60 files:
         0.65 ms against 42.9 ms for the entry walk.
         """
-        self._refresh_counts()
+        with self._lock:
+            self._refresh_counts()
 
-        return self._file_count
+            return self._file_count
 
     def record_count(self) -> int:
         """How many rows the current snapshot holds.
@@ -259,9 +274,10 @@ class LogTable:
         the offset column out of every Parquet file — correct, and proportional
         to the data, which is the wrong shape for anything polling.
         """
-        self._refresh_counts()
+        with self._lock:
+            self._refresh_counts()
 
-        return self._record_count
+            return self._record_count
 
     def _refresh_counts(self) -> None:
         location = self.metadata_location
@@ -411,7 +427,8 @@ class LogTable:
         """
         for attempt in range(_COMMIT_ATTEMPTS):
             try:
-                operation()
+                with self._lock:
+                    operation()
             except CommitFailedException:
                 if attempt == _COMMIT_ATTEMPTS - 1:
                     raise
