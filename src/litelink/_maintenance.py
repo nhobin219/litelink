@@ -33,6 +33,18 @@ if TYPE_CHECKING:
     from litelink.log import LogConfig
 
 
+def _checkpoint(heartbeat: Callable[[], bool] | None) -> None:
+    """Renew the caller's claim, or refuse to carry on without it.
+
+    Losing the role mid-pass is not something to push through: another owner
+    is already redoing this work, and two of them writing the same table is
+    what the lease exists to prevent.
+    """
+    if heartbeat is not None and not heartbeat():
+        msg = "lost the maintenance lease mid-pass"
+        raise RuntimeError(msg)
+
+
 class Maintenance:
     """The reclamation passes for one log."""
 
@@ -72,15 +84,16 @@ class Maintenance:
         phase that runs long enough to matter is a reason to raise the TTL, not
         to check more often.
         """
-        for phase in (self.compact, self.evict, self.expire):
-            phase()
-            if heartbeat is not None and not heartbeat():
-                msg = "lost the maintenance lease mid-pass"
-                raise RuntimeError(msg)
+        self.compact(heartbeat)
+        _checkpoint(heartbeat)
+        self.evict()
+        _checkpoint(heartbeat)
+        self.expire()
+        _checkpoint(heartbeat)
 
     # -- compaction ---------------------------------------------------------
 
-    def compact(self) -> None:
+    def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Merge runs of undersized adjacent files (§6).
 
         Required, not opportunistic: the `max_age` seal branch guarantees a
@@ -103,11 +116,13 @@ class Maintenance:
                 continue
 
             if len(run) >= self._config.compact_min_files:
-                self._compact_run(run)
+                self._compact_run(run, heartbeat)
 
             run = []
 
-    def _compact_run(self, run: list[DataFile]) -> None:
+    def _compact_run(
+        self, run: list[DataFile], heartbeat: Callable[[], bool] | None = None
+    ) -> None:
         lo, hi = run[0].lo, run[-1].hi
         # Unique per attempt. See `compaction_path`: a fixed name made a
         # rewrite of a previous compaction write over the file it was reading.
@@ -117,10 +132,15 @@ class Maintenance:
         # recoverable by name, instead of being a file nobody can identify
         # without listing the directory.
         self._buffer.claim_compaction(lo, hi, rel_path)
-        self._write_merge(run, rel_path)
+        self._write_merge(run, rel_path, heartbeat)
         self._buffer.clear_compaction()
 
-    def _write_merge(self, run: list[DataFile], rel_path: str) -> None:
+    def _write_merge(
+        self,
+        run: list[DataFile],
+        rel_path: str,
+        heartbeat: Callable[[], bool] | None = None,
+    ) -> None:
         lo, hi = run[0].lo, run[-1].hi
         merged = self._table.scan_range(lo, hi)
         if self._sort_by:
@@ -135,6 +155,13 @@ class Maintenance:
         dest.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(merged, dest)
         fsync(dest)
+
+        # Checked between writing and committing, because those are the two
+        # halves a lapsed lease separates. A run outlasting the TTL lets
+        # another owner recover — unlinking the output this claimed — and the
+        # commit would then land anyway, leaving the table pointing at a file
+        # that no longer exists while the sources it superseded drain away.
+        _checkpoint(heartbeat)
 
         self._table.replace_range(lo, hi, str(dest))
         # Superseded, not yet deletable: a scan that started before this commit
@@ -159,9 +186,7 @@ class Maintenance:
         # because a pass here has no phases to sit between.
         for data_file in self._table.data_files():
             self._compact_run([data_file])
-            if heartbeat is not None and not heartbeat():
-                msg = "lost the maintenance lease mid-rewrite"
-                raise RuntimeError(msg)
+            _checkpoint(heartbeat)
 
     # -- eviction -----------------------------------------------------------
 

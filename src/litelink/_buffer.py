@@ -139,13 +139,17 @@ class Buffer:
             self._con.execute(_BEGIN)
             try:
                 yield
+                # Inside the guard, not after it. A COMMIT can fail on its own
+                # — a full disk, an I/O error — and leaving that unguarded put
+                # the connection back in the state this helper exists to
+                # prevent, with the lock released and the next statement any
+                # thread issues joining a transaction nobody owns.
+                self._con.execute("COMMIT")
             except BaseException:
                 with contextlib.suppress(sqlite3.OperationalError):
                     self._con.execute("ROLLBACK")
 
                 raise
-
-            self._con.execute("COMMIT")
 
     def set_target_size(self, target_size: int) -> None:
         """Adopt a new cut size in place, rather than being rebuilt around it.
