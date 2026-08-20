@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from datetime import date
+    pass
 
 NAMESPACE = "litelink"
 
@@ -72,12 +72,8 @@ class Layout:
         """
         return (self.root / self.name, self.root / f"{NAMESPACE}.db" / self.name)
 
-    def seal_path(self, start: int, end: int, day: date, token: str) -> str:
+    def seal_path(self, start: int, end: int, token: str) -> str:
         """Root-relative path for a seal covering `[start, end)` (§4).
-
-        The date is passed in rather than read from the clock, so the caller
-        that persists this path is the one that chose it. Recomputing it later
-        could land in a different day's directory and strand the first file.
 
         `token` makes it unique per ATTEMPT, not per range. The name was once
         derived from the range alone, on the reasoning that a retry should
@@ -91,8 +87,16 @@ class Layout:
         Unique names alone would trade that for an untracked file, which is
         worse. They come with the rule that a superseded attempt is queued in
         `pending_delete` before its claim is replaced — see `_recover_seal`.
+
+        No date directory. Seals used to be grouped by the day they were
+        written, which nothing read: the table is unpartitioned, Iceberg finds
+        files by the path in its manifests, and no code here ever lists a
+        directory — that refusal is the whole reason `pending_delete` exists.
+        What the grouping did produce was a way to strand a file, by
+        recomputing a path across midnight and landing somewhere else.
+        Compaction outputs were never dated, which is the tell.
         """
-        return f"{self.name}/data/{day.isoformat()}/{start}-{end}-{token}.parquet"
+        return f"{self.name}/data/{start}-{end}-{token}.parquet"
 
     def compaction_path(self, lo: int, hi: int, token: str) -> str:
         """Root-relative path for the merge of the offset range `[lo, hi]` (§6).

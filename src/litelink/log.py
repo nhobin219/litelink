@@ -743,9 +743,7 @@ class Log:
 
             return end
 
-        rel_path = self._layout.seal_path(
-            start, end, datetime.now(UTC).date(), uuid.uuid4().hex[:8]
-        )
+        rel_path = self._layout.seal_path(start, end, uuid.uuid4().hex[:8])
         # I2: the range and its path are fixed BEFORE the file exists, so a
         # retry recomputes nothing and overwrites in place rather than
         # stranding the first attempt under a different name.
@@ -927,9 +925,7 @@ class Log:
         # queue entry is a file this database can no longer name, which is the
         # one thing §12 refuses — worse than the collision it fixes.
         self._buffer.enqueue_deletions([rel_path], int(datetime.now(UTC).timestamp()))
-        retry = self._layout.seal_path(
-            start, end, datetime.now(UTC).date(), uuid.uuid4().hex[:8]
-        )
+        retry = self._layout.seal_path(start, end, uuid.uuid4().hex[:8])
         self._buffer.claim_seal(start, end, retry)
         self._write_and_commit(end, retry)
         self._buffer.finish_seal(end)

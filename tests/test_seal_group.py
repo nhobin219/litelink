@@ -225,7 +225,7 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
 
         assert group is not None
         start, end = group
-        path = log._layout.seal_path(start, end, _today(), "tok")
+        path = log._layout.seal_path(start, end, "tok")
         log._buffer.claim_seal(start, end, path)
         log._write_and_commit(end, path)
 
@@ -438,7 +438,7 @@ def test_a_retried_seal_takes_a_new_name_and_queues_the_old(tmp_path: Path) -> N
         start, end = group
 
         # An attempt that claimed a name and never committed.
-        abandoned = log._layout.seal_path(start, end, _today(), "stalled")
+        abandoned = log._layout.seal_path(start, end, "stalled")
         log._buffer.claim_seal(start, end, abandoned)
         log._layout.absolute(abandoned).parent.mkdir(parents=True, exist_ok=True)
         log._layout.absolute(abandoned).write_bytes(b"half a parquet file")
