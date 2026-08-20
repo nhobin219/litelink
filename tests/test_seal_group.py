@@ -359,7 +359,10 @@ def test_the_read_cache_never_hides_rows_a_seal_raced_past(tmp_path: Path) -> No
     with open_log(tmp_path, quiet()) as log:
         buffer = log._buffer
         buffer.append(rows(300))
-        buffer.finish_seal(201)  # a seal committed and dropped offsets 1..200
+        # A seal committed and dropped offsets 1..200. Claimed first, because
+        # `finish_seal` only clears the claim it is given.
+        buffer.claim_seal(1, 201, "sealed")
+        buffer.finish_seal(201, "sealed")
 
         # A reader whose boundary was still 100 when it looked.
         assert buffer.rows_above(100).num_rows == 100

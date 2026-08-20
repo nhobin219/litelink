@@ -334,3 +334,54 @@ def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
         log.set_sort_by(("key", "event_ts"), rewrite=True)
 
         assert log._sort_by == ("key", "event_ts")
+
+
+def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
+    tmp_path: Path,
+) -> None:
+    """A stalled writer wakes believing it still owns the seal. It does not.
+
+    Unique per-attempt names removed an accidental fence: under the old shared
+    name, a lapsed writer's `register` failed with "already referenced by
+    table". With its own name it succeeds, and the range lands in the table
+    TWICE — silent duplicate rows, which is worse than the torn file the
+    unique names were introduced to prevent.
+
+    Two guards replace that accident. The commit is fenced on the lease, and
+    the file is queued for deletion when the fence rejects it so that it stays
+    nameable. And `finish_seal` clears only the claim it is given, so a lapsed
+    writer cannot wipe the record its successor is working under.
+    """
+    config = LogConfig(target_size=1 << 30)
+    with open_log(tmp_path, config=config) as log:
+        log.extend(rows(40))
+        log._buffer.close_open_group()
+        group = log._buffer.pending_group()
+
+        assert group is not None
+        start, end = group
+        path = log._layout.seal_path(start, end, "lapsed")
+        log._buffer.claim_seal(start, end, path)
+
+        # A lease this writer no longer holds.
+        lapsed = log._buffer.lease("seal", new_owner(), ttl_ms=1)
+
+        assert lapsed.acquire()
+        time.sleep(0.05)
+        stolen = Lease(log._buffer._con, log._buffer._lock, "seal", new_owner())
+
+        assert stolen.acquire(), "could not simulate the takeover"
+
+        with pytest.raises(RuntimeError, match="lost the seal lease"):
+            log._write_and_commit(end, path, lapsed)
+
+        assert log.table_files() == 0, "a lapsed writer committed anyway"
+        assert path in log._buffer.queued_deletions(), (
+            "its file is on disk and reachable from nothing"
+        )
+
+        # And it cannot clear a claim that is no longer its own.
+        log._buffer.claim_seal(start, end, "someone-elses")
+
+        assert not log._buffer.finish_seal(end, path), "wiped a successor's claim"
+        assert log._buffer.pending_seal() is not None

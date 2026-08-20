@@ -326,12 +326,25 @@ and the owner that took the role over both wrote that one name, and `pq.write_ta
 truncates on open, so the file became a blend of two writers with one of them committing
 it.
 
-Unique names on their own would trade a torn file for a worse thing: one this database
-cannot name. So they come with a rule — **the abandoned attempt is queued in
-`pending_delete` before its claim is replaced.** That ordering is the whole of it. Every
-file on disk stays reachable from SQLite, a stalled writer's output becomes an ordinary
-tracked orphan, and no reclamation path ever needs a directory scan. Compaction outputs
-carry a per-attempt token for the same reason.
+Unique names on their own would trade a torn file for two worse things, and both need
+answering.
+
+**One this database cannot name.** So the abandoned attempt is queued in
+`pending_delete` *before* its claim is replaced, and a writer whose commit is refused
+queues its own file before raising. Every file on disk stays reachable from SQLite, a
+stalled writer's output becomes an ordinary tracked orphan, and no reclamation path ever
+needs a directory scan. Compaction outputs carry a per-attempt token for the same reason.
+
+**Two copies of the same rows.** The shared name used to make a lapsed writer's commit
+fail — pyiceberg refuses a file already referenced — which was an accidental fence, and
+unique names remove it: the commit now *succeeds*, and the range is in the table twice.
+Silent duplicate rows are worse than the torn file this was meant to fix. So the commit
+is fenced explicitly on the lease, immediately before it, and `finish_seal` clears only
+the claim it is handed so a lapsed writer cannot wipe its successor's record.
+
+A window of milliseconds remains between that check and the commit. It cannot be closed
+from here — Iceberg's compare-and-swap knows nothing of our lease — and it sits against a
+30 s TTL that a writer must already have blown through.
 
 **Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
 {`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
