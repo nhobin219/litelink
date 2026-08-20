@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     import pyarrow as pa
 
@@ -56,10 +56,26 @@ class Maintenance:
     def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
         self._sort_by = sort_by
 
-    def run(self) -> None:
-        self.compact()
-        self.evict()
-        self.expire()
+    def run(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """The three passes, with a checkpoint between them.
+
+        `heartbeat` renews the caller's claim and reports whether it still
+        holds it. A pass is long — a compaction of 540 files measured 20 s
+        against a 30 s lease — so without one, a second maintainer can take the
+        role mid-pass and start compacting the same runs. Both would write the
+        same deterministic output path, which is a torn file rather than a
+        conflict Iceberg could resolve.
+
+        Between phases rather than inside them: it bounds the exposure to a
+        single phase without threading a callback through every loop, and a
+        phase that runs long enough to matter is a reason to raise the TTL, not
+        to check more often.
+        """
+        for phase in (self.compact, self.evict, self.expire):
+            phase()
+            if heartbeat is not None and not heartbeat():
+                msg = "lost the maintenance lease mid-pass"
+                raise RuntimeError(msg)
 
     # -- compaction ---------------------------------------------------------
 

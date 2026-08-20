@@ -52,9 +52,10 @@ if TYPE_CHECKING:
 OFFSET = "litelink_offset"
 
 # The two operations whose ownership must survive the process holding it (§13.6).
-# How often `await_seal` re-asks. Short because it is only ever reached by a
-# caller that has chosen to block, and long enough not to spin.
-_IDLE_POLL = 0.005
+# How often `await_seal` re-asks. Each round attempts a drain, and taking the
+# lease is a write, so this is slower than a pure poll would need to be —
+# 20 attempts a second while a caller is blocked, and none otherwise.
+_AWAIT_POLL = 0.05
 
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
@@ -332,9 +333,10 @@ class Log:
         table = LogTable.load(layout, readonly=read_only)
         schema = _declared_schema(layout, application_schema(table.arrow_schema()))
 
-        # Read before the buffer is built, not through it: the buffer needs
-        # `target_size` to size the groups it cuts, so the config has to be in
-        # hand before the collaborator that consumes it exists.
+        # Read through a throwaway connection, like the schema above it,
+        # because the buffer needs `target_size` before it can size the groups
+        # it cuts and the value lives in the buffer's own database. A wart:
+        # policy is stored inside the thing that consumes it.
         #
         # Required, not defaulted, for the same reason as the schema: new()
         # always writes it, so its absence is a damaged log rather than an
@@ -390,6 +392,10 @@ class Log:
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
             self.config = config
             self._maintenance.set_config(config)
+            # The buffer too, or `target_size` changes everywhere except where
+            # the cut is actually made and the log quietly keeps sizing files
+            # to the value it was opened with.
+            self._buffer.set_target_size(config.target_size)
 
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5)."""
@@ -697,6 +703,24 @@ class Log:
             return None
 
         start, end = group
+        # A claim already naming this range means a previous attempt got at
+        # least as far as recording it and then died — possibly AFTER its
+        # commit landed. Replaying blindly re-registers a file the table
+        # already holds, pyiceberg refuses it, `finish_seal` never runs, and
+        # the group stays at the head of the queue failing forever. Sealing
+        # wedges and the buffer grows without bound.
+        #
+        # `_recover_seal` is exactly the idempotent version — commit only if
+        # the file is absent, retire the group either way — so a replay goes
+        # through it. Detected with a keyed read rather than by asking the
+        # table, which would walk manifests on every ordinary seal to learn
+        # something only a replay needs to know.
+        claimed = self._buffer.pending_seal()
+        if claimed is not None and claimed[1] == end:
+            self._recover_seal()
+
+            return end
+
         rel_path = self._layout.seal_path(start, end, datetime.now(UTC).date())
         # I2: the range and its path are fixed BEFORE the file exists, so a
         # retry recomputes nothing and overwrites in place rather than
@@ -714,14 +738,20 @@ class Log:
     def await_seal(self, timeout: float | None = None) -> bool:
         """Block until the queue is drained and no seal is in flight.
 
-        A background seal means `extend` can return before the rows it queued
-        are in the table. Nothing about correctness needs this — the rows are
-        durable and readable throughout — but a caller that wants to observe
-        the table afterwards does.
+        A caller that wants to observe the table needs this: nothing about
+        correctness does — the rows are durable and readable throughout — but
+        `seal` promises the cut, not that the file has been written.
 
         Asks the two tables rather than an Event, so it is also true across
         processes: a queued group and an in-flight `sealing` claim are both
         durable state, and an Event is neither.
+
+        **Helps rather than only waits.** Each round it tries to drain the
+        queue itself, which does nothing while another owner holds the lease —
+        and everything once that owner dies and its lease lapses. Purely
+        watching would hang until the timeout, or forever without one, over
+        work no survivor was going to do. A readonly log has no such option and
+        can only wait.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -730,10 +760,13 @@ class Log:
             ):
                 return True
 
+            if not self.readonly:
+                self._seal_queued()
+
             if deadline is not None and time.monotonic() >= deadline:
                 return False
 
-            time.sleep(_IDLE_POLL)
+            time.sleep(_AWAIT_POLL)
 
     def _write_and_commit(self, end: int, rel_path: str) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
@@ -916,7 +949,13 @@ class Log:
             raise RuntimeError(msg)
 
         try:
-            self._maintenance.run()
+            # Renewed between passes, not merely held. A compaction can run for
+            # tens of seconds against a 30 s lease, and a second maintainer
+            # taking the role mid-pass would compact the same runs to the same
+            # deterministic path — a torn file, not a conflict Iceberg can
+            # resolve. Losing it is a hard error rather than something to plough
+            # on through.
+            self._maintenance.run(heartbeat=lease.renew)
         finally:
             lease.release()
 

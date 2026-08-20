@@ -434,3 +434,23 @@ def test_an_interrupt_inside_commit_is_not_masked(tmp_path: Path) -> None:
 
         # The COMMIT did land, so the row is durable despite the raise.
         assert len(read_all(log)) == 1
+
+
+def test_set_config_reaches_the_thing_that_makes_the_cut(tmp_path: Path) -> None:
+    """§12 says policy can change under a running log. All of it, not most.
+
+    `target_size` decides where the appender cuts, and the appender is the
+    buffer — so a config update that stopped at `Log` left the log sizing
+    files to whatever it was opened with, silently and for its whole life.
+    """
+    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+        log.extend(rows(40))
+
+        assert log._buffer.pending_group() is None, "nothing should have crossed"
+
+        log.set_config(LogConfig(target_size=512))
+        log.extend(rows(40, start=40))
+
+        assert log._buffer.pending_group() is not None, (
+            "the new target_size never reached the buffer"
+        )
