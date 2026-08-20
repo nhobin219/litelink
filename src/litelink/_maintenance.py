@@ -104,6 +104,14 @@ class Maintenance:
         contiguous, non-overlapping ranges, so the range filter selects exactly
         the sources and nothing else.
         """
+        # Reloaded first, like every other pass. A handle predating another
+        # owner's eviction still lists the files it removed — they are unlinked
+        # only after the grace period, so they are readable — and merging them
+        # re-adds the rows. `_commit` makes that land: its first attempt fails
+        # against the moved branch, then it reloads and retries the swap on the
+        # FRESH table, committing evicted data back into the log.
+        self._table.reload()
+
         threshold = self._config.compact_below or self._config.target_size // 2
 
         run: list[DataFile] = []
@@ -202,6 +210,10 @@ class Maintenance:
         retention = self._config.local_retention
         if retention is None:
             return
+
+        # Same reason as `compact`: this decides what to drop from the ages a
+        # handle reports, and a stale one reports a table that has moved.
+        self._table.reload()
 
         cutoff = datetime.now(UTC) - retention
         expired = {
