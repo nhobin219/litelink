@@ -13,10 +13,15 @@ The writer appends; the maintainer does the rest. Sealing is maintenance, not a 
 role — it is the first thing done with what the writer leaves behind. (A reader is not a
 role: any number may open the log `read_only`, holding and mutating nothing.)
 
-`demo-capture` alone is enough to see something — it seals on a background thread until a
-maintainer appears. Start `demo-maintain` and that thread begins losing the lease
-immediately: no restart, no flag, no coordination between them. Stop it and the writer
-takes the role back once the lease lapses. Nothing decides this but the `lease` table.
+`demo-capture` seals nothing at all, and that is the point of running it alone first:
+`demo-tail` shows every row in the buffer and none in the table. They are durable and
+readable the whole time — `scan()` unions the buffer with the table — so nothing is lost
+by starting the maintainer late. Start it and the rows move into Parquet at exactly the
+cuts recorded while it was not running.
+
+Nothing coordinates that but the `lease` table. The writer holds no lease and never
+tries; the maintainer takes both when it starts, and if it dies they lapse and the next
+one takes over.
 
 ```
 just demo-clean        # delete the captured data when you are done

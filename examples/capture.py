@@ -1,7 +1,6 @@
 """The writer: append, and nothing else.
 
     uv run python examples/capture.py [--root DIR] [--rate ROWS_PER_SECOND]
-    uv run python examples/capture.py --no-seal    # alongside examples/maintainer.py
 
 One thread appending, and every append durable when `extend()` returns — there
 is no in-memory buffer to flush, which is the failure the README opens with.
@@ -11,11 +10,12 @@ into Parquet, then compacting, evicting and expiring what that produces.
 Sealing is maintenance, not a third role — it is the first thing done with what
 this process leaves behind.
 
-By default this still seals on a background thread, so the demo does something
-on its own. Start `examples/maintainer.py` and that thread begins losing the lease
-immediately — no restart here, no flag, no coordination. `--no-seal` skips
-starting a thread that would only lose, which is what a real deployment wants
-once it runs a dedicated sealer.
+`seal_mode="none"`, with no option to change it, because there is nothing to
+decide: this process appends. Run it alone and the rows stay in SQLite, durable
+and readable — `scan()` unions the buffer with the table, so a reader sees them
+whether or not anything has sealed yet. They reach Parquet when the maintainer
+starts, at exactly the cuts recorded while it was not running. Only the buffer
+grows in the meantime, which is worth seeing.
 
 Ctrl-C to stop. Nothing committed is lost, and nothing queued is either: a cut
 that has been recorded but not yet sealed is picked up by whoever opens the log
@@ -40,11 +40,6 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
     parser.add_argument("--rate", type=float, default=2000.0, help="reports per second")
     parser.add_argument("--batch", type=int, default=20, help="rows per transaction")
-    parser.add_argument(
-        "--no-seal",
-        action="store_true",
-        help="do not seal here; run examples/maintainer.py instead",
-    )
     args = parser.parse_args()
 
     # Deliberately small for a demo: seal often so the reader sees the table
@@ -56,9 +51,10 @@ def main() -> None:
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
         # Seal a quiet stream on a timer as well as by size, or a feed slower
-        # than the target would sit in SQLite indefinitely.
+        # than the target would sit in SQLite indefinitely. Read by whoever
+        # holds the seal lease, which is never this process.
         max_age=timedelta(seconds=15),
-        seal_mode="none" if args.no_seal else "background",
+        seal_mode="none",
     )
 
     # new() creates and takes the shape; open() recovers it. A service that
@@ -71,12 +67,9 @@ def main() -> None:
         log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
 
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
-    if args.no_seal:
-        print("not sealing here — run `just demo-maintain`")
-    else:
-        print("sealing on a background thread until `just demo-maintain` takes over")
-
-    print("`just demo-maintain` seals and reclaims disk; `just demo-tail` watches.\n")
+    print("appending only — `just demo-maintain` seals and reclaims disk")
+    print("`just demo-tail` watches. Until a maintainer runs, rows stay buffered")
+    print("and readable; nothing is lost by starting it late.\n")
 
     source = observations()
     interval = args.batch / args.rate

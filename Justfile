@@ -62,7 +62,7 @@ check: lint format-check typecheck test
 build:
     uv build
 
-# Appends only. Seals on a thread until demo-maintain takes over; --no-seal skips that.
+# Appends only — nothing seals here. Rows stay buffered until demo-maintain runs.
 demo-capture *args:
     uv run python examples/capture.py {{args}}
 
