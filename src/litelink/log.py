@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -51,6 +52,10 @@ if TYPE_CHECKING:
 OFFSET = "litelink_offset"
 
 # The two operations whose ownership must survive the process holding it (§13.6).
+# How often `await_seal` re-asks. Short because it is only ever reached by a
+# caller that has chosen to block, and long enough not to spin.
+_IDLE_POLL = 0.005
+
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
 
@@ -239,9 +244,6 @@ class Log:
         # directions — a maintenance process redoing the writer's in-flight
         # seal, a writer deleting a maintenance process's half-written
         # compaction — and ownership is what resolves it.
-        self._sealed = threading.Event()
-        self._sealed.set()
-        self._seal_wanted = threading.Event()
         self._stop = threading.Event()
         self._sealer: threading.Thread | None = None
         # The last failure from the sealing thread, which has no caller to
@@ -302,7 +304,7 @@ class Log:
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
-        buffer = Buffer(layout.buffer_db, schema)
+        buffer = Buffer(layout.buffer_db, schema, target_size=settings.target_size)
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
         # cast to. It is kept here because Iceberg cannot represent it: one
@@ -317,7 +319,7 @@ class Log:
             layout=layout,
             table=table,
             buffer=buffer,
-            reader=Reader(layout, table, table_schema(schema)),
+            reader=Reader(layout, table, buffer, table_schema(schema)),
             maintenance=Maintenance(table, buffer, layout, settings, order),
             schema=schema,
             sort_by=order,
@@ -353,24 +355,33 @@ class Log:
 
         table = LogTable.load(layout, readonly=read_only)
         schema = _declared_schema(layout, application_schema(table.arrow_schema()))
-        buffer = Buffer(layout.buffer_db, schema, readonly=read_only)
 
+        # Read before the buffer is built, not through it: the buffer needs
+        # `target_size` to size the groups it cuts, so the config has to be in
+        # hand before the collaborator that consumes it exists.
+        #
         # Required, not defaulted, for the same reason as the schema: new()
         # always writes it, so its absence is a damaged log rather than an
         # older one, and quietly substituting defaults would change how a log
         # seals and what it retains without saying so.
-        encoded = buffer.get_meta(_CONFIG_KEY)
+        encoded = Buffer.peek_meta(layout.buffer_db, _CONFIG_KEY)
         if encoded is None:
             msg = f"log at {layout.root}/{name} has no stored config; it is corrupt"
             raise ValueError(msg)
 
         config = LogConfig.from_json(encoded)
+        buffer = Buffer(
+            layout.buffer_db,
+            schema,
+            target_size=config.target_size,
+            readonly=read_only,
+        )
         sort_by = table.sort_by()
         log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
-            reader=Reader(layout, table, table_schema(schema)),
+            reader=Reader(layout, table, buffer, table_schema(schema)),
             maintenance=Maintenance(table, buffer, layout, config, sort_by),
             schema=schema,
             sort_by=sort_by,
@@ -479,7 +490,10 @@ class Log:
         with self._lock:
             self._writable()
             offsets = self._buffer.append(rows)
-            self._maybe_seal()
+            # The append decides nothing about sealing beyond the cut it just
+            # recorded (see `seal_group`). It does not measure, compare, or
+            # signal — the sealer reads the queue and finds the work there.
+            self._arrange_seal()
 
             return offsets
 
@@ -625,6 +639,24 @@ class Log:
         """
         with self._lock:
             self._writable()
+            # "Now" is the whole contract of this method, so a caller that has
+            # not filled a group still gets a file. The background loop does
+            # NOT come through here — it drains queued groups only — because a
+            # quiet stream would otherwise emit a stub file every poll, which
+            # is the pathology §6 exists to clean up after.
+            if self._buffer.pending_group() is None:
+                self._buffer.close_open_group()
+
+        return self._seal_queued()
+
+    def _seal_queued(self) -> int | None:
+        """Seal the oldest queued group. None if none is queued.
+
+        Split from `seal` so that draining the queue can never cut a group
+        short: everything this writes was sized when its rows arrived.
+        """
+        with self._lock:
+            self._writable()
             # One mechanism for both cases: owners are unique per attempt, so
             # the row that refuses a sealer in another process refuses one in
             # another thread on the same terms — and it lapses if this attempt
@@ -633,45 +665,56 @@ class Log:
             if not lease.acquire():
                 return None
 
-            extent = self._buffer.extent()
-            if extent is None:
+            # The range comes from the queue, not from whatever the buffer
+            # happens to hold now. That is the difference between a file of
+            # `target_size` and a file of however much arrived while the sealer
+            # was getting here — and it costs one indexed row read instead of
+            # the SCAN that asking the buffer for its extent used to.
+            group = self._buffer.pending_group()
+            if group is None:
                 lease.release()
                 return None
 
-            start, last = extent
-            end = last + 1
+            start, end = group
             rel_path = self._layout.seal_path(start, end, datetime.now(UTC).date())
             # I2: the range and its path are fixed BEFORE the file exists, so a
             # retry recomputes nothing and overwrites in place rather than
             # stranding the first attempt under a different name.
             self._buffer.claim_seal(start, end, rel_path)
-            self._sealed.clear()
 
         try:
             self._write_and_commit(end, rel_path)
             with self._lock:
                 self._buffer.finish_seal(end)
         finally:
-            # Set after step 3, not after step 2: a waiter that resumed between
-            # them would see a table holding the rows and a buffer that still
-            # held them too — correct to read (§7 excludes them) and confusing
-            # to assert against.
             with self._lock:
                 lease.release()
-
-            self._sealed.set()
 
         return end
 
     def await_seal(self, timeout: float | None = None) -> bool:
-        """Block until no seal is in flight. True if none is.
+        """Block until the queue is drained and no seal is in flight.
 
-        A background seal means `extend` can return before the rows it
-        triggered a seal for are in the table. Nothing about correctness needs
-        this — the rows are durable and readable throughout — but a caller that
-        wants to observe the table afterwards does.
+        A background seal means `extend` can return before the rows it queued
+        are in the table. Nothing about correctness needs this — the rows are
+        durable and readable throughout — but a caller that wants to observe
+        the table afterwards does.
+
+        Asks the two tables rather than an Event, so it is also true across
+        processes: a queued group and an in-flight `sealing` claim are both
+        durable state, and an Event is neither.
         """
-        return self._sealed.wait(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if self._buffer.pending_group() is None and (
+                self._buffer.pending_seal() is None
+            ):
+                return True
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+
+            time.sleep(_IDLE_POLL)
 
     def _write_and_commit(self, end: int, rel_path: str) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
@@ -693,40 +736,28 @@ class Log:
         with self._table_lock:
             self._table.register(str(dest))
 
-    def _maybe_seal(self) -> None:
-        """Seal when the buffer crosses `target_size`.
+    def _arrange_seal(self) -> None:
+        """Make sure something will seal what the append just queued.
 
-        Deliberately only the O(1) counter. This runs after every append, and
-        asking SQLite for min/max to check emptiness first — which is what it
-        used to do — put a query on the write path to learn something the
-        counter already knew, at 13-62% of the raw SQLite floor.
+        With `background_seal` that is a thread, started here rather than at
+        open so a log that never writes — a reader, a test, a short-lived
+        import — never starts one it has no use for. The thread is not told
+        anything; it reads the queue, exactly as another process would.
 
-        With `background_seal` the append hands off rather than sealing: it
-        wakes the sealer and returns, so the caller pays a set() rather than the
-        whole of §4. The `max_age` branch is still not wired — it needs a clock
-        the caller does not drive — so age-based sealing means calling `seal()`.
+        Without it, the append seals inline, and it asks the queue first
+        because acquiring the lease is itself a write and doing that per append
+        would put a transaction on the hot path to discover there is nothing to
+        do.
         """
-        if self._buffer.byte_size() < self.config.target_size:
+        if self.config.background_seal:
+            self._start_sealer()
             return
 
-        if not self.config.background_seal:
-            self.seal()
-            return
-
-        self._start_sealer()
-        # Cleared here rather than in `seal`, or a caller that asks and then
-        # waits can win the race against the thread starting and be told the
-        # seal it just requested is already finished.
-        self._sealed.clear()
-        self._seal_wanted.set()
+        if self._buffer.pending_group() is not None:
+            self._seal_queued()
 
     def _start_sealer(self) -> None:
-        """Start the sealing thread, once, on first need.
-
-        Lazily rather than at open, so a log that never fills a buffer — a
-        reader, a test, a short-lived import — never starts a thread it has no
-        use for.
-        """
+        """Start the sealing thread, once, on first need."""
         if self._sealer is not None:
             return
 
@@ -736,31 +767,48 @@ class Log:
         self._sealer.start()
 
     def _seal_loop(self) -> None:
-        """Seal whenever the buffer is full, until closed.
+        """Drain the seal queue until closed.
 
-        The condition is polled, not signalled. An `Event` only reaches threads
-        in this process, and the whole point of the lease is that the sealer
-        need not be one — so the loop asks the same question a separate process
-        would: is the buffer over `target_size`? The event is kept as a
-        shortcut, turning a poll interval into an immediate wake for the common
-        in-process case, and nothing depends on it.
+        Polled, with nothing signalled. An `Event` reaches only threads in this
+        process, and the whole point of the lease is that the sealer need not
+        be one — so the loop asks the question a separate process would ask,
+        and there is exactly one way to ask it. Poll latency is affordable
+        because it no longer affects file size: the cut was made when the rows
+        arrived, so a late seal writes the same file, later.
 
         Failures are held rather than raised, because there is no caller to
         raise to. A seal that fails leaves its claim in `sealing`, which the
         next holder of the lease replays (§4).
         """
         while not self._stop.is_set():
-            woken = self._seal_wanted.wait(self.config.seal_poll.total_seconds())
-            self._seal_wanted.clear()
+            self._stop.wait(self.config.seal_poll.total_seconds())
+            # Re-checked after the wait, not only before it. `close` does not
+            # seal (see its docstring), and without this the wait returns
+            # immediately on stop and runs one more pass on the way out.
+            if self._stop.is_set():
+                return
+
             try:
-                if woken or self._buffer.measure() >= self.config.target_size:
-                    self.seal()
+                # Before draining, not after: a quiet stream has no closed
+                # group at all, and this is the only thing that gives it one.
+                self._buffer.close_open_group(
+                    int((datetime.now(UTC) - self.config.max_age).timestamp())
+                )
+                # Peeked before the lock, not inside it. Almost every poll
+                # finds nothing, and taking the write lock to discover that
+                # would serialise the sealer against appends on a timer — for
+                # every log, forever, whether or not it ever seals.
+                while (
+                    self._buffer.pending_group() is not None
+                    and not self._stop.is_set()
+                    and self._seal_queued() is not None
+                ):
+                    # A sealer that fell behind has several groups waiting, and
+                    # each is already the right size — draining beats sleeping
+                    # between them.
+                    pass
             except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
                 self._seal_error = exc
-            finally:
-                # Whether it sealed, found nothing, or failed, nothing is
-                # pending — a waiter must not hang on a seal never coming.
-                self._sealed.set()
 
     def run_sealer(self, stop: threading.Event | None = None) -> None:
         """Seal for this log until `stop` is set. For a dedicated process.
@@ -773,7 +821,8 @@ class Log:
         who may replay an interrupted one.
 
         The capturing process should be opened with `background_seal=False`, or
-        both will try.
+        both will try. Nothing breaks if both do — the lease refuses the loser
+        — but a thread that always loses is a thread for nothing.
         """
         self._writable()
         self._stop = stop or threading.Event()
@@ -979,16 +1028,22 @@ class Log:
 
         Not sealing is deliberate: committed rows are already durable, and an
         implicit seal on close would emit an undersized file every time a
-        process restarted. An in-flight seal is waited for rather than
-        interrupted — it holds a claim in `sealing`, and letting it finish is
-        cheaper than making the next open replay it.
+        process restarted. Groups already queued are left queued — they are
+        durable, correctly sized, and whoever opens the log next will find
+        them, which is the point of writing the cut down rather than deriving
+        it. An in-flight seal is waited for rather than interrupted: it holds a
+        claim in `sealing`, and letting it finish is cheaper than replaying it.
         """
         self._stop.set()
         if self._sealer is not None:
+            # The join IS the wait for an in-flight seal: the thread only
+            # returns once its current pass is done, which is what clears the
+            # `sealing` claim. Waiting on the QUEUE here instead would hang for
+            # the full timeout in the ordinary case — the sealer has already
+            # stopped, so nothing is left that could drain it.
             self._sealer.join(timeout=60)
             self._sealer = None
 
-        self.await_seal(timeout=60)
         self._reader.close()
         self._buffer.close()
 

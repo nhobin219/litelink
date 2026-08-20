@@ -452,6 +452,9 @@ sqlite_scanner   REPOSITORY
 httpfs           REPOSITORY
 ```
 
+`sqlite_scanner` is no longer provisioned — the buffer leg is not read through DuckDB at
+all. See "Two SQLite libraries in one process" below.
+
 A `REPOSITORY` extension is fetched from extensions.duckdb.org the first time a query names
 it, and the fetch is silent. **So the first read on a fresh machine is a network read** — at
 precisely the point the design claims to be offline. It does not degrade gracefully either:
@@ -1047,8 +1050,10 @@ The consequence worth planning for is that local disk holds roughly
    - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
      free because the writer already knows the buffer grew. A maintainer would poll. The
      `max_age` branch is time-based and would not care, but it is not wired up at all today.
-   - **The size counter is per-process.** The seal trigger reads an in-memory byte count the
-     appending process maintains; rows removed by another process would not decrement it.
+   - ~~**The size counter is per-process.**~~ **Resolved by `seal_group`.** The running
+     total lives in the open queue row and is written in the same transaction as the rows
+     it accounts for, so any process reads it with a keyed read of one row — and there is
+     no second, in-memory copy to disagree with it.
    - **Deferring step 3 widens a window that is currently narrow.** It is safe by §7's
      boundary at any width, and it *should* be free: the boundary already excludes sealed
      rows, so a row awaiting deletion is one the read has no reason to touch. Persistence,
@@ -1061,19 +1066,45 @@ The consequence worth planning for is that local disk holds roughly
      range; SQLite given the same predicate answers with
      `SEARCH buffer USING INTEGER PRIMARY KEY (rowid>?)` in 1.0 ms against 17.1 ms attached.
 
-     **Fixed by pushing the predicate down.** `sqlite_query('buf', …)` hands the boundary to
-     SQLite instead of filtering above the scan: measured on the buffer leg in isolation,
-     31.6 ms against 8.1 ms returning 1,000 rows from a 61,000-row buffer. End to end the
-     win is smaller and easily lost in noise, because the Iceberg leg dominates at these
-     sizes — the point is not the average read, it is that a deferred delete no longer
-     inflates one.
+     **Fixed by pushing the predicate down**, and then by removing DuckDB from the buffer
+     leg entirely. The predicate still goes to SQLite — `SEARCH buffer USING INTEGER
+     PRIMARY KEY (rowid>?)` — but through the library's own connection, because
+     `sqlite_query('buf', …)` turned out to be unsafe at any speed.
 
-     The cost is that `binary` columns are unsupported until §15 lands, because
-     `sqlite_query` decodes blob bytes as UTF-8 and fails, with or without a CAST. That is a
-     smaller loss than it appears and arguably a signal: the target workload is tabular JSON
-     off a websocket, where the payload is text, and §15's design already has binary payloads
-     **bypass** the buffer rather than travel through it. The mechanism refusing to carry
-     blobs through SQLite and the extension routing them around SQLite point the same way.
+   ### Two SQLite libraries in one process
+
+   `ATTACH '<buffer.db>' (TYPE sqlite)` corrupted the buffer. DuckDB's sqlite extension
+   carries its OWN statically linked SQLite, so the file was managed by two independent
+   SQLite libraries inside one process. Each keeps private, process-local state: a table of
+   open descriptors (to work around POSIX advisory locks being per process and per inode,
+   so that closing any descriptor drops all of that process's locks on the file) and the
+   coordination for WAL's shared-memory index. Neither is shared between libraries, so the
+   reader and the writer stopped being serialised against each other.
+
+   Measured, on the ordinary shape of a scan concurrent with appends:
+
+   | reader | result |
+   |---|---|
+   | same process, via `sqlite_query` | corrupt on the FIRST scan; `integrity_check` fails afterwards |
+   | separate process, via `Log.open(read_only=True)` | 327 scans, clean |
+   | same process, strictly sequential append→scan | 300 iterations, clean |
+
+   The symptoms were `database disk image is malformed` and, when the torn mapping was the
+   `-shm` index, `SIGBUS`. Cross-process is exactly the case WAL is designed for; two
+   libraries inside one process is not, and no attach option, pragma or locking mode
+   reconciles them.
+
+   **The buffer leg is therefore read through the connection that already owns the file**
+   and handed to DuckDB as Arrow, converted incrementally: rows are immutable once
+   committed, arrive only above the last one, and leave only as a prefix at a seal, so a
+   query converts its own delta and slices the rest zero-copy. That is also *faster* than
+   the attached version, which re-read the whole buffer per query — 25.6 ms against
+   46.0 ms with 20,000 sealed and 20,000 buffered rows and 200 rows appended between scans.
+
+     `binary` columns remain unsupported until §15 lands, though no longer for this reason:
+     the target workload is tabular JSON off a websocket, where the payload is text, and
+     §15's design already has binary payloads **bypass** the buffer rather than travel
+     through it.
 
    ### What `max_age` needs to know, and how little that is
 
@@ -1091,11 +1122,20 @@ The consequence worth planning for is that local disk holds roughly
    internal state constrains it"*. A `litelink_ts` in the buffer table only, never in the
    Iceberg schema, sits on the same side of that line.
 
-   **But it may not be needed at all.** §12 does not say what `max_age` is the age *of*, and
-   the cheapest reading needs no per-row data: it bounds how long data may sit unsealed, so
-   the quantity is the age of the **oldest unsealed row** — one value, written when the
-   buffer goes from empty to non-empty, cleared at seal. A `meta` key, O(1), no column
+   **It was not needed at all, and this is now built.** §12 does not say what `max_age` is
+   the age *of*, and the cheapest reading needs no per-row data: it bounds how long data may
+   sit unsealed, so the quantity is the age of the **oldest unsealed row** — one value,
+   written when the buffer goes from empty to non-empty, cleared at seal. O(1), no column
    anywhere, no §2 argument to have.
+
+   That value is `seal_group.opened_at`, stamped by the **first row** to land in a group and
+   null while the group is empty. A sealer closes an aged group on its own poll, which is
+   what a quiet stream needs: until this existed `max_age` was dead config — a field that
+   was validated, persisted and round-tripped through `open`, and that nothing ever read —
+   so a low-rate stream never sealed at all and its rows stayed in SQLite indefinitely.
+
+   Stamping the group's *creation* instead would seal a one-row file the moment an idle
+   group finally received a row, which is the pathology §6 exists to clean up after.
 
    The per-row version buys exactly one thing over that: a **partial** seal, cutting at the
    last row older than `max_age` instead of sealing everything present. Sealing everything is

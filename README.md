@@ -71,10 +71,16 @@ in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
   write amplification and buys nothing, because the local WAL already made the row durable.
 - **Read boundaries are derived from committed table state**, never from a stored flag — so
   no seal window can double-count or drop.
+- **The seal cut is chosen by the appender**, in the transaction that crosses
+  `target_size`, and queued. A sealer that falls behind therefore writes several
+  correctly-sized files rather than one oversized one.
 - **Compaction is required and local**, because a time-based seal trigger guarantees
   undersized files. Local means no egress to read files back.
 
 Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
+
+How the pieces run — writer, sealer and maintainer, and what crosses between them — is
+[`docs/RUNTIME.md`](docs/RUNTIME.md).
 
 ## Extensions
 
@@ -86,10 +92,10 @@ are inlined into Iceberg at seal, so the archive stays ordinary Iceberg with a `
 column: no pointers in the published schema, and blob lifetime inherits snapshot expiry and
 compaction rather than becoming a hand-maintained refcount.
 
-Until it lands, `binary` columns are refused outright. The read path pushes its boundary
-predicate down into SQLite — which is what stops cleanup costing query latency — and the
-mechanism that allows it cannot carry blob bytes. That constraint and the extension point
-the same way: §15 has payloads bypass the buffer rather than travel through it.
+Until it lands, `binary` columns are refused outright — see `_types`. (They were once
+refused because DuckDB's sqlite scanner decoded blob bytes as UTF-8 and failed; that
+scanner is gone, so the remaining reason is §15 itself, which has payloads bypass the
+buffer rather than travel through it.)
 
 ## Open questions
 
@@ -142,9 +148,11 @@ just bootstrap          # uv sync + git hooks + DuckDB extensions
 just check              # lint + format-check + typecheck + tests, same as CI
 ```
 
-`just bootstrap` provisions the `iceberg` and `sqlite` DuckDB extensions, which are
+`just bootstrap` provisions the `iceberg` and `avro` DuckDB extensions, which are
 downloaded rather than bundled — see [`docs/SPEC.md`](docs/SPEC.md) §7. `just
-duckdb-extensions --check` verifies a machine can read offline.
+duckdb-extensions --check` verifies a machine can read offline. The buffer is **not**
+read through DuckDB's sqlite scanner: two independently linked SQLite libraries in one
+process corrupt the database, which [`docs/RUNTIME.md`](docs/RUNTIME.md) records.
 
 `just --list` has the rest. Tooling is uv + ruff + [ty](https://github.com/astral-sh/ty)
 + pytest; the style gate in `scripts/check_blank_lines.py` requires a blank line after
