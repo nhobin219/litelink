@@ -1165,6 +1165,35 @@ class Log:
         # it is cheap enough to run far more often than the rest of this.
         self.seal_due()
 
+    def rewrite_archive(self) -> None:
+        """Merge undersized files already in the archive (§6, ad-hoc).
+
+        An operation, not a policy. Nothing calls it on a schedule and normal
+        operation does not need it: `sync` pushes only files compaction has
+        finished with, so the archive is well-sized by construction. It exists
+        for the two things that break that on purpose — an explicit `seal()`
+        stranding a small file, and a change to `target_size`, which applies to
+        the future while the archive is immutable history.
+
+        Run it when nothing else is maintaining the log: it takes the same
+        lease as `maintain` and `sync`, and it rewrites the same files they
+        would.
+        """
+        self._writable()
+        if not self._archive.configured():
+            msg = "rewrite_archive() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            self._maintenance.rewrite_archive(lease.renew)
+        finally:
+            lease.release()
+
     def hydrate(self, since: timedelta) -> None:
         """Re-register archived files into the local table (§8).
 
