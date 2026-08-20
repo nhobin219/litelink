@@ -1,6 +1,12 @@
 # litelink development commands
 # Install just: uv tool install rust-just
 
+# The local S3-compatible endpoint the archive tier is tested and demoed against.
+# Matches tests/conftest.py; change both together.
+RUSTFS_ENDPOINT := "http://127.0.0.1:9000"
+RUSTFS_KEY := "litelink"
+RUSTFS_SECRET := "litelink-secret"
+
 # Default recipe: list available commands
 default:
     @just --list
@@ -78,6 +84,44 @@ demo-tail *args:
 # it is there to poke at — so nothing removes it automatically. The benchmarks do
 # clean up: they run in a temp directory.
 #
+# rustfs is an S3-compatible object store in one container — the archive tier
+# needs somewhere to push to, and pointing tests and demos at real S3 makes both
+# slow, costly and dependent on credentials nobody should need to run `just check`.
+# The same code path runs against AWS; only the endpoint differs.
+#
+#   just rustfs-stop    tears it down, discarding its data
+#
+# Bring up a local S3-compatible object store for the archive tier. Idempotent.
+rustfs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "$(docker ps -q -f name=^litelink-rustfs$)" ]; then
+        echo "rustfs already running on {{RUSTFS_ENDPOINT}}"
+        exit 0
+    fi
+    docker rm -f litelink-rustfs >/dev/null 2>&1 || true
+    docker run -d --name litelink-rustfs -p 9000:9000 \
+        -e RUSTFS_ACCESS_KEY={{RUSTFS_KEY}} \
+        -e RUSTFS_SECRET_KEY={{RUSTFS_SECRET}} \
+        rustfs/rustfs:latest >/dev/null
+    for _ in $(seq 1 40); do
+        # Any HTTP answer means it is listening. NOT `curl -f`: an
+        # unauthenticated S3 root is a 403, which is a healthy server refusing
+        # an anonymous request, and -f treats that as a failure.
+        if curl -s -o /dev/null "{{RUSTFS_ENDPOINT}}" 2>/dev/null; then
+            echo "rustfs up on {{RUSTFS_ENDPOINT}}"
+            exit 0
+        fi
+        sleep 0.25
+    done
+    echo "rustfs did not answer on {{RUSTFS_ENDPOINT}}" >&2
+    docker logs litelink-rustfs 2>&1 | tail -20 >&2
+    exit 1
+
+# Stop rustfs and discard its data. The container is disposable on purpose.
+rustfs-stop:
+    @docker rm -f litelink-rustfs >/dev/null 2>&1 && echo "rustfs stopped" || echo "not running"
+
 # Delete a demo's captured data.
 demo-clean root="litelink-data":
     #!/usr/bin/env bash
