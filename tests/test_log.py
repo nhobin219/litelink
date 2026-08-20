@@ -266,11 +266,12 @@ def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
     """`sealing` holds one row by design (§2), and two seals would overlap."""
     with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
         log.extend(rows(50))
-        log._sealing = True
+        held = log._lease("seal")
+        assert held.acquire(), "could not simulate a seal in flight"
 
         assert log.seal() is None, "sealed while another seal was in flight"
 
-        log._sealing = False
+        held.release()
         assert log.seal() == 51
 
 

@@ -29,7 +29,7 @@ import pyarrow.parquet as pq
 from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
-from litelink._lease import new_owner
+from litelink._lease import Lease, new_owner
 from litelink._maintenance import Maintenance
 from litelink._read import Reader
 from litelink._table import LogTable
@@ -239,13 +239,6 @@ class Log:
         # directions — a maintenance process redoing the writer's in-flight
         # seal, a writer deleting a maintenance process's half-written
         # compaction — and ownership is what resolves it.
-        self._owner = new_owner()
-        self._seal_lease = buffer.lease(SEAL_ROLE, self._owner)
-        self._maintain_lease = buffer.lease(MAINTAIN_ROLE, self._owner)
-
-        # Still a flag as well, so a thread does not pay a SQLite round trip to
-        # discover what it already knows.
-        self._sealing = False
         self._sealed = threading.Event()
         self._sealed.set()
         self._seal_wanted = threading.Event()
@@ -449,6 +442,15 @@ class Log:
             self._maintenance.set_sort_by(requested)
             self._maintenance.rewrite_sorted()
 
+    def _lease(self, role: str) -> Lease:
+        """A fresh claim on `role` for this attempt.
+
+        Minted per call rather than held as a field. A field would fix one owner
+        for the whole Log, and two threads sharing it would then re-enter each
+        other's lease — leaving the role excluding nothing inside a process.
+        """
+        return self._buffer.lease(role, new_owner())
+
     def _writable(self) -> None:
         if self.readonly:
             msg = "this Log was opened readonly"
@@ -623,15 +625,17 @@ class Log:
         """
         with self._lock:
             self._writable()
-            # The lease, not just the flag. It refuses a second sealer in any
-            # process, and it lapses if this one dies mid-seal so that another
-            # may finish what the `sealing` claim records.
-            if self._sealing or not self._seal_lease.acquire():
+            # One mechanism for both cases: owners are unique per attempt, so
+            # the row that refuses a sealer in another process refuses one in
+            # another thread on the same terms — and it lapses if this attempt
+            # dies mid-seal, so another may finish what `sealing` records.
+            lease = self._lease(SEAL_ROLE)
+            if not lease.acquire():
                 return None
 
             extent = self._buffer.extent()
             if extent is None:
-                self._seal_lease.release()
+                lease.release()
                 return None
 
             start, last = extent
@@ -641,7 +645,6 @@ class Log:
             # retry recomputes nothing and overwrites in place rather than
             # stranding the first attempt under a different name.
             self._buffer.claim_seal(start, end, rel_path)
-            self._sealing = True
             self._sealed.clear()
 
         try:
@@ -654,8 +657,7 @@ class Log:
             # held them too — correct to read (§7 excludes them) and confusing
             # to assert against.
             with self._lock:
-                self._sealing = False
-                self._seal_lease.release()
+                lease.release()
 
             self._sealed.set()
 
@@ -787,17 +789,19 @@ class Log:
         """
         # Each half is replayed only by whoever is entitled to it. Another
         # process may be part way through the very operation this would redo.
-        if self._maintain_lease.acquire():
+        maintain = self._lease(MAINTAIN_ROLE)
+        if maintain.acquire():
             try:
                 self._recover_compaction()
             finally:
-                self._maintain_lease.release()
+                maintain.release()
 
-        if self._seal_lease.acquire():
+        seal = self._lease(SEAL_ROLE)
+        if seal.acquire():
             try:
                 self._recover_seal()
             finally:
-                self._seal_lease.release()
+                seal.release()
 
     def _recover_seal(self) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
@@ -886,14 +890,15 @@ class Log:
             # Taken after the refusals above, so a rejected call does not leave
             # a lease behind for its TTL and lock out the process that could
             # have done the work.
-            if not self._maintain_lease.acquire():
-                msg = "another process holds the maintenance lease"
+            lease = self._lease(MAINTAIN_ROLE)
+            if not lease.acquire():
+                msg = "another owner holds the maintenance lease"
                 raise RuntimeError(msg)
 
             try:
                 self._maintenance.run()
             finally:
-                self._maintain_lease.release()
+                lease.release()
 
     def hydrate(self, since: timedelta) -> None:
         """Re-register archived files into the local table (§8).
