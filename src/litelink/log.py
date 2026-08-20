@@ -33,7 +33,7 @@ from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._lease import Lease, new_owner
-from litelink._maintenance import Maintenance, checkpoint, settled_size
+from litelink._maintenance import Maintenance, checkpoint, stable_prefix
 from litelink._read import Reader, duckdb_connection
 from litelink._s3 import S3Options
 from litelink._table import LogTable
@@ -92,6 +92,24 @@ class LogConfig:
     # BYTES, not rows. §13.3 is the deciding argument: a row-count bound can
     # exceed a byte-based memory limit, so it loses the race to the OOM killer
     # in exactly the situation the bound exists to prevent.
+    #
+    # UNCOMPRESSED bytes, in memory — not the size of the file that results.
+    # Deliberate, and the one thing to understand before setting it. A file
+    # holding 8 MiB of rows lands at 8 MiB on disk if they are incompressible
+    # and under 1 MiB if they repeat, so on-disk size is an OUTPUT here, never
+    # the target. Sizing by it instead would be sizing by the compression
+    # ratio: rows per file would swing with the data, and what a reader pays to
+    # hold a file — which is the uncompressed size, whatever the file cost to
+    # store — would be unbounded. This way it is bounded by construction, and
+    # bounded per file is what lets a scan bound its total: N files open at
+    # once cost N times this, which is the number to divide a memory budget by
+    # when choosing read parallelism.
+    #
+    # So expect files smaller than this on disk, and set it larger than an
+    # on-disk file target would be. Everything downstream is stated in the same
+    # currency — compaction sizes a merge by what its inputs HOLD, carried in
+    # `file_bytes` from the seal that measured it, never by what they compressed
+    # to (see `_maintenance.runs`).
     #
     # The 8 MiB default is §7's row guidance restated — its table puts a 20k-row
     # buffer at 8.0 MB at the 400-byte row it measured, and 20k rows is the
@@ -1055,35 +1073,33 @@ class Log:
     def _push(self, lease: Lease) -> None:
         """Upload and register everything above the archive's extent.
 
-        Everything except the TRAILING undersized files. Holding a small file
-        back is only worth it while it can still grow: compaction merges the
-        frontier with later seals into a properly sized file, so pushing it now
-        would put something in the archive that wants replacing.
+        Everything compaction has finished with, which `stable_prefix` decides
+        from compaction's own rule rather than from a size of its own. A file
+        pushed and then merged locally would leave the archive holding rows
+        that have been rewritten underneath it, so the two must agree on which
+        files are still in play, and the only way to guarantee that is to ask
+        the same function.
 
-        A small file in the MIDDLE can never grow — files are immutable and its
-        neighbours are already over the threshold, so compaction will not touch
-        it. Stopping at the first one, which is what this did, meant a single
-        explicit `seal()` blocked the archive permanently: everything after it
-        is newer, so the watermark never advanced again, and I4 then pinned
-        local disk too. Not "later" — never.
-
-        So the archive may gain one small file per explicit seal. That is a
-        cosmetic cost with a deliberate cause, and `rewrite_archive` is the
-        tool for it.
+        The archive may still gain a small file: one stranded between larger
+        neighbours can never be merged, so holding it back would block the
+        watermark forever rather than improve anything. That is a cosmetic cost
+        with a deliberate cause, and `rewrite_archive` is the tool for it.
         """
         archive = self._archive.require()
         self._table.reload()
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
-        threshold = settled_size(self.config.target_size)
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
-        # Drop the trailing run of undersized files, and only that run.
-        while pending and pending[-1].size < threshold:
-            pending.pop()
+        settled = stable_prefix(
+            pending,
+            self.config.target_size,
+            self.config.compact_min_files,
+            self._maintenance.memory(),
+        )
 
-        for data_file in pending:
+        for data_file in pending[:settled]:
             checkpoint(lease.renew)
             rel_path = self._layout.relative(data_file.path)
             archive.put(self._layout.absolute(rel_path), rel_path)

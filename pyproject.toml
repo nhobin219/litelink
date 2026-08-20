@@ -97,5 +97,6 @@ testpaths = ["tests"]
 # warning. The ini key below is read from `_inicfg` and does fail collection.
 strict_markers = true
 markers = [
+    "s3: needs an S3-compatible endpoint — `just rustfs` starts one, or set AWS_ENDPOINT_URL. Skipped when none answers.",
     "slow: exercises real fsync volume or file counts — the ~1 ms per-commit fsync in docs/SPEC.md §2 means these are wall-clock bound, not CPU bound. Deselect with -m 'not slow'.",
 ]

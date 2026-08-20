@@ -20,6 +20,7 @@ changed the URI and went on serving reads from the table it had already opened.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from litelink._s3 import S3Options
@@ -48,21 +49,40 @@ class Archive:
         self._s3 = s3 or S3Options()
         self._schema = schema
         self._handle: LogTable | None = None
+        # Guards all three fields together, because they are one fact. The
+        # reader resolves the archive on a query thread while a maintainer
+        # syncs on another and `set_archive` can re-point it from a third, and
+        # without this the interleaving that matters is: `set_uri` clears the
+        # handle, then an open already in flight for the OLD uri stores its
+        # result, and every read after that is served from an archive the log
+        # has been told to stop using. Two threads opening at once would also
+        # each pay the round trip and one would use a handle the other has
+        # discarded.
+        #
+        # Cheap by construction: taken when an archive is opened or
+        # re-pointed, never per row and never per query once the handle
+        # exists. A leaf in the lock order — nothing here calls back into the
+        # Log, the reader or the maintainer — so it can be taken under any of
+        # their locks and adds no cycle.
+        self._lock = threading.Lock()
 
     @property
     def uri(self) -> str | None:
         """Where the archive is, or None when there is none."""
-        return self._uri
+        with self._lock:
+            return self._uri
 
     @property
     def s3(self) -> S3Options:
         """Credentials, for callers that configure their own client — DuckDB's
         S3 secret on the read path. Never persisted; see `_s3`."""
-        return self._s3
+        with self._lock:
+            return self._s3
 
     def configured(self) -> bool:
         """Whether there is an archive at all. Cheap, and opens nothing."""
-        return self._uri is not None
+        with self._lock:
+            return self._uri is not None
 
     def set_uri(self, uri: str | None) -> None:
         """Attach, re-point, or detach.
@@ -85,20 +105,24 @@ class Archive:
         (I5): `include_archive=False` is the default, and a reader that never
         opts in never reaches this.
         """
-        if not self.configured():
-            return None
+        with self._lock:
+            if self._uri is None:
+                return None
 
-        if self._handle is None:
-            if self._schema is None:
-                msg = "archive was constructed without a schema"
-                raise ValueError(msg)
+            if self._handle is None:
+                if self._schema is None:
+                    msg = "archive was constructed without a schema"
+                    raise ValueError(msg)
 
-            assert self._uri is not None
-            self._handle = LogTable.open_archive(
-                self._layout, self._uri, self._s3, self._schema
-            )
+                # Held across the open, which is a round trip. Deliberate: a
+                # second caller arriving mid-open should wait for that handle
+                # rather than start a second one, and `set_uri` should wait
+                # rather than clear a field the open is about to write.
+                self._handle = LogTable.open_archive(
+                    self._layout, self._uri, self._s3, self._schema
+                )
 
-        return self._handle
+            return self._handle
 
     def require(self) -> LogTable:
         """The remote table, insisting there is one.

@@ -7,6 +7,8 @@ from pathlib import Path
 
 from pyiceberg.catalog.sql import SqlCatalog
 
+from litelink._maintenance import runs, stable_prefix
+from litelink._table import DataFile
 from litelink.log import Log, LogConfig
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
@@ -39,18 +41,24 @@ def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
         assert len(log._table.data_files()) == 4
 
 
-def test_compaction_skips_settled_files(tmp_path: Path) -> None:
-    """Every file already at or above the settled size, so nothing is a
-    candidate — the pass must leave all three alone rather than merge them.
+def test_compaction_leaves_full_files_alone(tmp_path: Path) -> None:
+    """In normal operation compaction is a no-op.
 
-    A 4-row Parquet file runs to roughly 1.3 kB, so a 2 kB target puts the
-    settled size at 1 kB, under every one of them.
+    Every file here came from a cut the appender made at `target_size`, so each
+    already holds what a file should. Merging any two would produce one holding
+    twice that. The rule that decides this reads what the files hold in memory,
+    not their size on disk — these compress to a fraction of the target, and
+    judged that way every one of them looks starved.
     """
     with open_log(tmp_path, LogConfig(target_size=2048, compact_min_files=2)) as log:
-        seal_files(log, 3)
+        log.extend(rows(200))
+        log.seal()
+        before = len(log._table.data_files())
+        assert before >= 3, "the target must be crossed several times"
+
         log.maintain()
 
-        assert len(log._table.data_files()) == 3
+        assert len(log._table.data_files()) == before
 
 
 def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
@@ -509,3 +517,107 @@ def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> N
         assert len(after) == 1
         assert after[0] != before[0], "the rewrite reused the live file's path"
         assert len(read_all(log)) == 12
+
+
+def sized(*sizes: int) -> tuple[list[DataFile], dict[str, int]]:
+    """Files holding the given uncompressed sizes, adjacent and in order.
+
+    Sizes come as a separate mapping because that is how the real ones do: a
+    file's size on disk is what compression made of it, and what it holds in
+    memory is carried in the buffer beside it.
+    """
+    files, memory, offset = [], {}, 1
+    for size in sizes:
+        path = f"{offset}.parquet"
+        # A deliberately misleading on-disk size: every rule under test must
+        # read `memory`, and any that reaches for `size` gets a wrong answer.
+        files.append(DataFile(path=path, size=1, rows=1, lo=offset, hi=offset))
+        memory[path] = size
+        offset += 1
+
+    return files, memory
+
+
+def test_a_run_closes_before_it_exceeds_the_budget() -> None:
+    """The output cap. Without it, a hundred files just under the line merge
+    into one file a hundred times the target."""
+    files, memory = sized(30, 30, 30, 30, 30)
+    grouped = runs(files, 100, memory)
+
+    assert [len(run) for run in grouped] == [3, 2]
+    assert all(sum(memory[f.path] for f in run) <= 100 for run in grouped)
+
+
+def test_a_file_over_the_budget_forms_its_own_run() -> None:
+    """It has no room for a neighbour, so it must not drag one in."""
+    files, memory = sized(10, 500, 10)
+    grouped = runs(files, 100, memory)
+
+    assert [[memory[f.path] for f in run] for run in grouped] == [[10], [500], [10]]
+
+
+def test_an_unmeasured_file_counts_as_full() -> None:
+    """Unknown is not zero.
+
+    Treating an unrecorded size as small is what pulls an already-correct file
+    into a rewrite; the cost of leaving it alone is only a merge that did not
+    happen.
+    """
+    files, memory = sized(10, 10, 10)
+    del memory[files[1].path]
+
+    assert [len(run) for run in runs(files, 100, memory)] == [1, 1, 1]
+
+
+def test_the_trailing_run_is_never_settled() -> None:
+    """It is under budget, so a file that has not been written yet can still
+    join it — pushing it now would archive something compaction will replace.
+
+    Two files short of `min_files`, so compaction leaves them alone today; it
+    is room in the budget, not the merge, that makes them unsettled.
+    """
+    files, memory = sized(60, 60, 20)
+
+    assert stable_prefix(files, 100, 3, memory) == 1
+
+
+def test_a_full_trailing_run_is_settled() -> None:
+    """Nothing more fits, so nothing can change it."""
+    files, memory = sized(60, 60, 100)
+
+    assert stable_prefix(files, 100, 2, memory) == 3
+
+
+def test_nothing_before_a_mergeable_run_is_settled() -> None:
+    """Compaction is about to rewrite it, and the watermark is a prefix, so the
+    files ahead of it cannot be archived past it either."""
+    files, memory = sized(200, 200, 10, 10, 10)
+
+    assert stable_prefix(files, 100, 2, memory) == 2
+
+
+def test_a_stranded_small_file_is_still_settled() -> None:
+    """The regression that made a single explicit seal block the archive
+    forever. A small file between larger neighbours can never be merged — no
+    run containing it fits the budget — so waiting for it to grow waits
+    forever, and the watermark never advances past it again."""
+    files, memory = sized(98, 5, 98, 200)
+
+    assert stable_prefix(files, 100, 2, memory) == 4
+
+
+def test_sizing_does_not_depend_on_how_well_the_data_compressed() -> None:
+    """What the on-disk rule got wrong.
+
+    These files each hold a full target's worth of rows and compressed to an
+    eighth of it. Judged by their size on disk they all look starved, and
+    compaction merged eight at a time into a file holding eight times the
+    memory the target allows — while `sync`, asking whether a file had reached
+    half the target, found none and left the archive empty. Judged by what they
+    hold, each is already full: nothing to merge, everything archivable.
+    """
+    target = 64 * 1024
+    files, memory = sized(*([target] * 24))
+
+    assert runs(files, target, memory) == [[f] for f in files], "each already full"
+    assert stable_prefix(files, target, 2, memory) == 24

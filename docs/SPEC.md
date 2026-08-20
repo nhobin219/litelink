@@ -343,10 +343,22 @@ equivalent.
 
 The table is unpartitioned (§13), so the compaction unit is a **contiguous offset range**.
 That works because sealed files already cover contiguous, non-overlapping ranges: pick
-adjacent files under `compact_below`, and their combined range is itself contiguous.
+adjacent files that together hold less than `target_size`, and their combined range is
+itself contiguous.
+
+**Sizing is in uncompressed bytes, never in file size on disk.** `target_size` bounds what
+a file HOLDS — the appender's own byte count for the rows that went into it — and that
+number is carried per file from the seal that measured it, added up across a merge, and
+dropped when the file is unlinked. It cannot be recovered from the file afterwards: on
+data compressing 8:1 a file holding a full target is an eighth of it on disk, so a rule
+reading sizes off disk merges eight already-full files into one holding eight times the
+memory the target allows — and, since `sync` refuses anything compaction may still
+rewrite, archives nothing at all in the meantime. A file whose size was never recorded
+counts as full, so an unmeasured file is never rewritten on a guess.
 
 ```
-1. Select adjacent files under compact_below spanning [lo, hi]; require compact_min_files.
+1. Select adjacent files holding < target_size in total, spanning [lo, hi];
+   require compact_min_files.
 2. Scan them into one Arrow table; re-sort by `sort_by`.
 3. Verify row count and per-column min/max against the sources.
 4. local.overwrite(table, overwrite_filter=(offset >= lo) & (offset <= hi))  -- one snapshot
@@ -841,14 +853,13 @@ of them is chosen.
 ## 12. Configuration
 
 ```
-target_size            seal at this buffer size           (size it for READ latency, not
-                                                          file size -- keep buffer <20k rows;
-                                                          compaction produces the big files)
-max_age                seal at this age regardless        (e.g. 5 min)
+target_size            uncompressed bytes per file        (size it for READ latency and for
+                                                          memory -- keep buffer <20k rows;
+                                                          files land SMALLER on disk, by
+                                                          whatever compression achieved)
 local_retention        local table window                 (> longest hot lookback, with margin; 0 = evict on upload)
 wal_replication        continuous WAL shipping for RPO    (off by default; §3a)
 snapshot_retention     snapshot expiry floor              (> longest scan)
-compact_below          compact files under this size      (e.g. 0.5 x target_size)
 compact_min_files      minimum adjacent files to compact  (e.g. 4)
 sort_by                within-file sort order              (capture default: event_ts, key)
 ```
@@ -899,7 +910,8 @@ The consequence worth planning for is that local disk holds roughly
    **The file is staged, not sealed.** It is raw input to the same local
    normalise-then-upload path as a seal's output, so an oversized one is split before it is
    ever registered — the mirror of a quiet stream's undersized file being merged before
-   upload. §6 is merge-only, selecting files *under* `compact_below`, so the split is an
+   upload. §6 is merge-only, selecting files that together hold *under* `target_size`, so
+   the split is an
    addition: the same `overwrite` on the same offset-range filter, emitting N files instead
    of one, with step 3's row-count-and-min/max verification unchanged. Bulk ingest is what
    creates the requirement — a seal cannot emit an oversized file, since `target_size`
@@ -1246,7 +1258,8 @@ The consequence worth planning for is that local disk holds roughly
    config.
 
    **A file-count component remains**, and it is the honest residual: 43.2 ms to 86.3 ms as
-   files went 40 to 240 with snapshots pinned at one. §6 selects files *under* `compact_below`,
+   files went 40 to 240 with snapshots pinned at one. §6 selects files holding *under*
+   `target_size`,
    so a file compaction has already produced at or above that size is never revisited —
    compaction bounds how many *small* files exist and cannot reduce the total. Eviction is the
    only mechanism that removes a large file, and §8 makes `local_retention = None` the default,
@@ -1254,7 +1267,7 @@ The consequence worth planning for is that local disk holds roughly
    first claimed, and for a reason now named.
 
    Worth measuring before choosing a fix, since the options differ in shape: raising
-   `compact_below` over time so yesterday's output is tomorrow's input, tiered compaction, or
+   `target_size` over time so yesterday's output is tomorrow's input, tiered compaction, or
    the honest possibility that unbounded local retention is not a supported configuration.
 
    ### Registering files without pyiceberg's commit path
@@ -1721,7 +1734,7 @@ storage that Iceberg does not know about.
 Compaction (§6) needs no change in principle, since re-sorting an offset range carries the
 bytes along. It does change in cost: compaction now reads blob bytes rather than only Parquet
 metadata and small columns. Streams with blob fields should therefore get a separate, lower
-`compact_below`, or the pass will move far more data than the file-count problem justifies.
+`target_size`, or the pass will move far more data than the file-count problem justifies.
 
 ---
 
@@ -1732,10 +1745,10 @@ metadata and small columns. Streams with blob fields should therefore get a sepa
 | §2 Layout | Buffer holds no blob bytes. Adds an internal `{name}_staged` bit per blob field, in the buffer table only — never in the Iceberg schema. |
 | §3 Write path | Adds the staging write and the fsync ordering (§15.3). |
 | §4 Seal | Adds materialization (step 2), the staging sweep (step 5), and sort-by-key-then-permute. |
-| §6 Compaction | Unchanged in logic; needs a separate `compact_below` for blob streams. |
+| §6 Compaction | Unchanged in logic; needs a separate size bound for blob streams. |
 | §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `litelink_offset` must be quoted. |
 | §8 Retention | Unchanged. Blobs inherit it. |
-| §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_below`; `target_size` raised. |
+| §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_size`; `target_size` raised. |
 
 ---
 
