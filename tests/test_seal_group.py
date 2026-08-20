@@ -10,6 +10,7 @@ appender, in the transaction that crosses it.
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -457,3 +458,38 @@ def test_a_retried_seal_takes_a_new_name_and_queues_the_old(tmp_path: Path) -> N
         assert abandoned in log._buffer.queued_deletions(), (
             "the abandoned file is on disk and reachable from nothing"
         )
+
+
+def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
+    """The window between the lease check and the commit, closed.
+
+    A fence cannot be atomic with an Iceberg commit — the compare-and-swap
+    knows nothing of our lease — so a writer that loses the lease in those
+    milliseconds could still register. With per-attempt names its commit no
+    longer collides, so it succeeded, and the range landed in the table twice.
+
+    Iceberg was already serialising the two: one CAS moves the pointer and the
+    other raises. What defeated it was our own retry, which reloaded and tried
+    again. The commit now declines a range the table already covers, so the
+    loser's retry does nothing — and a writer arriving afterwards never
+    attempts at all.
+    """
+    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(60))
+        end = log.seal()
+
+        assert end is not None
+        assert log.table_files() == 1
+        assert log.table_rows() == 60
+
+        # A lapsed writer, waking with its own file already written, commits.
+        second = log._layout.seal_path(1, end, "lapsed")
+        dest = log._layout.absolute(second)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(log._table.data_files()[0].path, dest)
+
+        log._table.register(str(dest), sealed_through=end)
+
+        assert log.table_files() == 1, "a second file for the same range landed"
+        assert log.table_rows() == 60, "rows were duplicated"

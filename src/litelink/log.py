@@ -844,7 +844,10 @@ class Log:
             msg = "lost the seal lease before committing"
             raise RuntimeError(msg)
 
-        self._table.register(str(dest))
+        # `end` passed so the commit can decline if the range is already in
+        # the table. The lease check above is the fence; this is what makes a
+        # failure of that fence harmless rather than a duplicate.
+        self._table.register(str(dest), sealed_through=end)
 
     def seal_due(self) -> int | None:
         """Seal everything the policy says is ready. Returns the last end, or None.

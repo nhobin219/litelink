@@ -342,9 +342,18 @@ Silent duplicate rows are worse than the torn file this was meant to fix. So the
 is fenced explicitly on the lease, immediately before it, and `finish_seal` clears only
 the claim it is handed so a lapsed writer cannot wipe its successor's record.
 
-A window of milliseconds remains between that check and the commit. It cannot be closed
-from here — Iceberg's compare-and-swap knows nothing of our lease — and it sits against a
-30 s TTL that a writer must already have blown through.
+A fence can never be atomic with an Iceberg commit — the compare-and-swap knows nothing
+of our lease — so the check leaves a window of milliseconds. **What closes it is not a
+tighter fence but Iceberg's own serialisation.** Two racing writers both
+compare-and-swap against the same pointer; one moves it and the other raises. That was
+already correct, and what defeated it was our retry: reloading and trying again, which
+succeeded because per-attempt names no longer collide.
+
+So the commit declines a range the table already covers, re-checked on every attempt
+because `_commit` reloads between them. The loser's retry now does nothing, and a writer
+arriving after the winner never attempts at all. The lease fence remains as the thing
+that stops the work early; this is what makes a failure of that fence harmless rather
+than a duplicate.
 
 **Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
 {`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
