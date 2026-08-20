@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Provision the DuckDB extensions the read path needs.
 
-SPEC §7 reads through `iceberg_scan` plus the `sqlite` scanner. Neither is
+SPEC §7 reads through `iceberg_scan`, which needs `avro` too. Neither is
 compiled into the duckdb wheel — of what the read path touches, only `parquet`
 is statically linked — so DuckDB fetches them from extensions.duckdb.org the
 first time a query names one. That download is silent, and it happens on the
@@ -38,13 +38,17 @@ from pathlib import Path
 
 import duckdb
 
-# The §7 read path: iceberg_scan for the table leg, the sqlite scanner for the
-# buffer leg. Both legs run in one engine, so both are needed for any read.
+# The §7 read path: iceberg_scan for the table leg. The buffer leg is NOT read
+# by DuckDB — the `sqlite_scanner` was removed from this list because attaching
+# the buffer put it under two independently linked SQLite libraries in one
+# process and corrupted it; see `Buffer.rows_above`. It is handed to DuckDB as
+# Arrow instead, which needs no extension.
+#
 # `avro` is iceberg's dependency, not a choice: iceberg's init function
 # auto-installs it, so a machine with network never notices it is missing.
 # Installing it explicitly is what makes a vendored directory complete —
 # without it, `LOAD iceberg` with autoinstall disabled fails asking for avro.
-READ_PATH = ("iceberg", "avro", "sqlite_scanner")
+READ_PATH = ("iceberg", "avro")
 
 # The archive tier (§5). Local-first capture never loads this, which is why it
 # is opt-in rather than part of the required set.

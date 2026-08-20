@@ -452,6 +452,9 @@ sqlite_scanner   REPOSITORY
 httpfs           REPOSITORY
 ```
 
+`sqlite_scanner` is no longer provisioned — the buffer leg is not read through DuckDB at
+all. See "Two SQLite libraries in one process" below.
+
 A `REPOSITORY` extension is fetched from extensions.duckdb.org the first time a query names
 it, and the fetch is silent. **So the first read on a fresh machine is a network read** — at
 precisely the point the design claims to be offline. It does not degrade gracefully either:
@@ -967,7 +970,82 @@ The consequence worth planning for is that local disk holds roughly
    buffer rows. But only step 3 writes the buffer, and it is explicitly garbage collection
    rather than correctness; the expensive step *reads*, which WAL permits alongside a writer.
 
-   Options, none chosen:
+   **A lease per resource is built**, and the seal is the operation that uses it. `sealing`
+   belongs to whoever holds the `seal` role and `compacting` to whoever holds `maintain`, so
+   recovery replays only what it owns — which is the hazard above, resolved.
+
+   Nothing configures where the sealer runs, because nothing in the library runs one.
+   `seal_due()` drains the queue and applies `max_age`; `maintain()` calls it and then
+   compacts, evicts and expires. Both are plain methods on their caller's schedule, and
+   if another owner holds the lease the call is refused and returns rather than
+   duplicating the work.
+
+   An earlier design had `seal_mode` ("background" | "inline" | "none") and `seal_poll`,
+   with `extend()` starting a daemon thread. That existed only because sealing used to sit
+   on the append path — "where does this expensive thing run" was a real question. Once the
+   cut moved into the append transaction, sealing became draining, which is what
+   `maintain()` already was, and the asymmetry had no defence: there was never a
+   `maintain_mode` or a `maintain_poll`. Removing it also removed a library that started
+   threads behind its caller, which is how two of §13.6's bugs stayed hidden.
+
+   **An explicit `seal()` records its cut unconditionally.** Cutting only when the queue
+   was empty made the method's effect depend on how far behind a sealer was: the caller's
+   rows went uncut, an older group was sealed instead, and the call could return None
+   having sealed nothing. Eight appends and eight seals produced seven files, one holding
+   two appends' worth of rows — the same calls, a different data layout, decided by a
+   race. The lease decides who *writes* a file, never where it is cut, so `seal()` now
+   reports the cut regardless of who writes it and `await_seal()` is what blocks until
+   the table has moved.
+
+   **Two roles, but not necessarily two processes.** `seal` and `maintain` are separately
+   leased so they *can* be split, and the shipped shape does not split them: one writer,
+   and one storage process holding both. They are the same kind of work — off the hot path,
+   committing to the same Iceberg table, neither latency-critical the way an append is — so
+   sharing a GIL between them costs nothing that matters, while separating them costs
+   something real. `_table_lock` serialises a seal's commit against a maintenance pass
+   *within* a process and nothing does across processes, so two storage processes race on
+   Iceberg's `write.metadata.delete-after-commit` cleanup and each warns about metadata the
+   other already removed. Splitting them is then a deployment decision needing no code
+   change, worth making only once compaction delays seals enough to matter — and a delayed
+   seal costs latency rather than file size, because the cut was recorded when the rows
+   arrived.
+
+   ### An async API, not built
+
+   `fsync` cannot run on an event loop, so an `async` caller reaches this library through
+   `asyncio.to_thread` — which is already supported and tested (see the concurrency
+   contract in `docs/RUNTIME.md`): a pool hands out a different thread each call, and
+   nothing here demands thread affinity.
+
+   What is *not* built is the API that would make that ergonomic. `await log.append(...)`,
+   `await log.seal_due()`, and above all `await log.await_seal()` — whose name already
+   describes an awaitable and whose current implementation is a sleep-poll loop that an
+   event loop would rather own. A capture feed arriving over a websocket is asyncio by
+   construction, so the wrapper is worth having.
+
+   Deliberately deferred rather than forgotten. It is a surface decision — sync core with
+   an async facade, or async all the way down — and it should be made when the API has
+   users to be broken, not stacked onto the change that made the core coherent.
+
+   **A lease statement must be its own transaction.** The buffer connection is shared and
+   every write on it takes `Buffer._lock` around an explicit `BEGIN IMMEDIATE`, so a lease
+   statement issued *without* that lock lands inside whatever transaction happens to be
+   open — an append's — and commits or rolls back with it. A rolled-back append then took
+   the lease row with it, leaving its holder believing it held a role the table no longer
+   recorded. Observed as two sealers writing the same file, with pyiceberg refusing the
+   second: `Cannot add files that are already referenced by table`. `Lease` therefore
+   carries the lock as well as the connection, and holding it is what guarantees the
+   connection is in autocommit so that one statement is one transaction.
+
+   **The lease is the only exclusion mechanism**, threads included. It works for both
+   because an owner is a UUID minted per acquisition rather than per `Log`, so two threads
+   calling `seal()` are two owners and the second loses on the same row that would refuse
+   another process. An owner fixed per `Log` would be re-entered by every thread sharing it,
+   and an owner derived from the pid or thread ident would be worse than useless: both are
+   reused after their holder exits, so a new arrival could inherit a dead one's identity and
+   re-enter a lease it never took.
+
+   The remaining options, none chosen:
 
    - **Leave it in-process and seal on a background thread.** Avoids every open item above —
      no leases, no recovery-ownership question, no signalling — because there is still one
@@ -983,8 +1061,22 @@ The consequence worth planning for is that local disk holds roughly
      lock contention.
 
      So: a second connection, the lock held only for steps 1 and 3, and a guard against two
-     seals in flight. The cost is that step 3 is deferred by one seal's duration rather than
-     by a poll interval, which is the narrowest version of the window below.
+     seals in flight. **Built, and it is necessary but not sufficient.** Measured with it in
+     place: the lock is held 3.1 ms of a 48 ms seal, exactly as intended — and an appending
+     thread still stalls, because the lock was never the whole problem.
+
+     **The rest is the GIL.** A seal is CPU-bound in pure Python — 80% of its commit is
+     pyiceberg deep-copying `TableMetadata` (§13.7) — so the sealing thread starves the
+     appending one whether or not it holds a lock. Demonstrated by moving nothing but
+     `sys.setswitchinterval`: at Python's 5 ms default the worst append was 45.2 ms, at 0.1 ms
+     it was 6.4 ms, against a no-seal control of 5.7 ms. Contention spreads rather than
+     concentrates, so a background seal can show a *worse* p99 than an inline one while
+     improving the maximum.
+
+     A library has no business setting a process-wide switch interval, so the lever is the CPU
+     cost itself. §16 removes the deep copy; running the seal in a separate process would too,
+     which is one more thing the multi-process question above is worth to this one. **The
+     ordering matters: this option is gated on §16, not independent of it.**
    - **A lease per role**, writer and maintainer, each recovering its own intents. Simple to
      state, but the split is coarser than what is actually exclusive, and it forces sealing
      to sit on whichever side owns the buffer.
@@ -994,13 +1086,31 @@ The consequence worth planning for is that local disk holds roughly
    - **Move sealing to maintenance entirely**, handing step 3 back to whoever holds the buffer
      write lease.
 
+   **What the built background seal does and does not port.** Its durable half is already
+   process-agnostic: `sealing` records the intent before the work and recovery replays it
+   without caring which process wrote it (I16). Its runtime half is entirely Python-local, so
+   it is thread-portable and not process-portable, and the gap is four named things:
+
+   | | lives in | breaks across processes as |
+   |---|---|---|
+   | the one-seal-at-a-time guard | a Python bool | both processes seal; `claim_seal` does DELETE-then-INSERT unconditionally, so the second overwrites the first's claim rather than being refused |
+   | the wake-up and completion signals | `threading.Event` | no cross-process equivalent |
+   | the buffer and table locks | `RLock` | no mutual exclusion; SQLite serialises individual writes but not multi-statement transactions |
+   | the buffered-size counter | an in-memory integer | the seal trigger's only input, and it neither exists in another process nor decrements when one seals |
+
+   Each maps onto an option already listed: the guard wants a lease, the signals want a queue
+   table or a watermark, and the counter is the sub-question below. Nothing about the durable
+   protocol needs revisiting — only who decides to seal, and how they are told.
+
    Open sub-questions the last option raises, and probably the reason to be careful:
 
    - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
      free because the writer already knows the buffer grew. A maintainer would poll. The
      `max_age` branch is time-based and would not care, but it is not wired up at all today.
-   - **The size counter is per-process.** The seal trigger reads an in-memory byte count the
-     appending process maintains; rows removed by another process would not decrement it.
+   - ~~**The size counter is per-process.**~~ **Resolved by `seal_group`.** The running
+     total lives in the open queue row and is written in the same transaction as the rows
+     it accounts for, so any process reads it with a keyed read of one row — and there is
+     no second, in-memory copy to disagree with it.
    - **Deferring step 3 widens a window that is currently narrow.** It is safe by §7's
      boundary at any width, and it *should* be free: the boundary already excludes sealed
      rows, so a row awaiting deletion is one the read has no reason to touch. Persistence,
@@ -1013,19 +1123,45 @@ The consequence worth planning for is that local disk holds roughly
      range; SQLite given the same predicate answers with
      `SEARCH buffer USING INTEGER PRIMARY KEY (rowid>?)` in 1.0 ms against 17.1 ms attached.
 
-     **Fixed by pushing the predicate down.** `sqlite_query('buf', …)` hands the boundary to
-     SQLite instead of filtering above the scan: measured on the buffer leg in isolation,
-     31.6 ms against 8.1 ms returning 1,000 rows from a 61,000-row buffer. End to end the
-     win is smaller and easily lost in noise, because the Iceberg leg dominates at these
-     sizes — the point is not the average read, it is that a deferred delete no longer
-     inflates one.
+     **Fixed by pushing the predicate down**, and then by removing DuckDB from the buffer
+     leg entirely. The predicate still goes to SQLite — `SEARCH buffer USING INTEGER
+     PRIMARY KEY (rowid>?)` — but through the library's own connection, because
+     `sqlite_query('buf', …)` turned out to be unsafe at any speed.
 
-     The cost is that `binary` columns are unsupported until §15 lands, because
-     `sqlite_query` decodes blob bytes as UTF-8 and fails, with or without a CAST. That is a
-     smaller loss than it appears and arguably a signal: the target workload is tabular JSON
-     off a websocket, where the payload is text, and §15's design already has binary payloads
-     **bypass** the buffer rather than travel through it. The mechanism refusing to carry
-     blobs through SQLite and the extension routing them around SQLite point the same way.
+   ### Two SQLite libraries in one process
+
+   `ATTACH '<buffer.db>' (TYPE sqlite)` corrupted the buffer. DuckDB's sqlite extension
+   carries its OWN statically linked SQLite, so the file was managed by two independent
+   SQLite libraries inside one process. Each keeps private, process-local state: a table of
+   open descriptors (to work around POSIX advisory locks being per process and per inode,
+   so that closing any descriptor drops all of that process's locks on the file) and the
+   coordination for WAL's shared-memory index. Neither is shared between libraries, so the
+   reader and the writer stopped being serialised against each other.
+
+   Measured, on the ordinary shape of a scan concurrent with appends:
+
+   | reader | result |
+   |---|---|
+   | same process, via `sqlite_query` | corrupt on the FIRST scan; `integrity_check` fails afterwards |
+   | separate process, via `Log.open(read_only=True)` | 327 scans, clean |
+   | same process, strictly sequential append→scan | 300 iterations, clean |
+
+   The symptoms were `database disk image is malformed` and, when the torn mapping was the
+   `-shm` index, `SIGBUS`. Cross-process is exactly the case WAL is designed for; two
+   libraries inside one process is not, and no attach option, pragma or locking mode
+   reconciles them.
+
+   **The buffer leg is therefore read through the connection that already owns the file**
+   and handed to DuckDB as Arrow, converted incrementally: rows are immutable once
+   committed, arrive only above the last one, and leave only as a prefix at a seal, so a
+   query converts its own delta and slices the rest zero-copy. That is also *faster* than
+   the attached version, which re-read the whole buffer per query — 25.6 ms against
+   46.0 ms with 20,000 sealed and 20,000 buffered rows and 200 rows appended between scans.
+
+     `binary` columns remain unsupported until §15 lands, though no longer for this reason:
+     the target workload is tabular JSON off a websocket, where the payload is text, and
+     §15's design already has binary payloads **bypass** the buffer rather than travel
+     through it.
 
    ### What `max_age` needs to know, and how little that is
 
@@ -1043,11 +1179,20 @@ The consequence worth planning for is that local disk holds roughly
    internal state constrains it"*. A `litelink_ts` in the buffer table only, never in the
    Iceberg schema, sits on the same side of that line.
 
-   **But it may not be needed at all.** §12 does not say what `max_age` is the age *of*, and
-   the cheapest reading needs no per-row data: it bounds how long data may sit unsealed, so
-   the quantity is the age of the **oldest unsealed row** — one value, written when the
-   buffer goes from empty to non-empty, cleared at seal. A `meta` key, O(1), no column
+   **It was not needed at all, and this is now built.** §12 does not say what `max_age` is
+   the age *of*, and the cheapest reading needs no per-row data: it bounds how long data may
+   sit unsealed, so the quantity is the age of the **oldest unsealed row** — one value,
+   written when the buffer goes from empty to non-empty, cleared at seal. O(1), no column
    anywhere, no §2 argument to have.
+
+   That value is `seal_group.opened_at`, stamped by the **first row** to land in a group and
+   null while the group is empty. A sealer closes an aged group on its own poll, which is
+   what a quiet stream needs: until this existed `max_age` was dead config — a field that
+   was validated, persisted and round-tripped through `open`, and that nothing ever read —
+   so a low-rate stream never sealed at all and its rows stayed in SQLite indefinitely.
+
+   Stamping the group's *creation* instead would seal a one-row file the moment an idle
+   group finally received a row, which is the pathology §6 exists to clean up after.
 
    The per-row version buys exactly one thing over that: a **partial** seal, cutting at the
    last row older than `max_age` instead of sealing everything present. Sealing everything is

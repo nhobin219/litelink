@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from datetime import date
+    pass
 
 NAMESPACE = "litelink"
 
@@ -72,18 +72,49 @@ class Layout:
         """
         return (self.root / self.name, self.root / f"{NAMESPACE}.db" / self.name)
 
-    def seal_path(self, start: int, end: int, day: date) -> str:
+    def seal_path(self, start: int, end: int, token: str) -> str:
         """Root-relative path for a seal covering `[start, end)` (§4).
 
-        The date is passed in rather than read from the clock, so the caller
-        that persists this path is the one that chose it. Recomputing it later
-        could land in a different day's directory and strand the first file.
-        """
-        return f"{self.name}/data/{day.isoformat()}/{start}-{end}.parquet"
+        `token` makes it unique per ATTEMPT, not per range. The name was once
+        derived from the range alone, on the reasoning that a retry should
+        overwrite in place and strand nothing — but recovery never recomputes
+        it, it reads it back from `sealing`, so determinism bought nothing and
+        cost the one thing it appeared to prevent. A writer stalled past its
+        lease and the owner that took over both wrote that single name, and
+        `pq.write_table` truncates on open, so the file became a blend of two
+        writers with one of them committing it.
 
-    def compaction_path(self, lo: int, hi: int) -> str:
-        """Root-relative path for the merge of the offset range `[lo, hi]` (§6)."""
-        return f"{self.name}/data/compacted/{lo}-{hi}.parquet"
+        Unique names alone would trade that for an untracked file, which is
+        worse. They come with the rule that a superseded attempt is queued in
+        `pending_delete` before its claim is replaced — see `_recover_seal`.
+
+        No date directory. Seals used to be grouped by the day they were
+        written, which nothing read: the table is unpartitioned, Iceberg finds
+        files by the path in its manifests, and no code here ever lists a
+        directory — that refusal is the whole reason `pending_delete` exists.
+        What the grouping did produce was a way to strand a file, by
+        recomputing a path across midnight and landing somewhere else.
+        Compaction outputs were never dated, which is the tell.
+        """
+        return f"{self.name}/data/{start}-{end}-{token}.parquet"
+
+    def compaction_path(self, lo: int, hi: int, token: str) -> str:
+        """Root-relative path for the merge of the offset range `[lo, hi]` (§6).
+
+        `token` makes it unique per attempt, and unlike a seal's path it does
+        NOT need to be derivable: `compacting` records it before the file
+        exists, so recovery reads the name rather than recomputing it.
+
+        Uniqueness is the point. A deterministic `{lo}-{hi}` meant a compaction
+        whose inputs were themselves a previous compaction of the same range
+        wrote to the path it was reading — `set_sort_by(rewrite=True)` after
+        any compaction truncated the live, table-referenced file, and a crash
+        mid-write destroyed the only copy of those rows. It also meant two
+        owners racing the role wrote one file. A seal can overwrite in place
+        because its source is the buffer, which is still there; a compaction's
+        source is the file it is replacing.
+        """
+        return f"{self.name}/data/compacted/{lo}-{hi}-{token}.parquet"
 
     def absolute(self, rel_path: str) -> Path:
         return self.root / rel_path
