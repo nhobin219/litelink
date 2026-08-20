@@ -186,9 +186,27 @@ class LogTable:
     # -- state ------------------------------------------------------------
 
     def reload(self) -> None:
-        table = self._catalog.load_table(self._layout.table_id)
+        """Point at the current snapshot, never at an older one.
+
+        The load happens INSIDE the lock, which looks like holding a mutex
+        across I/O for no reason and is not. Loading outside it and assigning
+        after let two concurrent reloads land in completion order rather than
+        snapshot order: a slow load of an older snapshot finishing last
+        installs it, and the handle goes backwards.
+
+        A reader then straddles the regression. `_query` resolves a floor from
+        the newer snapshot, reads the buffer tail above it, and resolves again
+        — landing on the older one. Its table leg scans the older snapshot
+        while its buffer leg holds only rows above the newer boundary, so
+        everything in between is in neither: rows silently missing from the
+        answer, which is the failure this whole read path is arranged to make
+        impossible.
+
+        A catalog resolve is ~0.5 ms and reads already serialise on the
+        reader's own lock, so ordering costs nothing worth having.
+        """
         with self._lock:
-            self._table = table
+            self._table = self._catalog.load_table(self._layout.table_id)
 
     @property
     def metadata_location(self) -> str:
