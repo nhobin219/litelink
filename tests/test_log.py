@@ -355,7 +355,7 @@ def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
     """
     import threading
 
-    config = LogConfig(target_size=2048, compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_size=2048, compact_min_files=2)
     failures: list[BaseException] = []
     stop = threading.Event()
 

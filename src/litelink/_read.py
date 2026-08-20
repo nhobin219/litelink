@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import duckdb
 import pyarrow as pa
 
+from litelink._archive import Archive
 from litelink._types import column_type
 
 if TYPE_CHECKING:
@@ -63,12 +64,19 @@ class Reader:
         buffer: Buffer,
         schema: pa.Schema,
         connect: Callable[[], duckdb.DuckDBPyConnection],
+        archive: Archive | None = None,
     ) -> None:
         self._layout = layout
         self._table = table
         self._buffer = buffer
         self._schema = schema
         self._connect_to = connect
+        # The shared archive object, not a table handle: it opens the table on
+        # first use, so a reader that never passes `include_archive` never
+        # touches the network (I5), and `Log.set_archive` re-points this same
+        # object rather than leaving the reader holding a stale one.
+        self._archive = archive if archive is not None else Archive(layout)
+        self._remote_ready = False
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -78,7 +86,51 @@ class Reader:
         # connection would swap each other's buffer leg.
         self._lock = threading.Lock()
 
-    def query(self, sql: str) -> pa.RecordBatchReader:
+    def _prepare_remote(self, cursor: duckdb.DuckDBPyConnection) -> str | None:
+        """Load httpfs, install the credentials, return the archive's pointer.
+
+        None when there is no archive or it holds nothing yet, which is the
+        signal to build the union without a third leg rather than to fail.
+        """
+        archive = self._archive.table()
+        if archive is None:
+            return None
+
+        archive.reload()
+        if archive.is_empty():
+            return None
+
+        if not self._remote_ready:
+            # Once per connection. `httpfs` is not in the local read path, so a
+            # log that never opts in never pays for it — §7's rule that a hot
+            # read is offline.
+            self._connect().execute("LOAD httpfs")
+            self._remote_ready = True
+
+        options = self._archive.s3.resolved()
+        parts = ["TYPE s3"]
+        if options.access_key is not None:
+            parts.append(f"KEY_ID '{options.access_key}'")
+
+        if options.secret_key is not None:
+            parts.append(f"SECRET '{options.secret_key}'")
+
+        if options.region is not None:
+            parts.append(f"REGION '{options.region}'")
+
+        if options.endpoint is not None:
+            # DuckDB wants host:port with the scheme carried by USE_SSL, unlike
+            # pyiceberg which takes a URL. One S3Options, two spellings.
+            without_scheme = options.endpoint.split("://", 1)[-1]
+            parts.append(f"ENDPOINT '{without_scheme}'")
+            parts.append(f"USE_SSL {str(options.endpoint.startswith('https')).lower()}")
+            parts.append("URL_STYLE 'path'")
+
+        cursor.execute(f"CREATE OR REPLACE SECRET litelink_s3 ({', '.join(parts)})")
+
+        return archive.metadata_location
+
+    def query(self, sql: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
 
         The relation is rebuilt per call and cannot be held across calls.
@@ -119,6 +171,7 @@ class Reader:
             cursor = self._connect().cursor()
 
         cursor.register(BUFFER_REL, tail)
+        remote = self._prepare_remote(cursor) if include_archive else None
 
         # Resolving per query is §7's rule. Both halves in one call, or a
         # commit between them pairs a new snapshot with an old boundary.
@@ -129,13 +182,16 @@ class Reader:
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
         # over an already-registered relation is cheap.
         cursor.execute(
-            f"CREATE OR REPLACE TEMP VIEW {VIEW} AS {self._union(location, extent)}"
+            f"CREATE OR REPLACE TEMP VIEW {VIEW} AS "
+            f"{self._union(location, extent, remote)}"
         )
         reader = cursor.execute(sql).to_arrow_reader()
 
         return _cast_to(reader, self._schema)
 
-    def _union(self, location: str, extent: tuple[int, int] | None) -> str:
+    def _union(
+        self, location: str, extent: tuple[int, int] | None, remote: str | None = None
+    ) -> str:
         """The hot read: the local table, plus the buffer above its extent.
 
         `location` is passed rather than re-read, so the snapshot scanned and
@@ -152,21 +208,35 @@ class Reader:
             for c in columns
         )
 
-        if extent is None:
-            # Nothing sealed yet, so there is no boundary to derive and no table
-            # to union — every row is still in the buffer.
-            return f"SELECT {casts} FROM {BUFFER_REL} b"
-
         projection = ", ".join(f'"{c}"' for c in columns)
-        # Applied here as well as pushed into SQLite. The registered tail was
-        # read against an earlier floor, so it can still hold rows this
-        # snapshot has since taken ownership of; without this they would appear
-        # in both legs.
-        return (
-            f"SELECT {projection} FROM iceberg_scan('{location}')"
-            f" UNION ALL SELECT {casts} FROM {BUFFER_REL} b"
-            f' WHERE b."{OFFSET}" > {extent[1]}'
-        )
+        buffered = f"SELECT {casts} FROM {BUFFER_REL} b"
+        if extent is None:
+            # Nothing sealed locally. The archive can still hold history — a
+            # log evicted down to nothing is §8's `local_retention=0` shape —
+            # and then everything local is in the buffer.
+            if remote is None:
+                return buffered
+
+            return f"SELECT {projection} FROM iceberg_scan('{remote}') UNION ALL {buffered}"
+
+        legs = []
+        if remote is not None:
+            # Strictly below what the local table holds. `extent[0]` is the
+            # oldest offset still local, so anything at or above it is served
+            # from disk rather than over the network.
+            legs.append(
+                f"SELECT {projection} FROM iceberg_scan('{remote}')"
+                f' WHERE "{OFFSET}" < {extent[0]}'
+            )
+
+        legs.append(f"SELECT {projection} FROM iceberg_scan('{location}')")
+        # The buffer bound is applied here as well as pushed into SQLite. The
+        # registered tail was read against an earlier floor, so it can still
+        # hold rows this snapshot has since taken ownership of; without this
+        # they would appear in both legs.
+        legs.append(f'{buffered} WHERE b."{OFFSET}" > {extent[1]}')
+
+        return " UNION ALL ".join(legs)
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         """The connection, built on first read and kept.

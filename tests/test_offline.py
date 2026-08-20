@@ -134,8 +134,7 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
         ])
         config = LogConfig(
             target_size=4096,
-            compact_below=1 << 20,
-            compact_min_files=2,
+                compact_min_files=2,
             snapshot_retention=timedelta(microseconds=1),
         )
         rows = [
