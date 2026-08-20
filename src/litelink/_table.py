@@ -477,14 +477,46 @@ class LogTable:
 
                 return
 
-    def register(self, path: str) -> None:
+    def register(self, path: str, sealed_through: int | None = None) -> None:
         """Add an already-written file to the table (§4 step 2).
 
         `add_files` rather than `append`: pyiceberg's append writes the file
         itself and commits afterwards, so a crash in between orphans a file
         under a name nothing recorded — exactly what I2 exists to prevent.
+
+        `sealed_through` is the exclusive end of the range this file covers,
+        and passing it makes the commit a no-op if the range is already in the
+        table. That is what closes the race two owners can otherwise win.
+
+        Iceberg already serialises them: both compare-and-swap against the same
+        pointer, one moves it, the other raises `CommitFailedException`. What
+        broke it was OUR retry — reloading and trying again, which succeeds,
+        because per-attempt names mean the second file does not collide with
+        the first. The CAS was doing its job and we were overriding it.
+
+        Re-checked on every attempt rather than once, because `_commit` reloads
+        between them: the loser's retry now sees the winner's file covering its
+        range and does nothing. Both orderings are safe — a writer that reloads
+        after the winner never attempts at all.
         """
-        self._commit(lambda: self._table.add_files([path]))
+
+        def add() -> None:
+            if sealed_through is not None and self._covers(sealed_through):
+                return
+
+            self._table.add_files([path])
+
+        self._commit(add)
+
+    def _covers(self, sealed_through: int) -> bool:
+        """Whether the table already holds everything below `sealed_through`.
+
+        Data files cover contiguous, non-overlapping offset ranges (§4), so the
+        extent's upper bound answers this on its own.
+        """
+        extent = self.extent()
+
+        return extent is not None and extent[1] >= sealed_through - 1
 
     def replace_range(self, lo: int, hi: int, path: str) -> None:
         """Swap `[lo, hi]` for one already-written file, in one snapshot (§6).
