@@ -17,6 +17,7 @@ from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
 
+from litelink._fs import fsync
 from litelink._predicates import offset_at_or_below, offset_between
 from litelink._s3 import S3Options
 
@@ -561,6 +562,38 @@ class LogTable:
         output = self._table.io.new_output(destination)
         with output.create(overwrite=True) as writing:
             writing.write(payload)
+
+    def fetch(self, path: str, destination: Path) -> None:
+        """Download a file out of this table's warehouse. Inverse of `put`.
+
+        Through the catalog's own FileIO for the same reason `put` is: the
+        credentials that reach the archive are the ones the table was opened
+        with, so there is no second client to configure and no way to read from
+        somewhere the table does not point.
+
+        Whole-file, not streamed. These are `target_size` files, the same
+        amount a seal holds in memory to write one, and the caller is an
+        explicit operation rather than anything on a read path.
+        """
+        payload = self._table.io.new_input(path).open().read()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Written under a temporary name and renamed, so a crash cannot leave a
+        # short file under a name the table is about to reference. Rename is
+        # atomic within a directory; the fsync is what makes the bytes precede
+        # it (§2).
+        staged = destination.with_name(f"{destination.name}.partial")
+        staged.write_bytes(payload)
+        fsync(staged)
+        staged.replace(destination)
+
+    def key(self, path: str) -> str:
+        """The warehouse-relative name of a file in this table.
+
+        The inverse of `uri`, and what lets an archived file be placed locally
+        under the same name it has remotely — so hydrating twice writes the
+        same path rather than accumulating copies.
+        """
+        return path.removeprefix(self._warehouse.rstrip("/") + "/")
 
     def register(self, path: str, sealed_through: int | None = None) -> bool:
         """Add an already-written file to the table (§4 step 2).
