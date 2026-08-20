@@ -318,6 +318,17 @@ out a **different thread each call**. That is why the buffer opens its connectio
 affinity would make the library unusable from asyncio, which is where a websocket feed
 lives.
 
+**One residual race, stated rather than hidden.** A seal writes its Parquet file to a
+path fixed before the file exists (I2), so a replay writes the same name. The lease is
+renewed either side of that write and a lost lease aborts the seal, which leaves one
+window: a `pq.write_table` that outlasts the whole 30 s TTL while another owner takes the
+role and writes the same path. The usual fix — stage to a unique temporary name and
+rename — is refused here, because a crash between writing and renaming would leave a file
+on disk that SQLite cannot name, and every reclamation path in this design depends on
+never needing a directory scan to find one. A single group is one `target_size` file; a
+write that takes 30 s means the machine is in trouble, and the seal stopping is the right
+answer then too.
+
 **Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
 {`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
 acquiring one another, and nothing below reaches back up, so there is no cycle to

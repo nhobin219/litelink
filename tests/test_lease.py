@@ -278,3 +278,33 @@ def test_a_writer_defers_to_a_sealer_in_another_process(tmp_path: Path) -> None:
 
         assert log.seal() == 401, "did not take the role back once free"
         assert log.table_files() == 1, "the queued cut was never written"
+
+
+def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
+    """Every exit from a seal releases, including the one that only recovers.
+
+    The replay path returns early, and returning early past the release left
+    the seal role dead for its whole TTL: the drain loop above it exits with
+    groups still queued and nothing able to pick them up for 30 seconds.
+    """
+    import datetime as dt
+
+    config = LogConfig(target_size=1 << 30)
+    with open_log(tmp_path, config=config) as log:
+        log.extend(rows(50))
+
+        # A seal that committed but never retired its group.
+        log._buffer.close_open_group()
+        group = log._buffer.pending_group()
+        assert group is not None
+        start, end = group
+        path = log._layout.seal_path(start, end, dt.datetime.now(dt.UTC).date())
+        log._buffer.claim_seal(start, end, path)
+        log._write_and_commit(end, path)
+
+        assert log.seal_due() == end, "the replay did not finish the seal"
+
+        # The role must be free again immediately, not in thirty seconds.
+        taker = Lease(log._buffer._con, log._buffer._lock, "seal", new_owner())
+
+        assert taker.acquire(), "the replay path kept the seal lease"
