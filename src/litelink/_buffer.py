@@ -578,27 +578,46 @@ class Buffer:
                     table = table.combine_chunks()
 
             self._tail = table
-            self._tail_lo = floor
+            # Taken from the DATA, never from `floor`. They are not the same
+            # number: `floor` is the table's boundary, and the first buffered
+            # row above it can be higher still if a seal deleted the rows
+            # between while this was being read. Recording `floor` as though it
+            # were the row before the first made the slice arithmetic below
+            # count from a row that no longer existed, and the miscount hid
+            # buffered rows from every subsequent query — silently, because an
+            # over-long slice comes back empty rather than raising.
             if table.num_rows:
+                self._tail_lo = int(table.column(OFFSET)[0].as_py()) - 1
                 self._tail_hi = int(table.column(OFFSET)[-1].as_py())
+            else:
+                self._tail_lo = self._tail_hi = floor
 
             return table
 
     def _reusable(self, floor: int) -> pa.Table | None:
         """The cached tail with everything through `floor` dropped, or None.
 
-        The slice index is arithmetic — buffered offsets are contiguous, so
-        dropping through `floor` drops exactly `floor - _tail_lo` rows — and
-        then checked, because that contiguity is a property of AUTOINCREMENT
-        and prefix-only deletion rather than something enforced here. A failed
-        check costs a rebuild, which is what the code did unconditionally
-        before.
+        The slice index is arithmetic — cached offsets are contiguous from
+        `_tail_lo + 1`, so dropping through `floor` drops exactly
+        `floor - _tail_lo` rows — and then checked, because that contiguity is
+        a property of AUTOINCREMENT and prefix-only deletion rather than
+        something enforced here. A failed check costs a rebuild, which is what
+        the code did unconditionally before.
+
+        Both directions are checked. A wrong non-empty slice starts at the
+        wrong offset; a wrong EMPTY slice is the dangerous one, because it
+        looks exactly like "nothing buffered above the boundary" and would be
+        returned as an answer. `_tail_hi > floor` says the last cached row
+        qualifies, so an empty result contradicts the cache itself.
         """
         if self._tail is None or not (self._tail_lo <= floor <= self._tail_hi):
             return None
 
         kept = self._tail.slice(floor - self._tail_lo)
-        if kept.num_rows and int(kept.column(OFFSET)[0].as_py()) != floor + 1:
+        if kept.num_rows:
+            if int(kept.column(OFFSET)[0].as_py()) != floor + 1:
+                return None
+        elif self._tail_hi > floor:
             return None
 
         return kept
