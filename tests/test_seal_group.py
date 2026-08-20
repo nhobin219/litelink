@@ -61,10 +61,10 @@ def groups(log: Log) -> list[tuple[int, int | None, int | None, int]]:
 def quiet(**kwargs: object) -> LogConfig:
     """A config whose sealer will not act behind the test's back.
 
-    NOT `background_seal=False` — that seals INLINE on every append, which
-    retires a group before a test can look at it. A background sealer with a
-    poll it will never reach leaves the queue intact and still exercises the
-    real path. `close()` wakes it immediately, so nothing waits an hour.
+    NOT `seal_mode="inline"` — that seals on every append, retiring a group
+    before a test can look at it. A background sealer with a poll it will
+    never reach leaves the queue intact and still exercises the real path.
+    `close()` wakes it immediately, so nothing waits an hour.
     """
     return LogConfig(
         target_size=TARGET,

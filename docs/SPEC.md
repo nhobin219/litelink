@@ -974,11 +974,12 @@ The consequence worth planning for is that local disk holds roughly
    belongs to whoever holds the `seal` role and `compacting` to whoever holds `maintain`, so
    recovery replays only what it owns — which is the hazard above, resolved.
 
-   Nothing configures where the sealer runs. A writer with `background_seal` on starts a
+   Nothing configures where the sealer runs. A writer with `seal_mode="background"` starts a
    thread, that thread calls `seal()`, and if another process holds the role the call is
    refused and returns. Adding a sealer process therefore needs no change to the writer, and
-   if it dies its lease lapses and the writer takes the role back. `background_seal=False`
-   only avoids starting a thread that would lose.
+   if it dies its lease lapses and the writer takes the role back. `seal_mode="none"` only
+   avoids starting a thread that would lose; `"inline"` is a third setting that seals inside
+   the append, which a test wants and a deployment does not.
 
    **The lease is the only exclusion mechanism**, threads included. It works for both
    because an owner is a UUID minted per acquisition rather than per `Log`, so two threads

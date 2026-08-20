@@ -62,17 +62,27 @@ check: lint format-check typecheck test
 build:
     uv build
 
-# Capture into ./litelink-data, maintaining on a background thread. Ctrl-C to stop.
+# Appends only. Seals on a thread until demo-seal takes over; --no-seal skips that.
 demo-capture *args:
     uv run python examples/capture.py {{args}}
+
+# Seal in a dedicated process — off the writer's GIL. Run with demo-capture.
+demo-seal *args:
+    uv run python examples/sealer.py {{args}}
+
+# Compact, evict and expire in a dedicated process. A separate lease from the sealer.
+demo-maintain *args:
+    uv run python examples/maintainer.py {{args}}
 
 # Watch a running capture accumulate. Run alongside `just demo-capture`.
 demo-tail *args:
     uv run python examples/tail.py {{args}}
 
-# Delete a demo's captured data. The demo keeps it on purpose — tail.py reads
-# it after the writer stops, and it is there to poke at — so nothing removes it
-# automatically. The benchmarks do clean up: they run in a temp directory.
+# The demo keeps its data on purpose — tail.py reads it after the writer stops, and
+# it is there to poke at — so nothing removes it automatically. The benchmarks do
+# clean up: they run in a temp directory.
+#
+# Delete a demo's captured data.
 demo-clean root="litelink-data":
     #!/usr/bin/env bash
     set -euo pipefail

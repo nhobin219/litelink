@@ -192,8 +192,8 @@ def test_target_size_triggers_a_seal(tmp_path: Path) -> None:
 
 
 def test_a_synchronous_seal_is_available(tmp_path: Path) -> None:
-    """`background_seal=False` for callers who need the table to have moved."""
-    config = LogConfig(target_size=512, background_seal=False)
+    """`seal_mode="inline"` for callers who need the table to have moved."""
+    config = LogConfig(target_size=512, seal_mode="inline")
 
     with open_log(tmp_path, config) as log:
         log.extend(rows(40))
