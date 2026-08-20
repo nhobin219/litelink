@@ -60,6 +60,17 @@ class Layout:
         return f"file://{self.root}"
 
     @property
+    def rewrite_db(self) -> Path:
+        """Scratch buffer for an archive rewrite.
+
+        Its own file, alongside the real one rather than inside it: the rewrite
+        re-ingests archived rows through an ordinary `Buffer` to re-cut them,
+        and that buffer must not be the log's own — appends are still landing
+        there, and its offsets are the live ones.
+        """
+        return self.root / f"{self.name}-rewrite.db"
+
+    @property
     def archive_db(self) -> Path:
         """The archive catalog, kept beside the local one (§2).
 

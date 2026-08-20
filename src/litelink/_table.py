@@ -657,18 +657,23 @@ class LogTable:
 
         return extent is not None and extent[1] >= sealed_through - 1
 
-    def replace_range(self, lo: int, hi: int, path: str) -> None:
-        """Swap `[lo, hi]` for one already-written file, in one snapshot (§6).
+    def replace_range(self, lo: int, hi: int, paths: Sequence[str]) -> None:
+        """Swap `[lo, hi]` for already-written files, in one snapshot (§6).
 
         `overwrite()` would do this in a single call, but it writes the output
         itself — putting a path on disk this process only learns about
         afterwards, which is what the deletion queue exists to avoid.
+
+        Several paths because an archive rewrite re-cuts a range into however
+        many correctly sized files it takes, and the swap has to be one
+        snapshot: committing them one at a time would mean each commit deleting
+        a sub-range of a file the next commit still needs.
         """
 
         def swap() -> None:
             with self._table.transaction() as transaction:
                 transaction.delete(delete_filter=offset_between(lo, hi))
-                transaction.add_files([path])
+                transaction.add_files(list(paths))
 
         self._commit(swap)
 

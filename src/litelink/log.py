@@ -33,7 +33,12 @@ from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._lease import Lease, new_owner
-from litelink._maintenance import Maintenance, checkpoint, stable_prefix
+from litelink._maintenance import (
+    Maintenance,
+    checkpoint,
+    is_remote,
+    stable_prefix,
+)
 from litelink._read import Reader, duckdb_connection
 from litelink._s3 import S3Options
 from litelink._table import LogTable
@@ -1006,7 +1011,8 @@ class Log:
         committed — so the table is already correct and the next `maintain()`
         will pick the same run up again. All that is owed is the half-written
         output, and `compacting` names it, so removing it costs one unlink
-        rather than a directory scan.
+        rather than a directory scan — or, for an archive rewrite, one DELETE
+        rather than a paginated LIST over object storage.
         """
         pending = self._buffer.pending_compaction()
         if pending is None:
@@ -1019,9 +1025,18 @@ class Log:
         # already out of the snapshot and queued for deletion.
         self._table.reload()
 
-        _, _, rel_path = pending
-        if str(self._layout.absolute(rel_path)) not in self._table.file_paths():
-            self._layout.absolute(rel_path).unlink(missing_ok=True)
+        _, _, key = pending
+        if is_remote(key):
+            # An archive rewrite. The claim is the object's URI, so this asks
+            # the archive whether its commit landed and deletes the object if
+            # it did not — the same question as below, over different storage.
+            archive = self._archive.table()
+            if archive is not None:
+                archive.reload()
+                if key not in archive.file_paths():
+                    archive.remove(key)
+        elif str(self._layout.absolute(key)) not in self._table.file_paths():
+            self._layout.absolute(key).unlink(missing_ok=True)
 
         self._buffer.clear_compaction()
 
