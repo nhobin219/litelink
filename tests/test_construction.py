@@ -15,10 +15,12 @@ import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
+from litelink._archive import Archive
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
+from litelink._s3 import S3Options
 from litelink._table import LogTable
 from litelink.log import table_schema, validate
 
@@ -67,15 +69,22 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     buffer = Buffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
 
     config = LogConfig()
+    # Local-only, and still a real object: the reader, the maintainer and the
+    # Log are handed the same one, which is what lets `set_archive` reach all
+    # three later. `uri=None` says the slot is empty, not that there is no slot.
+    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, table_schema(SCHEMA), duckdb_connection),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
+        reader=Reader(
+            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
+        ),
+        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
+        archive=archive,
     )
 
     assert log.name == "s"
@@ -100,16 +109,20 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
     buffer = StubBuffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
     config = LogConfig()
+    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
 
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, table_schema(SCHEMA), duckdb_connection),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
+        reader=Reader(
+            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
+        ),
+        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
+        archive=archive,
     )
 
     assert log.end_offset() == 4_242

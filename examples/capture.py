@@ -34,6 +34,7 @@ from pathlib import Path
 from _stream import NAME, SCHEMA, SORT_BY, observations
 
 from litelink import Log, LogConfig
+from litelink._s3 import S3Options
 
 
 def main() -> None:
@@ -41,6 +42,22 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
     parser.add_argument("--rate", type=float, default=2000.0, help="reports per second")
     parser.add_argument("--batch", type=int, default=20, help="rows per transaction")
+    # Off by default, so the demo needs no object storage to run. `just rustfs`
+    # starts one locally and prints the URI to pass here; the same flag with an
+    # `s3://` bucket on AWS is the entire difference between the two.
+    parser.add_argument(
+        "--archive",
+        default=None,
+        help="s3:// prefix for the archive tier (see `just rustfs`)",
+    )
+    # Only meaningful with an archive: it is how long a file stays on local
+    # disk AFTER the archive has it, and I4 will not let it be evicted before.
+    parser.add_argument(
+        "--local-retention",
+        type=float,
+        default=60.0,
+        help="seconds to keep archived files locally",
+    )
     args = parser.parse_args()
 
     # Deliberately small for a demo: seal often so the reader sees the table
@@ -50,6 +67,12 @@ def main() -> None:
         target_size=256 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
+        # None without an archive, because with nowhere to push to a retention
+        # is a policy for deleting the only copy — which `Log.new` refuses to
+        # be told by accident.
+        local_retention=(
+            timedelta(seconds=args.local_retention) if args.archive else None
+        ),
     )
 
     # new() creates and takes the shape; open() recovers it. A service that
@@ -58,14 +81,31 @@ def main() -> None:
     # library rather than of the filesystem: which file proves a log exists is
     # the library's business, and an example that checked for it itself would
     # be wrong the day that changes.
+    # Credentials are never in the config, and never in the log: `S3Options()`
+    # with nothing set reads AWS_ENDPOINT_URL / AWS_ACCESS_KEY_ID /
+    # AWS_SECRET_ACCESS_KEY / AWS_REGION at the point of use. `just rustfs`
+    # prints the exports for a local endpoint.
+    s3 = S3Options()
     try:
-        log = Log.open(args.root, NAME)
+        log = Log.open(args.root, NAME, s3=s3)
         log.set_config(config)
+        log.set_archive(args.archive)
     except FileNotFoundError:
-        log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
+        log = Log.new(
+            args.root,
+            NAME,
+            schema=SCHEMA,
+            sort_by=SORT_BY,
+            config=config,
+            archive=args.archive,
+            s3=s3,
+        )
 
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
     print("appending only — `just demo-maintain` seals and reclaims disk")
+    if args.archive:
+        print(f"archiving to {args.archive} once files are sealed and settled")
+
     print("`just demo-tail` watches. Until a maintainer runs, rows stay buffered")
     print("and readable; nothing is lost by starting it late.\n")
 

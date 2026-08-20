@@ -6,6 +6,7 @@
 RUSTFS_ENDPOINT := "http://127.0.0.1:9000"
 RUSTFS_KEY := "litelink"
 RUSTFS_SECRET := "litelink-secret"
+RUSTFS_BUCKET := "litelink-demo"
 
 # Default recipe: list available commands
 default:
@@ -80,6 +81,43 @@ demo-maintain *args:
 demo-tail *args:
     uv run python examples/tail.py {{args}}
 
+# Needs `just rustfs` first, and a maintainer alongside — the writer seals,
+# archives and evicts nothing on its own.
+#
+#   just rustfs         # once
+#   just demo-archive   # terminal 1: append, with an archive configured
+#   just demo-maintain  # terminal 2: seal, compact, push, evict
+#   just demo-tail      # terminal 3: watch `in table` fall as `archived` rises
+#
+# Capture into a log with the archive tier configured, against local rustfs.
+demo-archive *args:
+    AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}} \
+    AWS_ACCESS_KEY_ID={{RUSTFS_KEY}} \
+    AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}} \
+    AWS_REGION=us-east-1 \
+    uv run python examples/capture.py --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
+
+# Create the demo bucket. Idempotent, and through the same s3fs the library
+# uses rather than an AWS CLI nobody is required to have installed.
+_rustfs-bucket:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}} \
+    AWS_ACCESS_KEY_ID={{RUSTFS_KEY}} \
+    AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}} \
+    AWS_REGION=us-east-1 \
+    uv run --extra s3 python -c "
+    import os, s3fs
+    fs = s3fs.S3FileSystem(
+        key=os.environ['AWS_ACCESS_KEY_ID'],
+        secret=os.environ['AWS_SECRET_ACCESS_KEY'],
+        client_kwargs={'endpoint_url': os.environ['AWS_ENDPOINT_URL'],
+                       'region_name': os.environ['AWS_REGION']},
+    )
+    if not fs.exists('{{RUSTFS_BUCKET}}'):
+        fs.mkdir('{{RUSTFS_BUCKET}}')
+    "
+
 # The demo keeps its data on purpose — tail.py reads it after the writer stops, and
 # it is there to poke at — so nothing removes it automatically. The benchmarks do
 # clean up: they run in a temp directory.
@@ -109,7 +147,15 @@ rustfs:
         # unauthenticated S3 root is a 403, which is a healthy server refusing
         # an anonymous request, and -f treats that as a failure.
         if curl -s -o /dev/null "{{RUSTFS_ENDPOINT}}" 2>/dev/null; then
+            just _rustfs-bucket
             echo "rustfs up on {{RUSTFS_ENDPOINT}}"
+            echo
+            echo "  export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}"
+            echo "  export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}"
+            echo "  export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}"
+            echo "  export AWS_REGION=us-east-1"
+            echo
+            echo "then: just demo-archive"
             exit 0
         fi
         sleep 0.25

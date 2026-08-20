@@ -212,7 +212,7 @@ class Log:
         schema: pa.Schema,
         sort_by: tuple[str, ...],
         config: LogConfig,
-        archive: Archive | None = None,
+        archive: Archive,
         readonly: bool = False,
     ) -> None:
         self.name = layout.name
@@ -225,11 +225,13 @@ class Log:
         self._buffer = buffer
         self._schema = schema
         self._sort_by = sort_by
-        # One object, shared with the reader and the maintainer that were
-        # handed the same one. See `_archive.Archive`: it owns the URI, the
-        # credentials and the lazily opened handle, so `set_archive` re-points
-        # all three at once instead of fanning out to each.
-        self._archive = archive if archive is not None else Archive(layout)
+        # The same object the reader and the maintainer were handed. See
+        # `_archive.Archive`: it owns the URI, the credentials and the lazily
+        # opened handle, so `set_archive` re-points all three at once instead
+        # of fanning out to each. Required rather than defaulted, because a
+        # collaborator this constructor builds for itself is one no caller can
+        # substitute — the reason `new` and `open` build every other one.
+        self._archive = archive
         self._reader = reader
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
@@ -326,7 +328,7 @@ class Log:
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, archive, s3, table_schema(schema))
+        remote = Archive(layout, archive, s3 or S3Options(), table_schema(schema))
 
         return cls(
             layout=layout,
@@ -403,7 +405,7 @@ class Log:
         # row, and an empty archive is no archive. Read once here because both
         # the Log and its maintainer need it.
         archive = buffer.get_meta(_ARCHIVE_KEY) or None
-        remote = Archive(layout, archive, s3, table_schema(schema))
+        remote = Archive(layout, archive, s3 or S3Options(), table_schema(schema))
         log = cls(
             layout=layout,
             table=table,
@@ -447,6 +449,25 @@ class Log:
             # the cut is actually made and the log quietly keeps sizing files
             # to the value it was opened with.
             self._buffer.set_target_size(config.target_size)
+
+    def archived_through(self) -> int:
+        """Highest offset the archive is known to hold, 0 if none (§5, I4).
+
+        The lag between this and `end_offset` is how far sync is behind, which
+        is what an operator watches: I4 will not evict past this line, so a
+        stalled sync shows up first as local disk that stops being reclaimed.
+        """
+        return self._maintenance.archived_through()
+
+    @property
+    def archive(self) -> str | None:
+        """Where the archive is, or None for a local-only log.
+
+        The question a maintenance loop has to answer before calling `sync`,
+        and one only the log can: the archive is recovered from `meta` on
+        `open`, so a caller that restated it could disagree with the log.
+        """
+        return self._archive.uri
 
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5)."""
@@ -1281,6 +1302,7 @@ class Log:
         floor = held[0] if held is not None else None
         cutoff = datetime.now(UTC) - since
         added = archive.snapshot_ages()
+        held = self._maintenance.memory()
 
         for data_file in archive.data_files():
             if floor is not None and data_file.hi >= floor:
@@ -1298,6 +1320,14 @@ class Log:
             # table already covers, and every range here is deliberately below
             # what it covers. The filter above is what prevents an overlap.
             self._table.register(str(destination))
+            # An extent for the local copy, carrying what the archive's copy
+            # holds. Restored data is subject to `local_retention` like
+            # anything else, and eviction dates a file by this record — so a
+            # hydrated file without one would sit undateable, treated as newly
+            # written, and never leave again.
+            self._buffer.record_file(
+                rel_path, data_file.lo, data_file.hi + 1, held.get(data_file.path, 0)
+            )
 
     # -- schema evolution --------------------------------------------------
     #

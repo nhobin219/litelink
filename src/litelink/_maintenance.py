@@ -164,14 +164,17 @@ class Maintenance:
         layout: Layout,
         config: LogConfig,
         sort_by: tuple[str, ...],
-        archive: Archive | None = None,
+        archive: Archive,
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
         self._config = config
         self._sort_by = sort_by
-        self._archive = archive if archive is not None else Archive(layout)
+        self._archive = archive
+        # Read once per eviction pass rather than once per file. Cleared at the
+        # top of `evict`, so a pass never decides from what a previous one saw.
+        self._age_cache: dict[str, int] | None = None
 
     def set_config(self, config: LogConfig) -> None:
         """Adopt new policy in place, rather than being rebuilt around it."""
@@ -394,14 +397,10 @@ class Maintenance:
         # Same reason as `compact`: this decides what to drop from the ages a
         # handle reports, and a stale one reports a table that has moved.
         self._table.reload()
+        self._age_cache = None
 
         cutoff = datetime.now(UTC) - retention
-        expired = {
-            path
-            for path, added in self._table.snapshot_ages().items()
-            if added.replace(tzinfo=UTC) < cutoff
-        }
-        stale = [f for f in self._table.data_files() if f.path in expired]
+        stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
         if not stale:
             return
 
@@ -617,6 +616,35 @@ class Maintenance:
             )
             scratch.finish_seal(end, rel_path)
             written.append(rel_path)
+
+    def _written(self, data_file: DataFile) -> datetime:
+        """When a file was written, for `local_retention` to measure against.
+
+        The log's own record first. Iceberg's is the fallback and cannot be the
+        primary: it dates a file by the snapshot that added it, and `expire`
+        deletes that snapshot, after which the file has no age there at all.
+
+        A file neither knows is treated as newly written, so it is never
+        evicted on an age nobody recorded. That is the safe direction — the
+        cost is disk, and the alternative is deleting data because its age was
+        unknown. It applies to files this database never saw, which after
+        `hydrate` records what it restores is only files from a version that
+        did not keep them.
+        """
+        named = self._ages().get(self._key(data_file.path))
+        if named is not None:
+            return datetime.fromtimestamp(named, UTC)
+
+        added = self._table.snapshot_ages().get(data_file.path)
+
+        return datetime.now(UTC) if added is None else added.replace(tzinfo=UTC)
+
+    def _ages(self) -> dict[str, int]:
+        """Read once per pass, not once per file."""
+        if self._age_cache is None:
+            self._age_cache = self._buffer.file_ages()
+
+        return self._age_cache
 
     # -- expiry and the deletion queue --------------------------------------
 
