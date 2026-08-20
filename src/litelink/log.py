@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -52,6 +52,9 @@ if TYPE_CHECKING:
 OFFSET = "litelink_offset"
 
 # The two operations whose ownership must survive the process holding it (§13.6).
+# Where sealing happens in this process. See `LogConfig.seal_mode`.
+SealMode = Literal["background", "inline", "none"]
+
 # How often `await_seal` re-asks. Short because it is only ever reached by a
 # caller that has chosen to block, and long enough not to spin.
 _IDLE_POLL = 0.005
@@ -116,14 +119,22 @@ class LogConfig:
     # max_age at the cost of a sidecar.
     wal_replication: bool = False
 
-    # Seal on a background thread rather than inside the append that crossed
-    # the threshold. §13.6 measured that append at 30-93 ms against a 0.73 ms
-    # median — the caller who happens to cross the line pays for the sort, the
-    # Parquet write, the fsync and the Iceberg commit.
+    # Who seals in THIS process. Not persisted, unlike everything above it:
+    # the others are policy belonging to the log, this is a deployment choice
+    # belonging to the process, and two processes on one log may differ.
     #
-    # Off makes seals synchronous, which is what a test wants when it needs the
-    # table to have changed by the time `extend` returns.
-    background_seal: bool = True
+    #   "background"  a thread, so the append that crossed the threshold does
+    #                 not pay for the sort, the Parquet write, the fsync and
+    #                 the Iceberg commit — §13.6 measured that append at
+    #                 30-93 ms against a 0.73 ms median.
+    #   "inline"      inside the append, which is what a caller wants when it
+    #                 needs the table to have changed by the time `extend`
+    #                 returns. Nothing else recommends it.
+    #   "none"        not here at all. For a writer running alongside a
+    #                 dedicated sealer process — see `run_sealer`. The lease
+    #                 already makes a second sealer harmless, so this is about
+    #                 not starting work that would only lose, not about safety.
+    seal_mode: SealMode = "background"
 
     # How often a sealer checks whether the buffer is over `target_size`. Only
     # the interval matters, not the mechanism: a sealer in another process has
@@ -739,7 +750,7 @@ class Log:
     def _arrange_seal(self) -> None:
         """Make sure something will seal what the append just queued.
 
-        With `background_seal` that is a thread, started here rather than at
+        With `seal_mode="background"` that is a thread, started here rather than at
         open so a log that never writes — a reader, a test, a short-lived
         import — never starts one it has no use for. The thread is not told
         anything; it reads the queue, exactly as another process would.
@@ -749,7 +760,10 @@ class Log:
         would put a transaction on the hot path to discover there is nothing to
         do.
         """
-        if self.config.background_seal:
+        if self.config.seal_mode == "none":
+            return
+
+        if self.config.seal_mode == "background":
             self._start_sealer()
             return
 
@@ -820,9 +834,11 @@ class Log:
         lease is what makes it safe: it refuses a second sealer and it decides
         who may replay an interrupted one.
 
-        The capturing process should be opened with `background_seal=False`, or
-        both will try. Nothing breaks if both do — the lease refuses the loser
-        — but a thread that always loses is a thread for nothing.
+        The capturing process should be opened with `seal_mode="none"`, or both
+        will try. Nothing breaks if both do — the lease refuses the loser — but
+        a thread that always loses is a thread for nothing. Note that "none" is
+        the right setting and `"inline"` is NOT: inline still seals, inside the
+        append, which is precisely the cost this process exists to take away.
         """
         self._writable()
         self._stop = stop or threading.Event()

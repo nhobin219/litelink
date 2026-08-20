@@ -21,9 +21,9 @@ should be cut and returns.
 | **sealer** | buffer → Parquet → Iceberg commit → delete buffer rows | a thread in the writer, **or its own process** |
 | **maintainer** | compact, evict, expire, unlink | its own process, or a thread |
 
-Nothing configures which. **The `lease` table decides**: a writer with `background_seal`
-on starts a sealing thread, that thread tries, and if another process holds the `seal`
-role it is refused and returns. So adding a dedicated sealer needs no change to the
+Nothing configures which. **The `lease` table decides**: a writer with
+`seal_mode="background"` starts a sealing thread, that thread tries, and if another
+process holds the `seal` role it is refused and returns. So adding a dedicated sealer needs no change to the
 writer, and if that sealer dies its lease lapses and the writer takes the role back.
 
 A sealer in its own *process* is the point of the exercise. A seal is CPU-bound pure
@@ -189,7 +189,7 @@ just demo-tail         # in another terminal: watch it accumulate
 ```
 
 To move sealing out of the writer's GIL, run `Log.run_sealer()` in its own process and
-open the capturing process with `background_seal=False` — not because it would be unsafe
+open the capturing process with `seal_mode="none"` — not because it would be unsafe
 otherwise, but because a thread that always loses the lease is a thread for nothing.
 
 Maintenance wants its own process for the same reason. `examples/capture.py` still runs

@@ -30,6 +30,22 @@ OFFSET = "litelink_offset"
 # is compacted back into one.
 _MAX_TAIL_CHUNKS = 32
 
+# IMMEDIATE, never a bare BEGIN. Every transaction here writes, and several read
+# first — an append reads the open `seal_group` row before inserting anything.
+# A deferred transaction that reads first takes a read snapshot, and if another
+# process has written since, SQLite refuses to upgrade it to a writer and
+# returns "database is locked" IMMEDIATELY: `busy_timeout` does not apply,
+# because waiting could not help a snapshot that is already stale.
+#
+# Taking the write lock up front makes the wait a lock wait, which the timeout
+# below does cover. Found by running the writer, the sealer and the maintainer
+# as three processes: the writer died the moment the other two started.
+_BEGIN = "BEGIN IMMEDIATE"
+
+# Long enough to outlast a seal's brief write steps and a maintenance pass's
+# commits, since those are what an append now queues behind across processes.
+_BUSY_TIMEOUT_MS = 30_000
+
 
 def _now() -> int:
     """Unix seconds. Whole seconds because `max_age` is a coarse policy."""
@@ -110,6 +126,7 @@ class Buffer:
 
         self._con = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self._con.execute("PRAGMA journal_mode=WAL")
+        self._con.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         # §3's durability claim rests on this line. WAL alone fsyncs at
         # checkpoint, not at commit, which would put committed rows back in the
         # OS page cache — the exact loss this library exists to prevent.
@@ -318,7 +335,7 @@ class Buffer:
         """The append's transaction, with the lock already held."""
         offsets: list[int] = []
         cursor = self._con.cursor()
-        cursor.execute("BEGIN")
+        cursor.execute(_BEGIN)
         try:
             group = self._read_group(cursor)
             # Bound once, and the accounting inlined below, because this loop
@@ -633,7 +650,7 @@ class Buffer:
             return False
 
         with self._lock:
-            self._con.execute("BEGIN")
+            self._con.execute(_BEGIN)
             try:
                 cursor = self._con.execute(
                     "UPDATE seal_group SET end_offset ="
@@ -663,7 +680,7 @@ class Buffer:
         land on a different date directory and strand the first file.
         """
         with self._lock:
-            self._con.execute("BEGIN")
+            self._con.execute(_BEGIN)
             self._con.execute("DELETE FROM sealing")
             self._con.execute(
                 "INSERT INTO sealing (start_offset, end_offset, rel_path) VALUES (?, ?, ?)",
@@ -692,7 +709,7 @@ class Buffer:
         group without `sealing` having had to remember which one it was.
         """
         with self._lock:
-            self._con.execute("BEGIN")
+            self._con.execute(_BEGIN)
             self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
             self._con.execute("DELETE FROM seal_group WHERE end_offset = ?", (end,))
             self._con.execute("DELETE FROM sealing")
@@ -748,7 +765,7 @@ class Buffer:
         name down first.
         """
         with self._lock:
-            self._con.execute("BEGIN")
+            self._con.execute(_BEGIN)
             self._con.execute("DELETE FROM compacting")
             self._con.execute(
                 "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
@@ -773,7 +790,7 @@ class Buffer:
         is the only moment their paths are known without going to look.
         """
         with self._lock:
-            self._con.execute("BEGIN")
+            self._con.execute(_BEGIN)
             self._con.executemany(
                 "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at) VALUES (?, ?)",
                 [(p, superseded_at) for p in rel_paths],

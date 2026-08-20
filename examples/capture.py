@@ -1,22 +1,31 @@
-"""The writer: append continuously, maintain in the background.
+"""The writer: append, and nothing else.
 
     uv run python examples/capture.py [--root DIR] [--rate ROWS_PER_SECOND]
+    uv run python examples/capture.py --no-seal    # alongside examples/sealer.py
 
-Two threads, which is the whole operational shape of a litelink process:
+One thread appending, and every append durable when `extend()` returns — there
+is no in-memory buffer to flush, which is the failure the README opens with.
 
-  - the main thread appends, and every append is durable when it returns
-  - a daemon thread calls maintain() on an interval, reclaiming disk
+**Sealing and maintenance are separate processes**, in `sealer.py` and
+`maintainer.py`. They are separate from each other too: different roles, holding
+different leases, so either can be restarted or crash without stopping the
+other, and a compaction that takes seconds cannot delay a seal.
 
-They share one Log because SQLite serialises the writes, and §1's single-writer
-rule is about processes, not threads. Ctrl-C to stop; nothing committed is lost,
-because there is no in-memory buffer to lose.
+By default this still seals on a background thread, so the demo does something
+on its own. Start `examples/sealer.py` and that thread begins losing the lease
+immediately — no restart here, no flag, no coordination. `--no-seal` skips
+starting a thread that would only lose, which is what a real deployment wants
+once it runs a dedicated sealer.
+
+Ctrl-C to stop. Nothing committed is lost, and nothing queued is either: a cut
+that has been recorded but not yet sealed is picked up by whoever opens the log
+next.
 """
 
 from __future__ import annotations
 
 import argparse
 import itertools
-import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -26,20 +35,16 @@ from _stream import NAME, SCHEMA, SORT_BY, observations
 from litelink import Log, LogConfig
 
 
-def maintain_forever(log: Log, every: float, stop: threading.Event) -> None:
-    while not stop.wait(every):
-        try:
-            log.maintain()
-        except Exception as exc:  # noqa: BLE001 - a daemon must not die quietly
-            print(f"  [maintain] failed: {exc}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
     parser.add_argument("--rate", type=float, default=2000.0, help="reports per second")
     parser.add_argument("--batch", type=int, default=20, help="rows per transaction")
-    parser.add_argument("--maintain-every", type=float, default=10.0, help="seconds")
+    parser.add_argument(
+        "--no-seal",
+        action="store_true",
+        help="do not seal here; run examples/sealer.py instead",
+    )
     args = parser.parse_args()
 
     # Deliberately small for a demo: seal often so the reader sees the table
@@ -50,6 +55,10 @@ def main() -> None:
         compact_below=1024 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
+        # Seal a quiet stream on a timer as well as by size, or a feed slower
+        # than the target would sit in SQLite indefinitely.
+        max_age=timedelta(seconds=15),
+        seal_mode="none" if args.no_seal else "background",
     )
 
     # new() creates and takes the shape; open() recovers it. A service that
@@ -61,15 +70,13 @@ def main() -> None:
     else:
         log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
 
-    stop = threading.Event()
-    maintainer = threading.Thread(
-        target=maintain_forever, args=(log, args.maintain_every, stop), daemon=True
-    )
-    maintainer.start()
-
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
-    print(f"maintain() every {args.maintain_every:.0f}s in a daemon thread")
-    print("run examples/tail.py in another terminal. Ctrl-C to stop.\n")
+    if args.no_seal:
+        print("not sealing here — run `just demo-seal`")
+    else:
+        print("sealing on a background thread until `just demo-seal` takes over")
+
+    print("`just demo-maintain` reclaims disk; `just demo-tail` watches. Ctrl-C.\n")
 
     source = observations()
     interval = args.batch / args.rate
@@ -95,7 +102,6 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nstopping")
     finally:
-        stop.set()
         log.close()
 
     on_disk = sum(f.stat().st_size for f in args.root.rglob("*") if f.is_file())
@@ -105,6 +111,8 @@ def main() -> None:
     # writer stops, and a demo you cannot inspect afterwards is not much of one.
     # Note the demo leaves local_retention unset, so the window grows without
     # bound; a real deployment sets it and lets maintain() hold the size.
+    # Rows still queued or buffered here are not lost — they are durable, and
+    # the next process to open the log finds the cuts already recorded.
 
 
 if __name__ == "__main__":

@@ -175,7 +175,7 @@ def test_a_separate_process_can_seal(tmp_path: Path) -> None:
     The writer's threshold is set out of reach so that nothing it does can seal;
     everything here is the other process's work.
     """
-    config = LogConfig(target_size=1 << 30, background_seal=False)
+    config = LogConfig(target_size=1 << 30, seal_mode="none")
     with Log.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
@@ -212,13 +212,13 @@ def test_a_separate_process_can_seal(tmp_path: Path) -> None:
 def test_a_writer_defers_to_a_sealer_in_another_process(tmp_path: Path) -> None:
     """No configuration decides this — the lease does.
 
-    A writer with `background_seal` on still tries; it simply loses. So an
+    A writer sealing in-process still tries; it simply loses. So an
     operator adds a sealer process without changing the writer, and if that
     process dies the writer takes the role back when the lease lapses.
     """
-    # Synchronous, so the only seals are the explicit ones below and the
-    # assertions are not racing this log's own thread.
-    config = LogConfig(target_size=1 << 30, background_seal=False)
+    # Nothing seals here, so the only seals are the explicit ones below and
+    # the assertions are not racing this log's own thread.
+    config = LogConfig(target_size=1 << 30, seal_mode="none")
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(400))
 
