@@ -1112,6 +1112,39 @@ The consequence worth planning for is that local disk holds roughly
    `compact_below` over time so yesterday's output is tomorrow's input, tiered compaction, or
    the honest possibility that unbounded local retention is not a supported configuration.
 
+   ### Registering files without pyiceberg's commit path
+
+   The cost above is pyiceberg's, not Iceberg's, which makes a fourth option available: write
+   the metadata directly. **The library already writes its own Parquet** — at a path claimed in
+   `sealing` before the bytes exist (I2), fsynced before the commit (I1) — so pyiceberg is only
+   doing the registration. That registration is a manifest entry, a manifest, a manifest list,
+   a `metadata.json`, and a pointer swap, and every one of those is a documented file format
+   plus a SQLite row update the library already knows how to make atomically (I16).
+
+   The attraction is that appending an entry does not inherently require copying the whole
+   table metadata twenty-seven times. The objection is §1's principle that *"everything Iceberg
+   provides is used, not reimplemented"*, and the distinction that principle turns on is worth
+   stating: using the **format** is the commitment, using the **library** is an implementation
+   choice. Files that conform are still Iceberg. The real risk is drift — hand-written metadata
+   that is subtly wrong still opens locally and breaks the external readers the archive exists
+   for, and it breaks them later, in someone else's engine.
+
+   Two cheaper things should be ruled out first, because both are small and neither risks the
+   format:
+
+   - **Commit less often.** A seal must make rows durable, which it does by writing and
+     fsyncing Parquet; it does not have to register them in the same breath. Registering every
+     Nth seal cuts commit count by N, and the rows stay readable throughout because §7 serves
+     anything above the table's extent from the buffer — the same window step 3 already leaves
+     open, just wider. What it costs is a larger buffer, which §7 measures as the variable cost
+     of a read.
+   - **Wait for the upstream fix.** The deep copy is not load-bearing; it is how
+     `update_table_metadata` is written today.
+
+   If those are not enough, hand-writing the commit is a bounded piece of work with one hard
+   requirement: an external engine must read the result. That is a test before it is a design —
+   attach something that is not pyiceberg and assert it sees what litelink says is there.
+
    **The archive has the same commit cost and it does not matter in the same way.** Its file
    count is unbounded by design — it is the full history — so registering into it rewrites
    manifests against a table that only grows. But that happens in §5, which is lazy,
@@ -1126,6 +1159,35 @@ The consequence worth planning for is that local disk holds roughly
    feeling a cost that was supposed to have been moved off it. The remote table wants the same
    manifest-merge properties as the local one for that reason, and §5's throughput is worth a
    number rather than an assumption.
+8. **Iceberg v3.** Tables are written at format-version 2 because pyiceberg will not write
+   anything else — `NotImplementedError: Writing V3 is not yet supported`, at 0.11.1 and at
+   0.12.0rc1, tracked upstream as apache/iceberg-python#1551. That is the whole of the current
+   answer. Nothing about this design prefers v2.
+
+   Three things in v3 would matter here, and the one that looks decisive is not.
+
+   **Variant**, for semi-structured data, is the interesting one and the furthest away —
+   pyiceberg has no `VariantType` at any version yet. The target workload is tabular JSON off a
+   websocket, where today the choice is to parse every field into a column or keep the frame as
+   text. Variant is the third option: store the frame, address into it, let the engine prune.
+
+   **Nanosecond timestamps.** Temporal columns are refused today because their round trip
+   through SQLite's storage classes is untested, and `timestamp[ns]` pyiceberg rejected
+   outright. The examples carry epoch nanoseconds in an `int64` as a result — honest, and it
+   loses the type. v3 has the types and pyiceberg already models them.
+
+   **Default column values**, which would make §9's add-a-column less lossy: an older file
+   could read a declared default rather than null.
+
+   **Row lineage does not replace `litelink_offset`**, though it is the obvious candidate. v3
+   gives each row a table-level `_row_id`, which answers §2's objection that Iceberg's sequence
+   numbers are per *snapshot* rather than per row. It does not answer the other half. A
+   `_row_id` is assigned when the row is committed to the table, and the tier boundary needs an
+   identifier that exists while the row is still in the buffer — §7 filters the buffer leg on
+   an offset the table has not seen. The library keeps owning that column under v3.
+
+   **Deletion vectors** are irrelevant rather than useful: §1 has no updates and no deletes,
+   and the only rows that leave do so as whole files leaving a snapshot.
 
 ---
 
