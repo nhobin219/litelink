@@ -108,6 +108,13 @@ class Buffer:
         # Assigned unconditionally, including for a readonly buffer. It used to
         # be skipped there, which left `lease()` raising AttributeError on a
         # handle that had every right to ask.
+        #
+        # The rule is every statement on `_con`, reads included — not just the
+        # transactions. A bare SELECT issued while another thread has a
+        # transaction open joins it and sees uncommitted rows, which a rollback
+        # then unmakes; that is the same mechanism that once let a lease
+        # evaporate under its holder. `_reader` needs none of this precisely
+        # because nothing ever opens a transaction on it.
         self._lock = threading.RLock()
         # The read cache — see `rows_above`. Its own lock rather than the one
         # above, which appends hold: a read must not wait behind a write to
@@ -178,6 +185,12 @@ class Buffer:
         )
 
     def _create(self) -> None:
+        """The schema. Unlocked, and the only place that is right.
+
+        This and `_seed_group` run inside `open`, before the buffer has been
+        handed to anyone, so there is no second thread to exclude. Every method
+        reachable afterwards takes the lock.
+        """
         columns = ",\n  ".join(
             f'"{name}" {column_type(self._schema.field(name).type).sqlite}'
             for name in self._columns
@@ -476,9 +489,10 @@ class Buffer:
         which drops back to null every time a seal empties the table. No
         catalog resolve is needed: the sequence already outlives the rows.
         """
-        row = self._con.execute(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
-        ).fetchone()
+        with self._lock:
+            row = self._con.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone()
 
         return (row[0] if row else 0) + 1
 
@@ -511,9 +525,10 @@ class Buffer:
         with a rowid range rather than a scan, and rows already sealed but not
         yet deleted cost nothing.
         """
-        row = self._con.execute(
-            'SELECT count(*) FROM buffer WHERE "litelink_offset" > ?', (boundary,)
-        ).fetchone()
+        with self._lock:
+            row = self._con.execute(
+                'SELECT count(*) FROM buffer WHERE "litelink_offset" > ?', (boundary,)
+            ).fetchone()
 
         return int(row[0])
 
@@ -652,10 +667,11 @@ class Buffer:
         per queued file plus the open one — never a scan of the buffer, and
         never a question about where to cut, because that was decided already.
         """
-        row = self._con.execute(
-            "SELECT start_offset, end_offset FROM seal_group"
-            " WHERE end_offset IS NOT NULL ORDER BY group_id LIMIT 1"
-        ).fetchone()
+        with self._lock:
+            row = self._con.execute(
+                "SELECT start_offset, end_offset FROM seal_group"
+                " WHERE end_offset IS NOT NULL ORDER BY group_id LIMIT 1"
+            ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]))
 
@@ -665,9 +681,10 @@ class Buffer:
         What an explicit `seal()` must drain to. Taken under the same lock that
         made the cut, so it cannot miss one that call just recorded.
         """
-        row = self._con.execute(
-            "SELECT max(end_offset) FROM seal_group WHERE end_offset IS NOT NULL"
-        ).fetchone()
+        with self._lock:
+            row = self._con.execute(
+                "SELECT max(end_offset) FROM seal_group WHERE end_offset IS NOT NULL"
+            ).fetchone()
 
         return None if row[0] is None else int(row[0])
 
@@ -688,14 +705,14 @@ class Buffer:
         # the answer is almost always "nothing to close" — issuing a write
         # transaction to discover that would put a commit and an fsync on a
         # timer, for every log, forever. The read is a single row.
-        if not self._con.execute(
-            "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
-            " AND start_offset IS NOT NULL" + stale,
-            () if cutoff is None else (cutoff,),
-        ).fetchone():
-            return False
-
         with self._lock:
+            if not self._con.execute(
+                "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
+                " AND start_offset IS NOT NULL" + stale,
+                () if cutoff is None else (cutoff,),
+            ).fetchone():
+                return False
+
             self._con.execute(_BEGIN)
             try:
                 cursor = self._con.execute(
@@ -736,9 +753,10 @@ class Buffer:
 
     def pending_seal(self) -> tuple[int, int, str] | None:
         """The in-flight seal, if a crash left one."""
-        row = self._con.execute(
-            "SELECT start_offset, end_offset, rel_path FROM sealing"
-        ).fetchone()
+        with self._lock:
+            row = self._con.execute(
+                "SELECT start_offset, end_offset, rel_path FROM sealing"
+            ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
@@ -789,16 +807,18 @@ class Buffer:
         return None if row is None else str(row[0])
 
     def get_meta(self, key: str) -> str | None:
-        row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+        with self._lock:
+            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
 
         return None if row is None else str(row[0])
 
     def set_meta(self, key: str, value: str) -> None:
-        self._con.execute(
-            "INSERT INTO meta (k, v) VALUES (?, ?) "
-            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            (key, value),
-        )
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO meta (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (key, value),
+            )
 
     # -- compaction bookkeeping -------------------------------------------
 
@@ -820,12 +840,16 @@ class Buffer:
             self._con.execute("COMMIT")
 
     def pending_compaction(self) -> tuple[int, int, str] | None:
-        row = self._con.execute("SELECT lo, hi, rel_path FROM compacting").fetchone()
+        with self._lock:
+            row = self._con.execute(
+                "SELECT lo, hi, rel_path FROM compacting"
+            ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
     def clear_compaction(self) -> None:
-        self._con.execute("DELETE FROM compacting")
+        with self._lock:
+            self._con.execute("DELETE FROM compacting")
 
     # -- deletion queue ---------------------------------------------------
 
@@ -845,13 +869,14 @@ class Buffer:
 
     def due_deletions(self, cutoff: int) -> list[str]:
         """Files superseded at or before `cutoff` — now minus the grace period."""
-        return [
-            str(row[0])
-            for row in self._con.execute(
-                "SELECT rel_path FROM pending_delete WHERE superseded_at <= ?",
-                (cutoff,),
-            )
-        ]
+        with self._lock:
+            return [
+                str(row[0])
+                for row in self._con.execute(
+                    "SELECT rel_path FROM pending_delete WHERE superseded_at <= ?",
+                    (cutoff,),
+                ).fetchall()
+            ]
 
     def forget_deletion(self, rel_path: str) -> None:
         """Drop a queue entry, after its file is gone.
@@ -860,13 +885,19 @@ class Buffer:
         row and the next drain retries an unlink that is already a no-op. The
         reverse order loses the path and leaks the file permanently.
         """
-        self._con.execute("DELETE FROM pending_delete WHERE rel_path = ?", (rel_path,))
+        with self._lock:
+            self._con.execute(
+                "DELETE FROM pending_delete WHERE rel_path = ?", (rel_path,)
+            )
 
     def queued_deletions(self) -> list[str]:
-        return [
-            str(row[0])
-            for row in self._con.execute("SELECT rel_path FROM pending_delete")
-        ]
+        with self._lock:
+            return [
+                str(row[0])
+                for row in self._con.execute(
+                    "SELECT rel_path FROM pending_delete"
+                ).fetchall()
+            ]
 
     # -- lifecycle --------------------------------------------------------
 
