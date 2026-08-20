@@ -61,9 +61,23 @@ def new_owner() -> str:
 
 @dataclass(frozen=True, slots=True)
 class Lease:
-    """One process's claim on one role, held in SQLite."""
+    """One process's claim on one role, held in SQLite.
+
+    `lock` is the mutex guarding `connection`, and holding it is what makes
+    these statements atomic rather than merely single. Without it a lease write
+    can land inside a transaction another thread has open on the same
+    connection — an append's `BEGIN IMMEDIATE` — and then it commits or rolls
+    back with that transaction rather than on its own. A rolled-back append
+    took the lease row with it, leaving its holder believing it held a role the
+    table no longer recorded: observed as two sealers writing the same file,
+    and pyiceberg refusing the second with "already referenced by table".
+
+    Every buffer transaction is taken under this same lock, so holding it means
+    the connection is in autocommit and one statement is one transaction.
+    """
 
     connection: sqlite3.Connection
+    lock: threading.RLock
     role: str
     owner: str
     ttl_ms: int = DEFAULT_TTL_MS
@@ -76,15 +90,16 @@ class Lease:
         `rowcount == 0` and knows it does not hold the role.
         """
         now = _now_ms()
-        cursor = self.connection.execute(
-            "INSERT INTO lease (role, owner, expires_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(role) DO UPDATE SET owner = excluded.owner, "
-            "expires_at = excluded.expires_at "
-            "WHERE lease.owner = excluded.owner OR lease.expires_at <= ?",
-            (self.role, self.owner, now + self.ttl_ms, now),
-        )
+        with self.lock:
+            cursor = self.connection.execute(
+                "INSERT INTO lease (role, owner, expires_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(role) DO UPDATE SET owner = excluded.owner, "
+                "expires_at = excluded.expires_at "
+                "WHERE lease.owner = excluded.owner OR lease.expires_at <= ?",
+                (self.role, self.owner, now + self.ttl_ms, now),
+            )
 
-        return cursor.rowcount == 1
+            return cursor.rowcount == 1
 
     def renew(self) -> bool:
         """Extend our claim. False means we no longer hold it.
@@ -93,26 +108,30 @@ class Lease:
         find that out rather than carry on: the new holder may already be
         replaying the work it was doing.
         """
-        cursor = self.connection.execute(
-            "UPDATE lease SET expires_at = ? WHERE role = ? AND owner = ?",
-            (_now_ms() + self.ttl_ms, self.role, self.owner),
-        )
+        with self.lock:
+            cursor = self.connection.execute(
+                "UPDATE lease SET expires_at = ? WHERE role = ? AND owner = ?",
+                (_now_ms() + self.ttl_ms, self.role, self.owner),
+            )
 
-        return cursor.rowcount == 1
+            return cursor.rowcount == 1
 
     def held(self) -> bool:
         """Whether we hold it right now, unexpired."""
-        row = self.connection.execute(
-            "SELECT owner, expires_at FROM lease WHERE role = ?", (self.role,)
-        ).fetchone()
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT owner, expires_at FROM lease WHERE role = ?", (self.role,)
+            ).fetchone()
 
         return row is not None and row[0] == self.owner and row[1] > _now_ms()
 
     def release(self) -> None:
         """Give it up, so the next process need not wait out the TTL."""
-        self.connection.execute(
-            "DELETE FROM lease WHERE role = ? AND owner = ?", (self.role, self.owner)
-        )
+        with self.lock:
+            self.connection.execute(
+                "DELETE FROM lease WHERE role = ? AND owner = ?",
+                (self.role, self.owner),
+            )
 
 
 def _now_ms() -> int:

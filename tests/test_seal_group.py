@@ -142,19 +142,49 @@ def test_a_sealer_that_falls_behind_still_writes_sized_files(tmp_path: Path) -> 
 
         assert len(queued) > 5, "not enough backlog to be a test"
 
-        sealed = 0
-        while log.seal() is not None:
-            sealed += 1
-
-        # One more than the backlog: the last call finds the queue empty and
-        # cuts the open group, which is what "seal now" means.
-        assert sealed == len(queued) + 1, f"{len(queued)} queued but {sealed} sealed"
+        # One call drains the whole backlog: it cuts what is still open, then
+        # seals everything up to that cut.
+        assert log.seal() is not None
+        assert log.seal() is None, "left work behind"
+        assert log.table_files() == len(queued) + 1, (
+            f"{len(queued)} queued plus the open group, {log.table_files()} files"
+        )
 
         sizes = [f.size for f in log._table.data_files()]
 
         assert max(sizes) < TARGET * 2, (
             f"largest file {max(sizes)} bytes — the backlog was merged into one"
         )
+
+
+def test_an_explicit_seal_cuts_its_own_rows_whatever_else_is_running(
+    tmp_path: Path,
+) -> None:
+    """The cut must not depend on how far behind a sealer happens to be.
+
+    `seal` used to cut only when the queue was empty, so a call made while a
+    background sealer still had a group queued left the caller's rows uncut and
+    sealed an older group instead — sometimes returning None having sealed
+    nothing. Eight appends and eight seals then produced SEVEN files, one of
+    them holding two appends' worth of rows. Same calls, different data
+    layout, decided by a race.
+
+    Run with a live background sealer on a short poll, which is what made it
+    reproduce.
+    """
+    config = LogConfig(
+        target_size=1 << 30,
+        seal_poll=timedelta(milliseconds=1),
+        snapshot_retention=timedelta(days=1),
+    )
+    with open_log(tmp_path, config) as log:
+        for i in range(8):
+            log.extend(rows(20, start=i * 20))
+            log.seal()
+
+        assert log.await_seal(timeout=30), "a queued cut was never written"
+        assert log.table_files() == 8, "eight appends and eight seals, eight files"
+        assert log.table_rows() == 160
 
 
 def test_an_empty_group_is_never_closed(tmp_path: Path) -> None:

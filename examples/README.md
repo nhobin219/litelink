@@ -1,18 +1,21 @@
 # examples
 
-Four scripts against a real log, one per role. None need an archive, a service, or a
-network.
+Three scripts against a real log. None need an archive, a service, or a network.
 
 ```
-just demo-capture      # terminal 1: append continuously
-just demo-seal         # terminal 2: turn the buffer into Parquet
-just demo-maintain     # terminal 3: compact, evict, expire
-just demo-tail         # terminal 4: watch where the rows are
+just demo-capture      # terminal 1: append, and nothing else
+just demo-maintain     # terminal 2: seal, compact, evict, expire
+just demo-tail         # terminal 3: watch where the rows are
 ```
 
-`demo-capture` alone is enough to see something: it seals on a background thread until a
-dedicated sealer appears. Start `demo-seal` and that thread begins losing the lease
-immediately — no restart, no flag, no coordination between them. Stop it and the writer
+Two roles, because there are two kinds of work: **the hot path, and everything else.**
+The writer appends; the maintainer does the rest. Sealing is maintenance, not a third
+role — it is the first thing done with what the writer leaves behind. (A reader is not a
+role: any number may open the log `read_only`, holding and mutating nothing.)
+
+`demo-capture` alone is enough to see something — it seals on a background thread until a
+maintainer appears. Start `demo-maintain` and that thread begins losing the lease
+immediately: no restart, no flag, no coordination between them. Stop it and the writer
 takes the role back once the lease lapses. Nothing decides this but the `lease` table.
 
 ```
@@ -21,12 +24,11 @@ just demo-clean        # delete the captured data when you are done
 
 Benchmarks live in [`benchmarks/`](../benchmarks/).
 
-Running the sealer and the maintainer together logs occasional pyiceberg warnings —
-`Failed to delete metadata file …`. Both processes commit to the same Iceberg table, and
-both honour `write.metadata.delete-after-commit`, so they race to remove the same
-superseded metadata JSON and the loser warns about a file that is already gone. Noisy,
-not harmful; the data files themselves are never deleted this way (that is
-`pending_delete`, and it is transactional).
+Only the maintainer commits to the Iceberg table, which is what keeps the log
+free of pyiceberg's `Failed to delete metadata file …` warnings. Two committing processes
+race on `write.metadata.delete-after-commit` and the loser complains about a file the
+winner already removed. Data files are never affected either way — those go through
+`pending_delete`, transactionally.
 
 The demo keeps its data on purpose — `tail.py` reads it after the writer stops, and it is
 there to poke at — so nothing removes it automatically, and `local_retention` is left unset
@@ -42,21 +44,29 @@ prunes from Iceberg statistics.
 with no buffer to flush, and the only other thing it does is record where the next file
 should be cut — see [`docs/RUNTIME.md`](../docs/RUNTIME.md).
 
-`sealer.py` and `maintainer.py` are the other two roles, in their own processes.
+`maintainer.py` does everything else, in one process.
 
-**Why a process and not a thread.** A seal is CPU-bound pure Python — most of its commit
-is pyiceberg copying table metadata — so a sealing thread starves the appending one
-through the GIL even while holding no lock: appends measured 45.2 ms behind an in-process
-seal. A process does not share the GIL. This is what the leases are for.
+**Why a process and not the writer's thread.** A seal is CPU-bound pure Python — most of
+its commit is pyiceberg copying table metadata — so a sealing thread starves the
+appending one through the GIL even while holding no lock: appends measured 45.2 ms behind
+an in-process seal. A process does not share the GIL. This is what the leases are for.
 
-**Why seal and maintenance are separate from each other.** They hold different leases, so
-either can crash or be restarted without stopping the other, and a compaction taking
-seconds cannot delay a seal. Persistence, compaction, deletion and query planning are
-four concerns; coupling them lets the slowest set the latency of the rest.
+**Why sealing is not its own process.** They are the same kind of work —
+off the hot path, writing to the same Iceberg table, neither latency-critical the way an
+append is. Sharing a GIL between them costs nothing that matters, and separating them
+costs something real: `_table_lock` serialises a seal's commit against a maintenance pass
+*within* a process, and nothing does across processes. Run as two, they raced on
+Iceberg's delete-after-commit metadata cleanup and each logged warnings about files the
+other had already removed.
 
-Running all three against one log is safe because every hand-off is a row in SQLite
-rather than an object in Python, and WAL serialises the processes. Reading is safe for
-the same reason — but note that DuckDB must never open the buffer database itself, which
+They keep separate leases, so splitting them later needs no code change — point a second
+process at the same log and the `maintain` role moves. Worth doing only if compaction
+starts delaying seals enough to matter, and a delayed seal costs latency rather than file
+size: the cut was recorded when the rows arrived.
+
+Running both against one log is safe because every hand-off is a row in SQLite rather
+than an object in Python, and WAL serialises the processes. Reading is safe for the same
+reason — but note that DuckDB must never open the buffer database itself, which
 [`docs/RUNTIME.md`](../docs/RUNTIME.md) explains at some cost.
 
 `tail.py` opens the same log `readonly` while the writer runs, and prints where the rows

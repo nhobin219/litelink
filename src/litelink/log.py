@@ -631,7 +631,16 @@ class Log:
     # -- seal --------------------------------------------------------------
 
     def seal(self) -> int | None:
-        """Seal now; returns the exclusive end offset, or None if nothing to do.
+        """Cut everything buffered into files. Returns the exclusive end offset.
+
+        Deterministic in the only way that matters to the data: the cut lands
+        where the caller asked, always, so a given sequence of appends and
+        seals produces the same files whatever else is running. None means
+        nothing was buffered — never that someone else was busy.
+
+        Whether *this* call writes those files depends on who holds the lease.
+        Use `await_seal` when the table itself has to have moved before you
+        look at it.
 
         The lock is held for §4's steps 1 and 3 — claiming the range, and
         deleting the rows it covered — and released for step 2, which is all of
@@ -650,15 +659,36 @@ class Log:
         """
         with self._lock:
             self._writable()
-            # "Now" is the whole contract of this method, so a caller that has
-            # not filled a group still gets a file. The background loop does
-            # NOT come through here — it drains queued groups only — because a
-            # quiet stream would otherwise emit a stub file every poll, which
-            # is the pathology §6 exists to clean up after.
-            if self._buffer.pending_group() is None:
-                self._buffer.close_open_group()
+            # Unconditionally, and that is the whole contract. Cutting only
+            # when the queue happened to be empty made this method's effect
+            # depend on how far behind a sealer was: the rows the caller had
+            # just appended went uncut, an older group was sealed instead, and
+            # the call could return None having sealed nothing at all. Two
+            # appends and two seals could then produce one file, not two.
+            #
+            # The background loop does NOT come through here — it drains queued
+            # groups only — or a quiet stream would emit a stub file every
+            # poll, which is the pathology §6 exists to clean up after.
+            self._buffer.close_open_group()
+            target = self._buffer.last_queued_end()
 
-        return self._seal_queued()
+        if target is None:
+            return None
+
+        # Then seal as much of it as this caller is entitled to. Losing the
+        # lease is not a failure and not "nothing to do": another sealer holds
+        # it and is working through the same queue, so the cut still becomes a
+        # file, just not by this call. Blocking until it did would put a
+        # caller's `seal()` behind another process's lease TTL, which is a
+        # worse bargain than returning — `await_seal` is for callers who need
+        # the table to have moved.
+        while True:
+            group = self._buffer.pending_group()
+            if group is None or group[1] > target:
+                return target
+
+            if self._seal_queued() is None:
+                return target
 
     def _seal_queued(self) -> int | None:
         """Seal the oldest queued group. None if none is queued.
@@ -666,16 +696,21 @@ class Log:
         Split from `seal` so that draining the queue can never cut a group
         short: everything this writes was sized when its rows arrived.
         """
-        with self._lock:
-            self._writable()
-            # One mechanism for both cases: owners are unique per attempt, so
-            # the row that refuses a sealer in another process refuses one in
-            # another thread on the same terms — and it lapses if this attempt
-            # dies mid-seal, so another may finish what `sealing` records.
-            lease = self._lease(SEAL_ROLE)
-            if not lease.acquire():
-                return None
+        self._writable()
+        # Outside `_lock`, because the lease excludes other OWNERS and the lock
+        # sequences this process's own buffer writes — different jobs. Taking
+        # it inside put two more fsyncs under the lock an append needs, and at
+        # `synchronous=FULL` those are the expensive part of a small seal.
+        #
+        # One mechanism for both cases: owners are unique per attempt, so the
+        # row that refuses a sealer in another process refuses one in another
+        # thread on the same terms — and it lapses if this attempt dies
+        # mid-seal, so another may finish what `sealing` records.
+        lease = self._lease(SEAL_ROLE)
+        if not lease.acquire():
+            return None
 
+        with self._lock:
             # The range comes from the queue, not from whatever the buffer
             # happens to hold now. That is the difference between a file of
             # `target_size` and a file of however much arrived while the sealer
@@ -698,8 +733,7 @@ class Log:
             with self._lock:
                 self._buffer.finish_seal(end)
         finally:
-            with self._lock:
-                lease.release()
+            lease.release()
 
         return end
 

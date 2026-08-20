@@ -981,6 +981,38 @@ The consequence worth planning for is that local disk holds roughly
    avoids starting a thread that would lose; `"inline"` is a third setting that seals inside
    the append, which a test wants and a deployment does not.
 
+   **An explicit `seal()` records its cut unconditionally.** Cutting only when the queue
+   was empty made the method's effect depend on how far behind a sealer was: the caller's
+   rows went uncut, an older group was sealed instead, and the call could return None
+   having sealed nothing. Eight appends and eight seals produced seven files, one holding
+   two appends' worth of rows — the same calls, a different data layout, decided by a
+   race. The lease decides who *writes* a file, never where it is cut, so `seal()` now
+   reports the cut regardless of who writes it and `await_seal()` is what blocks until
+   the table has moved.
+
+   **Two roles, but not necessarily two processes.** `seal` and `maintain` are separately
+   leased so they *can* be split, and the shipped shape does not split them: one writer,
+   and one storage process holding both. They are the same kind of work — off the hot path,
+   committing to the same Iceberg table, neither latency-critical the way an append is — so
+   sharing a GIL between them costs nothing that matters, while separating them costs
+   something real. `_table_lock` serialises a seal's commit against a maintenance pass
+   *within* a process and nothing does across processes, so two storage processes race on
+   Iceberg's `write.metadata.delete-after-commit` cleanup and each warns about metadata the
+   other already removed. Splitting them is then a deployment decision needing no code
+   change, worth making only once compaction delays seals enough to matter — and a delayed
+   seal costs latency rather than file size, because the cut was recorded when the rows
+   arrived.
+
+   **A lease statement must be its own transaction.** The buffer connection is shared and
+   every write on it takes `Buffer._lock` around an explicit `BEGIN IMMEDIATE`, so a lease
+   statement issued *without* that lock lands inside whatever transaction happens to be
+   open — an append's — and commits or rolls back with it. A rolled-back append then took
+   the lease row with it, leaving its holder believing it held a role the table no longer
+   recorded. Observed as two sealers writing the same file, with pyiceberg refusing the
+   second: `Cannot add files that are already referenced by table`. `Lease` therefore
+   carries the lock as well as the connection, and holding it is what guarantees the
+   connection is in autocommit so that one statement is one transaction.
+
    **The lease is the only exclusion mechanism**, threads included. It works for both
    because an owner is a UUID minted per acquisition rather than per `Log`, so two threads
    calling `seal()` are two owners and the second loses on the same row that would refuse
