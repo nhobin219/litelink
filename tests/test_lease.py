@@ -308,3 +308,31 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
         taker = Lease(log._buffer._con, log._buffer._lock, "seal", new_owner())
 
         assert taker.acquire(), "the replay path kept the seal lease"
+
+
+def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
+    """A rewrite IS a compaction, so it needs compaction's exclusion.
+
+    Same claim record, same deterministic output path, same commit. Reaching
+    that path lease-free let it run beside a `maintain()` in another process:
+    two writers to one `compaction_path`, and a single-row `compacting` intent
+    each would clear from under the other — leaving a half-written file that
+    nothing could name, which is the one thing §12's queue exists to prevent.
+    """
+    with open_log(tmp_path, config=LogConfig(target_size=1 << 30)) as log:
+        log.extend(rows(20))
+        log.seal()
+
+        held = Lease(log._buffer._con, log._buffer._lock, "maintain", new_owner())
+
+        assert held.acquire(), "could not simulate another maintainer"
+
+        with pytest.raises(RuntimeError, match="maintenance lease"):
+            log.set_sort_by(("key", "event_ts"), rewrite=True)
+
+        assert log._sort_by == ("event_ts",), "the sort order changed anyway"
+
+        held.release()
+        log.set_sort_by(("key", "event_ts"), rewrite=True)
+
+        assert log._sort_by == ("key", "event_ts")
