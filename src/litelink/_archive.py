@@ -16,6 +16,14 @@ collaborator, and `set_archive` has one place to write instead of a fan-out to
 keep in step. That the fan-out is gone is not only tidiness: the cached handle
 lives here too, so re-pointing the archive drops it, where before the Log
 changed the URI and went on serving reads from the table it had already opened.
+
+A local-only log gets one of these with `uri=None`, rather than the three
+holders each taking `Archive | None`. It is the difference between "there is no
+archive" and "there is nowhere to look yet", and only the second survives
+`set_archive`: attaching one to a log that started local has to reach the
+reader and the maintainer, and with an optional they would each be holding a
+None that nothing can update. This object is the slot, and the slot always
+exists — `configured()` is the question about what is in it.
 """
 
 from __future__ import annotations
@@ -38,15 +46,15 @@ class Archive:
     def __init__(
         self,
         layout: Layout,
-        uri: str | None = None,
-        s3: S3Options | None = None,
-        schema: pa.Schema | None = None,
+        uri: str | None,
+        s3: S3Options,
+        schema: pa.Schema,
     ) -> None:
         self._layout = layout
         # `or None` throughout: detaching writes an empty string to `meta`
         # rather than deleting the row, and an empty archive is no archive.
         self._uri = uri or None
-        self._s3 = s3 or S3Options()
+        self._s3 = s3
         self._schema = schema
         self._handle: LogTable | None = None
         # Guards all three fields together, because they are one fact. The
@@ -110,10 +118,6 @@ class Archive:
                 return None
 
             if self._handle is None:
-                if self._schema is None:
-                    msg = "archive was constructed without a schema"
-                    raise ValueError(msg)
-
                 # Held across the open, which is a round trip. Deliberate: a
                 # second caller arriving mid-open should wait for that handle
                 # rather than start a second one, and `set_uri` should wait

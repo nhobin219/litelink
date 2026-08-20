@@ -48,6 +48,7 @@ from pathlib import Path
 from _stream import NAME
 
 from litelink import Log
+from litelink._s3 import S3Options
 
 
 def main() -> None:
@@ -65,11 +66,17 @@ def main() -> None:
     # and repeating that here would mean an example knowing which file to look
     # for, which is the library's business and not the caller's.
     try:
-        log = Log.open(args.root, NAME)
+        # Credentials from the environment, never from the log — see
+        # `capture.py`. Harmless when there is no archive: nothing resolves
+        # them unless a push actually happens.
+        log = Log.open(args.root, NAME, s3=S3Options())
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 
     print(f"maintaining {NAME} in {args.root} — pid {os.getpid()}")
+    if log.archive:
+        print(f"pushing settled files to {log.archive}")
+
     print(
         f"sealing every {args.seal_every:.2f}s, maintaining every "
         f"{args.maintain_every:.0f}s"
@@ -106,12 +113,27 @@ def _maintain(log: Log, root: Path) -> None:
         print(f"  skipped: {exc}")
         return
 
+    # After `maintain`, not before. Eviction reads the archive watermark to
+    # decide what it is allowed to drop (I4), so a push landing first is what
+    # lets the NEXT pass reclaim the disk it freed up.
+    #
+    # Separate from `maintain()` because it is the one step that can block on a
+    # network: everything above is local and finishes in milliseconds, and a
+    # loop that could not tell them apart would report an S3 timeout as slow
+    # compaction.
+    archived = ""
+    if log.archive:
+        pushed = time.monotonic()
+        log.sync()
+        archived = f"  sync={(time.monotonic() - pushed) * 1000:>5.0f} ms"
+
     print(
         f"  table={log.table_rows():>10,} rows"
         f"  buffered={log.buffered_rows():>9,}"
         f"  files={log.table_files():>4}"
         f"  disk={_disk(root) / 1e6:>7.1f} MB"
         f"  ({(time.monotonic() - started) * 1000:>5.0f} ms)"
+        f"{archived}"
     )
 
 

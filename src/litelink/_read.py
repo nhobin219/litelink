@@ -64,7 +64,7 @@ class Reader:
         buffer: Buffer,
         schema: pa.Schema,
         connect: Callable[[], duckdb.DuckDBPyConnection],
-        archive: Archive | None = None,
+        archive: Archive,
     ) -> None:
         self._layout = layout
         self._table = table
@@ -75,7 +75,7 @@ class Reader:
         # first use, so a reader that never passes `include_archive` never
         # touches the network (I5), and `Log.set_archive` re-points this same
         # object rather than leaving the reader holding a stale one.
-        self._archive = archive if archive is not None else Archive(layout)
+        self._archive = archive
         self._remote_ready = False
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built

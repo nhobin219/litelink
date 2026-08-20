@@ -18,10 +18,11 @@ from pathlib import Path
 from _stream import NAME
 
 from litelink import Log
+from litelink._s3 import S3Options
 
 
-def snapshot(log: Log) -> tuple[int, int, int, int]:
-    """(total rows, table rows, buffer rows, data files) — one read, one moment.
+def snapshot(log: Log) -> tuple[int, int, int, int, int]:
+    """(stream, table rows, buffer rows, data files, archived) — one moment.
 
     Nothing here scans data. Iceberg tracks a row count per file, so the table's
     total comes off the manifest read that produced the boundary; the buffer is
@@ -30,12 +31,20 @@ def snapshot(log: Log) -> tuple[int, int, int, int]:
     The difference is the shape, not the constant. A `count(*)` over the log
     reads the offset column out of every Parquet file, so the poll got slower as
     the log grew — 24 ms at 50,000 rows and climbing. This is flat.
+
+    With an archive, `table + buffer` stops being the whole stream: eviction
+    removes files the archive has, so the local tiers SHRINK while the stream
+    only grows. `end_offset` is the count that keeps growing either way — it is
+    the next offset to be assigned, so one less than it is every row ever
+    appended, whichever tier now holds it. The watermark says how much of that
+    the archive has taken, and the gap between them is how far sync is behind.
     """
     return (
-        log.table_rows() + log.buffered_rows(),
+        log.end_offset() - 1,
         log.table_rows(),
         log.buffered_rows(),
         log.table_files(),
+        log.archived_through(),
     )
 
 
@@ -47,20 +56,29 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log = Log.open(args.root, NAME, read_only=True)
-    print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.\n")
-    print(f"{'total':>12} {'in table':>12} {'in buffer':>12} {'files':>7} {'read':>8}")
+    log = Log.open(args.root, NAME, read_only=True, s3=S3Options())
+    print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.")
+    if log.archive:
+        print(f"archive: {log.archive} — `in table` falls as files are evicted")
+
+    print()
+    archived_column = f" {'archived':>12}" if log.archive else ""
+    print(
+        f"{'stream':>12} {'in table':>12} {'in buffer':>12}"
+        f"{archived_column} {'files':>7} {'read':>8}"
+    )
 
     previous = 0
     try:
         while True:
             started = time.monotonic()
-            total, table, buffered, files = snapshot(log)
+            total, table, buffered, files, archived = snapshot(log)
             elapsed_ms = (time.monotonic() - started) * 1000
 
             delta = f"+{total - previous:,}" if total > previous else ""
             print(
-                f"{total:>12,} {table:>12,} {buffered:>12,} {files:>7} "
+                f"{total:>12,} {table:>12,} {buffered:>12,}"
+                f"{f' {archived:>12,}' if log.archive else ''} {files:>7} "
                 f"{elapsed_ms:>7.1f}ms  {delta}"
             )
             previous = total

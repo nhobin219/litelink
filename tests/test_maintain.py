@@ -621,3 +621,49 @@ def test_sizing_does_not_depend_on_how_well_the_data_compressed() -> None:
 
     assert runs(files, target, memory) == [[f] for f in files], "each already full"
     assert stable_prefix(files, target, 2, memory) == 24
+
+
+def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> None:
+    """`local_retention` must not depend on `snapshot_retention`.
+
+    A file's age came from the snapshot that added it, and expiry deletes that
+    snapshot — after which the file was in no age map at all, `evict` could not
+    classify it as stale, and it stayed on local disk for ever.
+
+    The two settings are sized by unrelated things: §6 says `snapshot_retention`
+    must exceed the longest SCAN, §8 says `local_retention` must exceed the
+    longest hot LOOKBACK. So the ordinary configuration has expiry running in
+    minutes and retention in days — and every file lost its age long before it
+    was old enough to evict. Retention silently did nothing.
+    """
+    config = LogConfig(
+        target_size=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)
+        files = log._table.data_files()
+        assert len(files) == 4
+
+        # A commit AFTER the last seal, which is what makes every remaining
+        # file's adding snapshot expirable. Iceberg always keeps the current
+        # snapshot, so without this the newest file stays dateable and drags
+        # the rest out with it — which is why the fault only appears once a log
+        # has been running a while, and never in a test that just seals.
+        # Eviction itself is the commit that does it in practice.
+        log._table.evict_through(files[0].hi)
+        log._maintenance.expire()
+
+        remaining = log._table.data_files()
+        assert remaining, "the fixture must leave files behind to evict"
+        assert not set(log._table.snapshot_ages()) & {f.path for f in remaining}, (
+            "the fixture must leave every remaining file undateable"
+        )
+
+        log._maintenance.evict()
+
+        assert log._table.data_files() == [], (
+            "a file whose adding snapshot has expired must still be evictable"
+        )

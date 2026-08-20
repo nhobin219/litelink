@@ -293,7 +293,8 @@ class Buffer:
               start_offset INTEGER,
               end_offset   INTEGER,
               bytes        INTEGER NOT NULL DEFAULT 0,
-              rel_path     TEXT UNIQUE
+              rel_path     TEXT UNIQUE,
+              named_at     INTEGER
             )
         """)
         # The two states that are still work, which is what every hot query
@@ -903,7 +904,7 @@ class Buffer:
             # Same transaction as the rows it retires, so a file can never be
             # committed with the count of what it holds lost.
             self._con.execute(
-                "UPDATE extent SET rel_path = ?"
+                "UPDATE extent SET rel_path = ?, named_at = unixepoch()"
                 " WHERE end_offset = ? AND rel_path IS NULL",
                 (rel_path, end),
             )
@@ -936,6 +937,29 @@ class Buffer:
 
         return {str(row[0]): int(row[1]) for row in rows}
 
+    def file_ages(self) -> dict[str, int]:
+        """When each file was written, as a unix timestamp, keyed by location.
+
+        A log's own record of its files' ages, because Iceberg's does not
+        survive. A file's age used to be read off the snapshot that added it,
+        and `expire` deletes that snapshot — after which the file appeared in
+        no age map, `evict` could not call it stale, and `local_retention`
+        silently stopped reclaiming anything.
+
+        The two settings are sized by unrelated things: §6 wants
+        `snapshot_retention` above the longest scan, §8 wants
+        `local_retention` above the longest hot lookback. Any deployment where
+        the second is longer than the first — which is the ordinary one — has
+        every file losing its Iceberg age before it is old enough to evict.
+        """
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, named_at FROM extent"
+                " WHERE rel_path IS NOT NULL AND named_at IS NOT NULL"
+            ).fetchall()
+
+        return {str(row[0]): int(row[1]) for row in rows}
+
     def record_file(self, rel_path: str, start: int, end: int, held: int) -> None:
         """Record a second file holding an extent the log already has.
 
@@ -955,8 +979,9 @@ class Buffer:
         """
         with self._lock:
             self._con.execute(
-                "INSERT INTO extent (start_offset, end_offset, bytes, rel_path)"
-                " VALUES (?, ?, ?, ?)"
+                "INSERT INTO extent"
+                " (start_offset, end_offset, bytes, rel_path, named_at)"
+                " VALUES (?, ?, ?, ?, unixepoch())"
                 " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
                 (start, end, held, rel_path),
             )
@@ -990,7 +1015,8 @@ class Buffer:
             if summed[1] == len(paths):
                 self._con.execute(
                     "INSERT INTO extent"
-                    " (start_offset, end_offset, bytes, rel_path) VALUES (?, ?, ?, ?)"
+                    " (start_offset, end_offset, bytes, rel_path, named_at)"
+                    " VALUES (?, ?, ?, ?, unixepoch())"
                     " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
                     (summed[2], summed[3], int(summed[0]), rel_path),
                 )
