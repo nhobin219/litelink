@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -21,16 +23,50 @@ if TYPE_CHECKING:
 from litelink._lease import DEFAULT_TTL_MS, Lease
 from litelink._types import column_type
 
+# The library-owned column (§2).
+OFFSET = "litelink_offset"
+
+# How many appended-since-last-query slices the tail may accumulate before it
+# is compacted back into one.
+_MAX_TAIL_CHUNKS = 32
+
+
+def _now() -> int:
+    """Unix seconds. Whole seconds because `max_age` is a coarse policy."""
+    return int(time.time())
+
+
+@dataclass(slots=True)
+class _Group:
+    """The open `seal_group` row, while an append transaction fills it.
+
+    Read once per transaction and written back once, so the per-row accounting
+    that decides the cut is arithmetic rather than a statement per row.
+    """
+
+    group_id: int
+    start_offset: int | None
+    bytes: int
+    opened_at: int | None
+
 
 class Buffer:
     """The unsealed tail of a log."""
 
     def __init__(
-        self, path: Path, schema: pa.Schema, *, readonly: bool = False
+        self,
+        path: Path,
+        schema: pa.Schema,
+        *,
+        target_size: int,
+        readonly: bool = False,
     ) -> None:
         """Open or create the buffer at `path`.
 
         `schema` is the application's columns, without `offset`.
+
+        `target_size` is here rather than only on the seal because the cut it
+        describes is made on the append path — see `seal_group`.
 
         A readonly buffer opens the same file through SQLite's `mode=ro` URI so
         the handle cannot write even by mistake, and creates nothing. WAL allows
@@ -38,6 +74,14 @@ class Buffer:
         """
         self._schema = schema
         self._columns = tuple(schema.names)
+        self._target_size = target_size
+        # The read cache — see `rows_above`. Guarded by its own lock rather
+        # than `_lock`, which appends hold: a read must not wait behind a write
+        # to look at a table the write cannot invalidate.
+        self._tail_lock = threading.Lock()
+        self._tail: pa.Table | None = None
+        self._tail_lo = 0
+        self._tail_hi = 0
 
         if readonly:
             self._con = sqlite3.connect(
@@ -47,7 +91,6 @@ class Buffer:
                 check_same_thread=False,
             )
             self._reader = self._con
-            self._bytes = 0
             return
 
         # check_same_thread=False because scheduling maintenance on a background
@@ -84,7 +127,7 @@ class Buffer:
             check_same_thread=False,
         )
         self._create()
-        self._bytes = self._measure()
+        self._seed_group()
 
     def _create(self) -> None:
         columns = ",\n  ".join(
@@ -127,6 +170,31 @@ class Buffer:
               rel_path TEXT PRIMARY KEY, superseded_at INTEGER NOT NULL
             )
         """)
+        # The seal queue, and the reason `target_size` means anything.
+        #
+        # A single running byte counter cannot keep that promise. It says a
+        # threshold was crossed, never WHERE — so a sealer that polls one cuts
+        # wherever the buffer has reached by the time it looks, swallowing
+        # everything that arrived during the poll gap and during the seal
+        # itself. File size would then track how far behind the sealer was.
+        #
+        # So the cut is made by the appender, in the transaction that crosses
+        # it, and written down here. A closed row is a file that ought to
+        # exist; the sealer reads one row to learn both that there is work and
+        # exactly which offsets it covers. Falling behind costs latency rather
+        # than file size, because every queued group is already the right size.
+        #
+        # The same shape as `pending_delete`: work that must not be rediscovered
+        # by scanning is recorded when it is created.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS seal_group (
+              group_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+              start_offset INTEGER,
+              end_offset   INTEGER,
+              bytes        INTEGER NOT NULL DEFAULT 0,
+              opened_at    INTEGER
+            )
+        """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
@@ -141,22 +209,48 @@ class Buffer:
 
     # -- size accounting --------------------------------------------------
     #
-    # `target_size` is in bytes, so the seal trigger needs the buffered size on
-    # every append — and a SUM() over the whole table per append is a full scan
-    # of the thing being appended to. Tracked incrementally instead: measured
-    # once at open, incremented per row, re-measured after a seal empties it.
-    # Losing the counter to a restart costs nothing, since open re-measures.
+    # The running total lives in the open `seal_group` row and is written in the
+    # same transaction as the rows it accounts for. That is what lets any
+    # process read it — a keyed read of one row, rather than a SUM() over the
+    # table being appended to — and what makes it impossible for the count and
+    # the rows to disagree after a crash.
     #
     # Approximate on purpose. SQLite stores an integer in 1-8 bytes and
     # `octet_length` reports its TEXT width, so neither side of this is exact.
     # It is a policy trigger, not an accounting record; being within a few
     # percent of the true size is what `target_size` actually needs.
 
-    def byte_size(self) -> int:
-        """Approximate bytes currently buffered."""
-        return self._bytes
+    def _seed_group(self) -> None:
+        """Ensure exactly one open group, seeded from whatever is buffered.
 
-    def _measure(self) -> int:
+        The only SUM() left, and it runs once per open rather than per append.
+        It fires for a log created before this table existed, and for one whose
+        open group was closed by a sealer just before the process died.
+        """
+        if self._con.execute(
+            "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
+        ).fetchone():
+            return
+
+        covered = int(
+            self._con.execute(
+                "SELECT coalesce(max(end_offset), 0) FROM seal_group"
+            ).fetchone()[0]
+        )
+        start = self._con.execute(
+            'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
+            (covered,),
+        ).fetchone()[0]
+        # Restarting the max_age clock at open is deliberate. Nothing records
+        # when a row arrived — §2 stamps no timestamp — so the alternative is
+        # inventing an age, and inventing an old one seals a stub file on every
+        # restart, which is the failure §6 exists to clean up after.
+        self._con.execute(
+            "INSERT INTO seal_group (start_offset, bytes, opened_at) VALUES (?, ?, ?)",
+            (start, self._measure_from(covered), None if start is None else _now()),
+        )
+
+    def _measure_from(self, floor: int) -> int:
         terms = ["8"]  # offset
         for name in self._columns:
             terms.append(
@@ -167,6 +261,8 @@ class Buffer:
 
         row = self._con.execute(
             f"SELECT coalesce(sum({' + '.join(terms)}), 0) FROM buffer"
+            ' WHERE "litelink_offset" >= ?',
+            (floor,),
         ).fetchone()
 
         return int(row[0])
@@ -221,18 +317,37 @@ class Buffer:
     def _insert(self, rows: Iterable[Mapping[str, object]], sql: str) -> list[int]:
         """The append's transaction, with the lock already held."""
         offsets: list[int] = []
-        added = 0
         cursor = self._con.cursor()
         cursor.execute("BEGIN")
         try:
+            group = self._read_group(cursor)
+            # Bound once, and the accounting inlined below, because this loop
+            # runs per row: routing it through a method cost 19 points of
+            # overhead against raw SQLite at 1,000-row batches.
+            target = self._target_size
+            row_bytes = self._row_bytes
+            columns = self._columns
             for row in rows:
                 self._reject_offset(row)
-                cursor.execute(sql, tuple(row.get(c) for c in self._columns))
+                cursor.execute(sql, tuple(row.get(c) for c in columns))
                 # lastrowid is the assigned offset, available inside the open
                 # transaction and before the row is visible to anyone else.
-                offsets.append(int(cursor.lastrowid or 0))
-                added += self._row_bytes(row)
+                offset = int(cursor.lastrowid or 0)
+                offsets.append(offset)
 
+                if group.start_offset is None:
+                    # Stamped by the first row, not by the group's creation:
+                    # `max_age` measures how long data has waited, and a group
+                    # that sat empty for an hour would otherwise seal a one-row
+                    # file the moment it filled.
+                    group.start_offset = offset
+                    group.opened_at = _now()
+
+                group.bytes += row_bytes(row)
+                if group.bytes >= target:
+                    group = self._cut(cursor, group, offset)
+
+            self._write_group(cursor, group)
             cursor.execute("COMMIT")
         except BaseException:
             # Best-effort, and it must not raise over the original. An
@@ -251,9 +366,50 @@ class Buffer:
 
             raise
 
-        self._bytes += added
-
         return offsets
+
+    def _read_group(self, cursor: sqlite3.Cursor) -> _Group:
+        """The open group, once per transaction rather than once per row."""
+        row = cursor.execute(
+            "SELECT group_id, start_offset, bytes, opened_at FROM seal_group"
+            " WHERE end_offset IS NULL"
+        ).fetchone()
+
+        return _Group(int(row[0]), row[1], int(row[2]), row[3])
+
+    def _cut(self, cursor: sqlite3.Cursor, group: _Group, offset: int) -> _Group:
+        """Close the group at `offset` and open the next. Once per FILE.
+
+        The cut lands on the row that crossed, not at the end of the batch:
+        `target_size` is the library's one promise about file size, and cutting
+        on the batch boundary would make that promise depend on how the caller
+        chose to batch — which §1 says carries no meaning of its own. A batch
+        large enough crosses several times and comes through here each time.
+        """
+        self._write_group(cursor, group, end_offset=offset + 1)
+        cursor.execute("INSERT INTO seal_group (bytes) VALUES (0)")
+
+        return _Group(int(cursor.lastrowid or 0), None, 0, None)
+
+    def _write_group(
+        self, cursor: sqlite3.Cursor, group: _Group, end_offset: int | None = None
+    ) -> None:
+        """Write the accumulated group back. Once per cut, once per batch.
+
+        `end_offset` closes it; without one the group stays open and this is
+        just the running total being persisted for other processes to read.
+        """
+        cursor.execute(
+            "UPDATE seal_group SET start_offset = ?, bytes = ?, opened_at = ?,"
+            " end_offset = ? WHERE group_id = ?",
+            (
+                group.start_offset,
+                group.bytes,
+                group.opened_at,
+                end_offset,
+                group.group_id,
+            ),
+        )
 
     @staticmethod
     def _reject_offset(row: Mapping[str, object]) -> None:
@@ -279,12 +435,26 @@ class Buffer:
         return (row[0] if row else 0) + 1
 
     def extent(self) -> tuple[int, int] | None:
-        """`(min, max)` offset currently buffered, or None if empty."""
-        lo, hi = self._con.execute(
-            'SELECT min("litelink_offset"), max("litelink_offset") FROM buffer'
-        ).fetchone()
+        """`(min, max)` offset currently buffered, or None if empty.
 
-        return None if lo is None else (int(lo), int(hi))
+        Two statements, deliberately. SQLite rewrites `min(pk)` or `max(pk)`
+        into a single B-tree edge seek ONLY when it is the sole aggregate in
+        the select list; ask for both at once and the plan degrades from SEARCH
+        to a full SCAN of the table. Measured on a 20,000-row buffer:
+        2.465 ms together, 0.006 ms apart. Do not tidy these back into one.
+        """
+        with self._lock:
+            lo = self._con.execute(
+                'SELECT min("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+            if lo is None:
+                return None
+
+            hi = self._con.execute(
+                'SELECT max("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+
+        return (int(lo), int(hi))
 
     def count_above(self, boundary: int) -> int:
         """How many buffered rows sit above `boundary` — the unsealed tail.
@@ -300,11 +470,89 @@ class Buffer:
         return int(row[0])
 
     def rows_below(self, end: int) -> pa.Table:
-        """Buffered rows with `offset < end`, as Arrow."""
+        """Buffered rows with `offset < end`, as Arrow. The seal's input."""
+        return self._rows("< ?", (end,))
+
+    def rows_above(self, boundary: int | None) -> pa.Table:
+        """Buffered rows with `offset > boundary`, as Arrow. The read's input.
+
+        `boundary` is the local table's committed extent, so this is §7's
+        unsealed tail — the rows the Iceberg leg does not already carry.
+
+        Read here rather than by the query engine, and that is a correctness
+        requirement rather than a preference. DuckDB's sqlite extension carries
+        its OWN statically linked SQLite, so attaching this file put it under
+        two independent SQLite libraries in one process. POSIX advisory locks
+        are per process and per inode, and each library keeps its own table of
+        open descriptors to work around that — so closing one library's handle
+        drops the other library's locks, and the writer and reader stop being
+        serialised at all. Measured: an in-process scan concurrent with appends
+        corrupted the database on the FIRST scan ("database disk image is
+        malformed", and a torn -shm mmap raises SIGBUS); the same workload with
+        the reader in a separate process ran 327 scans clean.
+
+        Converted incrementally, because a scan repeated over a buffer that
+        gained 200 rows should not re-convert the other 20,000. Rows are
+        immutable once committed, arrive only above the last one, and leave
+        only as a prefix at a seal — so the previous answer stays valid in the
+        middle, and a query pays for its own delta plus a zero-copy slice.
+        Measured at a full 8 MiB buffer: 29.4 ms rebuilt, and two thirds of
+        that is `fetchall` turning 120,000 values into Python objects.
+        """
+        floor = 0 if boundary is None else boundary
+        with self._tail_lock:
+            cached = self._reusable(floor)
+            if cached is None:
+                table = self._rows("> ?", (floor,))
+            else:
+                fresh = self._rows("> ?", (self._tail_hi,))
+                table = (
+                    cached if fresh.num_rows == 0 else pa.concat_tables([cached, fresh])
+                )
+                if table.column(0).num_chunks > _MAX_TAIL_CHUNKS:
+                    # One chunk per query otherwise, forever. Combining is a
+                    # copy, so it is amortised rather than paid every time.
+                    table = table.combine_chunks()
+
+            self._tail = table
+            self._tail_lo = floor
+            if table.num_rows:
+                self._tail_hi = int(table.column(OFFSET)[-1].as_py())
+
+            return table
+
+    def _reusable(self, floor: int) -> pa.Table | None:
+        """The cached tail with everything through `floor` dropped, or None.
+
+        The slice index is arithmetic — buffered offsets are contiguous, so
+        dropping through `floor` drops exactly `floor - _tail_lo` rows — and
+        then checked, because that contiguity is a property of AUTOINCREMENT
+        and prefix-only deletion rather than something enforced here. A failed
+        check costs a rebuild, which is what the code did unconditionally
+        before.
+        """
+        if self._tail is None or not (self._tail_lo <= floor <= self._tail_hi):
+            return None
+
+        kept = self._tail.slice(floor - self._tail_lo)
+        if kept.num_rows and int(kept.column(OFFSET)[0].as_py()) != floor + 1:
+            return None
+
+        return kept
+
+    def _rows(self, predicate: str, params: tuple[object, ...]) -> pa.Table:
+        """Buffered rows matching `offset <predicate>`, in offset order.
+
+        The predicate is on the INTEGER PRIMARY KEY so SQLite answers it with
+        `SEARCH buffer USING INTEGER PRIMARY KEY (rowid>?)` rather than reading
+        rows the caller will discard. That is what keeps a deferred cleanup
+        costing disk rather than query latency (§7).
+        """
         names = ", ".join(f'"{c}"' for c in ("litelink_offset", *self._columns))
         cursor = self._reader.execute(
-            f'SELECT {names} FROM buffer WHERE "litelink_offset" < ? ORDER BY "litelink_offset"',
-            (end,),
+            f'SELECT {names} FROM buffer WHERE "litelink_offset" {predicate}'
+            ' ORDER BY "litelink_offset"',
+            params,
         )
         columns = list(zip(*cursor.fetchall(), strict=True)) or [
             () for _ in range(len(self._columns) + 1)
@@ -313,34 +561,98 @@ class Buffer:
             [pa.field("litelink_offset", pa.int64(), nullable=False), *self._schema]
         )
 
-        # Built loosely, then cast to the declared schema — the SQLite edge.
-        # SQLite has no boolean and no distinction between string widths, so
-        # its values come back as whatever storage class it chose; casting is
-        # what turns them back into the types the caller declared. Constructing
-        # directly with `type=` instead refuses rather than converting: a bool
-        # column comes back as 1 and 0, and `pa.array([1], type=bool_())`
-        # raises.
-        loose = pa.table(
-            [pa.array(values) for values in columns],
-            names=list(schema.names),
+        return pa.table(
+            [
+                self._column(values, field.type)
+                for values, field in zip(columns, schema, strict=True)
+            ],
+            schema=schema,
         )
 
-        return loose.cast(schema)
+    @staticmethod
+    def _column(values: tuple[object, ...], declared: pa.DataType) -> pa.Array:
+        """One column, at the SQLite edge, in the declared type.
+
+        Typed construction first, and a cast only where that fails. SQLite has
+        no boolean and no distinction between string widths, so its values come
+        back as whatever storage class it chose — a bool column arrives as 1
+        and 0, which `pa.array([1], type=bool_())` refuses and a cast converts.
+
+        Casting the whole table unconditionally was the obvious version, and it
+        cost roughly as much again as building it: every column paid the
+        conversion pass, including the ones already in the right type.
+        """
+        try:
+            return pa.array(values, type=declared)
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
+            return pa.array(values).cast(declared)
 
     def lease(self, role: str, owner: str, ttl_ms: int = DEFAULT_TTL_MS) -> Lease:
         """A claim on `role`, backed by this database."""
         return Lease(self._con, role, owner, ttl_ms)
 
-    def measure(self) -> int:
-        """Buffered bytes, computed rather than remembered.
+    # -- the seal queue ---------------------------------------------------
 
-        `byte_size` reads a counter this process maintains, which is right for
-        the append path and useless to any other — it neither exists there nor
-        decrements when this process seals. A sealer in its own process polls
-        this instead, paying a scan of a buffer §7 already wants small.
+    def pending_group(self) -> tuple[int, int] | None:
+        """The oldest group awaiting a file: `(start, end)`, end exclusive.
+
+        The sealer's entire trigger, in any process. Closed groups sort below
+        the open one, so this reads the first row of a table holding one entry
+        per queued file plus the open one — never a scan of the buffer, and
+        never a question about where to cut, because that was decided already.
         """
+        row = self._con.execute(
+            "SELECT start_offset, end_offset FROM seal_group"
+            " WHERE end_offset IS NOT NULL ORDER BY group_id LIMIT 1"
+        ).fetchone()
+
+        return None if row is None else (int(row[0]), int(row[1]))
+
+    def close_open_group(self, cutoff: int | None = None) -> bool:
+        """Cut the open group short so a sealer can pick it up.
+
+        With `cutoff`, only if its first row landed at or before then. That is
+        `max_age` (§4), and it belongs to the sealer rather than the appender:
+        a quiet stream is one that is not appending, so the appender has no
+        moment at which to notice. Harmless to race — the predicate matches
+        nothing once another poller has closed it.
+
+        Without one, unconditionally, which is what an explicit `seal()` means.
+        An empty group is never closed either way; there would be no file.
+        """
+        stale = "" if cutoff is None else " AND opened_at <= ?"
+        # Asked before it is written. The sealer calls this on every poll, and
+        # the answer is almost always "nothing to close" — issuing a write
+        # transaction to discover that would put a commit and an fsync on a
+        # timer, for every log, forever. The read is a single row.
+        if not self._con.execute(
+            "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
+            " AND start_offset IS NOT NULL" + stale,
+            () if cutoff is None else (cutoff,),
+        ).fetchone():
+            return False
+
         with self._lock:
-            return self._measure()
+            self._con.execute("BEGIN")
+            try:
+                cursor = self._con.execute(
+                    "UPDATE seal_group SET end_offset ="
+                    ' (SELECT max("litelink_offset") + 1 FROM buffer)'
+                    " WHERE end_offset IS NULL AND start_offset IS NOT NULL" + stale,
+                    () if cutoff is None else (cutoff,),
+                )
+                closed = bool(cursor.rowcount)
+                if closed:
+                    self._con.execute("INSERT INTO seal_group (bytes) VALUES (0)")
+
+                self._con.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.OperationalError):
+                    self._con.execute("ROLLBACK")
+
+                raise
+
+            return closed
 
     # -- seal bookkeeping -------------------------------------------------
 
@@ -368,18 +680,23 @@ class Buffer:
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
     def finish_seal(self, end: int) -> None:
-        """Delete sealed rows and clear the intent.
+        """Delete sealed rows, retire the group, and clear the intent.
 
         Garbage collection, not correctness: the read boundary in §7 already
         excludes these rows the moment the Iceberg commit lands, so the window
         between that commit and this call is safe in both directions.
+
+        The group is keyed by `end` rather than an id threaded through the
+        seal. Groups are consecutive and non-overlapping, so an exclusive end
+        identifies exactly one — which also means a recovered seal retires its
+        group without `sealing` having had to remember which one it was.
         """
         with self._lock:
             self._con.execute("BEGIN")
             self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
+            self._con.execute("DELETE FROM seal_group WHERE end_offset = ?", (end,))
             self._con.execute("DELETE FROM sealing")
             self._con.execute("COMMIT")
-            self._bytes = self._measure()
 
     # -- meta ---------------------------------------------------------------
     #
