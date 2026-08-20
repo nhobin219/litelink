@@ -1070,33 +1070,47 @@ The consequence worth planning for is that local disk holds roughly
    something is due*. Nothing identified so far needs the former, and adding an insert to the
    append path to deliver it would spend write latency — the thing this whole line of
    thinking is trying to reclaim.
-7. **Seal cost grows with the table, and compaction cannot arrest it.** A seal commits, and a
-   commit's cost tracks the number of **live data files**, not the number added since the last
-   one. Measured with compaction disabled, one file per seal: 46.7 ms at 20 files, 103.3 ms at
-   80, 301.8 ms at 320. Roughly linear.
+7. **Seal cost grows, mostly with snapshots and secondarily with files.** A seal commits, and
+   a commit's cost tracks what the table *metadata* holds — not the rows, and not only the
+   files. Measured at one file per seal:
 
-   Manifests are not the unbounded part, which is worth saying because they are the obvious
-   suspect. They cap at `commit.manifest.target-size-bytes` and split rather than growing —
-   verified by lowering the target until the split was reachable, after which the largest
-   manifest held at ~61 KB against a 64 KB target. `add_files`' duplicate check contributes
-   about 18% (272 ms against 224 ms at 240 files with it off). The rest is pyiceberg's commit
-   path doing work proportional to what the table holds.
+   ```
+   snapshots retained     40 files /  40 snapshots     61.6 ms
+                         240 files / 240 snapshots    247.6 ms
+   snapshots expired      40 files /   1 snapshot      43.2 ms
+                         240 files /   1 snapshot      86.3 ms
+   ```
 
-   **The file count is what has no bound.** §6 selects files *under* `compact_below`, so a
-   file compaction has already produced at or above that size is never revisited. Compaction
-   bounds how many *small* files exist; it cannot reduce the total.
+   **The larger factor is snapshot accumulation, and expiry arrests it** — which `maintain()`
+   already does, bounded by `snapshot_retention`. An earlier version of this entry blamed file
+   count alone, measured with `maintain()` never running so that every snapshot survived. That
+   made the growth look both steeper and less fixable than it is.
 
-   Eviction is then the only mechanism that removes a large file, and §8 makes
-   `local_retention = None` — keep everything — the default. So a long-running local-only
-   capture that keeps its history accumulates files indefinitely and its seals degrade
-   indefinitely, with compaction running and unable to help. Archival configurations are fine,
-   because eviction is doing the bounding; it is the "just keep it all locally" case that
-   walks into this.
+   **The cause is not manifests**, which is the obvious suspect and worth ruling out. They cap
+   at `commit.manifest.target-size-bytes` and split rather than growing — verified by lowering
+   the target until the split was reachable, after which the largest manifest held at ~61 KB
+   against a 64 KB target. `add_files`' duplicate check contributes about 18% (272 ms against
+   224 ms at 240 files with it off).
+
+   It is pyiceberg deep-copying the whole `TableMetadata` on every metadata update: 27 copies
+   per commit, each descending the full model tree, which is 80% of a commit at 300 files.
+   Metadata holds the snapshot list, the schemas and the metadata log —
+   `write.metadata.previous-versions-max` already bounds the last, and expiry bounds the
+   first. There is no supported way to switch the copying off from outside pyiceberg, so
+   keeping the metadata small **is** the mitigation, and both levers for that are already
+   config.
+
+   **A file-count component remains**, and it is the honest residual: 43.2 ms to 86.3 ms as
+   files went 40 to 240 with snapshots pinned at one. §6 selects files *under* `compact_below`,
+   so a file compaction has already produced at or above that size is never revisited —
+   compaction bounds how many *small* files exist and cannot reduce the total. Eviction is the
+   only mechanism that removes a large file, and §8 makes `local_retention = None` the default,
+   so a local-only capture that keeps its history still degrades. Less steeply than this entry
+   first claimed, and for a reason now named.
 
    Worth measuring before choosing a fix, since the options differ in shape: raising
-   `compact_below` over time so yesterday's output is tomorrow's input, tiered compaction, a
-   manifest layout that makes a commit independent of table size, or the honest possibility
-   that unbounded local retention is not a supported configuration.
+   `compact_below` over time so yesterday's output is tomorrow's input, tiered compaction, or
+   the honest possibility that unbounded local retention is not a supported configuration.
 
    **The archive has the same commit cost and it does not matter in the same way.** Its file
    count is unbounded by design — it is the full history — so registering into it rewrites
