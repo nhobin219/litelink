@@ -106,6 +106,15 @@ class LogConfig:
     # max_age at the cost of a sidecar.
     wal_replication: bool = False
 
+    # Seal on a background thread rather than inside the append that crossed
+    # the threshold. §13.6 measured that append at 30-93 ms against a 0.73 ms
+    # median — the caller who happens to cross the line pays for the sort, the
+    # Parquet write, the fsync and the Iceberg commit.
+    #
+    # Off makes seals synchronous, which is what a test wants when it needs the
+    # table to have changed by the time `extend` returns.
+    background_seal: bool = True
+
     def to_json(self) -> str:
         """Serialised for the `meta` table, so `open` recovers the policy.
 
@@ -195,6 +204,31 @@ class Log:
         # The cost is that a read blocks behind a running compaction — worth
         # revisiting when compaction gets long enough to notice.
         self._lock = threading.RLock()
+        # A second lock, so the two things a seal touches can be released
+        # independently. `_lock` guards the buffer — appends, and the seal's
+        # claim and cleanup. `_table_lock` guards the pyiceberg handle, which a
+        # reader reloads per query (§7) and a seal mutates when it commits.
+        #
+        # One lock could not do this. The seal's expensive half writes Parquet
+        # and commits, and holding the buffer lock across that is exactly the
+        # stall being removed; holding nothing across the commit races a reader
+        # reloading the same object. Two locks let an append proceed throughout
+        # while a read waits only for the commit itself.
+        self._table_lock = threading.RLock()
+
+        # A seal's expensive half runs without the lock, so exactly one may be
+        # in flight; `_sealing` is that guarantee and `_sealed` lets a caller
+        # wait for one to finish.
+        self._sealing = False
+        self._sealed = threading.Event()
+        self._sealed.set()
+        self._seal_wanted = threading.Event()
+        self._stop = threading.Event()
+        self._sealer: threading.Thread | None = None
+        # The last failure from the sealing thread, which has no caller to
+        # raise to. Surfaced by `close`, so a process that never checks still
+        # finds out.
+        self._seal_error: BaseException | None = None
 
     # -- construction ------------------------------------------------------
 
@@ -478,7 +512,7 @@ class Log:
             msg = "archive reads are not implemented"
             raise NotImplementedError(msg)
 
-        with self._lock:
+        with self._table_lock:
             return self._reader.query(query)
 
     def end_offset(self) -> int:
@@ -518,14 +552,14 @@ class Log:
         From the manifests, which track a count per file, so this costs nothing
         beyond the snapshot read the boundary already needs.
         """
-        with self._lock:
+        with self._table_lock:
             self._table.reload()
 
             return self._table.record_count()
 
     def table_files(self) -> int:
         """Data files in the local table — what compaction is bringing down."""
-        with self._lock:
+        with self._table_lock:
             self._table.reload()
 
             return self._table.file_count()
@@ -536,7 +570,7 @@ class Log:
         §7's tier boundary. Read from manifest column statistics — no data file
         is opened, which is what makes it ~0.6 ms rather than a scan.
         """
-        with self._lock:
+        with self._table_lock:
             self._table.reload()
 
             return self._table.extent()
@@ -544,13 +578,28 @@ class Log:
     # -- seal --------------------------------------------------------------
 
     def seal(self) -> int | None:
-        """Force a seal now; returns the exclusive end offset, or None if empty.
+        """Seal now; returns the exclusive end offset, or None if nothing to do.
 
-        Normally automatic at `min(target_size, max_age)` (§4). Explicit seals
-        are for shutdown and tests.
+        The lock is held for §4's steps 1 and 3 — claiming the range, and
+        deleting the rows it covered — and released for step 2, which is all of
+        the cost. Step 2 reads the buffer on its own connection and commits
+        through its own table handle, so an append can proceed the whole time it
+        runs.
+
+        That division is what §4 already implies. Step 1 fixes `[start, end)`
+        before the file exists, so rows arriving during step 2 land above `end`
+        and cannot change what it is writing; step 3 is garbage collection
+        rather than correctness, because §7's boundary already excludes those
+        rows once the commit lands.
+
+        One seal at a time. A second would claim a range overlapping the first,
+        and `sealing` holds one row by design (§2).
         """
         with self._lock:
             self._writable()
+            if self._sealing:
+                return None
+
             extent = self._buffer.extent()
             if extent is None:
                 return None
@@ -562,10 +611,34 @@ class Log:
             # retry recomputes nothing and overwrites in place rather than
             # stranding the first attempt under a different name.
             self._buffer.claim_seal(start, end, rel_path)
-            self._write_and_commit(end, rel_path)
-            self._buffer.finish_seal(end)
+            self._sealing = True
+            self._sealed.clear()
 
-            return end
+        try:
+            self._write_and_commit(end, rel_path)
+            with self._lock:
+                self._buffer.finish_seal(end)
+        finally:
+            # Set after step 3, not after step 2: a waiter that resumed between
+            # them would see a table holding the rows and a buffer that still
+            # held them too — correct to read (§7 excludes them) and confusing
+            # to assert against.
+            with self._lock:
+                self._sealing = False
+
+            self._sealed.set()
+
+        return end
+
+    def await_seal(self, timeout: float | None = None) -> bool:
+        """Block until no seal is in flight. True if none is.
+
+        A background seal means `extend` can return before the rows it
+        triggered a seal for are in the table. Nothing about correctness needs
+        this — the rows are durable and readable throughout — but a caller that
+        wants to observe the table afterwards does.
+        """
+        return self._sealed.wait(timeout)
 
     def _write_and_commit(self, end: int, rel_path: str) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
@@ -584,23 +657,73 @@ class Log:
         pq.write_table(rows, dest)
         fsync(dest)
 
-        self._table.register(str(dest))
+        with self._table_lock:
+            self._table.register(str(dest))
 
     def _maybe_seal(self) -> None:
         """Seal when the buffer crosses `target_size`.
-
-        The `max_age` branch is not wired up: it needs a clock the caller does
-        not drive, and §4 evaluates both triggers at commit time. Sealing on age
-        therefore has to be driven by the application calling `seal()` until
-        this grows a timer.
 
         Deliberately only the O(1) counter. This runs after every append, and
         asking SQLite for min/max to check emptiness first — which is what it
         used to do — put a query on the write path to learn something the
         counter already knew, at 13-62% of the raw SQLite floor.
+
+        With `background_seal` the append hands off rather than sealing: it
+        wakes the sealer and returns, so the caller pays a set() rather than the
+        whole of §4. The `max_age` branch is still not wired — it needs a clock
+        the caller does not drive — so age-based sealing means calling `seal()`.
         """
-        if self._buffer.byte_size() >= self.config.target_size:
+        if self._buffer.byte_size() < self.config.target_size:
+            return
+
+        if not self.config.background_seal:
             self.seal()
+            return
+
+        self._start_sealer()
+        # Cleared here rather than in `seal`, or a caller that asks and then
+        # waits can win the race against the thread starting and be told the
+        # seal it just requested is already finished.
+        self._sealed.clear()
+        self._seal_wanted.set()
+
+    def _start_sealer(self) -> None:
+        """Start the sealing thread, once, on first need.
+
+        Lazily rather than at open, so a log that never fills a buffer — a
+        reader, a test, a short-lived import — never starts a thread it has no
+        use for.
+        """
+        if self._sealer is not None:
+            return
+
+        self._sealer = threading.Thread(
+            target=self._seal_loop, name=f"litelink-seal-{self.name}", daemon=True
+        )
+        self._sealer.start()
+
+    def _seal_loop(self) -> None:
+        """Seal whenever asked, until closed.
+
+        Failures are held rather than raised, because there is no caller left to
+        raise to. A seal that fails leaves its claim in `sealing`, which the
+        next open replays (§4) — so the durable state stays correct and the loop
+        keeps trying on the next request.
+        """
+        while not self._stop.is_set():
+            if not self._seal_wanted.wait(0.05):
+                continue
+
+            self._seal_wanted.clear()
+            try:
+                self.seal()
+            except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
+                self._seal_error = exc
+            finally:
+                # Whether it sealed, found nothing, or failed, nothing is
+                # pending any more — a waiter must not hang on a seal that is
+                # never coming.
+                self._sealed.set()
 
     # -- recovery ----------------------------------------------------------
 
@@ -685,7 +808,7 @@ class Log:
         is open — §11 treats stalled eviction as an operational condition, and
         returning None says nothing about it.
         """
-        with self._lock:
+        with self._table_lock:
             self._writable()
             if self._archive is not None:
                 # I4 needs sync's registration watermark to decide what is safe
@@ -774,14 +897,26 @@ class Log:
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
-        """Release the buffer and reader handles. Does not seal.
+        """Release handles and stop the sealer. Does not seal.
 
         Not sealing is deliberate: committed rows are already durable, and an
         implicit seal on close would emit an undersized file every time a
-        process restarted.
+        process restarted. An in-flight seal is waited for rather than
+        interrupted — it holds a claim in `sealing`, and letting it finish is
+        cheaper than making the next open replay it.
         """
+        self._stop.set()
+        if self._sealer is not None:
+            self._sealer.join(timeout=60)
+            self._sealer = None
+
+        self.await_seal(timeout=60)
         self._reader.close()
         self._buffer.close()
+
+        if self._seal_error is not None:
+            error, self._seal_error = self._seal_error, None
+            raise error
 
     def __enter__(self) -> Self:
         return self

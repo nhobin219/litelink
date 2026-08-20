@@ -983,8 +983,22 @@ The consequence worth planning for is that local disk holds roughly
      lock contention.
 
      So: a second connection, the lock held only for steps 1 and 3, and a guard against two
-     seals in flight. The cost is that step 3 is deferred by one seal's duration rather than
-     by a poll interval, which is the narrowest version of the window below.
+     seals in flight. **Built, and it is necessary but not sufficient.** Measured with it in
+     place: the lock is held 3.1 ms of a 48 ms seal, exactly as intended — and an appending
+     thread still stalls, because the lock was never the whole problem.
+
+     **The rest is the GIL.** A seal is CPU-bound in pure Python — 80% of its commit is
+     pyiceberg deep-copying `TableMetadata` (§13.7) — so the sealing thread starves the
+     appending one whether or not it holds a lock. Demonstrated by moving nothing but
+     `sys.setswitchinterval`: at Python's 5 ms default the worst append was 45.2 ms, at 0.1 ms
+     it was 6.4 ms, against a no-seal control of 5.7 ms. Contention spreads rather than
+     concentrates, so a background seal can show a *worse* p99 than an inline one while
+     improving the maximum.
+
+     A library has no business setting a process-wide switch interval, so the lever is the CPU
+     cost itself. §16 removes the deep copy; running the seal in a separate process would too,
+     which is one more thing the multi-process question above is worth to this one. **The
+     ordering matters: this option is gated on §16, not independent of it.**
    - **A lease per role**, writer and maintainer, each recovering its own intents. Simple to
      state, but the split is coarser than what is actually exclusive, and it forces sealing
      to sit on whichever side owns the buffer.

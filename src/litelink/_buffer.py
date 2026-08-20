@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+import threading
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -44,6 +45,7 @@ class Buffer:
                 isolation_level=None,
                 check_same_thread=False,
             )
+            self._reader = self._con
             self._bytes = 0
             return
 
@@ -53,12 +55,33 @@ class Buffer:
         # (`sqlite3.threadsafety == 3`), so the connection itself is safe; Log
         # holds a lock to serialise its own multi-statement sequences, which is
         # the part SQLite cannot know about.
+        # The buffer serialises its own writes rather than leaving callers to
+        # agree on a lock. One write connection is reached by several threads —
+        # an append, a seal claiming and clearing its range, a maintenance pass
+        # queuing deletions — and two BEGINs at once is "cannot start a
+        # transaction within a transaction". Worse than the error: with
+        # autocommit suspended by someone else's BEGIN, an unrelated INSERT
+        # joins their transaction and commits or rolls back with it.
+        self._lock = threading.RLock()
+
         self._con = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self._con.execute("PRAGMA journal_mode=WAL")
         # §3's durability claim rests on this line. WAL alone fsyncs at
         # checkpoint, not at commit, which would put committed rows back in the
         # OS page cache — the exact loss this library exists to prevent.
         self._con.execute("PRAGMA synchronous=FULL")
+
+        # A second connection for the rows a seal is about to write out. That
+        # read is the expensive half of a seal, and on the write connection it
+        # would serialise against the appends a background seal exists to stay
+        # out of the way of. WAL allows it: one writer, any number of readers.
+        # It deliberately does NOT take the lock above.
+        self._reader = sqlite3.connect(
+            f"file:{path}?mode=ro",
+            uri=True,
+            isolation_level=None,
+            check_same_thread=False,
+        )
         self._create()
         self._bytes = self._measure()
 
@@ -183,6 +206,11 @@ class Buffer:
         names = ", ".join(f'"{c}"' for c in self._columns)
         sql = f"INSERT INTO buffer ({names}) VALUES ({placeholders})"
 
+        with self._lock:
+            return self._insert(rows, sql)
+
+    def _insert(self, rows: Iterable[Mapping[str, object]], sql: str) -> list[int]:
+        """The append's transaction, with the lock already held."""
         offsets: list[int] = []
         added = 0
         cursor = self._con.cursor()
@@ -265,7 +293,7 @@ class Buffer:
     def rows_below(self, end: int) -> pa.Table:
         """Buffered rows with `offset < end`, as Arrow."""
         names = ", ".join(f'"{c}"' for c in ("litelink_offset", *self._columns))
-        cursor = self._con.execute(
+        cursor = self._reader.execute(
             f'SELECT {names} FROM buffer WHERE "litelink_offset" < ? ORDER BY "litelink_offset"',
             (end,),
         )
@@ -298,13 +326,14 @@ class Buffer:
         The path is persisted, not recomputed: a retry that recomputed it could
         land on a different date directory and strand the first file.
         """
-        self._con.execute("BEGIN")
-        self._con.execute("DELETE FROM sealing")
-        self._con.execute(
-            "INSERT INTO sealing (start_offset, end_offset, rel_path) VALUES (?, ?, ?)",
-            (start, end, rel_path),
-        )
-        self._con.execute("COMMIT")
+        with self._lock:
+            self._con.execute("BEGIN")
+            self._con.execute("DELETE FROM sealing")
+            self._con.execute(
+                "INSERT INTO sealing (start_offset, end_offset, rel_path) VALUES (?, ?, ?)",
+                (start, end, rel_path),
+            )
+            self._con.execute("COMMIT")
 
     def pending_seal(self) -> tuple[int, int, str] | None:
         """The in-flight seal, if a crash left one."""
@@ -321,11 +350,12 @@ class Buffer:
         excludes these rows the moment the Iceberg commit lands, so the window
         between that commit and this call is safe in both directions.
         """
-        self._con.execute("BEGIN")
-        self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
-        self._con.execute("DELETE FROM sealing")
-        self._con.execute("COMMIT")
-        self._bytes = self._measure()
+        with self._lock:
+            self._con.execute("BEGIN")
+            self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
+            self._con.execute("DELETE FROM sealing")
+            self._con.execute("COMMIT")
+            self._bytes = self._measure()
 
     # -- meta ---------------------------------------------------------------
     #
@@ -376,13 +406,14 @@ class Buffer:
         only way to find it without a directory scan is to have written its
         name down first.
         """
-        self._con.execute("BEGIN")
-        self._con.execute("DELETE FROM compacting")
-        self._con.execute(
-            "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
-            (lo, hi, rel_path),
-        )
-        self._con.execute("COMMIT")
+        with self._lock:
+            self._con.execute("BEGIN")
+            self._con.execute("DELETE FROM compacting")
+            self._con.execute(
+                "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
+                (lo, hi, rel_path),
+            )
+            self._con.execute("COMMIT")
 
     def pending_compaction(self) -> tuple[int, int, str] | None:
         row = self._con.execute("SELECT lo, hi, rel_path FROM compacting").fetchone()
@@ -400,12 +431,13 @@ class Buffer:
         Enqueued in the same breath as the commit that superseded them, which
         is the only moment their paths are known without going to look.
         """
-        self._con.execute("BEGIN")
-        self._con.executemany(
-            "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at) VALUES (?, ?)",
-            [(p, superseded_at) for p in rel_paths],
-        )
-        self._con.execute("COMMIT")
+        with self._lock:
+            self._con.execute("BEGIN")
+            self._con.executemany(
+                "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at) VALUES (?, ?)",
+                [(p, superseded_at) for p in rel_paths],
+            )
+            self._con.execute("COMMIT")
 
     def due_deletions(self, cutoff: int) -> list[str]:
         """Files superseded at or before `cutoff` — now minus the grace period."""
@@ -436,3 +468,5 @@ class Buffer:
 
     def close(self) -> None:
         self._con.close()
+        if self._reader is not self._con:
+            self._reader.close()
