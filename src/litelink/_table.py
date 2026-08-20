@@ -477,7 +477,7 @@ class LogTable:
 
                 return
 
-    def register(self, path: str, sealed_through: int | None = None) -> None:
+    def register(self, path: str, sealed_through: int | None = None) -> bool:
         """Add an already-written file to the table (§4 step 2).
 
         `add_files` rather than `append`: pyiceberg's append writes the file
@@ -498,15 +498,27 @@ class LogTable:
         between them: the loser's retry now sees the winner's file covering its
         range and does nothing. Both orderings are safe — a writer that reloads
         after the winner never attempts at all.
+
+
+        Returns whether the file was added. False means the range was already
+        covered, so this file is redundant — and the caller has to queue it for
+        deletion, or it is a file on disk that nothing records.
         """
+        added = True
 
         def add() -> None:
+            nonlocal added
             if sealed_through is not None and self._covers(sealed_through):
+                added = False
+
                 return
 
+            added = True
             self._table.add_files([path])
 
         self._commit(add)
+
+        return added
 
     def _covers(self, sealed_through: int) -> bool:
         """Whether the table already holds everything below `sealed_through`.

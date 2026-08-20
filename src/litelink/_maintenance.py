@@ -171,10 +171,17 @@ class Maintenance:
         # that no longer exists while the sources it superseded drain away.
         _checkpoint(heartbeat)
 
-        self._table.replace_range(lo, hi, str(dest))
-        # Superseded, not yet deletable: a scan that started before this commit
-        # is still reading them (I6).
+        # Queued BEFORE the commit that supersedes them, not after. A crash in
+        # between used to lose the only record of these paths — recovery clears
+        # the compaction claim without re-deriving its sources, so nothing
+        # could name them again. Queueing first is safe because `drain` refuses
+        # to delete anything the table still references, so an entry made for a
+        # commit that never lands simply never comes due.
+        #
+        # Superseded, not yet deletable either way: a scan that started before
+        # this commit is still reading them (I6).
         self._enqueue(f.path for f in run)
+        self._table.replace_range(lo, hi, str(dest))
 
     def rewrite_sorted(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Re-cluster every data file under the current sort order (§7).
@@ -227,8 +234,14 @@ class Maintenance:
 
         # Files cover contiguous non-overlapping ranges, so evicting a prefix is
         # a single upper bound. Anything newer is untouched.
-        self._table.evict_through(max(f.hi for f in stale))
-        self._enqueue(f.path for f in stale)
+        boundary = max(f.hi for f in stale)
+        # Everything the boundary REMOVES, not just what looked old enough to
+        # trigger it. A compaction output has a fresh snapshot age, so it never
+        # appears in `stale` — but its offsets can sit below a stale file's
+        # `hi`, so the boundary drops it too. Queueing only `stale` left it
+        # removed from the table and named by nothing.
+        self._enqueue(f.path for f in self._table.data_files() if f.hi <= boundary)
+        self._table.evict_through(boundary)
 
     # -- expiry and the deletion queue --------------------------------------
 
@@ -242,16 +255,20 @@ class Maintenance:
         # would be to list the directory — the thing this design refuses to do.
         doomed = self._table.metadata_paths(self._table.snapshots_older_than(cutoff))
 
+        # Queued BEFORE the expiry, like every other supersession here. After
+        # it, these names exist nowhere — the metadata that referenced them is
+        # gone — so a crash between the two left files only a directory scan
+        # could find, which is the one thing this design refuses.
+        #
+        # Unfiltered, therefore. The filter used to run after expiry, when
+        # `referenced_paths` had stopped counting the doomed snapshots; asked
+        # beforehand it counts them all and would queue nothing. `drain`'s veto
+        # does the same job later and does it repeatedly: a manifest shared with
+        # a live snapshot is skipped every pass until that snapshot expires too,
+        # and then retired. The cost is queue rows that wait, against files that
+        # could not be found at all.
+        self._enqueue(doomed)
         self._table.expire_snapshots_older_than(cutoff)
-
-        # Manifests are shared across snapshots, so a doomed snapshot's manifest
-        # may still be live. Filtering here rather than leaning on the drain's
-        # veto keeps permanently-referenced paths out of the queue, which would
-        # otherwise accumulate rows that can never be retired.
-        # Same reason as `drain`'s veto: a stale handle under-reports what is
-        # still referenced, and this decides what may be queued for deletion.
-        self._table.reload()
-        self._enqueue(doomed - self._table.referenced_paths())
         self.drain()
 
     def drain(self) -> None:
