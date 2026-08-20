@@ -29,6 +29,7 @@ import pyarrow.parquet as pq
 from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
+from litelink._lease import new_owner
 from litelink._maintenance import Maintenance
 from litelink._read import Reader
 from litelink._table import LogTable
@@ -48,6 +49,10 @@ if TYPE_CHECKING:
 # schema change has something to check against, and prefixed so it can never
 # collide with a column §9 lets an application add.
 OFFSET = "litelink_offset"
+
+# The two operations whose ownership must survive the process holding it (§13.6).
+SEAL_ROLE = "seal"
+MAINTAIN_ROLE = "maintain"
 
 _CONFIG_KEY = "config"
 _ARCHIVE_KEY = "archive"
@@ -115,6 +120,12 @@ class LogConfig:
     # table to have changed by the time `extend` returns.
     background_seal: bool = True
 
+    # How often a sealer checks whether the buffer is over `target_size`. Only
+    # the interval matters, not the mechanism: a sealer in another process has
+    # no way to be woken, so the condition is polled and this bounds how late a
+    # seal can be. In-process an event short-circuits it.
+    seal_poll: timedelta = timedelta(milliseconds=250)
+
     def to_json(self) -> str:
         """Serialised for the `meta` table, so `open` recovers the policy.
 
@@ -134,6 +145,7 @@ class LogConfig:
                 "snapshot_retention": self.snapshot_retention.total_seconds(),
                 "compact_below": self.compact_below,
                 "compact_min_files": self.compact_min_files,
+                "seal_poll": self.seal_poll.total_seconds(),
                 "wal_replication": self.wal_replication,
             }
         )
@@ -150,6 +162,7 @@ class LogConfig:
             snapshot_retention=timedelta(seconds=raw["snapshot_retention"]),
             compact_below=raw["compact_below"],
             compact_min_files=raw["compact_min_files"],
+            seal_poll=timedelta(seconds=raw.get("seal_poll", 0.25)),
             wal_replication=raw["wal_replication"],
         )
 
@@ -216,9 +229,22 @@ class Log:
         # while a read waits only for the commit itself.
         self._table_lock = threading.RLock()
 
-        # A seal's expensive half runs without the lock, so exactly one may be
-        # in flight; `_sealing` is that guarantee and `_sealed` lets a caller
-        # wait for one to finish.
+        # Who may seal, and who may maintain. Durable rather than in-memory,
+        # because the answer has to survive the process asking (§13.6): a
+        # boolean says nothing about a second process, and `claim_seal`
+        # overwrites rather than refuses, so two sealers would take turns
+        # clobbering each other's claim.
+        #
+        # The same leases decide recovery. §11 has the hazard in both
+        # directions — a maintenance process redoing the writer's in-flight
+        # seal, a writer deleting a maintenance process's half-written
+        # compaction — and ownership is what resolves it.
+        self._owner = new_owner()
+        self._seal_lease = buffer.lease(SEAL_ROLE, self._owner)
+        self._maintain_lease = buffer.lease(MAINTAIN_ROLE, self._owner)
+
+        # Still a flag as well, so a thread does not pay a SQLite round trip to
+        # discover what it already knows.
         self._sealing = False
         self._sealed = threading.Event()
         self._sealed.set()
@@ -597,11 +623,15 @@ class Log:
         """
         with self._lock:
             self._writable()
-            if self._sealing:
+            # The lease, not just the flag. It refuses a second sealer in any
+            # process, and it lapses if this one dies mid-seal so that another
+            # may finish what the `sealing` claim records.
+            if self._sealing or not self._seal_lease.acquire():
                 return None
 
             extent = self._buffer.extent()
             if extent is None:
+                self._seal_lease.release()
                 return None
 
             start, last = extent
@@ -625,6 +655,7 @@ class Log:
             # to assert against.
             with self._lock:
                 self._sealing = False
+                self._seal_lease.release()
 
             self._sealed.set()
 
@@ -703,27 +734,48 @@ class Log:
         self._sealer.start()
 
     def _seal_loop(self) -> None:
-        """Seal whenever asked, until closed.
+        """Seal whenever the buffer is full, until closed.
 
-        Failures are held rather than raised, because there is no caller left to
+        The condition is polled, not signalled. An `Event` only reaches threads
+        in this process, and the whole point of the lease is that the sealer
+        need not be one — so the loop asks the same question a separate process
+        would: is the buffer over `target_size`? The event is kept as a
+        shortcut, turning a poll interval into an immediate wake for the common
+        in-process case, and nothing depends on it.
+
+        Failures are held rather than raised, because there is no caller to
         raise to. A seal that fails leaves its claim in `sealing`, which the
-        next open replays (§4) — so the durable state stays correct and the loop
-        keeps trying on the next request.
+        next holder of the lease replays (§4).
         """
         while not self._stop.is_set():
-            if not self._seal_wanted.wait(0.05):
-                continue
-
+            woken = self._seal_wanted.wait(self.config.seal_poll.total_seconds())
             self._seal_wanted.clear()
             try:
-                self.seal()
+                if woken or self._buffer.measure() >= self.config.target_size:
+                    self.seal()
             except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
                 self._seal_error = exc
             finally:
                 # Whether it sealed, found nothing, or failed, nothing is
-                # pending any more — a waiter must not hang on a seal that is
-                # never coming.
+                # pending — a waiter must not hang on a seal never coming.
                 self._sealed.set()
+
+    def run_sealer(self, stop: threading.Event | None = None) -> None:
+        """Seal for this log until `stop` is set. For a dedicated process.
+
+        The point of the exercise (§13.6). A seal is CPU-bound in pure Python —
+        80% of its commit is pyiceberg deep-copying table metadata (§13.7) — so
+        a sealing *thread* starves the appending one through the GIL even
+        holding no lock. A sealing *process* does not share the GIL, and the
+        lease is what makes it safe: it refuses a second sealer and it decides
+        who may replay an interrupted one.
+
+        The capturing process should be opened with `background_seal=False`, or
+        both will try.
+        """
+        self._writable()
+        self._stop = stop or threading.Event()
+        self._seal_loop()
 
     # -- recovery ----------------------------------------------------------
 
@@ -733,8 +785,19 @@ class Log:
         Idempotent in every direction, which is why it can simply run at open
         rather than being an operator's decision.
         """
-        self._recover_compaction()
-        self._recover_seal()
+        # Each half is replayed only by whoever is entitled to it. Another
+        # process may be part way through the very operation this would redo.
+        if self._maintain_lease.acquire():
+            try:
+                self._recover_compaction()
+            finally:
+                self._maintain_lease.release()
+
+        if self._seal_lease.acquire():
+            try:
+                self._recover_seal()
+            finally:
+                self._seal_lease.release()
 
     def _recover_seal(self) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
@@ -820,7 +883,17 @@ class Log:
                 )
                 raise NotImplementedError(msg)
 
-            self._maintenance.run()
+            # Taken after the refusals above, so a rejected call does not leave
+            # a lease behind for its TTL and lock out the process that could
+            # have done the work.
+            if not self._maintain_lease.acquire():
+                msg = "another process holds the maintenance lease"
+                raise RuntimeError(msg)
+
+            try:
+                self._maintenance.run()
+            finally:
+                self._maintain_lease.release()
 
     def hydrate(self, since: timedelta) -> None:
         """Re-register archived files into the local table (§8).
