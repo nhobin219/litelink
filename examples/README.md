@@ -23,6 +23,10 @@ Nothing coordinates that but the `lease` table. The writer holds no lease and ne
 tries; the maintainer takes both when it starts, and if it dies they lapse and the next
 one takes over.
 
+`maintainer.py` is one loop calling two plain methods at two cadences — `seal_due()`
+often, `maintain()` rarely. The library owns neither the thread nor the interval, so
+there is no `seal_mode` to set and nothing starts behind your back.
+
 ```
 just demo-clean        # delete the captured data when you are done
 ```

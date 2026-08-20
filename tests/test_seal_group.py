@@ -59,16 +59,14 @@ def groups(log: Log) -> list[tuple[int, int | None, int | None, int]]:
 
 
 def quiet(**kwargs: object) -> LogConfig:
-    """A config whose sealer will not act behind the test's back.
+    """The ordinary config. Nothing seals unless a test asks it to.
 
-    NOT `seal_mode="inline"` — that seals on every append, retiring a group
-    before a test can look at it. A background sealer with a poll it will
-    never reach leaves the queue intact and still exercises the real path.
-    `close()` wakes it immediately, so nothing waits an hour.
+    There is no sealer to quieten any more: appending records cuts and
+    `seal`/`seal_due` are the only things that write files, so the queue stays
+    exactly as the appends left it.
     """
     return LogConfig(
         target_size=TARGET,
-        seal_poll=timedelta(hours=1),
         snapshot_retention=timedelta(days=1),
         **kwargs,  # ty: ignore[invalid-argument-type]
     )
@@ -169,18 +167,27 @@ def test_an_explicit_seal_cuts_its_own_rows_whatever_else_is_running(
     them holding two appends' worth of rows. Same calls, different data
     layout, decided by a race.
 
-    Run with a live background sealer on a short poll, which is what made it
-    reproduce.
+    Run against a maintainer draining the same queue — a thread here, a process
+    in a deployment; the lease cannot tell the difference — because competition
+    is what made it reproduce.
     """
-    config = LogConfig(
-        target_size=1 << 30,
-        seal_poll=timedelta(milliseconds=1),
-        snapshot_retention=timedelta(days=1),
-    )
+    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
-        for i in range(8):
-            log.extend(rows(20, start=i * 20))
-            log.seal()
+        stop = threading.Event()
+
+        def maintain() -> None:
+            while not stop.wait(0.001):
+                log.seal_due()
+
+        draining = threading.Thread(target=maintain)
+        draining.start()
+        try:
+            for i in range(8):
+                log.extend(rows(20, start=i * 20))
+                log.seal()
+        finally:
+            stop.set()
+            draining.join(30)
 
         assert log.await_seal(timeout=30), "a queued cut was never written"
         assert log.table_files() == 8, "eight appends and eight seals, eight files"
@@ -305,7 +312,6 @@ def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> No
     """
     config = LogConfig(
         target_size=TARGET,
-        seal_poll=timedelta(milliseconds=10),
         snapshot_retention=timedelta(days=1),
     )
     with open_log(tmp_path, config) as log:

@@ -181,42 +181,54 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
         assert len(list(tmp_path.rglob("*.parquet"))) == 1, "no orphaned file"
 
 
-def test_target_size_triggers_a_seal(tmp_path: Path) -> None:
-    """The seal happens on a thread, so the append does not wait for it."""
+def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None:
+    """§4's size trigger, split across the two roles that own its halves.
+
+    Crossing `target_size` is the appender's business — it records the cut in
+    the transaction that crosses it. Writing the file is the maintainer's, and
+    `seal_due` is the call it makes. Neither half guesses what the other did.
+    """
     with open_log(tmp_path, LogConfig(target_size=512)) as log:
         log.extend(rows(40))
 
-        assert log.await_seal(timeout=30), "seal did not finish"
+        assert log._buffer.pending_group() is not None, "the cut was not recorded"
+        assert log.table_extent() is None, "an append wrote a file"
+
+        assert log.seal_due() is not None, "seal_due found nothing queued"
         assert log.table_extent() is not None, "should have sealed on size"
         assert len(read_all(log)) == 40
 
 
 def test_a_synchronous_seal_is_available(tmp_path: Path) -> None:
-    """`seal_mode="inline"` for callers who need the table to have moved."""
-    config = LogConfig(target_size=512, seal_mode="inline")
-
-    with open_log(tmp_path, config) as log:
+    """Appending never seals. `seal()` is how a caller makes the table move."""
+    with open_log(tmp_path, LogConfig(target_size=512)) as log:
         log.extend(rows(40))
 
-        assert log.table_extent() is not None, "sealed before extend returned"
+        assert log.table_extent() is None, "an append sealed on its own"
+
+        log.seal()
+
+        assert log.table_extent() is not None, "seal() did not move the table"
         assert len(read_all(log)) == 40
 
 
-def test_rows_stay_readable_throughout_a_background_seal(tmp_path: Path) -> None:
+def test_rows_stay_readable_across_a_seal(tmp_path: Path) -> None:
     """Nothing about correctness depends on when the seal lands.
 
     Between the Iceberg commit and the buffer delete a row is in both tiers, and
-    §7's boundary excludes it from one of them — which is why the seal can take
-    as long as it likes without a reader noticing.
+    §7's boundary excludes it from one of them — which is why a seal can happen
+    whenever a maintainer gets to it without a reader noticing.
     """
     with open_log(tmp_path, LogConfig(target_size=512)) as log:
         log.extend(rows(60))
 
-        for _ in range(20):
-            assert len(read_all(log)) == 60, "a row went missing mid-seal"
+        for _ in range(10):
+            assert len(read_all(log)) == 60, "a row went missing before the seal"
 
-        assert log.await_seal(timeout=30)
-        assert len(read_all(log)) == 60
+        log.seal_due()
+
+        for _ in range(10):
+            assert len(read_all(log)) == 60, "a row went missing after the seal"
 
 
 def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
@@ -233,11 +245,9 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
     import threading
     import time
 
-    # seal_mode="none", or this measures the wrong thing. The wrapper times from
-    # BEFORE acquire, so it counts waiting as holding — and a background sealer
-    # would be contending for the same lock over the group this test just
-    # queued, inflating exactly the number being asserted on.
-    config = LogConfig(target_size=1 << 30, seal_mode="none")
+    # The wrapper times from BEFORE acquire, so it counts waiting as holding.
+    # Nothing else seals in this process, so there is nothing to wait behind.
+    config = LogConfig(target_size=1 << 30)
     with open_log(tmp_path, config) as log:
         log.extend(rows(400))
 
@@ -269,7 +279,7 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
 
 def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
     """`sealing` holds one row by design (§2), and two seals would overlap."""
-    with open_log(tmp_path, LogConfig(target_size=1 << 30, seal_mode="none")) as log:
+    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
         log.extend(rows(50))
         held = log._lease("seal")
         assert held.acquire(), "could not simulate a seal in flight"

@@ -48,10 +48,22 @@ also means splitting the role across two processes later needs no code change, i
 compaction ever delays sealing enough to matter. It costs latency, not file size — the
 cut was recorded when the rows arrived.
 
-Nothing configures any of this in code. **The `lease` table decides**: a writer with
-`seal_mode="background"` starts a sealing thread, that thread tries, and if the
-maintainer holds the `seal` lease it is refused and returns. Starting a maintainer needs
-no change to the writer; if it dies, its leases lapse and the writer takes sealing back.
+**Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue
+and closes anything past `max_age`; `maintain()` compacts, evicts and expires — and calls
+`seal_due()` first, because sealing is the first thing done with what the writer leaves
+behind. They are two methods rather than one only because their costs differ by an order
+of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
+often, while `maintain()` reads table metadata and wants to be run rarely.
+
+The library owns no thread and no interval. It used to: `extend()` quietly started a
+sealing thread and a `seal_mode` setting chose between "background", "inline" and "none".
+None of that survived the queue — once the cut is recorded by the append, sealing is just
+draining, which is what `maintain()` already was. A library that spawns threads on your
+behalf is also a library whose tests interfere with themselves, which is how two of the
+bugs above were found.
+
+Whichever process calls them, **the `lease` table decides** who does the work: a second
+caller is refused and returns rather than duplicating it.
 
 ---
 
@@ -235,7 +247,7 @@ just demo-capture      # append continuously
 just demo-tail         # in another terminal: watch it accumulate
 ```
 
-To move sealing out of the writer's GIL, run `Log.run_sealer()` in the maintainer and
-open the capturing process with `seal_mode="none"` — not because it would be unsafe
-otherwise, but because a thread that always loses the lease is a thread for nothing.
-`examples/maintainer.py` does exactly that, with `maintain()` on an interval beside it.
+A maintainer is not optional. Nothing seals unless something calls `seal_due()` or
+`maintain()`, so a writer running alone accumulates in SQLite indefinitely — durable and
+readable the whole time, but never reaching Parquet. `examples/maintainer.py` is the
+smallest thing that qualifies: one loop, two calls, two intervals.

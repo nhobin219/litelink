@@ -974,12 +974,19 @@ The consequence worth planning for is that local disk holds roughly
    belongs to whoever holds the `seal` role and `compacting` to whoever holds `maintain`, so
    recovery replays only what it owns — which is the hazard above, resolved.
 
-   Nothing configures where the sealer runs. A writer with `seal_mode="background"` starts a
-   thread, that thread calls `seal()`, and if another process holds the role the call is
-   refused and returns. Adding a sealer process therefore needs no change to the writer, and
-   if it dies its lease lapses and the writer takes the role back. `seal_mode="none"` only
-   avoids starting a thread that would lose; `"inline"` is a third setting that seals inside
-   the append, which a test wants and a deployment does not.
+   Nothing configures where the sealer runs, because nothing in the library runs one.
+   `seal_due()` drains the queue and applies `max_age`; `maintain()` calls it and then
+   compacts, evicts and expires. Both are plain methods on their caller's schedule, and
+   if another owner holds the lease the call is refused and returns rather than
+   duplicating the work.
+
+   An earlier design had `seal_mode` ("background" | "inline" | "none") and `seal_poll`,
+   with `extend()` starting a daemon thread. That existed only because sealing used to sit
+   on the append path — "where does this expensive thing run" was a real question. Once the
+   cut moved into the append transaction, sealing became draining, which is what
+   `maintain()` already was, and the asymmetry had no defence: there was never a
+   `maintain_mode` or a `maintain_poll`. Removing it also removed a library that started
+   threads behind its caller, which is how two of §13.6's bugs stayed hidden.
 
    **An explicit `seal()` records its cut unconditionally.** Cutting only when the queue
    was empty made the method's effect depend on how far behind a sealer was: the caller's
