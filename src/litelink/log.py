@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,8 +31,9 @@ import pyarrow.parquet as pq
 from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
+from litelink._lease import Lease, new_owner
 from litelink._maintenance import Maintenance
-from litelink._read import Reader
+from litelink._read import Reader, duckdb_connection
 from litelink._table import LogTable
 from litelink._types import validate_schema
 
@@ -48,6 +51,15 @@ if TYPE_CHECKING:
 # schema change has something to check against, and prefixed so it can never
 # collide with a column §9 lets an application add.
 OFFSET = "litelink_offset"
+
+# The two operations whose ownership must survive the process holding it (§13.6).
+# How often `await_seal` re-asks. Each round attempts a drain, and taking the
+# lease is a write, so this is slower than a pure poll would need to be —
+# 20 attempts a second while a caller is blocked, and none otherwise.
+_AWAIT_POLL = 0.05
+
+SEAL_ROLE = "seal"
+MAINTAIN_ROLE = "maintain"
 
 _CONFIG_KEY = "config"
 _ARCHIVE_KEY = "archive"
@@ -188,13 +200,32 @@ class Log:
         self._archive = archive
         self._reader = reader
         self._maintenance = maintenance
-        # One lock over every operation, so a maintenance thread and an append
-        # loop can share a Log. Coarse on purpose: a seal and a compaction both
-        # span several statements plus an Iceberg commit, and interleaving them
-        # would let a compaction supersede a range a seal is still writing into.
-        # The cost is that a read blocks behind a running compaction — worth
-        # revisiting when compaction gets long enough to notice.
+        # Sequences the only thing left that needs it: Log mutating several
+        # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
+        # where a SQLite row and a Python object have to change together.
+        #
+        # Nothing on the append, seal or read paths takes it. Each collaborator
+        # owns its own safety — the buffer serialises its connection,
+        # `LogTable` guards its handle and caches, `Reader` guards its DuckDB
+        # connection — and the leases decide who may seal or maintain across
+        # processes, which no in-memory lock could. A lock on top of those is a
+        # second answer to a settled question, and it was not free: one held
+        # across a whole maintenance pass made a read wait 21.5 s.
         self._lock = threading.RLock()
+
+        # Who may seal, and who may maintain. Durable rather than in-memory,
+        # because the answer has to survive the process asking (§13.6): a
+        # boolean says nothing about a second process, and `claim_seal`
+        # overwrites rather than refuses, so two sealers would take turns
+        # clobbering each other's claim.
+        #
+        # The same leases decide recovery. §11 has the hazard in both
+        # directions — a maintenance process redoing the writer's in-flight
+        # seal, a writer deleting a maintenance process's half-written
+        # compaction — and ownership is what resolves it.
+        # The last failure from the sealing thread, which has no caller to
+        # raise to. Surfaced by `close`, so a process that never checks still
+        # finds out.
 
     # -- construction ------------------------------------------------------
 
@@ -249,7 +280,7 @@ class Log:
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
-        buffer = Buffer(layout.buffer_db, schema)
+        buffer = Buffer.open(layout.buffer_db, schema, target_size=settings.target_size)
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
         # cast to. It is kept here because Iceberg cannot represent it: one
@@ -264,7 +295,9 @@ class Log:
             layout=layout,
             table=table,
             buffer=buffer,
-            reader=Reader(layout, table, table_schema(schema)),
+            reader=Reader(
+                layout, table, buffer, table_schema(schema), duckdb_connection
+            ),
             maintenance=Maintenance(table, buffer, layout, settings, order),
             schema=schema,
             sort_by=order,
@@ -300,24 +333,36 @@ class Log:
 
         table = LogTable.load(layout, readonly=read_only)
         schema = _declared_schema(layout, application_schema(table.arrow_schema()))
-        buffer = Buffer(layout.buffer_db, schema, readonly=read_only)
 
+        # Read through a throwaway connection, like the schema above it,
+        # because the buffer needs `target_size` before it can size the groups
+        # it cuts and the value lives in the buffer's own database. A wart:
+        # policy is stored inside the thing that consumes it.
+        #
         # Required, not defaulted, for the same reason as the schema: new()
         # always writes it, so its absence is a damaged log rather than an
         # older one, and quietly substituting defaults would change how a log
         # seals and what it retains without saying so.
-        encoded = buffer.get_meta(_CONFIG_KEY)
+        encoded = Buffer.peek_meta(layout.buffer_db, _CONFIG_KEY)
         if encoded is None:
             msg = f"log at {layout.root}/{name} has no stored config; it is corrupt"
             raise ValueError(msg)
 
         config = LogConfig.from_json(encoded)
+        buffer = Buffer.open(
+            layout.buffer_db,
+            schema,
+            target_size=config.target_size,
+            readonly=read_only,
+        )
         sort_by = table.sort_by()
         log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
-            reader=Reader(layout, table, table_schema(schema)),
+            reader=Reader(
+                layout, table, buffer, table_schema(schema), duckdb_connection
+            ),
             maintenance=Maintenance(table, buffer, layout, config, sort_by),
             schema=schema,
             sort_by=sort_by,
@@ -348,6 +393,10 @@ class Log:
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
             self.config = config
             self._maintenance.set_config(config)
+            # The buffer too, or `target_size` changes everywhere except where
+            # the cut is actually made and the log quietly keeps sizing files
+            # to the value it was opened with.
+            self._buffer.set_target_size(config.target_size)
 
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5)."""
@@ -384,10 +433,33 @@ class Log:
                 )
                 raise ValueError(msg)
 
-            self._table.set_sort_order(requested)
-            self._sort_by = requested
-            self._maintenance.set_sort_by(requested)
-            self._maintenance.rewrite_sorted()
+            # Under the maintain lease, because a rewrite IS a compaction —
+            # same claim record, same deterministic output path, same commit.
+            # Without it this reached that path beside a running `maintain()`
+            # in another process: two writers to one `compaction_path`, and a
+            # single-row `compacting` intent each would clear from under the
+            # other, leaving a half-written file nothing could name.
+            lease = self._lease(MAINTAIN_ROLE)
+            if not lease.acquire():
+                msg = "another owner holds the maintenance lease"
+                raise RuntimeError(msg)
+
+            try:
+                self._table.set_sort_order(requested)
+                self._sort_by = requested
+                self._maintenance.set_sort_by(requested)
+                self._maintenance.rewrite_sorted(heartbeat=lease.renew)
+            finally:
+                lease.release()
+
+    def _lease(self, role: str) -> Lease:
+        """A fresh claim on `role` for this attempt.
+
+        Minted per call rather than held as a field. A field would fix one owner
+        for the whole Log, and two threads sharing it would then re-enter each
+        other's lease — leaving the role excluding nothing inside a process.
+        """
+        return self._buffer.lease(role, new_owner())
 
     def _writable(self) -> None:
         if self.readonly:
@@ -414,12 +486,15 @@ class Log:
         which is the whole of §3's throughput story. It carries no meaning
         beyond that — see §1 on why there is no transaction id column.
         """
-        with self._lock:
-            self._writable()
-            offsets = self._buffer.append(rows)
-            self._maybe_seal()
+        self._writable()
 
-            return offsets
+        # No lock. `Buffer` serialises its own connection, which is the only
+        # thing two appending threads share — and the append decides nothing
+        # beyond the cut it records (see `seal_group`). It does not measure,
+        # compare, signal, or start anything: a maintainer calls `seal_due` and
+        # finds the work waiting, exactly as it calls `maintain` and finds
+        # files to compact.
+        return self._buffer.append(rows)
 
     # -- read --------------------------------------------------------------
 
@@ -478,8 +553,10 @@ class Log:
             msg = "archive reads are not implemented"
             raise NotImplementedError(msg)
 
-        with self._lock:
-            return self._reader.query(query)
+        # No lock here. `Reader` guards its own connection and `LogTable` its
+        # own cache, both briefly — whereas this used to be the SAME lock a
+        # whole maintenance pass held, so a read waited out a compaction.
+        return self._reader.query(query)
 
     def end_offset(self) -> int:
         """The offset the next append will receive — an EXCLUSIVE upper bound.
@@ -493,8 +570,7 @@ class Log:
         buffer. A consumer resuming from here sees every durable row; one
         resuming from `hi` silently skips the unsealed tail.
         """
-        with self._lock:
-            return self._buffer.next_offset()
+        return self._buffer.next_offset()
 
     def buffered_rows(self) -> int:
         """Rows durable in the buffer but not yet sealed.
@@ -507,10 +583,13 @@ class Log:
         predicate against the Iceberg leg too, reading the offset column out of
         every Parquet file to establish that none of them qualify.
         """
-        with self._lock:
-            extent = self.table_extent()
+        extent = self.table_extent()
 
-            return self._buffer.count_above(0 if extent is None else extent[1])
+        # Deliberately unlocked, and therefore approximate: a seal landing
+        # between the two reads shifts the boundary under the count. This is a
+        # number to watch, not one to derive anything from, and locking it
+        # would put a metric on the path of every append.
+        return self._buffer.count_above(0 if extent is None else extent[1])
 
     def table_rows(self) -> int:
         """Rows in the local Iceberg table.
@@ -518,17 +597,15 @@ class Log:
         From the manifests, which track a count per file, so this costs nothing
         beyond the snapshot read the boundary already needs.
         """
-        with self._lock:
-            self._table.reload()
+        self._table.reload()
 
-            return self._table.record_count()
+        return self._table.record_count()
 
     def table_files(self) -> int:
         """Data files in the local table — what compaction is bringing down."""
-        with self._lock:
-            self._table.reload()
+        self._table.reload()
 
-            return self._table.file_count()
+        return self._table.file_count()
 
     def table_extent(self) -> tuple[int, int] | None:
         """`(lo, hi)` offset extent of the local table, from statistics.
@@ -536,38 +613,202 @@ class Log:
         §7's tier boundary. Read from manifest column statistics — no data file
         is opened, which is what makes it ~0.6 ms rather than a scan.
         """
-        with self._lock:
-            self._table.reload()
+        self._table.reload()
 
-            return self._table.extent()
+        return self._table.extent()
 
     # -- seal --------------------------------------------------------------
 
     def seal(self) -> int | None:
-        """Force a seal now; returns the exclusive end offset, or None if empty.
+        """Cut everything buffered into files. Returns the exclusive end offset.
 
-        Normally automatic at `min(target_size, max_age)` (§4). Explicit seals
-        are for shutdown and tests.
+        Deterministic in the only way that matters to the data: the cut lands
+        where the caller asked, always, so a given sequence of appends and
+        seals produces the same files whatever else is running. None means
+        nothing was buffered — never that someone else was busy.
+
+        Whether *this* call writes those files depends on who holds the lease.
+        Use `await_seal` when the table itself has to have moved before you
+        look at it.
+
+        The lock is held for §4's steps 1 and 3 — claiming the range, and
+        deleting the rows it covered — and released for step 2, which is all of
+        the cost. Step 2 reads the buffer on its own connection and commits
+        through its own table handle, so an append can proceed the whole time it
+        runs.
+
+        That division is what §4 already implies. Step 1 fixes `[start, end)`
+        before the file exists, so rows arriving during step 2 land above `end`
+        and cannot change what it is writing; step 3 is garbage collection
+        rather than correctness, because §7's boundary already excludes those
+        rows once the commit lands.
+
+        One seal at a time. A second would claim a range overlapping the first,
+        and `sealing` holds one row by design (§2).
         """
-        with self._lock:
-            self._writable()
-            extent = self._buffer.extent()
-            if extent is None:
-                return None
+        self._writable()
+        # Cut unconditionally, and that is the whole contract. Cutting only
+        # when the queue happened to be empty made this method's effect depend
+        # on how far behind a sealer was: the rows the caller had just appended
+        # went uncut, an older group was sealed instead, and the call could
+        # return None having sealed nothing at all. Two appends and two seals
+        # could then produce one file, not two.
+        #
+        # Unlocked, because the two calls need not be atomic together: another
+        # sealer cutting between them leaves `last_queued_end` HIGHER, so this
+        # drains a superset of its own rows, which is harmless. What must never
+        # happen is failing to cut.
+        #
+        # `seal_due` does NOT come through here — it drains queued groups only
+        # — or a quiet stream would emit a stub file every poll, which is the
+        # pathology §6 exists to clean up after.
+        self._buffer.close_open_group()
+        target = self._buffer.last_queued_end()
 
-            start, last = extent
-            end = last + 1
-            rel_path = self._layout.seal_path(start, end, datetime.now(UTC).date())
-            # I2: the range and its path are fixed BEFORE the file exists, so a
-            # retry recomputes nothing and overwrites in place rather than
-            # stranding the first attempt under a different name.
-            self._buffer.claim_seal(start, end, rel_path)
-            self._write_and_commit(end, rel_path)
-            self._buffer.finish_seal(end)
+        if target is None:
+            return None
+
+        # Then seal as much of it as this caller is entitled to. Losing the
+        # lease is not a failure and not "nothing to do": another sealer holds
+        # it and is working through the same queue, so the cut still becomes a
+        # file, just not by this call. Blocking until it did would put a
+        # caller's `seal()` behind another process's lease TTL, which is a
+        # worse bargain than returning — `await_seal` is for callers who need
+        # the table to have moved.
+        while True:
+            group = self._buffer.pending_group()
+            if group is None or group[1] > target:
+                return target
+
+            if self._seal_queued() is None:
+                return target
+
+    def _seal_queued(self) -> int | None:
+        """Seal the oldest queued group. None if none is queued.
+
+        Split from `seal` so that draining the queue can never cut a group
+        short: everything this writes was sized when its rows arrived.
+        """
+        self._writable()
+        # Outside `_lock`, because the lease excludes other OWNERS and the lock
+        # sequences this process's own buffer writes — different jobs. Taking
+        # it inside put two more fsyncs under the lock an append needs, and at
+        # `synchronous=FULL` those are the expensive part of a small seal.
+        #
+        # One mechanism for both cases: owners are unique per attempt, so the
+        # row that refuses a sealer in another process refuses one in another
+        # thread on the same terms — and it lapses if this attempt dies
+        # mid-seal, so another may finish what `sealing` records.
+        lease = self._lease(SEAL_ROLE)
+        if not lease.acquire():
+            return None
+
+        # No lock here either: the lease is the exclusion, and it already
+        # refuses every other owner in this process and any other. A lock would
+        # be a second answer to a question already settled.
+        #
+        # The range comes from the queue, not from whatever the buffer happens
+        # to hold now. That is the difference between a file of `target_size`
+        # and a file of however much arrived while the sealer was getting here
+        # — and it costs one indexed row read instead of the SCAN that asking
+        # the buffer for its extent used to.
+        group = self._buffer.pending_group()
+        if group is None:
+            lease.release()
+            return None
+
+        start, end = group
+        # A claim already naming this range means a previous attempt got at
+        # least as far as recording it and then died — possibly AFTER its
+        # commit landed. Replaying blindly re-registers a file the table
+        # already holds, pyiceberg refuses it, `finish_seal` never runs, and
+        # the group stays at the head of the queue failing forever. Sealing
+        # wedges and the buffer grows without bound.
+        #
+        # `_recover_seal` is exactly the idempotent version — commit only if
+        # the file is absent, retire the group either way — so a replay goes
+        # through it. Detected with a keyed read rather than by asking the
+        # table, which would walk manifests on every ordinary seal to learn
+        # something only a replay needs to know.
+        claimed = self._buffer.pending_seal()
+        if claimed is not None and claimed[1] == end:
+            # In the `try` below in spirit, and now in fact: returning from
+            # here without releasing left the seal role dead for its whole TTL,
+            # so the drain loop above exited with groups still queued and
+            # nobody able to take them.
+            try:
+                self._recover_seal(lease)
+            finally:
+                lease.release()
 
             return end
 
-    def _write_and_commit(self, end: int, rel_path: str) -> None:
+        rel_path = self._layout.seal_path(start, end, uuid.uuid4().hex[:8])
+        # I2: the range and its path are fixed BEFORE the file exists, so a
+        # retry recomputes nothing and overwrites in place rather than
+        # stranding the first attempt under a different name.
+        self._buffer.claim_seal(start, end, rel_path)
+
+        try:
+            # Renewed either side of the expensive half, and a lost lease is
+            # fatal rather than something to push through. Another owner that
+            # takes this role replays the SAME range to the SAME path (I2), so
+            # continuing would mean two processes writing one file: whichever
+            # finished second would truncate the other, and a `finish_seal`
+            # from the loser would drop the buffer rows backing a file nobody
+            # had completely written.
+            #
+            # The write itself cannot be checkpointed — it is one blocking call
+            # — so it gets a full TTL and no more. A single group is one
+            # `target_size` file; a write that outlasts 30 s means the machine
+            # is in trouble, and stopping is the right answer then too.
+            if not lease.renew():
+                msg = "lost the seal lease before writing"
+                raise RuntimeError(msg)
+
+            self._write_and_commit(end, rel_path, lease)
+            self._buffer.finish_seal(end, rel_path)
+        finally:
+            lease.release()
+
+        return end
+
+    def await_seal(self, timeout: float | None = None) -> bool:
+        """Block until the queue is drained and no seal is in flight.
+
+        A caller that wants to observe the table needs this: nothing about
+        correctness does — the rows are durable and readable throughout — but
+        `seal` promises the cut, not that the file has been written.
+
+        Asks the two tables rather than an Event, so it is also true across
+        processes: a queued group and an in-flight `sealing` claim are both
+        durable state, and an Event is neither.
+
+        **Helps rather than only waits.** Each round it tries to drain the
+        queue itself, which does nothing while another owner holds the lease —
+        and everything once that owner dies and its lease lapses. Purely
+        watching would hang until the timeout, or forever without one, over
+        work no survivor was going to do. A readonly log has no such option and
+        can only wait.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if self._buffer.pending_group() is None and (
+                self._buffer.pending_seal() is None
+            ):
+                return True
+
+            if not self.readonly:
+                self._seal_queued()
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+
+            time.sleep(_AWAIT_POLL)
+
+    def _write_and_commit(
+        self, end: int, rel_path: str, lease: Lease | None = None
+    ) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
 
         I1 in this order: committing first would publish a manifest entry for a
@@ -584,23 +825,75 @@ class Log:
         pq.write_table(rows, dest)
         fsync(dest)
 
-        self._table.register(str(dest))
+        # Checked immediately before the commit, because this is the moment a
+        # lapsed owner does real damage. Its file now has a name of its own, so
+        # `register` no longer collides with the owner that took over — it
+        # succeeds, and the range lands in the table twice. The shared name
+        # used to refuse that by accident; nothing does now except this.
+        #
+        # A narrow window remains between the check and the commit. It cannot
+        # be closed from here — Iceberg's CAS knows nothing of our lease — and
+        # it is milliseconds against a 30 s TTL.
+        if lease is not None and not lease.renew():
+            # The file exists and will never be registered, so it has to stay
+            # nameable: queue it before raising, or it is a file on disk that
+            # this database cannot find.
+            self._buffer.enqueue_deletions(
+                [rel_path], int(datetime.now(UTC).timestamp())
+            )
+            msg = "lost the seal lease before committing"
+            raise RuntimeError(msg)
 
-    def _maybe_seal(self) -> None:
-        """Seal when the buffer crosses `target_size`.
+        # `end` passed so the commit can decline if the range is already in
+        # the table. The lease check above is the fence; this is what makes a
+        # failure of that fence harmless rather than a duplicate.
+        if not self._table.register(str(dest), sealed_through=end):
+            # Declined: another owner already sealed this range, so this file
+            # is redundant and will never be referenced. Queue it, or it joins
+            # the one category this design has no way to find — a file on disk
+            # that no SQLite row names. The lease-fence path above does the
+            # same; both fences have to leave the disk in a describable state.
+            self._buffer.enqueue_deletions(
+                [rel_path], int(datetime.now(UTC).timestamp())
+            )
 
-        The `max_age` branch is not wired up: it needs a clock the caller does
-        not drive, and §4 evaluates both triggers at commit time. Sealing on age
-        therefore has to be driven by the application calling `seal()` until
-        this grows a timer.
+    def seal_due(self) -> int | None:
+        """Seal everything the policy says is ready. Returns the last end, or None.
 
-        Deliberately only the O(1) counter. This runs after every append, and
-        asking SQLite for min/max to check emptiness first — which is what it
-        used to do — put a query on the write path to learn something the
-        counter already knew, at 13-62% of the raw SQLite floor.
+        The maintainer's frequent call, and the counterpart to `maintain`: both
+        are plain methods the caller runs on its own schedule, because the
+        library has no business owning a thread or an interval. This one is
+        cheap when there is nothing to do — an indexed read of one row — so it
+        can be run often; `maintain` reads table metadata and wants to be run
+        rarely. That difference is the only reason they are two methods.
+
+        "Due" is §4's two triggers. `target_size` needs nothing here: the cut
+        was recorded by the append that crossed it, and this drains it. Age is
+        the other, and it has to be evaluated by whoever is sealing, because a
+        stream quiet enough to need it is by definition not appending.
+
+        A group whose lease is held elsewhere is left alone, not waited for.
         """
-        if self._buffer.byte_size() >= self.config.target_size:
-            self.seal()
+        self._writable()
+        # Before draining, not after: a quiet stream has no closed group at
+        # all, and this is the only thing that gives it one.
+        self._buffer.close_open_group(
+            int((datetime.now(UTC) - self.config.max_age).timestamp())
+        )
+
+        end = None
+        # Peeked before `_seal_queued` takes the lock, because almost every
+        # call finds nothing and taking the write lock to discover that would
+        # serialise a maintainer against appends on a timer.
+        while self._buffer.pending_group() is not None:
+            sealed = self._seal_queued()
+            if sealed is None:
+                # Another owner holds the lease and is draining the same queue.
+                break
+
+            end = sealed
+
+        return end
 
     # -- recovery ----------------------------------------------------------
 
@@ -610,21 +903,59 @@ class Log:
         Idempotent in every direction, which is why it can simply run at open
         rather than being an operator's decision.
         """
-        self._recover_compaction()
-        self._recover_seal()
+        # Each half is replayed only by whoever is entitled to it. Another
+        # process may be part way through the very operation this would redo.
+        maintain = self._lease(MAINTAIN_ROLE)
+        if maintain.acquire():
+            try:
+                self._recover_compaction()
+            finally:
+                maintain.release()
 
-    def _recover_seal(self) -> None:
+        seal = self._lease(SEAL_ROLE)
+        if seal.acquire():
+            try:
+                self._recover_seal(seal)
+            finally:
+                seal.release()
+
+    def _recover_seal(self, lease: Lease | None = None) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
-        did not, the whole file is rewritten to the same path."""
+        did not, the whole file is rewritten to the same path.
+
+        Reloads first, because "did the commit land" is a question about the
+        CURRENT table and this handle may predate it. A writer that has only
+        appended for hours holds a snapshot from when it opened; asked with
+        that, it would decide a committed file is missing and rewrite the live
+        one underneath the readers scanning it.
+        """
         pending = self._buffer.pending_seal()
         if pending is None:
             return
 
-        _, end, rel_path = pending
-        if str(self._layout.absolute(rel_path)) not in self._table.file_paths():
-            self._write_and_commit(end, rel_path)
+        self._table.reload()
 
-        self._buffer.finish_seal(end)
+        start, end, rel_path = pending
+        if str(self._layout.absolute(rel_path)) in self._table.file_paths():
+            self._buffer.finish_seal(end, rel_path)
+
+            return
+
+        # Not committed, so it has to be written — but NOT to the name the last
+        # attempt chose. That attempt may still be running: a writer stalled
+        # past its lease is indistinguishable from one that died, and
+        # `pq.write_table` truncates on open, so sharing the name blends two
+        # writers into one file and commits it.
+        #
+        # The abandoned name goes on the deletion queue BEFORE the claim is
+        # replaced. That ordering is the whole of it: a unique name with no
+        # queue entry is a file this database can no longer name, which is the
+        # one thing §12 refuses — worse than the collision it fixes.
+        self._buffer.enqueue_deletions([rel_path], int(datetime.now(UTC).timestamp()))
+        retry = self._layout.seal_path(start, end, uuid.uuid4().hex[:8])
+        self._buffer.claim_seal(start, end, retry)
+        self._write_and_commit(end, retry, lease)
+        self._buffer.finish_seal(end, retry)
 
     def _recover_compaction(self) -> None:
         """Resolve a compaction interrupted before its commit (§11).
@@ -639,6 +970,13 @@ class Log:
         pending = self._buffer.pending_compaction()
         if pending is None:
             return
+
+        # Reloaded for the same reason `_recover_seal` is, and the consequence
+        # here is worse: this UNLINKS. A handle that predates another process's
+        # commit reports the output missing, and removing a file the table now
+        # references loses the rows outright — the sources it superseded are
+        # already out of the snapshot and queued for deletion.
+        self._table.reload()
 
         _, _, rel_path = pending
         if str(self._layout.absolute(rel_path)) not in self._table.file_paths():
@@ -685,19 +1023,49 @@ class Log:
         is open — §11 treats stalled eviction as an operational condition, and
         returning None says nothing about it.
         """
-        with self._lock:
-            self._writable()
-            if self._archive is not None:
-                # I4 needs sync's registration watermark to decide what is safe
-                # to evict, and sync does not exist yet. Refusing beats evicting
-                # a file no archive has — that failure is silent and permanent.
-                msg = (
-                    "maintain() with an archive configured requires sync(), "
-                    "which is not implemented"
-                )
-                raise NotImplementedError(msg)
+        self._writable()
+        if self._archive is not None:
+            # I4 needs sync's registration watermark to decide what is safe
+            # to evict, and sync does not exist yet. Refusing beats evicting
+            # a file no archive has — that failure is silent and permanent.
+            msg = (
+                "maintain() with an archive configured requires sync(), "
+                "which is not implemented"
+            )
+            raise NotImplementedError(msg)
 
-            self._maintenance.run()
+        # The lease is the exclusion, and it is the only one this needs. There
+        # is no lock around the pass any more: a compaction reads every file it
+        # merges and writes a new one, and holding a lock that reads also take
+        # made one read wait 21.5 s. `LogTable` guards its handle and caches
+        # for the moment each is touched, and `_commit` retries a branch that
+        # moved underneath it, which is what cross-process safety rests on
+        # anyway — a lock could never have provided it.
+        #
+        # Taken after the refusals above, so a rejected call does not leave
+        # a lease behind for its TTL and lock out the process that could
+        # have done the work.
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            # Renewed between passes, not merely held. A compaction can run for
+            # tens of seconds against a 30 s lease, and a second maintainer
+            # taking the role mid-pass would compact the same runs to the same
+            # deterministic path — a torn file, not a conflict Iceberg can
+            # resolve. Losing it is a hard error rather than something to plough
+            # on through.
+            self._maintenance.run(heartbeat=lease.renew)
+        finally:
+            lease.release()
+
+        # Sealing IS maintenance — it is the first thing done with what the
+        # writer leaves behind. Called here so that a caller running only this
+        # in a loop is correct; `seal_due` is exposed separately only because
+        # it is cheap enough to run far more often than the rest of this.
+        self.seal_due()
 
     def hydrate(self, since: timedelta) -> None:
         """Re-register archived files into the local table (§8).
@@ -774,11 +1142,19 @@ class Log:
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
-        """Release the buffer and reader handles. Does not seal.
+        """Release handles. Does not seal, and has nothing to stop.
 
         Not sealing is deliberate: committed rows are already durable, and an
         implicit seal on close would emit an undersized file every time a
-        process restarted.
+        process restarted. Groups already queued are left queued — they are
+        durable, correctly sized, and whoever opens the log next will find
+        them, which is the point of writing the cut down rather than deriving
+        it.
+
+        Nothing to stop because nothing was started. Sealing happens when a
+        caller asks for it, in the caller's own loop, so there is no thread
+        here whose lifetime has to be managed and no error from one to
+        re-raise at a place the caller never asked about.
         """
         self._reader.close()
         self._buffer.close()

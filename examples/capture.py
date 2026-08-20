@@ -1,22 +1,32 @@
-"""The writer: append continuously, maintain in the background.
+"""The writer: append, and nothing else.
 
     uv run python examples/capture.py [--root DIR] [--rate ROWS_PER_SECOND]
 
-Two threads, which is the whole operational shape of a litelink process:
+One thread appending, and every append durable when `extend()` returns — there
+is no in-memory buffer to flush, which is the failure the README opens with.
 
-  - the main thread appends, and every append is durable when it returns
-  - a daemon thread calls maintain() on an interval, reclaiming disk
+**Everything else is `maintainer.py`**, a separate process: sealing the buffer
+into Parquet, then compacting, evicting and expiring what that produces.
+Sealing is maintenance, not a third role — it is the first thing done with what
+this process leaves behind.
 
-They share one Log because SQLite serialises the writes, and §1's single-writer
-rule is about processes, not threads. Ctrl-C to stop; nothing committed is lost,
-because there is no in-memory buffer to lose.
+Nothing here seals, and there is no setting that would make it. Appending
+records where the next file should be cut and stops; writing that file is the
+maintainer's job. Run this alone and the rows stay in SQLite, durable and
+readable — `scan()` unions the buffer with the table, so a reader sees them
+whether or not anything has sealed yet. They reach Parquet when the maintainer
+starts, at exactly the cuts recorded while it was not running. Only the buffer
+grows in the meantime, which is worth seeing.
+
+Ctrl-C to stop. Nothing committed is lost, and nothing queued is either: a cut
+that has been recorded but not yet sealed is picked up by whoever opens the log
+next.
 """
 
 from __future__ import annotations
 
 import argparse
 import itertools
-import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -26,20 +36,11 @@ from _stream import NAME, SCHEMA, SORT_BY, observations
 from litelink import Log, LogConfig
 
 
-def maintain_forever(log: Log, every: float, stop: threading.Event) -> None:
-    while not stop.wait(every):
-        try:
-            log.maintain()
-        except Exception as exc:  # noqa: BLE001 - a daemon must not die quietly
-            print(f"  [maintain] failed: {exc}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
     parser.add_argument("--rate", type=float, default=2000.0, help="reports per second")
     parser.add_argument("--batch", type=int, default=20, help="rows per transaction")
-    parser.add_argument("--maintain-every", type=float, default=10.0, help="seconds")
     args = parser.parse_args()
 
     # Deliberately small for a demo: seal often so the reader sees the table
@@ -50,26 +51,28 @@ def main() -> None:
         compact_below=1024 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
+        # Seal a quiet stream on a timer as well as by size, or a feed slower
+        # than the target would sit in SQLite indefinitely. Read by whoever
+        # holds the seal lease, which is never this process.
+        max_age=timedelta(seconds=15),
     )
 
     # new() creates and takes the shape; open() recovers it. A service that
     # restarts wants the second, and must not fail because the log is already
-    # there — so the choice is made by whether it exists.
-    if (args.root / "catalog.db").exists():
+    # there — so the choice is made by whether open() finds one. Asked of the
+    # library rather than of the filesystem: which file proves a log exists is
+    # the library's business, and an example that checked for it itself would
+    # be wrong the day that changes.
+    try:
         log = Log.open(args.root, NAME)
         log.set_config(config)
-    else:
+    except FileNotFoundError:
         log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
 
-    stop = threading.Event()
-    maintainer = threading.Thread(
-        target=maintain_forever, args=(log, args.maintain_every, stop), daemon=True
-    )
-    maintainer.start()
-
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
-    print(f"maintain() every {args.maintain_every:.0f}s in a daemon thread")
-    print("run examples/tail.py in another terminal. Ctrl-C to stop.\n")
+    print("appending only — `just demo-maintain` seals and reclaims disk")
+    print("`just demo-tail` watches. Until a maintainer runs, rows stay buffered")
+    print("and readable; nothing is lost by starting it late.\n")
 
     source = observations()
     interval = args.batch / args.rate
@@ -95,7 +98,6 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nstopping")
     finally:
-        stop.set()
         log.close()
 
     on_disk = sum(f.stat().st_size for f in args.root.rglob("*") if f.is_file())
@@ -105,6 +107,8 @@ def main() -> None:
     # writer stops, and a demo you cannot inspect afterwards is not much of one.
     # Note the demo leaves local_retention unset, so the window grows without
     # bound; a real deployment sets it and lets maintain() hold the size.
+    # Rows still queued or buffered here are not lost — they are durable, and
+    # the next process to open the log finds the cuts already recorded.
 
 
 if __name__ == "__main__":

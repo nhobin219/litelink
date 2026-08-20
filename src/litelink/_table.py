@@ -7,6 +7,7 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     import pyarrow as pa
+    from pyiceberg.table import Table
     from pyiceberg.table.snapshots import Snapshot
 
     from litelink._layout import Layout
@@ -77,10 +79,25 @@ class LogTable:
     silently serves a stale snapshot.
     """
 
-    def __init__(self, catalog: SqlCatalog, layout: Layout) -> None:
+    def __init__(self, catalog: SqlCatalog, layout: Layout, table: Table) -> None:
+        """Take the loaded table. `create` and `load` are what load it.
+
+        Assigning only, so that a caller holding a `Table` from anywhere — a
+        fixture, a different catalog — can build one of these around it.
+        """
         self._catalog = catalog
         self._layout = layout
-        self._table = catalog.load_table(layout.table_id)
+        # Guards the handle below and the caches keyed off it — NOT the work
+        # done with them. A compaction reads files, writes Parquet and commits;
+        # only the commit and the cache reads belong in here. Holding it across
+        # the whole pass is what made a read wait 21.5 s behind one.
+        #
+        # Safe to hold so briefly because a pyiceberg table is an immutable
+        # view of one snapshot: a caller that took the handle keeps working
+        # against the snapshot it read, and `reload` only changes which
+        # snapshot the NEXT caller sees.
+        self._lock = threading.RLock()
+        self._table = table
         # Snapshot-derived facts, cached against the metadata pointer. See
         # `extent`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
@@ -111,7 +128,7 @@ class LogTable:
             layout.table_id, schema=schema, properties=METADATA_PROPERTIES
         )
 
-        table = cls(catalog, layout)
+        table = cls(catalog, layout, catalog.load_table(layout.table_id))
         table.set_sort_order(sort_by)
 
         return table
@@ -119,7 +136,8 @@ class LogTable:
     @classmethod
     def load(cls, layout: Layout, *, readonly: bool) -> LogTable:
         """Load an existing table. Raises if there is none."""
-        table = cls(cls._catalog_for(layout), layout)
+        catalog = cls._catalog_for(layout)
+        table = cls(catalog, layout, catalog.load_table(layout.table_id))
         if not readonly:
             table.ensure_metadata_properties()
 
@@ -168,7 +186,27 @@ class LogTable:
     # -- state ------------------------------------------------------------
 
     def reload(self) -> None:
-        self._table = self._catalog.load_table(self._layout.table_id)
+        """Point at the current snapshot, never at an older one.
+
+        The load happens INSIDE the lock, which looks like holding a mutex
+        across I/O for no reason and is not. Loading outside it and assigning
+        after let two concurrent reloads land in completion order rather than
+        snapshot order: a slow load of an older snapshot finishing last
+        installs it, and the handle goes backwards.
+
+        A reader then straddles the regression. `_query` resolves a floor from
+        the newer snapshot, reads the buffer tail above it, and resolves again
+        — landing on the older one. Its table leg scans the older snapshot
+        while its buffer leg holds only rows above the newer boundary, so
+        everything in between is in neither: rows silently missing from the
+        answer, which is the failure this whole read path is arranged to make
+        impossible.
+
+        A catalog resolve is ~0.5 ms and reads already serialise on the
+        reader's own lock, so ordering costs nothing worth having.
+        """
+        with self._lock:
+            self._table = self._catalog.load_table(self._layout.table_id)
 
     @property
     def metadata_location(self) -> str:
@@ -237,9 +275,23 @@ class LogTable:
         entirely redundant, and on a read-heavy log it was nearly all of the
         per-query overhead.
         """
-        self._refresh()
+        with self._lock:
+            self._refresh()
 
-        return self._extent
+            return self._extent
+
+    def snapshot(self) -> tuple[str, tuple[int, int] | None]:
+        """The metadata pointer and the extent it belongs to, read together.
+
+        Two calls could not be paired safely: a commit between them hands a
+        reader a new snapshot with an old boundary, or the reverse, and each
+        tear corrupts the union differently — one duplicates the rows in the
+        gap, the other loses them.
+        """
+        with self._lock:
+            self._refresh()
+
+            return self.metadata_location, self._extent
 
     def file_count(self) -> int:
         """How many data files the current snapshot holds.
@@ -248,9 +300,10 @@ class LogTable:
         one file rather than opening every manifest. Measured at 60 files:
         0.65 ms against 42.9 ms for the entry walk.
         """
-        self._refresh_counts()
+        with self._lock:
+            self._refresh_counts()
 
-        return self._file_count
+            return self._file_count
 
     def record_count(self) -> int:
         """How many rows the current snapshot holds.
@@ -259,9 +312,10 @@ class LogTable:
         the offset column out of every Parquet file — correct, and proportional
         to the data, which is the wrong shape for anything polling.
         """
-        self._refresh_counts()
+        with self._lock:
+            self._refresh_counts()
 
-        return self._record_count
+            return self._record_count
 
     def _refresh_counts(self) -> None:
         location = self.metadata_location
@@ -411,7 +465,8 @@ class LogTable:
         """
         for attempt in range(_COMMIT_ATTEMPTS):
             try:
-                operation()
+                with self._lock:
+                    operation()
             except CommitFailedException:
                 if attempt == _COMMIT_ATTEMPTS - 1:
                     raise
@@ -422,14 +477,58 @@ class LogTable:
 
                 return
 
-    def register(self, path: str) -> None:
+    def register(self, path: str, sealed_through: int | None = None) -> bool:
         """Add an already-written file to the table (§4 step 2).
 
         `add_files` rather than `append`: pyiceberg's append writes the file
         itself and commits afterwards, so a crash in between orphans a file
         under a name nothing recorded — exactly what I2 exists to prevent.
+
+        `sealed_through` is the exclusive end of the range this file covers,
+        and passing it makes the commit a no-op if the range is already in the
+        table. That is what closes the race two owners can otherwise win.
+
+        Iceberg already serialises them: both compare-and-swap against the same
+        pointer, one moves it, the other raises `CommitFailedException`. What
+        broke it was OUR retry — reloading and trying again, which succeeds,
+        because per-attempt names mean the second file does not collide with
+        the first. The CAS was doing its job and we were overriding it.
+
+        Re-checked on every attempt rather than once, because `_commit` reloads
+        between them: the loser's retry now sees the winner's file covering its
+        range and does nothing. Both orderings are safe — a writer that reloads
+        after the winner never attempts at all.
+
+
+        Returns whether the file was added. False means the range was already
+        covered, so this file is redundant — and the caller has to queue it for
+        deletion, or it is a file on disk that nothing records.
         """
-        self._commit(lambda: self._table.add_files([path]))
+        added = True
+
+        def add() -> None:
+            nonlocal added
+            if sealed_through is not None and self._covers(sealed_through):
+                added = False
+
+                return
+
+            added = True
+            self._table.add_files([path])
+
+        self._commit(add)
+
+        return added
+
+    def _covers(self, sealed_through: int) -> bool:
+        """Whether the table already holds everything below `sealed_through`.
+
+        Data files cover contiguous, non-overlapping offset ranges (§4), so the
+        extent's upper bound answers this on its own.
+        """
+        extent = self.extent()
+
+        return extent is not None and extent[1] >= sealed_through - 1
 
     def replace_range(self, lo: int, hi: int, path: str) -> None:
         """Swap `[lo, hi]` for one already-written file, in one snapshot (§6).
