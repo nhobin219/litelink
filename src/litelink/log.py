@@ -717,7 +717,14 @@ class Log:
         # something only a replay needs to know.
         claimed = self._buffer.pending_seal()
         if claimed is not None and claimed[1] == end:
-            self._recover_seal()
+            # In the `try` below in spirit, and now in fact: returning from
+            # here without releasing left the seal role dead for its whole TTL,
+            # so the drain loop above exited with groups still queued and
+            # nobody able to take them.
+            try:
+                self._recover_seal()
+            finally:
+                lease.release()
 
             return end
 
@@ -728,7 +735,28 @@ class Log:
         self._buffer.claim_seal(start, end, rel_path)
 
         try:
+            # Renewed either side of the expensive half, and a lost lease is
+            # fatal rather than something to push through. Another owner that
+            # takes this role replays the SAME range to the SAME path (I2), so
+            # continuing would mean two processes writing one file: whichever
+            # finished second would truncate the other, and a `finish_seal`
+            # from the loser would drop the buffer rows backing a file nobody
+            # had completely written.
+            #
+            # The write itself cannot be checkpointed — it is one blocking call
+            # — so it gets a full TTL and no more. A single group is one
+            # `target_size` file; a write that outlasts 30 s means the machine
+            # is in trouble, and stopping is the right answer then too.
+            if not lease.renew():
+                msg = "lost the seal lease before writing"
+                raise RuntimeError(msg)
+
             self._write_and_commit(end, rel_path)
+
+            if not lease.renew():
+                msg = "lost the seal lease before clearing the buffer"
+                raise RuntimeError(msg)
+
             self._buffer.finish_seal(end)
         finally:
             lease.release()
@@ -851,10 +879,19 @@ class Log:
 
     def _recover_seal(self) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
-        did not, the whole file is rewritten to the same path."""
+        did not, the whole file is rewritten to the same path.
+
+        Reloads first, because "did the commit land" is a question about the
+        CURRENT table and this handle may predate it. A writer that has only
+        appended for hours holds a snapshot from when it opened; asked with
+        that, it would decide a committed file is missing and rewrite the live
+        one underneath the readers scanning it.
+        """
         pending = self._buffer.pending_seal()
         if pending is None:
             return
+
+        self._table.reload()
 
         _, end, rel_path = pending
         if str(self._layout.absolute(rel_path)) not in self._table.file_paths():
