@@ -8,7 +8,7 @@ having them as parameters is for.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -122,9 +122,7 @@ def test_layout_paths_are_derived_not_discovered(tmp_path: Path) -> None:
 
     assert layout.buffer_db == tmp_path / "sensors" / "buffer.db"
     assert layout.table_id == "litelink.sensors"
-    assert layout.seal_path(1, 51, date(2026, 8, 19), "abc123") == (
-        "sensors/data/2026-08-19/1-51-abc123.parquet"
-    )
+    assert layout.seal_path(1, 51, "abc123") == "sensors/data/1-51-abc123.parquet"
     assert layout.compaction_path(1, 200, "abc123") == (
         "sensors/data/compacted/1-200-abc123.parquet"
     )
@@ -309,7 +307,7 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
         )
         log.seal()
 
-        written = next(tmp_path.rglob("*/data/2*/*.parquet"))
+        written = next(tmp_path.rglob("*/data/*.parquet"))
         assert pq.read_table(written)["event_ts"].to_pylist() == [1, 2, 3]
 
         log.set_sort_by(("key",), rewrite=True)
