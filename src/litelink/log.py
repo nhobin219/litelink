@@ -10,8 +10,8 @@ applications that need a small binary column declare an ordinary `binary`
 column in their own schema, which §15.2 already says is the right route for
 payloads that fit comfortably in the buffer.
 
-`sync`, `hydrate` and schema evolution are not implemented; their signatures
-are the design, and they raise.
+Schema evolution is not implemented; the signatures are the design, and they
+raise.
 """
 
 from __future__ import annotations
@@ -1170,8 +1170,75 @@ class Log:
 
         Raising `local_retention` is an operation, not a config change: without
         this, a raised setting applies only to data captured afterwards.
+
+        `since` is measured against when the ARCHIVE took each file, which is
+        the only age still on record — the local snapshots that once dated them
+        went with the eviction, and the library stamps no timestamp of its own
+        (§2). So this reads "bring back what was archived in the last week",
+        not "what was captured then"; for a stream that fell behind, those
+        differ.
+
+        Files are copied down and registered under the name they have
+        remotely, so hydrating twice writes the same paths rather than
+        accumulating copies, and one interrupted halfway is finished by the
+        next run. Only ranges strictly below what the local table already holds
+        are considered, which is what keeps files contiguous and
+        non-overlapping (§4) — the archive's copy of a range the local table
+        still has would otherwise be added a second time and every row in it
+        read twice.
+
+        A hydrated file is not measured: nothing local counted its rows, and
+        `file_bytes` therefore has no entry. That is deliberate and it is what
+        an unknown size means everywhere else — the file counts as full, so
+        compaction will not merge it and `sync` will not push it back to the
+        archive it just came from. Eviction still applies to it, which is the
+        point: this is temporary unless `local_retention` is raised too.
         """
-        raise NotImplementedError
+        self._writable()
+        if not self._archive.configured():
+            msg = "hydrate() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        # The maintenance lease, because this writes the local table and copies
+        # files into the data directory — the same two things eviction and
+        # compaction do, and for the same reason they must not overlap.
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            self._pull(lease, since)
+        finally:
+            lease.release()
+
+    def _pull(self, lease: Lease, since: timedelta) -> None:
+        """Copy down and register everything archived since `since`."""
+        archive = self._archive.require()
+        self._table.reload()
+
+        held = self._table.extent()
+        # Nothing local means nothing to sit below, so everything qualifies.
+        floor = held[0] if held is not None else None
+        cutoff = datetime.now(UTC) - since
+        added = archive.snapshot_ages()
+
+        for data_file in archive.data_files():
+            if floor is not None and data_file.hi >= floor:
+                continue
+
+            stamped = added.get(data_file.path)
+            if stamped is None or stamped.replace(tzinfo=UTC) < cutoff:
+                continue
+
+            checkpoint(lease.renew)
+            rel_path = archive.key(data_file.path)
+            destination = self._layout.absolute(rel_path)
+            archive.fetch(data_file.path, destination)
+            # No `sealed_through`: that check exists to decline a range the
+            # table already covers, and every range here is deliberately below
+            # what it covers. The filter above is what prevents an overlap.
+            self._table.register(str(destination))
 
     # -- schema evolution --------------------------------------------------
     #

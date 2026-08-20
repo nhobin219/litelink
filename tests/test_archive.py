@@ -236,3 +236,70 @@ def test_only_settled_files_reach_the_archive(
 
         assert int(log._buffer.get_meta("archive_through") or 0) == files[-2].hi
         assert log._archive.require().extent() == (1, files[-2].hi)
+
+
+def test_hydrate_brings_evicted_files_back_to_local_disk(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """§8: raising `local_retention` is an operation, not a config change.
+
+    Everything is evicted first, so the local table holds only the unsealed
+    tail and a plain `scan()` cannot see the rest. After hydrating, the same
+    read — no `include_archive`, no network — returns the whole stream, which
+    is the point: the data is back on local disk, not merely reachable.
+    """
+    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        log.maintain()
+
+        evicted = log.scan().read_all().num_rows
+        assert evicted < ROWS, "the fixture must evict something to test this"
+
+        log.hydrate(since=timedelta(hours=1))
+
+        assert log.scan().read_all().num_rows == ROWS
+        restored = log.sql("SELECT * FROM log").read_all().column(OFFSET).to_pylist()
+        assert sorted(restored) == list(range(1, ROWS + 1)), (
+            "every offset exactly once, with no overlap against what stayed local"
+        )
+
+
+def test_hydrate_is_idempotent(tmp_path: Path, bucket: str, s3: S3Options) -> None:
+    """Run twice and nothing doubles.
+
+    Files land under the name they have in the archive, so the second pass
+    rewrites the same paths, and the range filter refuses anything the local
+    table already holds. Without that filter the second run would register the
+    archive's copy of a range alongside the copy it just restored, and every
+    row in it would be read twice.
+    """
+    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        log.maintain()
+
+        log.hydrate(since=timedelta(hours=1))
+        once = log.table_files()
+        log.hydrate(since=timedelta(hours=1))
+
+        assert log.table_files() == once
+        assert log.scan().read_all().num_rows == ROWS
+
+
+def test_hydrate_ignores_files_older_than_the_window(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A zero window restores nothing, which is what makes the window real."""
+    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        log.maintain()
+        evicted = log.table_files()
+
+        log.hydrate(since=timedelta(0))
+
+        assert log.table_files() == evicted
