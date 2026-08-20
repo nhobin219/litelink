@@ -182,10 +182,97 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
 
 
 def test_target_size_triggers_a_seal(tmp_path: Path) -> None:
+    """The seal happens on a thread, so the append does not wait for it."""
     with open_log(tmp_path, LogConfig(target_size=512)) as log:
         log.extend(rows(40))
+
+        assert log.await_seal(timeout=30), "seal did not finish"
         assert log.table_extent() is not None, "should have sealed on size"
         assert len(read_all(log)) == 40
+
+
+def test_a_synchronous_seal_is_available(tmp_path: Path) -> None:
+    """`background_seal=False` for callers who need the table to have moved."""
+    config = LogConfig(target_size=512, background_seal=False)
+
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(40))
+
+        assert log.table_extent() is not None, "sealed before extend returned"
+        assert len(read_all(log)) == 40
+
+
+def test_rows_stay_readable_throughout_a_background_seal(tmp_path: Path) -> None:
+    """Nothing about correctness depends on when the seal lands.
+
+    Between the Iceberg commit and the buffer delete a row is in both tiers, and
+    §7's boundary excludes it from one of them — which is why the seal can take
+    as long as it likes without a reader noticing.
+    """
+    with open_log(tmp_path, LogConfig(target_size=512)) as log:
+        log.extend(rows(60))
+
+        for _ in range(20):
+            assert len(read_all(log)) == 60, "a row went missing mid-seal"
+
+        assert log.await_seal(timeout=30)
+        assert len(read_all(log)) == 60
+
+
+def test_appends_are_not_blocked_by_a_running_seal(tmp_path: Path) -> None:
+    """The point of the exercise (§13.6).
+
+    A seal holds the buffer lock only to claim its range and to delete the rows
+    it covered. The sort, the Parquet write, the fsync and the Iceberg commit
+    happen with the lock released, on a separate SQLite connection — so an
+    append that arrives during one waits for neither.
+    """
+    import statistics
+    import time
+
+    with open_log(tmp_path, LogConfig(target_size=4096)) as log:
+        log.extend(rows(200))  # provoke a seal
+        latencies = []
+        for i in range(400):
+            started = time.perf_counter()
+            log.extend(rows(1, start=1000 + i))
+            latencies.append((time.perf_counter() - started) * 1000)
+
+        assert log.await_seal(timeout=30)
+
+    latencies.sort()
+    median = statistics.median(latencies)
+    worst = latencies[-1]
+
+    # Sealing inline made the triggering append 30-90 ms against a sub-1 ms
+    # median. The bound is loose on purpose — this asserts the stall is gone,
+    # not a particular machine's timing.
+    assert worst < max(15.0, median * 30), (
+        f"an append waited {worst:.1f} ms against a {median:.2f} ms median"
+    )
+
+
+def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
+    """`sealing` holds one row by design (§2), and two seals would overlap."""
+    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+        log.extend(rows(50))
+        log._sealing = True
+
+        assert log.seal() is None, "sealed while another seal was in flight"
+
+        log._sealing = False
+        assert log.seal() == 51
+
+
+def test_close_waits_for_an_in_flight_seal(tmp_path: Path) -> None:
+    """A seal holds a claim in `sealing`; letting it finish beats replaying it."""
+    log = open_log(tmp_path, LogConfig(target_size=512))
+    log.extend(rows(60))
+    log.close()
+
+    with open_log(tmp_path) as reopened:
+        assert reopened._buffer.pending_seal() is None, "left a claim behind"
+        assert len(read_all(reopened)) == 60
 
 
 def test_local_retention_zero_without_an_archive_is_rejected(tmp_path: Path) -> None:
