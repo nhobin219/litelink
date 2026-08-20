@@ -79,8 +79,8 @@ in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
-How the pieces run — writer, sealer and maintainer, and what crosses between them — is
-[`docs/RUNTIME.md`](docs/RUNTIME.md).
+How the pieces run — writer and maintainer, what crosses between them, and what is safe
+to call from which thread or process — is [`docs/RUNTIME.md`](docs/RUNTIME.md).
 
 ## Extensions
 

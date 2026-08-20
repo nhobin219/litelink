@@ -254,6 +254,65 @@ query.
 
 ---
 
+## The concurrency contract
+
+What is safe, stated rather than inferred. Everything below is a promise; anything not
+listed is not one.
+
+**Between processes**
+
+| | |
+|---|---|
+| one writer process per log | §1. Two processes appending to one log is unsupported and unchecked |
+| any number of reader processes | `Log.open(..., read_only=True)`. They hold no lease and mutate nothing |
+| one maintainer at a time, enforced | the `seal` and `maintain` leases refuse a second holder and lapse if one dies |
+| open the log *after* forking | a SQLite handle does not survive `fork`, and neither does a DuckDB one |
+
+**Between threads, within a process**
+
+Safe to call on one `Log` from any thread, including different threads on different
+calls:
+
+- `append` / `extend`
+- `scan` / `sql`
+- `seal` / `seal_due` / `maintain`
+- `await_seal`, `table_rows`, `table_files`, `table_extent`, `end_offset`
+
+**Not** concurrency-safe — call them when nothing else is using the log:
+
+- `set_config`, `set_archive`, `set_sort_by`
+
+Those three mutate a SQLite row and a Python object together, and they are the only
+place `Log._lock` still exists. Reconfiguring a log from two threads at once is not a
+scenario worth designing for; corrupting one is not a failure worth allowing.
+
+`buffered_rows` is safe but approximate: it reads the tier boundary and the buffer count
+without holding anything between them, so a seal landing in the middle shifts one under
+the other. It is a number to watch, not one to derive from.
+
+**Threads buy latency, not throughput.** Measured on this design: appending from 1, 2 and
+4 threads gave 28.4k, 29.2k and 30.6k rows/s — within noise — while p99 batch latency
+went from 3.5–8 ms to 30–36 ms. Appends are fsync-bound and SQLite admits one writer at a
+time, so more threads cannot help. Reads are worse: 1, 2 and 4 concurrent readers gave
+35, 28 and 7 scans/s, because DuckDB already uses every core for a single query.
+
+So do not reach for threads to go faster. Reach for them to avoid blocking — which is the
+case that matters, because an `async` caller has no choice. `fsync` cannot run on an event
+loop, so `await log.append(...)` means dispatching to a worker thread, and a pool hands
+out a **different thread each call**. That is why the buffer opens its connection with
+`check_same_thread=False` and guards it with a lock instead of demanding thread affinity:
+affinity would make the library unusable from asyncio, which is where a websocket feed
+lives.
+
+**The rule the lock actually encodes.** Every statement on the buffer's write connection
+takes that lock, reads included. A statement issued while another thread has a
+transaction open on the same connection *joins* it: a read sees uncommitted rows that a
+rollback then unmakes, and a write commits or rolls back with someone else's work. That
+is not a hot-path concern, it is how a lease once evaporated under its holder and how two
+sealers came to write the same file. The read-only connection needs no such lock, and
+that is the proof the rule is about transactions rather than about threads — nothing ever
+opens one on it.
+
 ## Operating it
 
 ```
