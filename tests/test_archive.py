@@ -43,6 +43,20 @@ def rows(count: int) -> list[dict[str, object]]:
     ]
 
 
+# Coprime with any row count used here, so the sort column is a PERMUTATION of
+# arrival order rather than agreeing with it. Files are clustered by `sort_by`,
+# and a test whose sort column only ever increases cannot tell that apart from
+# offset order — which is the one thing the archive rewrite depends on.
+STRIDE = 7919
+
+
+def scrambled(count: int) -> list[dict[str, object]]:
+    return [
+        {"event_ts": (i * STRIDE) % count, "key": f"k{i % 7}", "payload": "x" * 96}
+        for i in range(count)
+    ]
+
+
 def archived_log(root: Path, bucket: str, s3: S3Options, **overrides: object) -> Log:
     settings: dict[str, object] = {
         "target_size": 64 * 1024,
@@ -250,10 +264,19 @@ def test_rewrite_archive_merges_files_left_undersized(
     change applies only to what has not been written yet. The rewrite merges
     them and the data survives exactly.
     """
-    with archived_log(tmp_path, bucket, s3, target_size=8 * 1024) as log:
-        log.extend(rows(ROWS))
+    with archived_log(
+        tmp_path, bucket, s3, target_size=8 * 1024, local_retention=timedelta(0)
+    ) as log:
+        log.extend(scrambled(ROWS))
         log.seal_due()
         log.sync()
+        # Evicted, so the read at the end is served BY the archive. Without
+        # this the local table still holds every row, the archive leg of the
+        # union is bounded above by the local extent and contributes nothing,
+        # and the assertions below pass without reading a rewritten file at
+        # all — which is exactly what they did before this line.
+        log.maintain()
+        assert log.scan().read_all().num_rows < ROWS, "the read must need S3"
 
         remote = log._archive.require()
         before = len(remote.data_files())
@@ -271,6 +294,20 @@ def test_rewrite_archive_merges_files_left_undersized(
 
         restored = log.sql("SELECT * FROM log", include_archive=True).read_all()
         assert sorted(restored.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1))
+
+        # Every row still carries the offset it was written with. The rewrite
+        # re-ingests through a buffer, so offsets are REASSIGNED by the counter
+        # rather than copied — exact only while the rows arrive in the order
+        # their offsets already have. They do not by default: a file is
+        # clustered by `sort_by`, and a scan hands them back that way, which is
+        # why `scrambled` puts the sort column deliberately out of step with
+        # arrival order. Get it wrong and nothing raises: the offsets are still
+        # 1..N with no gap, every row still holds its own data, and only the
+        # pairing between them is destroyed.
+        paired = restored.sort_by([(OFFSET, "ascending")])
+        assert paired.column("event_ts").to_pylist() == [
+            (i * STRIDE) % ROWS for i in range(ROWS)
+        ], "a row was handed an offset belonging to another row"
 
 
 def test_rewrite_archive_defers_deleting_what_it_superseded(

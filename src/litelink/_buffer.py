@@ -563,6 +563,56 @@ class Buffer:
 
         return int(row[0])
 
+    @property
+    def schema(self) -> pa.Schema:
+        """The declared Arrow schema, for building a second buffer like this
+        one — an archive rewrite re-ingests through a scratch buffer and must
+        cast the rows exactly as this one would."""
+        return self._schema
+
+    def seed_offsets(self, first: int) -> None:
+        """Make the next appended row take offset `first`.
+
+        Only for the scratch buffer an archive rewrite re-ingests through. Rows
+        being re-cut keep the offsets they already have — they are the same
+        rows, and §4's contiguous non-overlapping ranges are stated in them —
+        so the sequence has to resume where the range starts rather than at 1.
+
+        Seeded rather than supplied per row, so the rewrite goes through the
+        ordinary append path and I11 still holds: nothing hands an offset to
+        `extend`, the counter simply starts elsewhere.
+        """
+        # `sqlite_sequence` is SQLite's own, and documented as writable — but
+        # it carries no unique constraint, so this is an UPDATE with an INSERT
+        # behind it rather than an upsert. The row appears only after the first
+        # AUTOINCREMENT insert, which for a buffer opened seconds ago has not
+        # happened yet.
+        with self._lock, self._con:
+            updated = self._con.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
+                (first - 1,),
+            )
+            if not updated.rowcount:
+                self._con.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
+                    (first - 1,),
+                )
+
+    def group_bytes(self, end: int) -> int:
+        """What the extent ending at `end` holds, before a file claims it.
+
+        Read out so it can be recorded against the archive's copy: the scratch
+        buffer measured these rows exactly as the appender would have, and that
+        count is the whole reason the rewrite goes through a buffer at all.
+        """
+        with self._lock:
+            row = self._con.execute(
+                "SELECT bytes FROM extent WHERE end_offset = ? AND rel_path IS NULL",
+                (end,),
+            ).fetchone()
+
+        return 0 if row is None else int(row[0])
+
     def rows_below(self, end: int) -> pa.Table:
         """Buffered rows with `offset < end`, as Arrow. The seal's input."""
         return self._rows("< ?", (end,))
@@ -997,6 +1047,21 @@ class Buffer:
                 (lo, hi, rel_path),
             )
 
+    def claim_output(self, lo: int, hi: int, rel_path: str) -> None:
+        """Record one more output path, without clearing the others.
+
+        A compaction writes one file and `claim_compaction` says so by
+        replacing whatever was there. An archive rewrite writes several before
+        a single commit swaps them all in, and every one of them needs its name
+        recorded before it exists (I2) — so they accumulate, and recovery
+        removes each that the commit never claimed.
+        """
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
+                (lo, hi, rel_path),
+            )
+
     def pending_compaction(self) -> tuple[int, int, str] | None:
         with self._lock:
             row = self._con.execute(
@@ -1004,6 +1069,16 @@ class Buffer:
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
+
+    def pending_outputs(self) -> list[tuple[int, int, str]]:
+        """Every claimed output, for recovery. One row for a compaction,
+        several for an interrupted archive rewrite."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT lo, hi, rel_path FROM compacting ORDER BY rowid"
+            ).fetchall()
+
+        return [(int(lo), int(hi), str(path)) for lo, hi, path in rows]
 
     def clear_compaction(self) -> None:
         with self._lock:

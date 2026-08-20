@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 
 from litelink._archive import Archive
+from litelink._buffer import OFFSET, Buffer
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
@@ -142,7 +142,7 @@ def stable_prefix(
     return settled
 
 
-def _is_remote(path: str) -> bool:
+def is_remote(path: str) -> bool:
     """Whether a queued deletion names an object rather than a local file.
 
     The queue holds root-relative names for local files and full URIs for
@@ -260,38 +260,59 @@ class Maintenance:
         remote one is recorded and named by the same URI.
         """
         return {
-            key if _is_remote(key) else str(self._layout.absolute(key)): size
+            key if is_remote(key) else str(self._layout.absolute(key)): size
             for key, size in self._buffer.file_bytes().items()
         }
 
     def _merge(self, run: list[DataFile], heartbeat: Callable[[], bool] | None) -> None:
         """Compact a run, if there is enough of it to be worth a rewrite."""
         if len(run) >= self._config.compact_min_files:
-            self._compact_run(run, heartbeat)
+            self._rewrite_run(self._table, run, heartbeat)
 
-    def _compact_run(
-        self, run: list[DataFile], heartbeat: Callable[[], bool] | None = None
+    def _rewrite_run(
+        self,
+        table: LogTable,
+        run: list[DataFile],
+        heartbeat: Callable[[], bool] | None = None,
+        *,
+        upload: bool = False,
     ) -> None:
+        """Replace one run of adjacent files with a single merged one.
+
+        Both tiers, one path. A local compaction and an archive rewrite differ
+        only in which table they commit to and whether the output is uploaded
+        afterwards; everything that makes either safe — the claim before the
+        file exists, re-sorting, verification, queueing the sources before the
+        commit that supersedes them, carrying their measured sizes onto the
+        output — is identical, and was identical when it was written twice.
+        """
         lo, hi = run[0].lo, run[-1].hi
         # Unique per attempt. See `compaction_path`: a fixed name made a
         # rewrite of a previous compaction write over the file it was reading.
         rel_path = self._layout.compaction_path(lo, hi, uuid.uuid4().hex[:8])
+        target = table.uri(rel_path) if upload else str(self._layout.absolute(rel_path))
         # Claimed before the file exists, exactly as a seal claims its path
-        # (I2). A compaction that dies between the write and the commit is then
+        # (I2). One that dies between the write and the commit is then
         # recoverable by name, instead of being a file nobody can identify
-        # without listing the directory.
-        self._buffer.claim_compaction(lo, hi, rel_path)
-        self._write_merge(run, rel_path, heartbeat)
+        # without listing — which for the archive would be a paginated LIST
+        # over object storage, the thing this design refuses. Claimed as the
+        # TARGET, so recovery knows which tier to remove it from.
+        self._buffer.claim_compaction(lo, hi, self._key(target))
+        self._write_merge(table, run, rel_path, target, heartbeat, upload=upload)
         self._buffer.clear_compaction()
 
     def _write_merge(
         self,
+        table: LogTable,
         run: list[DataFile],
         rel_path: str,
+        target: str,
         heartbeat: Callable[[], bool] | None = None,
+        *,
+        upload: bool = False,
     ) -> None:
         lo, hi = run[0].lo, run[-1].hi
-        merged = self._table.scan_range(lo, hi)
+        merged = table.scan_range(lo, hi)
         if self._sort_by:
             # Re-sorted, not merely concatenated: concatenation would leave the
             # row groups carrying each source file's range, which is the
@@ -300,14 +321,21 @@ class Maintenance:
 
         _verify(merged, run, lo, hi)
 
+        # Written locally either way, because Parquet is written to a file and
+        # the alternative is holding a second copy of the run in memory. For
+        # the archive it is a staging copy under the name it will have
+        # remotely, uploaded and then removed.
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(merged, dest)
         fsync(dest)
+        if upload:
+            table.put(dest, rel_path)
+            dest.unlink(missing_ok=True)
 
         # Checked between writing and committing, because those are the two
         # halves a lapsed lease separates. A run outlasting the TTL lets
-        # another owner recover — unlinking the output this claimed — and the
+        # another owner recover — removing the output this claimed — and the
         # commit would then land anyway, leaving the table pointing at a file
         # that no longer exists while the sources it superseded drain away.
         checkpoint(heartbeat)
@@ -322,13 +350,11 @@ class Maintenance:
         # Superseded, not yet deletable either way: a scan that started before
         # this commit is still reading them (I6).
         self._enqueue(f.path for f in run)
-        self._table.replace_range(lo, hi, str(dest))
+        table.replace_range(lo, hi, [target])
         # After the commit: until it lands the sources are still the live
         # files, and moving their sizes onto an output that never became real
         # would leave every one of them unmeasured.
-        self._buffer.record_merge(
-            rel_path, (self._layout.relative(f.path) for f in run)
-        )
+        self._buffer.record_merge(self._key(target), (self._key(f.path) for f in run))
 
     def rewrite_sorted(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Re-cluster every data file under the current sort order (§7).
@@ -347,7 +373,7 @@ class Maintenance:
         # before it outlasts a user's patience. Per file rather than per pass,
         # because a pass here has no phases to sit between.
         for data_file in self._table.data_files():
-            self._compact_run([data_file])
+            self._rewrite_run(self._table, [data_file])
             checkpoint(heartbeat)
 
     # -- eviction -----------------------------------------------------------
@@ -406,34 +432,43 @@ class Maintenance:
         self._table.evict_through(boundary)
 
     def rewrite_archive(self, heartbeat: Callable[[], bool] | None = None) -> None:
-        """Merge undersized files already in the archive (§6, ad-hoc).
+        """Re-cut undersized archived files to `target_size` (§6, ad-hoc).
 
         Not part of `maintain`, and not expected to be needed. The archive is
         well-sized by construction: `sync` pushes only what compaction has
         finished with, so nothing undersized reaches it in normal operation.
-        Two things break that, both deliberate acts. An explicit `seal()` can
-        strand a small file between larger ones, where compaction can never
-        merge it and `sync` pushes it rather than blocking the watermark for
-        ever. And lowering `target_size` leaves everything written under the
-        old one looking oversized, while raising it leaves everything
-        undersized — the archive is immutable history, so a size change applies
-        to the future and this is what applies it to the past.
+        Two deliberate acts break that. An explicit `seal()` can strand a small
+        file between larger ones, where compaction can never merge it and
+        `sync` pushes it rather than blocking the watermark for ever. And
+        changing `target_size` leaves history sized for the old value, since
+        the archive is immutable and a size change applies to the future.
 
-        Sizes are the same ones the seal measured. `sync` carries each entry
-        over to the archive's name for the file when it pushes it, so nothing
-        here re-derives a size from the file — which could not be done anyway,
-        since a Parquet footer records what it held before compression and not
-        what the appender counted. An archived file with no entry counts as
-        full, exactly as a local one does.
+        **It re-ingests rather than merging.** The rows from the first
+        badly-sized file onwards are appended to a scratch `Buffer` and sealed
+        back out — the same append path, the same `_cut`, the same byte
+        accounting, the same extent rows. That is not a saving of code so much
+        as of ways to be wrong: a merge can only combine whole files, so it
+        lands near the target and leaves the remainder undersized, while the
+        appender cuts on the row that crosses and hits it exactly. Sizing the
+        archive by a second rule that approximates the first is how this came
+        to compare compressed bytes against a memory bound in the first place.
 
-        Runs of one are skipped, and `compact_min_files` does not apply. It is
-        a throughput heuristic for a pass that runs continuously — worth
-        batching there, pointless in an operation somebody invoked because the
-        layout is already wrong.
+        The scratch buffer stays small. Sealing deletes the rows it took, so it
+        holds roughly one file at a time however long the range is, and it is
+        removed at the end either way.
 
-        The rewritten file is committed before its sources are deletable: they
-        go through the same queue and the same grace period as a local
-        compaction's, so a reader mid-scan keeps the files it resolved (I6).
+        FOLLOW-UP: it is opened with the log's own durability, and does not
+        need it. Everything in it is derived from the archive, which stays
+        intact until the single commit at the end, so a crash costs a re-run
+        rather than data — `synchronous=FULL` and the WAL are paying for a
+        guarantee nothing here depends on. Left as it is because it is the
+        same `Buffer` the appender uses and an operation that runs by hand is
+        the wrong place to introduce a second configuration of it. Rows already
+        arrive one source file per transaction rather than one per row.
+
+        One commit swaps the whole range. Committing each new file as it is
+        written would have each commit delete a sub-range of a file the next
+        one still needs to read.
         """
         archive = self._archive.table()
         if archive is None:
@@ -441,46 +476,145 @@ class Maintenance:
             raise ValueError(msg)
 
         archive.reload()
-        files = archive.data_files()
+        stale = self._badly_sized(archive)
+        if len(stale) < 2:
+            # One file, or none. A single undersized file at the end of the
+            # archive is where an undersized file is allowed to be, and
+            # rewriting it alone would produce the same file again.
+            return
+
+        # Queued BEFORE the commit that supersedes them, exactly as a local
+        # compaction queues its sources, and safe for the same reason: `drain`
+        # refuses to delete anything the table still references, so an entry
+        # made for a commit that never lands simply never comes due.
+        self._enqueue(data_file.path for data_file in stale)
+        self._recut(archive, stale, heartbeat)
+
+    def _badly_sized(self, archive: LogTable) -> list[DataFile]:
+        """The archived files from the first one under `target_size` on.
+
+        Everything before it already holds a full target and re-cutting it
+        would rewrite bytes to reproduce them. Everything after has to move
+        regardless of its own size, because the shortfall ahead of it shifts
+        every boundary behind it.
+
+        A file whose size was never recorded counts as full, so an archive
+        whose local extents were lost is left alone rather than rewritten on a
+        guess about what it holds.
+        """
         held = self.memory()
-        for run in runs(files, self._config.target_size, held):
-            if len(run) < 2:
-                continue
+        target = self._config.target_size
+        files = archive.data_files()
+        for index, data_file in enumerate(files):
+            if held.get(data_file.path, target) < target:
+                return files[index:]
 
-            checkpoint(heartbeat)
-            self._rewrite_remote(archive, run)
+        return []
 
-    def _rewrite_remote(self, archive: LogTable, run: list[DataFile]) -> None:
-        """Replace one run of archived files with a single merged one."""
-        lo, hi = run[0].lo, run[-1].hi
-        merged = archive.scan_range(lo, hi)
-        if self._sort_by:
-            merged = merged.sort_by([(c, "ascending") for c in self._sort_by])
-
-        _verify(merged, run, lo, hi)
-
-        rel_path = self._layout.compaction_path(lo, hi, uuid.uuid4().hex[:8])
-        # Staged locally and uploaded, because Parquet is written to a file and
-        # the alternative is holding a second copy of the run in memory. Under
-        # a name of its own rather than the data directory's, so a crash cannot
-        # leave something that looks like a local data file: nothing references
-        # this path, and the `finally` removes it either way.
-        staged = self._layout.root / f"{Path(rel_path).name}.rewrite"
-        try:
-            pq.write_table(merged, staged)
-            fsync(staged)
-            archive.put(staged, rel_path)
-        finally:
-            staged.unlink(missing_ok=True)
-
-        # Queued before the commit that supersedes them, exactly as a local
-        # compaction queues its sources: after it their names are still in the
-        # old snapshot, but nothing this process holds would re-derive them.
-        self._enqueue(data_file.path for data_file in run)
-        archive.replace_range(lo, hi, archive.uri(rel_path))
-        self._buffer.record_merge(
-            archive.uri(rel_path), (data_file.path for data_file in run)
+    def _recut(
+        self,
+        archive: LogTable,
+        stale: list[DataFile],
+        heartbeat: Callable[[], bool] | None = None,
+    ) -> None:
+        """Append `stale` back through a buffer and seal it out again."""
+        lo, hi = stale[0].lo, stale[-1].hi
+        scratch = Buffer.open(
+            self._layout.rewrite_db,
+            self._buffer.schema,
+            target_size=self._config.target_size,
         )
+        written: list[str] = []
+        expected = 0
+        try:
+            # The rows keep the offsets they already have (§4), so the counter
+            # resumes at the start of the range rather than at 1. Reassigned
+            # rather than supplied, which is what keeps I11 true of the rewrite
+            # as well: nothing hands an offset to `append`.
+            scratch.seed_offsets(lo)
+            expected = 0
+            for data_file in stale:
+                checkpoint(heartbeat)
+                rows = archive.scan_range(data_file.lo, data_file.hi)
+                # Sorted by offset and then stripped of it. The counter is what
+                # reassigns them, so the rows have to arrive in the order their
+                # offsets already have — files are clustered by `sort_by`, not
+                # by offset, so what comes back is in neither order by default.
+                # Getting this wrong would not raise anywhere: every row would
+                # keep its data and be handed somebody else's offset.
+                rows = rows.sort_by([(OFFSET, "ascending")])
+                expected += rows.num_rows
+                scratch.append(rows.drop_columns([OFFSET]).to_pylist())
+                written += self._seal_scratch(scratch, archive, heartbeat)
+
+            # The tail, which by definition did not reach the target. Cutting
+            # it short is what `seal()` does, and one undersized file at the
+            # end is where one is allowed to be.
+            scratch.close_open_group()
+            written += self._seal_scratch(scratch, archive, heartbeat)
+        finally:
+            scratch.close()
+            for suffix in ("", "-wal", "-shm"):
+                self._layout.rewrite_db.with_name(
+                    self._layout.rewrite_db.name + suffix
+                ).unlink(missing_ok=True)
+
+        # Before the swap, not after. The commit is the point of no return:
+        # it deletes the range these rows came from, so a rewrite that lost
+        # any of them must fail while the originals are still the live files.
+        if expected != hi - lo + 1:
+            msg = f"archive rewrite read {expected} rows for offsets {lo}-{hi}"
+            raise RuntimeError(msg)
+
+        archive.replace_range(lo, hi, [archive.uri(path) for path in written])
+        self._buffer.clear_compaction()
+
+    def _seal_scratch(
+        self,
+        scratch: Buffer,
+        archive: LogTable,
+        heartbeat: Callable[[], bool] | None = None,
+    ) -> list[str]:
+        """Write out every extent the scratch buffer has cut, and return their
+        names. The seal's own loop: take the queued range, claim the path
+        before the file exists, write, and retire the extent."""
+        written: list[str] = []
+        while True:
+            queued = scratch.pending_group()
+            if queued is None:
+                return written
+
+            start, end = queued
+            rel_path = self._layout.compaction_path(
+                start, end - 1, uuid.uuid4().hex[:8]
+            )
+            # Both claims. `sealing` in the scratch buffer makes the extent
+            # recoverable there; `compacting` in the real one is what an
+            # interrupted rewrite is found by, since the scratch database is
+            # deleted on the way out.
+            scratch.claim_seal(start, end, rel_path)
+            self._buffer.claim_output(start, end - 1, archive.uri(rel_path))
+
+            rows = scratch.rows_below(end)
+            if self._sort_by:
+                rows = rows.sort_by([(c, "ascending") for c in self._sort_by])
+
+            dest = self._layout.absolute(rel_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(rows, dest)
+            fsync(dest)
+            archive.put(dest, rel_path)
+            dest.unlink(missing_ok=True)
+            checkpoint(heartbeat)
+
+            # The bytes the scratch buffer counted for exactly these rows,
+            # which is the same number the appender would have recorded had
+            # they been cut this way the first time.
+            self._buffer.record_file(
+                archive.uri(rel_path), start, end, scratch.group_bytes(end)
+            )
+            scratch.finish_seal(end, rel_path)
+            written.append(rel_path)
 
     # -- expiry and the deletion queue --------------------------------------
 
@@ -529,7 +663,7 @@ class Maintenance:
         if not self._archive.configured():
             return
 
-        if not any(_is_remote(p) for p in self._buffer.queued_deletions()):
+        if not any(is_remote(p) for p in self._buffer.queued_deletions()):
             return
 
         archive = self._archive.table()
@@ -565,11 +699,11 @@ class Maintenance:
         # Only if the queue holds something remote, so an ordinary drain on a
         # local-only log still opens nothing. `rewrite_archive` is what puts
         # remote entries here, and it is an operation somebody ran on purpose.
-        remote = self._archive.table() if any(_is_remote(p) for p in due) else None
+        remote = self._archive.table() if any(is_remote(p) for p in due) else None
         remote_referenced = set() if remote is None else remote.referenced_paths()
 
         for rel_path in due:
-            if _is_remote(rel_path):
+            if is_remote(rel_path):
                 if remote is None or rel_path in remote_referenced:
                     continue
 
@@ -590,15 +724,21 @@ class Maintenance:
             path.unlink(missing_ok=True)
             self._buffer.forget_deletion(rel_path)
 
-    def _enqueue(self, paths: Iterable[str]) -> None:
-        """Queue files for deletion once their grace period passes.
+    def _key(self, path: str) -> str:
+        """How a file is named in SQLite, whichever tier it is in.
 
-        Local files are stored root-relative, so a log directory stays movable;
-        remote ones keep the full URI, which is already absolute and has no
-        root to be relative to. `_is_remote` is what tells `drain` them apart.
+        Local files root-relative, so a log directory stays movable; remote
+        ones by the full URI, which is already absolute and has no root to be
+        relative to. One rule, used by the deletion queue, the extent table and
+        the compaction claim alike, so `_is_remote` can tell them apart again
+        wherever one of those is read back.
         """
+        return path if is_remote(path) else self._layout.relative(path)
+
+    def _enqueue(self, paths: Iterable[str]) -> None:
+        """Queue files for deletion once their grace period passes."""
         self._buffer.enqueue_deletions(
-            (p if _is_remote(p) else self._layout.relative(p) for p in paths),
+            (self._key(p) for p in paths),
             int(datetime.now(UTC).timestamp()),
         )
 
