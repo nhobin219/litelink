@@ -281,10 +281,24 @@ calls:
 **Not** concurrency-safe — call them when nothing else is using the log:
 
 - `set_config`, `set_archive`, `set_sort_by`
+- `close`
 
-Those three mutate a SQLite row and a Python object together, and they are the only
+The first three mutate a SQLite row and a Python object together, and they are the only
 place `Log._lock` still exists. Reconfiguring a log from two threads at once is not a
 scenario worth designing for; corrupting one is not a failure worth allowing.
+
+`close` is different, and deliberately unguarded. It closes the connections, and a lock
+could not save a caller who is mid-scan on another thread anyway: the seal's read runs on
+the second connection precisely so it does NOT wait behind the write lock, so no single
+lock covers everything `close` tears down. Guarding it would mean putting that read back
+behind the append lock — undoing the split §4 exists for — to defend against a caller
+using an object it has asked to be destroyed.
+
+It is safe to leave unguarded because the failure is loud. SQLite raises
+`ProgrammingError: Cannot operate on a closed database` and DuckDB
+`ConnectionException: Connection already closed`, both immediately. That is the
+distinction worth spending effort on: a silent failure earns a lock, a loud one earns a
+sentence.
 
 `buffered_rows` is safe but approximate: it reads the tier boundary and the buffer count
 without holding anything between them, so a seal landing in the middle shifts one under
@@ -303,6 +317,13 @@ out a **different thread each call**. That is why the buffer opens its connectio
 `check_same_thread=False` and guards it with a lock instead of demanding thread affinity:
 affinity would make the library unusable from asyncio, which is where a websocket feed
 lives.
+
+**Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
+{`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
+acquiring one another, and nothing below reaches back up, so there is no cycle to
+deadlock on. A read takes `Reader._lock` then briefly `LogTable._lock` and
+`Buffer._tail_lock`; a seal takes `Buffer._lock` and `LogTable._lock` at different
+moments and never together.
 
 **The rule the lock actually encodes.** Every statement on the buffer's write connection
 takes that lock, reads included. A statement issued while another thread has a

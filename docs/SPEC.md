@@ -1010,6 +1010,23 @@ The consequence worth planning for is that local disk holds roughly
    seal costs latency rather than file size, because the cut was recorded when the rows
    arrived.
 
+   ### An async API, not built
+
+   `fsync` cannot run on an event loop, so an `async` caller reaches this library through
+   `asyncio.to_thread` — which is already supported and tested (see the concurrency
+   contract in `docs/RUNTIME.md`): a pool hands out a different thread each call, and
+   nothing here demands thread affinity.
+
+   What is *not* built is the API that would make that ergonomic. `await log.append(...)`,
+   `await log.seal_due()`, and above all `await log.await_seal()` — whose name already
+   describes an awaitable and whose current implementation is a sleep-poll loop that an
+   event loop would rather own. A capture feed arriving over a websocket is asyncio by
+   construction, so the wrapper is worth having.
+
+   Deliberately deferred rather than forgotten. It is a surface decision — sync core with
+   an async facade, or async all the way down — and it should be made when the API has
+   users to be broken, not stacked onto the change that made the core coherent.
+
    **A lease statement must be its own transaction.** The buffer connection is shared and
    every write on it takes `Buffer._lock` around an explicit `BEGIN IMMEDIATE`, so a lease
    statement issued *without* that lock lands inside whatever transaction happens to be
