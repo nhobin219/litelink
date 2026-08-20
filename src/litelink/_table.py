@@ -11,6 +11,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import pyarrow.parquet as pq
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
 from pyiceberg.exceptions import CommitFailedException
@@ -585,6 +586,37 @@ class LogTable:
         staged.write_bytes(payload)
         fsync(staged)
         staged.replace(destination)
+
+    def held(self, path: str) -> int:
+        """Uncompressed bytes in a file, from its Parquet footer.
+
+        For files this database never measured — the archive's, whose
+        `file_bytes` entries went with the local copies when they were evicted.
+        A footer read is one small range request rather than a download, and
+        the caller is an ad-hoc repair pass rather than anything on a hot path.
+
+        Not the same measure as the buffer's: this is what Parquet recorded
+        before compression, the buffer's is what SQLite estimated for the same
+        rows, and the two differ a little by encoding. That is fine here
+        because every file in the comparison is measured this way, so the
+        relation between them holds even where the absolute number drifts.
+        """
+        with self._table.io.new_input(path).open() as reading:
+            metadata = pq.ParquetFile(reading).metadata
+
+        return sum(
+            metadata.row_group(group).total_byte_size
+            for group in range(metadata.num_row_groups)
+        )
+
+    def remove(self, path: str) -> None:
+        """Delete a file from this table's warehouse.
+
+        Through the catalog's FileIO, like `put` and `fetch`, so one set of
+        credentials reaches object storage and a delete cannot be aimed
+        somewhere the table does not point.
+        """
+        self._table.io.delete(path)
 
     def key(self, path: str) -> str:
         """The warehouse-relative name of a file in this table.

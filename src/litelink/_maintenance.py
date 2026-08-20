@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
@@ -139,6 +140,18 @@ def stable_prefix(
         settled += len(run)
 
     return settled
+
+
+def _is_remote(path: str) -> bool:
+    """Whether a queued deletion names an object rather than a local file.
+
+    The queue holds root-relative names for local files and full URIs for
+    remote ones, and a URI is the only thing that can carry a scheme — a
+    relative path never contains "://". One queue for both, because the grace
+    period, the reference veto and the ordering that makes them safe are
+    identical either side of the network.
+    """
+    return "://" in path
 
 
 class Maintenance:
@@ -387,6 +400,78 @@ class Maintenance:
         self._enqueue(f.path for f in self._table.data_files() if f.hi <= boundary)
         self._table.evict_through(boundary)
 
+    def rewrite_archive(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """Merge undersized files already in the archive (§6, ad-hoc).
+
+        Not part of `maintain`, and not expected to be needed. The archive is
+        well-sized by construction: `sync` pushes only what compaction has
+        finished with, so nothing undersized reaches it in normal operation.
+        Two things break that, both deliberate acts. An explicit `seal()` can
+        strand a small file between larger ones, where compaction can never
+        merge it and `sync` pushes it rather than blocking the watermark for
+        ever. And lowering `target_size` leaves everything written under the
+        old one looking oversized, while raising it leaves everything
+        undersized — the archive is immutable history, so a size change applies
+        to the future and this is what applies it to the past.
+
+        Sizes come from Parquet footers rather than from `file_bytes`: the
+        entries that measured these files went with the local copies when they
+        were evicted. See `LogTable.held` for why that measure is good enough
+        here and would not be locally.
+
+        Runs of one are skipped, and `compact_min_files` does not apply. It is
+        a throughput heuristic for a pass that runs continuously — worth
+        batching there, pointless in an operation somebody invoked because the
+        layout is already wrong.
+
+        The rewritten file is committed before its sources are deletable: they
+        go through the same queue and the same grace period as a local
+        compaction's, so a reader mid-scan keeps the files it resolved (I6).
+        """
+        archive = self._archive.table()
+        if archive is None:
+            msg = "rewrite_archive() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        archive.reload()
+        files = archive.data_files()
+        held = {data_file.path: archive.held(data_file.path) for data_file in files}
+        for run in runs(files, self._config.target_size, held):
+            if len(run) < 2:
+                continue
+
+            checkpoint(heartbeat)
+            self._rewrite_remote(archive, run)
+
+    def _rewrite_remote(self, archive: LogTable, run: list[DataFile]) -> None:
+        """Replace one run of archived files with a single merged one."""
+        lo, hi = run[0].lo, run[-1].hi
+        merged = archive.scan_range(lo, hi)
+        if self._sort_by:
+            merged = merged.sort_by([(c, "ascending") for c in self._sort_by])
+
+        _verify(merged, run, lo, hi)
+
+        rel_path = self._layout.compaction_path(lo, hi, uuid.uuid4().hex[:8])
+        # Staged locally and uploaded, because Parquet is written to a file and
+        # the alternative is holding a second copy of the run in memory. Under
+        # a name of its own rather than the data directory's, so a crash cannot
+        # leave something that looks like a local data file: nothing references
+        # this path, and the `finally` removes it either way.
+        staged = self._layout.root / f"{Path(rel_path).name}.rewrite"
+        try:
+            pq.write_table(merged, staged)
+            fsync(staged)
+            archive.put(staged, rel_path)
+        finally:
+            staged.unlink(missing_ok=True)
+
+        # Queued before the commit that supersedes them, exactly as a local
+        # compaction queues its sources: after it their names are still in the
+        # old snapshot, but nothing this process holds would re-derive them.
+        self._enqueue(data_file.path for data_file in run)
+        archive.replace_range(lo, hi, archive.uri(rel_path))
+
     # -- expiry and the deletion queue --------------------------------------
 
     def expire(self) -> None:
@@ -413,7 +498,36 @@ class Maintenance:
         # could not be found at all.
         self._enqueue(doomed)
         self._table.expire_snapshots_older_than(cutoff)
+        self._expire_archive(cutoff)
         self.drain()
+
+    def _expire_archive(self, cutoff: datetime) -> None:
+        """The same expiry on the archive, when a rewrite has left work there.
+
+        Only then. `sync` adds files and never supersedes one, so an archive
+        that has only ever been synced has nothing an old snapshot is keeping
+        alive, and expiring it every pass would spend a remote catalog commit
+        to discover that. `rewrite_archive` is the one thing that supersedes an
+        archived file, and it is also the only thing that puts a remote entry
+        in the deletion queue — so a queue with one in it is the exact signal
+        that the archive has garbage to release.
+
+        Without this the queue never drains: `drain` refuses to delete a file
+        any snapshot still references, and until the snapshot that named it
+        expires, one always does.
+        """
+        if not self._archive.configured():
+            return
+
+        if not any(_is_remote(p) for p in self._buffer.queued_deletions()):
+            return
+
+        archive = self._archive.table()
+        if archive is None:
+            return
+
+        self._enqueue(archive.metadata_paths(archive.snapshots_older_than(cutoff)))
+        archive.expire_snapshots_older_than(cutoff)
 
     def drain(self) -> None:
         """Delete files whose grace period has passed.
@@ -438,7 +552,21 @@ class Maintenance:
         # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
         self._table.reload()
         referenced = self._table.referenced_paths()
+        # Only if the queue holds something remote, so an ordinary drain on a
+        # local-only log still opens nothing. `rewrite_archive` is what puts
+        # remote entries here, and it is an operation somebody ran on purpose.
+        remote = self._archive.table() if any(_is_remote(p) for p in due) else None
+        remote_referenced = set() if remote is None else remote.referenced_paths()
+
         for rel_path in due:
+            if _is_remote(rel_path):
+                if remote is None or rel_path in remote_referenced:
+                    continue
+
+                remote.remove(rel_path)
+                self._buffer.forget_deletion(rel_path)
+                continue
+
             path = self._layout.absolute(rel_path)
             if str(path) in referenced:
                 # A compaction can re-register a path the queue still holds.
@@ -453,8 +581,14 @@ class Maintenance:
             self._buffer.forget_deletion(rel_path)
 
     def _enqueue(self, paths: Iterable[str]) -> None:
+        """Queue files for deletion once their grace period passes.
+
+        Local files are stored root-relative, so a log directory stays movable;
+        remote ones keep the full URI, which is already absolute and has no
+        root to be relative to. `_is_remote` is what tells `drain` them apart.
+        """
         self._buffer.enqueue_deletions(
-            (self._layout.relative(p) for p in paths),
+            (p if _is_remote(p) else self._layout.relative(p) for p in paths),
             int(datetime.now(UTC).timestamp()),
         )
 

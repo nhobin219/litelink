@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -111,12 +112,13 @@ def bucket(s3: S3Options) -> Iterator[str]:
 
 
 def archived_log(root: Path, bucket: str, s3: S3Options, **overrides: object) -> Log:
-    config = LogConfig(
-        target_size=64 * 1024,
-        compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
-        **overrides,  # ty: ignore[invalid-argument-type]
-    )
+    settings: dict[str, object] = {
+        "target_size": 64 * 1024,
+        "compact_min_files": 2,
+        "snapshot_retention": timedelta(seconds=0),
+    }
+    settings.update(overrides)
+    config = LogConfig(**settings)  # ty: ignore[invalid-argument-type]
 
     return Log.new(
         root,
@@ -303,3 +305,81 @@ def test_hydrate_ignores_files_older_than_the_window(
         log.hydrate(since=timedelta(0))
 
         assert log.table_files() == evicted
+
+
+def test_rewrite_archive_merges_files_left_undersized(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The repair, on the layout that needs repairing.
+
+    Every file here is pushed under a small target and is then undersized
+    against a larger one — which is what lowering and raising `target_size`
+    does to an archive, since the archive is immutable history and a size
+    change applies only to what has not been written yet. The rewrite merges
+    them and the data survives exactly.
+    """
+    with archived_log(tmp_path, bucket, s3, target_size=8 * 1024) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+
+        remote = log._archive.require()
+        before = len(remote.data_files())
+        assert before >= 4, "the fixture must archive several files to merge"
+
+        log.set_config(replace(log.config, target_size=1024 * 1024))
+        log.rewrite_archive()
+
+        remote.reload()
+        after = remote.data_files()
+        assert len(after) < before, "the rewrite must reduce the file count"
+        assert [f.lo for f in after] == sorted(f.lo for f in after)
+        assert after[0].lo == 1, "the range must still start where it did"
+        assert after[-1].hi == max(f.hi for f in remote.data_files())
+
+        restored = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        assert sorted(restored.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1))
+
+
+def test_rewrite_archive_defers_deleting_what_it_superseded(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """I6 reaches across the network.
+
+    A reader that resolved the archive before the rewrite is still reading
+    those objects, so they go through the same queue and the same grace period
+    a local compaction's sources do. Deleting them at commit time would break
+    a scan already in flight — and object storage has no equivalent of a POSIX
+    unlink that leaves an open handle working.
+    """
+    with archived_log(
+        tmp_path,
+        bucket,
+        s3,
+        target_size=8 * 1024,
+        snapshot_retention=timedelta(hours=1),
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        superseded = {f.path for f in log._archive.require().data_files()}
+
+        log.set_config(replace(log.config, target_size=1024 * 1024))
+        log.rewrite_archive()
+
+        queued = set(log._buffer.queued_deletions())
+        assert superseded & queued, "the sources must be queued, not deleted"
+
+        fs = filesystem(s3)
+        for path in superseded & queued:
+            assert fs.exists(path.removeprefix("s3://")), (
+                "a queued file must still exist until its grace period passes"
+            )
+
+        log.set_config(replace(log.config, snapshot_retention=timedelta(0)))
+        log.maintain()
+
+        for path in superseded & queued:
+            assert not fs.exists(path.removeprefix("s3://")), (
+                "the drain must remove remote files once they come due"
+            )
