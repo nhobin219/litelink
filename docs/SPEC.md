@@ -1008,6 +1008,22 @@ The consequence worth planning for is that local disk holds roughly
    - **Move sealing to maintenance entirely**, handing step 3 back to whoever holds the buffer
      write lease.
 
+   **What the built background seal does and does not port.** Its durable half is already
+   process-agnostic: `sealing` records the intent before the work and recovery replays it
+   without caring which process wrote it (I16). Its runtime half is entirely Python-local, so
+   it is thread-portable and not process-portable, and the gap is four named things:
+
+   | | lives in | breaks across processes as |
+   |---|---|---|
+   | the one-seal-at-a-time guard | a Python bool | both processes seal; `claim_seal` does DELETE-then-INSERT unconditionally, so the second overwrites the first's claim rather than being refused |
+   | the wake-up and completion signals | `threading.Event` | no cross-process equivalent |
+   | the buffer and table locks | `RLock` | no mutual exclusion; SQLite serialises individual writes but not multi-statement transactions |
+   | the buffered-size counter | an in-memory integer | the seal trigger's only input, and it neither exists in another process nor decrements when one seals |
+
+   Each maps onto an option already listed: the guard wants a lease, the signals want a queue
+   table or a watermark, and the counter is the sub-question below. Nothing about the durable
+   protocol needs revisiting — only who decides to seal, and how they are told.
+
    Open sub-questions the last option raises, and probably the reason to be careful:
 
    - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
