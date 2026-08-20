@@ -18,6 +18,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pytest
 
 from litelink import Log, LogConfig
 
@@ -117,3 +118,54 @@ def test_appends_and_reads_interleave_without_loss(tmp_path: Path) -> None:
         check = log._buffer._con.execute("PRAGMA integrity_check").fetchall()
 
         assert check == [("ok",)], f"buffer database damaged: {check}"
+
+
+def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The union's two legs must come from one moment, not two.
+
+    A seal commits its file and THEN deletes the rows it covered, so it has a
+    window where a row is in both tiers. A query that resolves the boundary and
+    reads the buffer at different moments straddles that window: pairing a new
+    snapshot with an old boundary duplicates the rows in the gap, and pairing
+    an old snapshot with a buffer the seal has already emptied loses them.
+
+    Forced here rather than raced: the seal runs inside the buffer read, which
+    is exactly the interleaving that is otherwise a matter of luck.
+    """
+    config = LogConfig(target_size=2 * 1024, snapshot_retention=timedelta(days=1))
+    with open_log(tmp_path, config) as log:
+        # Both legs must be non-empty, or the union takes its buffer-only
+        # branch and the boundary never enters into it.
+        log.extend(rows(200))
+        log.seal()
+        log.extend(rows(200, start=200))
+        log.scan().read_all()  # warm the view and the tail cache
+
+        assert log.table_rows() and log.buffered_rows(), "need both legs"
+
+        buffer = log._buffer
+        real = buffer.rows_above
+        fired = []
+
+        def seal_midway(boundary: int | None) -> object:
+            tail = real(boundary)
+            if not fired:
+                fired.append(log.seal_due())
+
+            return tail
+
+        monkeypatch.setattr(buffer, "rows_above", seal_midway)
+        got = log.scan().read_all()
+        monkeypatch.undo()
+
+        assert fired and fired[0] is not None, "the seal never ran"
+
+        offsets = got.column("litelink_offset").to_pylist()
+
+        assert len(offsets) == len(set(offsets)), "a row appeared in both legs"
+        assert sorted(offsets) == list(range(1, 401)), (
+            f"expected offsets 1..400, got {len(offsets)} rows "
+            f"spanning {min(offsets)}..{max(offsets)}"
+        )

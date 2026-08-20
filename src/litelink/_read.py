@@ -93,20 +93,35 @@ class Reader:
             return self._query(sql)
 
     def _query(self, sql: str) -> pa.RecordBatchReader:
-        self._table.reload()
         connection = self._connect()
-        extent = self._table.extent()
+        # Buffer first, table second, and the order is the correctness
+        # argument. A seal commits its file and THEN deletes the rows it
+        # covered, so between those two moments a row is in both tiers and
+        # after them it is only in the table. Reading the buffer first means
+        # anything a seal removes afterwards is already in the snapshot
+        # resolved below; reading it second would let a seal land in between
+        # and leave those rows in neither leg.
+        #
+        # The floor here only bounds how much is read — §7's point about a
+        # deferred delete not inflating a query. It is not the boundary; that
+        # is decided after, against a snapshot that cannot then move.
+        self._table.reload()
+        floor = self._table.extent()
+        tail = self._buffer.rows_above(None if floor is None else floor[1])
+
         # Re-registered every query, because the buffer has moved on since the
         # last one. Replacing the relation leaves the view valid: the view
         # names it and DuckDB resolves that name at execution.
-        connection.register(
-            BUFFER_REL, self._buffer.rows_above(None if extent is None else extent[1])
-        )
-        # Resolving per query is §7's rule and still happens above. What is
-        # skipped is reinstalling an identical view: the union text is derived
-        # entirely from the metadata pointer and the extent, so unchanged text
-        # means an unchanged snapshot.
-        union = self._union(extent)
+        connection.register(BUFFER_REL, tail)
+
+        # Resolving per query is §7's rule. Both halves in one call, or a
+        # commit between them pairs a new snapshot with an old boundary.
+        self._table.reload()
+        location, extent = self._table.snapshot()
+        # What is skipped is reinstalling an identical view: the union text is
+        # derived entirely from the metadata pointer and the extent, so
+        # unchanged text means an unchanged snapshot.
+        union = self._union(location, extent)
         if union != self._view:
             connection.execute(f"CREATE OR REPLACE TEMP VIEW {VIEW} AS {union}")
             self._view = union
@@ -115,8 +130,12 @@ class Reader:
 
         return _cast_to(reader, self._schema)
 
-    def _union(self, extent: tuple[int, int] | None) -> str:
-        """The hot read: the local table, plus the buffer above its extent."""
+    def _union(self, location: str, extent: tuple[int, int] | None) -> str:
+        """The hot read: the local table, plus the buffer above its extent.
+
+        `location` is passed rather than re-read, so the snapshot scanned and
+        the boundary cutting the buffer are the same one.
+        """
         columns = tuple(self._schema.names)
         # Cast the buffer side explicitly rather than letting UNION ALL
         # reconcile: SQLite's per-value typing comes through loosely, and a
@@ -134,10 +153,14 @@ class Reader:
             return f"SELECT {casts} FROM {BUFFER_REL} b"
 
         projection = ", ".join(f'"{c}"' for c in columns)
-
+        # Applied here as well as pushed into SQLite. The registered tail was
+        # read against an earlier floor, so it can still hold rows this
+        # snapshot has since taken ownership of; without this they would appear
+        # in both legs.
         return (
-            f"SELECT {projection} FROM iceberg_scan('{self._table.metadata_location}')"
+            f"SELECT {projection} FROM iceberg_scan('{location}')"
             f" UNION ALL SELECT {casts} FROM {BUFFER_REL} b"
+            f' WHERE b."{OFFSET}" > {extent[1]}'
         )
 
     def _connect(self) -> duckdb.DuckDBPyConnection:

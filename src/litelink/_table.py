@@ -262,6 +262,19 @@ class LogTable:
 
             return self._extent
 
+    def snapshot(self) -> tuple[str, tuple[int, int] | None]:
+        """The metadata pointer and the extent it belongs to, read together.
+
+        Two calls could not be paired safely: a commit between them hands a
+        reader a new snapshot with an old boundary, or the reverse, and each
+        tear corrupts the union differently — one duplicates the rows in the
+        gap, the other loses them.
+        """
+        with self._lock:
+            self._refresh()
+
+            return self.metadata_location, self._extent
+
     def file_count(self) -> int:
         """How many data files the current snapshot holds.
 
