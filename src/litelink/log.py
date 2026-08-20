@@ -198,24 +198,18 @@ class Log:
         self._archive = archive
         self._reader = reader
         self._maintenance = maintenance
-        # One lock over every operation, so a maintenance thread and an append
-        # loop can share a Log. Coarse on purpose: a seal and a compaction both
-        # span several statements plus an Iceberg commit, and interleaving them
-        # would let a compaction supersede a range a seal is still writing into.
-        # The cost is that a read blocks behind a running compaction — worth
-        # revisiting when compaction gets long enough to notice.
-        self._lock = threading.RLock()
-        # A second lock, so the two things a seal touches can be released
-        # independently. `_lock` guards the buffer — appends, and the seal's
-        # claim and cleanup. `_table_lock` guards the pyiceberg handle, which a
-        # reader reloads per query (§7) and a seal mutates when it commits.
+        # Sequences Log's own multi-step mutations. It is NOT what makes the
+        # collaborators safe — each owns that: the buffer serialises its
+        # connection, `LogTable` guards its handle and caches, `Reader` guards
+        # its DuckDB connection, and the leases decide who may seal or maintain
+        # across processes, which no in-memory lock could.
         #
-        # One lock could not do this. The seal's expensive half writes Parquet
-        # and commits, and holding the buffer lock across that is exactly the
-        # stall being removed; holding nothing across the commit races a reader
-        # reloading the same object. Two locks let an append proceed throughout
-        # while a read waits only for the commit itself.
-        self._table_lock = threading.RLock()
+        # There used to be a second lock here, held across a whole maintenance
+        # pass and taken by every read, on the theory that a compaction and a
+        # seal must not interleave. They must not, and the lease is what says
+        # so; the lock only added the cost. Measured: one read waited 21.5 s
+        # behind a compaction of 540 files.
+        self._lock = threading.RLock()
 
         # Who may seal, and who may maintain. Durable rather than in-memory,
         # because the answer has to survive the process asking (§13.6): a
@@ -533,8 +527,10 @@ class Log:
             msg = "archive reads are not implemented"
             raise NotImplementedError(msg)
 
-        with self._table_lock:
-            return self._reader.query(query)
+        # No lock here. `Reader` guards its own connection and `LogTable` its
+        # own cache, both briefly — whereas this used to be the SAME lock a
+        # whole maintenance pass held, so a read waited out a compaction.
+        return self._reader.query(query)
 
     def end_offset(self) -> int:
         """The offset the next append will receive — an EXCLUSIVE upper bound.
@@ -573,17 +569,15 @@ class Log:
         From the manifests, which track a count per file, so this costs nothing
         beyond the snapshot read the boundary already needs.
         """
-        with self._table_lock:
-            self._table.reload()
+        self._table.reload()
 
-            return self._table.record_count()
+        return self._table.record_count()
 
     def table_files(self) -> int:
         """Data files in the local table — what compaction is bringing down."""
-        with self._table_lock:
-            self._table.reload()
+        self._table.reload()
 
-            return self._table.file_count()
+        return self._table.file_count()
 
     def table_extent(self) -> tuple[int, int] | None:
         """`(lo, hi)` offset extent of the local table, from statistics.
@@ -591,10 +585,9 @@ class Log:
         §7's tier boundary. Read from manifest column statistics — no data file
         is opened, which is what makes it ~0.6 ms rather than a scan.
         """
-        with self._table_lock:
-            self._table.reload()
+        self._table.reload()
 
-            return self._table.extent()
+        return self._table.extent()
 
     # -- seal --------------------------------------------------------------
 
@@ -746,8 +739,7 @@ class Log:
         pq.write_table(rows, dest)
         fsync(dest)
 
-        with self._table_lock:
-            self._table.register(str(dest))
+        self._table.register(str(dest))
 
     def seal_due(self) -> int | None:
         """Seal everything the policy says is ready. Returns the last end, or None.
@@ -883,30 +875,37 @@ class Log:
         is open — §11 treats stalled eviction as an operational condition, and
         returning None says nothing about it.
         """
-        with self._table_lock:
-            self._writable()
-            if self._archive is not None:
-                # I4 needs sync's registration watermark to decide what is safe
-                # to evict, and sync does not exist yet. Refusing beats evicting
-                # a file no archive has — that failure is silent and permanent.
-                msg = (
-                    "maintain() with an archive configured requires sync(), "
-                    "which is not implemented"
-                )
-                raise NotImplementedError(msg)
+        self._writable()
+        if self._archive is not None:
+            # I4 needs sync's registration watermark to decide what is safe
+            # to evict, and sync does not exist yet. Refusing beats evicting
+            # a file no archive has — that failure is silent and permanent.
+            msg = (
+                "maintain() with an archive configured requires sync(), "
+                "which is not implemented"
+            )
+            raise NotImplementedError(msg)
 
-            # Taken after the refusals above, so a rejected call does not leave
-            # a lease behind for its TTL and lock out the process that could
-            # have done the work.
-            lease = self._lease(MAINTAIN_ROLE)
-            if not lease.acquire():
-                msg = "another owner holds the maintenance lease"
-                raise RuntimeError(msg)
+        # The lease is the exclusion, and it is the only one this needs. There
+        # is no lock around the pass any more: a compaction reads every file it
+        # merges and writes a new one, and holding a lock that reads also take
+        # made one read wait 21.5 s. `LogTable` guards its handle and caches
+        # for the moment each is touched, and `_commit` retries a branch that
+        # moved underneath it, which is what cross-process safety rests on
+        # anyway — a lock could never have provided it.
+        #
+        # Taken after the refusals above, so a rejected call does not leave
+        # a lease behind for its TTL and lock out the process that could
+        # have done the work.
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
 
-            try:
-                self._maintenance.run()
-            finally:
-                lease.release()
+        try:
+            self._maintenance.run()
+        finally:
+            lease.release()
 
         # Sealing IS maintenance — it is the first thing done with what the
         # writer leaves behind. Called here so that a caller running only this

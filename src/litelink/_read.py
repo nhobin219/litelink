@@ -7,6 +7,7 @@ its planning happens in Python and costs ~100 ms per scan, paid on every query.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -41,6 +42,13 @@ class Reader:
         self._buffer = buffer
         self._schema = schema
         self._connection: duckdb.DuckDBPyConnection | None = None
+        # This reader's own, guarding the DuckDB connection and the view built
+        # on it. Its own rather than the Log's, because a query must not wait
+        # behind a maintenance pass — one waited 21.5 s behind a compaction
+        # when the two shared a lock. Reads still serialise against each other:
+        # `register` below is connection-global, so two concurrent scans on one
+        # connection would swap each other's buffer leg.
+        self._lock = threading.Lock()
         # The view text last installed. Rebuilding it costs a DuckDB statement
         # per query, and it can only change when the snapshot does.
         self._view: str | None = None
@@ -53,6 +61,10 @@ class Reader:
         commit writes a new metadata JSON, so a reader holding the snapshot it
         opened with reports an empty log after the writer's first seal.
         """
+        with self._lock:
+            return self._query(sql)
+
+    def _query(self, sql: str) -> pa.RecordBatchReader:
         self._table.reload()
         connection = self._connect()
         extent = self._table.extent()
