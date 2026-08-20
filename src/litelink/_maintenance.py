@@ -201,6 +201,9 @@ class Maintenance:
         # may still be live. Filtering here rather than leaning on the drain's
         # veto keeps permanently-referenced paths out of the queue, which would
         # otherwise accumulate rows that can never be retired.
+        # Same reason as `drain`'s veto: a stale handle under-reports what is
+        # still referenced, and this decides what may be queued for deletion.
+        self._table.reload()
         self._enqueue(doomed - self._table.referenced_paths())
         self.drain()
 
@@ -221,6 +224,11 @@ class Maintenance:
         if not due:
             return
 
+        # Reloaded first. This veto is the last thing standing between the
+        # deletion queue and an unrecoverable mistake, and asked of a handle
+        # that predates another process's commit it reports a live file as
+        # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
+        self._table.reload()
         referenced = self._table.referenced_paths()
         for rel_path in due:
             path = self._layout.absolute(rel_path)

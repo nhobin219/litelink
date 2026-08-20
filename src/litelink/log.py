@@ -432,10 +432,24 @@ class Log:
                 )
                 raise ValueError(msg)
 
-            self._table.set_sort_order(requested)
-            self._sort_by = requested
-            self._maintenance.set_sort_by(requested)
-            self._maintenance.rewrite_sorted()
+            # Under the maintain lease, because a rewrite IS a compaction —
+            # same claim record, same deterministic output path, same commit.
+            # Without it this reached that path beside a running `maintain()`
+            # in another process: two writers to one `compaction_path`, and a
+            # single-row `compacting` intent each would clear from under the
+            # other, leaving a half-written file nothing could name.
+            lease = self._lease(MAINTAIN_ROLE)
+            if not lease.acquire():
+                msg = "another owner holds the maintenance lease"
+                raise RuntimeError(msg)
+
+            try:
+                self._table.set_sort_order(requested)
+                self._sort_by = requested
+                self._maintenance.set_sort_by(requested)
+                self._maintenance.rewrite_sorted()
+            finally:
+                lease.release()
 
     def _lease(self, role: str) -> Lease:
         """A fresh claim on `role` for this attempt.
@@ -912,6 +926,13 @@ class Log:
         pending = self._buffer.pending_compaction()
         if pending is None:
             return
+
+        # Reloaded for the same reason `_recover_seal` is, and the consequence
+        # here is worse: this UNLINKS. A handle that predates another process's
+        # commit reports the output missing, and removing a file the table now
+        # references loses the rows outright — the sources it superseded are
+        # already out of the snapshot and queued for deletion.
+        self._table.reload()
 
         _, _, rel_path = pending
         if str(self._layout.absolute(rel_path)) not in self._table.file_paths():
