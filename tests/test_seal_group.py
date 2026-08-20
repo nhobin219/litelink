@@ -225,7 +225,7 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
 
         assert group is not None
         start, end = group
-        path = log._layout.seal_path(start, end, _today())
+        path = log._layout.seal_path(start, end, _today(), "tok")
         log._buffer.claim_seal(start, end, path)
         log._write_and_commit(end, path)
 
@@ -413,3 +413,44 @@ def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> No
         check = log._buffer._con.execute("PRAGMA integrity_check").fetchall()
 
         assert check == [("ok",)], f"buffer database damaged: {check}"
+
+
+def test_a_retried_seal_takes_a_new_name_and_queues_the_old(tmp_path: Path) -> None:
+    """Two owners must never write one path, and neither may go untracked.
+
+    A seal's name was once derived from its range alone, so a writer stalled
+    past its lease and the owner that took over both wrote the same file —
+    `pq.write_table` truncates on open, so it became a blend of two writers
+    with one of them committing it. Recovery reads the name back from
+    `sealing` rather than recomputing it, so determinism bought nothing.
+
+    Unique names alone would trade a torn file for one this database cannot
+    name. The abandoned attempt is queued for deletion BEFORE the claim is
+    replaced, which is what keeps every file on disk reachable from SQLite.
+    """
+    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(50))
+        log._buffer.close_open_group()
+        group = log._buffer.pending_group()
+
+        assert group is not None
+        start, end = group
+
+        # An attempt that claimed a name and never committed.
+        abandoned = log._layout.seal_path(start, end, _today(), "stalled")
+        log._buffer.claim_seal(start, end, abandoned)
+        log._layout.absolute(abandoned).parent.mkdir(parents=True, exist_ok=True)
+        log._layout.absolute(abandoned).write_bytes(b"half a parquet file")
+
+        assert log.seal_due() == end
+
+        claimed = [f.path for f in log._table.data_files()]
+
+        assert len(claimed) == 1
+        assert not claimed[0].endswith("stalled.parquet"), (
+            "the retry reused the stalled attempt's name"
+        )
+        assert abandoned in log._buffer.queued_deletions(), (
+            "the abandoned file is on disk and reachable from nothing"
+        )

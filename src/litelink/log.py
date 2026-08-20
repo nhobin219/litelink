@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -742,7 +743,9 @@ class Log:
 
             return end
 
-        rel_path = self._layout.seal_path(start, end, datetime.now(UTC).date())
+        rel_path = self._layout.seal_path(
+            start, end, datetime.now(UTC).date(), uuid.uuid4().hex[:8]
+        )
         # I2: the range and its path are fixed BEFORE the file exists, so a
         # retry recomputes nothing and overwrites in place rather than
         # stranding the first attempt under a different name.
@@ -907,10 +910,28 @@ class Log:
 
         self._table.reload()
 
-        _, end, rel_path = pending
-        if str(self._layout.absolute(rel_path)) not in self._table.file_paths():
-            self._write_and_commit(end, rel_path)
+        start, end, rel_path = pending
+        if str(self._layout.absolute(rel_path)) in self._table.file_paths():
+            self._buffer.finish_seal(end)
 
+            return
+
+        # Not committed, so it has to be written — but NOT to the name the last
+        # attempt chose. That attempt may still be running: a writer stalled
+        # past its lease is indistinguishable from one that died, and
+        # `pq.write_table` truncates on open, so sharing the name blends two
+        # writers into one file and commits it.
+        #
+        # The abandoned name goes on the deletion queue BEFORE the claim is
+        # replaced. That ordering is the whole of it: a unique name with no
+        # queue entry is a file this database can no longer name, which is the
+        # one thing §12 refuses — worse than the collision it fixes.
+        self._buffer.enqueue_deletions([rel_path], int(datetime.now(UTC).timestamp()))
+        retry = self._layout.seal_path(
+            start, end, datetime.now(UTC).date(), uuid.uuid4().hex[:8]
+        )
+        self._buffer.claim_seal(start, end, retry)
+        self._write_and_commit(end, retry)
         self._buffer.finish_seal(end)
 
     def _recover_compaction(self) -> None:

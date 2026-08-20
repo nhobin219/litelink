@@ -130,7 +130,9 @@ def test_recovery_leaves_another_owners_seal_alone(tmp_path: Path) -> None:
 
     holder = open_log(tmp_path)
     holder.extend(rows(4))
-    path = holder._layout.seal_path(1, 5, datetime.datetime.now(datetime.UTC).date())
+    path = holder._layout.seal_path(
+        1, 5, datetime.datetime.now(datetime.UTC).date(), "tok"
+    )
     holder._buffer.claim_seal(1, 5, path)
 
     # Someone else holds the seal role and is still working. Taken on the
@@ -298,7 +300,7 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
         group = log._buffer.pending_group()
         assert group is not None
         start, end = group
-        path = log._layout.seal_path(start, end, dt.datetime.now(dt.UTC).date())
+        path = log._layout.seal_path(start, end, dt.datetime.now(dt.UTC).date(), "tok")
         log._buffer.claim_seal(start, end, path)
         log._write_and_commit(end, path)
 

@@ -318,16 +318,20 @@ out a **different thread each call**. That is why the buffer opens its connectio
 affinity would make the library unusable from asyncio, which is where a websocket feed
 lives.
 
-**One residual race, stated rather than hidden.** A seal writes its Parquet file to a
-path fixed before the file exists (I2), so a replay writes the same name. The lease is
-renewed either side of that write and a lost lease aborts the seal, which leaves one
-window: a `pq.write_table` that outlasts the whole 30 s TTL while another owner takes the
-role and writes the same path. The usual fix — stage to a unique temporary name and
-rename — is refused here, because a crash between writing and renaming would leave a file
-on disk that SQLite cannot name, and every reclamation path in this design depends on
-never needing a directory scan to find one. A single group is one `target_size` file; a
-write that takes 30 s means the machine is in trouble, and the seal stopping is the right
-answer then too.
+**Every write attempt gets its own name.** A seal's path once came from its range alone,
+on the reasoning that a retry should overwrite in place and strand nothing. Recovery
+never recomputes it — it reads the name back from `sealing` — so determinism bought
+nothing, and it cost the thing it appeared to prevent: a writer stalled past its lease
+and the owner that took the role over both wrote that one name, and `pq.write_table`
+truncates on open, so the file became a blend of two writers with one of them committing
+it.
+
+Unique names on their own would trade a torn file for a worse thing: one this database
+cannot name. So they come with a rule — **the abandoned attempt is queued in
+`pending_delete` before its claim is replaced.** That ordering is the whole of it. Every
+file on disk stays reachable from SQLite, a stalled writer's output becomes an ordinary
+tracked orphan, and no reclamation path ever needs a directory scan. Compaction outputs
+carry a per-attempt token for the same reason.
 
 **Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
 {`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
