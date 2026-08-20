@@ -60,6 +60,29 @@ class Layout:
         return f"file://{self.root}"
 
     @property
+    def archive_db(self) -> Path:
+        """The archive catalog, kept beside the local one (§2).
+
+        A local SQLite file describing a warehouse on object storage. §2
+        replicates this file to S3 as well, so another machine can attach to
+        the archive without this one; that replication is not built yet.
+        """
+        return self.root / "archive.db"
+
+    @property
+    def archive_catalog_uri(self) -> str:
+        return f"sqlite:///{self.archive_db}"
+
+    def archive_key(self, rel_path: str) -> str:
+        """Where a local file lands in the archive prefix.
+
+        The same root-relative name under the archive's prefix, so a file's
+        identity is its offset range in both tiers and neither has to translate
+        the other's paths.
+        """
+        return rel_path
+
+    @property
     def table_id(self) -> str:
         return f"{NAMESPACE}.{self.name}"
 

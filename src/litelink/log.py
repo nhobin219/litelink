@@ -32,8 +32,9 @@ from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._lease import Lease, new_owner
-from litelink._maintenance import Maintenance
+from litelink._maintenance import Maintenance, checkpoint
 from litelink._read import Reader, duckdb_connection
+from litelink._s3 import S3Options
 from litelink._table import LogTable
 from litelink._types import validate_schema
 
@@ -185,6 +186,7 @@ class Log:
         sort_by: tuple[str, ...],
         config: LogConfig,
         archive: str | None = None,
+        s3: S3Options | None = None,
         readonly: bool = False,
     ) -> None:
         self.name = layout.name
@@ -198,6 +200,9 @@ class Log:
         self._schema = schema
         self._sort_by = sort_by
         self._archive = archive
+        self._s3 = s3 or S3Options()
+        # Opened on first sync, not at construction — see `_archive_table`.
+        self._archive_handle: LogTable | None = None
         self._reader = reader
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
@@ -239,6 +244,7 @@ class Log:
         sort_by: Sequence[str],
         config: LogConfig | None = None,
         archive: str | None = None,
+        s3: S3Options | None = None,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
 
@@ -298,11 +304,12 @@ class Log:
             reader=Reader(
                 layout, table, buffer, table_schema(schema), duckdb_connection
             ),
-            maintenance=Maintenance(table, buffer, layout, settings, order),
+            maintenance=Maintenance(table, buffer, layout, settings, order, archive),
             schema=schema,
             sort_by=order,
             config=settings,
             archive=archive,
+            s3=s3,
         )
 
     @classmethod
@@ -312,6 +319,7 @@ class Log:
         name: str,
         *,
         read_only: bool = False,
+        s3: S3Options | None = None,
     ) -> Self:
         """Open an existing log, and recover it.
 
@@ -356,6 +364,10 @@ class Log:
             readonly=read_only,
         )
         sort_by = table.sort_by()
+        # `or None`: detaching stores an empty string rather than deleting the
+        # row, and an empty archive is no archive. Read once here because both
+        # the Log and its maintainer need it.
+        archive = buffer.get_meta(_ARCHIVE_KEY) or None
         log = cls(
             layout=layout,
             table=table,
@@ -363,14 +375,12 @@ class Log:
             reader=Reader(
                 layout, table, buffer, table_schema(schema), duckdb_connection
             ),
-            maintenance=Maintenance(table, buffer, layout, config, sort_by),
+            maintenance=Maintenance(table, buffer, layout, config, sort_by, archive),
             schema=schema,
             sort_by=sort_by,
             config=config,
-            # `or None`: detaching stores an empty string rather than deleting
-            # the row, and an empty archive is no archive. Without this it reads
-            # back truthy enough to make maintain() refuse to run.
-            archive=buffer.get_meta(_ARCHIVE_KEY) or None,
+            archive=archive,
+            s3=s3,
             readonly=read_only,
         )
         if not read_only:
@@ -405,6 +415,11 @@ class Log:
             validate(self._schema, self._sort_by, self.config, archive)
             self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
             self._archive = archive or None
+            # The maintainer too. `evict` reads this to decide whether I4 is
+            # owed anything, and a setting that stopped at `Log` would leave it
+            # deleting the only copy of rows an archive was just configured to
+            # receive. Same fan-out `target_size` needed.
+            self._maintenance.set_archive(self._archive)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.
@@ -987,11 +1002,25 @@ class Log:
     # -- maintenance -------------------------------------------------------
 
     def sync(self) -> None:
-        """Push to the archive: upload, register, replicate compactions (§5).
+        """Push to the archive: upload, register, record the watermark (§5).
 
         Archive-facing work only. Lazy, restartable, and arbitrarily far
-        behind — no read depends on it. Raises if no archive is configured; with
-        `archive=None` there is nothing this could do.
+        behind — no read depends on it. Raises if no archive is configured;
+        with `archive=None` there is nothing this could do.
+
+        **Only files at or above the compaction threshold are pushed**, and
+        that one rule does three jobs. The archive never receives an undersized
+        file, so nothing ever has to merge one back out of object storage —
+        which would mean paying egress to fix a sizing decision made locally.
+        Such a file is also never a compaction input (`compact` only builds
+        runs from files BELOW the threshold), so nothing merges across what the
+        archive already holds, and no push can duplicate or strand a range.
+        And the undersized frontier stays local, bounded by roughly
+        `compact_min_files` files, until compaction grows it past the line.
+
+        There is therefore at most one undersized region in the system and it
+        is always the local one. The archive is well-sized by construction
+        rather than by a pass that repairs it afterwards.
 
         DEVIATES from §5, which also lists snapshot expiry (step 4) and local
         eviction (step 5). Both are local storage work and belong to `maintain`;
@@ -1000,7 +1029,67 @@ class Log:
         skipped. Sync's remaining obligation to eviction is the registration
         watermark it records in `meta`, which is what lets `maintain` enforce I4.
         """
-        raise NotImplementedError
+        self._writable()
+        if self._archive is None:
+            msg = "sync() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            self._push(lease)
+        finally:
+            lease.release()
+
+    def _archive_table(self) -> LogTable:
+        """The remote table, opened on first use and kept.
+
+        Built lazily and cached: creating it costs a round trip to object
+        storage, which a log that never syncs should not pay, and rebuilding it
+        per pass would pay it every time.
+        """
+        if self._archive_handle is None:
+            if self._archive is None:
+                msg = "no archive configured"
+                raise ValueError(msg)
+
+            self._archive_handle = LogTable.open_archive(
+                self._layout, self._archive, self._s3, table_schema(self._schema)
+            )
+
+        return self._archive_handle
+
+    def _push(self, lease: Lease) -> None:
+        """Upload and register everything above the archive's extent."""
+        archive = self._archive_table()
+        self._table.reload()
+
+        covered = archive.extent()
+        floor = 0 if covered is None else covered[1]
+        threshold = self.config.compact_below or self.config.target_size // 2
+
+        for data_file in self._table.data_files():
+            if data_file.hi <= floor:
+                continue
+
+            if data_file.size < threshold:
+                # The frontier. Everything above it is newer, so stopping here
+                # keeps the archive a contiguous prefix — which is what lets a
+                # single watermark stand for "what the archive holds" and what
+                # I4 is stated in terms of.
+                break
+
+            checkpoint(lease.renew)
+            rel_path = self._layout.relative(data_file.path)
+            archive.put(self._layout.absolute(rel_path), rel_path)
+            archive.register(archive.uri(rel_path), sealed_through=data_file.hi + 1)
+            # After the register, never before: the watermark is a promise that
+            # the archive HAS the range, and I4 lets `maintain` delete the local
+            # copy on the strength of it.
+            self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(data_file.hi))
 
     def maintain(self) -> None:
         """Reclaim local storage: compact, evict, expire (§6, §8, §12).
@@ -1024,15 +1113,6 @@ class Log:
         returning None says nothing about it.
         """
         self._writable()
-        if self._archive is not None:
-            # I4 needs sync's registration watermark to decide what is safe
-            # to evict, and sync does not exist yet. Refusing beats evicting
-            # a file no archive has — that failure is silent and permanent.
-            msg = (
-                "maintain() with an archive configured requires sync(), "
-                "which is not implemented"
-            )
-            raise NotImplementedError(msg)
 
         # The lease is the exclusion, and it is the only one this needs. There
         # is no lock around the pass any more: a compaction reads every file it

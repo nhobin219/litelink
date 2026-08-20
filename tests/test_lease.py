@@ -167,8 +167,10 @@ def test_a_rejected_maintain_does_not_strand_the_lease(tmp_path: Path) -> None:
     log = Log.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), archive="s3://bucket/x"
     )
-    with pytest.raises(NotImplementedError):
-        log.maintain()
+    # sync() refuses without credentials reaching a real endpoint; what matters
+    # is that a refusal hands the lease back rather than holding it for its TTL.
+    with pytest.raises(Exception):  # noqa: B017, PT011 - any refusal will do
+        log.sync()
 
     other = Lease(log._buffer._con, log._buffer._lock, "maintain", new_owner())
 

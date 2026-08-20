@@ -18,10 +18,12 @@ from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
 
 from litelink._predicates import offset_at_or_below, offset_between
+from litelink._s3 import S3Options
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from datetime import datetime
+    from pathlib import Path
 
     import pyarrow as pa
     from pyiceberg.table import Table
@@ -79,7 +81,13 @@ class LogTable:
     silently serves a stale snapshot.
     """
 
-    def __init__(self, catalog: SqlCatalog, layout: Layout, table: Table) -> None:
+    def __init__(
+        self,
+        catalog: SqlCatalog,
+        layout: Layout,
+        table: Table,
+        warehouse: str | None = None,
+    ) -> None:
         """Take the loaded table. `create` and `load` are what load it.
 
         Assigning only, so that a caller holding a `Table` from anywhere — a
@@ -98,6 +106,9 @@ class LogTable:
         # snapshot the NEXT caller sees.
         self._lock = threading.RLock()
         self._table = table
+        # Where this table's files live. The local one derives it from the
+        # layout; the archive is told, because its prefix is the caller's.
+        self._warehouse = warehouse or layout.warehouse_uri
         # Snapshot-derived facts, cached against the metadata pointer. See
         # `extent`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
@@ -148,6 +159,35 @@ class LogTable:
         return SqlCatalog(
             "local", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
         )
+
+    @classmethod
+    def open_archive(
+        cls, layout: Layout, prefix: str, options: S3Options, schema: pa.Schema
+    ) -> LogTable:
+        """The remote table, created on first use (§5).
+
+        Its catalog is a SQLite file beside the local one and its warehouse is
+        the object-store prefix — §2's two-catalog shape. Created lazily rather
+        than at `Log.new`, because a log may be configured with an archive long
+        before anything is pushed to it and creating a remote table costs a
+        round trip a local-only run should never pay.
+
+        The schema is the local table's, so the two cannot drift: one declared
+        shape, and the archive is the same rows later.
+        """
+        catalog = SqlCatalog(
+            "archive",
+            uri=layout.archive_catalog_uri,
+            warehouse=prefix,
+            **options.resolved().catalog_properties(),
+        )
+        catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
+        if not catalog.table_exists(layout.table_id):
+            catalog.create_table(
+                layout.table_id, schema=schema, properties=METADATA_PROPERTIES
+            )
+
+        return cls(catalog, layout, catalog.load_table(layout.table_id), prefix)
 
     def exists(self) -> bool:
         return True
@@ -476,6 +516,30 @@ class LogTable:
                 self.reload()
 
                 return
+
+    def uri(self, rel_path: str) -> str:
+        """Where a root-relative file lives in this table's warehouse."""
+        return f"{self._warehouse.rstrip('/')}/{rel_path}"
+
+    def put(self, source: Path, rel_path: str) -> None:
+        """Upload a local file into this table's warehouse (§5 step 1).
+
+        Through pyiceberg's own FileIO rather than a second S3 client, so the
+        credentials and endpoint that reach the archive are the ones the
+        catalog was built with — one place to configure, and no way for an
+        upload to land somewhere the table cannot then read.
+
+        Overwrites. The name carries a per-attempt token, so a repeat is the
+        same sync replaying the same file, and finishing it is what makes the
+        pass restartable.
+        """
+        destination = self.uri(rel_path)
+        with source.open("rb") as reading:
+            payload = reading.read()
+
+        output = self._table.io.new_output(destination)
+        with output.create(overwrite=True) as writing:
+            writing.write(payload)
 
     def register(self, path: str, sealed_through: int | None = None) -> bool:
         """Add an already-written file to the table (§4 step 2).

@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
-import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
 from litelink.log import Log, LogConfig
@@ -126,19 +125,45 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
         assert len(read_all(log)) == 12
 
 
-def test_maintain_refuses_when_an_archive_is_configured(tmp_path: Path) -> None:
-    """I4 needs sync's registration watermark, and sync does not exist yet."""
+def test_eviction_waits_for_the_archive_watermark(tmp_path: Path) -> None:
+    """I4, and the only line of `maintain` that is correctness (§5, §8).
+
+    With an archive configured the local copy stops being the only one only
+    once sync says so. `maintain` used to refuse outright rather than risk it;
+    now it clamps the eviction boundary to what sync has recorded, so a sync
+    arbitrarily far behind delays eviction instead of losing data.
+
+    No object store needed: the watermark is a `meta` row, and what is under
+    test is that eviction reads it.
+    """
+    config = LogConfig(local_retention=timedelta(0))
     log = Log.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
+        config=config,
         archive="s3://bucket/prefix",
     )
-    with pytest.raises(NotImplementedError, match="sync"):
+    try:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+
+        # Nothing archived yet: retention says evict everything, I4 says none.
         log.maintain()
 
-    log.close()
+        assert log.table_files() == before, "evicted with an empty archive"
+
+        # Sync has reached the first file only.
+        first = min(f.hi for f in log._table.data_files())
+        log._buffer.set_meta("archive_through", str(first))
+        log.maintain()
+
+        assert log.table_files() == before - 1, "did not evict what was archived"
+    finally:
+        log.close()
 
 
 def test_reads_stay_correct_across_a_compaction(tmp_path: Path) -> None:

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from litelink.log import LogConfig
 
 
-def _checkpoint(heartbeat: Callable[[], bool] | None) -> None:
+def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
     """Renew the caller's claim, or refuse to carry on without it.
 
     Losing the role mid-pass is not something to push through: another owner
@@ -55,12 +55,14 @@ class Maintenance:
         layout: Layout,
         config: LogConfig,
         sort_by: tuple[str, ...],
+        archive: str | None = None,
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
         self._config = config
         self._sort_by = sort_by
+        self._archive = archive
 
     def set_config(self, config: LogConfig) -> None:
         """Adopt new policy in place, rather than being rebuilt around it."""
@@ -68,6 +70,10 @@ class Maintenance:
 
     def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
         self._sort_by = sort_by
+
+    def set_archive(self, archive: str | None) -> None:
+        """Adopt a changed archive in place, like the config above it."""
+        self._archive = archive
 
     def run(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """The three passes, with a checkpoint between them.
@@ -85,13 +91,28 @@ class Maintenance:
         to check more often.
         """
         self.compact(heartbeat)
-        _checkpoint(heartbeat)
+        checkpoint(heartbeat)
         self.evict()
-        _checkpoint(heartbeat)
+        checkpoint(heartbeat)
         self.expire()
-        _checkpoint(heartbeat)
+        checkpoint(heartbeat)
 
     # -- compaction ---------------------------------------------------------
+
+    ARCHIVED_KEY = "archive_through"
+
+    def archived_through(self) -> int:
+        """Highest offset the archive is known to hold, 0 if none (§5, I4).
+
+        One number rather than a set, because data files cover contiguous
+        non-overlapping ranges and sync pushes them in offset order: what the
+        archive has is always a prefix. It is the watermark I4 is stated in
+        terms of — "never evict a file the archive still lacks" — and the
+        record sync leaves for `evict` to read.
+        """
+        recorded = self._buffer.get_meta(self.ARCHIVED_KEY)
+
+        return 0 if recorded is None else int(recorded)
 
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Merge runs of undersized adjacent files (§6).
@@ -112,6 +133,14 @@ class Maintenance:
         # FRESH table, committing evicted data back into the log.
         self._table.reload()
 
+        # Never merge what the archive already has. Marking compaction output
+        # archivable is not enough on its own: an output can still fall under
+        # `compact_below` and be merged again, and a merge spanning the archive
+        # watermark either duplicates the rows already pushed or strands the
+        # ones above them. Skipping archived files makes that unreachable —
+        # they are simply never inputs.
+        archived = self.archived_through()
+
         threshold = self._config.compact_below or self._config.target_size // 2
 
         run: list[DataFile] = []
@@ -119,6 +148,17 @@ class Maintenance:
             # Adjacency is in offset order, so a large file between two small
             # ones ends the run — merging across it would pull an already-sized
             # file through the rewrite for nothing.
+            if data_file is not None and data_file.hi <= archived:
+                # Below the watermark and therefore final. Ends any run in
+                # progress rather than joining it, exactly as an oversized file
+                # does — adjacency is in offset order, so a run cannot reach
+                # past this one.
+                if len(run) >= self._config.compact_min_files:
+                    self._compact_run(run, heartbeat)
+
+                run = []
+                continue
+
             if data_file is not None and data_file.size < threshold:
                 run.append(data_file)
                 continue
@@ -169,7 +209,7 @@ class Maintenance:
         # another owner recover — unlinking the output this claimed — and the
         # commit would then land anyway, leaving the table pointing at a file
         # that no longer exists while the sources it superseded drain away.
-        _checkpoint(heartbeat)
+        checkpoint(heartbeat)
 
         # Queued BEFORE the commit that supersedes them, not after. A crash in
         # between used to lose the only record of these paths — recovery clears
@@ -201,7 +241,7 @@ class Maintenance:
         # because a pass here has no phases to sit between.
         for data_file in self._table.data_files():
             self._compact_run([data_file])
-            _checkpoint(heartbeat)
+            checkpoint(heartbeat)
 
     # -- eviction -----------------------------------------------------------
 
@@ -235,6 +275,21 @@ class Maintenance:
         # Files cover contiguous non-overlapping ranges, so evicting a prefix is
         # a single upper bound. Anything newer is untouched.
         boundary = max(f.hi for f in stale)
+        # I4, and the only line in this pass that is correctness rather than
+        # housekeeping: a file the archive still lacks must not leave the local
+        # table, because with an archive configured the local copy is not the
+        # only one only once sync says so. Clamped rather than skipped, so a
+        # sync that is arbitrarily far behind delays eviction instead of
+        # stopping it — §5's "lazy, restartable" applies here too.
+        #
+        # With no archive there is no watermark and none is owed: §8 says
+        # `local_retention` is then a deletion policy over the only copy, which
+        # is the contract the operator asked for.
+        if self._archive is not None:
+            boundary = min(boundary, self.archived_through())
+            if boundary <= 0:
+                return
+
         # Everything the boundary REMOVES, not just what looked old enough to
         # trigger it. A compaction output has a fresh snapshot age, so it never
         # appears in `stale` — but its offsets can sit below a stale file's
