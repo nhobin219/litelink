@@ -967,7 +967,21 @@ The consequence worth planning for is that local disk holds roughly
    buffer rows. But only step 3 writes the buffer, and it is explicitly garbage collection
    rather than correctness; the expensive step *reads*, which WAL permits alongside a writer.
 
-   Options, none chosen:
+   **A lease per resource is built**, and the seal is the operation that uses it. `sealing`
+   belongs to whoever holds the `seal` role and `compacting` to whoever holds `maintain`, so
+   recovery replays only what it owns — which is the hazard above, resolved.
+
+   Nothing configures where the sealer runs. A writer with `background_seal` on starts a
+   thread, that thread calls `seal()`, and if another process holds the role the call is
+   refused and returns. Adding a sealer process therefore needs no change to the writer, and
+   if it dies its lease lapses and the writer takes the role back. `background_seal=False`
+   only avoids starting a thread that would lose.
+
+   In-process exclusion is still a flag under a lock, because a lease re-entered by its own
+   owner succeeds — a retry needs that. Neither substitutes for the other: the flag says
+   nothing about another process, and the lease says nothing about another thread.
+
+   The remaining options, none chosen:
 
    - **Leave it in-process and seal on a background thread.** Avoids every open item above —
      no leases, no recovery-ownership question, no signalling — because there is still one

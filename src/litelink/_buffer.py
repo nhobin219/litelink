@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from pathlib import Path
 
+from litelink._lease import DEFAULT_TTL_MS, Lease
 from litelink._types import column_type
 
 
@@ -129,6 +130,14 @@ class Buffer:
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
+        # Who owns which operation, across processes (§13.6). A Python lock
+        # cannot say anything about a process that is no longer running, and
+        # recovery has to know whether an interrupted operation was ours.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS lease (
+              role TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL
+            )
+        """)
 
     # -- size accounting --------------------------------------------------
     #
@@ -317,6 +326,21 @@ class Buffer:
         )
 
         return loose.cast(schema)
+
+    def lease(self, role: str, owner: str, ttl_ms: int = DEFAULT_TTL_MS) -> Lease:
+        """A claim on `role`, backed by this database."""
+        return Lease(self._con, role, owner, ttl_ms)
+
+    def measure(self) -> int:
+        """Buffered bytes, computed rather than remembered.
+
+        `byte_size` reads a counter this process maintains, which is right for
+        the append path and useless to any other — it neither exists there nor
+        decrements when this process seals. A sealer in its own process polls
+        this instead, paying a scan of a buffer §7 already wants small.
+        """
+        with self._lock:
+            return self._measure()
 
     # -- seal bookkeeping -------------------------------------------------
 
