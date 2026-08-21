@@ -349,6 +349,21 @@ class LogConfig:
         )
 
 
+def _repointed_mid_push() -> RuntimeError:
+    """The log was pointed at another archive while a sync was pushing.
+
+    A push can outlive its lease — a register alone measured 4.1 s against S3,
+    and retries compound it — so the re-point that races it took the lease
+    lawfully. Nothing here is corrupt; the watermark this push earned simply
+    describes an archive the log has left, and recording it would tell eviction
+    (I4) that the new archive holds rows it has never been sent.
+    """
+    return RuntimeError(
+        "the archive was re-pointed while this sync was pushing; its watermark "
+        "belongs to the previous archive and is not recorded"
+    )
+
+
 class Log:
     """One append-only stream.
 
@@ -1489,6 +1504,15 @@ class Log:
         """
         archive = self._archive.require()
         self._table.reload()
+        # The ARCHIVE reloaded too, and for a stronger reason than the local
+        # table. A pyiceberg handle is a frozen snapshot view, and `Archive`
+        # caches it for the life of the process — so a second maintainer that
+        # synced, released the lease and took it back reads the extent as it
+        # was before the OTHER maintainer's register. Every other reader of
+        # this extent already reloads; this is the one place that turns it into
+        # a durable watermark, and a stale answer here retires the frontier
+        # against an archive that has since grown past it.
+        archive.reload()
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
@@ -1516,17 +1540,19 @@ class Log:
         # confirmed watermark has caught up to the extent: separately, a crash
         # between them leaves neither guarding the range, and compaction merges
         # across a boundary the archive already holds.
-        if (self._buffer.get_meta(_ARCHIVE_KEY) or None) == self._archive.uri:
-            # Guarded together, for the reason the guard exists at all:
-            # reconciling against an archive the log has been pointed away from
-            # is the loss this whole path is here to prevent.
-            confirmed = max(self._maintenance.archived_through(), floor)
-            self._buffer.set_meta_all(
-                {
-                    Maintenance.ARCHIVED_KEY: str(confirmed),
-                    Maintenance.PENDING_KEY: "0",
-                }
-            )
+        # Compared and written in one transaction, not read and then written.
+        # Reconciling against an archive the log has been pointed away from is
+        # the loss this whole path is here to prevent, and a guard that reads
+        # first only reports where the archive was.
+        confirmed = max(self._maintenance.archived_through(), floor)
+        self._buffer.set_meta_if(
+            _ARCHIVE_KEY,
+            self._archive.uri,
+            {
+                Maintenance.ARCHIVED_KEY: str(confirmed),
+                Maintenance.PENDING_KEY: "0",
+            },
+        )
 
         memory = self._maintenance.memory()
         pending = [f for f in self._table.data_files() if f.hi > floor]
@@ -1561,7 +1587,16 @@ class Log:
         # lets compaction know, after a crash between the register and its
         # confirming write, that these offsets may already be in the archive
         # and must not be merged into a file that straddles its extent.
-        self._buffer.set_meta(Maintenance.PENDING_KEY, str(last.hi))
+        if not self._buffer.set_meta_if(
+            _ARCHIVE_KEY, self._archive.uri, {Maintenance.PENDING_KEY: str(last.hi)}
+        ):
+            # Declined, so the register does not happen either. The upload
+            # already spent longer than a lease TTL against S3 more than once,
+            # which is how the log gets re-pointed underneath a push — and
+            # registering into the archive it was pointed AWAY from writes the
+            # log's rows somewhere nothing will look for them again.
+            raise _repointed_mid_push()
+
         if not archive.register(
             [archive.uri(rel_path) for _, rel_path in uploaded],
             sealed_through=last.hi + 1,
@@ -1593,14 +1628,13 @@ class Log:
         # this about to record an extent earned by a bucket the log has left.
         # Re-read rather than trusted, because nothing lowers a watermark
         # afterwards.
-        if (self._buffer.get_meta(_ARCHIVE_KEY) or None) != self._archive.uri:
-            msg = (
-                "the archive was re-pointed while this sync was pushing; its "
-                "watermark belongs to the previous archive and is not recorded"
-            )
-            raise RuntimeError(msg)
-
-        self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(last.hi))
+        # Re-read rather than trusted, and in the same transaction as the
+        # write: nothing lowers a watermark afterwards, so recording one earned
+        # by a bucket the log has left is not a mistake anything corrects.
+        if not self._buffer.set_meta_if(
+            _ARCHIVE_KEY, self._archive.uri, {Maintenance.ARCHIVED_KEY: str(last.hi)}
+        ):
+            raise _repointed_mid_push()
 
     def maintain(self) -> None:
         """Reclaim local storage: compact, evict, expire (§6, §8, §12).

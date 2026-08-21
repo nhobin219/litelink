@@ -965,3 +965,126 @@ def test_a_repoint_is_all_or_nothing(
             assert log.archived_through() == 0, (
                 "a new archive must not inherit the old one's promise"
             )
+
+
+def test_the_reconcile_reads_a_current_archive_extent(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A stale extent retires the frontier over a range the archive holds.
+
+    `sync` resolves the frontier on the strength of what the archive is
+    observed to contain, so the observation has to be current. A pyiceberg
+    handle is a frozen snapshot and `Archive` caches it for the life of the
+    process, so a maintainer that synced, released the lease and took it back
+    reads the archive as it was before another maintainer's register.
+
+    Set up at the state that makes it bite: a register that landed while the
+    watermark write after it did not. The frontier is then the only thing
+    standing between compaction and a merge straddling the archive's extent,
+    and a stale reconcile retires it while confirming nothing.
+    """
+    with archived_log(tmp_path, bucket, s3) as writer:
+        writer.extend(rows(ROWS))
+        writer.seal_due()
+        writer.sync()
+        settled = writer.archived_through()
+        assert settled > 0
+
+        with Log.open(tmp_path, "s", s3=s3) as other:
+            # `other` caches its archive handle here, at today's extent.
+            assert other.archive_files() > 0
+
+            writer.extend(rows(ROWS))
+            writer.seal_due()
+            writer.sync()
+            grown = writer.archived_through()
+            assert grown > settled
+
+            # That second push, as a crash between the register and its
+            # confirming write leaves it.
+            other._buffer.set_meta_all(
+                {
+                    Maintenance.ARCHIVED_KEY: str(settled),
+                    Maintenance.PENDING_KEY: str(grown),
+                }
+            )
+
+            other.sync()
+
+            assert other.archived_through() == grown, (
+                "the watermark must be reconciled against the archive as it is, "
+                "not as this handle last saw it"
+            )
+            assert other._maintenance.archive_frontier() == grown, (
+                "the frontier must not be retired over a range nothing confirmed"
+            )
+
+
+def test_set_meta_if_writes_only_while_the_guard_still_holds(tmp_path: Path) -> None:
+    """The guard and the write it protects are one transaction, or no guard.
+
+    `sync` re-reads which archive it is pushing to before recording a
+    watermark. Read and written separately, that check only reports where the
+    archive was — a `set_archive` landing between leaves the log pointed at the
+    NEW archive holding the OLD one's extent, which eviction believes (I4) and
+    nothing ever lowers.
+
+    What this pins is the contract, not the atomicity: the window the
+    transaction closes is between two adjacent statements, and a test that
+    tried to land inside it would be a race that usually loses. Atomicity here
+    is by construction — one `BEGIN IMMEDIATE`, per SPEC §4a.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    with log:
+        log._buffer.set_meta("archive", "s3://a/p")
+
+        assert not log._buffer.set_meta_if("archive", "s3://b/p", {"w": "9"}), (
+            "a guard that no longer holds must decline"
+        )
+        assert log._buffer.get_meta("w") is None
+
+        assert log._buffer.set_meta_if("archive", "s3://a/p", {"w": "9"})
+        assert log._buffer.get_meta("w") == "9"
+
+
+def test_a_repoint_during_a_push_forfeits_the_watermark(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A watermark earned by one archive is never recorded against another.
+
+    The push outlives its lease — a register alone measured 4.1 s against S3,
+    and retries compound it — so the `set_archive` that races it holds the
+    lease lawfully. What must not happen is the log ending up pointed at the
+    new archive while `archived_through` describes the old one: eviction acts
+    on that number (I4) and deletes local files the new archive was never sent.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        settled = log.archived_through()
+        assert settled > 0
+
+        log.extend(rows(ROWS))
+        log.seal_due()
+
+        # The re-point lands while this push is still in S3.
+        archive = log._archive.require()
+        original = archive.register
+
+        def racing(*args: object, **kwargs: object) -> bool:
+            outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
+            log._buffer.set_meta("archive", f"s3://{bucket}/elsewhere")
+            return outcome
+
+        archive.register = racing  # ty: ignore[invalid-assignment]
+        try:
+            with pytest.raises(RuntimeError, match="re-pointed"):
+                log.sync()
+
+        finally:
+            archive.register = original  # ty: ignore[invalid-assignment]
+
+        assert log._maintenance.archived_through() == settled, (
+            "an archive the log has never pushed to must not inherit a watermark"
+        )

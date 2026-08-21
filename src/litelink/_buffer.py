@@ -1110,6 +1110,42 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
+    def set_meta_if(
+        self, key: str, expected: str | None, pairs: Mapping[str, str]
+    ) -> bool:
+        """Write `pairs`, but only while `meta[key]` still reads `expected`.
+
+        Compare-and-set, in ONE write transaction, for the guards that decide
+        whether a fact still belongs to the log it was computed for. Read and
+        write as separate statements, the check is only ever a statement about
+        the past: `sync` re-reads which archive it is pushing to before
+        recording a watermark, and a `set_archive` landing between the read and
+        the write leaves the log pointed at the NEW archive holding the OLD
+        one's extent — which eviction believes (I4) and nothing ever lowers.
+
+        The lease does not close that window, because the window opens when the
+        lease has already lapsed: a push that spent longer than the TTL in S3
+        is exactly the case the guard exists for, and the re-point that races
+        it took the lease lawfully. SPEC §4a states the rule — the read of a
+        conflicting claim and the write that depends on it happen in one SQLite
+        transaction, or they are not a guard.
+
+        Returns whether the write happened, so callers can decline rather than
+        record something they no longer have the right to record.
+        """
+        with self._transaction():
+            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+            current = (row[0] if row is not None else None) or None
+            if current != (expected or None):
+                return False
+
+            self._con.executemany(
+                "INSERT INTO meta (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                list(pairs.items()),
+            )
+            return True
+
     def set_meta_all(self, pairs: Mapping[str, str]) -> None:
         """Write several `meta` values in ONE transaction.
 
