@@ -275,6 +275,24 @@ class LogTable:
         different operation and is NOT supported: this creates an empty table
         at the prefix rather than discovering what is already there.
         """
+        # Asked BEFORE the catalog is constructed, because constructing one
+        # creates its tables in `archive.db` and registering the namespace adds
+        # a row — writes, from a path that promised to make none. A reader
+        # against a never-synced archive should touch nothing at all.
+        boundary = prefix.rstrip("/") + "/"
+        if not repair:
+            try:
+                if _recorded_location(layout) is None:
+                    msg = f"no archive table at {prefix!r} yet"
+                    raise ArchiveAbsent(msg)
+            except LookupError as exc:
+                if not isinstance(exc, ArchiveAbsent):
+                    # Could not tell offline. Fall through and let pyiceberg
+                    # answer, accepting the local writes that costs.
+                    pass
+                else:
+                    raise
+
         catalog = SqlCatalog(
             ARCHIVE_CATALOG,
             uri=layout.archive_catalog_uri,
@@ -292,7 +310,6 @@ class LogTable:
         # `s3://b/one-more` as a string, so a plain `startswith` accepts a
         # SIBLING archive's entry as this one's, and the log then reads and
         # writes into the neighbour it was pointed away from.
-        boundary = prefix.rstrip("/") + "/"
         try:
             recorded = _recorded_location(layout)
         except LookupError:
