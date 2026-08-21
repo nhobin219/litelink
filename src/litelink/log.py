@@ -1313,12 +1313,10 @@ class Log:
         if pending is None:
             return
 
-        # Reloaded for the same reason `_recover_seal` is, and the consequence
-        # here is worse: this UNLINKS. A handle that predates another process's
-        # commit reports the output missing, and removing a file the table now
-        # references loses the rows outright — the sources it superseded are
-        # already out of the snapshot and queued for deletion.
-        self._table.reload()
+        # No reload. This used to decide from `file_paths()` and unlink, so it
+        # needed the freshest possible view — and still raced. It queues now,
+        # and the decision that matters is `drain`'s, which reloads at the
+        # moment it removes.
 
         # EVERY claim, not the first. An archive rewrite writes one file per
         # re-cut segment and claims each before it exists (I2), so taking one

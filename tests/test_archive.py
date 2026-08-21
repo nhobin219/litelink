@@ -18,8 +18,10 @@ import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
+from litelink._layout import Layout
 from litelink._s3 import S3Options
-from litelink.log import OFFSET
+from litelink._table import LogTable, _recorded_location
+from litelink.log import OFFSET, table_schema
 from tests.conftest import filesystem
 
 pytestmark = pytest.mark.s3
@@ -538,3 +540,45 @@ def test_a_sibling_prefix_is_not_mistaken_for_this_one(
         assert where.startswith(f"{target}/"), (
             f"a sibling prefix was mistaken for this one: {where}"
         )
+
+
+def test_a_transient_failure_does_not_replace_the_archive(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """An archive that cannot be READ is not an archive that is not there.
+
+    Opening it used to catch everything and rebuild, so a 503, a timeout or an
+    expired token was taken for "no table" — and the repair dropped the only
+    pointer to a live archive and wrote an empty one over it, while the
+    watermark went on telling eviction those rows were safe elsewhere.
+
+    Whether the entry belongs to this prefix is answered from the local catalog
+    row, offline, so a genuine mismatch is still detected without reading the
+    bucket at all. Only a failed read of OUR OWN metadata reaches here, and
+    that is an error.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        where = log.archive
+        assert where is not None
+        recorded = _recorded_location(log._layout)
+        assert recorded is not None and recorded.startswith(f"{where}/")
+
+    fs = filesystem(s3)
+    before = len(fs.find(where.removeprefix("s3://")))
+    assert before > 0
+
+    unreadable = replace(s3, access_key="wrong", secret_key="wrong")
+    with pytest.raises(Exception, match=r".+"):
+        LogTable.open_archive(
+            Layout(tmp_path, "s"), where, unreadable, table_schema(SCHEMA)
+        )
+
+    assert len(fs.find(where.removeprefix("s3://"))) == before, (
+        "an unreadable archive must not be replaced"
+    )
+    assert _recorded_location(Layout(tmp_path, "s")) == recorded, (
+        "and its catalog entry must survive"
+    )

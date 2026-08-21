@@ -7,7 +7,7 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
-import contextlib
+import sqlite3
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -16,7 +16,6 @@ from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
 from pyiceberg.exceptions import (
     CommitFailedException,
-    NoSuchTableError,
 )
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
@@ -76,6 +75,38 @@ class DataFile:
     rows: int
     lo: int
     hi: int
+
+
+def _recorded_location(layout: Layout) -> str | None:
+    """Where the archive's catalog entry says its metadata is, without a read.
+
+    Straight out of the catalog's own SQLite file, because the question — does
+    this entry belong to the prefix being opened? — has to be answerable when
+    the bucket it names is unreachable. `load_table` would fetch the metadata
+    to tell us, and that fetch is exactly the one that can fail for reasons
+    other than "there is no table".
+
+    None when there is no entry, or when the catalog's own shape is not what
+    this expects. Both mean "decide the other way", and the other way is to
+    load and let any failure surface.
+    """
+    if not layout.archive_db.exists():
+        return None
+
+    namespace, _, name = layout.table_id.rpartition(".")
+    connection = sqlite3.connect(f"file:{layout.archive_db}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT metadata_location FROM iceberg_tables"
+            " WHERE table_namespace = ? AND table_name = ?",
+            (namespace, name),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+
+    return None if row is None or row[0] is None else str(row[0])
 
 
 class LogTable:
@@ -217,66 +248,40 @@ class LogTable:
             **options.resolved().catalog_properties(),
         )
         catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
-        table = None
-        try:
-            table = catalog.load_table(layout.table_id)
-        except Exception:  # noqa: BLE001
-            # Anything: no entry at all, or one naming metadata in a bucket
-            # this process can no longer read because that archive has been
-            # retired. Both mean there is no usable table for this prefix, and
-            # both are repaired the same way.
-            table = None
 
+        # Read OFFLINE, before deciding anything. Whether the entry belongs to
+        # this prefix is answerable from the local catalog row, and asking it
+        # that way is what separates "this names another archive" from "this
+        # names ours and object storage is having a bad minute".
+        #
         # On a separator, not a bare prefix: `s3://b/one` is a prefix of
         # `s3://b/one-more` as a string, so a plain `startswith` accepts a
-        # SIBLING archive's entry as this one's — and the log then reads and
+        # SIBLING archive's entry as this one's, and the log then reads and
         # writes into the neighbour it was pointed away from.
+        recorded = _recorded_location(layout)
         boundary = prefix.rstrip("/") + "/"
-        if table is not None and not table.metadata_location.startswith(boundary):
+        if recorded is not None and not recorded.startswith(boundary):
             # Another archive's table, found by table id. The entry goes; the
             # objects do not, because detaching an archive is not deleting one.
+            # No read of the old bucket is needed to know this, which matters
+            # when the archive being left has already been taken away.
             catalog.drop_table(layout.table_id)
-            table = None
+            recorded = None
 
-        if table is None:
-            with contextlib.suppress(NoSuchTableError):
-                catalog.drop_table(layout.table_id)
-
+        if recorded is None:
             table = catalog.create_table(
                 layout.table_id, schema=schema, properties=METADATA_PROPERTIES
             )
+        else:
+            # Deliberately unguarded. Catching everything here and rebuilding
+            # meant a 503, a timeout or an expired token read as "there is no
+            # table" — and the repair then dropped the only pointer to a live
+            # archive and wrote an empty table over it, while the watermark
+            # still promised eviction that those rows were safe. A failed read
+            # of OUR OWN metadata is an error, not an absence.
+            table = catalog.load_table(layout.table_id)
 
         return cls(catalog, layout, table, prefix)
-
-    @staticmethod
-    def forget_archive(layout: Layout, options: S3Options) -> None:
-        """Drop the archive's catalog entry, keeping every object it named.
-
-        Called when a log is pointed somewhere else. `archive.db` is local and
-        keyed by table id, so without this the entry made for the previous
-        prefix survives and `open_archive` hands back a table whose metadata
-        location is still in the OLD bucket: the handle reads it, `sync`
-        registers into it, and `_push`'s reconciliation writes the old
-        watermark back over the reset that was supposed to protect the new
-        one. Measured: watermark 3,856, re-point, reset to 0, one sync — 3,856
-        again, with the new bucket holding nothing.
-
-        Drops the entry only. The objects stay where they are, because
-        detaching an archive is not deleting one, and the whole point of
-        re-pointing is usually that the old bucket is about to be retired by
-        somebody who knows what is in it.
-        """
-        # Credentials because pyiceberg resolves a table by READING its
-        # metadata, even to answer whether it exists — and that metadata is in
-        # the bucket being left behind. `NoSuchTableError` rather than a
-        # `table_exists` check for the same reason: the check is the load.
-        catalog = SqlCatalog(
-            "archive",
-            uri=layout.archive_catalog_uri,
-            **options.resolved().catalog_properties(),
-        )
-        with contextlib.suppress(NoSuchTableError):
-            catalog.drop_table(layout.table_id)
 
     def exists(self) -> bool:
         return True
