@@ -145,7 +145,13 @@ class Reader:
             return None
 
         archive.reload()
-        covered = archive.extent()
+        # Paired, not two reads. `snapshot()` exists because a pointer and an
+        # extent taken separately can come from different commits — and this
+        # handle is shared, so a concurrent `sync` advances it between them.
+        # Unpaired, the empty-extent branch below scans a NEWER archive
+        # snapshot while cutting the buffer at an OLDER extent, and every row
+        # registered in between comes back from both legs.
+        location, covered = archive.snapshot()
         if covered is None:
             return None
 
@@ -158,7 +164,7 @@ class Reader:
 
         cursor.execute(secret_sql(self._archive.s3.resolved()))
 
-        return archive.metadata_location, covered
+        return location, covered
 
     def query(self, sql: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.

@@ -13,6 +13,15 @@ What the library owns is what the config has to SAY: which files carry the
 log's state, and where they go. Both are things only the log knows, and both
 are silently wrong when written by hand — a config that omits `archive.db`
 leaves the objects in S3 intact with nothing able to say what they are.
+
+**One sidecar per ROOT, not per log.** `catalog.db` and `archive.db` live at the
+root and are shared by every log under it, so two logs each running their own
+sidecar would have two litestream instances replicating those two files — the
+one thing litestream says never to do — and, under a shared archive prefix,
+shipping them to one replica path. Only the buffer is per log. A root holding
+several logs therefore wants one config naming every buffer under it, which
+this does not generate: it describes the log it was asked about. Until it does,
+put each log in its own root, or write that config by hand.
 """
 
 from __future__ import annotations
