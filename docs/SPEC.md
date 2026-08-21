@@ -1008,6 +1008,30 @@ The consequence worth planning for is that local disk holds roughly
 
 ## 13. Open questions
 
+0. **Per-operation claims, replacing the maintenance lease.** Designed in §4a, **not
+   implemented.** Today `compact`, `evict`, `expire` and `sync` all take one `maintain`
+   lease, so they exclude each other for the whole of their work — including the seconds
+   spent reading Parquet and waiting on S3, none of which touches the catalog. §4a works
+   through what each pair actually needs and concludes that most of it is interval
+   arithmetic on immutable offsets, not mutual exclusion.
+
+   What it would take: one `claims(id, owner, expires_at, kind, lo, hi, rel_path)` table
+   subsuming `sealing` and `compacting`; every range-owning pass claiming before it works,
+   with the conflict check and the insert in one SQLite transaction; recovery reclaiming
+   expired claims rather than a role's; and the role leases dissolving into per-operation
+   liveness.
+
+   What it buys: compaction concurrent with eviction and with other compactions, and sync
+   no longer blocking compaction on network latency. What it risks: it is surgery on the
+   seal path, I2 and recovery — the three most safety-critical things here — so it wants
+   its own change rather than riding along with a feature.
+
+   The one correctness item it also fixes is in §4a: a merge that begins before the archive
+   watermark moves can include files sync has since archived, and pushing that merged file
+   adds a range PARTIALLY overlapping the archive, which `register` admits because it
+   declines only a range entirely covered. Duplicate rows on an archive read. Today the
+   shared lease prevents it; nothing else does.
+
 1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
    data naturally clustered by ingest time, so `litelink_offset` and `ingest_ts` statistics are tight
    and manifests prune without a partition spec. Partitioning by event date would be
