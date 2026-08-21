@@ -328,7 +328,9 @@ class Maintenance:
         # TARGET, so recovery knows which tier to remove it from.
         self._buffer.claim_compaction(lo, hi, self._key(target))
         self._write_merge(table, run, rel_path, target, heartbeat, upload=upload)
-        self._buffer.clear_compaction()
+        # Only this one. Another operation's claim — a rewrite that crashed
+        # before recovery ran — is not ours to retire.
+        self._buffer.clear_compaction(self._key(target))
 
     def _write_merge(
         self,
@@ -633,7 +635,11 @@ class Maintenance:
             raise RuntimeError(msg)
 
         archive.replace_range(lo, hi, [archive.uri(path) for path in written])
-        self._buffer.clear_compaction()
+        # Each of this rewrite's own claims, now that the commit names every
+        # object they described. Clearing the table wholesale would also retire
+        # claims left by an operation that crashed and has not been recovered.
+        for path in written:
+            self._buffer.clear_compaction(archive.uri(path))
 
     def _discard_scratch(self) -> None:
         """Remove the rewrite scratch database and its sidecars."""

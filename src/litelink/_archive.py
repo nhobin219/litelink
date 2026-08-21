@@ -108,6 +108,12 @@ class Archive:
         with self._lock:
             if uri != self._uri:
                 self._handle = None
+                # The catalog entry too, not only the cached handle. It lives
+                # in a local SQLite file keyed by table id, so an entry made
+                # for the previous prefix would be found again and hand back a
+                # table whose metadata is still in the old bucket — a re-point
+                # that changes nothing except what the log claims.
+                LogTable.forget_archive(self._layout, self._s3)
 
             self._uri = uri
 

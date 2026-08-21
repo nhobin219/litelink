@@ -302,7 +302,12 @@ demo-clean root="litelink-data":
     # drift apart.
     from litelink._layout import NAMESPACE
     base = archive.removeprefix('s3://').rstrip('/')
-    for suffix in (f'{NAMESPACE}/{NAME}', '_wal'):
+    # BOTH subtrees. pyiceberg puts the table metadata under
+    # {prefix}/{namespace}/{name}/, while sync uploads data files under
+    # {prefix}/{name}/ — the root-relative name they have locally. Removing
+    # only the first leaves every data object stranded, and deletes the
+    # metadata that could have named them.
+    for suffix in (f'{NAMESPACE}/{NAME}', NAME, '_wal'):
         target = f'{base}/{suffix}'
         if fs.exists(target):
             print(f'  removing s3://{target}')
