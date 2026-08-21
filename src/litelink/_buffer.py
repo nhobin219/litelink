@@ -321,6 +321,14 @@ class Buffer:
             CREATE INDEX IF NOT EXISTS extent_unsealed ON extent (group_id)
             WHERE rel_path IS NULL
         """)
+        # I4 per segment (§4a) reads the archive copies covering what the local
+        # table still holds. Without this the lookup is a scan of one row per
+        # file ever archived, which grows without limit — the local file count
+        # does not.
+        self._con.execute("""
+            CREATE INDEX IF NOT EXISTS extent_archived ON extent (start_offset)
+            WHERE rel_path IS NOT NULL
+        """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
@@ -1109,6 +1117,31 @@ class Buffer:
             row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
 
         return None if row is None else str(row[0])
+
+    def archived_ranges(self, prefix: str, floor: int) -> set[tuple[int, int]]:
+        """Offset ranges with a recorded copy under `prefix`, at or above `floor`.
+
+        I4 asked of segments rather than of a watermark (§4a). `sync` records
+        where each pushed file's copy went, so the archive's contents are
+        already durable here per file — a watermark summarising them is a
+        second copy of the same fact, and the only boundary in the log that can
+        move backwards.
+
+        Bounded by `floor` rather than by the prefix alone: the archive grows
+        without limit and this only ever asks about ranges the local table
+        still holds, which compaction bounds. The prefix match is applied in
+        Python because SQLite's `LIKE` would not use the index that `floor`
+        selects on.
+        """
+        boundary = prefix.rstrip("/") + "/"
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT start_offset, end_offset, rel_path FROM extent "
+                "WHERE start_offset >= ? AND rel_path IS NOT NULL",
+                (floor,),
+            ).fetchall()
+
+        return {(lo, hi) for lo, hi, path in rows if path.startswith(boundary)}
 
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.

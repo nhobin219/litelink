@@ -799,7 +799,7 @@ class Log:
         self._buffer.set_meta_moved(
             _ARCHIVE_KEY,
             normalised or "",
-            {Maintenance.ARCHIVED_KEY: "0", Maintenance.PENDING_KEY: "0"},
+            {Maintenance.ARCHIVED_KEY: "0"},
         )
 
         # Reaches the maintainer and the reader because all three hold this
@@ -1526,45 +1526,44 @@ class Log:
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
-        # Both watermarks reconciled against the archive itself, in ONE
-        # transaction, before anything is pushed.
+        # The watermark reconciled against the archive itself. It is a cache of
+        # what the archive holds — kept for the push floor and for display, and
+        # no longer for anything that authorises a deletion — so a commit that
+        # landed while the `meta` write after it did not would leave it behind
+        # for ever: the next pass computes `floor` from the archive, finds
+        # nothing left to push, and never revisits it.
         #
-        # The confirmed one is a cache of what the archive holds, so a commit
-        # that landed while the `meta` write after it did not would leave it
-        # behind for ever: the next pass computes `floor` from the archive,
-        # finds nothing left to push, and never revisits the number eviction
-        # depends on.
-        #
-        # The frontier is RESOLVED rather than advanced, whichever way it went.
-        # It stands in for a question — did the register land? — that the
-        # extent has just answered: reached, and it did; not reached, and it
-        # never did. Either way the guess must go, and clearing it here is what
-        # keeps it from deadlocking. Nothing but the NEXT successful push ever
-        # overwrote it, and it blocks compaction — so a register that failed
-        # where `stable_prefix` needed that very merge before anything could
-        # settle left sync waiting on a compaction the frontier forbade, while
-        # being the only thing that would clear it. Both passes returned
-        # success, for ever.
-        #
-        # One transaction because clearing the frontier is only safe once the
-        # confirmed watermark has caught up to the extent: separately, a crash
-        # between them leaves neither guarding the range, and compaction merges
-        # across a boundary the archive already holds.
         # Compared and written in one transaction, not read and then written.
         # Reconciling against an archive the log has been pointed away from is
-        # the loss this whole path is here to prevent, and a guard that reads
-        # first only reports where the archive was.
+        # the loss this path is here to prevent, and a guard that reads first
+        # only reports where the archive was.
         confirmed = max(self._maintenance.archived_through(), floor)
         self._buffer.set_meta_if(
-            _ARCHIVE_KEY,
-            pinned,
-            {
-                Maintenance.ARCHIVED_KEY: str(confirmed),
-                Maintenance.PENDING_KEY: "0",
-            },
+            _ARCHIVE_KEY, pinned, {Maintenance.ARCHIVED_KEY: str(confirmed)}
         )
 
         memory = self._maintenance.memory()
+
+        # BACKFILL, and it is what makes I4-per-segment recoverable. The row
+        # naming a file's archive copy is written after the register, so a
+        # crash between the two leaves the archive holding a range that nothing
+        # local records — and compaction, which now decides from those rows,
+        # would merge it into a file spanning the archive's extent. The next
+        # push would register a partial overlap, which `register` admits.
+        #
+        # The archive's own manifest is the truth, so recover from it rather
+        # than promising anything beforehand. Reading it costs nothing extra:
+        # `extent()` above already walked it.
+        recorded = self._buffer.archived_ranges(pinned or "", 0)
+        for held in archive.data_files():
+            if (held.lo, held.hi + 1) not in recorded:
+                self._buffer.record_file(
+                    held.path,
+                    held.lo,
+                    held.hi + 1,
+                    memory.get(held.path, self.config.compact_size),
+                )
+
         pending = [f for f in self._table.data_files() if f.hi > floor]
         settled = stable_prefix(
             pending,
@@ -1597,14 +1596,11 @@ class Log:
         # lets compaction know, after a crash between the register and its
         # confirming write, that these offsets may already be in the archive
         # and must not be merged into a file that straddles its extent.
-        if not self._buffer.set_meta_if(
-            _ARCHIVE_KEY, pinned, {Maintenance.PENDING_KEY: str(last.hi)}
-        ):
-            # Declined, so the register does not happen either. The upload
-            # already spent longer than a lease TTL against S3 more than once,
-            # which is how the log gets re-pointed underneath a push — and
-            # registering into the archive it was pointed AWAY from writes the
-            # log's rows somewhere nothing will look for them again.
+        if (self._buffer.get_meta(_ARCHIVE_KEY) or None) != pinned:
+            # The upload already spent longer than a lease TTL against S3 more
+            # than once, which is how the log gets re-pointed underneath a push
+            # — and registering into the archive it was pointed AWAY from
+            # writes the log's rows somewhere nothing will look for them again.
             raise _repointed_mid_push()
 
         if not archive.register(
@@ -1885,16 +1881,17 @@ class Log:
             # anything else, and eviction dates a file by this record — so a
             # hydrated file without one would sit undateable, treated as newly
             # written, and never leave again.
-            # KNOWN GAP, dormant: this promises above that a hydrated file
-            # "counts as full", and a file the archive never measured records
-            # zero instead — the opposite. It stays dormant because a hydrated
-            # file sits at or below `archive_frontier` and every size consumer
-            # excludes it there; the value goes live only if a watermark reset
-            # drops the frontier beneath it, which is the archive-identity seam
-            # SPEC §13 item 0 owns. Align the two when that is redesigned,
-            # rather than now, on code that redesign will rewrite.
+            # A file the archive never measured counts as FULL, matching what
+            # this promises above. Zero was the opposite, and it was dormant
+            # only while a watermark kept hydrated files out of every size
+            # consumer — removing the watermark is what wakes it: a file
+            # recorded at zero bytes is a permanent compaction candidate that
+            # merging can never make big enough to stop being one.
             self._buffer.record_file(
-                rel_path, data_file.lo, data_file.hi + 1, held.get(data_file.path, 0)
+                rel_path,
+                data_file.lo,
+                data_file.hi + 1,
+                held.get(data_file.path, self.config.compact_size),
             )
             floor = data_file.lo
 
