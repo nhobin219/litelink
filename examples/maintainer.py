@@ -227,11 +227,13 @@ def main() -> None:
     try:
         while True:
             started = time.monotonic()
+            owns = True
             try:
                 report = run()
             except RuntimeError as exc:
                 # Another owner holds the lease this role needs. Not worth
                 # dying over: it means someone else is already doing this.
+                owns = False
                 report = f"skipped: {exc}"
 
             if report is not None:
@@ -239,7 +241,15 @@ def main() -> None:
                 print(f"{label} {report}  ({elapsed:.0f} ms)", flush=True)
 
             if sidecar is not None:
-                sidecar.keep_running()
+                # Tied to the lease, not to the role. A second maintainer is
+                # refused its table work and says so — which reads as safe —
+                # while nothing stopped it starting a SECOND litestream against
+                # the same databases, the one thing litestream forbids. The
+                # process doing the archive work is the one that replicates.
+                if owns:
+                    sidecar.keep_running()
+                else:
+                    sidecar.stop()
 
             time.sleep(every)
     except (KeyboardInterrupt, SystemExit):

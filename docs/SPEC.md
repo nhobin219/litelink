@@ -228,6 +228,13 @@ yet, `catalog.db` says which files the local table is made of, and `archive.db` 
 same for the archive. Omit the last and the objects in S3 survive with nothing to say what
 they are.
 
+**One sidecar per root.** Two of those three live at the root and are shared by every log
+under it, so a sidecar per log would run two instances against the same `catalog.db` — what
+litestream forbids — and ship them to one replica path. `Log.replication_config` describes
+the log it was asked about, so a root holding several logs needs one config naming every
+buffer under it, written by hand until this generates it. One log per root avoids the
+question.
+
 Optional. Three things to be clear about:
 
 **It covers append→seal only.** Once a seal deletes buffer rows, replication faithfully

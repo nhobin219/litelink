@@ -725,15 +725,22 @@ class Log:
         with self._lock:
             self._writable()
             validate(self._schema, self._sort_by, self.config, archive)
-            self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
-            # The watermark belonged to the PREVIOUS archive, and eviction acts
-            # on it: I4 lets `maintain` delete a local file because the archive
-            # holds it. Carried across a re-point, that is a promise about a
-            # bucket this log no longer uses — eviction would then delete the
-            # only copy of rows the new archive has never been sent. Reset, so
-            # nothing may be evicted until a sync has actually pushed it.
+            # The watermark FIRST, and the order is the point. It belonged to
+            # the PREVIOUS archive, and eviction acts on it: I4 lets `maintain`
+            # delete a local file because the archive holds it. Carried across
+            # a re-point, that is a promise about a bucket this log no longer
+            # uses, and eviction deletes the only copy of rows the new archive
+            # has never been sent.
+            #
+            # These are two autocommit writes, so a crash lands between them.
+            # Resetting first, the crash leaves a log still pointing at the OLD
+            # archive with a watermark of zero — eviction simply waits for a
+            # sync, which is a delay. The other order leaves the NEW archive
+            # with the old watermark, which is the data loss itself.
             if (archive or None) != self._archive.uri:
                 self._buffer.set_meta(Maintenance.ARCHIVED_KEY, "0")
+
+            self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
 
             # Reaches the maintainer and the reader because all three hold
             # this object. `evict` asks it whether I4 is owed anything, and a

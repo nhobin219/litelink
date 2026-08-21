@@ -115,7 +115,11 @@ demo-maintain *args:
     # failed recipe.
     trap 'stop; exit 0' INT TERM
     for role in $roles; do
-        uv run python examples/maintainer.py --role "$role" {{args}} &
+        # `{{args}}` BEFORE the role, so a user-supplied `--role` cannot win:
+        # argparse takes the last, and `just demo-maintain --role all` would
+        # otherwise start four processes all in role `all` — four sidecars
+        # against one database.
+        uv run python examples/maintainer.py {{args}} --role "$role" &
         pids="$pids $!"
     done
     wait || true
@@ -290,12 +294,21 @@ demo-clean root="litelink-data":
         raise SystemExit(0)
     import s3fs
     fs = s3fs.S3FileSystem()
-    location = archive.removeprefix('s3://')
-    if fs.exists(location):
-        print(f'  removing {archive}')
-        fs.rm(location, recursive=True)
-    else:
-        print(f'  nothing at {archive}')
+    # Never the bare prefix. It is shared by every demo run and may be
+    # somewhere real (see the env template), so a recursive delete of it takes
+    # another run archived rows, or objects that were never ours. Only what
+    # this log wrote: its own warehouse subtree, and the WAL beside it. The
+    # namespace comes from the library rather than a literal, so the two cannot
+    # drift apart.
+    from litelink._layout import NAMESPACE
+    base = archive.removeprefix('s3://').rstrip('/')
+    for suffix in (f'{NAMESPACE}/{NAME}', '_wal'):
+        target = f'{base}/{suffix}'
+        if fs.exists(target):
+            print(f'  removing s3://{target}')
+            fs.rm(target, recursive=True)
+        else:
+            print(f'  nothing at s3://{target}')
     " || echo "  skipped the archive (no credentials, or nothing to remove)"
     echo "removing {{root}} ($(du -sh "{{root}}" | cut -f1))"
     rm -rf "{{root}}"

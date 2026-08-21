@@ -53,6 +53,17 @@ def main() -> None:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 
     try:
+        if log.config.wal_replication:
+            # The maintainer already runs one against these databases, and two
+            # litestream instances on one database is the thing litestream is
+            # explicit about. Refused rather than warned: the recipe's own
+            # restore walkthrough invites running this next to a live demo.
+            raise SystemExit(
+                "wal_replication is on, so `just demo-maintain` is already "
+                "replicating these databases. Run this only to replicate "
+                "independently — start the capture without --replicate first."
+            )
+
         written = log.write_replication_config()
     except ValueError as exc:
         raise SystemExit(f"{exc}\nrun the capture with --archive") from exc

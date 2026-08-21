@@ -105,7 +105,14 @@ def main() -> None:
     try:
         log = Log.open(args.root, NAME, s3=s3)
         log.set_config(config)
-        log.set_archive(args.archive)
+        # Only when one was actually asked for. Unconditionally, a plain
+        # `just demo-capture` on a log created by `just demo-archive` passes
+        # None and DETACHES the archive — which succeeds without credentials,
+        # resets the watermark, and strands every row already evicted from
+        # local disk. `demo-clean` then sees no archive, skips the S3 removal,
+        # and deletes the local state, leaving paid storage nothing can name.
+        if args.archive is not None:
+            log.set_archive(args.archive)
     except FileNotFoundError:
         log = Log.new(
             args.root,
