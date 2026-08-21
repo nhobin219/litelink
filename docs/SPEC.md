@@ -381,6 +381,35 @@ a live claim covers; recovery means reclaiming an expired one and removing the f
 named. The intent record and the lease become the same row — which is what allows several
 passes to run at once without any of them excluding the others by kind.
 
+### The check and the claim are one transaction
+
+Claiming is not enough on its own, and this is the part that is easy to get wrong. Suppose
+eviction reads the live claims, sees none and decides to drop everything at or below 500;
+compaction then claims `[400, 600]` and starts merging; eviction commits its removal;
+compaction commits its merge and puts rows 400-500 back. Two operations that each checked,
+and a window between the checking and the acting.
+
+The fix is not more checking. It is that **the read of conflicting claims and the insert of
+one's own claim happen in a single SQLite write transaction.** Those are serialised (§2), so
+whichever commits second sees the first, and there is no interval in which both believe
+they own the range. The slow work — reading files, writing Parquet, uploading — stays
+outside the transaction; only the decision is inside it, and the decision is microseconds.
+
+This is why **eviction claims a range too**, rather than merely consulting the claims of
+others. An operation that only reads leaves exactly the window above: it has decided, and
+nothing durable says so until its commit lands somewhere else entirely. Both sides
+declaring is what makes the ordering total.
+
+So the invariant is: *no operation may begin work on a range until it has durably claimed
+that range in a transaction that saw no conflicting claim.* Under it, a merge's inputs are
+still live when it commits, and the resurrection above is unreachable rather than
+self-correcting.
+
+For the record, when it was reachable it was a policy fault and not a duplication one. A
+resurrected range is real rows at their real offsets, and `_union` bounds the archive leg by
+the local table's lower extent — so a local table that regains `[1, 100]` bounds the archive
+leg to `offset < 1`, and the range is served by exactly one tier either way.
+
 **Three mechanisms, three jobs**, and none substitutes for another:
 
 - **compare-and-swap** in the catalog: the commit is atomic, and a racing commit is detected
