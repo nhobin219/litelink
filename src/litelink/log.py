@@ -1885,6 +1885,14 @@ class Log:
             # anything else, and eviction dates a file by this record — so a
             # hydrated file without one would sit undateable, treated as newly
             # written, and never leave again.
+            # KNOWN GAP, dormant: this promises above that a hydrated file
+            # "counts as full", and a file the archive never measured records
+            # zero instead — the opposite. It stays dormant because a hydrated
+            # file sits at or below `archive_frontier` and every size consumer
+            # excludes it there; the value goes live only if a watermark reset
+            # drops the frontier beneath it, which is the archive-identity seam
+            # SPEC §13 item 0 owns. Align the two when that is redesigned,
+            # rather than now, on code that redesign will rewrite.
             self._buffer.record_file(
                 rel_path, data_file.lo, data_file.hi + 1, held.get(data_file.path, 0)
             )
@@ -2076,6 +2084,16 @@ def validate(
         msg = (
             "wal_replication needs an archive: WAL segments go beside the "
             "archived data, and a local-only log has nowhere to ship them"
+        )
+        raise ValueError(msg)
+
+    if config.compact_min_files < 1:
+        msg = (
+            f"compact_min_files must be at least 1: {config.compact_min_files}. "
+            "It is how many files a run needs before compaction will merge it, "
+            "and below one nothing is ever settled: `stable_prefix` returns "
+            "zero for ever, so sync pushes nothing, the watermark stands still, "
+            "eviction pins on it and the local table grows without bound"
         )
         raise ValueError(msg)
 
