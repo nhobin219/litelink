@@ -1178,8 +1178,12 @@ class Buffer:
 
         One by default of the caller's choosing, because a claim belongs to an
         operation and clearing another's is how a crashed rewrite's uploads
-        became unnameable. Recovery passes nothing and clears the lot, which is
-        correct there: it has just resolved every one of them.
+        became unnameable. Recovery clears one at a time too, for the same
+        reason: a rewrite whose lease lapsed mid-upload can be claiming its
+        next segment while recovery is still resolving the last.
+
+        The whole-table form is left for a caller that has genuinely resolved
+        every row, and nothing does today.
         """
         with self._lock:
             if rel_path is None:

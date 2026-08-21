@@ -231,13 +231,11 @@ def main() -> None:
     try:
         while True:
             started = time.monotonic()
-            owns = True
             try:
                 report = run()
             except RuntimeError as exc:
                 # Another owner holds the lease this role needs. Not worth
                 # dying over: it means someone else is already doing this.
-                owns = False
                 report = f"skipped: {exc}"
 
             if report is not None:
@@ -245,15 +243,13 @@ def main() -> None:
                 print(f"{label} {report}  ({elapsed:.0f} ms)", flush=True)
 
             if sidecar is not None:
-                # Tied to the lease, not to the role. A second maintainer is
-                # refused its table work and says so — which reads as safe —
-                # while nothing stopped it starting a SECOND litestream against
-                # the same databases, the one thing litestream forbids. The
-                # process doing the archive work is the one that replicates.
-                if owns:
-                    sidecar.keep_running()
-                else:
-                    sidecar.stop()
+                # Not gated on the lease. The flock is what stops two
+                # instances, and it is held for this process's whole life —
+                # whereas the lease is taken and released around every pass, so
+                # gating on it meant losing one pass to a busy compactor
+                # stopped replication while KEEPING the lock, and nobody
+                # replicated for as long as the contention lasted.
+                sidecar.keep_running()
 
             time.sleep(every)
     except (KeyboardInterrupt, SystemExit):
@@ -273,11 +269,21 @@ def main() -> None:
 _running = False
 
 
+# Loaded at import, NOT inside `preexec_fn`. That callback runs in the child
+# between fork and exec, where only async-signal-safe work is safe: this
+# process is multithreaded by then — s3fs keeps an asyncio loop, pyarrow and
+# duckdb keep pools — and a `dlopen` there deadlocks if any thread held the
+# loader or allocator lock at the moment of the fork. The parent would then
+# block for ever inside `Popen`, holding the replication lock, with nothing
+# replicating and no standby able to take over.
+_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
 def _die_with_parent() -> None:
     """In the child, between fork and exec: ask for SIGKILL when this process's
     parent dies. Linux-specific (`PR_SET_PDEATHSIG`), and the only thing that
-    covers a parent killed with SIGKILL."""
-    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+    covers a parent killed with SIGKILL — a handler cannot run for that."""
+    _LIBC.prctl(1, signal.SIGKILL)
 
 
 def _stop(signum: int, frame: object) -> None:
