@@ -151,7 +151,7 @@ just demo-maintain     # also pushes to it, and evicts what it has pushed
 **Against a real AWS bucket**, nothing changes but the environment:
 
 ```
-cp examples/.env.example .env    # set LITELINK_ARCHIVE=s3://your-bucket/prefix
+cp .env.example .env    # set LITELINK_DEMO_ARCHIVE=s3://your-bucket/prefix
 just demo-archive
 just demo-maintain
 ```

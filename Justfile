@@ -4,7 +4,7 @@
 # The local S3-compatible endpoint the archive tier is tested and demoed against.
 # Matches tests/conftest.py; change both together.
 # Loaded from `.env` if present, so the demo can point at a real bucket without
-# editing anything here — see `examples/.env.example`. Recipes read AWS_* through the
+# editing anything here — see `.env.example`. Recipes read AWS_* through the
 # environment exactly as the library does, so what works here works in
 # production.
 set dotenv-load := true
@@ -85,7 +85,7 @@ demo-maintain *args:
     set -euo pipefail
     # Same rule as demo-archive: a real endpoint if `.env` names one, rustfs
     # otherwise. Needed here too — the maintainer is what pushes to the archive.
-    if [ -z "${LITELINK_ARCHIVE:-}" ]; then
+    if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
@@ -115,9 +115,9 @@ demo-archive *args:
     # A real bucket if `.env` names one, rustfs otherwise. The library reads
     # credentials from the environment either way, so this is the whole
     # difference between the local demo and a production deployment.
-    if [ -n "${LITELINK_ARCHIVE:-}" ]; then
-        echo "archiving to $LITELINK_ARCHIVE (credentials from the environment)"
-        uv run python examples/capture.py --archive "$LITELINK_ARCHIVE" {{args}}
+    if [ -n "${LITELINK_DEMO_ARCHIVE:-}" ]; then
+        echo "archiving to $LITELINK_DEMO_ARCHIVE (credentials from the environment)"
+        uv run python examples/capture.py --archive "$LITELINK_DEMO_ARCHIVE" {{args}}
     else
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
