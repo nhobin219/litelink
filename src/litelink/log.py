@@ -757,32 +757,39 @@ class Log:
 
     def _repoint(self, archive: str | None) -> None:
         """Record the new location, with the maintenance lease held."""
-        # The watermark FIRST, and the order is the point. It belonged to the
-        # PREVIOUS archive, and eviction acts on it: I4 lets `maintain` delete
-        # a local file because the archive holds it. Carried across a re-point,
-        # that is a promise about a bucket this log no longer uses.
+        # Normalised before anything compares it. Every path builder strips
+        # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same archive
+        # everywhere except here — where the difference would read as a move
+        # and reset the watermarks of an archive that genuinely holds data.
+        normalised = (archive or "").rstrip("/") or None
+        # ONE transaction, because the three facts are only true together.
         #
-        # These are two autocommit writes, so a crash lands between them.
-        # Resetting first, the crash leaves a log still pointing at the OLD
-        # archive with a watermark of zero — eviction waits for a sync, which
-        # is a delay. The other order leaves the NEW archive with the old
-        # watermark, which is the data loss itself.
-        if (archive or None) != self._archive.uri:
-            self._buffer.set_meta(Maintenance.ARCHIVED_KEY, "0")
-            # The frontier too. It names a range the PREVIOUS archive may hold,
-            # and compaction reads it to decide what is already somebody else's
-            # business — carried across, it would go on refusing to merge files
-            # the new archive has never seen. Conservative rather than unsafe,
-            # but permanently so: nothing else ever lowers it.
-            self._buffer.set_meta(Maintenance.PENDING_KEY, "0")
-
-        self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
+        # Where the archive is, and the two watermarks describing what the
+        # PREVIOUS one held: the confirmed one eviction acts on, and the
+        # frontier compaction reads to decide which files are already the
+        # archive's business. As separate writes a crash lands between them,
+        # and BOTH orders have cost a defect — watermark last leaves the new
+        # archive carrying the old one's promise, which eviction believes;
+        # watermark first leaves the old archive with a frontier of zero, and
+        # compaction does not wait for a sync the way eviction does, so it
+        # merges across a boundary the archive already holds. There is no
+        # ordering that is safe, so there is no ordering.
+        if normalised != self._archive.uri:
+            self._buffer.set_meta_all(
+                {
+                    _ARCHIVE_KEY: normalised or "",
+                    Maintenance.ARCHIVED_KEY: "0",
+                    Maintenance.PENDING_KEY: "0",
+                }
+            )
+        else:
+            self._buffer.set_meta(_ARCHIVE_KEY, normalised or "")
 
         # Reaches the maintainer and the reader because all three hold this
         # object. `evict` asks it whether I4 is owed anything, and a setting
         # that stopped at `Log` would leave the maintainer deleting the only
         # copy of rows an archive was just configured to receive.
-        self._archive.set_uri(archive)
+        self._archive.set_uri(normalised)
 
         # Repaired here as well as at open, and the difference is who waits.
         # The catalog entry still names the previous archive until something
@@ -1485,20 +1492,41 @@ class Log:
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
-        # The watermark is a cache of what the archive actually holds, so it is
-        # reconciled here rather than only advanced after a push. A commit that
-        # landed while the `meta` write after it did not would otherwise leave
-        # it behind for ever: the next pass computes `floor` from the archive
-        # itself, finds nothing left to push, and never revisits the number
-        # eviction depends on.
-        if (
-            covered is not None
-            and self._maintenance.archived_through() < covered[1]
-            # Same guard as below: reconciling upward from an archive the log
-            # has been pointed away from is the loss this whole path guards.
-            and (self._buffer.get_meta(_ARCHIVE_KEY) or None) == self._archive.uri
-        ):
-            self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(covered[1]))
+        # Both watermarks reconciled against the archive itself, in ONE
+        # transaction, before anything is pushed.
+        #
+        # The confirmed one is a cache of what the archive holds, so a commit
+        # that landed while the `meta` write after it did not would leave it
+        # behind for ever: the next pass computes `floor` from the archive,
+        # finds nothing left to push, and never revisits the number eviction
+        # depends on.
+        #
+        # The frontier is RESOLVED rather than advanced, whichever way it went.
+        # It stands in for a question — did the register land? — that the
+        # extent has just answered: reached, and it did; not reached, and it
+        # never did. Either way the guess must go, and clearing it here is what
+        # keeps it from deadlocking. Nothing but the NEXT successful push ever
+        # overwrote it, and it blocks compaction — so a register that failed
+        # where `stable_prefix` needed that very merge before anything could
+        # settle left sync waiting on a compaction the frontier forbade, while
+        # being the only thing that would clear it. Both passes returned
+        # success, for ever.
+        #
+        # One transaction because clearing the frontier is only safe once the
+        # confirmed watermark has caught up to the extent: separately, a crash
+        # between them leaves neither guarding the range, and compaction merges
+        # across a boundary the archive already holds.
+        if (self._buffer.get_meta(_ARCHIVE_KEY) or None) == self._archive.uri:
+            # Guarded together, for the reason the guard exists at all:
+            # reconciling against an archive the log has been pointed away from
+            # is the loss this whole path is here to prevent.
+            confirmed = max(self._maintenance.archived_through(), floor)
+            self._buffer.set_meta_all(
+                {
+                    Maintenance.ARCHIVED_KEY: str(confirmed),
+                    Maintenance.PENDING_KEY: "0",
+                }
+            )
 
         memory = self._maintenance.memory()
         pending = [f for f in self._table.data_files() if f.hi > floor]

@@ -1110,6 +1110,22 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
+    def set_meta_all(self, pairs: Mapping[str, str]) -> None:
+        """Write several `meta` values in ONE transaction.
+
+        For facts that are only true together. Re-pointing an archive writes
+        where it is and resets the two watermarks that describe the previous
+        one, and as separate autocommit statements a crash lands between them:
+        either order leaves a log whose parts disagree, and both disagreements
+        have cost a defect. One transaction has no between.
+        """
+        with self._transaction():
+            self._con.executemany(
+                "INSERT INTO meta (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                list(pairs.items()),
+            )
+
     def set_meta(self, key: str, value: str) -> None:
         with self._lock:
             self._con.execute(

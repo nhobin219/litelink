@@ -19,6 +19,7 @@ import pytest
 
 from litelink import Log, LogConfig
 from litelink._layout import Layout
+from litelink._maintenance import Maintenance
 from litelink._s3 import S3Options
 from litelink._table import LogTable, _recorded_location
 from litelink.log import OFFSET, table_schema
@@ -849,3 +850,118 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         assert doomed not in log._buffer.queued_deletions(), (
             "the log's own archived object must be drainable"
         )
+
+
+def test_a_failed_push_cannot_wedge_sync_and_compaction(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The frontier must not outlive the question it answers.
+
+    It is written before a register is attempted and blocks compaction, so a
+    register that failed left it standing — and if `stable_prefix` then needed
+    that very merge before anything could settle, sync waited on a compaction
+    the frontier forbade while being the only thing that cleared it. Both
+    passes returned success, for ever.
+
+    Reproduced at its narrowest: a pass that settles nothing at all. Before the
+    fix that pass returns early, above the only line that overwrote the
+    frontier, and the log never compacts or evicts again.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        settled = log.archived_through()
+        assert settled > 0
+
+        # A push that recorded its intent and then failed, with nothing left
+        # for the next pass to settle.
+        log._buffer.set_meta(Maintenance.PENDING_KEY, str(settled + 10_000))
+        assert log._maintenance.archive_frontier() > settled
+
+        log.sync()
+
+        assert log._maintenance.archive_frontier() == settled, (
+            "a frontier the extent has answered must not survive the pass"
+        )
+        assert log.archived_through() == settled
+
+
+def test_repointing_to_the_same_archive_spelled_differently_keeps_the_watermark(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A trailing slash is not a move.
+
+    Every path builder strips one, so `s3://b/p` and `s3://b/p/` name the same
+    objects everywhere except the comparison that decides whether the archive
+    changed. Read verbatim, re-stating the current archive with a slash on the
+    end reads as a move and resets both watermarks — against a bucket that
+    genuinely holds the data, which is I4's whole premise for eviction.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        settled = log.archived_through()
+        assert settled > 0
+
+        log.set_archive(f"s3://{bucket}/prefix/")
+
+        assert log.archived_through() == settled, (
+            "the same archive, spelled with a trailing slash, is the same archive"
+        )
+        assert log.scan().read_all().num_rows == ROWS
+
+
+def test_a_repoint_is_all_or_nothing(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Where the archive is and what it holds are only true together.
+
+    The two watermarks describe the PREVIOUS archive, so a crash between them
+    and the location leaves a log whose parts disagree — and both orderings
+    have cost a defect. Watermark last leaves the new archive carrying the old
+    one's promise, which eviction believes. Watermark first leaves the OLD
+    archive with a frontier of zero, and compaction, unlike eviction, does not
+    wait for a sync before merging across a boundary the archive already holds.
+
+    So the failure is injected rather than reasoned about: any single write may
+    fail, and what survives must still be coherent.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        settled = log.archived_through()
+        assert settled > 0
+
+        calls = 0
+        original = log._buffer.set_meta
+
+        def flaky(key: str, value: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("crash between the writes")
+
+            original(key, value)
+
+        log._buffer.set_meta = flaky  # ty: ignore[invalid-assignment]
+        try:
+            log.set_archive(f"s3://{bucket}/elsewhere")
+        except RuntimeError:
+            pass
+
+        finally:
+            log._buffer.set_meta = original  # ty: ignore[invalid-assignment]
+
+        recorded = log._buffer.get_meta("archive") or None
+        if recorded == f"s3://{bucket}/prefix":
+            assert log.archived_through() == settled, (
+                "still the old archive, so its watermark must still be true"
+            )
+
+        else:
+            assert log.archived_through() == 0, (
+                "a new archive must not inherit the old one's promise"
+            )
