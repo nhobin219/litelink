@@ -1523,6 +1523,11 @@ class Log:
         # waited, and the buffer grew for the whole of it.
         checkpoint(lease.renew)
         last = uploaded[-1][0]
+        # Recorded BEFORE the register, and never read by eviction. It is what
+        # lets compaction know, after a crash between the register and its
+        # confirming write, that these offsets may already be in the archive
+        # and must not be merged into a file that straddles its extent.
+        self._buffer.set_meta(Maintenance.PENDING_KEY, str(last.hi))
         if not archive.register(
             [archive.uri(rel_path) for _, rel_path in uploaded],
             sealed_through=last.hi + 1,

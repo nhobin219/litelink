@@ -820,3 +820,32 @@ def test_drain_never_deletes_from_an_archive_the_log_has_left(
         assert stranded in log._buffer.queued_deletions(), (
             "and it stays queued for whoever owns that archive"
         )
+
+
+def test_a_trailing_slash_does_not_wedge_the_remote_queue(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The configured URI may carry a trailing slash; queued paths never do.
+
+    Every remote path is built from the warehouse with its slashes stripped, so
+    comparing against the URI verbatim classifies this log's OWN objects as
+    another archive's — and the guard that exists to protect a retired bucket
+    instead stops the queue draining at all, for ever.
+    """
+    with archived_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
+        log.set_archive(f"s3://{bucket}/slashed/")
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+
+        fs = filesystem(s3)
+        objects = fs.find(f"{bucket}/slashed")
+        assert objects
+        doomed = f"s3://{objects[0]}"
+        log._buffer.enqueue_deletions([doomed], 0)
+
+        log._maintenance.drain()
+
+        assert doomed not in log._buffer.queued_deletions(), (
+            "the log's own archived object must be drainable"
+        )
