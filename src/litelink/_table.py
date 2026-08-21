@@ -326,6 +326,9 @@ class LogTable:
             except NoSuchTableError:
                 recorded = None
 
+        # The entry this repair displaces, kept so a failed create can put it
+        # back. See below.
+        displaced: str | None = None
         if recorded is not None and not recorded.startswith(boundary):
             # Another archive's table, found by table id. No read of the old
             # bucket is needed to know this, which matters when the archive
@@ -344,10 +347,16 @@ class LogTable:
                 )
                 raise ValueError(msg)
 
-            # The entry goes; the objects do not, because detaching an archive
-            # is not deleting one.
+            # The entry goes; the objects do not, because detaching an
+            # archive is not deleting one. Held onto, though: the create below
+            # can fail — the new prefix may not exist yet, which this design
+            # explicitly allows — and a drop that is not followed by a create
+            # destroys the only record of where the PREVIOUS archive's metadata
+            # is. `previous_metadata_location` dies with the row, so a later
+            # roll-back to that archive would build an empty table over data
+            # nothing could then reach.
             catalog.drop_table(layout.table_id)
-            recorded = None
+            displaced, recorded = recorded, None
 
         if recorded is None:
             if not repair:
@@ -359,9 +368,19 @@ class LogTable:
                 msg = f"no archive table at {prefix!r} yet"
                 raise ArchiveAbsent(msg)
 
-            table = catalog.create_table(
-                layout.table_id, schema=schema, properties=METADATA_PROPERTIES
-            )
+            try:
+                table = catalog.create_table(
+                    layout.table_id, schema=schema, properties=METADATA_PROPERTIES
+                )
+            except Exception:
+                if displaced is not None:
+                    # Put the old entry back. The repair is meant to move the
+                    # log from one archive to another, and a half-done move
+                    # that leaves NEITHER is the one outcome worse than not
+                    # moving at all.
+                    catalog.register_table(layout.table_id, displaced)
+
+                raise
         else:
             # Deliberately unguarded. Catching everything here and rebuilding
             # meant a 503, a timeout or an expired token read as "there is no

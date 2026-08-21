@@ -822,6 +822,22 @@ class Maintenance:
                 if remote is None or rel_path in remote_referenced:
                     continue
 
+                # Only objects belonging to the archive this log is pointed at.
+                # A queued remote path names the archive it was superseded in,
+                # and the veto above asks the CURRENT one — so after a
+                # re-point, entries left by a rewrite on the old archive would
+                # be checked against a new archive that references nothing and
+                # deleted from the old bucket, where they may still be live and
+                # may be the only copy of rows already evicted locally.
+                #
+                # Left queued rather than forgotten: they are somebody's to
+                # resolve, and the log that owns that archive is the one that
+                # can say whether they are dead. A stranded queue row is a
+                # bounded cost; deleting live data in a bucket this log no
+                # longer understands is not.
+                if not rel_path.startswith(f"{self._archive.uri}/"):
+                    continue
+
                 remote.remove(rel_path)
                 self._buffer.forget_deletion(rel_path)
                 continue
