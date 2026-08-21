@@ -85,6 +85,16 @@ def main() -> None:
         f"{args.maintain_every:.0f}s"
     )
     print("run alongside `just demo-capture`. Ctrl-C to hand the leases back.\n")
+    # The same column names `tail.py` uses, because they describe the same
+    # numbers and two vocabularies for one pipeline is one too many.
+    archived_rows = f" {'archived rows':>14}" if log.archive else ""
+    archived_files = f" {'archived files':>14}" if log.archive else ""
+    sync_column = f" {'sync':>9}" if log.archive else ""
+    print(
+        f"{'local rows':>13} {'buffer rows':>13}{archived_rows}"
+        f" {'local files':>12}{archived_files}"
+        f" {'disk':>9} {'maintain':>9}{sync_column}"
+    )
 
     # SIGTERM, not just Ctrl-C. Python does not unwind on it — the process
     # simply stops — so without this the `finally` below never runs and a
@@ -235,27 +245,29 @@ def _maintain(log: Log, root: Path) -> None:
         print(f"  skipped: {exc}")
         return
 
+    local_ms = (time.monotonic() - started) * 1000
+
     # After `maintain`, not before. Eviction reads the archive watermark to
     # decide what it is allowed to drop (I4), so a push landing first is what
     # lets the NEXT pass reclaim the disk it freed up.
     #
-    # Separate from `maintain()` because it is the one step that can block on a
-    # network: everything above is local and finishes in milliseconds, and a
-    # loop that could not tell them apart would report an S3 timeout as slow
-    # compaction.
-    archived = ""
+    # Timed separately, not folded into the pass, because it is the one step
+    # that can block on a network: everything above is local and finishes in
+    # milliseconds, and a single number would report an S3 timeout as slow
+    # compaction. That is not hypothetical — a sync taking 83 s of an 89 s
+    # pass is what sent us looking.
+    archived_rows = archived_files = sync_column = ""
     if log.archive:
         pushed = time.monotonic()
         log.sync()
-        archived = f"  sync={(time.monotonic() - pushed) * 1000:>5.0f} ms"
+        archived_rows = f" {log.archived_through():>14,}"
+        archived_files = f" {log.archive_files():>14,}"
+        sync_column = f" {(time.monotonic() - pushed) * 1000:>7.0f}ms"
 
     print(
-        f"  table={log.table_rows():>10,} rows"
-        f"  buffered={log.buffered_rows():>9,}"
-        f"  files={log.table_files():>4}"
-        f"  disk={_disk(root) / 1e6:>7.1f} MB"
-        f"  ({(time.monotonic() - started) * 1000:>5.0f} ms)"
-        f"{archived}"
+        f"{log.table_rows():>13,} {log.buffered_rows():>13,}{archived_rows}"
+        f" {log.table_files():>12,}{archived_files}"
+        f" {_disk(root) / 1e6:>7.1f}MB {local_ms:>7.0f}ms{sync_column}"
     )
 
 

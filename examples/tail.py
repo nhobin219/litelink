@@ -22,7 +22,7 @@ from litelink._s3 import S3Options
 
 
 def snapshot(log: Log) -> tuple[int, int, int, int, int]:
-    """(stream, table rows, buffer rows, local files, archived, remote files).
+    """(stream rows, local rows, buffer rows, local files, archived rows).
 
     Nothing here scans data. Iceberg tracks a row count per file, so the table's
     total comes off the manifest read that produced the boundary; the buffer is
@@ -90,14 +90,17 @@ def main() -> None:
     print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.")
     if log.archive:
         print(f"archive: {log.archive}")
-        print("`files` is local disk, `arch files` is object storage — the first")
-        print("falls as the second rises, and `stream` counts every row either way")
+        print("local falls as archived rises; stream counts every row either way")
 
     print()
-    archived_column = f" {'archived':>12} {'arch files':>10}" if log.archive else ""
+    # Named for what they are rather than for where they live. "in table"
+    # meant local rows and "files" meant local files, which asks the reader to
+    # remember the implementation to read the display.
+    archived_rows = f" {'archived rows':>14}" if log.archive else ""
+    archived_files = f" {'archived files':>14}" if log.archive else ""
     print(
-        f"{'stream':>12} {'in table':>12} {'in buffer':>12}"
-        f"{archived_column} {'files':>7} {'read':>8}"
+        f"{'stream rows':>13} {'buffer rows':>13} {'local rows':>13}{archived_rows}"
+        f" {'local files':>12}{archived_files} {'read':>9}"
     )
 
     previous = 0
@@ -111,10 +114,10 @@ def main() -> None:
 
             delta = f"+{total - previous:,}" if total > previous else ""
             print(
-                f"{total:>12,} {table:>12,} {buffered:>12,}"
-                f"{f' {archived:>12,} {remote:>10,}' if log.archive else ''}"
-                f" {files:>7} "
-                f"{elapsed_ms:>7.1f}ms  {delta}"
+                f"{total:>13,} {buffered:>13,} {table:>13,}"
+                f"{f' {archived:>14,}' if log.archive else ''}"
+                f" {files:>12,}{f' {remote:>14,}' if log.archive else ''}"
+                f" {elapsed_ms:>7.1f}ms  {delta}"
             )
             previous = total
             time.sleep(args.every)
