@@ -769,6 +769,12 @@ class Log:
         # watermark, which is the data loss itself.
         if (archive or None) != self._archive.uri:
             self._buffer.set_meta(Maintenance.ARCHIVED_KEY, "0")
+            # The frontier too. It names a range the PREVIOUS archive may hold,
+            # and compaction reads it to decide what is already somebody else's
+            # business — carried across, it would go on refusing to merge files
+            # the new archive has never seen. Conservative rather than unsafe,
+            # but permanently so: nothing else ever lowers it.
+            self._buffer.set_meta(Maintenance.PENDING_KEY, "0")
 
         self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
 
