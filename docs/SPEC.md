@@ -481,8 +481,17 @@ the only copy.
 It is tempting to require that a file be compacted before local-only eviction will take it,
 by symmetry with the archive case, where only compacted files are ever pushed and therefore
 only compacted files are ever eligible. **Resist it.** The reason to hold a file back is
-never its compaction state; it is that a merge is *using* it right now, which is a claim and
-already answered above. Requiring "compacted" instead reintroduces the trailing-run holdback
+never its compaction state; it is that a merge — `_rewrite_run`, reading a run of files to
+write the one that replaces them — holds it as an input right now. That is a claim, and it
+is already answered above.
+
+A merge is the pair that matters here because it is the only pass that can put rows *back*:
+select `[1, 100]`, have eviction commit their removal, then commit the replacement, and the
+range returns. Every other pass holding a file open merely fails when it vanishes — sync's
+upload errors and retries, expire is an idempotent metadata commit. Compaction state is a
+proxy for this and a bad one, since it is neither necessary (an uncompacted file no merge
+has claimed is safe to drop) nor sufficient (a compacted file can be an input to the next
+merge up). Requiring "compacted" instead reintroduces the trailing-run holdback
 this section rejects below — bounded in bytes, at most one compaction target, but unbounded
 in time, so a log that goes idle keeps its last target-sized residue for ever. Whether that
 is acceptable depends on whether `local_retention` is a disk heuristic or an obligation to
