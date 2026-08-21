@@ -946,25 +946,76 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         assert log.scan().read_all().num_rows == log.buffered_rows()
 
 
-def test_a_single_pass_takes_the_maintenance_lease(tmp_path: Path) -> None:
-    """Running the parts separately is not a way around the exclusion.
+def test_a_pass_defers_to_a_claim_over_the_range_it_wanted(tmp_path: Path) -> None:
+    """Exclusion is by range now, not by role (§4a).
 
-    Whichever entry point a second owner comes through, it is refused — the
-    lease is the thing that stops two maintainers compacting the same run to
-    the same deterministic path, which is a torn file rather than a conflict
-    Iceberg could resolve.
+    What stops two maintainers compacting the same run to the same
+    deterministic path — a torn file rather than a conflict Iceberg could
+    resolve — is that the second finds the range claimed. It skips rather than
+    raising: another owner working there is ordinary, not an error, and the
+    work is still there next pass.
     """
-    with open_log(tmp_path, LogConfig(target_seal_size=4096)) as log:
+    with open_log(
+        tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
+    ) as log:
+        seal_files(log, 3)
+        before = len(log._table.data_files())
+
+        assert before >= 2
+
         held = log._lease("maintain")
+
         assert held.acquire()
+
         try:
-            for pass_ in (log.compact, log.evict, log.expire):
-                with pytest.raises(RuntimeError, match="maintenance lease"):
-                    pass_()
+            log.compact()
+
+            assert len(log._table.data_files()) == before, (
+                "compacted a range another owner had claimed"
+            )
         finally:
             held.release()
 
         log.compact()
+
+        assert len(log._table.data_files()) < before, "did not compact once free"
+
+
+def test_two_owners_compact_disjoint_ranges_at_once(tmp_path: Path) -> None:
+    """The point of claiming a range instead of a role (§4a).
+
+    Two operations on disjoint offsets commute, so nothing needs to serialise
+    them. Under one lease per role the second waited on the first for the whole
+    of its work — reading and rewriting Parquet, none of which touches anything
+    the other reads.
+    """
+    with open_log(
+        tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
+    ) as log:
+        seal_files(log, 4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        assert len(files) >= 4
+
+        # One owner is working on the bottom of the log.
+        low = log._buffer.claim("compact", files[0].lo, files[1].hi, "other-owner")
+
+        assert low.acquire()
+
+        try:
+            # A second owner claims the top, and is not refused.
+            high = log._buffer.claim("compact", files[2].lo, files[-1].hi, "mine")
+
+            assert high.acquire(), "disjoint ranges must not exclude each other"
+
+            high.release()
+
+            # Overlapping, and it is.
+            clash = log._buffer.claim("compact", files[1].lo, files[2].hi, "mine")
+
+            assert not clash.acquire(), "overlapping ranges must exclude"
+        finally:
+            low.release()
 
 
 def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:

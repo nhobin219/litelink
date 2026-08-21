@@ -19,7 +19,8 @@ import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
-from litelink._lease import Lease, new_owner
+from litelink._claim import Claim, new_owner
+from litelink.log import EVERYTHING
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -52,7 +53,7 @@ def test_a_lease_is_never_a_passenger_in_another_transaction(tmp_path: Path) -> 
     """
     with open_log(tmp_path) as log:
         buffer = log._buffer
-        lease = buffer.lease("seal", new_owner())
+        lease = buffer.claim("seal", 0, EVERYTHING, new_owner())
         acquired = threading.Event()
         taken: list[bool] = []
 
@@ -78,7 +79,9 @@ def test_a_lease_is_never_a_passenger_in_another_transaction(tmp_path: Path) -> 
 def test_a_second_owner_is_refused(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         ours = log._lease("seal")
-        theirs = Lease(log._buffer._con, log._buffer._lock, "seal", new_owner())
+        theirs = Claim(
+            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
+        )
 
         assert ours.acquire()
         assert not theirs.acquire(), "two owners held the same role"
@@ -111,8 +114,14 @@ def test_an_expired_lease_can_be_taken_over(tmp_path: Path) -> None:
     same file to the same name.
     """
     with open_log(tmp_path) as log:
-        dying = Lease(
-            log._buffer._con, log._buffer._lock, "seal", new_owner(), ttl_ms=1
+        dying = Claim(
+            log._buffer._con,
+            log._buffer._lock,
+            "seal",
+            0,
+            EVERYTHING,
+            new_owner(),
+            ttl_ms=1,
         )
 
         assert dying.acquire()
@@ -134,7 +143,9 @@ def test_recovery_leaves_another_owners_seal_alone(tmp_path: Path) -> None:
 
     # Someone else holds the seal role and is still working. Taken on the
     # holder's own connection so it outlives the Log opened below.
-    other = Lease(holder._buffer._con, holder._buffer._lock, "seal", new_owner())
+    other = Claim(
+        holder._buffer._con, holder._buffer._lock, "seal", 0, EVERYTHING, new_owner()
+    )
     assert other.acquire()
 
     with open_log(tmp_path) as reopened:
@@ -150,16 +161,43 @@ def test_recovery_leaves_another_owners_seal_alone(tmp_path: Path) -> None:
     holder.close()
 
 
-def test_maintain_refuses_while_another_owner_holds_it(tmp_path: Path) -> None:
-    with open_log(tmp_path) as log:
-        other = Lease(log._buffer._con, log._buffer._lock, "maintain", new_owner())
+def test_maintain_does_nothing_while_another_owner_holds_the_range(
+    tmp_path: Path,
+) -> None:
+    """It skips rather than raising, which is the §4a change.
+
+    Under one lease per role, a second maintainer was refused outright. Now the
+    passes claim the ranges they work on, so another owner working somewhere is
+    ordinary: this one does what it can and leaves the rest, which is still
+    there next pass.
+    """
+    with open_log(
+        tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
+    ) as log:
+        for i in range(3):
+            log.extend(rows(4, start=i * 4))
+            log.seal()
+
+        before = len(log._table.data_files())
+
+        assert before >= 2
+
+        other = Claim(
+            log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
+        )
+
         assert other.acquire()
 
-        with pytest.raises(RuntimeError, match="maintenance lease"):
-            log.maintain()
+        log.maintain()
+
+        assert len(log._table.data_files()) == before, (
+            "worked on a range another owner had claimed"
+        )
 
         other.release()
         log.maintain()
+
+        assert len(log._table.data_files()) < before
 
 
 def test_a_rejected_maintain_does_not_strand_the_lease(tmp_path: Path) -> None:
@@ -172,7 +210,9 @@ def test_a_rejected_maintain_does_not_strand_the_lease(tmp_path: Path) -> None:
     with pytest.raises(Exception):  # noqa: B017, PT011 - any refusal will do
         log.sync()
 
-    other = Lease(log._buffer._con, log._buffer._lock, "maintain", new_owner())
+    other = Claim(
+        log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
+    )
 
     assert other.acquire(), "the refused call kept the lease"
 
@@ -267,7 +307,9 @@ def test_a_writer_defers_to_a_sealer_in_another_process(tmp_path: Path) -> None:
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(400))
 
-        elsewhere = Lease(log._buffer._con, log._buffer._lock, "seal", new_owner())
+        elsewhere = Claim(
+            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
+        )
         assert elsewhere.acquire(), "could not simulate another sealer"
 
         # The cut is recorded either way — that is `seal`'s promise and it does
@@ -305,7 +347,9 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
         assert log.seal_due() == end, "the replay did not finish the seal"
 
         # The role must be free again immediately, not in thirty seconds.
-        taker = Lease(log._buffer._con, log._buffer._lock, "seal", new_owner())
+        taker = Claim(
+            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
+        )
 
         assert taker.acquire(), "the replay path kept the seal lease"
 
@@ -323,11 +367,13 @@ def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
         log.extend(rows(20))
         log.seal()
 
-        held = Lease(log._buffer._con, log._buffer._lock, "maintain", new_owner())
+        held = Claim(
+            log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
+        )
 
         assert held.acquire(), "could not simulate another maintainer"
 
-        with pytest.raises(RuntimeError, match="maintenance lease"):
+        with pytest.raises(RuntimeError, match="claim over this range"):
             log.set_sort_by(("key", "event_ts"), rewrite=True)
 
         assert log._sort_by == ("event_ts",), "the sort order changed anyway"
@@ -366,11 +412,13 @@ def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
         log._buffer.claim_seal(start, end, path)
 
         # A lease this writer no longer holds.
-        lapsed = log._buffer.lease("seal", new_owner(), ttl_ms=1)
+        lapsed = log._buffer.claim("seal", 0, EVERYTHING, new_owner(), ttl_ms=1)
 
         assert lapsed.acquire()
         time.sleep(0.05)
-        stolen = Lease(log._buffer._con, log._buffer._lock, "seal", new_owner())
+        stolen = Claim(
+            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
+        )
 
         assert stolen.acquire(), "could not simulate the takeover"
 
@@ -387,3 +435,29 @@ def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
 
         assert not log._buffer.finish_seal(end, path), "wiped a successor's claim"
         assert log._buffer.pending_seal() is not None
+
+
+def test_a_lapsed_claim_cannot_renew_itself_back_to_life(tmp_path: Path) -> None:
+    """Once expired, it is lost — whether or not anyone has taken it yet.
+
+    One row per operation means nothing overwrites a claim the way a per-role
+    row did, so a lapsed holder still finds its own row sitting there. Letting
+    it extend that row would hand the range back to a holder the log has
+    already moved past, and the window in which someone else may take it is
+    open from the moment it expires, not from the moment they do.
+    """
+    with open_log(tmp_path) as log:
+        stalled = log._buffer.claim("seal", 0, 100, new_owner())
+
+        assert stalled.acquire()
+        assert stalled.renew(), "a live claim must renew"
+
+        # Expired in place, so the row is still there and still ours — which is
+        # exactly the state a per-role row could never be left in.
+        with log._buffer._lock:
+            log._buffer._con.execute(
+                "UPDATE claim SET expires_at = 1 WHERE id = ?", (stalled.row_id,)
+            )
+
+        assert not stalled.held()
+        assert not stalled.renew(), "an expired claim renewed itself"
