@@ -510,3 +510,31 @@ def test_detaching_and_reattaching_keeps_the_archive(
         assert sorted(merged.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1)), (
             "every row must still be readable after a detach and reattach"
         )
+
+
+def test_a_sibling_prefix_is_not_mistaken_for_this_one(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`s3://b/one` is a string prefix of `s3://b/one-more`.
+
+    The archive's catalog entry is checked against the prefix asked for, and a
+    bare `startswith` accepts a sibling's entry as this log's — so a log
+    re-pointed from `one-more` to `one` would keep reading and writing into
+    `one-more`, which is a neighbour it was explicitly pointed away from.
+    """
+    sibling, target = f"s3://{bucket}/one-more", f"s3://{bucket}/one"
+    fs = filesystem(s3)
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.set_archive(sibling)
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        assert len(fs.find(sibling.removeprefix("s3://"))) > 0
+
+        log.set_archive(target)
+        log.sync()
+
+        where = log._archive.require().metadata_location
+        assert where.startswith(f"{target}/"), (
+            f"a sibling prefix was mistaken for this one: {where}"
+        )

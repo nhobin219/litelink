@@ -227,7 +227,12 @@ class LogTable:
             # both are repaired the same way.
             table = None
 
-        if table is not None and not table.metadata_location.startswith(prefix):
+        # On a separator, not a bare prefix: `s3://b/one` is a prefix of
+        # `s3://b/one-more` as a string, so a plain `startswith` accepts a
+        # SIBLING archive's entry as this one's — and the log then reads and
+        # writes into the neighbour it was pointed away from.
+        boundary = prefix.rstrip("/") + "/"
+        if table is not None and not table.metadata_location.startswith(boundary):
             # Another archive's table, found by table id. The entry goes; the
             # objects do not, because detaching an archive is not deleting one.
             catalog.drop_table(layout.table_id)
