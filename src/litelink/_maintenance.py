@@ -201,7 +201,7 @@ class Maintenance:
         self._sort_by = sort_by
 
     def run(self, heartbeat: Callable[[], bool] | None = None) -> None:
-        """The three passes, with a checkpoint between them.
+        """The local passes, with a checkpoint between them.
 
         `heartbeat` renews the caller's claim and reports whether it still
         holds it. A pass is long — a compaction of 540 files measured 20 s
@@ -229,11 +229,12 @@ class Maintenance:
     def archived_through(self) -> int:
         """Highest offset the archive is known to hold, 0 if none (§5, I4).
 
-        One number rather than a set, because data files cover contiguous
-        non-overlapping ranges and sync pushes them in offset order: what the
-        archive has is always a prefix. It is the watermark I4 is stated in
-        terms of — "never evict a file the archive still lacks" — and the
-        record sync leaves for `evict` to read.
+        A prefix, always: files cover contiguous non-overlapping ranges (§4)
+        and `sync` pushes them in order, so one integer describes it.
+
+        Cached in `meta` rather than read from the archive, so eviction can ask
+        a keyed read instead of a network round trip to find out what it may
+        drop.
         """
         recorded = self._buffer.get_meta(self.ARCHIVED_KEY)
 
@@ -450,16 +451,15 @@ class Maintenance:
         if boundary <= 0:
             return
 
-        # I4, and the only line in this pass that is correctness rather than
-        # housekeeping: a file the archive still lacks must not leave the local
-        # table, because with an archive configured the local copy is not the
+        # I4: a file the archive still lacks must not leave the local table,
+        # because with an archive configured the local copy stops being the
         # only one only once sync says so. Clamped rather than skipped, so a
         # sync that is arbitrarily far behind delays eviction instead of
         # stopping it — §5's "lazy, restartable" applies here too.
         #
-        # With no archive there is no watermark and none is owed: §8 says
-        # `local_retention` is then a deletion policy over the only copy, which
-        # is the contract the operator asked for.
+        # With no archive there is nothing owed: §8 says `local_retention` is
+        # then a deletion policy over the only copy, which is the contract the
+        # operator asked for.
         if self._archive.configured():
             boundary = min(boundary, self.archived_through())
             if boundary <= 0:

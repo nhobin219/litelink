@@ -327,6 +327,77 @@ keeps serving reads; it accumulates unregistered files.
 
 ---
 
+## 4a. Concurrency between the maintenance passes
+
+Everything after the seal reads the file list, does slow work based on what it read, and
+commits. The catalog's compare-and-swap makes each **commit** atomic, but it does not make
+that sequence **isolated**: an operation can have its premise invalidated while it works,
+and its retry is what makes the stale result land. `compact` documents the case — a handle
+predating another owner's eviction still lists the files it removed, merging them re-adds
+the rows, and `_commit` reloads and lands exactly that.
+
+A lock over each pass fixes it and is the wrong trade: the slow part is reading and writing
+Parquet and uploading, none of which touches the catalog. What the passes actually need is
+narrower, and it follows from the data model rather than from a lock.
+
+**Offsets are immutable and files cover contiguous non-overlapping ranges (§4), so two
+operations on disjoint ranges commute.** Whether they are disjoint is a comparison of two
+integers. The exclusion is interval arithmetic, not mutual exclusion.
+
+### What each pair actually needs
+
+| pair | why it is safe |
+|---|---|
+| seal ∥ anything | the seal appends above every range the others touch |
+| compact ∥ evict | eviction stays below every in-flight merge's `lo` |
+| compact ∥ compact | each claims a distinct run and skips runs already claimed |
+| compact ∥ sync | a merge must not span into what sync is archiving, and vice versa |
+| sync ∥ sync | `register` declines a range the archive already covers |
+| evict ∥ expire | both are metadata commits; CAS orders them and both are idempotent |
+
+`compact ∥ sync` is the one that is a correctness matter rather than wasted work.
+Compaction skips files at or below the archive watermark, so a merged file cannot span into
+the archived range — unless the watermark advances *while* it merges, which makes its
+inputs, chosen against the older watermark, include files sync has since archived. Pushing
+that merged file adds a range partially overlapping one the archive holds:
+`register`'s check declines only a range that is **entirely** covered, so a partial overlap
+is admitted and the archive returns duplicate rows.
+
+### The claim, and why it needs an expiry
+
+Range-disjointness answers "may these two run together". It cannot answer the question
+recovery has to ask: **is this in-flight record live work, or did that process die?**
+Nothing derived from the data answers that; only a deadline does.
+
+So every operation that owns a range writes a claim before its file exists (I2), and the
+claim carries an owner and an expiry:
+
+```
+claims(id, owner, expires_at, kind, lo, hi, rel_path)
+```
+
+One row per **operation** rather than one per **role**. Choosing work means skipping ranges
+a live claim covers; recovery means reclaiming an expired one and removing the file it
+named. The intent record and the lease become the same row — which is what allows several
+passes to run at once without any of them excluding the others by kind.
+
+**Three mechanisms, three jobs**, and none substitutes for another:
+
+- **compare-and-swap** in the catalog: the commit is atomic, and a racing commit is detected
+  rather than lost.
+- **range-disjointness**: two operations never work on the same offsets.
+- **owner and expiry on a claim**: in-flight or abandoned — the only question the data
+  cannot answer.
+
+### Rejected: one settled watermark for both
+
+An earlier version of this section had a single `settled_through` that compaction worked
+above and eviction at or below. It does not survive: "settled enough to archive" needs the
+trailing run held back, because compaction may still merge it and archiving a file that is
+about to be replaced is waste — while "safe to evict" must have no such holdback, or a
+quiet stream that never fills a compaction target never settles and `local_retention` stops
+removing anything at all. One number cannot mean both.
+
 ## 5. Sync
 
 Independent, lazy, restartable, arbitrarily far behind. No read depends on it.

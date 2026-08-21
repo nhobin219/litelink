@@ -641,11 +641,11 @@ class Log:
             )
 
     def archived_through(self) -> int:
-        """Highest offset the archive is known to hold, 0 if none (§5, I4).
+        """Highest offset the archive holds, 0 if none (§5, I4).
 
-        The lag between this and `end_offset` is how far sync is behind, which
-        is what an operator watches: I4 will not evict past this line, so a
-        stalled sync shows up first as local disk that stops being reclaimed.
+        Eviction never goes above it, so the lag between this and `end_offset`
+        is what an operator watches: a stalled sync shows up first as local
+        disk that stops being reclaimed.
         """
         return self._maintenance.archived_through()
 

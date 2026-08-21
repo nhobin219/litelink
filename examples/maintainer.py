@@ -98,7 +98,12 @@ def compact_pass(log: Log) -> str | None:
 
 
 def reclaim_pass(log: Log, root: Path) -> str | None:
-    """Evict past `local_retention`, expire snapshots, delete what came due."""
+    """Settle, evict past `local_retention`, expire, delete what came due.
+
+    Settling first because eviction never goes above the watermark (§4a), and
+    on a log with no archive nothing else moves it — `sync` is the step that
+    moves it when there is one, and does not run here.
+    """
     before = log.table_files()
     log.evict()
     log.expire()
