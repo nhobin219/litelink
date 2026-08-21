@@ -21,7 +21,7 @@ from litelink import Log
 from litelink._s3 import S3Options
 
 
-def snapshot(log: Log, remote: tuple[int, int]) -> tuple[int, int, int, int, int, int]:
+def snapshot(log: Log) -> tuple[int, int, int, int, int]:
     """(stream, table rows, buffer rows, local files, archived, remote files).
 
     Nothing here scans data. Iceberg tracks a row count per file, so the table's
@@ -32,12 +32,9 @@ def snapshot(log: Log, remote: tuple[int, int]) -> tuple[int, int, int, int, int
     reads the offset column out of every Parquet file, so the poll got slower as
     the log grew — 24 ms at 50,000 rows and climbing. This is flat.
 
-    The archive file count is the exception, so it is refreshed only when the
-    watermark moves. That local number changes exactly when `sync` commits,
-    which is exactly when the archive can have gained files — so the signal is
-    free, and a tick that has nothing new to report costs no round trip. Asking
-    every tick took the read from 8 ms to 300 ms and buried the local latency
-    this is here to show.
+    Everything here is local and free, which is what lets the `read` column
+    mean something. The archive's file count is neither, so it is not in here —
+    see `ArchiveCount`.
 
     With an archive, `table + buffer` stops being the whole stream: eviction
     removes files the archive has, so the local tiers SHRINK while the stream
@@ -46,17 +43,39 @@ def snapshot(log: Log, remote: tuple[int, int]) -> tuple[int, int, int, int, int
     appended, whichever tier now holds it. The watermark says how much of that
     the archive has taken, and the gap between them is how far sync is behind.
     """
-    archived = log.archived_through()
-    seen, files = remote
-
     return (
         log.end_offset() - 1,
         log.table_rows(),
         log.buffered_rows(),
         log.table_files(),
-        archived,
-        files if archived == seen else log.archive_files(),
+        log.archived_through(),
     )
+
+
+class ArchiveCount:
+    """How many files the archive holds, fetched only when it can have changed.
+
+    Counting what object storage holds means asking object storage, so this is
+    the one number in the display that is not free — asking every tick took the
+    read from 8 ms to 300 ms and buried the local latency the `read` column is
+    there to show.
+
+    The watermark is the signal. It is a local read, and it moves exactly when
+    `sync` commits, which is exactly when the archive can have gained files. So
+    a tick with nothing new to report costs no round trip, and one that does
+    pays for it once.
+    """
+
+    def __init__(self) -> None:
+        self._watermark = -1
+        self._files = 0
+
+    def at(self, log: Log, watermark: int) -> int:
+        if watermark != self._watermark:
+            self._watermark = watermark
+            self._files = log.archive_files()
+
+        return self._files
 
 
 def main() -> None:
@@ -82,13 +101,12 @@ def main() -> None:
     )
 
     previous = 0
-    # (watermark the count was taken at, the count) — see `snapshot`.
-    remote_at = (-1, 0)
+    archive = ArchiveCount()
     try:
         while True:
             started = time.monotonic()
-            total, table, buffered, files, archived, remote = snapshot(log, remote_at)
-            remote_at = (archived, remote)
+            total, table, buffered, files, archived = snapshot(log)
+            remote = archive.at(log, archived) if log.archive else 0
             elapsed_ms = (time.monotonic() - started) * 1000
 
             delta = f"+{total - previous:,}" if total > previous else ""
