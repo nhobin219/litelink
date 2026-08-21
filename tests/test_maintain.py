@@ -1054,3 +1054,23 @@ def test_compaction_will_not_merge_across_the_archive_frontier(
             "no file may span the frontier, or the archive gets it twice"
         )
         assert log.scan().read_all().num_rows == 1200
+
+
+def test_repointing_clears_the_archive_frontier(tmp_path: Path) -> None:
+    """The frontier names a range the PREVIOUS archive may hold.
+
+    Compaction reads it to decide which files are already the archive's
+    business. Carried across a re-point it would go on refusing to merge files
+    the new archive has never seen — conservative rather than unsafe, but
+    permanently so, because nothing else ever lowers it.
+    """
+    config = LogConfig(target_seal_size=4096, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(400))
+        log.seal_due()
+        log._buffer.set_meta("archive_pending", "999999")
+        assert log._maintenance.archive_frontier() == 999999
+
+        log.set_archive("s3://bucket/somewhere-new")
+
+        assert log._maintenance.archive_frontier() == 0
