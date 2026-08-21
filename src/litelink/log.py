@@ -40,6 +40,7 @@ from litelink._maintenance import (
     stable_prefix,
 )
 from litelink._read import Reader, duckdb_connection
+from litelink._replication import litestream_config
 from litelink._s3 import S3Options
 from litelink._table import LogTable
 from litelink._types import validate_schema
@@ -184,6 +185,19 @@ class LogConfig:
     # a log breaching its floors to stay under a cap is misconfigured and
     # should say so rather than quietly serving every read from object storage.
     local_rows: int | None = None
+
+    # §3a. Continuous WAL shipping, which is the ONLY thing bounding RPO now
+    # that the seal has no timer: a stream that goes quiet holds its last
+    # partial file's worth of rows indefinitely.
+    #
+    # A declaration rather than a supervisor. It is read — `write_replication_
+    # config` needs it, and validation refuses it without an archive to
+    # replicate to — but litelink never starts the sidecar. That is a separate
+    # process reading the WAL, which is exactly why replication does not put
+    # the network in the write path, and litestream is explicit that two
+    # instances must never replicate one database. Supervising it belongs in
+    # deployment code, where it is visible: see `examples/maintainer.py`.
+    wal_replication: bool = False
     # §6/§8. Must exceed the longest scan: expiry deletes files an open scan is
     # still reading (I6).
     snapshot_retention: timedelta = timedelta(hours=1)
@@ -209,6 +223,7 @@ class LogConfig:
                     else self.local_retention.total_seconds()
                 ),
                 "local_rows": self.local_rows,
+                "wal_replication": self.wal_replication,
                 "snapshot_retention": self.snapshot_retention.total_seconds(),
                 "compact_min_files": self.compact_min_files,
             }
@@ -243,6 +258,7 @@ class LogConfig:
                 else timedelta(seconds=retention)
             ),
             local_rows=raw.get("local_rows", defaults.local_rows),
+            wal_replication=raw.get("wal_replication", defaults.wal_replication),
             snapshot_retention=(
                 defaults.snapshot_retention
                 if snapshots is None
@@ -565,6 +581,33 @@ class Log:
         (§3a); a library that supervised it would.
         """
         return self._layout.databases
+
+    def replication_config(self) -> str:
+        """A litestream config for this log (§3a).
+
+        Derived, not configured: the file set is `databases`, the destination
+        is `_wal` beside the archived data, and the endpoint comes from the
+        credentials this log was opened with. Everything a hand-written config
+        would have to restate, and each of those a way to get it silently
+        wrong.
+        """
+        if self._archive.uri is None:
+            msg = "replication needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        return litestream_config(self.databases, self._archive.uri, self._archive.s3)
+
+    def write_replication_config(self) -> Path:
+        """Write that config next to the log, and return where.
+
+        Beside the data rather than at a configured path, for the same reason
+        every other path is derived: a setting for it would be one more thing
+        to keep in step with the log it describes.
+        """
+        destination = self._layout.root / "litestream.yml"
+        destination.write_text(self.replication_config())
+
+        return destination
 
     @property
     def archive(self) -> str | None:
@@ -1616,6 +1659,13 @@ def validate(
         msg = (
             "local_retention=0 means 'evict on upload' and presupposes an "
             "archive; with archive=None it would delete each file as it sealed"
+        )
+        raise ValueError(msg)
+
+    if config.wal_replication and archive is None:
+        msg = (
+            "wal_replication needs an archive: WAL segments go beside the "
+            "archived data, and a local-only log has nowhere to ship them"
         )
         raise ValueError(msg)
 

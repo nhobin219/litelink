@@ -52,6 +52,13 @@ def main() -> None:
     )
     # Only meaningful with an archive: it is how long a file stays on local
     # disk AFTER the archive has it, and I4 will not let it be evicted before.
+    # Off by default because it needs a binary the demo does not install. With
+    # it on, the maintainer writes the config and runs the sidecar itself.
+    parser.add_argument(
+        "--replicate",
+        action="store_true",
+        help="ship the WAL continuously (needs litestream on PATH, and --archive)",
+    )
     parser.add_argument(
         "--local-retention",
         type=float,
@@ -73,6 +80,7 @@ def main() -> None:
         local_retention=(
             timedelta(seconds=args.local_retention) if args.archive else None
         ),
+        wal_replication=args.replicate,
     )
 
     # new() creates and takes the shape; open() recovers it. A service that
@@ -105,6 +113,9 @@ def main() -> None:
     print("appending only — `just demo-maintain` seals and reclaims disk")
     if args.archive:
         print(f"archiving to {args.archive} once files are sealed and settled")
+
+    if args.replicate:
+        print("WAL replication on — `just demo-maintain` runs the sidecar")
 
     print("`just demo-tail` watches. Until a maintainer runs, rows stay buffered")
     print("and readable; nothing is lost by starting it late.\n")

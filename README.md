@@ -140,6 +140,27 @@ just demo-tail         # in a third: watch where the rows are
 just bench --quick     # write and read throughput on your hardware
 ```
 
+Local only, no network. To add the archive tier against a local S3-compatible store:
+
+```
+just rustfs            # object storage in one container
+just demo-archive      # capture, with an archive configured
+just demo-maintain     # also pushes to it, and evicts what it has pushed
+```
+
+**Against a real AWS bucket**, nothing changes but the environment:
+
+```
+cp examples/.env.example .env    # set LITELINK_ARCHIVE=s3://your-bucket/prefix
+just demo-archive
+just demo-maintain
+```
+
+Credentials are not in that file unless you put them there. The library reads them from
+the environment at the point of use through the ordinary AWS chain, so a profile, instance
+metadata or SSO all work untouched — and a log directory, which gets copied and attached
+elsewhere, never carries a key with it.
+
 See [`examples/`](examples/).
 
 ## Development

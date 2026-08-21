@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
+import subprocess
 import time
 from pathlib import Path
 
@@ -83,22 +85,115 @@ def main() -> None:
     )
     print("run alongside `just demo-capture`. Ctrl-C to hand the leases back.\n")
 
+    # SIGTERM, not just Ctrl-C. Python does not unwind on it — the process
+    # simply stops — so without this the `finally` below never runs and a
+    # supervisor stopping this service (systemd, `docker stop`, a `kill` from a
+    # deploy script) leaves litestream running against a database the next
+    # maintainer is about to start replicating. Two instances on one database
+    # is the one thing litestream says never to do, and it is reachable the
+    # ordinary way a process is stopped. Observed: two orphans accumulated in
+    # testing before this was here.
+    signal.signal(signal.SIGTERM, _stop)
+
+    sidecar = Sidecar(log) if log.config.wal_replication else None
+    if sidecar is not None:
+        print(f"replicating the WAL — config at {sidecar.config}")
+
     # One thread, one loop, two calls at two cadences. Nothing here is a
     # daemon, nothing is signalled, and stopping is just leaving the loop.
     due = 0.0
     try:
         while True:
             log.seal_due()
+            if sidecar is not None:
+                sidecar.keep_running()
+
             due += args.seal_every
             if due >= args.maintain_every:
                 due = 0.0
                 _maintain(log, args.root)
 
             time.sleep(args.seal_every)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         print("\nreleasing the seal and maintain leases")
     finally:
+        if sidecar is not None:
+            sidecar.stop()
+
         log.close()
+
+
+def _stop(signum: int, frame: object) -> None:
+    """Turn a signal into an exception, so the cleanup path is the same one.
+
+    `SystemExit` rather than a flag the loop checks: the loop spends most of
+    its time in `sleep`, and a flag would leave the sidecar running until the
+    current interval elapsed.
+    """
+    raise SystemExit(128 + signum)
+
+
+class Sidecar:
+    """Runs litestream alongside this process, and restarts it if it dies.
+
+    **Here rather than in the library, on purpose.** Replication is a separate
+    process reading the WAL — that is what keeps the network out of the write
+    path — and supervising one means process lifecycle: restarts, orphan
+    reaping, shutdown ordering. A library doing that would also risk the one
+    thing litestream is explicit about, which is that two instances must never
+    replicate the same database: a maintainer killed with SIGKILL holds its
+    lease for the full TTL and orphans its child, so whoever takes the lease
+    next would start a second against the same file.
+
+    None of that goes away by being here. It becomes visible and editable, in
+    the file that already decides how often to seal — and if this shape does
+    not suit a deployment, `litestream replicate -config` against the same
+    generated file is the alternative, with nothing to change in the log.
+
+    Note what this couples: replication now lives as long as the MAINTAINER,
+    while the rows it protects come from the WRITER. A deployment that runs a
+    writer with no maintainer has `wal_replication=True` and no replication,
+    which is the strongest argument for running the sidecar independently.
+    """
+
+    def __init__(self, log: Log) -> None:
+        self.config = log.write_replication_config()
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def keep_running(self) -> None:
+        """Start it, or restart it if it has exited. Called every pass.
+
+        Polled rather than signalled, because the loop is already polling and a
+        second mechanism to notice a dead child would be a thread whose only
+        job is to wait.
+        """
+        if self._process is not None and self._process.poll() is None:
+            return
+
+        if self._process is not None:
+            print(f"  litestream exited ({self._process.returncode}), restarting")
+
+        try:
+            self._process = subprocess.Popen(  # noqa: S603
+                ["litestream", "replicate", "-config", str(self.config)],  # noqa: S607
+            )
+        except FileNotFoundError:
+            raise SystemExit(
+                "wal_replication is on but litestream is not on PATH — "
+                "see https://litestream.io/install"
+            ) from None
+
+    def stop(self) -> None:
+        """Terminate it, and wait. An orphan would keep replicating the same
+        database the next maintainer is about to start replicating."""
+        if self._process is None or self._process.poll() is not None:
+            return
+
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
 
 
 def _maintain(log: Log, root: Path) -> None:

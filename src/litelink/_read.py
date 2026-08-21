@@ -14,6 +14,7 @@ import duckdb
 import pyarrow as pa
 
 from litelink._archive import Archive
+from litelink._s3 import S3Options
 from litelink._types import column_type
 
 if TYPE_CHECKING:
@@ -32,6 +33,45 @@ BUFFER_REL = "buf_tail"
 
 # The library-owned column (§2), which the boundary filters on.
 OFFSET = "litelink_offset"
+
+
+def secret_sql(options: S3Options) -> str:
+    """DuckDB's spelling of the same credentials pyiceberg was given.
+
+    Separate from the query path so it can be tested without object storage —
+    the fault it exists to prevent only appeared against real AWS, where writes
+    worked and every `include_archive` read came back 403.
+    """
+    parts = ["TYPE s3"]
+    if options.access_key is not None and options.secret_key is not None:
+        parts.append(f"KEY_ID '{options.access_key}'")
+        parts.append(f"SECRET '{options.secret_key}'")
+    else:
+        # Nothing explicit means the credentials live where every AWS tool
+        # looks for them: a profile, instance metadata, SSO. pyiceberg and s3fs
+        # resolve those themselves, so WRITES worked while reads got a secret
+        # with no keys — which DuckDB treats as anonymous, so a log on an
+        # ordinary AWS host archived happily and answered every archive read
+        # with 403. A local endpoint never showed it, because there the keys
+        # are always passed explicitly.
+        #
+        # `credential_chain` is DuckDB's equivalent of that resolution. The
+        # else-branch rather than the default, because an explicit key must
+        # still win — see `S3Options.resolved`.
+        parts.append("PROVIDER credential_chain")
+
+    if options.region is not None:
+        parts.append(f"REGION '{options.region}'")
+
+    if options.endpoint is not None:
+        # DuckDB wants host:port with the scheme carried by USE_SSL, unlike
+        # pyiceberg which takes a URL. One S3Options, two spellings.
+        without_scheme = options.endpoint.split("://", 1)[-1]
+        parts.append(f"ENDPOINT '{without_scheme}'")
+        parts.append(f"USE_SSL {str(options.endpoint.startswith('https')).lower()}")
+        parts.append("URL_STYLE 'path'")
+
+    return f"CREATE OR REPLACE SECRET litelink_s3 ({', '.join(parts)})"
 
 
 def duckdb_connection() -> duckdb.DuckDBPyConnection:
@@ -107,26 +147,7 @@ class Reader:
             self._connect().execute("LOAD httpfs")
             self._remote_ready = True
 
-        options = self._archive.s3.resolved()
-        parts = ["TYPE s3"]
-        if options.access_key is not None:
-            parts.append(f"KEY_ID '{options.access_key}'")
-
-        if options.secret_key is not None:
-            parts.append(f"SECRET '{options.secret_key}'")
-
-        if options.region is not None:
-            parts.append(f"REGION '{options.region}'")
-
-        if options.endpoint is not None:
-            # DuckDB wants host:port with the scheme carried by USE_SSL, unlike
-            # pyiceberg which takes a URL. One S3Options, two spellings.
-            without_scheme = options.endpoint.split("://", 1)[-1]
-            parts.append(f"ENDPOINT '{without_scheme}'")
-            parts.append(f"USE_SSL {str(options.endpoint.startswith('https')).lower()}")
-            parts.append("URL_STYLE 'path'")
-
-        cursor.execute(f"CREATE OR REPLACE SECRET litelink_s3 ({', '.join(parts)})")
+        cursor.execute(secret_sql(self._archive.s3.resolved()))
 
         return archive.metadata_location
 
