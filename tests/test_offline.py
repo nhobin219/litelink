@@ -133,7 +133,7 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
             pa.field("payload", pa.string()),
         ])
         config = LogConfig(
-            target_size=4096,
+            target_seal_size=4096,
                 compact_min_files=2,
             snapshot_retention=timedelta(microseconds=1),
         )

@@ -53,7 +53,7 @@ def test_one_log_survives_being_passed_around_a_thread_pool(tmp_path: Path) -> N
     which is exactly what `asyncio.to_thread` does, and exactly what
     `check_same_thread=True` would forbid.
     """
-    config = LogConfig(target_size=8 * 1024, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=8 * 1024, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = []
@@ -76,7 +76,7 @@ def test_appends_and_reads_interleave_without_loss(tmp_path: Path) -> None:
     buffer delete a row is in both tiers, and the boundary excludes it from
     one.
     """
-    config = LogConfig(target_size=8 * 1024, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=8 * 1024, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         stop = threading.Event()
         failures: list[str] = []
@@ -134,7 +134,7 @@ def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
     Forced here rather than raced: the seal runs inside the buffer read, which
     is exactly the interleaving that is otherwise a matter of luck.
     """
-    config = LogConfig(target_size=2 * 1024, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=2 * 1024, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         # Both legs must be non-empty, or the union takes its buffer-only
         # branch and the boundary never enters into it.
@@ -184,7 +184,7 @@ def test_a_reader_is_not_destroyed_by_the_next_query(tmp_path: Path) -> None:
     an independent connection over the same database, with its own
     registrations and temp views.
     """
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         log.extend(rows(200))
 

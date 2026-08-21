@@ -1,6 +1,6 @@
 """The seal queue: where the cut is made, and by whom (SPEC §4).
 
-`target_size` is the library's one promise about file size, and a running byte
+`target_seal_size` is the library's one promise about file size, and a running byte
 counter cannot keep it. A counter says a threshold was crossed, never where —
 so a sealer that polls one cuts wherever the buffer has reached by the time it
 looks, and the file it writes measures how far behind the sealer was rather
@@ -75,7 +75,7 @@ def quiet(**kwargs: object) -> LogConfig:
     exactly as the appends left it.
     """
     settings: dict[str, object] = {
-        "target_size": TARGET,
+        "target_seal_size": TARGET,
         "snapshot_retention": timedelta(days=1),
     }
     settings.update(kwargs)
@@ -182,7 +182,7 @@ def test_an_explicit_seal_cuts_its_own_rows_whatever_else_is_running(
     in a deployment; the lease cannot tell the difference — because competition
     is what made it reproduce.
     """
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         stop = threading.Event()
 
@@ -222,7 +222,7 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
     """
     # A target nothing crosses, so the only cut is the explicit one below and
     # the group covers every row.
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         log.extend(rows(100))
 
@@ -267,7 +267,7 @@ def test_a_quiet_stream_keeps_its_rows_in_the_buffer(tmp_path: Path) -> None:
     with open_log(tmp_path, quiet()) as log:
         log.extend(rows(3))
 
-        assert log.seal_due() is None, "sealed without reaching target_size"
+        assert log.seal_due() is None, "sealed without reaching target_seal_size"
         assert log._table.data_files() == [], "wrote an undersized file"
         assert log.buffered_rows() == 3, "the rows went somewhere else"
         assert len(log.scan().read_all()) == 3, "buffered rows must still read"
@@ -370,7 +370,7 @@ def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> No
     "database disk image is malformed", with a torn -shm mmap raising SIGBUS.
     """
     config = LogConfig(
-        target_size=TARGET,
+        target_seal_size=TARGET,
         snapshot_retention=timedelta(days=1),
     )
     with open_log(tmp_path, config) as log:
@@ -418,7 +418,7 @@ def test_a_retried_seal_takes_a_new_name_and_queues_the_old(tmp_path: Path) -> N
     name. The abandoned attempt is queued for deletion BEFORE the claim is
     replaced, which is what keeps every file on disk reachable from SQLite.
     """
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         log.extend(rows(50))
         log._buffer.close_open_group()
@@ -460,7 +460,7 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
     loser's retry does nothing — and a writer arriving afterwards never
     attempts at all.
     """
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         log.extend(rows(60))
         end = log.seal()
@@ -475,14 +475,14 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(log._table.data_files()[0].path, dest)
 
-        log._table.register(str(dest), sealed_through=end)
+        log._table.register([str(dest)], sealed_through=end)
 
         assert log.table_files() == 1, "a second file for the same range landed"
         assert log.table_rows() == 60, "rows were duplicated"
 
 
 def test_the_seal_cuts_on_whichever_limit_is_reached_first(tmp_path: Path) -> None:
-    """§7's other half, and the one `target_size` cannot express.
+    """§7's other half, and the one `target_seal_size` cannot express.
 
     Buffer cost is per ROW — SQLite is row-oriented — so a narrow-row stream
     reaches a byte target only after far more rows than the read-latency
@@ -490,7 +490,7 @@ def test_the_seal_cuts_on_whichever_limit_is_reached_first(tmp_path: Path) -> No
     fine. Bytes bound memory, rows bound read latency, and both are ceilings on
     one file, so the tighter one wins.
     """
-    config = quiet(target_size=1 << 30, target_rows=10)
+    config = quiet(target_seal_size=1 << 30, target_seal_rows=10)
     with open_log(tmp_path, config) as log:
         log.extend(rows(25))
 
@@ -505,12 +505,21 @@ def test_the_seal_cuts_on_whichever_limit_is_reached_first(tmp_path: Path) -> No
 def test_a_row_capped_cut_is_not_undone_by_compaction(tmp_path: Path) -> None:
     """The half that is easy to miss.
 
-    A file cut on the row limit holds fewer BYTES than `target_size`, so judged
-    by bytes alone it looks starved — and compaction would merge exactly the
-    files the row cap just created, straight back past it. Whichever ceiling
-    the seal respected, compaction respects too.
+    A file cut on the row limit holds fewer BYTES than `target_seal_size`, so
+    judged by bytes alone it looks starved — and compaction would merge exactly
+    the files the row cap just created, straight past the ceiling. Compaction
+    respects a row ceiling as the seal does; the only difference is which one,
+    since conversion aims at a larger file than a seal does.
     """
-    config = quiet(target_size=1 << 30, target_rows=10, compact_min_files=2)
+    config = quiet(
+        target_seal_size=1 << 30,
+        target_seal_rows=10,
+        # Equal to the seal's, so this is about the ceiling being respected
+        # rather than about the conversion. Left to default it would be eight
+        # times larger and these files would merge — correctly.
+        target_compact_rows=10,
+        compact_min_files=2,
+    )
     with open_log(tmp_path, config) as log:
         log.extend(rows(40))
         log.seal_due()
@@ -520,5 +529,5 @@ def test_a_row_capped_cut_is_not_undone_by_compaction(tmp_path: Path) -> None:
         log.maintain()
 
         after = log._table.data_files()
-        assert len(after) == before, "compaction must not merge past target_rows"
+        assert len(after) == before, "compaction must not merge past the ceiling"
         assert all(f.rows <= 10 for f in after)

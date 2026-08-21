@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     from types import TracebackType
     from typing import Self
 
+    from litelink._table import DataFile
+
     Row = Mapping[str, object]
 
 # Keys in the buffer's `meta` table (§2). These hold what the Iceberg table
@@ -72,6 +74,18 @@ MAINTAIN_ROLE = "maintain"
 _CONFIG_KEY = "config"
 _ARCHIVE_KEY = "archive"
 _SCHEMA_KEY = "arrow_schema"
+
+
+# How much larger a compacted file is than a sealed one, when nothing says.
+#
+# The two are at odds by nature: §7 wants the seal small because the buffer is
+# what a hot read scans, and both object storage and Parquet want files large.
+# Eight is chosen to be comfortably past the point where per-file overhead
+# dominates — measured at 44 ms to read the offset boundary over 64 files
+# against 1.0 ms over one — while keeping compaction's peak memory, which is
+# one run held as a single Arrow table, to something a maintainer process can
+# hold. On the default 8 MiB seal that is 64 MiB.
+COMPACT_MULTIPLE = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +143,7 @@ class LogConfig:
     # may eventually need `min(target_size, target_rows)` —
     # deliberately not added now, on one knob until a real workload demands the
     # second.
-    target_size: int = 8 * 1024 * 1024
+    target_seal_size: int = 8 * 1024 * 1024
     # The second half of §7's argument, and the one `target_size` cannot make.
     # Buffer cost is per ROW — SQLite is row-oriented, 1.0 us/row at 20k and
     # 2.3 us/row at 180k — so a stream of 40-byte rows reaches 8 MiB at 200k
@@ -143,7 +157,66 @@ class LogConfig:
     #
     # None means no row limit, which is the right default: a narrow-row stream
     # is the case that needs this and a library cannot guess the row width.
-    target_rows: int | None = None
+    target_seal_rows: int | None = None
+
+    # §6. How big a file should END UP, which is not the same question as how
+    # much may sit in the buffer, and the two pull in opposite directions.
+    #
+    # §7 wants the seal SMALL: the buffer is what a hot read scans, so its size
+    # is read latency. The archive wants files LARGE: measured against S3, a
+    # 9 kB file takes 648 ms to upload and almost all of that is the round
+    # trip, so halving file size doubles the cost of archiving the same stream.
+    # One knob cannot serve both — it did, and compaction could therefore never
+    # produce a file bigger than a seal, which is why it was a no-op.
+    #
+    # Splitting them gives compaction a job: converting sealed chunks into
+    # archive-shaped ones. Eligibility follows for free — `sync` only takes
+    # files compaction has finished with, so raising this above the seal size
+    # means a freshly sealed file is a merge candidate and is not archived
+    # until it has been converted.
+    #
+    # The price is write amplification, and it is bounded rather than ongoing:
+    # every row is written twice locally, once at seal and once at compaction,
+    # and read once in between. Bounded because a converted file is already at
+    # the target, so it is never a candidate again — eight seals become one
+    # compacted file, once.
+    #
+    # None means `COMPACT_MULTIPLE` times the seal size, and the conversion is
+    # therefore ON by default even with no archive. A local-only log gets the
+    # same benefit at read time: file count is a measured cost here, not a
+    # reputation — reading the offset boundary from manifest statistics
+    # measured 1.0 ms over one file and 44 ms over 64.
+    #
+    # It is a MULTIPLE for a reason. Sealed files are uniform, so merging whole
+    # files lands exactly on the target when it divides and short when it does
+    # not: three 1 MiB files against a 4 MiB target give 3 MiB files for ever,
+    # 25% under what was asked for, with nothing to indicate why.
+    target_compact_size: int | None = None
+    target_compact_rows: int | None = None
+
+    @property
+    def compact_size(self) -> int:
+        """The file size compaction aims for.
+
+        `COMPACT_MULTIPLE` times the seal size unless set. On the 8 MiB default
+        seal that is 64 MiB of rows — under Parquet's usual advice once
+        compression is applied, and far above the size at which per-file
+        overhead dominates a scan.
+        """
+        return self.target_compact_size or self.target_seal_size * COMPACT_MULTIPLE
+
+    @property
+    def compact_rows(self) -> int | None:
+        """The row ceiling compaction respects. Scaled like `compact_size`, so
+        setting only the seal's row limit does not silently cap conversion at
+        one seal's worth."""
+        if self.target_compact_rows is not None:
+            return self.target_compact_rows
+
+        if self.target_seal_rows is None:
+            return None
+
+        return self.target_seal_rows * COMPACT_MULTIPLE
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
@@ -215,8 +288,10 @@ class LogConfig:
         """
         return json.dumps(
             {
-                "target_size": self.target_size,
-                "target_rows": self.target_rows,
+                "target_seal_size": self.target_seal_size,
+                "target_compact_size": self.target_compact_size,
+                "target_seal_rows": self.target_seal_rows,
+                "target_compact_rows": self.target_compact_rows,
                 "local_retention": (
                     None
                     if self.local_retention is None
@@ -250,8 +325,14 @@ class LogConfig:
         snapshots = raw.get("snapshot_retention")
 
         return cls(
-            target_size=raw.get("target_size", defaults.target_size),
-            target_rows=raw.get("target_rows", defaults.target_rows),
+            target_seal_size=raw.get("target_seal_size", defaults.target_seal_size),
+            target_compact_size=raw.get(
+                "target_compact_size", defaults.target_compact_size
+            ),
+            target_seal_rows=raw.get("target_seal_rows", defaults.target_seal_rows),
+            target_compact_rows=raw.get(
+                "target_compact_rows", defaults.target_compact_rows
+            ),
             local_retention=(
                 retention
                 if isinstance(retention, timedelta) or retention is None
@@ -419,8 +500,8 @@ class Log:
         buffer = Buffer.open(
             layout.buffer_db,
             schema,
-            target_size=settings.target_size,
-            target_rows=settings.target_rows,
+            target_size=settings.target_seal_size,
+            target_rows=settings.target_seal_rows,
         )
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
@@ -503,8 +584,8 @@ class Log:
         buffer = Buffer.open(
             layout.buffer_db,
             schema,
-            target_size=config.target_size,
-            target_rows=config.target_rows,
+            target_size=config.target_seal_size,
+            target_rows=config.target_seal_rows,
             readonly=read_only,
         )
         sort_by = table.sort_by()
@@ -555,7 +636,9 @@ class Log:
             # The buffer too, or `target_size` changes everywhere except where
             # the cut is actually made and the log quietly keeps sizing files
             # to the value it was opened with.
-            self._buffer.set_target_size(config.target_size, config.target_rows)
+            self._buffer.set_target_size(
+                config.target_seal_size, config.target_seal_rows
+            )
 
     def archived_through(self) -> int:
         """Highest offset the archive is known to hold, 0 if none (§5, I4).
@@ -581,6 +664,22 @@ class Log:
         (§3a); a library that supervised it would.
         """
         return self._layout.databases
+
+    def archive_files(self) -> int:
+        """How many data files the archive holds, or 0 with no archive.
+
+        A network round trip, unlike `table_files()`: it reloads the remote
+        table to answer. Paired with `table_files()` it is the two halves of
+        where the data is — local disk and object storage — which is otherwise
+        only visible as a watermark in offsets.
+        """
+        archive = self._archive.table()
+        if archive is None:
+            return 0
+
+        archive.reload()
+
+        return len(archive.data_files())
 
     def replication_config(self) -> str:
         """A litestream config for this log (§3a).
@@ -1068,7 +1167,7 @@ class Log:
         # `end` passed so the commit can decline if the range is already in
         # the table. The lease check above is the fence; this is what makes a
         # failure of that fence harmless rather than a duplicate.
-        if not self._table.register(str(dest), sealed_through=end):
+        if not self._table.register([str(dest)], sealed_through=end):
             # Declined: another owner already sealed this range, so this file
             # is redundant and will never be referenced. Queue it, or it joins
             # the one category this design has no way to find — a file on disk
@@ -1276,22 +1375,51 @@ class Log:
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
+        # The watermark is a cache of what the archive actually holds, so it is
+        # reconciled here rather than only advanced after a push. A commit that
+        # landed while the `meta` write after it did not would otherwise leave
+        # it behind for ever: the next pass computes `floor` from the archive
+        # itself, finds nothing left to push, and never revisits the number
+        # eviction depends on.
+        if covered is not None and self._maintenance.archived_through() < covered[1]:
+            self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(covered[1]))
 
         memory = self._maintenance.memory()
         pending = [f for f in self._table.data_files() if f.hi > floor]
         settled = stable_prefix(
             pending,
-            self.config.target_size,
+            self.config.compact_size,
             self.config.compact_min_files,
             memory,
-            self.config.target_rows,
+            self.config.compact_rows,
         )
 
+        uploaded: list[tuple[DataFile, str]] = []
         for data_file in pending[:settled]:
             checkpoint(lease.renew)
             rel_path = self._layout.relative(data_file.path)
             archive.put(self._layout.absolute(rel_path), rel_path)
-            archive.register(archive.uri(rel_path), sealed_through=data_file.hi + 1)
+            uploaded.append((data_file, rel_path))
+
+        if not uploaded:
+            return
+
+        # ONE commit for everything uploaded, because the commit is what costs.
+        # Measured against S3: 648 ms to upload a file and 4.1 s to register
+        # it, and registering does not get cheaper for holding one file instead
+        # of twenty — it reads a footer, writes a manifest, a manifest list and
+        # a fresh metadata.json whatever the count. Per file, that made `sync`
+        # take 83 s over sixteen files while the sealer sharing its thread
+        # waited, and the buffer grew for the whole of it.
+        checkpoint(lease.renew)
+        last = uploaded[-1][0]
+        if not archive.register(
+            [archive.uri(rel_path) for _, rel_path in uploaded],
+            sealed_through=last.hi + 1,
+        ):
+            return
+
+        for data_file, rel_path in uploaded:
             # The archive's copy holds what the local one did, and this is the
             # only moment both names are known. Nothing could re-derive it
             # afterwards: the local entry goes when the local file is unlinked,
@@ -1306,10 +1434,10 @@ class Log:
                     archive.uri(rel_path), data_file.lo, data_file.hi + 1, held
                 )
 
-            # After the register, never before: the watermark is a promise that
-            # the archive HAS the range, and I4 lets `maintain` delete the local
-            # copy on the strength of it.
-            self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(data_file.hi))
+        # After the register, never before: the watermark is a promise that the
+        # archive HAS the range, and I4 lets `maintain` delete the local copy on
+        # the strength of it.
+        self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(last.hi))
 
     def maintain(self) -> None:
         """Reclaim local storage: compact, evict, expire (§6, §8, §12).
@@ -1470,7 +1598,7 @@ class Log:
             # No `sealed_through`: that check exists to decline a range the
             # table already covers, and every range here is deliberately below
             # what it covers. The filter above is what prevents an overlap.
-            self._table.register(str(destination))
+            self._table.register([str(destination)])
             # An extent for the local copy, carrying what the archive's copy
             # holds. Restored data is subject to `local_retention` like
             # anything else, and eviction dates a file by this record — so a
@@ -1669,11 +1797,31 @@ def validate(
         )
         raise ValueError(msg)
 
-    if config.target_rows is not None and config.target_rows < 1:
+    if config.target_seal_rows is not None and config.target_seal_rows < 1:
         msg = (
-            f"target_rows must be at least 1: {config.target_rows}. "
+            f"target_seal_rows must be at least 1: {config.target_seal_rows}. "
             "It is the number of rows a file may hold, and a file has to hold "
             "the row that crossed the limit"
+        )
+        raise ValueError(msg)
+
+    if config.compact_size < config.target_seal_size:
+        msg = (
+            f"target_compact_size ({config.compact_size}) must be at least "
+            f"target_seal_size ({config.target_seal_size}): compaction converts "
+            "sealed files into larger ones, and a smaller target would ask it "
+            "to shrink a file it just merged, for ever"
+        )
+        raise ValueError(msg)
+
+    if (
+        config.compact_rows is not None
+        and config.target_seal_rows is not None
+        and config.compact_rows < config.target_seal_rows
+    ):
+        msg = (
+            f"target_compact_rows ({config.compact_rows}) must be at least "
+            f"target_seal_rows ({config.target_seal_rows}), for the same reason"
         )
         raise ValueError(msg)
 

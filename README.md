@@ -131,6 +131,32 @@ recent = log.scan(where="event_ts > 1000").read_all()
 log.maintain()                                        # compact, evict, expire
 ```
 
+## Sizing: two targets, not one
+
+A seal wants to be **small** and a file wants to be **large**, and one number cannot serve
+both:
+
+| | bounded by | wants to be | because |
+|---|---|---|---|
+| `target_seal_size` | the buffer | small | the buffer is what a hot read scans, so its size is read latency (§7) |
+| `target_compact_size` | a file on disk | large | per-file overhead dominates both scans and uploads |
+
+Compaction is what bridges them, and that is its whole job: converting sealed chunks into
+archive-shaped ones. It defaults to **8× the seal size**, so the conversion is on even
+without an archive — file count is a measured cost here, not a reputation. Reading the
+offset boundary from manifest statistics measured **1.0 ms over one file and 44 ms over
+64**, and uploading a 9 kB file to S3 took **648 ms**, nearly all of it round trip rather
+than bytes.
+
+The price is bounded write amplification: each row is written twice locally, once at seal
+and once at conversion, and never again — a converted file is already at the target, so it
+is not a candidate a second time. Set `target_compact_size` equal to the seal size to turn
+the conversion off.
+
+Keep it a **multiple** of the seal size. Sealed files are uniform, so merging whole files
+lands exactly on the target when it divides and short when it does not — three 1 MiB files
+against a 4 MiB target give 3 MiB files for ever.
+
 ## Try it
 
 ```

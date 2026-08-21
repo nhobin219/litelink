@@ -44,6 +44,7 @@ import argparse
 import os
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -95,6 +96,19 @@ def main() -> None:
     # testing before this was here.
     signal.signal(signal.SIGTERM, _stop)
 
+    # Maintenance runs on its own thread, and this is not a detail. `sync`
+    # talks to object storage, so it takes as long as the network takes —
+    # measured at 83 s for sixteen files before registration was batched, and
+    # still seconds after. Sealing is local, has to keep pace with the writer,
+    # and is the only thing that bounds how far the buffer grows. Sharing one
+    # thread meant a slow upload stopped sealing: the buffer reached 170,540
+    # rows while the table sat at 69,920, and the log looked stalled.
+    #
+    # Safe because the roles are separate leases and an owner is minted per
+    # attempt (see `Log._lease`), so the seal this loop runs and the seal
+    # inside `maintain()` exclude each other exactly as two processes would —
+    # one is simply refused.
+    worker: threading.Thread | None = None
     sidecar = Sidecar(log) if log.config.wal_replication else None
     if sidecar is not None:
         print(f"replicating the WAL — config at {sidecar.config}")
@@ -109,9 +123,12 @@ def main() -> None:
                 sidecar.keep_running()
 
             due += args.seal_every
-            if due >= args.maintain_every:
+            if due >= args.maintain_every and not pass_running(worker):
                 due = 0.0
-                _maintain(log, args.root)
+                worker = threading.Thread(
+                    target=_maintain, args=(log, args.root), daemon=True
+                )
+                worker.start()
 
             time.sleep(args.seal_every)
     except (KeyboardInterrupt, SystemExit):
@@ -121,6 +138,16 @@ def main() -> None:
             sidecar.stop()
 
         log.close()
+
+
+def pass_running(worker: threading.Thread | None) -> bool:
+    """Whether the last maintenance pass is still going.
+
+    Skipped rather than queued: passes are idempotent and the next one will
+    pick up whatever this one did not, so stacking them behind a slow upload
+    would only spend threads to arrive at the same place later.
+    """
+    return worker is not None and worker.is_alive()
 
 
 def _stop(signum: int, frame: object) -> None:

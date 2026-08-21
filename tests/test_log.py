@@ -184,11 +184,11 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
 def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None:
     """§4's size trigger, split across the two roles that own its halves.
 
-    Crossing `target_size` is the appender's business — it records the cut in
+    Crossing `target_seal_size` is the appender's business — it records the cut in
     the transaction that crosses it. Writing the file is the maintainer's, and
     `seal_due` is the call it makes. Neither half guesses what the other did.
     """
-    with open_log(tmp_path, LogConfig(target_size=512)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(40))
 
         assert log._buffer.pending_group() is not None, "the cut was not recorded"
@@ -201,7 +201,7 @@ def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None
 
 def test_a_synchronous_seal_is_available(tmp_path: Path) -> None:
     """Appending never seals. `seal()` is how a caller makes the table move."""
-    with open_log(tmp_path, LogConfig(target_size=512)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(40))
 
         assert log.table_extent() is None, "an append sealed on its own"
@@ -219,7 +219,7 @@ def test_rows_stay_readable_across_a_seal(tmp_path: Path) -> None:
     §7's boundary excludes it from one of them — which is why a seal can happen
     whenever a maintainer gets to it without a reader noticing.
     """
-    with open_log(tmp_path, LogConfig(target_size=512)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(60))
 
         for _ in range(10):
@@ -247,7 +247,7 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
 
     # The wrapper times from BEFORE acquire, so it counts waiting as holding.
     # Nothing else seals in this process, so there is nothing to wait behind.
-    config = LogConfig(target_size=1 << 30)
+    config = LogConfig(target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         log.extend(rows(400))
 
@@ -279,7 +279,7 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
 
 def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
     """`sealing` holds one row by design (§2), and two seals would overlap."""
-    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=1 << 30)) as log:
         log.extend(rows(50))
         held = log._lease("seal")
         assert held.acquire(), "could not simulate a seal in flight"
@@ -295,7 +295,7 @@ def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
 
 def test_close_waits_for_an_in_flight_seal(tmp_path: Path) -> None:
     """A seal holds a claim in `sealing`; letting it finish beats replaying it."""
-    log = open_log(tmp_path, LogConfig(target_size=512))
+    log = open_log(tmp_path, LogConfig(target_seal_size=512))
     log.extend(rows(60))
     log.close()
 
@@ -355,7 +355,7 @@ def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
     """
     import threading
 
-    config = LogConfig(target_size=2048, compact_min_files=2)
+    config = LogConfig(target_seal_size=2048, compact_min_files=2)
     failures: list[BaseException] = []
     stop = threading.Event()
 
@@ -439,20 +439,20 @@ def test_an_interrupt_inside_commit_is_not_masked(tmp_path: Path) -> None:
 def test_set_config_reaches_the_thing_that_makes_the_cut(tmp_path: Path) -> None:
     """§12 says policy can change under a running log. All of it, not most.
 
-    `target_size` decides where the appender cuts, and the appender is the
+    `target_seal_size` decides where the appender cuts, and the appender is the
     buffer — so a config update that stopped at `Log` left the log sizing
     files to whatever it was opened with, silently and for its whole life.
     """
-    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=1 << 30)) as log:
         log.extend(rows(40))
 
         assert log._buffer.pending_group() is None, "nothing should have crossed"
 
-        log.set_config(LogConfig(target_size=512))
+        log.set_config(LogConfig(target_seal_size=512))
         log.extend(rows(40, start=40))
 
         assert log._buffer.pending_group() is not None, (
-            "the new target_size never reached the buffer"
+            "the new target_seal_size never reached the buffer"
         )
 
 

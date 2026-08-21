@@ -21,8 +21,8 @@ from litelink import Log
 from litelink._s3 import S3Options
 
 
-def snapshot(log: Log) -> tuple[int, int, int, int, int]:
-    """(stream, table rows, buffer rows, data files, archived) — one moment.
+def snapshot(log: Log, remote: tuple[int, int]) -> tuple[int, int, int, int, int, int]:
+    """(stream, table rows, buffer rows, local files, archived, remote files).
 
     Nothing here scans data. Iceberg tracks a row count per file, so the table's
     total comes off the manifest read that produced the boundary; the buffer is
@@ -32,6 +32,13 @@ def snapshot(log: Log) -> tuple[int, int, int, int, int]:
     reads the offset column out of every Parquet file, so the poll got slower as
     the log grew — 24 ms at 50,000 rows and climbing. This is flat.
 
+    The archive file count is the exception, so it is refreshed only when the
+    watermark moves. That local number changes exactly when `sync` commits,
+    which is exactly when the archive can have gained files — so the signal is
+    free, and a tick that has nothing new to report costs no round trip. Asking
+    every tick took the read from 8 ms to 300 ms and buried the local latency
+    this is here to show.
+
     With an archive, `table + buffer` stops being the whole stream: eviction
     removes files the archive has, so the local tiers SHRINK while the stream
     only grows. `end_offset` is the count that keeps growing either way — it is
@@ -39,12 +46,16 @@ def snapshot(log: Log) -> tuple[int, int, int, int, int]:
     appended, whichever tier now holds it. The watermark says how much of that
     the archive has taken, and the gap between them is how far sync is behind.
     """
+    archived = log.archived_through()
+    seen, files = remote
+
     return (
         log.end_offset() - 1,
         log.table_rows(),
         log.buffered_rows(),
         log.table_files(),
-        log.archived_through(),
+        archived,
+        files if archived == seen else log.archive_files(),
     )
 
 
@@ -59,26 +70,32 @@ def main() -> None:
     log = Log.open(args.root, NAME, read_only=True, s3=S3Options())
     print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.")
     if log.archive:
-        print(f"archive: {log.archive} — `in table` falls as files are evicted")
+        print(f"archive: {log.archive}")
+        print("`files` is local disk, `arch files` is object storage — the first")
+        print("falls as the second rises, and `stream` counts every row either way")
 
     print()
-    archived_column = f" {'archived':>12}" if log.archive else ""
+    archived_column = f" {'archived':>12} {'arch files':>10}" if log.archive else ""
     print(
         f"{'stream':>12} {'in table':>12} {'in buffer':>12}"
         f"{archived_column} {'files':>7} {'read':>8}"
     )
 
     previous = 0
+    # (watermark the count was taken at, the count) — see `snapshot`.
+    remote_at = (-1, 0)
     try:
         while True:
             started = time.monotonic()
-            total, table, buffered, files, archived = snapshot(log)
+            total, table, buffered, files, archived, remote = snapshot(log, remote_at)
+            remote_at = (archived, remote)
             elapsed_ms = (time.monotonic() - started) * 1000
 
             delta = f"+{total - previous:,}" if total > previous else ""
             print(
                 f"{total:>12,} {table:>12,} {buffered:>12,}"
-                f"{f' {archived:>12,}' if log.archive else ''} {files:>7} "
+                f"{f' {archived:>12,} {remote:>10,}' if log.archive else ''}"
+                f" {files:>7} "
                 f"{elapsed_ms:>7.1f}ms  {delta}"
             )
             previous = total

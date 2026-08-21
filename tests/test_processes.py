@@ -91,7 +91,7 @@ def finish(process: subprocess.Popen[str], role: str) -> str:
 
 WRITER = """
     config = LogConfig(
-        target_size=TARGET,
+        target_seal_size=TARGET,
         compact_min_files=2,
         local_retention=timedelta(seconds=0),
         snapshot_retention=timedelta(seconds=0),
