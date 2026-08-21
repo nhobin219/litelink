@@ -59,7 +59,15 @@ def scrambled(count: int) -> list[dict[str, object]]:
 
 def archived_log(root: Path, bucket: str, s3: S3Options, **overrides: object) -> Log:
     settings: dict[str, object] = {
-        "target_size": 64 * 1024,
+        "target_seal_size": 64 * 1024,
+        # Conversion off, so these tests are about what reaches the archive and
+        # not about what makes a file eligible. By default compaction converts
+        # sealed files into ones eight times larger and `sync` waits for that,
+        # which is correct and has its own test —
+        # `test_only_compacted_files_are_eligible_for_the_archive`. Leaving it
+        # on here would mean every archive test first had to produce eight
+        # seals' worth of rows to observe anything.
+        "target_compact_size": 64 * 1024,
         "compact_min_files": 2,
         "snapshot_retention": timedelta(seconds=0),
     }
@@ -176,7 +184,7 @@ def test_only_settled_files_reach_the_archive(
 
         files = log._table.data_files()
         held = log._maintenance.memory()
-        assert held[files[-1].path] < log.config.target_size, (
+        assert held[files[-1].path] < log.config.target_seal_size, (
             "the tail must hold less than a full target to test this"
         )
 
@@ -259,13 +267,18 @@ def test_rewrite_archive_merges_files_left_undersized(
     """The repair, on the layout that needs repairing.
 
     Every file here is pushed under a small target and is then undersized
-    against a larger one — which is what lowering and raising `target_size`
+    against a larger one — which is what lowering and raising `target_seal_size`
     does to an archive, since the archive is immutable history and a size
     change applies only to what has not been written yet. The rewrite merges
     them and the data survives exactly.
     """
     with archived_log(
-        tmp_path, bucket, s3, target_size=8 * 1024, local_retention=timedelta(0)
+        tmp_path,
+        bucket,
+        s3,
+        target_seal_size=8 * 1024,
+        target_compact_size=8 * 1024,
+        local_retention=timedelta(0),
     ) as log:
         log.extend(scrambled(ROWS))
         log.seal_due()
@@ -282,7 +295,13 @@ def test_rewrite_archive_merges_files_left_undersized(
         before = len(remote.data_files())
         assert before >= 4, "the fixture must archive several files to merge"
 
-        log.set_config(replace(log.config, target_size=1024 * 1024))
+        log.set_config(
+            replace(
+                log.config,
+                target_seal_size=1024 * 1024,
+                target_compact_size=1024 * 1024,
+            )
+        )
         log.rewrite_archive()
 
         remote.reload()
@@ -325,7 +344,8 @@ def test_rewrite_archive_defers_deleting_what_it_superseded(
         tmp_path,
         bucket,
         s3,
-        target_size=8 * 1024,
+        target_seal_size=8 * 1024,
+        target_compact_size=8 * 1024,
         snapshot_retention=timedelta(hours=1),
     ) as log:
         log.extend(rows(ROWS))
@@ -333,7 +353,13 @@ def test_rewrite_archive_defers_deleting_what_it_superseded(
         log.sync()
         superseded = {f.path for f in log._archive.require().data_files()}
 
-        log.set_config(replace(log.config, target_size=1024 * 1024))
+        log.set_config(
+            replace(
+                log.config,
+                target_seal_size=1024 * 1024,
+                target_compact_size=1024 * 1024,
+            )
+        )
         log.rewrite_archive()
 
         queued = set(log._buffer.queued_deletions())

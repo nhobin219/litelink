@@ -221,7 +221,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
     Schema comes from the Iceberg table, sort order from its declared sort
     order (§4), config and archive from the buffer's `meta` table (§2).
     """
-    config = LogConfig(target_size=4096, compact_min_files=7)
+    config = LogConfig(target_seal_size=4096, compact_min_files=7)
     with Log.new(
         tmp_path,
         "s",
@@ -261,10 +261,10 @@ def test_a_log_with_no_stored_config_refuses_to_open(tmp_path: Path) -> None:
 def test_set_config_persists(tmp_path: Path) -> None:
     """Every knob in LogConfig governs future work, so no rewrite is needed."""
     with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.set_config(LogConfig(target_size=1234, compact_min_files=9))
+        log.set_config(LogConfig(target_seal_size=1234, compact_min_files=9))
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened.config.target_size == 1234
+        assert reopened.config.target_seal_size == 1234
         assert reopened.config.compact_min_files == 9
 
 
@@ -467,11 +467,11 @@ def test_a_config_written_without_a_setting_still_opens() -> None:
     positionally turned every new field into a breaking change to `open`, over
     a value that was never load-bearing.
     """
-    written = json.dumps({"target_size": 4096, "compact_min_files": 2})
+    written = json.dumps({"target_seal_size": 4096, "compact_min_files": 2})
 
     recovered = LogConfig.from_json(written)
 
-    assert recovered.target_size == 4096
+    assert recovered.target_seal_size == 4096
     assert recovered.compact_min_files == 2
     assert recovered.local_rows == LogConfig().local_rows
     assert recovered.snapshot_retention == LogConfig().snapshot_retention
@@ -480,9 +480,9 @@ def test_a_config_written_without_a_setting_still_opens() -> None:
 def test_a_config_written_by_a_newer_version_still_opens() -> None:
     """The same tolerance from the other side: an unknown setting is one this
     version does not have, not a reason to refuse the log."""
-    written = json.dumps({"target_size": 4096, "a_setting_from_the_future": 7})
+    written = json.dumps({"target_seal_size": 4096, "a_setting_from_the_future": 7})
 
-    assert LogConfig.from_json(written).target_size == 4096
+    assert LogConfig.from_json(written).target_seal_size == 4096
 
 
 def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:

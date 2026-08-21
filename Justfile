@@ -147,14 +147,19 @@ demo-replicate root="litelink-data":
         echo "litestream not on PATH — see https://litestream.io/install" >&2
         exit 1
     }
-    export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
-    export AWS_REGION=us-east-1
+    # rustfs unless `.env` names a real bucket, as everywhere else.
+    if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
+        export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
+        export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
+        export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
+        export AWS_REGION=us-east-1
+    fi
     # litestream takes credentials from the environment, never from the config
     # file — so the generated YAML is safe to commit and hand around.
-    export LITESTREAM_ACCESS_KEY_ID={{RUSTFS_KEY}}
-    export LITESTREAM_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
-    uv run python examples/replicate.py --root {{root}} \
-        --to s3://{{RUSTFS_BUCKET}}/wal --out {{root}}/litestream.yml
+    export LITESTREAM_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+    export LITESTREAM_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
+    # Destination and file set both come from the log — see `replicate.py`.
+    uv run python examples/replicate.py --root {{root}}
     litestream replicate -config {{root}}/litestream.yml
 
 # Create the demo bucket. Idempotent, and through the same s3fs the library
@@ -236,6 +241,38 @@ demo-clean root="litelink-data":
         echo "nothing at {{root}}"
         exit 0
     fi
+    # The archive first, while the log can still say where it is. Reading it
+    # from the log rather than from the environment means this removes what
+    # THIS demo wrote, even if `.env` has changed since.
+    if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
+        export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
+        export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
+        export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
+        export AWS_REGION=us-east-1
+    fi
+    uv run --extra s3 python -c "
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, 'examples')
+    from _stream import NAME
+    from litelink import Log
+    try:
+        with Log.open(Path('{{root}}'), NAME, read_only=True) as log:
+            archive = log.archive
+    except Exception as exc:
+        print(f'  could not read the archive location: {exc}')
+        raise SystemExit(0) from None
+    if archive is None:
+        raise SystemExit(0)
+    import s3fs
+    fs = s3fs.S3FileSystem()
+    location = archive.removeprefix('s3://')
+    if fs.exists(location):
+        print(f'  removing {archive}')
+        fs.rm(location, recursive=True)
+    else:
+        print(f'  nothing at {archive}')
+    " || echo "  skipped the archive (no credentials, or nothing to remove)"
     echo "removing {{root}} ($(du -sh "{{root}}" | cut -f1))"
     rm -rf "{{root}}"
 

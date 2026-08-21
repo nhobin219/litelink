@@ -272,9 +272,9 @@ class Maintenance:
 
         for run in runs(
             pending,
-            self._config.target_size,
+            self._config.compact_size,
             self.memory(),
-            self._config.target_rows,
+            self._config.compact_rows,
         ):
             self._merge(run, heartbeat)
 
@@ -541,7 +541,7 @@ class Maintenance:
         guess about what it holds.
         """
         held = self.memory()
-        target = self._config.target_size
+        target = self._config.compact_size
         files = archive.data_files()
         for index, data_file in enumerate(files):
             if held.get(data_file.path, target) < target:
@@ -565,7 +565,7 @@ class Maintenance:
         scratch = Buffer.open(
             self._layout.rewrite_db,
             self._buffer.schema,
-            target_size=self._config.target_size,
+            target_size=self._config.compact_size,
             durable=False,
         )
         written: list[str] = []

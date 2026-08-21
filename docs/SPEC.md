@@ -251,7 +251,8 @@ automatically.
 
 ## 4. Seal
 
-Triggered on `min(target_size, target_rows)`, evaluated by the writer at commit time.
+Triggered on `min(target_seal_size, target_seal_rows)`, evaluated by the writer at commit
+time.
 Entirely local. Both are ceilings on one file — bytes bound memory, rows bound the read
 latency §7 sizes for — so the cut lands on whichever is reached first, and `target_rows`
 defaults to no limit because only the caller knows how wide a row is.
@@ -876,10 +877,13 @@ of them is chosen.
 ## 12. Configuration
 
 ```
-target_rows            max rows per file                  (the other ceiling; the seal cuts at
+target_seal_rows       max rows per SEAL                  (the other ceiling; the seal cuts at
                                                           whichever is reached FIRST. None =
                                                           no row limit)
-target_size            uncompressed bytes per file        (size it for READ latency and for
+target_compact_size    uncompressed bytes per FILE        (what compaction converts sealed
+                                                          files INTO. None = 8x the seal)
+target_compact_rows    max rows per compacted file        (None = 8x target_seal_rows)
+target_seal_size       uncompressed bytes per SEAL        (size it for READ latency and for
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
                                                           whatever compression achieved)

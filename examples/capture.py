@@ -67,11 +67,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Deliberately small for a demo: seal often so the reader sees the table
-    # grow within seconds. A real deployment sizes this by §7's read-latency
-    # argument, not to make a demo lively.
+    # Small for a demo — seal often, so the reader sees the table grow within
+    # seconds — and larger than that where the archive is concerned, because
+    # the two want opposite things. A real deployment sizes the seal by §7's
+    # read-latency argument rather than to make a demo lively.
+    #
+    # Measured against S3: 648 ms to upload a 9 kB file. Almost all of that is
+    # the round trip, not the bytes, so halving file size doubles the cost of
+    # archiving the same stream. Compaction is what bridges it: seal at 1 MiB
+    # so the buffer stays shallow, convert to 8 MiB so the archive receives
+    # eight times fewer objects for the same data.
     config = LogConfig(
-        target_size=256 * 1024,
+        target_seal_size=1024 * 1024,
+        target_compact_size=8 * 1024 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
         # None without an archive, because with nowhere to push to a retention
