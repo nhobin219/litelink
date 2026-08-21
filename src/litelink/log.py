@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from litelink._archive import Archive
+from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
@@ -72,7 +72,8 @@ SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
 
 _CONFIG_KEY = "config"
-_ARCHIVE_KEY = "archive"
+# One home, in `_archive`, because `evict` reads it too.
+_ARCHIVE_KEY = ARCHIVE_KEY
 _SCHEMA_KEY = "arrow_schema"
 
 
@@ -789,16 +790,17 @@ class Log:
         # compaction does not wait for a sync the way eviction does, so it
         # merges across a boundary the archive already holds. There is no
         # ordering that is safe, so there is no ordering.
-        if normalised != self._archive.uri:
-            self._buffer.set_meta_all(
-                {
-                    _ARCHIVE_KEY: normalised or "",
-                    Maintenance.ARCHIVED_KEY: "0",
-                    Maintenance.PENDING_KEY: "0",
-                }
-            )
-        else:
-            self._buffer.set_meta(_ARCHIVE_KEY, normalised or "")
+        # Whether this is a move is decided against the DURABLE location, in
+        # the transaction that acts on the decision. This object's memory of
+        # where the archive is goes stale the moment another process re-points
+        # it, and nothing but a sync refreshes it — so a maintainer re-asserting
+        # the archive it already has would read its own staleness as a move and
+        # zero the watermarks of a bucket that holds the data.
+        self._buffer.set_meta_moved(
+            _ARCHIVE_KEY,
+            normalised or "",
+            {Maintenance.ARCHIVED_KEY: "0", Maintenance.PENDING_KEY: "0"},
+        )
 
         # Reaches the maintainer and the reader because all three hold this
         # object. `evict` asks it whether I4 is owed anything, and a setting
@@ -1483,11 +1485,19 @@ class Log:
                 msg = "sync() needs an archive; this log is local-only"
                 raise ValueError(msg)
 
-            self._push(lease)
+            # PINNED here, and every fence downstream compares against this
+            # string rather than re-reading the object. `Archive` is shared by
+            # the log, the reader and the maintainer precisely so a re-point
+            # reaches all three — which means a `set_archive` on another thread
+            # moves the value a fence was going to compare AGAINST, and both
+            # sides of the comparison change together. The fence passes, and
+            # the watermark this push earned is recorded against an archive
+            # that never received it.
+            self._push(lease, self._archive.uri)
         finally:
             lease.release()
 
-    def _push(self, lease: Lease) -> None:
+    def _push(self, lease: Lease, pinned: str | None) -> None:
         """Upload and register everything above the archive's extent.
 
         Everything compaction has finished with, which `stable_prefix` decides
@@ -1547,7 +1557,7 @@ class Log:
         confirmed = max(self._maintenance.archived_through(), floor)
         self._buffer.set_meta_if(
             _ARCHIVE_KEY,
-            self._archive.uri,
+            pinned,
             {
                 Maintenance.ARCHIVED_KEY: str(confirmed),
                 Maintenance.PENDING_KEY: "0",
@@ -1588,7 +1598,7 @@ class Log:
         # confirming write, that these offsets may already be in the archive
         # and must not be merged into a file that straddles its extent.
         if not self._buffer.set_meta_if(
-            _ARCHIVE_KEY, self._archive.uri, {Maintenance.PENDING_KEY: str(last.hi)}
+            _ARCHIVE_KEY, pinned, {Maintenance.PENDING_KEY: str(last.hi)}
         ):
             # Declined, so the register does not happen either. The upload
             # already spent longer than a lease TTL against S3 more than once,
@@ -1632,7 +1642,7 @@ class Log:
         # write: nothing lowers a watermark afterwards, so recording one earned
         # by a bucket the log has left is not a mistake anything corrects.
         if not self._buffer.set_meta_if(
-            _ARCHIVE_KEY, self._archive.uri, {Maintenance.ARCHIVED_KEY: str(last.hi)}
+            _ARCHIVE_KEY, pinned, {Maintenance.ARCHIVED_KEY: str(last.hi)}
         ):
             raise _repointed_mid_push()
 

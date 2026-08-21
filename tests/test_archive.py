@@ -1088,3 +1088,144 @@ def test_a_repoint_during_a_push_forfeits_the_watermark(
         assert log._maintenance.archived_through() == settled, (
             "an archive the log has never pushed to must not inherit a watermark"
         )
+
+
+def test_eviction_learns_about_an_archive_attached_by_another_process(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """I4 is owed by the log, not by a process's memory of it.
+
+    Attaching an archive to a log a maintainer already has open is supported
+    (§13.0). `sync` is the only thing that refreshes this process's `Archive`,
+    and a maintainer that believes the log is local-only never syncs — so it
+    would go on deleting the only copy of every row that ages past
+    `local_retention`, for as long as it ran, while the durable configuration
+    promised the archive held them.
+
+    The detach direction heals on its own, because a push to an archive that is
+    gone fails. This direction has nothing that fails.
+    """
+    config = LogConfig(
+        target_seal_size=32 * 1024,
+        target_compact_size=32 * 1024,
+        compact_min_files=2,
+        local_rows=1,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    writer = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
+    with writer:
+        writer.extend(rows(ROWS))
+        writer.seal_due()
+
+        # The maintainer opened while the log was local-only.
+        with Log.open(tmp_path, "s", s3=s3) as maintainer:
+            assert not maintainer._archive.configured()
+
+            writer.set_archive(f"s3://{bucket}/prefix")
+
+            maintainer.evict()
+
+            assert maintainer.scan().read_all().num_rows == ROWS, (
+                "nothing may be deleted for an archive that holds nothing"
+            )
+
+
+def test_a_commit_retry_will_not_follow_the_catalog_to_another_archive(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The Iceberg commit is the one durable write with no watermark fence.
+
+    `_commit` reloads and retries when the branch moves under it, and the
+    catalog row is keyed by table id rather than by identity — so a re-point
+    racing a slow register makes the reload re-bind the operation to the NEW
+    archive, and the retry commits paths that live in the old bucket.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+
+        archive = log._archive.require()
+        moved = Layout(tmp_path, "s").warehouse_uri
+        archive._warehouse = f"s3://{bucket}/somewhere-else"
+
+        with pytest.raises(RuntimeError, match="moved out of"):
+            archive._verify_identity()
+
+        assert moved
+
+
+def test_restating_the_archive_from_a_stale_process_keeps_the_watermark(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """ "Is this a move?" is a question about the log, not about this process.
+
+    Nothing refreshes a process's memory of where the archive is except a sync,
+    so in the two-process deployment `set_archive` is documented for, a caller
+    can hold a stale one. Asked of that memory, both answers are wrong — here,
+    re-asserting the archive the log already has reads as a move and zeroes the
+    watermarks of a bucket that genuinely holds the data, which drops the
+    compaction frontier to 0 over a live archive.
+    """
+    with archived_log(tmp_path, bucket, s3) as writer:
+        writer.extend(rows(ROWS))
+        writer.seal_due()
+        writer.sync()
+        settled = writer.archived_through()
+        assert settled > 0
+
+        with Log.open(tmp_path, "s", s3=s3) as other:
+            # This process's memory goes stale the way a long-running one does.
+            other._archive.set_uri(None)
+
+            other.set_archive(f"s3://{bucket}/prefix")
+
+            assert other.archived_through() == settled, (
+                "re-asserting the archive the log already has is not a move"
+            )
+            assert other._maintenance.archive_frontier() == settled
+
+
+def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Both sides of the comparison must not move together.
+
+    `Archive` is shared by the log, the reader and the maintainer exactly so a
+    re-point reaches all three — which means a `set_archive` on another thread
+    updates the value a fence is about to compare against as well as the one it
+    compares. Read live, the fence passes, and the watermark this push earned
+    is recorded against an archive that never received it.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        settled = log.archived_through()
+        assert settled > 0
+
+        log.extend(rows(ROWS))
+        log.seal_due()
+
+        # A full in-process re-point, landing while the push is in S3: it moves
+        # the durable location AND this shared object's memory of it.
+        archive = log._archive.require()
+        original = archive.register
+
+        def racing(*args: object, **kwargs: object) -> bool:
+            outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
+            log._buffer.set_meta("archive", f"s3://{bucket}/elsewhere")
+            log._archive.set_uri(f"s3://{bucket}/elsewhere")
+            return outcome
+
+        archive.register = racing  # ty: ignore[invalid-assignment]
+        try:
+            with pytest.raises(RuntimeError, match="re-pointed"):
+                log.sync()
+
+        finally:
+            archive.register = original  # ty: ignore[invalid-assignment]
+
+        assert log._maintenance.archived_through() == settled, (
+            "an archive the log has never pushed to must not inherit a watermark"
+        )

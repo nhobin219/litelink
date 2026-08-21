@@ -40,6 +40,13 @@ if TYPE_CHECKING:
     from litelink._layout import Layout
 
 
+# Where the archive's location is recorded. It lives here rather than in `log`
+# because it is not `Log`'s private business: `evict` acts on I4 and so has to
+# be able to ask the buffer, not this object's memory, whether an archive is
+# owed anything.
+ARCHIVE_KEY = "archive"
+
+
 class Archive:
     """The remote tier: a URI, credentials, and the table they open."""
 
@@ -91,6 +98,22 @@ class Archive:
         """Whether there is an archive at all. Cheap, and opens nothing."""
         with self._lock:
             return self._uri is not None
+
+    def refresh(self, recorded: str | None) -> None:
+        """Adopt the location the log durably records.
+
+        This object is a process's MEMORY of where the archive is, and another
+        process can change where it is. Attaching one to a log a maintainer
+        already has open is a supported operation (§13.0), and until the
+        maintainer hears about it every reader of this object answers for the
+        configuration the log had at open — including `evict`, which asks
+        whether I4 owes the archive anything before deleting the only local
+        copy of a row. Answered from stale memory, the answer is no.
+
+        The detach direction heals on its own, because a push to an archive
+        that is gone fails. The attach direction has nothing that fails.
+        """
+        self.set_uri(recorded)
 
     def set_uri(self, uri: str | None) -> None:
         """Attach, re-point, or detach.
