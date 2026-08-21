@@ -32,7 +32,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from litelink._s3 import S3Options
-from litelink._table import LogTable
+from litelink._table import ArchiveAbsent, LogTable
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -116,7 +116,7 @@ class Archive:
 
             self._uri = uri
 
-    def table(self) -> LogTable | None:
+    def table(self, *, repair: bool = False) -> LogTable | None:
         """The remote table, or None when unconfigured. Opened on first use.
 
         Lazy because opening it costs a round trip to object storage, which a
@@ -137,19 +137,27 @@ class Archive:
                 # second caller arriving mid-open should wait for that handle
                 # rather than start a second one, and `set_uri` should wait
                 # rather than clear a field the open is about to write.
-                self._handle = LogTable.open_archive(
-                    self._layout, self._uri, self._s3, self._schema
-                )
+                try:
+                    self._handle = LogTable.open_archive(
+                        self._layout, self._uri, self._s3, self._schema, repair=repair
+                    )
+                except ArchiveAbsent:
+                    # Nothing pushed yet. No leg, no error — and nothing
+                    # created, because creating a table is the write side's
+                    # business and a read must not have side effects.
+                    return None
 
             return self._handle
 
-    def require(self) -> LogTable:
+    def require(self, *, repair: bool = True) -> LogTable:
         """The remote table, insisting there is one.
 
         For the write side of §5, where "no archive" is a caller error rather
-        than a leg of a union to leave out.
+        than a leg of a union to leave out — and where the caller holds the
+        maintenance lease, which is what makes it the one allowed to create the
+        table or replace an entry naming somewhere else.
         """
-        table = self.table()
+        table = self.table(repair=repair)
         if table is None:
             msg = "this log is local-only; no archive is configured"
             raise ValueError(msg)

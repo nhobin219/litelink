@@ -623,3 +623,52 @@ def test_an_unreadable_catalog_schema_falls_back_rather_than_rebuilds(
     assert table.metadata_location == expected, (
         "the existing archive must be found, not replaced"
     )
+
+
+def test_a_read_never_repairs_the_archive_catalog(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Dropping and recreating a catalog entry is a write, and reads do not
+    hold the lease that makes it safe.
+
+    Two processes cold-opening after a re-point would both find the mismatch;
+    the second's drop can land after the first has already created, uploaded
+    and committed, taking the live entry with it and leaving an empty table
+    over pushed files. So only a caller holding the maintenance lease may
+    repair, and a reader that finds a mismatch says so.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        first = log.archive
+        assert first is not None
+
+    # The entry now names `first`, while the log is pointed at `second`.
+    second = f"s3://{bucket}/elsewhere"
+    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+        reader._archive.set_uri(second)
+
+        with pytest.raises(ValueError, match="not under"):
+            reader._archive.table()
+
+    assert _recorded_location(Layout(tmp_path, "s")) is not None, (
+        "a read must not have dropped the entry"
+    )
+
+
+def test_a_read_before_the_first_sync_simply_has_no_archive_leg(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Absent is not wrong. A log configured with an archive nothing has pushed
+    to yet reads without that leg, and creates nothing by reading."""
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(200))
+        log.seal_due()
+
+        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+
+        assert merged.num_rows == 200
+        assert _recorded_location(log._layout) is None, (
+            "reading must not create the archive table"
+        )

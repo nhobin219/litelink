@@ -84,6 +84,17 @@ class DataFile:
 ARCHIVE_CATALOG = "archive"
 
 
+class ArchiveAbsent(LookupError):
+    """No archive table exists at the prefix yet.
+
+    Distinct from a mismatch, because the two want opposite handling: absent is
+    the ordinary state of a log whose first sync has not run, and a reader
+    simply leaves that leg out of the union. A mismatch means the catalog names
+    somewhere the log is not pointed, which no reader should quietly work
+    around.
+    """
+
+
 def _recorded_location(layout: Layout) -> str | None:
     """Where the archive's catalog entry says its metadata is, without a read.
 
@@ -224,7 +235,13 @@ class LogTable:
 
     @classmethod
     def open_archive(
-        cls, layout: Layout, prefix: str, options: S3Options, schema: pa.Schema
+        cls,
+        layout: Layout,
+        prefix: str,
+        options: S3Options,
+        schema: pa.Schema,
+        *,
+        repair: bool = False,
     ) -> LogTable:
         """The remote table, created on first use (§5).
 
@@ -279,24 +296,51 @@ class LogTable:
         try:
             recorded = _recorded_location(layout)
         except LookupError:
-            # Could not tell. Let pyiceberg answer: it either loads the table,
-            # or says there is none. Slower than the offline read and correct
-            # in the one direction that matters — never creating an empty table
-            # over an archive that is alive.
+            # Could not tell. Let pyiceberg answer: it either loads the table
+            # or says there is none. Slower than the offline read, and it must
+            # still answer the SAME question — returning the loaded table here
+            # skipped the prefix check entirely, so a process that hit a locked
+            # catalog adopted the archive it had been pointed away from and
+            # read, pushed and reconciled its watermark from it for the rest of
+            # its life.
             try:
-                return cls(catalog, layout, catalog.load_table(layout.table_id), prefix)
+                recorded = catalog.load_table(layout.table_id).metadata_location
             except NoSuchTableError:
                 recorded = None
 
         if recorded is not None and not recorded.startswith(boundary):
-            # Another archive's table, found by table id. The entry goes; the
-            # objects do not, because detaching an archive is not deleting one.
-            # No read of the old bucket is needed to know this, which matters
-            # when the archive being left has already been taken away.
+            # Another archive's table, found by table id. No read of the old
+            # bucket is needed to know this, which matters when the archive
+            # being left has already been taken away.
+            if not repair:
+                # Only a caller holding the maintenance lease may fix it.
+                # Dropping and recreating is a mutation of shared state, and it
+                # was reachable from any `include_archive` read — two processes
+                # cold-opening after a re-point would both find the mismatch,
+                # and the second's drop could land after the first had already
+                # created, uploaded and committed, taking the live entry with
+                # it. A reader that cannot fix it must not pretend it can.
+                msg = (
+                    f"the archive catalog names {recorded!r}, which is not "
+                    f"under {prefix!r} — a maintenance pass repairs this"
+                )
+                raise ValueError(msg)
+
+            # The entry goes; the objects do not, because detaching an archive
+            # is not deleting one.
             catalog.drop_table(layout.table_id)
             recorded = None
 
         if recorded is None:
+            if not repair:
+                # Absent, not wrong. A log configured with an archive that
+                # nothing has pushed to yet is an ordinary state, and a reader
+                # asking for `include_archive` before the first sync should get
+                # a union without that leg — not an error, and not a table
+                # created as a side effect of reading.
+                msg = f"no archive table at {prefix!r} yet"
+                raise ArchiveAbsent(msg)
+
             table = catalog.create_table(
                 layout.table_id, schema=schema, properties=METADATA_PROPERTIES
             )

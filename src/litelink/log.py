@@ -1382,6 +1382,21 @@ class Log:
             msg = "sync() needs an archive; this log is local-only"
             raise ValueError(msg)
 
+        # Re-read where the archive IS before pushing to it. `set_archive` is
+        # a durable change made by whichever process runs it, and every other
+        # process cached the old value when it opened — so a maintainer started
+        # before a re-point would go on pushing to the retired archive and,
+        # worse, reconcile the watermark from ITS extent. Eviction trusts that
+        # watermark and deletes local files the new archive has never been
+        # sent: the rows survive only in the bucket the re-point was retiring.
+        #
+        # One keyed read per sync, against a change that is rare and durable.
+        # `set_uri` is a no-op when nothing moved.
+        self._archive.set_uri(self._buffer.get_meta(_ARCHIVE_KEY) or None)
+        if not self._archive.configured():
+            msg = "sync() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
             msg = "another owner holds the maintenance lease"
