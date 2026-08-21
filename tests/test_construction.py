@@ -8,6 +8,7 @@ having them as parameters is for.
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -25,7 +26,9 @@ from litelink._table import LogTable
 from litelink.log import table_schema, validate
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import json
+
+from pathlib import Path
 
 SCHEMA = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
 
@@ -453,3 +456,53 @@ def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
         assert buffer._con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     finally:
         buffer.close()
+
+
+def test_a_config_written_without_a_setting_still_opens() -> None:
+    """Adding a setting must not make existing logs unopenable.
+
+    `LogConfig` is policy, not data: a record written before a setting existed
+    means the log was running that setting's default. Reading the record
+    positionally turned every new field into a breaking change to `open`, over
+    a value that was never load-bearing.
+    """
+    written = json.dumps({"target_size": 4096, "compact_min_files": 2})
+
+    recovered = LogConfig.from_json(written)
+
+    assert recovered.target_size == 4096
+    assert recovered.compact_min_files == 2
+    assert recovered.local_rows == LogConfig().local_rows
+    assert recovered.snapshot_retention == LogConfig().snapshot_retention
+
+
+def test_a_config_written_by_a_newer_version_still_opens() -> None:
+    """The same tolerance from the other side: an unknown setting is one this
+    version does not have, not a reason to refuse the log."""
+    written = json.dumps({"target_size": 4096, "a_setting_from_the_future": 7})
+
+    assert LogConfig.from_json(written).target_size == 4096
+
+
+def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:
+    """§3a: what a WAL-shipping sidecar has to replicate.
+
+    All three, and the set is the library's to know rather than an operator's
+    to guess. `buffer.db` holds rows no Parquet file has yet — the one everyone
+    remembers. `catalog.db` says which files the local table is made of.
+    `archive.db` says the same for the archive, so omitting it leaves the
+    objects in S3 intact with nothing able to say what they are.
+
+    The rewrite scratch is excluded: it is derived from the archive and deleted
+    at the end of the operation that creates it, so replicating it would ship a
+    temporary file to object storage to no purpose.
+    """
+    layout = Layout(tmp_path, "s")
+
+    assert set(layout.databases) == {
+        layout.buffer_db,
+        layout.catalog_db,
+        layout.archive_db,
+    }
+    assert layout.rewrite_db not in layout.databases
+    assert all(path.suffix == ".db" for path in layout.databases)

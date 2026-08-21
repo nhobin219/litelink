@@ -206,16 +206,29 @@ Re-measure on target hardware; on local NVMe the fixed per-commit cost is a larg
 
 ## 3a. Optional: WAL replication for RPO
 
-Without it, unsealed rows exist only on local disk, so the data-loss window on machine
-failure is bounded by `max_age` — which means `max_age` is doing double duty as a file-size
-policy *and* an RPO policy. Shrinking it to reduce RPO produces small files, which is the
-problem sealing exists to solve.
+Without it, unsealed rows exist only on local disk, and nothing bounds how long they stay
+there: the seal fires on `target_size` alone, so a stream that goes quiet holds its last
+partial file's worth of rows indefinitely. **With the `max_age` timer removed, replication
+is the only thing that bounds RPO at all** — it is no longer a way to avoid a trade, it is
+the mechanism.
 
-**Litestream (or equivalent WAL shipping) breaks that coupling.** It continuously replicates
-SQLite WAL frames to object storage, so `max_age` can stay large for good file sizes while
-RPO falls to the replication lag.
+That removal is what makes it clean. A timer bounded RPO by sealing early, which meant the
+same knob set the file size and the loss window, and shrinking one wrecked the other.
+Shipping the WAL separates them completely: files are sized by `target_size` and RPO falls
+to the replication lag, which is a property of a sidecar rather than of the layout.
 
-Optional, and off by default. Three things to be clear about:
+**Litestream (or equivalent WAL shipping) is the sidecar.** It continuously replicates
+SQLite WAL frames to object storage. It is not configured in `LogConfig`: whether a sidecar
+is running is a deployment fact the library cannot know or enforce, and a boolean claiming
+otherwise would be a setting nothing reads. What the library does own is `Log.databases` —
+which files carry the log's state and therefore have to be replicated.
+
+**All three databases, not just the buffer.** `buffer.db` holds rows no Parquet file has
+yet, `catalog.db` says which files the local table is made of, and `archive.db` says the
+same for the archive. Omit the last and the objects in S3 survive with nothing to say what
+they are.
+
+Optional. Three things to be clear about:
 
 **It covers append→seal only.** Once a seal deletes buffer rows, replication faithfully
 carries the delete; sealed-but-unuploaded Parquet is not its concern. So
@@ -859,7 +872,6 @@ target_size            uncompressed bytes per file        (size it for READ late
                                                           whatever compression achieved)
 local_retention        local table window, by TIME        (> longest hot lookback, with margin; 0 = evict on upload)
 local_rows             local table window, by ROWS        (floor: keep at least this many recent rows)
-wal_replication        continuous WAL shipping for RPO    (off by default; §3a)
 snapshot_retention     snapshot expiry floor              (> longest scan)
 compact_min_files      minimum adjacent files to compact  (e.g. 4)
 sort_by                within-file sort order              (capture default: event_ts, key)
