@@ -378,3 +378,56 @@ def test_rewrite_archive_defers_deleting_what_it_superseded(
             assert not fs.exists(path.removeprefix("s3://")), (
                 "the drain must remove remote files once they come due"
             )
+
+
+def test_an_interrupted_hydrate_can_be_finished(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The hole that no later run could fill.
+
+    Restoring upward makes the first file the new lowest local range, so a
+    failure before the next one leaves the gap ABOVE what was restored. The
+    next run takes its floor from that new lower bound, finds the gap is no
+    longer below it, and skips it for ever — and `_union` bounds the archive
+    leg by the local floor, so those offsets are then served by neither tier.
+
+    Restoring downward, an interruption is only a range that starts higher than
+    intended, and the next run continues from there.
+    """
+    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        log.maintain()
+        assert log.scan().read_all().num_rows < ROWS
+
+        archive = log._archive.require()
+        real_fetch = archive.fetch
+        calls = 0
+
+        def fail_after_one(path: str, destination: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                msg = "network died mid-hydrate"
+                raise OSError(msg)
+
+            real_fetch(path, destination)
+
+        archive.fetch = fail_after_one  # ty: ignore[invalid-assignment]
+        with pytest.raises(OSError, match="mid-hydrate"):
+            log.hydrate(since=timedelta(hours=1))
+
+        archive.fetch = real_fetch  # ty: ignore[invalid-assignment]
+        partial = log.sql("SELECT * FROM log").read_all().column(OFFSET).to_pylist()
+        assert partial, "the first file must have been restored"
+        assert sorted(partial) == list(range(min(partial), max(partial) + 1)), (
+            "an interrupted hydrate must leave a contiguous local range, not a hole"
+        )
+
+        log.hydrate(since=timedelta(hours=1))
+
+        restored = log.sql("SELECT * FROM log").read_all().column(OFFSET).to_pylist()
+        assert sorted(restored) == list(range(1, ROWS + 1)), (
+            "the second run must finish what the first started"
+        )
