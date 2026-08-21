@@ -531,7 +531,12 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
 
         for database in log.databases:
             assert f"path: {database}" in rendered
-            assert f"path: prefix/{WAL_PREFIX}/{database.name}" in rendered
+            # Keyed by the LOG-RELATIVE path, not the bare filename: two logs
+            # under one root sharing an archive prefix would otherwise ship
+            # their distinct buffers to the same replica path, which is two
+            # sidecars writing one replica.
+            relative = database.relative_to(tmp_path).as_posix()
+            assert f"path: prefix/{WAL_PREFIX}/{relative}" in rendered
 
         assert "bucket: bucket" in rendered
         # A non-AWS endpoint needs both, and neither can be left to the
@@ -602,3 +607,27 @@ def test_an_explicit_key_still_wins_over_the_chain() -> None:
     assert "ENDPOINT '127.0.0.1:9000'" in rendered
     assert "USE_SSL false" in rendered
     assert "URL_STYLE 'path'" in rendered
+
+
+def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> None:
+    """Two buffers must never ship to one replica path.
+
+    `<root>/<log>/buffer.db` flattened to `buffer.db` would send both logs'
+    buffers to the same object, which is two litestream instances writing one
+    replica — the corruption litestream is explicit about — and a restore that
+    hands back the other log's WAL.
+    """
+    shared = "s3://bucket/prefix"
+    with (
+        Log.new(tmp_path, "one", schema=SCHEMA, archive=shared) as first,
+        Log.new(tmp_path, "two", schema=SCHEMA, archive=shared) as second,
+    ):
+        keys = {
+            line.split("path: ", 1)[1]
+            for rendered in (first.replication_config(), second.replication_config())
+            for line in rendered.splitlines()
+            if "        path: " in line
+        }
+        buffers = {key for key in keys if key.endswith("buffer.db")}
+
+        assert len(buffers) == 2, f"buffers must not collide: {buffers}"

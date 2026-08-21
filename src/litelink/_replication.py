@@ -42,7 +42,9 @@ def destination(archive: str) -> str:
     return f"{archive.rstrip('/')}/{WAL_PREFIX}"
 
 
-def litestream_config(databases: Sequence[Path], archive: str, s3: S3Options) -> str:
+def litestream_config(
+    databases: Sequence[Path], root: Path, archive: str, s3: S3Options
+) -> str:
     """A litestream config replicating every database the log needs.
 
     Written as text rather than through a YAML library: it is a fixed shape,
@@ -65,7 +67,13 @@ def litestream_config(databases: Sequence[Path], archive: str, s3: S3Options) ->
 
     lines = ["dbs:"]
     for database in databases:
-        key = f"{prefix}/{database.name}" if prefix else database.name
+        # Keyed by the path RELATIVE TO THE ROOT, not the bare filename. A
+        # buffer lives at `<root>/<log>/buffer.db`, so two logs under one root
+        # sharing an archive prefix would flatten to the same replica path —
+        # two sidecars writing one replica, which is the corruption litestream
+        # is explicit about, and a restore that hands back the other log's WAL.
+        name = database.relative_to(root).as_posix()
+        key = f"{prefix}/{name}" if prefix else name
         lines += [
             f"  - path: {database}",
             "    replicas:",

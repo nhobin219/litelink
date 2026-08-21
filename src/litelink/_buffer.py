@@ -352,28 +352,39 @@ class Buffer:
         The only SUM() left, and it runs once per open rather than per append.
         It fires for a log created before this table existed, and for one whose
         open group was closed by a sealer just before the process died.
-        """
-        if self._con.execute(
-            "SELECT 1 FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
-        ).fetchone():
-            return
 
-        covered = int(
-            self._con.execute(
-                "SELECT coalesce(max(end_offset), 0) FROM extent"
+        **The check and the insert are one transaction.** As two statements,
+        two processes opening the same log at once — a writer and a maintainer
+        starting together, which is the ordinary shape — both see no open group
+        and both insert one. Two open rows then take the same `start_offset`,
+        `close_open_group` closes BOTH at the same end, and `finish_seal` tries
+        to give both the same `rel_path`: a UNIQUE violation that rolls back
+        after the Iceberg commit has already landed, leaving the claim in place
+        and every retry, recovery included, failing the same way. The seal
+        queue wedges permanently and the buffer stops draining.
+        """
+        with self._transaction():
+            if self._con.execute(
+                "SELECT 1 FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+            ).fetchone():
+                return
+
+            covered = int(
+                self._con.execute(
+                    "SELECT coalesce(max(end_offset), 0) FROM extent"
+                ).fetchone()[0]
+            )
+            start = self._con.execute(
+                'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
+                (covered,),
             ).fetchone()[0]
-        )
-        start = self._con.execute(
-            'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
-            (covered,),
-        ).fetchone()[0]
-        # Adopting whatever is buffered, rather than starting a fresh group
-        # above it: those rows still have to become a file, and a group that
-        # skipped them would leave them unsealed for ever.
-        self._con.execute(
-            "INSERT INTO extent (start_offset, bytes) VALUES (?, ?)",
-            (start, self._measure_from(covered)),
-        )
+            # Adopting whatever is buffered, rather than starting a fresh group
+            # above it: those rows still have to become a file, and a group
+            # that skipped them would leave them unsealed for ever.
+            self._con.execute(
+                "INSERT INTO extent (start_offset, bytes) VALUES (?, ?)",
+                (start, self._measure_from(covered)),
+            )
 
     def _measure_from(self, floor: int) -> int:
         terms = ["8"]  # offset
@@ -626,6 +637,20 @@ class Buffer:
         # AUTOINCREMENT insert, which for a buffer opened seconds ago has not
         # happened yet.
         with self._lock, self._con:
+            # Loud, because the silent version is unrecoverable. SQLite assigns
+            # `max(largest existing rowid, seq) + 1`, so seeding DOWN past
+            # existing rows does nothing at all and every following row lands
+            # at an offset belonging to different data — which a rewrite then
+            # commits. Nothing downstream can detect it: the row counts match,
+            # the ranges look contiguous, and the payloads are simply attached
+            # to the wrong offsets.
+            if self._con.execute("SELECT 1 FROM buffer LIMIT 1").fetchone():
+                msg = (
+                    "cannot seed offsets on a buffer that already holds rows: "
+                    "SQLite ignores a sequence lowered past them"
+                )
+                raise ValueError(msg)
+
             updated = self._con.execute(
                 "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
                 (first - 1,),

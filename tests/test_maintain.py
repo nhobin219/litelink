@@ -930,3 +930,46 @@ def test_a_single_pass_takes_the_maintenance_lease(tmp_path: Path) -> None:
             held.release()
 
         log.compact()
+
+
+def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
+    """A row floor lands mid-file; the boundary must not.
+
+    `evict_through` filters by ROW, so a boundary inside a file makes pyiceberg
+    rewrite it copy-on-write — and the replacement lands at a path this library
+    never learns, which breaks the rule every reclamation rests on: a file's
+    path is in SQLite before the file exists (I2). The superseded original is
+    left out of the deletion queue too, so once expiry drops the snapshots
+    naming it, nothing can name it again. `drain` is a keyed read and this
+    design refuses directory scans, so it is unreclaimable for good.
+
+    The age limit is already file-aligned — it is some file's `hi` — and so is
+    the archive clamp. Only the row floor is arbitrary, which is why it arrived
+    with `local_rows`.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        target_compact_size=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        # Deliberately not a multiple of the 4 rows each sealed file holds, so
+        # the raw boundary falls inside one.
+        local_rows=6,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 5)
+        before = {f.path for f in log._table.data_files()}
+        assert len(before) == 5
+
+        log._maintenance.evict()
+
+        after = log._table.data_files()
+        assert {f.path for f in after} <= before, (
+            "eviction must not introduce a file, which is what a copy-on-write "
+            "rewrite of a straddling file would do"
+        )
+        # Whole files only: every survivor keeps the exact range it was sealed
+        # with, and the row floor is honoured by keeping MORE than asked.
+        assert sum(f.rows for f in after) >= 6
+        assert all(f.rows == 4 for f in after), "a file was split by the boundary"
