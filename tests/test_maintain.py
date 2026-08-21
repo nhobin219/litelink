@@ -1009,3 +1009,48 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
         # with, and the row floor is honoured by keeping MORE than asked.
         assert sum(f.rows for f in after) >= 6
         assert all(f.rows == 4 for f in after), "a file was split by the boundary"
+
+
+def test_compaction_will_not_merge_across_the_archive_frontier(
+    tmp_path: Path,
+) -> None:
+    """A watermark that is stale LOW must not put archived files back in a run.
+
+    The watermark is written after the archive commit lands, so a crash between
+    them leaves it lower than what the archive actually holds. Eviction is safe
+    with a low watermark — it waits. Compaction is not: it reads the same
+    number to decide which files are already the archive's business, and a low
+    one pulls an already-archived file into a merge. The merged file then spans
+    the archive's extent, and the next push registers a range partially
+    overlapping one the archive already holds — the same offsets in two files,
+    in the immutable tier, with nothing to repair it.
+
+    So compaction reads the FRONTIER: the higher of the confirmed watermark and
+    the range a push was about to register.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8 * 4096,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        files = log._table.data_files()
+        assert len(files) >= 4
+
+        # A push that registered through the second file and died before its
+        # confirming write: the watermark still says nothing is archived.
+        boundary = files[1].hi
+        log._buffer.set_meta("archive_pending", str(boundary))
+        assert log._maintenance.archived_through() == 0
+        assert log._maintenance.archive_frontier() == boundary
+
+        log.compact()
+
+        merged = log._table.data_files()
+        assert all(f.lo > boundary or f.hi <= boundary for f in merged), (
+            "no file may span the frontier, or the archive gets it twice"
+        )
+        assert log.scan().read_all().num_rows == 1200

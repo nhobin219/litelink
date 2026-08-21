@@ -225,6 +225,21 @@ class Maintenance:
     # -- compaction ---------------------------------------------------------
 
     ARCHIVED_KEY = "archive_through"
+    # The range a push is ABOUT to register, written before it registers.
+    #
+    # `ARCHIVED_KEY` is written after the commit lands, so a crash between the
+    # two leaves it lower than what the archive actually holds. Eviction is
+    # safe with a low watermark — it simply waits — but compaction reads the
+    # same number to decide which files are already archived and therefore not
+    # its business, and a low one puts an ALREADY-ARCHIVED file back in a merge
+    # run. The merged file then spans the archive's extent, and the next push
+    # registers a range partially overlapping one the archive holds: the same
+    # offsets in two files, in the immutable tier, with nothing to repair it.
+    #
+    # So compaction takes the higher of the two. Pending may name a range the
+    # register never reached, which costs a merge that does not happen —
+    # nothing, next to a duplicate that cannot be undone.
+    PENDING_KEY = "archive_pending"
 
     def archived_through(self) -> int:
         """Highest offset the archive is known to hold, 0 if none (§5, I4).
@@ -239,6 +254,18 @@ class Maintenance:
         recorded = self._buffer.get_meta(self.ARCHIVED_KEY)
 
         return 0 if recorded is None else int(recorded)
+
+    def archive_frontier(self) -> int:
+        """The highest offset the archive MAY hold — see `PENDING_KEY`.
+
+        For compaction, which must not merge a file the archive already has.
+        Never for eviction: this can name a range no register reached, and
+        deleting a local file on the strength of that would delete the only
+        copy.
+        """
+        pending = self._buffer.get_meta(self.PENDING_KEY)
+
+        return max(self.archived_through(), 0 if pending is None else int(pending))
 
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Merge runs of undersized adjacent files (§6).
@@ -262,7 +289,9 @@ class Maintenance:
         # FRESH table, committing evicted data back into the log.
         self._table.reload()
 
-        archived = self.archived_through()
+        # The FRONTIER, not the watermark: everything the archive may already
+        # hold, including a register whose confirming write never landed.
+        archived = self.archive_frontier()
 
         # Archived files are never inputs. Marking compaction output archivable
         # is not enough on its own: a merge spanning the archive watermark
@@ -835,7 +864,12 @@ class Maintenance:
                 # can say whether they are dead. A stranded queue row is a
                 # bounded cost; deleting live data in a bucket this log no
                 # longer understands is not.
-                if not rel_path.startswith(f"{self._archive.uri}/"):
+                #
+                # Normalised, because the configured URI may carry a trailing
+                # slash while every queued path is built from it stripped. The
+                # mismatch would classify this log's OWN objects as another
+                # archive's and wedge the remote queue permanently.
+                if not rel_path.startswith(f"{(self._archive.uri or '').rstrip('/')}/"):
                     continue
 
                 remote.remove(rel_path)
