@@ -448,6 +448,19 @@ class Maintenance:
             limits.append(self._buffer.next_offset() - 1 - keep_rows)
 
         boundary = min(limits)
+        # Snapped DOWN to a file boundary. The age limit is already one — it is
+        # some file's `hi` — and so is the archive clamp, but the row floor is
+        # arbitrary and lands mid-file on most passes. A mid-file boundary is
+        # not a smaller eviction: `evict_through` filters by row, so pyiceberg
+        # rewrites the straddling file copy-on-write, and the replacement is
+        # written at a path this library never learns. That breaks the rule the
+        # whole deletion design rests on — every file's path is in SQLite
+        # before the file exists (I2) — and leaves the superseded original out
+        # of the queue, so once expiry drops the snapshots naming it, nothing
+        # can name it again. `drain` is a keyed read and this design refuses
+        # directory scans, so the file is unreclaimable for good.
+        files = self._table.data_files()
+        boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
         if boundary <= 0:
             return
 
@@ -470,7 +483,7 @@ class Maintenance:
         # appears in `stale` — but its offsets can sit below a stale file's
         # `hi`, so the boundary drops it too. Queueing only `stale` left it
         # removed from the table and named by nothing.
-        self._enqueue(f.path for f in self._table.data_files() if f.hi <= boundary)
+        self._enqueue(f.path for f in files if f.hi <= boundary)
         self._table.evict_through(boundary)
 
     def rewrite_archive(self, heartbeat: Callable[[], bool] | None = None) -> None:
@@ -562,6 +575,18 @@ class Maintenance:
         # crash costs a re-run rather than data — and this does one transaction
         # per source file plus a few per sealed one, every one of which would
         # otherwise fsync for a guarantee nothing here depends on.
+        # Removed BEFORE opening, not only after. SQLite's AUTOINCREMENT
+        # assigns `max(largest existing rowid, seq) + 1`, so seeding the
+        # counter DOWN is silently ignored when rows already sit above it —
+        # verified: with rows at 100-105 and the sequence set to 99, the next
+        # insert takes 106. A rewrite killed before its first cut leaves rows
+        # in this database and no claim to recover by, so the next run would
+        # re-append every row at shifted offsets, hold each one twice, pass the
+        # row-count guard (which counts only what this run read), and commit
+        # files whose offsets carry the wrong rows. Durable archive corruption
+        # with every check green. It is derived state; starting from nothing is
+        # always correct.
+        self._discard_scratch()
         scratch = Buffer.open(
             self._layout.rewrite_db,
             self._buffer.schema,
@@ -598,10 +623,7 @@ class Maintenance:
             written += self._seal_scratch(scratch, archive, heartbeat)
         finally:
             scratch.close()
-            for suffix in ("", "-wal", "-shm"):
-                self._layout.rewrite_db.with_name(
-                    self._layout.rewrite_db.name + suffix
-                ).unlink(missing_ok=True)
+            self._discard_scratch()
 
         # Before the swap, not after. The commit is the point of no return:
         # it deletes the range these rows came from, so a rewrite that lost
@@ -612,6 +634,13 @@ class Maintenance:
 
         archive.replace_range(lo, hi, [archive.uri(path) for path in written])
         self._buffer.clear_compaction()
+
+    def _discard_scratch(self) -> None:
+        """Remove the rewrite scratch database and its sidecars."""
+        for suffix in ("", "-wal", "-shm"):
+            self._layout.rewrite_db.with_name(
+                self._layout.rewrite_db.name + suffix
+            ).unlink(missing_ok=True)
 
     def _seal_scratch(
         self,

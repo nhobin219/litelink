@@ -126,18 +126,27 @@ class Reader:
         # connection would swap each other's buffer leg.
         self._lock = threading.Lock()
 
-    def _prepare_remote(self, cursor: duckdb.DuckDBPyConnection) -> str | None:
-        """Load httpfs, install the credentials, return the archive's pointer.
+    def _prepare_remote(
+        self, cursor: duckdb.DuckDBPyConnection
+    ) -> tuple[str, tuple[int, int]] | None:
+        """Load httpfs, install the credentials, return the archive's pointer
+        and the offset range it covers.
 
         None when there is no archive or it holds nothing yet, which is the
         signal to build the union without a third leg rather than to fail.
+
+        The extent comes back with the pointer because the union needs it when
+        there is nothing sealed locally: with no local extent there is no
+        boundary between the archive and the buffer, and the registered tail
+        can hold rows the archive has since taken ownership of.
         """
         archive = self._archive.table()
         if archive is None:
             return None
 
         archive.reload()
-        if archive.is_empty():
+        covered = archive.extent()
+        if covered is None:
             return None
 
         if not self._remote_ready:
@@ -149,7 +158,7 @@ class Reader:
 
         cursor.execute(secret_sql(self._archive.s3.resolved()))
 
-        return archive.metadata_location
+        return archive.metadata_location, covered
 
     def query(self, sql: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
@@ -192,12 +201,25 @@ class Reader:
             cursor = self._connect().cursor()
 
         cursor.register(BUFFER_REL, tail)
-        remote = self._prepare_remote(cursor) if include_archive else None
 
         # Resolving per query is §7's rule. Both halves in one call, or a
         # commit between them pairs a new snapshot with an old boundary.
         self._table.reload()
         location, extent = self._table.snapshot()
+
+        # The archive AFTER the local snapshot, and that order is the
+        # correctness argument. The archive leg is bounded by `extent[0]` — the
+        # oldest offset still local — so every offset below it must be in the
+        # archive snapshot this reads. Resolved first, it can be older than the
+        # bound it is measured against: a sync registering [100, 199] and an
+        # eviction dropping them both land in between, and the reader pairs an
+        # archive snapshot ending at 99 with a local extent starting at 200.
+        # Rows 100-199 are then in no leg at all.
+        #
+        # After, it cannot happen. I4 means nothing is evicted before it is
+        # registered, so an archive snapshot taken later than the local one
+        # holds everything the local one has given up.
+        remote = self._prepare_remote(cursor) if include_archive else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
@@ -211,7 +233,10 @@ class Reader:
         return _cast_to(reader, self._schema)
 
     def _union(
-        self, location: str, extent: tuple[int, int] | None, remote: str | None = None
+        self,
+        location: str,
+        extent: tuple[int, int] | None,
+        remote: tuple[str, tuple[int, int]] | None = None,
     ) -> str:
         """The hot read: the local table, plus the buffer above its extent.
 
@@ -238,7 +263,18 @@ class Reader:
             if remote is None:
                 return buffered
 
-            return f"SELECT {projection} FROM iceberg_scan('{remote}') UNION ALL {buffered}"
+            # The buffer still needs a floor, and with no local extent the
+            # archive supplies it. The tail was registered against an earlier
+            # read, so it can hold rows that have since been sealed, archived
+            # and evicted — leaving the local table empty again and both legs
+            # claiming them. Bounding here is what the `extent[1]` cut does in
+            # the branch below, from the only boundary available.
+            location, covered = remote
+
+            return (
+                f"SELECT {projection} FROM iceberg_scan('{location}')"
+                f' UNION ALL {buffered} WHERE b."{OFFSET}" > {covered[1]}'
+            )
 
         legs = []
         if remote is not None:
@@ -246,7 +282,7 @@ class Reader:
             # oldest offset still local, so anything at or above it is served
             # from disk rather than over the network.
             legs.append(
-                f"SELECT {projection} FROM iceberg_scan('{remote}')"
+                f"SELECT {projection} FROM iceberg_scan('{remote[0]}')"
                 f' WHERE "{OFFSET}" < {extent[0]}'
             )
 

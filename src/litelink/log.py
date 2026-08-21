@@ -694,7 +694,9 @@ class Log:
             msg = "replication needs an archive; this log is local-only"
             raise ValueError(msg)
 
-        return litestream_config(self.databases, self._archive.uri, self._archive.s3)
+        return litestream_config(
+            self.databases, self._layout.root, self._archive.uri, self._archive.s3
+        )
 
     def write_replication_config(self) -> Path:
         """Write that config next to the log, and return where.
@@ -724,6 +726,15 @@ class Log:
             self._writable()
             validate(self._schema, self._sort_by, self.config, archive)
             self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
+            # The watermark belonged to the PREVIOUS archive, and eviction acts
+            # on it: I4 lets `maintain` delete a local file because the archive
+            # holds it. Carried across a re-point, that is a promise about a
+            # bucket this log no longer uses — eviction would then delete the
+            # only copy of rows the new archive has never been sent. Reset, so
+            # nothing may be evicted until a sync has actually pushed it.
+            if (archive or None) != self._archive.uri:
+                self._buffer.set_meta(Maintenance.ARCHIVED_KEY, "0")
+
             # Reaches the maintainer and the reader because all three hold
             # this object. `evict` asks it whether I4 is owed anything, and a
             # setting that stopped at `Log` would leave the maintainer deleting
@@ -1295,19 +1306,30 @@ class Log:
         # already out of the snapshot and queued for deletion.
         self._table.reload()
 
-        _, _, key = pending
-        if is_remote(key):
-            # An archive rewrite. The claim is the object's URI, so this asks
-            # the archive whether its commit landed and deletes the object if
-            # it did not — the same question as below, over different storage.
-            archive = self._archive.table()
-            if archive is not None:
-                archive.reload()
-                if key not in archive.file_paths():
-                    archive.remove(key)
-        elif str(self._layout.absolute(key)) not in self._table.file_paths():
-            self._layout.absolute(key).unlink(missing_ok=True)
+        # EVERY claim, not the first. An archive rewrite writes one file per
+        # re-cut segment and claims each before it exists (I2), so taking one
+        # row and then clearing the table left the rest as objects in a bucket
+        # that nothing references and only a paginated LIST could find — the
+        # one thing this design refuses to need.
+        archive = None
+        for _, _, key in self._buffer.pending_outputs():
+            if is_remote(key):
+                # An archive rewrite. The claim is the object's URI, so this
+                # asks the archive whether the commit landed and deletes the
+                # object if it did not — the same question, different storage.
+                if archive is None:
+                    archive = self._archive.table()
+                    if archive is not None:
+                        archive.reload()
 
+                if archive is not None and key not in archive.file_paths():
+                    archive.remove(key)
+            elif str(self._layout.absolute(key)) not in self._table.file_paths():
+                self._layout.absolute(key).unlink(missing_ok=True)
+
+        # The scratch database an interrupted rewrite left behind. It is
+        # rebuilt from the archive next time, so nothing in it is owed.
+        self._layout.rewrite_db.unlink(missing_ok=True)
         self._buffer.clear_compaction()
 
     # -- maintenance -------------------------------------------------------
@@ -1629,20 +1651,41 @@ class Log:
         archive = self._archive.require()
         self._table.reload()
 
-        held = self._table.extent()
+        covered = self._table.extent()
         # Nothing local means nothing to sit below, so everything qualifies.
-        floor = held[0] if held is not None else None
+        floor = covered[0] if covered is not None else None
         cutoff = datetime.now(UTC) - since
         added = archive.snapshot_ages()
         held = self._maintenance.memory()
 
-        for data_file in archive.data_files():
-            if floor is not None and data_file.hi >= floor:
-                continue
+        eligible = [
+            data_file
+            for data_file in archive.data_files()
+            if (floor is None or data_file.hi < floor)
+            and (stamped := added.get(data_file.path)) is not None
+            and stamped.replace(tzinfo=UTC) >= cutoff
+        ]
 
-            stamped = added.get(data_file.path)
-            if stamped is None or stamped.replace(tzinfo=UTC) < cutoff:
-                continue
+        # DOWNWARD from the local floor, and only across an unbroken join.
+        #
+        # Registering upward left a hole no later run could fill. The first
+        # file restored becomes the new lowest local range, so a failure before
+        # the next one — a lost lease, a network error, or a `since` window
+        # that selected a non-contiguous set because `rewrite_archive` re-dated
+        # a middle file — leaves the gap ABOVE what was restored. The next run
+        # takes its floor from that new lower bound, finds the gap no longer
+        # below it, and skips it for ever. `_union` bounds the archive leg by
+        # the local floor, so those offsets are then served by neither tier:
+        # rows silently missing from every query.
+        #
+        # Downward, every step keeps the local range contiguous, so an
+        # interruption is just a range that starts higher than intended and the
+        # next run continues from there. Stopping at a gap rather than stepping
+        # over it is the same rule: what cannot be joined onto cannot be
+        # restored without creating one.
+        for data_file in sorted(eligible, key=lambda f: f.hi, reverse=True):
+            if floor is not None and data_file.hi != floor - 1:
+                break
 
             checkpoint(lease.renew)
             rel_path = archive.key(data_file.path)
@@ -1660,6 +1703,7 @@ class Log:
             self._buffer.record_file(
                 rel_path, data_file.lo, data_file.hi + 1, held.get(data_file.path, 0)
             )
+            floor = data_file.lo
 
     # -- schema evolution --------------------------------------------------
     #

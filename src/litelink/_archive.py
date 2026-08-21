@@ -100,10 +100,16 @@ class Archive:
         told to use a different one.
         """
         uri = uri or None
-        if uri != self._uri:
-            self._handle = None
+        # Under the lock, like every other access. Without it, an open already
+        # in flight inside `table()` for the PREVIOUS uri stores its result
+        # after this has cleared the handle — and every read afterwards is
+        # served from an archive the log has been told to stop using, which is
+        # the exact interleaving the lock was added for.
+        with self._lock:
+            if uri != self._uri:
+                self._handle = None
 
-        self._uri = uri
+            self._uri = uri
 
     def table(self) -> LogTable | None:
         """The remote table, or None when unconfigured. Opened on first use.
