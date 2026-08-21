@@ -25,6 +25,10 @@ from litelink._types import column_type
 # The library-owned column (§2).
 OFFSET = "litelink_offset"
 
+# Stands in for "no row limit" so the per-row check stays one comparison. Far
+# above any row count a buffer sized for read latency could reach.
+_NO_ROW_LIMIT = 1 << 62
+
 # How many appended-since-last-query slices the tail may accumulate before it
 # is compacted back into one.
 _MAX_TAIL_CHUNKS = 32
@@ -70,6 +74,7 @@ class Buffer:
         columns: tuple[str, ...],
         *,
         target_size: int,
+        target_rows: int | None = None,
     ) -> None:
         """Take built collaborators. `open` is what builds and validates them.
 
@@ -89,6 +94,7 @@ class Buffer:
         self._schema = schema
         self._columns = columns
         self._target_size = target_size
+        self._target_rows = target_rows
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
         # an append, a seal claiming and clearing its range, a maintenance pass
@@ -144,14 +150,15 @@ class Buffer:
 
                 raise
 
-    def set_target_size(self, target_size: int) -> None:
-        """Adopt a new cut size in place, rather than being rebuilt around it.
+    def set_target_size(self, target_size: int, target_rows: int | None) -> None:
+        """Adopt new cut limits in place, rather than being rebuilt around them.
 
         Policy can change under a running log (§12), and the cut is made here,
         so it has to arrive here. `Maintenance` takes the same shape.
         """
         with self._lock:
             self._target_size = target_size
+            self._target_rows = target_rows
 
     @classmethod
     def open(
@@ -160,6 +167,7 @@ class Buffer:
         schema: pa.Schema,
         *,
         target_size: int,
+        target_rows: int | None = None,
         readonly: bool = False,
         durable: bool = True,
     ) -> Buffer:
@@ -186,7 +194,14 @@ class Buffer:
         if readonly:
             con = cls._connect_readonly(path)
 
-            return cls(con, con, schema, columns, target_size=target_size)
+            return cls(
+                con,
+                con,
+                schema,
+                columns,
+                target_size=target_size,
+                target_rows=target_rows,
+            )
 
         # check_same_thread=False because scheduling maintenance on a background
         # thread is the ordinary operational shape, and Python's guard would
@@ -209,6 +224,7 @@ class Buffer:
             schema,
             columns,
             target_size=target_size,
+            target_rows=target_rows,
         )
         buffer._create()
         buffer._seed_group()
@@ -434,6 +450,10 @@ class Buffer:
             # runs per row: routing it through a method cost 19 points of
             # overhead against raw SQLite at 1,000-row batches.
             target = self._target_size
+            # `_insert` runs per row, so both limits are bound once out here.
+            # A row cap of None becomes one nothing reaches, which keeps the
+            # inner test a comparison rather than a branch on None.
+            target_rows = self._target_rows or _NO_ROW_LIMIT
             row_bytes = self._row_bytes
             columns = self._columns
             for row in rows:
@@ -448,7 +468,14 @@ class Buffer:
                     group.start_offset = offset
 
                 group.bytes += row_bytes(row)
-                if group.bytes >= target:
+                # Whichever is reached FIRST. Both are ceilings on one file —
+                # bytes bound memory, rows bound the read latency §7 sizes for
+                # — so the tighter one wins, which is the opposite of how
+                # `local_retention` and `local_rows` combine.
+                if (
+                    group.bytes >= target
+                    or offset - (group.start_offset or offset) + 1 >= target_rows
+                ):
                     group = self._cut(cursor, group, offset)
 
             self._write_group(cursor, group)

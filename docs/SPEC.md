@@ -251,7 +251,10 @@ automatically.
 
 ## 4. Seal
 
-Triggered on `target_size` alone, evaluated by the writer at commit time. Entirely local.
+Triggered on `min(target_size, target_rows)`, evaluated by the writer at commit time.
+Entirely local. Both are ceilings on one file — bytes bound memory, rows bound the read
+latency §7 sizes for — so the cut lands on whichever is reached first, and `target_rows`
+defaults to no limit because only the caller knows how wide a row is.
 
 There is no timer. A `max_age` branch was specified here and removed: it emitted a small
 file every interval on a quiet stream — the layout §6 exists to repair — and made one knob
@@ -569,7 +572,7 @@ it separates cleanly from compaction:
 
 | knob | controls |
 |---|---|
-| seal threshold (`target_size`) | how many rows sit in the buffer, hence hot-read latency |
+| seal threshold (`target_size` / `target_rows`) | how many rows sit in the buffer, hence hot-read latency |
 | compaction | how large the files end up, hence scan cost |
 
 So **seal small and often, then compact** — rather than sealing at a large `target_size` to
@@ -873,6 +876,9 @@ of them is chosen.
 ## 12. Configuration
 
 ```
+target_rows            max rows per file                  (the other ceiling; the seal cuts at
+                                                          whichever is reached FIRST. None =
+                                                          no row limit)
 target_size            uncompressed bytes per file        (size it for READ latency and for
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
