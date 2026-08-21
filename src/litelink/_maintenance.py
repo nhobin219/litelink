@@ -843,6 +843,20 @@ class Maintenance:
         """
         return path if is_remote(path) else self._layout.relative(path)
 
+    def enqueue_recovered(self, keys: Iterable[str]) -> None:
+        """Queue an abandoned operation's outputs for deletion.
+
+        Already keyed the way the queue wants them — a claim records the same
+        name `_key` would produce — so this is `_enqueue` without the
+        translation, and it exists to make that explicit rather than have
+        recovery look like it is enqueueing table paths.
+
+        The grace period applies here as it does everywhere: `drain` refuses to
+        remove anything the table still references, which is what makes it safe
+        to queue a file whose owner may turn out to be alive.
+        """
+        self._buffer.enqueue_deletions(keys, int(datetime.now(UTC).timestamp()))
+
     def _enqueue(self, paths: Iterable[str]) -> None:
         """Queue files for deletion once their grace period passes."""
         self._buffer.enqueue_deletions(

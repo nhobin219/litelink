@@ -471,3 +471,42 @@ def test_repointing_an_archive_reaches_the_new_one(
         assert len(fs.find(first.removeprefix("s3://"))) == in_first, (
             "detaching an archive is not deleting it"
         )
+
+
+def test_detaching_and_reattaching_keeps_the_archive(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Coming back to the same archive must find what is in it.
+
+    Dropping the catalog entry the moment a log is re-pointed looked like the
+    fix for reaching the wrong archive, and broke this instead: pointing back
+    at an archive that still held data built a fresh empty table over it, and
+    rows already evicted locally were reachable from nowhere. The entry is
+    checked against the prefix when the archive is opened, so leaving and
+    returning to the same one changes nothing.
+    """
+    # Not exactly zero: that means "evict on upload" and validation refuses to
+    # detach an archive it presupposes. A microsecond evicts just as promptly
+    # and leaves detaching legal, which is what this is about.
+    with archived_log(
+        tmp_path, bucket, s3, local_retention=timedelta(microseconds=1)
+    ) as log:
+        where = log.archive
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        log.maintain()
+        assert log.scan().read_all().num_rows < ROWS, "rows must be archive-only"
+        watermark = log.archived_through()
+
+        log.set_archive(None)
+        log.set_archive(where)
+        log.sync()
+
+        assert log.archived_through() == watermark, (
+            "the same archive still holds the same range"
+        )
+        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        assert sorted(merged.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1)), (
+            "every row must still be readable after a detach and reattach"
+        )

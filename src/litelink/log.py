@@ -36,7 +36,6 @@ from litelink._lease import Lease, new_owner
 from litelink._maintenance import (
     Maintenance,
     checkpoint,
-    is_remote,
     stable_prefix,
 )
 from litelink._read import Reader, duckdb_connection
@@ -1326,26 +1325,29 @@ class Log:
         # row and then clearing the table left the rest as objects in a bucket
         # that nothing references and only a paginated LIST could find — the
         # one thing this design refuses to need.
-        archive = None
-        for _, _, key in self._buffer.pending_outputs():
-            if is_remote(key):
-                # An archive rewrite. The claim is the object's URI, so this
-                # asks the archive whether the commit landed and deletes the
-                # object if it did not — the same question, different storage.
-                if archive is None:
-                    archive = self._archive.table()
-                    if archive is not None:
-                        archive.reload()
-
-                if archive is not None and key not in archive.file_paths():
-                    archive.remove(key)
-            elif str(self._layout.absolute(key)) not in self._table.file_paths():
-                self._layout.absolute(key).unlink(missing_ok=True)
+        # QUEUED, not unlinked. The check and the removal are two moments, and
+        # the owner this is recovering from may not be dead — a maintainer
+        # stalled past its lease can wake between them and commit the very file
+        # about to be deleted, taking the whole range with it, because its
+        # sources were queued before that commit and drain away behind it.
+        #
+        # The seal path never had this exposure: an abandoned seal goes through
+        # `pending_delete`, whose drain re-reads `referenced_paths` at unlink
+        # time and refuses anything the table has since adopted. Recovery now
+        # uses the same route, so the last word belongs to a check made when
+        # the file is actually removed.
+        claimed = self._buffer.pending_outputs()
+        self._maintenance.enqueue_recovered(key for _, _, key in claimed)
 
         # The scratch database an interrupted rewrite left behind. It is
         # rebuilt from the archive next time, so nothing in it is owed.
         self._layout.rewrite_db.unlink(missing_ok=True)
-        self._buffer.clear_compaction()
+        # Only the rows just read. A rewrite whose lease lapsed mid-upload can
+        # be claiming its next segment while this runs, and clearing the table
+        # wholesale takes that claim with it — leaving an object in the bucket
+        # named by nothing, which is the state claims exist to prevent.
+        for _, _, key in claimed:
+            self._buffer.clear_compaction(key)
 
     # -- maintenance -------------------------------------------------------
 

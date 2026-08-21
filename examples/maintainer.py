@@ -51,6 +51,7 @@ and two threads are refused on identical terms.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import os
 import signal
@@ -272,6 +273,13 @@ def main() -> None:
 _running = False
 
 
+def _die_with_parent() -> None:
+    """In the child, between fork and exec: ask for SIGKILL when this process's
+    parent dies. Linux-specific (`PR_SET_PDEATHSIG`), and the only thing that
+    covers a parent killed with SIGKILL."""
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+
+
 def _stop(signum: int, frame: object) -> None:
     """Turn a signal into an exception, so the cleanup path is the same one.
 
@@ -322,11 +330,21 @@ class Sidecar:
         # it dies. A lock FILE would need liveness checks and would survive a
         # SIGKILL as a stale lock nothing could clear.
         self._lock = (log.root / "litestream.lock").open("w")
+        self.owner = self._claim()
+
+    def _claim(self) -> bool:
+        """Try for the lock. Retried every pass, not answered once.
+
+        Answered once, a standby never becomes the owner: the process holding
+        it exits cleanly, the kernel frees the lock, and the standby goes on
+        printing that somebody else is replicating while nobody is.
+        """
         try:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.owner = True
         except OSError:
-            self.owner = False
+            return False
+
+        return True
 
     def keep_running(self) -> None:
         """Start it, or restart it if it has exited. Called every pass.
@@ -336,7 +354,11 @@ class Sidecar:
         job is to wait.
         """
         if not self.owner:
-            return
+            self.owner = self._claim()
+            if not self.owner:
+                return
+
+            print("[   sync] took over WAL replication", flush=True)
 
         if self._process is not None and self._process.poll() is None:
             return
@@ -347,6 +369,13 @@ class Sidecar:
         try:
             self._process = subprocess.Popen(  # noqa: S603
                 ["litestream", "replicate", "-config", str(self.config)],  # noqa: S607
+                # Die with this process, however it dies. Without it a SIGKILL
+                # here leaves litestream running while the kernel frees the
+                # lock — so a supervisor restarting this service acquires the
+                # lock immediately and starts a SECOND instance beside the
+                # orphan, which is worse than the race it replaced. The signal
+                # handler cannot cover SIGKILL; only the kernel can.
+                preexec_fn=_die_with_parent,  # noqa: PLW1509
             )
         except FileNotFoundError:
             raise SystemExit(

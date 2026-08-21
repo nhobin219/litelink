@@ -107,13 +107,12 @@ class Archive:
         # the exact interleaving the lock was added for.
         with self._lock:
             if uri != self._uri:
+                # The cached handle only. The catalog entry is checked against
+                # the prefix when the archive is next opened — `open_archive`
+                # explains why a repair that runs every time beats a step here
+                # that a crash can skip, and why detaching and reattaching the
+                # same archive has to keep working.
                 self._handle = None
-                # The catalog entry too, not only the cached handle. It lives
-                # in a local SQLite file keyed by table id, so an entry made
-                # for the previous prefix would be found again and hand back a
-                # table whose metadata is still in the old bucket — a re-point
-                # that changes nothing except what the log claims.
-                LogTable.forget_archive(self._layout, self._s3)
 
             self._uri = uri
 
