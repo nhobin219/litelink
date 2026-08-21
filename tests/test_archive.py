@@ -697,3 +697,59 @@ def test_a_repoint_leaves_reads_working(
         merged = reader.sql("SELECT * FROM log", include_archive=True).read_all()
 
         assert merged.num_rows == ROWS, "a re-pointed log must still be readable"
+
+
+def test_repointing_cannot_interleave_with_a_sync(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A sync that has already pushed finishes by writing the watermark.
+
+    Land a re-point between those two moments and the log points at the new,
+    empty archive while carrying a watermark earned by the old one — eviction
+    believes it and deletes the only local copy of rows the new archive has
+    never been sent. Nothing lowers a watermark, so no later sync undoes it.
+
+    Re-reading the location at the top of `sync` narrows that window; only the
+    lease closes it. Held here by a stand-in for the maintainer.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(200))
+        log.seal_due()
+
+        held = log._lease("maintain")
+        assert held.acquire()
+        try:
+            with pytest.raises(RuntimeError, match="maintenance lease"):
+                log.set_archive(f"s3://{bucket}/elsewhere")
+        finally:
+            held.release()
+
+        # And the refusal changed nothing: the archive is still the old one.
+        assert log.archive is not None
+        assert log.archive.endswith("/prefix")
+
+        log.set_archive(f"s3://{bucket}/elsewhere")
+        assert log.archive.endswith("/elsewhere")
+
+
+def test_a_read_against_a_never_synced_archive_writes_nothing(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """ "Creates nothing" has to mean locally too.
+
+    Constructing the catalog creates its tables in `archive.db`, and
+    registering the namespace adds a row — writes, from a path that promised to
+    make none. So absence is decided from the catalog file before one is built,
+    and a reader against an archive nothing has pushed to touches nothing.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(200))
+        log.seal_due()
+        assert not log._layout.archive_db.exists()
+
+        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+
+        assert merged.num_rows == 200
+        assert not log._layout.archive_db.exists(), (
+            "a read must not create the archive catalog"
+        )

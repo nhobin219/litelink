@@ -721,10 +721,35 @@ class Log:
         return self._archive.uri
 
     def set_archive(self, archive: str | None) -> None:
-        """Point the log at an archive, or detach it (§5)."""
+        """Point the log at an archive, or detach it (§5).
+
+        Takes the maintenance lease, so it cannot interleave with a `sync` —
+        and raises if another owner holds it, rather than proceeding.
+
+        Re-reading the location at the top of `sync` narrowed the window; it
+        did not close it. A sync that has already read `s3://old`, taken the
+        lease and pushed to it finishes by writing that archive's extent as the
+        watermark. Land a re-point in between and the log points at the new,
+        empty archive while carrying a watermark earned by the old one —
+        eviction believes it and deletes the only local copy of rows the new
+        archive has never been sent. Nothing lowers a watermark, so the next
+        sync cannot undo it.
+
+        The shipped writer calls this on every restart, and the maintainer runs
+        in another process, so the two are exactly the pair that collide.
+        """
         with self._lock:
             self._writable()
             validate(self._schema, self._sort_by, self.config, archive)
+            # Before the first durable write, so a refusal changes nothing.
+            lease = self._lease(MAINTAIN_ROLE)
+            if not lease.acquire():
+                msg = (
+                    "another owner holds the maintenance lease; a sync may be "
+                    "pushing to the current archive. Retry."
+                )
+                raise RuntimeError(msg)
+
             # The watermark FIRST, and the order is the point. It belonged to
             # the PREVIOUS archive, and eviction acts on it: I4 lets `maintain`
             # delete a local file because the archive holds it. Carried across
@@ -746,35 +771,25 @@ class Log:
             # this object. `evict` asks it whether I4 is owed anything, and a
             # setting that stopped at `Log` would leave the maintainer deleting
             # the only copy of rows an archive was just configured to receive.
-            self._archive.set_uri(archive)
+            try:
+                self._archive.set_uri(archive)
+                if self._archive.configured():
+                    # Best effort in both directions: the archive may not be
+                    # reachable at all, and configuring one is a statement of
+                    # intent — it must not require the bucket to be up, or a
+                    # log could not be pointed at an archive before that
+                    # archive exists. The check at open heals what this misses,
+                    # and `sync` raises loudly the moment the location is used.
+                    with contextlib.suppress(Exception):
+                        self._archive.table(repair=True)
+            finally:
+                lease.release()
 
-        # Repaired here as well as at open, and the difference is who waits.
+        # Repaired under the same lease, and the difference is who waits.
         # The catalog entry still names the previous archive until something
         # replaces it, and only a lease holder may — so without this, ordinary
         # re-pointing left every `include_archive` read raising until a
-        # maintenance pass happened to run. Local reads keep working
-        # throughout, but that is a poor answer for a routine operation.
-        #
-        # Outside the lock, because it opens the archive: a round trip does not
-        # belong under a lock an append takes. Best effort — if another owner
-        # holds the maintenance lease it is already doing this kind of work,
-        # and the check at open heals whatever this misses, including a crash
-        # landing between the two writes above.
-        if self._archive.configured():
-            lease = self._lease(MAINTAIN_ROLE)
-            if lease.acquire():
-                try:
-                    # Best effort in both directions: another owner may hold
-                    # the lease, and the archive may not be reachable at all.
-                    # Configuring one is a statement of intent — it must not
-                    # require the bucket to be up, or a log could not be
-                    # pointed at an archive before that archive exists. The
-                    # check at open heals whatever this misses, and `sync`
-                    # raises loudly the moment the location is actually used.
-                    with contextlib.suppress(Exception):
-                        self._archive.table(repair=True)
-                finally:
-                    lease.release()
+        # maintenance pass happened to run.
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.

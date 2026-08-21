@@ -523,7 +523,12 @@ class Maintenance:
         written would have each commit delete a sub-range of a file the next
         one still needs to read.
         """
-        archive = self._archive.table()
+        # `repair=True`: this holds the maintenance lease, which is what makes
+        # replacing an entry that names another prefix safe. Opening with
+        # `repair=False` here meant `maintain` and `rewrite_archive` failed
+        # after a re-point with an error telling the operator that a
+        # maintenance pass would fix it — which they are.
+        archive = self._archive.table(repair=True)
         if archive is None:
             msg = "rewrite_archive() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -774,7 +779,7 @@ class Maintenance:
         if not any(is_remote(p) for p in self._buffer.queued_deletions()):
             return
 
-        archive = self._archive.table()
+        archive = self._archive.table(repair=True)
         if archive is None:
             return
 
@@ -807,7 +812,9 @@ class Maintenance:
         # Only if the queue holds something remote, so an ordinary drain on a
         # local-only log still opens nothing. `rewrite_archive` is what puts
         # remote entries here, and it is an operation somebody ran on purpose.
-        remote = self._archive.table() if any(is_remote(p) for p in due) else None
+        remote = (
+            self._archive.table(repair=True) if any(is_remote(p) for p in due) else None
+        )
         remote_referenced = set() if remote is None else remote.referenced_paths()
 
         for rel_path in due:
