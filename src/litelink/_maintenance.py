@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 
-from litelink._archive import Archive
+from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
 from litelink._fs import fsync
 
@@ -504,6 +504,14 @@ class Maintenance:
         # With no archive there is nothing owed: §8 says `local_retention` is
         # then a deletion policy over the only copy, which is the contract the
         # operator asked for.
+        # Re-read from the buffer rather than trusted from memory. Another
+        # process can attach an archive to a log this maintainer already has
+        # open, and nothing else here would ever hear about it: `sync` is what
+        # refreshes this object, and a maintainer that believes the log is
+        # local-only never syncs. It would go on deleting the only copy of
+        # every row that ages past `local_retention`, for as long as it ran,
+        # while the durable configuration promised I4.
+        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         if self._archive.configured():
             boundary = min(boundary, self.archived_through())
             if boundary <= 0:

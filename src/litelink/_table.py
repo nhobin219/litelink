@@ -727,10 +727,35 @@ class LogTable:
                     raise
 
                 self.reload()
+                # Refreshed, so check it is still the same table. The catalog
+                # row is keyed by table id, not by identity, and a `set_archive`
+                # racing a slow register replaces what that row names — so the
+                # reload silently re-binds this operation to the NEW archive
+                # and the retry commits paths that live in the old bucket. The
+                # new archive's manifests would then reference objects the
+                # re-point retired, and the next sync's reconcile would launder
+                # that extent into the watermark eviction acts on.
+                self._verify_identity()
             else:
                 self.reload()
 
                 return
+
+    def _verify_identity(self) -> None:
+        """Refuse to keep operating on a table that left this warehouse.
+
+        The one durable write in a push with no watermark fence around it is
+        the Iceberg commit itself, and `_commit`'s retry is where it can change
+        which table it means.
+        """
+        location = str(self._table.metadata_location)
+        boundary = self._warehouse.rstrip("/") + "/"
+        if not location.startswith(boundary):
+            msg = (
+                f"the table moved out of {self._warehouse!r} while this commit "
+                f"was in flight (now {location!r}); it was not retried"
+            )
+            raise RuntimeError(msg)
 
     def uri(self, rel_path: str) -> str:
         """Where a root-relative file lives in this table's warehouse."""

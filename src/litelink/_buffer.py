@@ -1110,6 +1110,35 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
+    def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
+        """Record `value`, applying `reset` only if it is a MOVE.
+
+        The question "is this a change?" is answered against the durable value,
+        inside the transaction that acts on the answer. Asked of a process's
+        memory instead, both answers are wrong in a two-process deployment,
+        because nothing refreshes that memory except a sync:
+
+        * memory stale, argument current — re-asserting the archive the log
+          already has reads as a move and zeroes the watermarks of a bucket
+          that genuinely holds the data;
+        * memory stale, argument stale — re-pointing BACK to an archive reads
+          as a restatement, and the log keeps the other archive's watermark
+          over a bucket whose extent is lower. Eviction believes it (I4).
+
+        Returns whether it was a move.
+        """
+        with self._transaction():
+            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+            current = (row[0] if row is not None else None) or None
+            moved = current != (value or None)
+            pairs = {key: value, **(dict(reset) if moved else {})}
+            self._con.executemany(
+                "INSERT INTO meta (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                list(pairs.items()),
+            )
+            return moved
+
     def set_meta_if(
         self, key: str, expected: str | None, pairs: Mapping[str, str]
     ) -> bool:
