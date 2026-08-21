@@ -16,6 +16,7 @@ from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
 from pyiceberg.exceptions import (
     CommitFailedException,
+    NoSuchTableError,
 )
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
@@ -77,6 +78,12 @@ class DataFile:
     hi: int
 
 
+# The catalog name the archive's `SqlCatalog` is built with, and the key its
+# rows are stored under. One constant so the reader below and the writer above
+# cannot disagree about which rows are ours.
+ARCHIVE_CATALOG = "archive"
+
+
 def _recorded_location(layout: Layout) -> str | None:
     """Where the archive's catalog entry says its metadata is, without a read.
 
@@ -86,9 +93,18 @@ def _recorded_location(layout: Layout) -> str | None:
     to tell us, and that fetch is exactly the one that can fail for reasons
     other than "there is no table".
 
-    None when there is no entry, or when the catalog's own shape is not what
-    this expects. Both mean "decide the other way", and the other way is to
-    load and let any failure surface.
+    None means there is definitely no entry — the catalog was readable and had
+    no row. `LookupError` means the question could not be answered, which is
+    NOT the same thing: answering None there sends the caller down the create
+    path against an entry that still exists, and every open of that log then
+    fails on a unique constraint. A log nobody can open, from a query that was
+    only ever an optimisation.
+
+    The schema is pyiceberg's, not ours: table `iceberg_tables`, keyed by
+    catalog name, namespace and table name. Verified against a real catalog
+    rather than assumed. If a future version changes it, the query fails, the
+    caller falls back to loading, and pyiceberg answers for itself — slower and
+    correct, instead of fast and destructive.
     """
     if not layout.archive_db.exists():
         return None
@@ -98,11 +114,12 @@ def _recorded_location(layout: Layout) -> str | None:
     try:
         row = connection.execute(
             "SELECT metadata_location FROM iceberg_tables"
-            " WHERE table_namespace = ? AND table_name = ?",
-            (namespace, name),
+            " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
+            (ARCHIVE_CATALOG, namespace, name),
         ).fetchone()
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as exc:
+        msg = f"cannot read the archive catalog's own table: {exc}"
+        raise LookupError(msg) from exc
     finally:
         connection.close()
 
@@ -242,7 +259,7 @@ class LogTable:
         at the prefix rather than discovering what is already there.
         """
         catalog = SqlCatalog(
-            "archive",
+            ARCHIVE_CATALOG,
             uri=layout.archive_catalog_uri,
             warehouse=prefix,
             **options.resolved().catalog_properties(),
@@ -258,8 +275,19 @@ class LogTable:
         # `s3://b/one-more` as a string, so a plain `startswith` accepts a
         # SIBLING archive's entry as this one's, and the log then reads and
         # writes into the neighbour it was pointed away from.
-        recorded = _recorded_location(layout)
         boundary = prefix.rstrip("/") + "/"
+        try:
+            recorded = _recorded_location(layout)
+        except LookupError:
+            # Could not tell. Let pyiceberg answer: it either loads the table,
+            # or says there is none. Slower than the offline read and correct
+            # in the one direction that matters — never creating an empty table
+            # over an archive that is alive.
+            try:
+                return cls(catalog, layout, catalog.load_table(layout.table_id), prefix)
+            except NoSuchTableError:
+                recorded = None
+
         if recorded is not None and not recorded.startswith(boundary):
             # Another archive's table, found by table id. The entry goes; the
             # objects do not, because detaching an archive is not deleting one.
