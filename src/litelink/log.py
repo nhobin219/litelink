@@ -16,6 +16,7 @@ raise.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -746,6 +747,34 @@ class Log:
             # setting that stopped at `Log` would leave the maintainer deleting
             # the only copy of rows an archive was just configured to receive.
             self._archive.set_uri(archive)
+
+        # Repaired here as well as at open, and the difference is who waits.
+        # The catalog entry still names the previous archive until something
+        # replaces it, and only a lease holder may — so without this, ordinary
+        # re-pointing left every `include_archive` read raising until a
+        # maintenance pass happened to run. Local reads keep working
+        # throughout, but that is a poor answer for a routine operation.
+        #
+        # Outside the lock, because it opens the archive: a round trip does not
+        # belong under a lock an append takes. Best effort — if another owner
+        # holds the maintenance lease it is already doing this kind of work,
+        # and the check at open heals whatever this misses, including a crash
+        # landing between the two writes above.
+        if self._archive.configured():
+            lease = self._lease(MAINTAIN_ROLE)
+            if lease.acquire():
+                try:
+                    # Best effort in both directions: another owner may hold
+                    # the lease, and the archive may not be reachable at all.
+                    # Configuring one is a statement of intent — it must not
+                    # require the bucket to be up, or a log could not be
+                    # pointed at an archive before that archive exists. The
+                    # check at open heals whatever this misses, and `sync`
+                    # raises loudly the moment the location is actually used.
+                    with contextlib.suppress(Exception):
+                        self._archive.table(repair=True)
+                finally:
+                    lease.release()
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.

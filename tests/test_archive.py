@@ -672,3 +672,28 @@ def test_a_read_before_the_first_sync_simply_has_no_archive_leg(
         assert _recorded_location(log._layout) is None, (
             "reading must not create the archive table"
         )
+
+
+def test_a_repoint_leaves_reads_working(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Re-pointing is routine, so it must not break reading until a maintainer
+    happens to run.
+
+    The catalog entry still names the previous archive until something replaces
+    it, and only a lease holder may — so `set_archive` does it, under the
+    lease, rather than leaving every cross-tier read raising in the meantime.
+    The check at open stays as the repair for what this misses: another owner
+    holding the lease, or a crash between the two durable writes.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+
+        log.set_archive(f"s3://{bucket}/moved")
+
+    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+        merged = reader.sql("SELECT * FROM log", include_archive=True).read_all()
+
+        assert merged.num_rows == ROWS, "a re-pointed log must still be readable"
