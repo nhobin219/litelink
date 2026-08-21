@@ -20,7 +20,8 @@ from litelink._archive import Archive
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
-from litelink._read import Reader, duckdb_connection
+from litelink._read import Reader, duckdb_connection, secret_sql
+from litelink._replication import WAL_PREFIX
 from litelink._s3 import S3Options
 from litelink._table import LogTable
 from litelink.log import table_schema, validate
@@ -506,3 +507,98 @@ def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:
     }
     assert layout.rewrite_db not in layout.databases
     assert all(path.suffix == ".db" for path in layout.databases)
+
+
+def test_replication_config_names_every_database_and_the_wal_prefix(
+    tmp_path: Path,
+) -> None:
+    """§3a, derived rather than restated.
+
+    Everything in the config comes from the log: the file set, the destination
+    beside the archived data, and the endpoint from the credentials it was
+    opened with. A config written by hand knows what someone remembered.
+    """
+    s3 = S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1")
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True),
+        archive="s3://bucket/prefix",
+        s3=s3,
+    ) as log:
+        rendered = log.replication_config()
+
+        for database in log.databases:
+            assert f"path: {database}" in rendered
+            assert f"path: prefix/{WAL_PREFIX}/{database.name}" in rendered
+
+        assert "bucket: bucket" in rendered
+        # A non-AWS endpoint needs both, and neither can be left to the
+        # environment: litestream resolves the region against real AWS
+        # otherwise, and `bucket.host` is a DNS name only AWS serves.
+        assert "endpoint: http://127.0.0.1:9000" in rendered
+        assert "force-path-style: true" in rendered
+        assert "secret" not in rendered.lower(), "credentials must stay in the env"
+
+
+def test_replication_needs_somewhere_to_ship_to(tmp_path: Path) -> None:
+    """WAL segments go beside the archived data, so a local-only log has
+    nowhere to put them — refused at construction rather than at the first
+    attempt to write a config nothing could act on."""
+    with pytest.raises(ValueError, match="wal_replication"):
+        validate(SCHEMA, (), LogConfig(wal_replication=True), None)
+
+
+def test_the_replication_config_is_written_beside_the_log(tmp_path: Path) -> None:
+    """Derived like every other path: a setting for it would be one more thing
+    to keep in step with the log it describes."""
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True),
+        archive="s3://bucket/prefix",
+    ) as log:
+        written = log.write_replication_config()
+
+        assert written == tmp_path / "litestream.yml"
+        assert written.read_text() == log.replication_config()
+
+
+def test_the_archive_read_falls_back_to_the_aws_credential_chain() -> None:
+    """The bug a local endpoint cannot catch.
+
+    On an ordinary AWS host the credentials are in a profile, in instance
+    metadata, or behind SSO — never in the arguments. pyiceberg and s3fs
+    resolve those themselves, so writes worked; DuckDB got a secret with no
+    keys, treated it as anonymous, and answered every `include_archive` read
+    with 403. Against rustfs it never appeared, because a local endpoint always
+    has explicit keys to pass.
+    """
+    rendered = secret_sql(S3Options(region="us-west-1"))
+
+    assert "PROVIDER credential_chain" in rendered
+    assert "KEY_ID" not in rendered
+    assert "REGION 'us-west-1'" in rendered
+
+
+def test_an_explicit_key_still_wins_over_the_chain() -> None:
+    """Which is what makes "test locally, then against AWS" a change of
+    environment rather than of code."""
+    rendered = secret_sql(
+        S3Options(
+            endpoint="http://127.0.0.1:9000",
+            access_key="litelink",
+            secret_key="litelink-secret",
+            region="us-east-1",
+        )
+    )
+
+    assert "PROVIDER credential_chain" not in rendered
+    assert "KEY_ID 'litelink'" in rendered
+    # A non-AWS endpoint needs path-style addressing and the scheme split off:
+    # DuckDB takes host:port with USE_SSL, where pyiceberg takes a URL.
+    assert "ENDPOINT '127.0.0.1:9000'" in rendered
+    assert "USE_SSL false" in rendered
+    assert "URL_STYLE 'path'" in rendered

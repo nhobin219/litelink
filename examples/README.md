@@ -8,6 +8,52 @@ just demo-maintain     # terminal 2: seal, compact, evict, expire
 just demo-tail         # terminal 3: watch where the rows are
 ```
 
+## Adding the archive tier
+
+Everything above is local. To push sealed files to object storage and read across both
+tiers, add a bucket:
+
+```
+just rustfs            # a local S3-compatible store, in one container
+just demo-archive      # terminal 1: capture, with an archive configured
+just demo-maintain     # terminal 2: also pushes, and evicts what it has pushed
+just demo-tail         # terminal 3: `in table` falls as `archived` rises
+```
+
+**Against a real AWS bucket instead**, nothing changes but the environment:
+
+```
+cp examples/.env.example .env      # then set LITELINK_ARCHIVE=s3://your-bucket/prefix
+just demo-archive
+just demo-maintain
+```
+
+`just` loads `.env` automatically. Credentials are NOT in it unless you put them there —
+the library reads them from the environment at the point of use through the ordinary AWS
+chain, so a profile, instance metadata or SSO all work untouched. That is deliberate:
+credentials never enter `LogConfig`, because a log directory gets copied, backed up and
+attached elsewhere, and a key inside it travels with all of that.
+
+The reader needs the same environment, since `include_archive=True` reaches object
+storage. Without it, `scan()` still works — it is local disk only, which is what makes a
+hot read a hot read.
+
+## Continuous RPO
+
+Add `--replicate` to `demo-archive` and the maintainer runs litestream alongside itself,
+shipping the SQLite WAL to `_wal` beside the archived data. Needs the binary on PATH
+([install](https://litestream.io/install)) and an archive to ship to.
+
+That supervision lives in `maintainer.py`, not in the library: replication is a separate
+process reading the WAL, which is exactly why it keeps the network out of the write path,
+and litestream is explicit that two instances must never replicate one database. To run it
+independently instead, generate the same config and use it directly:
+
+```
+uv run python examples/replicate.py --root litelink-data
+litestream replicate -config litelink-data/litestream.yml
+```
+
 Two roles, because there are two kinds of work: **the hot path, and everything else.**
 The writer appends; the maintainer does the rest. Sealing is maintenance, not a third
 role — it is the first thing done with what the writer leaves behind. (A reader is not a

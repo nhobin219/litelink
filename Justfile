@@ -3,6 +3,12 @@
 
 # The local S3-compatible endpoint the archive tier is tested and demoed against.
 # Matches tests/conftest.py; change both together.
+# Loaded from `.env` if present, so the demo can point at a real bucket without
+# editing anything here — see `examples/.env.example`. Recipes read AWS_* through the
+# environment exactly as the library does, so what works here works in
+# production.
+set dotenv-load := true
+
 RUSTFS_ENDPOINT := "http://127.0.0.1:9000"
 RUSTFS_KEY := "litelink"
 RUSTFS_SECRET := "litelink-secret"
@@ -75,6 +81,19 @@ demo-capture *args:
 
 # Seal, compact, evict and expire — the second role. Run with demo-capture.
 demo-maintain *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Same rule as demo-archive: a real endpoint if `.env` names one, rustfs
+    # otherwise. Needed here too — the maintainer is what pushes to the archive.
+    if [ -z "${LITELINK_ARCHIVE:-}" ]; then
+        export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
+        export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
+        export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
+        export AWS_REGION=us-east-1
+    fi
+    # litestream reads its own, and only if wal_replication is on.
+    export LITESTREAM_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+    export LITESTREAM_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
     uv run python examples/maintainer.py {{args}}
 
 # Watch a running capture accumulate. Run alongside `just demo-capture`.
@@ -91,11 +110,22 @@ demo-tail *args:
 #
 # Capture into a log with the archive tier configured, against local rustfs.
 demo-archive *args:
-    AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}} \
-    AWS_ACCESS_KEY_ID={{RUSTFS_KEY}} \
-    AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}} \
-    AWS_REGION=us-east-1 \
-    uv run python examples/capture.py --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A real bucket if `.env` names one, rustfs otherwise. The library reads
+    # credentials from the environment either way, so this is the whole
+    # difference between the local demo and a production deployment.
+    if [ -n "${LITELINK_ARCHIVE:-}" ]; then
+        echo "archiving to $LITELINK_ARCHIVE (credentials from the environment)"
+        uv run python examples/capture.py --archive "$LITELINK_ARCHIVE" {{args}}
+    else
+        export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
+        export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
+        export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
+        export AWS_REGION=us-east-1
+        uv run python examples/capture.py \
+            --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
+    fi
 
 # Needs `just rustfs`, a capture running, and the litestream binary on PATH
 # (https://litestream.io/install — a single Go binary, not a project dependency:
