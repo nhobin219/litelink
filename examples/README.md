@@ -23,7 +23,7 @@ just demo-tail         # terminal 3: `in table` falls as `archived` rises
 **Against a real AWS bucket instead**, nothing changes but the environment:
 
 ```
-cp examples/.env.example .env      # then set LITELINK_ARCHIVE=s3://your-bucket/prefix
+cp .env.example .env      # then set LITELINK_DEMO_ARCHIVE=s3://your-bucket/prefix
 just demo-archive
 just demo-maintain
 ```
