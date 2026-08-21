@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import pyarrow.parquet as pq
 
 from litelink._archive import Archive
-from litelink._buffer import OFFSET, Buffer
+from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
@@ -48,7 +48,10 @@ def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
 
 
 def runs(
-    files: Sequence[DataFile], budget: int, memory: Mapping[str, int]
+    files: Sequence[DataFile],
+    budget: int,
+    memory: Mapping[str, int],
+    rows: int | None = None,
 ) -> list[list[DataFile]]:
     """Adjacent files grouped into merge candidates, each within `budget`.
 
@@ -76,21 +79,30 @@ def runs(
     undersized file with the sign flipped. A run therefore closes when the next
     file would take it past the budget, and the pass emits several correctly
     sized files instead of one enormous one.
+
+    `rows` is `target_rows`, and it has to be here for the same reason. A seal
+    that cut on the row limit produced a file holding fewer bytes than
+    `target_size`, which by bytes alone looks starved — so compaction would
+    merge exactly the files the row cap just created, straight back past it.
+    Whichever ceiling the seal respected, this respects too.
     """
+    limit = rows or _NO_ROW_LIMIT
     grouped: list[list[DataFile]] = []
     run: list[DataFile] = []
     held = 0
+    counted = 0
     for data_file in files:
         size = memory.get(data_file.path, budget)
-        # A file already at the budget on its own closes the previous run and
-        # forms one of its own, which then closes on the next file. No special
-        # case needed: it simply never has room for a neighbour.
-        if run and held + size > budget:
+        # A file already at either ceiling on its own closes the previous run
+        # and forms one of its own, which then closes on the next file. No
+        # special case needed: it simply never has room for a neighbour.
+        if run and (held + size > budget or counted + data_file.rows > limit):
             grouped.append(run)
-            run, held = [], 0
+            run, held, counted = [], 0, 0
 
         run.append(data_file)
         held += size
+        counted += data_file.rows
 
     if run:
         grouped.append(run)
@@ -103,6 +115,7 @@ def stable_prefix(
     budget: int,
     min_files: int,
     memory: Mapping[str, int],
+    rows: int | None = None,
 ) -> int:
     """How many leading files compaction will never touch again.
 
@@ -128,13 +141,17 @@ def stable_prefix(
     archive permanently: everything after it is newer, so the watermark never
     advanced again and I4 then pinned local disk too. Not "later" — never.
     """
+    limit = rows or _NO_ROW_LIMIT
     settled = 0
-    for run in runs(files, budget, memory):
+    for run in runs(files, budget, memory, rows):
         if len(run) >= min_files:
             break
 
         held = sum(memory.get(f.path, budget) for f in run)
-        if run[-1] is files[-1] and held < budget:
+        counted = sum(f.rows for f in run)
+        # Room under BOTH ceilings is what makes the trailing run growable. At
+        # either one it is finished, and a file that cannot grow is settled.
+        if run[-1] is files[-1] and held < budget and counted < limit:
             break
 
         settled += len(run)
@@ -253,7 +270,12 @@ class Maintenance:
         # watermark is contiguous — so dropping them cannot break adjacency.
         pending = [f for f in self._table.data_files() if f.hi > archived]
 
-        for run in runs(pending, self._config.target_size, self.memory()):
+        for run in runs(
+            pending,
+            self._config.target_size,
+            self.memory(),
+            self._config.target_rows,
+        ):
             self._merge(run, heartbeat)
 
     def memory(self) -> dict[str, int]:

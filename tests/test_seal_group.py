@@ -74,11 +74,13 @@ def quiet(**kwargs: object) -> LogConfig:
     `seal`/`seal_due` are the only things that write files, so the queue stays
     exactly as the appends left it.
     """
-    return LogConfig(
-        target_size=TARGET,
-        snapshot_retention=timedelta(days=1),
-        **kwargs,  # ty: ignore[invalid-argument-type]
-    )
+    settings: dict[str, object] = {
+        "target_size": TARGET,
+        "snapshot_retention": timedelta(days=1),
+    }
+    settings.update(kwargs)
+
+    return LogConfig(**settings)  # ty: ignore[invalid-argument-type]
 
 
 def test_a_closed_group_is_never_smaller_than_the_target(tmp_path: Path) -> None:
@@ -477,3 +479,46 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
 
         assert log.table_files() == 1, "a second file for the same range landed"
         assert log.table_rows() == 60, "rows were duplicated"
+
+
+def test_the_seal_cuts_on_whichever_limit_is_reached_first(tmp_path: Path) -> None:
+    """§7's other half, and the one `target_size` cannot express.
+
+    Buffer cost is per ROW — SQLite is row-oriented — so a narrow-row stream
+    reaches a byte target only after far more rows than the read-latency
+    ceiling was sized for, while every byte-based check reports the buffer is
+    fine. Bytes bound memory, rows bound read latency, and both are ceilings on
+    one file, so the tighter one wins.
+    """
+    config = quiet(target_size=1 << 30, target_rows=10)
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(25))
+
+        cuts = [(start, end) for _, start, end, _ in groups(log) if end is not None]
+
+        assert cuts == [(1, 11), (11, 21)], (
+            "the row limit must cut every 10 rows, exactly, leaving the "
+            "remainder in the open group"
+        )
+
+
+def test_a_row_capped_cut_is_not_undone_by_compaction(tmp_path: Path) -> None:
+    """The half that is easy to miss.
+
+    A file cut on the row limit holds fewer BYTES than `target_size`, so judged
+    by bytes alone it looks starved — and compaction would merge exactly the
+    files the row cap just created, straight back past it. Whichever ceiling
+    the seal respected, compaction respects too.
+    """
+    config = quiet(target_size=1 << 30, target_rows=10, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(40))
+        log.seal_due()
+        before = len(log._table.data_files())
+        assert before >= 3, "the row cap must have produced several files"
+
+        log.maintain()
+
+        after = log._table.data_files()
+        assert len(after) == before, "compaction must not merge past target_rows"
+        assert all(f.rows <= 10 for f in after)

@@ -129,6 +129,20 @@ class LogConfig:
     # deliberately not added now, on one knob until a real workload demands the
     # second.
     target_size: int = 8 * 1024 * 1024
+    # The second half of §7's argument, and the one `target_size` cannot make.
+    # Buffer cost is per ROW — SQLite is row-oriented, 1.0 us/row at 20k and
+    # 2.3 us/row at 180k — so a stream of 40-byte rows reaches 8 MiB at 200k
+    # rows and breaches a read-latency ceiling meant to hold at 20k, tenfold,
+    # while every byte-based check reports the buffer is fine.
+    #
+    # Bytes bound memory; rows bound read latency. Both are CEILINGS on one
+    # file, so the seal cuts at whichever is reached FIRST — the mirror of
+    # `local_retention` and `local_rows`, which are floors and take whichever
+    # retains more.
+    #
+    # None means no row limit, which is the right default: a narrow-row stream
+    # is the case that needs this and a library cannot guess the row width.
+    target_rows: int | None = None
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
@@ -188,6 +202,7 @@ class LogConfig:
         return json.dumps(
             {
                 "target_size": self.target_size,
+                "target_rows": self.target_rows,
                 "local_retention": (
                     None
                     if self.local_retention is None
@@ -221,6 +236,7 @@ class LogConfig:
 
         return cls(
             target_size=raw.get("target_size", defaults.target_size),
+            target_rows=raw.get("target_rows", defaults.target_rows),
             local_retention=(
                 retention
                 if isinstance(retention, timedelta) or retention is None
@@ -384,7 +400,12 @@ class Log:
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
-        buffer = Buffer.open(layout.buffer_db, schema, target_size=settings.target_size)
+        buffer = Buffer.open(
+            layout.buffer_db,
+            schema,
+            target_size=settings.target_size,
+            target_rows=settings.target_rows,
+        )
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
         # cast to. It is kept here because Iceberg cannot represent it: one
@@ -467,6 +488,7 @@ class Log:
             layout.buffer_db,
             schema,
             target_size=config.target_size,
+            target_rows=config.target_rows,
             readonly=read_only,
         )
         sort_by = table.sort_by()
@@ -517,7 +539,7 @@ class Log:
             # The buffer too, or `target_size` changes everywhere except where
             # the cut is actually made and the log quietly keeps sizing files
             # to the value it was opened with.
-            self._buffer.set_target_size(config.target_size)
+            self._buffer.set_target_size(config.target_size, config.target_rows)
 
     def archived_through(self) -> int:
         """Highest offset the archive is known to hold, 0 if none (§5, I4).
@@ -1219,6 +1241,7 @@ class Log:
             self.config.target_size,
             self.config.compact_min_files,
             memory,
+            self.config.target_rows,
         )
 
         for data_file in pending[:settled]:
@@ -1593,6 +1616,14 @@ def validate(
         msg = (
             "local_retention=0 means 'evict on upload' and presupposes an "
             "archive; with archive=None it would delete each file as it sealed"
+        )
+        raise ValueError(msg)
+
+    if config.target_rows is not None and config.target_rows < 1:
+        msg = (
+            f"target_rows must be at least 1: {config.target_rows}. "
+            "It is the number of rows a file may hold, and a file has to hold "
+            "the row that crossed the limit"
         )
         raise ValueError(msg)
 

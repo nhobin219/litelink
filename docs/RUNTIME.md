@@ -485,6 +485,17 @@ sealers came to write the same file. The read-only connection needs no such lock
 that is the proof the rule is about transactions rather than about threads — nothing ever
 opens one on it.
 
+**The seal has two ceilings, and the tighter one binds.** `target_size` bounds the bytes a
+file holds, `target_rows` the number of rows, and the cut lands on whichever is reached
+first. They are not interchangeable: buffer cost is per ROW, so a stream of narrow rows
+reaches a byte target only after far more rows than the read-latency ceiling was sized for,
+while every byte-based check reports the buffer is fine. Compaction respects both, or it
+would merge exactly the files a row cap just created straight back past it.
+
+Note the direction, which is the opposite of retention's. These are ceilings on one file
+and the tighter wins; `local_retention` and `local_rows` are floors on what stays readable
+and the looser wins.
+
 ## Sorting, and why the default is not to
 
 `sort_by` is optional and defaults to offset order. That default is not a fallback — it is

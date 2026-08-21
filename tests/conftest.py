@@ -7,6 +7,7 @@ elsewhere or unsetting it.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import uuid
 from typing import TYPE_CHECKING
@@ -14,6 +15,9 @@ from typing import TYPE_CHECKING
 import pytest
 
 from litelink._s3 import S3Options
+
+# Names a bucket to share across the run, instead of creating one per test.
+_BUCKET = "LITELINK_TEST_BUCKET"
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -23,10 +27,12 @@ def options() -> S3Options:
     """Explicit for rustfs, environment for anything else.
 
     `just rustfs` is the default because it needs no credentials to exist
-    anywhere; exporting `AWS_ENDPOINT_URL` runs the same tests against another
-    endpoint, and unsetting it runs them against AWS.
+    anywhere. Naming a bucket through `LITELINK_TEST_BUCKET` — or pointing
+    `AWS_ENDPOINT_URL` somewhere else — switches to whatever the environment
+    resolves, which on AWS is the ordinary credential chain: profile, instance
+    metadata, SSO. Nothing here restates a key that boto3 already knows.
     """
-    if os.environ.get("AWS_ENDPOINT_URL"):
+    if os.environ.get("AWS_ENDPOINT_URL") or os.environ.get(_BUCKET):
         return S3Options().resolved()
 
     return S3Options(
@@ -67,16 +73,31 @@ def s3() -> S3Options:
 
 @pytest.fixture
 def bucket(s3: S3Options) -> Iterator[str]:
-    """A fresh bucket per test, removed afterwards.
+    """Somewhere isolated to write, removed afterwards.
 
-    Per test rather than shared: these assert on object counts and on what a
-    catalog holds, and a bucket carrying another test's files makes both
-    meaningless.
+    A whole bucket per test against a local endpoint, where buckets are free
+    and a leftover one is a container restart away from gone. Against a real
+    account, `LITELINK_TEST_BUCKET` names one bucket and each test gets a
+    prefix inside it — creating and destroying eleven buckets per run is slow,
+    rate-limited, and leaves debris in someone's account if a run is
+    interrupted.
+
+    Either way the value is a location rather than a bucket name, so a caller
+    writing `s3://{bucket}/prefix` gets an isolated one of its own.
     """
     fs = filesystem(s3)
-    name = f"litelink-test-{uuid.uuid4().hex[:12]}"
-    fs.mkdir(name)
+    shared = os.environ.get(_BUCKET)
+    if shared:
+        location = f"{shared.strip('/')}/run-{uuid.uuid4().hex[:12]}"
+    else:
+        location = f"litelink-test-{uuid.uuid4().hex[:12]}"
+        fs.mkdir(location)
+
     try:
-        yield name
+        yield location
     finally:
-        fs.rm(name, recursive=True)
+        # Best effort. A failed cleanup must not turn a passing test red, and
+        # against a shared bucket the prefix may legitimately not exist —
+        # nothing wrote to it.
+        with contextlib.suppress(Exception):
+            fs.rm(location, recursive=True)
