@@ -1015,6 +1015,36 @@ The consequence worth planning for is that local disk holds roughly
 
 ## 13. Open questions
 
+0. **The archive's identity is local, and re-pointing has to reconcile it.** Four
+   consecutive review rounds found defects in one seam, each fix adding a guard on top
+   of the last. That is a design signal, and it is recorded here rather than patched
+   again.
+
+   The shape of the problem: `archive.db` is a LOCAL catalog keyed by table id, naming a
+   REMOTE table. Nothing in the entry says which prefix it belongs to, so "is this entry
+   mine?" is answered by comparing its metadata location against the configured prefix —
+   a string comparison standing in for an identity. Meanwhile `set_archive` changes
+   durable state that every other process cached at open, and the watermark it resets is
+   the thing eviction deletes on.
+
+   What has accumulated as a result: the entry is validated at open; only a lease holder
+   may repair it; `set_archive` takes the maintenance lease; `sync` re-reads the location
+   under that lease and re-checks it before writing a watermark; a failed repair restores
+   the entry it displaced; `drain` refuses to delete outside the configured prefix. Each
+   is correct and each was found the hard way.
+
+   What would replace them: give the archive an IDENTITY the entry carries — a token
+   written into the archive's own table properties at creation and recorded beside the
+   URI locally, so "is this mine?" is an equality check on a value rather than an
+   inference from a path. Prefix comparison then stops being load-bearing, re-attaching
+   to an archive that already holds data becomes expressible (today it is not — see
+   `open_archive`), and a re-point becomes one durable fact to change rather than three
+   that can disagree.
+
+   Not attempted here. It touches the same code four rounds of fixes just stabilised, and
+   the guards above are sufficient for the operations this library actually supports:
+   attach, detach, and re-point to a fresh prefix.
+
 0. **Per-operation claims, replacing the maintenance lease.** Designed in §4a, **not
    implemented.** Today `compact`, `evict`, `expire` and `sync` all take one `maintain`
    lease, so they exclude each other for the whole of their work — including the seconds
