@@ -34,6 +34,7 @@ from pathlib import Path
 from _stream import NAME, SCHEMA, SORT_BY, observations
 
 from litelink import Log, LogConfig
+from litelink._s3 import S3Options
 
 
 def main() -> None:
@@ -41,20 +42,53 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
     parser.add_argument("--rate", type=float, default=2000.0, help="reports per second")
     parser.add_argument("--batch", type=int, default=20, help="rows per transaction")
+    # Off by default, so the demo needs no object storage to run. `just rustfs`
+    # starts one locally and prints the URI to pass here; the same flag with an
+    # `s3://` bucket on AWS is the entire difference between the two.
+    parser.add_argument(
+        "--archive",
+        default=None,
+        help="s3:// prefix for the archive tier (see `just rustfs`)",
+    )
+    # Only meaningful with an archive: it is how long a file stays on local
+    # disk AFTER the archive has it, and I4 will not let it be evicted before.
+    # Off by default because it needs a binary the demo does not install. With
+    # it on, the maintainer writes the config and runs the sidecar itself.
+    parser.add_argument(
+        "--replicate",
+        action="store_true",
+        help="ship the WAL continuously (needs litestream on PATH, and --archive)",
+    )
+    parser.add_argument(
+        "--local-retention",
+        type=float,
+        default=60.0,
+        help="seconds to keep archived files locally",
+    )
     args = parser.parse_args()
 
-    # Deliberately small for a demo: seal often so the reader sees the table
-    # grow within seconds. A real deployment sizes this by §7's read-latency
-    # argument, not to make a demo lively.
+    # Small for a demo — seal often, so the reader sees the table grow within
+    # seconds — and larger than that where the archive is concerned, because
+    # the two want opposite things. A real deployment sizes the seal by §7's
+    # read-latency argument rather than to make a demo lively.
+    #
+    # Measured against S3: 648 ms to upload a 9 kB file. Almost all of that is
+    # the round trip, not the bytes, so halving file size doubles the cost of
+    # archiving the same stream. Compaction is what bridges it: seal at 1 MiB
+    # so the buffer stays shallow, convert to 8 MiB so the archive receives
+    # eight times fewer objects for the same data.
     config = LogConfig(
-        target_size=256 * 1024,
-        compact_below=1024 * 1024,
+        target_seal_size=1024 * 1024,
+        target_compact_size=8 * 1024 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
-        # Seal a quiet stream on a timer as well as by size, or a feed slower
-        # than the target would sit in SQLite indefinitely. Read by whoever
-        # holds the seal lease, which is never this process.
-        max_age=timedelta(seconds=15),
+        # None without an archive, because with nowhere to push to a retention
+        # is a policy for deleting the only copy — which `Log.new` refuses to
+        # be told by accident.
+        local_retention=(
+            timedelta(seconds=args.local_retention) if args.archive else None
+        ),
+        wal_replication=args.replicate,
     )
 
     # new() creates and takes the shape; open() recovers it. A service that
@@ -63,14 +97,41 @@ def main() -> None:
     # library rather than of the filesystem: which file proves a log exists is
     # the library's business, and an example that checked for it itself would
     # be wrong the day that changes.
+    # Credentials are never in the config, and never in the log: `S3Options()`
+    # with nothing set reads AWS_ENDPOINT_URL / AWS_ACCESS_KEY_ID /
+    # AWS_SECRET_ACCESS_KEY / AWS_REGION at the point of use. `just rustfs`
+    # prints the exports for a local endpoint.
+    s3 = S3Options()
     try:
-        log = Log.open(args.root, NAME)
+        log = Log.open(args.root, NAME, s3=s3)
         log.set_config(config)
+        # Only when one was actually asked for. Unconditionally, a plain
+        # `just demo-capture` on a log created by `just demo-archive` passes
+        # None and DETACHES the archive — which succeeds without credentials,
+        # resets the watermark, and strands every row already evicted from
+        # local disk. `demo-clean` then sees no archive, skips the S3 removal,
+        # and deletes the local state, leaving paid storage nothing can name.
+        if args.archive is not None:
+            log.set_archive(args.archive)
     except FileNotFoundError:
-        log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
+        log = Log.new(
+            args.root,
+            NAME,
+            schema=SCHEMA,
+            sort_by=SORT_BY,
+            config=config,
+            archive=args.archive,
+            s3=s3,
+        )
 
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
     print("appending only — `just demo-maintain` seals and reclaims disk")
+    if args.archive:
+        print(f"archiving to {args.archive} once files are sealed and settled")
+
+    if args.replicate:
+        print("WAL replication on — `just demo-maintain` runs the sidecar")
+
     print("`just demo-tail` watches. Until a maintainer runs, rows stay buffered")
     print("and readable; nothing is lost by starting it late.\n")
 

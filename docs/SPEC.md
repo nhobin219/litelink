@@ -9,7 +9,7 @@
 ```
 SQLite buffer          durable on commit. unsealed rows only.
       │                WAL, synchronous=FULL, one db per stream
-      │  seal at min(target_size, max_age)
+      │  seal at target_size
       ▼
 local Iceberg table    a rolling WINDOW of recent data.
       │                SqlCatalog on SQLite, file:// warehouse
@@ -206,16 +206,36 @@ Re-measure on target hardware; on local NVMe the fixed per-commit cost is a larg
 
 ## 3a. Optional: WAL replication for RPO
 
-Without it, unsealed rows exist only on local disk, so the data-loss window on machine
-failure is bounded by `max_age` — which means `max_age` is doing double duty as a file-size
-policy *and* an RPO policy. Shrinking it to reduce RPO produces small files, which is the
-problem sealing exists to solve.
+Without it, unsealed rows exist only on local disk, and nothing bounds how long they stay
+there: the seal fires on `target_size` alone, so a stream that goes quiet holds its last
+partial file's worth of rows indefinitely. **With the `max_age` timer removed, replication
+is the only thing that bounds RPO at all** — it is no longer a way to avoid a trade, it is
+the mechanism.
 
-**Litestream (or equivalent WAL shipping) breaks that coupling.** It continuously replicates
-SQLite WAL frames to object storage, so `max_age` can stay large for good file sizes while
-RPO falls to the replication lag.
+That removal is what makes it clean. A timer bounded RPO by sealing early, which meant the
+same knob set the file size and the loss window, and shrinking one wrecked the other.
+Shipping the WAL separates them completely: files are sized by `target_size` and RPO falls
+to the replication lag, which is a property of a sidecar rather than of the layout.
 
-Optional, and off by default. Three things to be clear about:
+**Litestream (or equivalent WAL shipping) is the sidecar.** It continuously replicates
+SQLite WAL frames to object storage. It is not configured in `LogConfig`: whether a sidecar
+is running is a deployment fact the library cannot know or enforce, and a boolean claiming
+otherwise would be a setting nothing reads. What the library does own is `Log.databases` —
+which files carry the log's state and therefore have to be replicated.
+
+**All three databases, not just the buffer.** `buffer.db` holds rows no Parquet file has
+yet, `catalog.db` says which files the local table is made of, and `archive.db` says the
+same for the archive. Omit the last and the objects in S3 survive with nothing to say what
+they are.
+
+**One sidecar per root.** Two of those three live at the root and are shared by every log
+under it, so a sidecar per log would run two instances against the same `catalog.db` — what
+litestream forbids — and ship them to one replica path. `Log.replication_config` describes
+the log it was asked about, so a root holding several logs needs one config naming every
+buffer under it, written by hand until this generates it. One log per root avoids the
+question.
+
+Optional. Three things to be clear about:
 
 **It covers append→seal only.** Once a seal deletes buffer rows, replication faithfully
 carries the delete; sealed-but-unuploaded Parquet is not its concern. So
@@ -238,8 +258,16 @@ automatically.
 
 ## 4. Seal
 
-Triggered on `min(target_size, max_age)`, evaluated by the writer at commit time. Entirely
-local.
+Triggered on `min(target_seal_size, target_seal_rows)`, evaluated by the writer at commit
+time.
+Entirely local. Both are ceilings on one file — bytes bound memory, rows bound the read
+latency §7 sizes for — so the cut lands on whichever is reached first, and `target_rows`
+defaults to no limit because only the caller knows how wide a row is.
+
+There is no timer. A `max_age` branch was specified here and removed: it emitted a small
+file every interval on a quiet stream — the layout §6 exists to repair — and made one knob
+serve as both a file-size and an RPO policy, so shrinking it to lose less on a crash
+produced worse files. Freshness in the cloud is §3a's job.
 
 ```
 1. SQLite txn: choose [start, end), write it to `sealing`.
@@ -306,6 +334,199 @@ keeps serving reads; it accumulates unregistered files.
 
 ---
 
+## 4a. Concurrency between the maintenance passes
+
+Everything after the seal reads the file list, does slow work based on what it read, and
+commits. The catalog's compare-and-swap makes each **commit** atomic, but it does not make
+that sequence **isolated**: an operation can have its premise invalidated while it works,
+and its retry is what makes the stale result land. `compact` documents the case — a handle
+predating another owner's eviction still lists the files it removed, merging them re-adds
+the rows, and `_commit` reloads and lands exactly that.
+
+A lock over each pass fixes it and is the wrong trade: the slow part is reading and writing
+Parquet and uploading, none of which touches the catalog. What the passes actually need is
+narrower, and it follows from the data model rather than from a lock.
+
+**Offsets are immutable and files cover contiguous non-overlapping ranges (§4), so two
+operations on disjoint ranges commute.** Whether they are disjoint is a comparison of two
+integers. The exclusion is interval arithmetic, not mutual exclusion.
+
+### What each pair actually needs
+
+| pair | why it is safe |
+|---|---|
+| seal ∥ anything | the seal appends above every range the others touch |
+| compact ∥ evict | eviction stays below every in-flight merge's `lo` |
+| compact ∥ compact | each claims a distinct run and skips runs already claimed |
+| compact ∥ sync | a merge must not span into what sync is archiving, and vice versa |
+| sync ∥ sync | `register` declines a range the archive already covers |
+| evict ∥ expire | both are metadata commits; CAS orders them and both are idempotent |
+
+`compact ∥ sync` is the one that is a correctness matter rather than wasted work.
+Compaction skips files at or below the archive watermark, so a merged file cannot span into
+the archived range — unless the watermark advances *while* it merges, which makes its
+inputs, chosen against the older watermark, include files sync has since archived. Pushing
+that merged file adds a range partially overlapping one the archive holds:
+`register`'s check declines only a range that is **entirely** covered, so a partial overlap
+is admitted and the archive returns duplicate rows.
+
+### The claim, and why it needs an expiry
+
+Range-disjointness answers "may these two run together". It cannot answer the question
+recovery has to ask: **is this in-flight record live work, or did that process die?**
+Nothing derived from the data answers that; only a deadline does.
+
+So every operation that owns a range writes a claim before its file exists (I2), and the
+claim carries an owner and an expiry:
+
+```
+claims(id, owner, expires_at, kind, lo, hi, rel_path)
+```
+
+One row per **operation** rather than one per **role**. Choosing work means skipping ranges
+a live claim covers; recovery means reclaiming an expired one and removing the file it
+named. The intent record and the lease become the same row — which is what allows several
+passes to run at once without any of them excluding the others by kind.
+
+### The check and the claim are one transaction
+
+Claiming is not enough on its own, and this is the part that is easy to get wrong. Suppose
+eviction reads the live claims, sees none and decides to drop everything at or below 500;
+compaction then claims `[400, 600]` and starts merging; eviction commits its removal;
+compaction commits its merge and puts rows 400-500 back. Two operations that each checked,
+and a window between the checking and the acting.
+
+The fix is not more checking. It is that **the read of conflicting claims and the insert of
+one's own claim happen in a single SQLite write transaction.** Those are serialised (§2), so
+whichever commits second sees the first, and there is no interval in which both believe
+they own the range. The slow work — reading files, writing Parquet, uploading — stays
+outside the transaction; only the decision is inside it, and the decision is microseconds.
+
+This is why **eviction claims a range too**, rather than merely consulting the claims of
+others. An operation that only reads leaves exactly the window above: it has decided, and
+nothing durable says so until its commit lands somewhere else entirely. Both sides
+declaring is what makes the ordering total.
+
+So the invariant is: *no operation may begin work on a range until it has durably claimed
+that range in a transaction that saw no conflicting claim.* Under it, a merge's inputs are
+still live when it commits, and the resurrection above is unreachable rather than
+self-correcting.
+
+For the record, when it was reachable it was a policy fault and not a duplication one. A
+resurrected range is real rows at their real offsets, and `_union` bounds the archive leg by
+the local table's lower extent — so a local table that regains `[1, 100]` bounds the archive
+leg to `offset < 1`, and the range is served by exactly one tier either way.
+
+**Three mechanisms, three jobs**, and none substitutes for another:
+
+- **compare-and-swap** in the catalog: the commit is atomic, and a racing commit is detected
+  rather than lost.
+- **range-disjointness**: two operations never work on the same offsets.
+- **owner and expiry on a claim**: in-flight or abandoned — the only question the data
+  cannot answer.
+
+### Where a segment lives is a property of the segment, not a watermark
+
+The tiers are four steps, and only three of them are tiers:
+
+```
+buffer            rows, uncompacted, serves the newest data      (hot)
+sealed files      written out fast, unoptimised, all must be scanned
+compacted files   the read-optimised baseline that replaces them
+        └── stored locally, or in the archive, or both
+```
+
+The fourth step is not a tier. A compacted file in the archive is the **same file in a
+second place**, and litelink already records that per file: `sync` calls `record_file` with
+the archive's URI, so `extent` holds a row per pushed file naming exactly where its copy
+went. `archived_through` is a global summary of facts that are already durable per segment.
+
+That summary is the single most expensive line in this design, because it is **the only
+boundary in the system that can move backwards.** Offsets are immutable, seal cuts only
+advance, compaction only merges forward — and then a re-point resets the archive watermark
+to zero. Every reader that cached the old position is wrong at once, and there is no
+ordering of the writes that fixes it, because the problem is not the write ordering; it is
+that a per-segment fact was compressed into one mutable number and then had to be
+un-compressed by inference.
+
+**So do not compress it.** I4 is asked of a file, not of a watermark:
+
+> A local file may be dropped only if `extent` holds a row for the same offset range whose
+> `rel_path` names a copy in the archive this log is configured for.
+
+An equality check on a recorded value, and the consequences fall out:
+
+- **Nothing resets.** A re-point changes where the NEXT file goes. Files already pushed keep
+  naming the bucket that holds them, so no boundary moves backwards and no cached position
+  becomes wrong.
+- **Identity stops being inferred.** "Is this mine?" is a comparison against a URI the log
+  wrote down, not an inference from a prefix, a catalog row keyed by table id, or a
+  process's memory of its own configuration.
+- **Several archives coexist.** Old ranges name the old bucket and new ranges the new one,
+  which is what makes re-attaching to an archive that already holds data expressible — today
+  it is not.
+- **The compaction frontier goes.** `archive_pending` exists to stop a merge straddling a
+  range the archive may hold; per segment, compaction skips a file that records an archive
+  copy and needs no frontier, no crash window between writing it and using it, and no
+  reconciliation to retire it.
+
+`archived_through` may remain as a derived `MAX(...)` for the push floor and for display.
+What it may not be again is the thing that authorises a deletion.
+
+**Local-only is the same rule with one term absent.** With no archive there is no URI to
+record and no row to find, so I4 is vacuous — not unsatisfiable. Eviction is then
+`local_retention` and `local_rows` alone, which §8 already says is a deletion policy over
+the only copy.
+
+It is tempting to require that a file be compacted before local-only eviction will take it,
+by symmetry with the archive case, where only compacted files are ever pushed and therefore
+only compacted files are ever eligible. **Resist it.** The reason to hold a file back is
+never its compaction state; it is that a merge — `_rewrite_run`, reading a run of files to
+write the one that replaces them — holds it as an input right now. That is a claim, and it
+is already answered above.
+
+A merge is the pair that matters here because it is the only pass that can put rows *back*:
+select `[1, 100]`, have eviction commit their removal, then commit the replacement, and the
+range returns. Every other pass holding a file open merely fails when it vanishes — sync's
+upload errors and retries, expire is an idempotent metadata commit. Compaction state is a
+proxy for this and a bad one, since it is neither necessary (an uncompacted file no merge
+has claimed is safe to drop) nor sufficient (a compacted file can be an input to the next
+merge up). Requiring "compacted" instead reintroduces the trailing-run holdback
+this section rejects below — bounded in bytes, at most one compaction target, but unbounded
+in time, so a log that goes idle keeps its last target-sized residue for ever. Whether that
+is acceptable depends on whether `local_retention` is a disk heuristic or an obligation to
+delete; §8 currently reads as the latter, which would make it a defect rather than a lag.
+
+So eviction, in both configurations, is one rule: **drop what retention no longer wants,
+except what a live claim covers, and except — where an archive is configured — what has no
+recorded copy in it.**
+
+**Not implemented.** Three things to establish first: `extent` has no index on the offset
+columns, so the per-file check needs one on the eviction path; the boundary eviction snaps
+to a file edge has to be shown equivalent under the per-segment test; and `hydrate` records
+a byte count of zero for a file the archive never measured, which is dormant only while a
+watermark keeps such files out of every size consumer.
+
+### Rejected: one settled watermark for both
+
+An earlier version of this section had a single `settled_through` that compaction worked
+above and eviction at or below. It does not survive, though not for the reason first
+recorded here. The original argument was that a quiet stream never settles and so never
+evicts, "removing anything at all" — an overstatement twice over: the holdback is the
+trailing run, which is bounded by the compaction target, and with an archive configured that
+stall is already the behaviour, since a stream that never settles never pushes and I4 pins
+eviction regardless. It does not distinguish the design it was rejecting.
+
+The real reason is that the number is wrong in both directions at once. With an archive,
+`archived <= settled` always, so eviction at or below `settled_through` would delete files
+that settled but were never pushed — an I4 violation, and the binding constraint is
+`archived_through` anyway, which is never the larger of the two. Without an archive, nothing
+else clamps, so the holdback becomes the only constraint and applies where it has no reason
+to: "settled enough to archive" needs the trailing run held back because compaction may
+still merge it and pushing a file about to be replaced is waste, while "safe to evict" is a
+question about age, not about what may still change. One number cannot mean both, because
+the two consumers are asking about different directions in time.
+
 ## 5. Sync
 
 Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
@@ -335,18 +556,33 @@ which reads that same watermark to enforce I4 and runs with or without an archiv
 
 ## 6. Compaction
 
-Required: the `max_age` seal branch guarantees undersized files, so a quiet stream emits a
-small file every interval indefinitely.
+Not required, and in normal operation a no-op. Every file a seal writes is already the
+size it was asked to be, because the cut is exact and there is no timer to cut early. What
+is left for compaction is the deliberate exceptions: an explicit `seal()`, which cuts
+short by definition, and a change to `target_size`, which leaves history sized for the old
+value.
 
 Hand-written, because `rewrite_data_files` is a Spark procedure with no pyiceberg
 equivalent.
 
 The table is unpartitioned (§13), so the compaction unit is a **contiguous offset range**.
 That works because sealed files already cover contiguous, non-overlapping ranges: pick
-adjacent files under `compact_below`, and their combined range is itself contiguous.
+adjacent files that together hold less than `target_size`, and their combined range is
+itself contiguous.
+
+**Sizing is in uncompressed bytes, never in file size on disk.** `target_size` bounds what
+a file HOLDS — the appender's own byte count for the rows that went into it — and that
+number is carried per file from the seal that measured it, added up across a merge, and
+dropped when the file is unlinked. It cannot be recovered from the file afterwards: on
+data compressing 8:1 a file holding a full target is an eighth of it on disk, so a rule
+reading sizes off disk merges eight already-full files into one holding eight times the
+memory the target allows — and, since `sync` refuses anything compaction may still
+rewrite, archives nothing at all in the meantime. A file whose size was never recorded
+counts as full, so an unmeasured file is never rewritten on a guess.
 
 ```
-1. Select adjacent files under compact_below spanning [lo, hi]; require compact_min_files.
+1. Select adjacent files holding < target_size in total, spanning [lo, hi];
+   require compact_min_files.
 2. Scan them into one Arrow table; re-sort by `sort_by`.
 3. Verify row count and per-column min/max against the sources.
 4. local.overwrite(table, overwrite_filter=(offset >= lo) & (offset <= hi))  -- one snapshot
@@ -537,7 +773,7 @@ it separates cleanly from compaction:
 
 | knob | controls |
 |---|---|
-| seal threshold (`target_size` / `max_age`) | how many rows sit in the buffer, hence hot-read latency |
+| seal threshold (`target_size` / `target_rows`) | how many rows sit in the buffer, hence hot-read latency |
 | compaction | how large the files end up, hence scan cost |
 
 So **seal small and often, then compact** — rather than sealing at a large `target_size` to
@@ -580,7 +816,7 @@ directly*.
 **Fixed is a property of the implementation, not of the design, and it has to be earned.**
 The boundary comes from manifest statistics, and reading those costs time proportional to
 *file count*: measured at 1.0 ms over one file and 44 ms over 64, which at the small-file
-counts a `max_age` seal produces is most of a read. Two things bring it back to fixed.
+counts an undersized seal produces is most of a read. Two things bring it back to fixed.
 
 Read the offset bounds off the manifest entries rather than through a full file-metadata
 materialisation — pyiceberg's `inspect.files()` builds an eighteen-column Arrow table,
@@ -677,7 +913,7 @@ are registered in the archive, and the local table holds only what has not yet b
 uploaded. Hot reads are then limited to the buffer, and anything older goes to the archive
 over the network. That is the right setting for pure archival capture — litelink as a
 durable staging area into Iceberg — and the wrong one wherever a hot reader looks back
-further than `max_age`. It does not weaken I4: eviction still never precedes registration.
+further than the buffer holds. It does not weaken I4: eviction still never precedes registration.
 
 **With no archive, retention is deletion, and that is the intended contract.** I4 forbids
 evicting a file the archive still lacks — but nothing is owed to an archive that does not
@@ -841,14 +1077,19 @@ of them is chosen.
 ## 12. Configuration
 
 ```
-target_size            seal at this buffer size           (size it for READ latency, not
-                                                          file size -- keep buffer <20k rows;
-                                                          compaction produces the big files)
-max_age                seal at this age regardless        (e.g. 5 min)
-local_retention        local table window                 (> longest hot lookback, with margin; 0 = evict on upload)
-wal_replication        continuous WAL shipping for RPO    (off by default; §3a)
+target_seal_rows       max rows per SEAL                  (the other ceiling; the seal cuts at
+                                                          whichever is reached FIRST. None =
+                                                          no row limit)
+target_compact_size    uncompressed bytes per FILE        (what compaction converts sealed
+                                                          files INTO. None = 8x the seal)
+target_compact_rows    max rows per compacted file        (None = 8x target_seal_rows)
+target_seal_size       uncompressed bytes per SEAL        (size it for READ latency and for
+                                                          memory -- keep buffer <20k rows;
+                                                          files land SMALLER on disk, by
+                                                          whatever compression achieved)
+local_retention        local table window, by TIME        (> longest hot lookback, with margin; 0 = evict on upload)
+local_rows             local table window, by ROWS        (floor: keep at least this many recent rows)
 snapshot_retention     snapshot expiry floor              (> longest scan)
-compact_below          compact files under this size      (e.g. 0.5 x target_size)
 compact_min_files      minimum adjacent files to compact  (e.g. 4)
 sort_by                within-file sort order              (capture default: event_ts, key)
 ```
@@ -866,6 +1107,81 @@ The consequence worth planning for is that local disk holds roughly
 ---
 
 ## 13. Open questions
+
+0. **The archive's identity is local, and re-pointing has to reconcile it.** Seven
+   consecutive review rounds found defects in one seam, each fix adding a guard on top
+   of the last. That is a design signal, and it is recorded here rather than patched
+   again.
+
+   The shape of the problem: `archive.db` is a LOCAL catalog keyed by table id, naming a
+   REMOTE table. Nothing in the entry says which prefix it belongs to, so "is this entry
+   mine?" is answered by comparing its metadata location against the configured prefix —
+   a string comparison standing in for an identity. Meanwhile `set_archive` changes
+   durable state that every other process cached at open, and the watermark it resets is
+   the thing eviction deletes on.
+
+   What has accumulated as a result: the entry is validated at open; only a lease holder
+   may repair it; `set_archive` takes the maintenance lease; `sync` re-reads the location
+   under that lease and re-checks it before writing a watermark; a failed repair restores
+   the entry it displaced; `drain` refuses to delete outside the configured prefix. Each
+   is correct and each was found the hard way.
+
+   What would replace them: give the archive an IDENTITY the entry carries — a token
+   written into the archive's own table properties at creation and recorded beside the
+   URI locally, so "is this mine?" is an equality check on a value rather than an
+   inference from a path. Prefix comparison then stops being load-bearing, re-attaching
+   to an archive that already holds data becomes expressible (today it is not — see
+   `open_archive`), and a re-point becomes one durable fact to change rather than three
+   that can disagree.
+
+   **The deferral has a measured cost, and this paragraph used to understate it.** It
+   claimed the guards above were sufficient for the operations the library supports —
+   attach, detach, re-point to a fresh prefix. A later round disproved that. It found
+   four more defects in this seam, and unlike their predecessors two of them needed no
+   race, no crash and no lease lapse: attaching an archive to a log a maintainer already
+   had open let that maintainer go on deleting the only copy of every row past
+   `local_retention`, because `evict` asked its own memory whether I4 was owed; and
+   re-asserting an archive from a process whose memory had gone stale read as a move and
+   zeroed the watermarks of a bucket that held the data. The findings got *less*
+   contrived, which is the opposite of what a converging seam does.
+
+   The reason is now legible. The archive's identity lives in four places — the `meta`
+   row, each process's `Archive` object, the `archive.db` catalog row, and each captured
+   pyiceberg handle — and every guard listed above synchronises one read-write pair. Each
+   round finds the next pair nobody has synchronised yet. The four latest fixes (pin the
+   URI per push, compare-and-set the re-point against the durable value, refresh `evict`
+   from the buffer, refuse a commit whose table left its warehouse) are the same shape
+   again, and they are not evidence the next round will be clean.
+
+   The identity token above is what ends it, because it gives every guard one immutable
+   value to compare and no second in-memory life. Until it exists, the honest statement
+   of the contract is narrower than the API suggests: **re-pointing a live log is
+   defended interleaving by interleaving, not by construction.** The regime the current
+   mechanism is actually sound in is a re-point with every other process stopped.
+
+0. **Per-operation claims, replacing the maintenance lease.** Designed in §4a, **not
+   implemented.** Today `compact`, `evict`, `expire` and `sync` all take one `maintain`
+   lease, so they exclude each other for the whole of their work — including the seconds
+   spent reading Parquet and waiting on S3, none of which touches the catalog. §4a works
+   through what each pair actually needs and concludes that most of it is interval
+   arithmetic on immutable offsets, not mutual exclusion.
+
+   What it would take: one `claims(id, owner, expires_at, kind, lo, hi, rel_path)` table
+   subsuming `sealing` and `compacting`; every range-owning pass claiming before it works,
+   with the conflict check and the insert in one SQLite transaction; recovery reclaiming
+   expired claims rather than a role's; and the role leases dissolving into per-operation
+   liveness.
+
+   What it buys: compaction concurrent with eviction and with other compactions, and sync
+   no longer blocking compaction on network latency. What it risks: it is surgery on the
+   seal path, I2 and recovery — the three most safety-critical things here — so it wants
+   its own change rather than riding along with a feature.
+
+   The one correctness item it also fixes is in §4a: a merge that begins before the archive
+   watermark moves can include files sync has since archived, and pushing that merged file
+   adds a range PARTIALLY overlapping the archive, which `register` admits because it
+   declines only a range entirely covered. Duplicate rows on an archive read. Today the
+   shared lease prevents it; nothing else does.
 
 1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
    data naturally clustered by ingest time, so `litelink_offset` and `ingest_ts` statistics are tight
@@ -899,7 +1215,8 @@ The consequence worth planning for is that local disk holds roughly
    **The file is staged, not sealed.** It is raw input to the same local
    normalise-then-upload path as a seal's output, so an oversized one is split before it is
    ever registered — the mirror of a quiet stream's undersized file being merged before
-   upload. §6 is merge-only, selecting files *under* `compact_below`, so the split is an
+   upload. §6 is merge-only, selecting files that together hold *under* `target_size`, so
+   the split is an
    addition: the same `overwrite` on the same offset-range filter, emitting N files instead
    of one, with step 3's row-count-and-min/max verification unchanged. Bulk ingest is what
    creates the requirement — a seal cannot emit an oversized file, since `target_size`
@@ -975,7 +1292,7 @@ The consequence worth planning for is that local disk holds roughly
    recovery replays only what it owns — which is the hazard above, resolved.
 
    Nothing configures where the sealer runs, because nothing in the library runs one.
-   `seal_due()` drains the queue and applies `max_age`; `maintain()` calls it and then
+   `seal_due()` drains the queue; `maintain()` calls it and then
    compacts, evicts and expires. Both are plain methods on their caller's schedule, and
    if another owner holds the lease the call is refused and returns rather than
    duplicating the work.
@@ -1106,8 +1423,8 @@ The consequence worth planning for is that local disk holds roughly
 
    - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
      free because the writer already knows the buffer grew. A maintainer would poll. The
-     `max_age` branch is time-based and would not care, but it is not wired up at all today.
-   - ~~**The size counter is per-process.**~~ **Resolved by `seal_group`.** The running
+     `max_age` branch would not have cared, being time-based, but it no longer exists.
+   - ~~**The size counter is per-process.**~~ **Resolved by `extent`.** The running
      total lives in the open queue row and is written in the same transaction as the rows
      it accounts for, so any process reads it with a keyed read of one row — and there is
      no second, in-memory copy to disagree with it.
@@ -1163,7 +1480,11 @@ The consequence worth planning for is that local disk holds roughly
      §15's design already has binary payloads **bypass** the buffer rather than travel
      through it.
 
-   ### What `max_age` needs to know, and how little that is
+   ### ~~What `max_age` needs to know, and how little that is~~ (removed)
+
+   **Superseded: there is no `max_age`.** Kept because the reasoning about what the buffer
+   may record — and why a library-stamped timestamp is not it — still applies to anything
+   time-based that might be proposed later.
 
    A maintainer cannot evaluate `max_age` without knowing how old the unsealed data is, and
    the buffer records nothing temporal. The obvious move is a library-stamped timestamp
@@ -1185,7 +1506,7 @@ The consequence worth planning for is that local disk holds roughly
    written when the buffer goes from empty to non-empty, cleared at seal. O(1), no column
    anywhere, no §2 argument to have.
 
-   That value is `seal_group.opened_at`, stamped by the **first row** to land in a group and
+   That value is `extent.opened_at`, stamped by the **first row** to land in a group and
    null while the group is empty. A sealer closes an aged group on its own poll, which is
    what a quiet stream needs: until this existed `max_age` was dead config — a field that
    was validated, persisted and round-tripped through `open`, and that nothing ever read —
@@ -1246,7 +1567,8 @@ The consequence worth planning for is that local disk holds roughly
    config.
 
    **A file-count component remains**, and it is the honest residual: 43.2 ms to 86.3 ms as
-   files went 40 to 240 with snapshots pinned at one. §6 selects files *under* `compact_below`,
+   files went 40 to 240 with snapshots pinned at one. §6 selects files holding *under*
+   `target_size`,
    so a file compaction has already produced at or above that size is never revisited —
    compaction bounds how many *small* files exist and cannot reduce the total. Eviction is the
    only mechanism that removes a large file, and §8 makes `local_retention = None` the default,
@@ -1254,7 +1576,7 @@ The consequence worth planning for is that local disk holds roughly
    first claimed, and for a reason now named.
 
    Worth measuring before choosing a fix, since the options differ in shape: raising
-   `compact_below` over time so yesterday's output is tomorrow's input, tiered compaction, or
+   `target_size` over time so yesterday's output is tomorrow's input, tiered compaction, or
    the honest possibility that unbounded local retention is not a supported configuration.
 
    ### Registering files without pyiceberg's commit path
@@ -1721,7 +2043,7 @@ storage that Iceberg does not know about.
 Compaction (§6) needs no change in principle, since re-sorting an offset range carries the
 bytes along. It does change in cost: compaction now reads blob bytes rather than only Parquet
 metadata and small columns. Streams with blob fields should therefore get a separate, lower
-`compact_below`, or the pass will move far more data than the file-count problem justifies.
+`target_size`, or the pass will move far more data than the file-count problem justifies.
 
 ---
 
@@ -1732,10 +2054,10 @@ metadata and small columns. Streams with blob fields should therefore get a sepa
 | §2 Layout | Buffer holds no blob bytes. Adds an internal `{name}_staged` bit per blob field, in the buffer table only — never in the Iceberg schema. |
 | §3 Write path | Adds the staging write and the fsync ordering (§15.3). |
 | §4 Seal | Adds materialization (step 2), the staging sweep (step 5), and sort-by-key-then-permute. |
-| §6 Compaction | Unchanged in logic; needs a separate `compact_below` for blob streams. |
+| §6 Compaction | Unchanged in logic; needs a separate size bound for blob streams. |
 | §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `litelink_offset` must be quoted. |
 | §8 Retention | Unchanged. Blobs inherit it. |
-| §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_below`; `target_size` raised. |
+| §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_size`; `target_size` raised. |
 
 ---
 

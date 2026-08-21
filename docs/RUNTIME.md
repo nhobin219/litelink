@@ -48,8 +48,8 @@ also means splitting the role across two processes later needs no code change, i
 compaction ever delays sealing enough to matter. It costs latency, not file size — the
 cut was recorded when the rows arrived.
 
-**Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue
-and closes anything past `max_age`; `maintain()` compacts, evicts and expires — and calls
+**Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue;
+`maintain()` compacts, evicts and expires — and calls
 `seal_due()` first, because sealing is the first thing done with what the writer leaves
 behind. They are two methods rather than one only because their costs differ by an order
 of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
@@ -77,14 +77,14 @@ caller is refused and returns rather than duplicating it.
           running total += row bytes ......... in the same txn
           crossed target_size?  ──► freeze the cut HERE, at this row,
                                     and open the next group
-          UPDATE seal_group  ................. once per batch
+          UPDATE extent  ..................... once per batch
      ◄─ returns offsets; rows are ALREADY DURABLE (synchronous=FULL)
                               │
                               │ nothing but rows in SQLite.
                               │ no queue object, no event, no signal
                               ▼
  ┌──────────────────── buffer.db  (SQLite, WAL) ────────────────────────┐
- │  buffer │ seal_group │ sealing │ compacting │ pending_delete │ lease │
+ │  buffer │ extent │ sealing │ compacting │ pending_delete │ lease │
  │                                                                      │
  │  the coordinator (I16). every hand-off below is a row in here, so    │
  │  it works between THREADS and between PROCESSES on identical terms   │
@@ -93,7 +93,7 @@ caller is refused and returns rather than duplicating it.
         │                                        │
  ═══════╧═══════════════ MAINTAINER PROCESS ══════╧══════════════════════
   ─────── seal lease ───────────           ─────── maintain lease ────────
-  poll seal_group (one indexed          maintain() in a loop
+  poll extent (one indexed            maintain() in a loop
   row read; no lock taken if
   there is nothing queued)                _table_lock + lease
                                             ├─ compact()
@@ -111,7 +111,7 @@ caller is refused and returns rather than duplicating it.
                                       │          unlink files whose grace
   §4 step 3   with _lock:             │          has passed, in the SAME
     DELETE buffer rows < end          │          txn that clears the queue
-    DELETE the seal_group row         │
+    NAME the extent's row          │
     lease.release()                   ▼
                     ┌─────────────────────────────┐
                     │  local Iceberg table        │
@@ -170,10 +170,10 @@ returns the cut it recorded whether or not this caller wrote it, and `await_seal
 the call for anyone who needs the table itself to have moved. Blocking inside `seal()`
 instead would put a caller behind another process's lease TTL, which is a worse bargain.
 
-`max_age` (§4's other trigger) is the same mechanism from the other side: the open group
-records when its **first row** landed, and a sealer closes it once that is old enough.
-Stamping the group's creation instead would seal a one-row file the moment an idle group
-finally got a row.
+There is no second trigger. A `max_age` branch was specified and removed: it emitted a
+small file every interval on a quiet stream, and coupled the file size to the RPO so that
+improving one wrecked the other. What bounds RPO now is WAL replication, which is a
+property of a sidecar rather than of the layout.
 
 ---
 
@@ -183,7 +183,8 @@ Nothing in Python. Every arrow in the diagram is a SQLite row:
 
 | hand-off | the row |
 |---|---|
-| "this range should become a file" | `seal_group` with `end_offset` set |
+| "this range should become a file" | `extent`, `end_offset` set, unnamed |
+| "this range IS a file, holding this much" | `extent` with `rel_path` set |
 | "I am writing that file, at this path" | `sealing` |
 | "I am rewriting these files" | `compacting` |
 | "this file may be deleted after its grace" | `pending_delete` |
@@ -253,6 +254,93 @@ attached version was, because the attached version re-read the entire buffer on 
 query.
 
 ---
+
+## File sizing, and where undersized files are allowed to be
+
+`target_size` is the size a file should be, and the seal cut is exact — the appending
+transaction closes a group at the row that crosses it. Nothing else produces a file, so in
+normal operation **every file in the system is the size it was asked to be**, and the
+things that exist to repair sizing have nothing to repair.
+
+**It is measured in uncompressed bytes, in memory — not in the size of the file on disk.**
+That is the single most important thing to know before setting it. A file holding 8 MiB of
+rows is 8 MiB on disk if they are incompressible and under 1 MiB if they repeat, so on-disk
+size is an output here, never the target. Set it larger than an on-disk file target would
+be, and expect smaller files than the number suggests.
+
+The reason is that the uncompressed size is the one that bounds anything real. It is what a
+reader pays to hold a file whatever the file cost to store, so bounding it per file is what
+lets a scan bound its total — N files open at once cost N times this, which is the number
+to divide a memory budget by when choosing read parallelism. It is also the only size
+knowable at the moment the seal has to decide, since what compression will achieve is not
+known until after the write. Sizing by the file instead would be sizing by the compression
+ratio: rows per file would swing with the data, and memory per file would be unbounded.
+
+**Everything downstream is stated in the same currency.** A file's uncompressed size is
+recorded by the seal that measured it — the appender's own byte count for exactly those
+rows — carried in the buffer beside the file, added up across a merge, and dropped when the
+file is finally unlinked. Compaction and sync both read it, so neither ever compares a
+compressed size to a memory bound. That mistake is not hypothetical: measuring on disk, the
+system merged eight already-full files into one holding eight times the target and, because
+sync refuses anything compaction may still rewrite, archived nothing at all while doing it.
+A file whose size was never recorded counts as full, so an unmeasured file is never
+rewritten on a guess.
+
+That holds only because there is no time-based seal. A timer sealing a quiet stream emits
+a small file every interval for ever, which is what compaction was built to clean up
+after — and it coupled RPO to file size, so shrinking the window to lose less data on a
+crash produced worse files. §3a names that trade; WAL replication is what breaks it, and
+freshness in the cloud is its job rather than the seal's.
+
+**One undersized file may exist, and only at the frontier.** The buffer's trailing rows
+have not reached `target_size` yet; they stay in SQLite, readable, until they do. Anything
+already written as a file is full.
+
+**Where compaction still earns its place.** An explicit `seal()` cuts short by definition,
+so a caller who wants the table to move now produces a small file. Four adjacent ones make
+a run worth merging. It is a no-op the rest of the time — measured at 19.3 ms over 216
+files, which is the cost of *asking* (`data_files()` opens every manifest) rather than of
+doing.
+
+**Retention has two floors, and the looser one binds.** `local_retention` is a window in
+time, `local_rows` a count of recent rows, and which of them actually bounds local disk
+depends on a rate the library cannot know — an hour of a quiet stream is a handful of rows,
+an hour of a busy one is more disk than the machine has. Both say what must stay readable
+without a network round trip, so eviction keeps whichever retains MORE. That is the mirror
+of how the seal combines its limits, where they are ceilings and the tighter wins.
+
+A file's age for this purpose is when it was WRITTEN, recorded by the log itself in
+`extent`. It is deliberately not the Iceberg snapshot that added it: expiry deletes that
+snapshot, and a file dated by one that no longer exists has no age at all — which is how
+retention came to silently stop reclaiming anything. The grace period before a file is
+actually unlinked is a different clock again, stamped on `pending_delete` when the file
+left the table, because that one is about readers still holding it (I6).
+
+**Sync holds back exactly what compaction might still rewrite**, which it decides by asking
+compaction's own rule rather than a size of its own — a file pushed and then merged locally
+would leave the archive holding rows that have been rewritten underneath it, so the two
+must agree, and the only way to guarantee that is to share the function. Disqualified are
+files in a run compaction would merge now, and files in the trailing run, which is under
+budget and so still has room for files not yet written.
+
+A small file in the middle is therefore pushed, not held. It can never grow — files are
+immutable and its neighbours are too big to merge with — so waiting achieves nothing.
+Holding it blocked the archive permanently: everything after it is newer, so the watermark
+never advanced, and I4 pinned local disk with it.
+
+So the archive can gain one small file per explicit seal. `rewrite_archive` is the tool
+for that, ad-hoc, and the same one that recompacts after a `target_size` change.
+
+**What would change this.** Compaction rewriting everything downstream of an undersized
+file would keep the archive perfect — merging `[0.1][8][8]` and splitting at the cap moves
+the remainder to the tail, where an undersized file is allowed to be. It is not done
+online because the rewrite window is everything unarchived, so the work is largest exactly
+when sync is furthest behind, and it charges a full rewrite for a rare deliberate act.
+
+That reasoning depends on `seal()` being exceptional. **If it turns out to be common in
+real use, small files will accumulate in the archive faster than anyone runs the offline
+tool, and this belongs online after all.** It is a threshold change rather than a redesign:
+the mechanism is the same, only the trigger moves.
 
 ## The concurrency contract
 
@@ -364,11 +452,29 @@ independent connection over the same database, with its own registrations and vi
 costs 0.0055 ms.
 
 **Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
-{`LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
+{`Archive._lock`, `LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
 acquiring one another, and nothing below reaches back up, so there is no cycle to
 deadlock on. A read takes `Reader._lock` then briefly `LogTable._lock` and
 `Buffer._tail_lock`; a seal takes `Buffer._lock` and `LogTable._lock` at different
-moments and never together.
+moments and never together. `Archive._lock` guards the archive URI, its credentials and
+the handle they open as one fact, so a re-point cannot race an open in flight and two
+threads cannot each pay the round trip; it is held across that open, and never while
+calling back into anything above it.
+
+**One extent, four states.** `extent` is the only record of where a range of the stream
+lives, and a row keeps its identity through every stage: open while the appender fills it,
+closed when the cut is frozen, named when the seal commits the file, and re-pointed at an
+S3 URI when `sync` pushes a second copy. `bytes` — what the appender counted those rows as
+in memory — is written once, at the cut, and carried by everything downstream: compaction
+adds up the runs it merges, `sync` copies the number to the archive's name for the file,
+and the archive rewrite sizes its merges from the same column. Nothing re-derives it,
+because nothing can: a Parquet footer records what the rows compressed from, not what they
+cost to hold, and Iceberg has no per-file field to keep it in — v2's data-file metadata is
+a fixed set with nothing user-extensible, and `add_files` cannot attach one.
+
+Sealing therefore names a row rather than deleting one. It was two tables, a queue and a
+size map, which is this one split at the moment a file appears — and two tables that could
+disagree about the same range.
 
 **The rule the lock actually encodes.** Every statement on the buffer's write connection
 takes that lock, reads included. A statement issued while another thread has a
@@ -378,6 +484,107 @@ is not a hot-path concern, it is how a lease once evaporated under its holder an
 sealers came to write the same file. The read-only connection needs no such lock, and
 that is the proof the rule is about transactions rather than about threads — nothing ever
 opens one on it.
+
+**The seal has two ceilings, and the tighter one binds.** `target_size` bounds the bytes a
+file holds, `target_rows` the number of rows, and the cut lands on whichever is reached
+first. They are not interchangeable: buffer cost is per ROW, so a stream of narrow rows
+reaches a byte target only after far more rows than the read-latency ceiling was sized for,
+while every byte-based check reports the buffer is fine. Compaction respects both, or it
+would merge exactly the files a row cap just created straight back past it.
+
+Note the direction, which is the opposite of retention's. These are ceilings on one file
+and the tighter wins; `local_retention` and `local_rows` are floors on what stays readable
+and the looser wins.
+
+**One process per role is the deployable shape.** A seal is CPU-bound pure Python — most
+of its commit is pyiceberg copying table metadata — so it starves anything sharing its
+interpreter, which is why the writer is its own process (appends measured 45.2 ms behind an
+in-process seal). Compaction is the same work and more of it, so the argument repeats:
+sealing beside compaction waits on it, and the buffer grows for as long as it waits. A
+thread is not enough — it fixes blocking on the network, not contention for the interpreter.
+
+The cost is measured and worth stating: several processes committing to one Iceberg table
+race on pyiceberg's post-commit metadata cleanup, and the loser logs `Failed to delete
+metadata file` for one the winner already removed. A single-process control over the same
+workload logs none. It is noise — 817,760 rows read back contiguous with no gap or
+duplicate across a run that logged it — because the commit is protected by the CAS retry
+and the metadata this library depends on is deleted through its own expiry queue.
+
+**The passes are callable one at a time**, and worth doing when their costs diverge.
+Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
+finish in milliseconds; `sync` is the only one that can block on a network. `maintain()`
+runs the three local ones under a single lease and is what most deployments want —
+`compact()`, `evict()` and `expire()` exist for the schedules it cannot express, and take
+the same lease, so running them separately is not a way around the exclusion.
+
+Measured on the demo against local object storage, one pass: seal 0 ms, compact 147–920 ms,
+reclaim 20–400 ms, sync 11–712 ms. A combined number reports an S3 timeout as slow
+compaction, which is how an 83 s sync went unnoticed until the buffer had reached 170,540
+rows. `seal` reading 0 ms is the healthy case — the loop drains the queue every quarter
+second, so anything else means sealing fell behind.
+
+## Sorting, and why the default is not to
+
+`sort_by` is optional and defaults to offset order. That default is not a fallback — it is
+the order the buffer returns rows in — so it costs strictly less than any sort key: no sort
+runs at seal time, and every file's offset range is contiguous and exact, which is the
+tightest file-level statistic the table can carry.
+
+**Set it only for a column highly correlated with the offset.** For a capture stream that
+means an arrival timestamp. Files always hold contiguous offset ranges whatever they are
+sorted by internally, so a correlated key leaves each file a disjoint slice of that column
+and a predicate on it prunes whole files.
+
+An UNCORRELATED key costs twice, and neither cost shows up in a benchmark of the seal:
+
+- **Pruning stops working.** Every file's min/max on a scattered column spans nearly the
+  whole domain, so no file can be skipped. Only row-group skipping inside each file
+  survives, which is a fraction of the benefit the sort was for.
+- **Replay stops being sequential.** Rows inside a file end up in a random permutation of
+  offset order, so reading from an offset needs a sort after reading rather than a scan.
+  For a log this is the primary access pattern, which makes it the expensive half.
+
+Both are properties of the first seal, not of any later rewrite. `rewrite_archive` and
+`compact` re-sort what they rewrite, exactly as a seal does — they neither introduce this
+nor repair it.
+
+## Losing the machine
+
+Sealed data is in the archive once `sync` has pushed it. Everything else — rows that have
+not sealed yet, and the catalogs that say what the sealed files are — is SQLite on local
+disk, and a WAL-shipping sidecar is what gets it off the machine.
+
+**Nothing bounds the loss window without one.** The seal fires on `target_size` alone, so a
+stream that goes quiet holds its last partial file's worth of rows indefinitely. The
+`max_age` timer used to bound it, at the cost of making one knob set both the file size and
+the RPO; removing it made replication the only mechanism rather than one of two.
+
+```
+just demo-replicate      # generates litestream.yml from the log, runs the sidecar
+```
+
+**Three databases, not one.** `examples/replicate.py` generates the config from
+`Log.databases` rather than leaving it to be written by hand, because the set is not
+obvious and getting it wrong is silent: `buffer.db` holds rows no Parquet file has yet,
+`catalog.db` says which files the local table is made of, and `archive.db` says the same
+for the archive — omit it and the objects in S3 survive with nothing able to say what they
+are. `archive.db` is created on first use, so a log that has never opened its archive has
+none to restore, and a restore procedure has to tolerate that.
+
+**The endpoint goes in the config, the credentials do not.** litestream reads keys from the
+environment, so the generated file is safe to commit and copy — the same reason `S3Options`
+is not part of `LogConfig`. The endpoint is different: litestream resolves the bucket's
+region against real AWS unless the replica names one, so against anything else it fails
+with "cannot lookup bucket region" while the credentials it needs sit unused in the
+environment.
+
+**Restore is correct by construction.** A restored buffer may hold rows already sealed into
+the table. Nothing reconciles them, because the read boundary comes from the table's
+committed extent (I3), so those rows fall outside the buffer's contribution automatically.
+
+Measured on this machine: a log at 189,140 appended rows, killed with its directory
+discarded, restored from object storage alone — 189,140 rows readable, none of them ever
+sealed.
 
 ## Operating it
 

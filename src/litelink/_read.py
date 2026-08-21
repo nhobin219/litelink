@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 import duckdb
 import pyarrow as pa
 
+from litelink._archive import Archive
+from litelink._s3 import S3Options
 from litelink._types import column_type
 
 if TYPE_CHECKING:
@@ -31,6 +33,45 @@ BUFFER_REL = "buf_tail"
 
 # The library-owned column (§2), which the boundary filters on.
 OFFSET = "litelink_offset"
+
+
+def secret_sql(options: S3Options) -> str:
+    """DuckDB's spelling of the same credentials pyiceberg was given.
+
+    Separate from the query path so it can be tested without object storage —
+    the fault it exists to prevent only appeared against real AWS, where writes
+    worked and every `include_archive` read came back 403.
+    """
+    parts = ["TYPE s3"]
+    if options.access_key is not None and options.secret_key is not None:
+        parts.append(f"KEY_ID '{options.access_key}'")
+        parts.append(f"SECRET '{options.secret_key}'")
+    else:
+        # Nothing explicit means the credentials live where every AWS tool
+        # looks for them: a profile, instance metadata, SSO. pyiceberg and s3fs
+        # resolve those themselves, so WRITES worked while reads got a secret
+        # with no keys — which DuckDB treats as anonymous, so a log on an
+        # ordinary AWS host archived happily and answered every archive read
+        # with 403. A local endpoint never showed it, because there the keys
+        # are always passed explicitly.
+        #
+        # `credential_chain` is DuckDB's equivalent of that resolution. The
+        # else-branch rather than the default, because an explicit key must
+        # still win — see `S3Options.resolved`.
+        parts.append("PROVIDER credential_chain")
+
+    if options.region is not None:
+        parts.append(f"REGION '{options.region}'")
+
+    if options.endpoint is not None:
+        # DuckDB wants host:port with the scheme carried by USE_SSL, unlike
+        # pyiceberg which takes a URL. One S3Options, two spellings.
+        without_scheme = options.endpoint.split("://", 1)[-1]
+        parts.append(f"ENDPOINT '{without_scheme}'")
+        parts.append(f"USE_SSL {str(options.endpoint.startswith('https')).lower()}")
+        parts.append("URL_STYLE 'path'")
+
+    return f"CREATE OR REPLACE SECRET litelink_s3 ({', '.join(parts)})"
 
 
 def duckdb_connection() -> duckdb.DuckDBPyConnection:
@@ -63,12 +104,19 @@ class Reader:
         buffer: Buffer,
         schema: pa.Schema,
         connect: Callable[[], duckdb.DuckDBPyConnection],
+        archive: Archive,
     ) -> None:
         self._layout = layout
         self._table = table
         self._buffer = buffer
         self._schema = schema
         self._connect_to = connect
+        # The shared archive object, not a table handle: it opens the table on
+        # first use, so a reader that never passes `include_archive` never
+        # touches the network (I5), and `Log.set_archive` re-points this same
+        # object rather than leaving the reader holding a stale one.
+        self._archive = archive
+        self._remote_ready = False
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -78,7 +126,47 @@ class Reader:
         # connection would swap each other's buffer leg.
         self._lock = threading.Lock()
 
-    def query(self, sql: str) -> pa.RecordBatchReader:
+    def _prepare_remote(
+        self, cursor: duckdb.DuckDBPyConnection
+    ) -> tuple[str, tuple[int, int]] | None:
+        """Load httpfs, install the credentials, return the archive's pointer
+        and the offset range it covers.
+
+        None when there is no archive or it holds nothing yet, which is the
+        signal to build the union without a third leg rather than to fail.
+
+        The extent comes back with the pointer because the union needs it when
+        there is nothing sealed locally: with no local extent there is no
+        boundary between the archive and the buffer, and the registered tail
+        can hold rows the archive has since taken ownership of.
+        """
+        archive = self._archive.table()
+        if archive is None:
+            return None
+
+        archive.reload()
+        # Paired, not two reads. `snapshot()` exists because a pointer and an
+        # extent taken separately can come from different commits — and this
+        # handle is shared, so a concurrent `sync` advances it between them.
+        # Unpaired, the empty-extent branch below scans a NEWER archive
+        # snapshot while cutting the buffer at an OLDER extent, and every row
+        # registered in between comes back from both legs.
+        location, covered = archive.snapshot()
+        if covered is None:
+            return None
+
+        if not self._remote_ready:
+            # Once per connection. `httpfs` is not in the local read path, so a
+            # log that never opts in never pays for it — §7's rule that a hot
+            # read is offline.
+            self._connect().execute("LOAD httpfs")
+            self._remote_ready = True
+
+        cursor.execute(secret_sql(self._archive.s3.resolved()))
+
+        return location, covered
+
+    def query(self, sql: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
 
         The relation is rebuilt per call and cannot be held across calls.
@@ -124,18 +212,38 @@ class Reader:
         # commit between them pairs a new snapshot with an old boundary.
         self._table.reload()
         location, extent = self._table.snapshot()
+
+        # The archive AFTER the local snapshot, and that order is the
+        # correctness argument. The archive leg is bounded by `extent[0]` — the
+        # oldest offset still local — so every offset below it must be in the
+        # archive snapshot this reads. Resolved first, it can be older than the
+        # bound it is measured against: a sync registering [100, 199] and an
+        # eviction dropping them both land in between, and the reader pairs an
+        # archive snapshot ending at 99 with a local extent starting at 200.
+        # Rows 100-199 are then in no leg at all.
+        #
+        # After, it cannot happen. I4 means nothing is evicted before it is
+        # registered, so an archive snapshot taken later than the local one
+        # holds everything the local one has given up.
+        remote = self._prepare_remote(cursor) if include_archive else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
         # over an already-registered relation is cheap.
         cursor.execute(
-            f"CREATE OR REPLACE TEMP VIEW {VIEW} AS {self._union(location, extent)}"
+            f"CREATE OR REPLACE TEMP VIEW {VIEW} AS "
+            f"{self._union(location, extent, remote)}"
         )
         reader = cursor.execute(sql).to_arrow_reader()
 
         return _cast_to(reader, self._schema)
 
-    def _union(self, location: str, extent: tuple[int, int] | None) -> str:
+    def _union(
+        self,
+        location: str,
+        extent: tuple[int, int] | None,
+        remote: tuple[str, tuple[int, int]] | None = None,
+    ) -> str:
         """The hot read: the local table, plus the buffer above its extent.
 
         `location` is passed rather than re-read, so the snapshot scanned and
@@ -152,21 +260,46 @@ class Reader:
             for c in columns
         )
 
-        if extent is None:
-            # Nothing sealed yet, so there is no boundary to derive and no table
-            # to union — every row is still in the buffer.
-            return f"SELECT {casts} FROM {BUFFER_REL} b"
-
         projection = ", ".join(f'"{c}"' for c in columns)
-        # Applied here as well as pushed into SQLite. The registered tail was
-        # read against an earlier floor, so it can still hold rows this
-        # snapshot has since taken ownership of; without this they would appear
-        # in both legs.
-        return (
-            f"SELECT {projection} FROM iceberg_scan('{location}')"
-            f" UNION ALL SELECT {casts} FROM {BUFFER_REL} b"
-            f' WHERE b."{OFFSET}" > {extent[1]}'
-        )
+        buffered = f"SELECT {casts} FROM {BUFFER_REL} b"
+        if extent is None:
+            # Nothing sealed locally. The archive can still hold history — a
+            # log evicted down to nothing is §8's `local_retention=0` shape —
+            # and then everything local is in the buffer.
+            if remote is None:
+                return buffered
+
+            # The buffer still needs a floor, and with no local extent the
+            # archive supplies it. The tail was registered against an earlier
+            # read, so it can hold rows that have since been sealed, archived
+            # and evicted — leaving the local table empty again and both legs
+            # claiming them. Bounding here is what the `extent[1]` cut does in
+            # the branch below, from the only boundary available.
+            location, covered = remote
+
+            return (
+                f"SELECT {projection} FROM iceberg_scan('{location}')"
+                f' UNION ALL {buffered} WHERE b."{OFFSET}" > {covered[1]}'
+            )
+
+        legs = []
+        if remote is not None:
+            # Strictly below what the local table holds. `extent[0]` is the
+            # oldest offset still local, so anything at or above it is served
+            # from disk rather than over the network.
+            legs.append(
+                f"SELECT {projection} FROM iceberg_scan('{remote[0]}')"
+                f' WHERE "{OFFSET}" < {extent[0]}'
+            )
+
+        legs.append(f"SELECT {projection} FROM iceberg_scan('{location}')")
+        # The buffer bound is applied here as well as pushed into SQLite. The
+        # registered tail was read against an earlier floor, so it can still
+        # hold rows this snapshot has since taken ownership of; without this
+        # they would appear in both legs.
+        legs.append(f'{buffered} WHERE b."{OFFSET}" > {extent[1]}')
+
+        return " UNION ALL ".join(legs)
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         """The connection, built on first read and kept.

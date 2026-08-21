@@ -4,8 +4,67 @@ Three scripts against a real log. None need an archive, a service, or a network.
 
 ```
 just demo-capture      # terminal 1: append, and nothing else
-just demo-maintain     # terminal 2: seal, compact, evict, expire
+just demo-maintain     # terminal 2: one process per storage role
 just demo-tail         # terminal 3: watch where the rows are
+```
+
+`demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `sync` — and one
+command stops them all. They are separate processes rather than one, because a seal is
+CPU-bound pure Python and so is compaction, only more of it: run together, sealing waits on
+compaction through the interpreter and the buffer grows for as long as it waits. That is
+the same argument that makes the writer its own process, one level down. Each prints only
+when it does something, so silence is the healthy state.
+
+`maintainer.py --role all` is the single-process shape, and is right when the costs do not
+justify four. It is also quieter: four processes committing to one Iceberg table race on
+pyiceberg's post-commit metadata cleanup and log a `Failed to delete metadata file` now and
+then. Measured to be noise — 817,760 rows read back contiguous across a run that logged
+it — but a single process produces none.
+
+## Adding the archive tier
+
+Everything above is local. To push sealed files to object storage and read across both
+tiers, add a bucket:
+
+```
+just rustfs            # a local S3-compatible store, in one container
+just demo-archive      # terminal 1: capture, with an archive configured
+just demo-maintain     # terminal 2: also pushes, and evicts what it has pushed
+just demo-tail         # terminal 3: `in table` falls as `archived` rises
+```
+
+**Against a real AWS bucket instead**, nothing changes but the environment:
+
+```
+cp .env.example .env      # then set LITELINK_DEMO_ARCHIVE=s3://your-bucket/prefix
+just demo-archive
+just demo-maintain
+```
+
+`just` loads `.env` automatically. Credentials are NOT in it unless you put them there —
+the library reads them from the environment at the point of use through the ordinary AWS
+chain, so a profile, instance metadata or SSO all work untouched. That is deliberate:
+credentials never enter `LogConfig`, because a log directory gets copied, backed up and
+attached elsewhere, and a key inside it travels with all of that.
+
+The reader needs the same environment, since `include_archive=True` reaches object
+storage. Without it, `scan()` still works — it is local disk only, which is what makes a
+hot read a hot read.
+
+## Continuous RPO
+
+Add `--replicate` to `demo-archive` and the maintainer runs litestream alongside itself,
+shipping the SQLite WAL to `_wal` beside the archived data. Needs the binary on PATH
+([install](https://litestream.io/install)) and an archive to ship to.
+
+That supervision lives in `maintainer.py`, not in the library: replication is a separate
+process reading the WAL, which is exactly why it keeps the network out of the write path,
+and litestream is explicit that two instances must never replicate one database. To run it
+independently instead, generate the same config and use it directly:
+
+```
+uv run python examples/replicate.py --root litelink-data
+litestream replicate -config litelink-data/litestream.yml
 ```
 
 Two roles, because there are two kinds of work: **the hot path, and everything else.**

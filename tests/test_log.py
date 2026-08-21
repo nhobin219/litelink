@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from litelink.log import Log, LogConfig
+from litelink.log import OFFSET, Log, LogConfig
 
 SCHEMA = pa.schema(
     [
@@ -184,11 +184,11 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
 def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None:
     """§4's size trigger, split across the two roles that own its halves.
 
-    Crossing `target_size` is the appender's business — it records the cut in
+    Crossing `target_seal_size` is the appender's business — it records the cut in
     the transaction that crosses it. Writing the file is the maintainer's, and
     `seal_due` is the call it makes. Neither half guesses what the other did.
     """
-    with open_log(tmp_path, LogConfig(target_size=512)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(40))
 
         assert log._buffer.pending_group() is not None, "the cut was not recorded"
@@ -201,7 +201,7 @@ def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None
 
 def test_a_synchronous_seal_is_available(tmp_path: Path) -> None:
     """Appending never seals. `seal()` is how a caller makes the table move."""
-    with open_log(tmp_path, LogConfig(target_size=512)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(40))
 
         assert log.table_extent() is None, "an append sealed on its own"
@@ -219,7 +219,7 @@ def test_rows_stay_readable_across_a_seal(tmp_path: Path) -> None:
     §7's boundary excludes it from one of them — which is why a seal can happen
     whenever a maintainer gets to it without a reader noticing.
     """
-    with open_log(tmp_path, LogConfig(target_size=512)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(60))
 
         for _ in range(10):
@@ -247,7 +247,7 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
 
     # The wrapper times from BEFORE acquire, so it counts waiting as holding.
     # Nothing else seals in this process, so there is nothing to wait behind.
-    config = LogConfig(target_size=1 << 30)
+    config = LogConfig(target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         log.extend(rows(400))
 
@@ -279,7 +279,7 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
 
 def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
     """`sealing` holds one row by design (§2), and two seals would overlap."""
-    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=1 << 30)) as log:
         log.extend(rows(50))
         held = log._lease("seal")
         assert held.acquire(), "could not simulate a seal in flight"
@@ -295,7 +295,7 @@ def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
 
 def test_close_waits_for_an_in_flight_seal(tmp_path: Path) -> None:
     """A seal holds a claim in `sealing`; letting it finish beats replaying it."""
-    log = open_log(tmp_path, LogConfig(target_size=512))
+    log = open_log(tmp_path, LogConfig(target_seal_size=512))
     log.extend(rows(60))
     log.close()
 
@@ -355,7 +355,7 @@ def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
     """
     import threading
 
-    config = LogConfig(target_size=2048, compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_seal_size=2048, compact_min_files=2)
     failures: list[BaseException] = []
     stop = threading.Event()
 
@@ -439,18 +439,76 @@ def test_an_interrupt_inside_commit_is_not_masked(tmp_path: Path) -> None:
 def test_set_config_reaches_the_thing_that_makes_the_cut(tmp_path: Path) -> None:
     """§12 says policy can change under a running log. All of it, not most.
 
-    `target_size` decides where the appender cuts, and the appender is the
+    `target_seal_size` decides where the appender cuts, and the appender is the
     buffer — so a config update that stopped at `Log` left the log sizing
     files to whatever it was opened with, silently and for its whole life.
     """
-    with open_log(tmp_path, LogConfig(target_size=1 << 30)) as log:
+    with open_log(tmp_path, LogConfig(target_seal_size=1 << 30)) as log:
         log.extend(rows(40))
 
         assert log._buffer.pending_group() is None, "nothing should have crossed"
 
-        log.set_config(LogConfig(target_size=512))
+        log.set_config(LogConfig(target_seal_size=512))
         log.extend(rows(40, start=40))
 
         assert log._buffer.pending_group() is not None, (
-            "the new target_size never reached the buffer"
+            "the new target_seal_size never reached the buffer"
+        )
+
+
+def test_a_log_needs_no_sort_by(tmp_path: Path) -> None:
+    """Offset order is the default, and it is what the rows are already in.
+
+    Not a fallback: the buffer returns rows ordered by offset, so leaving
+    `sort_by` unset means no sort runs at seal time at all. It is the cheapest
+    option as well as the safest one.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA) as log:
+        log.extend(rows(50))
+        log.seal()
+
+        assert log._sort_by == ()
+        assert log.table_files() == 1
+
+        stored = log.scan().read_all()
+        offsets = stored.column(OFFSET).to_pylist()
+        assert offsets == list(range(1, 51)), (
+            "a sealed file must hold its rows in offset order, so replay from "
+            "an offset is a sequential read rather than a sort"
+        )
+
+
+def test_an_unsorted_log_reopens_unsorted(tmp_path: Path) -> None:
+    """`open` recovers the shape from the table, and "no sort order" is a
+    shape — not a missing value to be guessed at."""
+    with Log.new(tmp_path, "s", schema=SCHEMA) as log:
+        log.extend(rows(4))
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._sort_by == ()
+
+
+def test_a_sort_key_correlated_with_the_offset_keeps_files_prunable(
+    tmp_path: Path,
+) -> None:
+    """Why the guidance is about CORRELATION rather than about sorting.
+
+    Files hold contiguous offset ranges however they are sorted internally. A
+    sort column that tracks arrival stays contiguous with them, so each file's
+    min/max on it covers a narrow slice and a predicate prunes whole files. A
+    scattered one gives every file nearly the whole domain, and there is
+    nothing left to prune with.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        for batch in range(4):
+            log.extend(rows(20, start=batch * 20))
+            log.seal()
+
+        files = log._table.data_files()
+        assert len(files) == 4
+
+        stored = [pq.read_table(f.path).column("event_ts").to_pylist() for f in files]
+        spans = [(min(c), max(c)) for c in stored]
+        assert all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1)), (
+            "correlated keys leave each file a disjoint slice, so files prune"
         )
