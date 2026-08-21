@@ -94,6 +94,26 @@ class Layout:
         return rel_path
 
     @property
+    def databases(self) -> tuple[Path, ...]:
+        """Every SQLite file a restore needs, in dependency order (§3a).
+
+        What a WAL-shipping sidecar has to replicate. All three, not just the
+        buffer: the buffer holds rows no Parquet file has yet, `catalog.db`
+        holds which files the local table is made of, and `archive.db` holds
+        the same for the archive — so without it the objects in S3 are there
+        and nothing knows what they are.
+
+        The rewrite scratch is excluded. It is derived from the archive and
+        deleted at the end of the operation that makes it, so replicating it
+        would ship a temporary file to object storage to no purpose.
+
+        Listed here rather than assembled by a caller, because which files
+        matter is exactly what this class knows and nothing else should have to
+        rediscover by listing a directory.
+        """
+        return (self.buffer_db, self.catalog_db, self.archive_db)
+
+    @property
     def table_id(self) -> str:
         return f"{NAMESPACE}.{self.name}"
 

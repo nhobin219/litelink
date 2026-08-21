@@ -97,6 +97,36 @@ demo-archive *args:
     AWS_REGION=us-east-1 \
     uv run python examples/capture.py --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
 
+# Needs `just rustfs`, a capture running, and the litestream binary on PATH
+# (https://litestream.io/install — a single Go binary, not a project dependency:
+# it is a sidecar, and a library that pulled it in would be claiming to run it).
+#
+#   just demo-archive     # terminal 1
+#   just demo-replicate   # terminal 2: ship the WAL continuously
+#
+# Then to prove it, delete the log directory and:
+#
+#   litestream restore -config litestream.yml -o RESTORED/positions/buffer.db \
+#       litelink-data/positions/buffer.db
+#
+# Continuously replicate the demo log's SQLite state to rustfs (§3a).
+demo-replicate root="litelink-data":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v litestream >/dev/null || {
+        echo "litestream not on PATH — see https://litestream.io/install" >&2
+        exit 1
+    }
+    export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
+    export AWS_REGION=us-east-1
+    # litestream takes credentials from the environment, never from the config
+    # file — so the generated YAML is safe to commit and hand around.
+    export LITESTREAM_ACCESS_KEY_ID={{RUSTFS_KEY}}
+    export LITESTREAM_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
+    uv run python examples/replicate.py --root {{root}} \
+        --to s3://{{RUSTFS_BUCKET}}/wal --out {{root}}/litestream.yml
+    litestream replicate -config {{root}}/litestream.yml
+
 # Create the demo bucket. Idempotent, and through the same s3fs the library
 # uses rather than an AWS CLI nobody is required to have installed.
 _rustfs-bucket:

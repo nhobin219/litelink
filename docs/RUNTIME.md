@@ -485,6 +485,44 @@ sealers came to write the same file. The read-only connection needs no such lock
 that is the proof the rule is about transactions rather than about threads — nothing ever
 opens one on it.
 
+## Losing the machine
+
+Sealed data is in the archive once `sync` has pushed it. Everything else — rows that have
+not sealed yet, and the catalogs that say what the sealed files are — is SQLite on local
+disk, and a WAL-shipping sidecar is what gets it off the machine.
+
+**Nothing bounds the loss window without one.** The seal fires on `target_size` alone, so a
+stream that goes quiet holds its last partial file's worth of rows indefinitely. The
+`max_age` timer used to bound it, at the cost of making one knob set both the file size and
+the RPO; removing it made replication the only mechanism rather than one of two.
+
+```
+just demo-replicate      # generates litestream.yml from the log, runs the sidecar
+```
+
+**Three databases, not one.** `examples/replicate.py` generates the config from
+`Log.databases` rather than leaving it to be written by hand, because the set is not
+obvious and getting it wrong is silent: `buffer.db` holds rows no Parquet file has yet,
+`catalog.db` says which files the local table is made of, and `archive.db` says the same
+for the archive — omit it and the objects in S3 survive with nothing able to say what they
+are. `archive.db` is created on first use, so a log that has never opened its archive has
+none to restore, and a restore procedure has to tolerate that.
+
+**The endpoint goes in the config, the credentials do not.** litestream reads keys from the
+environment, so the generated file is safe to commit and copy — the same reason `S3Options`
+is not part of `LogConfig`. The endpoint is different: litestream resolves the bucket's
+region against real AWS unless the replica names one, so against anything else it fails
+with "cannot lookup bucket region" while the credentials it needs sit unused in the
+environment.
+
+**Restore is correct by construction.** A restored buffer may hold rows already sealed into
+the table. Nothing reconciles them, because the read boundary comes from the table's
+committed extent (I3), so those rows fall outside the buffer's contribution automatically.
+
+Measured on this machine: a log at 189,140 appended rows, killed with its directory
+discarded, restored from object storage alone — 189,140 rows readable, none of them ever
+sealed.
+
 ## Operating it
 
 ```

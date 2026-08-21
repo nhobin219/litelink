@@ -153,6 +153,22 @@ class LogConfig:
     # Rows, not files, because it is a statement about the data — "the last
     # million entries stay local" survives a change to `target_size`, and "the
     # last ten files" does not.
+    #
+    # FOLLOW-UP: no third floor in BYTES, and deliberately. These two answer
+    # "what can I query without touching the network", which is how queries are
+    # written — the last hour, the last million rows. "The last 10 GB" is not a
+    # statement any query makes, and rows already stand in for bytes since
+    # bytes are roughly rows times width.
+    #
+    # What is genuinely missing is the opposite: nothing bounds local disk from
+    # ABOVE, so with both of these unset it grows without limit. That wants a
+    # CAP rather than a floor, and it composes the other way — `max` after the
+    # `min` below, because a cap evicts MORE and can therefore violate both
+    # floors. It would measure on-disk size (`DataFile.size`), one of the few
+    # places where that is the right unit. And it could not be honoured at all
+    # while sync is behind, since I4 forbids evicting what the archive lacks —
+    # a log breaching its floors to stay under a cap is misconfigured and
+    # should say so rather than quietly serving every read from object storage.
     local_rows: int | None = None
     # §6/§8. Must exceed the longest scan: expiry deletes files an open scan is
     # still reading (I6).
@@ -161,10 +177,6 @@ class LogConfig:
     # §6. What counts as "big enough to leave alone" is `settled_size` of the
     # target, not its own setting — see `_maintenance.settled_size`.
     compact_min_files: int = 4
-
-    # §3a. Continuous SQLite WAL shipping. Off by default; decouples RPO from
-    # max_age at the cost of a sidecar.
-    wal_replication: bool = False
 
     def to_json(self) -> str:
         """Serialised for the `meta` table, so `open` recovers the policy.
@@ -184,22 +196,43 @@ class LogConfig:
                 "local_rows": self.local_rows,
                 "snapshot_retention": self.snapshot_retention.total_seconds(),
                 "compact_min_files": self.compact_min_files,
-                "wal_replication": self.wal_replication,
             }
         )
 
     @classmethod
     def from_json(cls, encoded: str) -> LogConfig:
+        """Recover the policy, tolerating a record written by another version.
+
+        Every field falls back to its default when absent, because that is what
+        an older record MEANS: the log was written before the setting existed,
+        so it was running the default. Reading them positionally instead made
+        adding any setting break `open` on every existing log — a config that
+        cannot be read is a log that cannot be opened, over a policy value that
+        was never load-bearing.
+
+        Unknown keys are ignored for the same reason from the other direction:
+        a log touched by a newer version stays openable by an older one, minus
+        the setting it does not have.
+        """
         raw = json.loads(encoded)
-        retention = raw["local_retention"]
+        defaults = cls()
+        retention = raw.get("local_retention", defaults.local_retention)
+        snapshots = raw.get("snapshot_retention")
 
         return cls(
-            target_size=raw["target_size"],
-            local_retention=None if retention is None else timedelta(seconds=retention),
-            local_rows=raw["local_rows"],
-            snapshot_retention=timedelta(seconds=raw["snapshot_retention"]),
-            compact_min_files=raw["compact_min_files"],
-            wal_replication=raw["wal_replication"],
+            target_size=raw.get("target_size", defaults.target_size),
+            local_retention=(
+                retention
+                if isinstance(retention, timedelta) or retention is None
+                else timedelta(seconds=retention)
+            ),
+            local_rows=raw.get("local_rows", defaults.local_rows),
+            snapshot_retention=(
+                defaults.snapshot_retention
+                if snapshots is None
+                else timedelta(seconds=snapshots)
+            ),
+            compact_min_files=raw.get("compact_min_files", defaults.compact_min_files),
         )
 
 
@@ -476,6 +509,22 @@ class Log:
         stalled sync shows up first as local disk that stops being reclaimed.
         """
         return self._maintenance.archived_through()
+
+    @property
+    def databases(self) -> tuple[Path, ...]:
+        """The SQLite files a restore needs (§3a).
+
+        For a WAL-shipping sidecar to replicate. Public because deciding to run
+        one is a deployment choice, but knowing WHICH files carry the log's
+        state is not — it is this library's, and a sidecar configured by hand
+        against a guess is one that silently omits `archive.db` and leaves the
+        objects in S3 with nothing to say what they are.
+
+        litelink does not run the sidecar. It is a separate process reading the
+        WAL, which is exactly why it does not put the network in the write path
+        (§3a); a library that supervised it would.
+        """
+        return self._layout.databases
 
     @property
     def archive(self) -> str | None:
