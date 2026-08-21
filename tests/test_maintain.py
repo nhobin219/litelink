@@ -264,13 +264,20 @@ def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
         assert written.exists(), "sweep deleted a file `sealing` had claimed"
 
 
-def test_recovery_removes_a_crashed_compaction_by_name(tmp_path: Path) -> None:
+def test_recovery_queues_a_crashed_compaction_by_name(tmp_path: Path) -> None:
     """§11: no snapshot was committed, so the output is dead — and it is named.
 
-    The point is that recovery unlinks one known path. Nothing scans a
+    The point is that recovery resolves one known path. Nothing scans a
     directory to discover that this file was garbage.
+
+    QUEUED rather than unlinked, because the owner being recovered from may not
+    be dead. A maintainer stalled past its lease can wake between the check and
+    the removal and commit the very file about to be deleted, taking the whole
+    range with it. The queue's drain re-reads what the table references at
+    unlink time, so the last word belongs to a check made when the file is
+    actually removed — the same route an abandoned seal has always taken.
     """
-    config = LogConfig(compact_min_files=99)
+    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
         rel_path = log._layout.compaction_path(1, 4, "deadbeef")
@@ -280,9 +287,38 @@ def test_recovery_removes_a_crashed_compaction_by_name(tmp_path: Path) -> None:
         half_written.write_bytes(b"a compaction that never committed")
 
     with open_log(tmp_path, config) as recovered:
-        assert not half_written.exists()
+        assert rel_path in recovered._buffer.queued_deletions()
         assert recovered._buffer.pending_compaction() is None
+
+        recovered._maintenance.drain()
+
+        assert not half_written.exists()
         # The inputs were never superseded, so the table is already correct.
+        assert len(read_all(recovered)) == 4
+
+
+def test_recovery_never_removes_a_file_the_table_adopted(tmp_path: Path) -> None:
+    """The reason recovery queues instead of unlinking.
+
+    An owner recovered from may still be alive — stalled past its lease — and
+    can commit its output between the check and the removal. Here the file IS
+    referenced, standing in for that commit having landed, and the drain must
+    refuse it. Unlinking on the strength of an earlier read would take the
+    whole range: the sources it superseded were queued before the commit and
+    drain away behind it.
+    """
+    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 1)
+        live = log._table.data_files()[0]
+        # Claimed as though a crashed compaction had produced it, while the
+        # table in fact references it.
+        log._buffer.claim_compaction(live.lo, live.hi, log._layout.relative(live.path))
+
+    with open_log(tmp_path, config) as recovered:
+        recovered._maintenance.drain()
+
+        assert Path(live.path).exists(), "a referenced file must survive recovery"
         assert len(read_all(recovered)) == 4
 
 

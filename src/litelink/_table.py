@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING
 
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
-from pyiceberg.exceptions import CommitFailedException, NoSuchTableError
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    NoSuchTableError,
+)
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
 
@@ -186,11 +189,26 @@ class LogTable:
         The schema is the local table's, so the two cannot drift: one declared
         shape, and the archive is the same rows later.
 
-        The catalog entry is keyed by table id, not by warehouse, so pointing a
-        log at a DIFFERENT prefix does not by itself reach a different table —
-        `table_exists` finds the entry made for the old one and hands back a
-        table whose metadata still lives there. That is what `forget` is for,
-        and why `Archive.set_uri` calls it.
+        The catalog entry is keyed by table id, not by warehouse, so an entry
+        made for a DIFFERENT prefix would be found here and hand back a table
+        whose metadata still lives in the old bucket. So it is checked against
+        the prefix asked for, and replaced when it does not match.
+
+        Checked HERE rather than dropped when the archive is re-pointed, which
+        is what this did first. Re-pointing is three durable writes — the URI,
+        the watermark, the catalog entry — and a crash between any two leaves
+        them disagreeing; no ordering avoids it, because the damage differs in
+        each direction. A check at open is a repair that runs every time, so a
+        half-finished re-point corrects itself.
+
+        It is also what keeps detach-and-reattach working. Dropping the entry
+        eagerly meant pointing back at an archive that still held data built a
+        fresh empty table over it, and rows already evicted locally were then
+        reachable from nowhere.
+
+        Adopting an archive that holds data but has no entry here is a
+        different operation and is NOT supported: this creates an empty table
+        at the prefix rather than discovering what is already there.
         """
         catalog = SqlCatalog(
             "archive",
@@ -199,12 +217,31 @@ class LogTable:
             **options.resolved().catalog_properties(),
         )
         catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
-        if not catalog.table_exists(layout.table_id):
-            catalog.create_table(
+        table = None
+        try:
+            table = catalog.load_table(layout.table_id)
+        except Exception:  # noqa: BLE001
+            # Anything: no entry at all, or one naming metadata in a bucket
+            # this process can no longer read because that archive has been
+            # retired. Both mean there is no usable table for this prefix, and
+            # both are repaired the same way.
+            table = None
+
+        if table is not None and not table.metadata_location.startswith(prefix):
+            # Another archive's table, found by table id. The entry goes; the
+            # objects do not, because detaching an archive is not deleting one.
+            catalog.drop_table(layout.table_id)
+            table = None
+
+        if table is None:
+            with contextlib.suppress(NoSuchTableError):
+                catalog.drop_table(layout.table_id)
+
+            table = catalog.create_table(
                 layout.table_id, schema=schema, properties=METADATA_PROPERTIES
             )
 
-        return cls(catalog, layout, catalog.load_table(layout.table_id), prefix)
+        return cls(catalog, layout, table, prefix)
 
     @staticmethod
     def forget_archive(layout: Layout, options: S3Options) -> None:
