@@ -105,7 +105,9 @@ def _recorded_location(layout: Layout) -> str | None:
     other than "there is no table".
 
     None means there is definitely no entry — the catalog was readable and had
-    no row. `LookupError` means the question could not be answered, which is
+    no row. Callers distinguish that from "cannot tell", so the two must not be
+    conflated: the empty string is used below as a third value meaning "carry
+    on and let pyiceberg decide". `LookupError` means the question could not be answered, which is
     NOT the same thing: answering None there sends the caller down the create
     path against an entry that still exists, and every open of that log then
     fails on a unique constraint. A log nobody can open, from a query that was
@@ -282,16 +284,15 @@ class LogTable:
         boundary = prefix.rstrip("/") + "/"
         if not repair:
             try:
-                if _recorded_location(layout) is None:
-                    msg = f"no archive table at {prefix!r} yet"
-                    raise ArchiveAbsent(msg)
-            except LookupError as exc:
-                if not isinstance(exc, ArchiveAbsent):
-                    # Could not tell offline. Fall through and let pyiceberg
-                    # answer, accepting the local writes that costs.
-                    pass
-                else:
-                    raise
+                known = _recorded_location(layout)
+            except LookupError:
+                # Could not tell offline. Fall through and let pyiceberg
+                # answer, accepting the local writes that costs.
+                known = ""
+
+            if known is None:
+                msg = f"no archive table at {prefix!r} yet"
+                raise ArchiveAbsent(msg)
 
         catalog = SqlCatalog(
             ARCHIVE_CATALOG,
