@@ -431,3 +431,43 @@ def test_an_interrupted_hydrate_can_be_finished(
         assert sorted(restored) == list(range(1, ROWS + 1)), (
             "the second run must finish what the first started"
         )
+
+
+def test_repointing_an_archive_reaches_the_new_one(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Re-pointing must actually re-point, and must not carry a watermark.
+
+    The archive's catalog is a LOCAL SQLite file keyed by table id, so an entry
+    made for the old prefix is found again unless it is dropped — and the
+    handle then reads, and `sync` writes, into the bucket the log claims to
+    have left. Worse, `_push` reconciles the watermark up from that old
+    archive's extent, undoing the reset that exists to stop eviction deleting
+    the only copy of rows the new archive has never been sent.
+    """
+    first, second = f"s3://{bucket}/one", f"s3://{bucket}/two"
+    fs = filesystem(s3)
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.set_archive(first)
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        assert log.archived_through() > 0
+        in_first = len(fs.find(first.removeprefix("s3://")))
+        assert in_first > 0
+
+        log.set_archive(second)
+
+        assert log.archived_through() == 0, (
+            "a bucket that has been sent nothing has earned no watermark"
+        )
+
+        log.sync()
+
+        assert second.removeprefix("s3://") in log._archive.require().metadata_location
+        assert len(fs.find(second.removeprefix("s3://"))) > 0, (
+            "sync must reach the NEW archive"
+        )
+        assert len(fs.find(first.removeprefix("s3://"))) == in_first, (
+            "detaching an archive is not deleting it"
+        )
