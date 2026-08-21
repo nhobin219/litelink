@@ -351,10 +351,9 @@ class Buffer:
             'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
             (covered,),
         ).fetchone()[0]
-        # Restarting the max_age clock at open is deliberate. Nothing records
-        # when a row arrived — §2 stamps no timestamp — so the alternative is
-        # inventing an age, and inventing an old one seals a stub file on every
-        # restart, which is the failure §6 exists to clean up after.
+        # Adopting whatever is buffered, rather than starting a fresh group
+        # above it: those rows still have to become a file, and a group that
+        # skipped them would leave them unsealed for ever.
         self._con.execute(
             "INSERT INTO extent (start_offset, bytes) VALUES (?, ?)",
             (start, self._measure_from(covered)),
