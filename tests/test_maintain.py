@@ -874,3 +874,59 @@ def test_a_compaction_target_under_the_seal_size_is_refused() -> None:
     config = LogConfig(target_seal_size=8192, target_compact_size=4096)
     with pytest.raises(ValueError, match="target_compact_size"):
         validate(SCHEMA, (), config, None)
+
+
+def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
+    """`maintain` is one call for all three; the parts are callable alone.
+
+    Their costs differ by orders of magnitude now that conversion reads and
+    rewrites whole files while eviction and expiry are metadata commits, so a
+    deployment may want them on different schedules. Running them separately
+    has to reach the same state as running them together.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8 * 4096,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        before = len(log._table.data_files())
+        assert before >= 4
+
+        log.compact()
+        converted = len(log._table.data_files())
+        assert converted < before, "compaction must run on its own"
+
+        log.evict()
+        log.expire()
+
+        assert log._table.data_files() == [], "eviction must run on its own"
+        # What is left is the unsealed tail, which never reached the seal
+        # target and is therefore still in the buffer. Eviction removes FILES;
+        # rows that are not in one are not its business.
+        assert log.scan().read_all().num_rows == log.buffered_rows()
+
+
+def test_a_single_pass_takes_the_maintenance_lease(tmp_path: Path) -> None:
+    """Running the parts separately is not a way around the exclusion.
+
+    Whichever entry point a second owner comes through, it is refused — the
+    lease is the thing that stops two maintainers compacting the same run to
+    the same deterministic path, which is a torn file rather than a conflict
+    Iceberg could resolve.
+    """
+    with open_log(tmp_path, LogConfig(target_seal_size=4096)) as log:
+        held = log._lease("maintain")
+        assert held.acquire()
+        try:
+            for pass_ in (log.compact, log.evict, log.expire):
+                with pytest.raises(RuntimeError, match="maintenance lease"):
+                    pass_()
+        finally:
+            held.release()
+
+        log.compact()

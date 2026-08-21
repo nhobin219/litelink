@@ -47,10 +47,15 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from _stream import NAME
 
 from litelink import Log
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 from litelink._s3 import S3Options
 
 
@@ -93,7 +98,7 @@ def main() -> None:
     print(
         f"{'local rows':>13} {'buffer rows':>13}{archived_rows}"
         f" {'local files':>12}{archived_files}"
-        f" {'disk':>9} {'maintain':>9}{sync_column}"
+        f" {'disk':>9} {'seal':>8} {'compact':>10} {'reclaim':>10}{sync_column}"
     )
 
     # SIGTERM, not just Ctrl-C. Python does not unwind on it — the process
@@ -234,28 +239,39 @@ class Sidecar:
 
 
 def _maintain(log: Log, root: Path) -> None:
-    started = time.monotonic()
+    """One pass, phase by phase.
+
+    `log.maintain()` does all of this in one call and is what most deployments
+    want. It is split here because the phases cost wildly different amounts and
+    a single number hides which one was slow — conversion reads and rewrites
+    whole files, eviction and expiry are metadata commits, and sync is the only
+    one that can block on a network. An 83 s sync went unnoticed inside a
+    combined figure until the buffer had grown to 170,540 rows.
+
+    `seal` reads 0 ms in a healthy log and that is the point: the loop above
+    drains the queue every quarter second, so by the time a pass runs there is
+    nothing left to seal. A number here means sealing fell behind, which is the
+    first thing to know and was previously invisible.
+    """
+    timings: dict[str, float] = {}
     try:
-        # Seals too — sealing is maintenance. The loop calls `seal_due`
-        # separately only because it is cheap enough to run far more often.
-        log.maintain()
+        for name, phase in (
+            ("seal", log.seal_due),
+            ("compact", log.compact),
+            ("reclaim", _reclaim(log)),
+        ):
+            started = time.monotonic()
+            phase()
+            timings[name] = (time.monotonic() - started) * 1000
     except RuntimeError as exc:
-        # Another process holds the maintain lease. Not worth dying over: it
+        # Another owner holds the maintenance lease. Not worth dying over: it
         # means someone else is already doing this.
         print(f"  skipped: {exc}")
         return
 
-    local_ms = (time.monotonic() - started) * 1000
-
-    # After `maintain`, not before. Eviction reads the archive watermark to
-    # decide what it is allowed to drop (I4), so a push landing first is what
-    # lets the NEXT pass reclaim the disk it freed up.
-    #
-    # Timed separately, not folded into the pass, because it is the one step
-    # that can block on a network: everything above is local and finishes in
-    # milliseconds, and a single number would report an S3 timeout as slow
-    # compaction. That is not hypothetical — a sync taking 83 s of an 89 s
-    # pass is what sent us looking.
+    # After the local passes, not before. Eviction reads the archive watermark
+    # to decide what it is allowed to drop (I4), so a push landing first is
+    # what lets the NEXT pass reclaim the disk it freed up.
     archived_rows = archived_files = sync_column = ""
     if log.archive:
         pushed = time.monotonic()
@@ -267,8 +283,21 @@ def _maintain(log: Log, root: Path) -> None:
     print(
         f"{log.table_rows():>13,} {log.buffered_rows():>13,}{archived_rows}"
         f" {log.table_files():>12,}{archived_files}"
-        f" {_disk(root) / 1e6:>7.1f}MB {local_ms:>7.0f}ms{sync_column}"
+        f" {_disk(root) / 1e6:>7.1f}MB"
+        f" {timings['seal']:>6.0f}ms {timings['compact']:>8.0f}ms"
+        f" {timings['reclaim']:>8.0f}ms{sync_column}"
     )
+
+
+def _reclaim(log: Log) -> Callable[[], None]:
+    """Eviction and expiry as one phase: both are metadata commits that finish
+    in milliseconds, and splitting them further would report noise."""
+
+    def run() -> None:
+        log.evict()
+        log.expire()
+
+    return run
 
 
 def _disk(root: Path) -> int:

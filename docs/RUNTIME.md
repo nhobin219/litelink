@@ -496,6 +496,19 @@ Note the direction, which is the opposite of retention's. These are ceilings on 
 and the tighter wins; `local_retention` and `local_rows` are floors on what stays readable
 and the looser wins.
 
+**The passes are callable one at a time**, and worth doing when their costs diverge.
+Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
+finish in milliseconds; `sync` is the only one that can block on a network. `maintain()`
+runs the three local ones under a single lease and is what most deployments want —
+`compact()`, `evict()` and `expire()` exist for the schedules it cannot express, and take
+the same lease, so running them separately is not a way around the exclusion.
+
+Measured on the demo against local object storage, one pass: seal 0 ms, compact 147–920 ms,
+reclaim 20–400 ms, sync 11–712 ms. A combined number reports an S3 timeout as slow
+compaction, which is how an 83 s sync went unnoticed until the buffer had reached 170,540
+rows. `seal` reading 0 ms is the healthy case — the loop drains the queue every quarter
+second, so anything else means sealing fell behind.
+
 ## Sorting, and why the default is not to
 
 `sort_by` is optional and defaults to offset order. That default is not a fallback — it is

@@ -46,7 +46,7 @@ from litelink._table import LogTable
 from litelink._types import validate_schema
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
     from os import PathLike
     from types import TracebackType
     from typing import Self
@@ -1442,6 +1442,12 @@ class Log:
     def maintain(self) -> None:
         """Reclaim local storage: compact, evict, expire (§6, §8, §12).
 
+        The one call most deployments want, and it takes the lease once for
+        all three. `compact`, `evict` and `expire` are callable on their own
+        for the case this cannot express — schedules that differ because the
+        costs do, now that conversion reads and rewrites files while the other
+        two are metadata commits.
+
         Runs with or without an archive — this is the call that makes
         `local_retention` mean something on a local-only log.
 
@@ -1494,6 +1500,53 @@ class Log:
         # in a loop is correct; `seal_due` is exposed separately only because
         # it is cheap enough to run far more often than the rest of this.
         self.seal_due()
+
+    def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """Convert sealed files into `target_compact_size` ones (§6).
+
+        The heavy half of `maintain`, and the reason the three passes are
+        callable separately: it reads and rewrites whole files, while eviction
+        and expiry are metadata commits that finish in milliseconds. A
+        deployment that wants them on different schedules — convert hourly,
+        expire every minute — can have that, and one that does not should call
+        `maintain` and get all three.
+        """
+        self._pass(self._maintenance.compact, heartbeat)
+
+    def evict(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """Drop files past `local_retention` from the local table (§8).
+
+        Never past what the archive holds when one is configured (I4), so a
+        sync that is behind delays this rather than losing data.
+        """
+        self._pass(lambda _: self._maintenance.evict(), heartbeat)
+
+    def expire(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """Expire snapshots past `snapshot_retention`, then delete what has
+        come due (§6, §8)."""
+        self._pass(lambda _: self._maintenance.expire(), heartbeat)
+
+    def _pass(
+        self,
+        run: Callable[[Callable[[], bool] | None], None],
+        heartbeat: Callable[[], bool] | None,
+    ) -> None:
+        """One maintenance pass under the maintenance lease.
+
+        The same exclusion `maintain` takes, so running the passes separately
+        is not a way around it: a second owner is refused whichever entry point
+        it came through.
+        """
+        self._writable()
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            run(heartbeat or lease.renew)
+        finally:
+            lease.release()
 
     def rewrite_archive(self) -> None:
         """Merge undersized files already in the archive (§6, ad-hoc).
