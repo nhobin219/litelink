@@ -2,11 +2,11 @@
 
 Durable append-only capture into Iceberg tables. Local-first, in-process, no service.
 
-**Status: early.** The local capture loop works — append, seal, read, compact, evict,
-expire — against a local Iceberg table. The archive tier does not: `sync()` and archive
-reads raise `NotImplementedError`, so today this is durable local capture into Iceberg
-rather than the full three-tier design. Schema evolution is likewise unimplemented. The
-design is [`docs/SPEC.md`](docs/SPEC.md), and it is ahead of the code.
+**Status: early.** All three tiers work — append, seal, read, compact, evict, expire, and
+`sync()` into an Iceberg table on S3, with reads spanning buffer, local table and archive.
+Verified against a local S3-compatible store and against AWS. **Schema evolution is not
+implemented**, and remains the one specified feature the code does not have. The design is
+[`docs/SPEC.md`](docs/SPEC.md), and in places it is still ahead of the code.
 
 ---
 

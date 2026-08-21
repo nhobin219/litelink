@@ -388,6 +388,20 @@ a live claim covers; recovery means reclaiming an expired one and removing the f
 named. The intent record and the lease become the same row — which is what allows several
 passes to run at once without any of them excluding the others by kind.
 
+**Implemented**, with two consequences of one-row-per-operation that one-row-per-role hid.
+Nothing overwrites a lapsed claim the way a keyed row did, so it sits there still naming its
+owner: `acquire` clears expired overlapping rows and `renew` refuses once expired, or a
+stalled holder extends itself back onto a range the log has moved past. And a nested claim
+must carry the OPERATION's owner rather than mint one — a rewrite running inside a config
+change's whole-log claim was refused by the operation it was part of, and silently did
+nothing.
+
+Two ranges are still coarser than the design wants: `sync` and the configuration changes
+claim the whole log. For a configuration change that is correct — a re-point is not an
+operation on an interval. For `sync` it is conservative: it cannot name the range it will
+push until it has read the archive's extent, so narrowing it to `(floor, last]` is the
+remaining refinement, and until then `compact ∥ sync` still serialises.
+
 ### The check and the claim are one transaction
 
 Claiming is not enough on its own, and this is the part that is easy to get wrong. Suppose
@@ -501,11 +515,19 @@ So eviction, in both configurations, is one rule: **drop what retention no longe
 except what a live claim covers, and except — where an archive is configured — what has no
 recorded copy in it.**
 
-**Not implemented.** Three things to establish first: `extent` has no index on the offset
-columns, so the per-file check needs one on the eviction path; the boundary eviction snaps
-to a file edge has to be shown equivalent under the per-segment test; and `hydrate` records
-a byte count of zero for a file the archive never measured, which is dormant only while a
-watermark keeps such files out of every size consumer.
+**Implemented.** `archive_pending` and the frontier are gone; `archived_prefix` walks the
+local files and stops at the first without a recorded copy, and both compaction and eviction
+ask it. Compaction skipping archived files is not optional here — it is what keeps a local
+range and its archived range the same range, so the per-segment test can match them at all.
+
+One window survives the change and closes differently. The row naming a file's archive copy
+is written after the register, so a crash between the two leaves the archive holding a range
+nothing local records. Nothing is promised beforehand to cover it — that is what made the
+watermark inexact in both directions — so the next push backfills from the archive's own
+manifest, which it reads anyway.
+
+`archived_through` remains as a derived cache, for the push floor and for display. It no
+longer authorises a deletion, which was the whole of the problem.
 
 ### Rejected: one settled watermark for both
 
