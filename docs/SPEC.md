@@ -425,14 +425,98 @@ leg to `offset < 1`, and the range is served by exactly one tier either way.
 - **owner and expiry on a claim**: in-flight or abandoned — the only question the data
   cannot answer.
 
+### Where a segment lives is a property of the segment, not a watermark
+
+The tiers are four steps, and only three of them are tiers:
+
+```
+buffer            rows, uncompacted, serves the newest data      (hot)
+sealed files      written out fast, unoptimised, all must be scanned
+compacted files   the read-optimised baseline that replaces them
+        └── stored locally, or in the archive, or both
+```
+
+The fourth step is not a tier. A compacted file in the archive is the **same file in a
+second place**, and litelink already records that per file: `sync` calls `record_file` with
+the archive's URI, so `extent` holds a row per pushed file naming exactly where its copy
+went. `archived_through` is a global summary of facts that are already durable per segment.
+
+That summary is the single most expensive line in this design, because it is **the only
+boundary in the system that can move backwards.** Offsets are immutable, seal cuts only
+advance, compaction only merges forward — and then a re-point resets the archive watermark
+to zero. Every reader that cached the old position is wrong at once, and there is no
+ordering of the writes that fixes it, because the problem is not the write ordering; it is
+that a per-segment fact was compressed into one mutable number and then had to be
+un-compressed by inference.
+
+**So do not compress it.** I4 is asked of a file, not of a watermark:
+
+> A local file may be dropped only if `extent` holds a row for the same offset range whose
+> `rel_path` names a copy in the archive this log is configured for.
+
+An equality check on a recorded value, and the consequences fall out:
+
+- **Nothing resets.** A re-point changes where the NEXT file goes. Files already pushed keep
+  naming the bucket that holds them, so no boundary moves backwards and no cached position
+  becomes wrong.
+- **Identity stops being inferred.** "Is this mine?" is a comparison against a URI the log
+  wrote down, not an inference from a prefix, a catalog row keyed by table id, or a
+  process's memory of its own configuration.
+- **Several archives coexist.** Old ranges name the old bucket and new ranges the new one,
+  which is what makes re-attaching to an archive that already holds data expressible — today
+  it is not.
+- **The compaction frontier goes.** `archive_pending` exists to stop a merge straddling a
+  range the archive may hold; per segment, compaction skips a file that records an archive
+  copy and needs no frontier, no crash window between writing it and using it, and no
+  reconciliation to retire it.
+
+`archived_through` may remain as a derived `MAX(...)` for the push floor and for display.
+What it may not be again is the thing that authorises a deletion.
+
+**Local-only is the same rule with one term absent.** With no archive there is no URI to
+record and no row to find, so I4 is vacuous — not unsatisfiable. Eviction is then
+`local_retention` and `local_rows` alone, which §8 already says is a deletion policy over
+the only copy.
+
+It is tempting to require that a file be compacted before local-only eviction will take it,
+by symmetry with the archive case, where only compacted files are ever pushed and therefore
+only compacted files are ever eligible. **Resist it.** The reason to hold a file back is
+never its compaction state; it is that a merge is *using* it right now, which is a claim and
+already answered above. Requiring "compacted" instead reintroduces the trailing-run holdback
+this section rejects below — bounded in bytes, at most one compaction target, but unbounded
+in time, so a log that goes idle keeps its last target-sized residue for ever. Whether that
+is acceptable depends on whether `local_retention` is a disk heuristic or an obligation to
+delete; §8 currently reads as the latter, which would make it a defect rather than a lag.
+
+So eviction, in both configurations, is one rule: **drop what retention no longer wants,
+except what a live claim covers, and except — where an archive is configured — what has no
+recorded copy in it.**
+
+**Not implemented.** Three things to establish first: `extent` has no index on the offset
+columns, so the per-file check needs one on the eviction path; the boundary eviction snaps
+to a file edge has to be shown equivalent under the per-segment test; and `hydrate` records
+a byte count of zero for a file the archive never measured, which is dormant only while a
+watermark keeps such files out of every size consumer.
+
 ### Rejected: one settled watermark for both
 
 An earlier version of this section had a single `settled_through` that compaction worked
-above and eviction at or below. It does not survive: "settled enough to archive" needs the
-trailing run held back, because compaction may still merge it and archiving a file that is
-about to be replaced is waste — while "safe to evict" must have no such holdback, or a
-quiet stream that never fills a compaction target never settles and `local_retention` stops
-removing anything at all. One number cannot mean both.
+above and eviction at or below. It does not survive, though not for the reason first
+recorded here. The original argument was that a quiet stream never settles and so never
+evicts, "removing anything at all" — an overstatement twice over: the holdback is the
+trailing run, which is bounded by the compaction target, and with an archive configured that
+stall is already the behaviour, since a stream that never settles never pushes and I4 pins
+eviction regardless. It does not distinguish the design it was rejecting.
+
+The real reason is that the number is wrong in both directions at once. With an archive,
+`archived <= settled` always, so eviction at or below `settled_through` would delete files
+that settled but were never pushed — an I4 violation, and the binding constraint is
+`archived_through` anyway, which is never the larger of the two. Without an archive, nothing
+else clamps, so the holdback becomes the only constraint and applies where it has no reason
+to: "settled enough to archive" needs the trailing run held back because compaction may
+still merge it and pushing a file about to be replaced is waste, while "safe to evict" is a
+question about age, not about what may still change. One number cannot mean both, because
+the two consumers are asking about different directions in time.
 
 ## 5. Sync
 
