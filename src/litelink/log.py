@@ -726,14 +726,12 @@ class Log:
         Takes the maintenance lease, so it cannot interleave with a `sync` —
         and raises if another owner holds it, rather than proceeding.
 
-        Re-reading the location at the top of `sync` narrowed the window; it
-        did not close it. A sync that has already read `s3://old`, taken the
-        lease and pushed to it finishes by writing that archive's extent as the
-        watermark. Land a re-point in between and the log points at the new,
-        empty archive while carrying a watermark earned by the old one —
-        eviction believes it and deletes the only local copy of rows the new
-        archive has never been sent. Nothing lowers a watermark, so the next
-        sync cannot undo it.
+        A sync that has already read `s3://old`, taken the lease and pushed to
+        it finishes by writing that archive's extent as the watermark. Land a
+        re-point in between and the log points at the new, empty archive while
+        carrying a watermark earned by the old one — eviction believes it and
+        deletes the only local copy of rows the new archive has never been
+        sent. Nothing lowers a watermark, so no later sync undoes it.
 
         The shipped writer calls this on every restart, and the maintainer runs
         in another process, so the two are exactly the pair that collide.
@@ -750,46 +748,49 @@ class Log:
                 )
                 raise RuntimeError(msg)
 
-            # The watermark FIRST, and the order is the point. It belonged to
-            # the PREVIOUS archive, and eviction acts on it: I4 lets `maintain`
-            # delete a local file because the archive holds it. Carried across
-            # a re-point, that is a promise about a bucket this log no longer
-            # uses, and eviction deletes the only copy of rows the new archive
-            # has never been sent.
-            #
-            # These are two autocommit writes, so a crash lands between them.
-            # Resetting first, the crash leaves a log still pointing at the OLD
-            # archive with a watermark of zero — eviction simply waits for a
-            # sync, which is a delay. The other order leaves the NEW archive
-            # with the old watermark, which is the data loss itself.
-            if (archive or None) != self._archive.uri:
-                self._buffer.set_meta(Maintenance.ARCHIVED_KEY, "0")
-
-            self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
-
-            # Reaches the maintainer and the reader because all three hold
-            # this object. `evict` asks it whether I4 is owed anything, and a
-            # setting that stopped at `Log` would leave the maintainer deleting
-            # the only copy of rows an archive was just configured to receive.
+            # Every write inside, so a failure — a full disk, a busy database —
+            # releases the lease instead of stranding it for its whole TTL.
             try:
-                self._archive.set_uri(archive)
-                if self._archive.configured():
-                    # Best effort in both directions: the archive may not be
-                    # reachable at all, and configuring one is a statement of
-                    # intent — it must not require the bucket to be up, or a
-                    # log could not be pointed at an archive before that
-                    # archive exists. The check at open heals what this misses,
-                    # and `sync` raises loudly the moment the location is used.
-                    with contextlib.suppress(Exception):
-                        self._archive.table(repair=True)
+                self._repoint(archive)
             finally:
                 lease.release()
 
-        # Repaired under the same lease, and the difference is who waits.
+    def _repoint(self, archive: str | None) -> None:
+        """Record the new location, with the maintenance lease held."""
+        # The watermark FIRST, and the order is the point. It belonged to the
+        # PREVIOUS archive, and eviction acts on it: I4 lets `maintain` delete
+        # a local file because the archive holds it. Carried across a re-point,
+        # that is a promise about a bucket this log no longer uses.
+        #
+        # These are two autocommit writes, so a crash lands between them.
+        # Resetting first, the crash leaves a log still pointing at the OLD
+        # archive with a watermark of zero — eviction waits for a sync, which
+        # is a delay. The other order leaves the NEW archive with the old
+        # watermark, which is the data loss itself.
+        if (archive or None) != self._archive.uri:
+            self._buffer.set_meta(Maintenance.ARCHIVED_KEY, "0")
+
+        self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
+
+        # Reaches the maintainer and the reader because all three hold this
+        # object. `evict` asks it whether I4 is owed anything, and a setting
+        # that stopped at `Log` would leave the maintainer deleting the only
+        # copy of rows an archive was just configured to receive.
+        self._archive.set_uri(archive)
+
+        # Repaired here as well as at open, and the difference is who waits.
         # The catalog entry still names the previous archive until something
         # replaces it, and only a lease holder may — so without this, ordinary
         # re-pointing left every `include_archive` read raising until a
         # maintenance pass happened to run.
+        #
+        # Best effort: the archive may not be reachable at all, and
+        # configuring one is a statement of intent, not a claim that the bucket
+        # exists yet. `sync` raises loudly the moment the location is used, and
+        # the check at open heals what this misses.
+        if self._archive.configured():
+            with contextlib.suppress(Exception):
+                self._archive.table(repair=True)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.
@@ -1436,17 +1437,24 @@ class Log:
         #
         # One keyed read per sync, against a change that is rare and durable.
         # `set_uri` is a no-op when nothing moved.
-        self._archive.set_uri(self._buffer.get_meta(_ARCHIVE_KEY) or None)
-        if not self._archive.configured():
-            msg = "sync() needs an archive; this log is local-only"
-            raise ValueError(msg)
-
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
             msg = "another owner holds the maintenance lease"
             raise RuntimeError(msg)
 
         try:
+            # UNDER the lease, not before it. Read first, the location can be
+            # re-pointed between the read and the acquire — `set_archive` takes
+            # the same lease, so it is free until this line — and the push then
+            # runs against the old archive while the log durably points at the
+            # new one. `_push` would reconcile the old archive's extent into
+            # the watermark with no network call at all, and eviction believes
+            # a watermark whatever earned it.
+            self._archive.set_uri(self._buffer.get_meta(_ARCHIVE_KEY) or None)
+            if not self._archive.configured():
+                msg = "sync() needs an archive; this log is local-only"
+                raise ValueError(msg)
+
             self._push(lease)
         finally:
             lease.release()
@@ -1477,7 +1485,13 @@ class Log:
         # it behind for ever: the next pass computes `floor` from the archive
         # itself, finds nothing left to push, and never revisits the number
         # eviction depends on.
-        if covered is not None and self._maintenance.archived_through() < covered[1]:
+        if (
+            covered is not None
+            and self._maintenance.archived_through() < covered[1]
+            # Same guard as below: reconciling upward from an archive the log
+            # has been pointed away from is the loss this whole path guards.
+            and (self._buffer.get_meta(_ARCHIVE_KEY) or None) == self._archive.uri
+        ):
             self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(covered[1]))
 
         memory = self._maintenance.memory()
@@ -1533,6 +1547,20 @@ class Log:
         # After the register, never before: the watermark is a promise that the
         # archive HAS the range, and I4 lets `maintain` delete the local copy on
         # the strength of it.
+        #
+        # And only if it is still a promise about the SAME archive. This push
+        # can outlive its lease — a register alone measured 4.1 s and retries
+        # compound it — and a re-point that takes the lease meanwhile leaves
+        # this about to record an extent earned by a bucket the log has left.
+        # Re-read rather than trusted, because nothing lowers a watermark
+        # afterwards.
+        if (self._buffer.get_meta(_ARCHIVE_KEY) or None) != self._archive.uri:
+            msg = (
+                "the archive was re-pointed while this sync was pushing; its "
+                "watermark belongs to the previous archive and is not recorded"
+            )
+            raise RuntimeError(msg)
+
         self._buffer.set_meta(Maintenance.ARCHIVED_KEY, str(last.hi))
 
     def maintain(self) -> None:

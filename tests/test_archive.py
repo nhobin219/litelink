@@ -753,3 +753,70 @@ def test_a_read_against_a_never_synced_archive_writes_nothing(
         assert not log._layout.archive_db.exists(), (
             "a read must not create the archive catalog"
         )
+
+
+def test_a_failed_repoint_puts_the_old_catalog_entry_back(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A half-done move that leaves NEITHER archive is worse than not moving.
+
+    The repair drops the entry and creates a table at the new prefix, and
+    creating can fail — configuring an archive deliberately does not require
+    the bucket to exist yet. A drop with no create destroys the only record of
+    where the previous archive's metadata is, and
+    `previous_metadata_location` dies with the row, so rolling back would build
+    an empty table over data nothing could then reach.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        original = _recorded_location(log._layout)
+        assert original is not None
+
+    # A prefix in a bucket that does not exist, so the create must fail.
+    missing = "s3://litelink-no-such-bucket-3f9a2/elsewhere"
+    with pytest.raises(Exception, match=r".+"):
+        LogTable.open_archive(
+            Layout(tmp_path, "s"), missing, s3, table_schema(SCHEMA), repair=True
+        )
+
+    assert _recorded_location(Layout(tmp_path, "s")) == original, (
+        "a failed repair must leave the previous archive reachable"
+    )
+
+
+def test_drain_never_deletes_from_an_archive_the_log_has_left(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A queued remote path names the archive it was superseded in.
+
+    The reference veto asks the archive the log is pointed at NOW, so after a
+    re-point those entries would be checked against a new archive that
+    references nothing, and deleted from the old bucket — where they may still
+    be live, and may be the only copy of rows already evicted locally.
+    """
+    old = f"s3://{bucket}/retired"
+    fs = filesystem(s3)
+    with archived_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
+        log.set_archive(old)
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        objects = fs.find(old.removeprefix("s3://"))
+        assert objects
+
+        # Queue one of the old archive's live objects, as an interrupted
+        # rewrite would have, then leave for a different archive.
+        stranded = f"s3://{objects[0]}"
+        log._buffer.enqueue_deletions([stranded], 0)
+        log.set_archive(f"s3://{bucket}/current")
+
+        log._maintenance.drain()
+
+        assert fs.exists(objects[0]), (
+            "drain must not delete from the archive the log has left"
+        )
+        assert stranded in log._buffer.queued_deletions(), (
+            "and it stays queued for whoever owns that archive"
+        )
