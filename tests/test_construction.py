@@ -8,6 +8,7 @@ having them as parameters is for.
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -15,15 +16,20 @@ import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
+from litelink._archive import Archive
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
-from litelink._read import Reader, duckdb_connection
+from litelink._read import Reader, duckdb_connection, secret_sql
+from litelink._replication import WAL_PREFIX
+from litelink._s3 import S3Options
 from litelink._table import LogTable
 from litelink.log import table_schema, validate
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import json
+
+from pathlib import Path
 
 SCHEMA = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
 
@@ -67,15 +73,22 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     buffer = Buffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
 
     config = LogConfig()
+    # Local-only, and still a real object: the reader, the maintainer and the
+    # Log are handed the same one, which is what lets `set_archive` reach all
+    # three later. `uri=None` says the slot is empty, not that there is no slot.
+    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, table_schema(SCHEMA), duckdb_connection),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
+        reader=Reader(
+            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
+        ),
+        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
+        archive=archive,
     )
 
     assert log.name == "s"
@@ -100,16 +113,20 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
     buffer = StubBuffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
     config = LogConfig()
+    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
 
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, table_schema(SCHEMA), duckdb_connection),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",)),
+        reader=Reader(
+            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
+        ),
+        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
+        archive=archive,
     )
 
     assert log.end_offset() == 4_242
@@ -204,9 +221,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
     Schema comes from the Iceberg table, sort order from its declared sort
     order (§4), config and archive from the buffer's `meta` table (§2).
     """
-    config = LogConfig(
-        target_size=4096, compact_min_files=7, max_age=timedelta(seconds=90)
-    )
+    config = LogConfig(target_seal_size=4096, compact_min_files=7)
     with Log.new(
         tmp_path,
         "s",
@@ -219,7 +234,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
 
     with Log.open(tmp_path, "s") as reopened:
         assert reopened._sort_by == ("key", "event_ts")
-        assert reopened._archive == "s3://bucket/prefix"
+        assert reopened._archive.uri == "s3://bucket/prefix"
         assert reopened.config == config
         # Logically the same schema, not byte-identical: Iceberg has one string
         # type, so `string` comes back as `large_string`.
@@ -246,10 +261,10 @@ def test_a_log_with_no_stored_config_refuses_to_open(tmp_path: Path) -> None:
 def test_set_config_persists(tmp_path: Path) -> None:
     """Every knob in LogConfig governs future work, so no rewrite is needed."""
     with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.set_config(LogConfig(target_size=1234, compact_min_files=9))
+        log.set_config(LogConfig(target_seal_size=1234, compact_min_files=9))
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened.config.target_size == 1234
+        assert reopened.config.target_seal_size == 1234
         assert reopened.config.compact_min_files == 9
 
 
@@ -266,11 +281,11 @@ def test_set_archive_persists(tmp_path: Path) -> None:
         log.set_archive("s3://bucket/x")
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened._archive == "s3://bucket/x"
+        assert reopened._archive.uri == "s3://bucket/x"
         reopened.set_archive(None)
 
     with Log.open(tmp_path, "s") as detached:
-        assert detached._archive is None
+        assert detached._archive.uri is None
 
 
 def test_sort_by_is_declared_on_the_table(tmp_path: Path) -> None:
@@ -408,3 +423,229 @@ def test_a_relative_root_is_resolved_once(
     assert log.root == root
     assert log.scan().read_all().num_rows == 1
     log.close()
+
+
+def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
+    """§3's durability claim, read back off the connection.
+
+    `synchronous=FULL` is the whole product: WAL alone fsyncs at checkpoint
+    rather than at commit, which puts committed rows back in the OS page cache
+    — the exact loss this library exists to prevent. 2 is SQLite's code for
+    FULL.
+    """
+    buffer = Buffer.open(tmp_path / "b.db", SCHEMA, target_size=1 << 20)
+    try:
+        assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 2
+    finally:
+        buffer.close()
+
+
+def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
+    """For a buffer whose rows still exist somewhere else.
+
+    The archive rewrite re-cuts through a scratch buffer whose every row came
+    from the archive and is still in it until the rewrite's final commit, so a
+    crash there costs a re-run rather than data. 0 is OFF. WAL stays either
+    way: the read-only handle is a second connection to the same file, which is
+    what WAL is for here — not durability.
+    """
+    buffer = Buffer.open(
+        tmp_path / "scratch.db", SCHEMA, target_size=1 << 20, durable=False
+    )
+    try:
+        assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 0
+        assert buffer._con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        buffer.close()
+
+
+def test_a_config_written_without_a_setting_still_opens() -> None:
+    """Adding a setting must not make existing logs unopenable.
+
+    `LogConfig` is policy, not data: a record written before a setting existed
+    means the log was running that setting's default. Reading the record
+    positionally turned every new field into a breaking change to `open`, over
+    a value that was never load-bearing.
+    """
+    written = json.dumps({"target_seal_size": 4096, "compact_min_files": 2})
+
+    recovered = LogConfig.from_json(written)
+
+    assert recovered.target_seal_size == 4096
+    assert recovered.compact_min_files == 2
+    assert recovered.local_rows == LogConfig().local_rows
+    assert recovered.snapshot_retention == LogConfig().snapshot_retention
+
+
+def test_a_config_written_by_a_newer_version_still_opens() -> None:
+    """The same tolerance from the other side: an unknown setting is one this
+    version does not have, not a reason to refuse the log."""
+    written = json.dumps({"target_seal_size": 4096, "a_setting_from_the_future": 7})
+
+    assert LogConfig.from_json(written).target_seal_size == 4096
+
+
+def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:
+    """§3a: what a WAL-shipping sidecar has to replicate.
+
+    All three, and the set is the library's to know rather than an operator's
+    to guess. `buffer.db` holds rows no Parquet file has yet — the one everyone
+    remembers. `catalog.db` says which files the local table is made of.
+    `archive.db` says the same for the archive, so omitting it leaves the
+    objects in S3 intact with nothing able to say what they are.
+
+    The rewrite scratch is excluded: it is derived from the archive and deleted
+    at the end of the operation that creates it, so replicating it would ship a
+    temporary file to object storage to no purpose.
+    """
+    layout = Layout(tmp_path, "s")
+
+    assert set(layout.databases) == {
+        layout.buffer_db,
+        layout.catalog_db,
+        layout.archive_db,
+    }
+    assert layout.rewrite_db not in layout.databases
+    assert all(path.suffix == ".db" for path in layout.databases)
+
+
+def test_replication_config_names_every_database_and_the_wal_prefix(
+    tmp_path: Path,
+) -> None:
+    """§3a, derived rather than restated.
+
+    Everything in the config comes from the log: the file set, the destination
+    beside the archived data, and the endpoint from the credentials it was
+    opened with. A config written by hand knows what someone remembered.
+    """
+    s3 = S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1")
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True),
+        archive="s3://bucket/prefix",
+        s3=s3,
+    ) as log:
+        rendered = log.replication_config()
+
+        for database in log.databases:
+            assert f"path: {database}" in rendered
+            # Keyed by the LOG-RELATIVE path, not the bare filename: two logs
+            # under one root sharing an archive prefix would otherwise ship
+            # their distinct buffers to the same replica path, which is two
+            # sidecars writing one replica.
+            relative = database.relative_to(tmp_path).as_posix()
+            assert f"path: prefix/{WAL_PREFIX}/{relative}" in rendered
+
+        assert "bucket: bucket" in rendered
+        # A non-AWS endpoint needs both, and neither can be left to the
+        # environment: litestream resolves the region against real AWS
+        # otherwise, and `bucket.host` is a DNS name only AWS serves.
+        assert "endpoint: http://127.0.0.1:9000" in rendered
+        assert "force-path-style: true" in rendered
+        assert "secret" not in rendered.lower(), "credentials must stay in the env"
+
+
+def test_replication_needs_somewhere_to_ship_to(tmp_path: Path) -> None:
+    """WAL segments go beside the archived data, so a local-only log has
+    nowhere to put them — refused at construction rather than at the first
+    attempt to write a config nothing could act on."""
+    with pytest.raises(ValueError, match="wal_replication"):
+        validate(SCHEMA, (), LogConfig(wal_replication=True), None)
+
+
+def test_the_replication_config_is_written_beside_the_log(tmp_path: Path) -> None:
+    """Derived like every other path: a setting for it would be one more thing
+    to keep in step with the log it describes."""
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True),
+        archive="s3://bucket/prefix",
+    ) as log:
+        written = log.write_replication_config()
+
+        assert written == tmp_path / "litestream.yml"
+        assert written.read_text() == log.replication_config()
+
+
+def test_the_archive_read_falls_back_to_the_aws_credential_chain() -> None:
+    """The bug a local endpoint cannot catch.
+
+    On an ordinary AWS host the credentials are in a profile, in instance
+    metadata, or behind SSO — never in the arguments. pyiceberg and s3fs
+    resolve those themselves, so writes worked; DuckDB got a secret with no
+    keys, treated it as anonymous, and answered every `include_archive` read
+    with 403. Against rustfs it never appeared, because a local endpoint always
+    has explicit keys to pass.
+    """
+    rendered = secret_sql(S3Options(region="us-west-1"))
+
+    assert "PROVIDER credential_chain" in rendered
+    assert "KEY_ID" not in rendered
+    assert "REGION 'us-west-1'" in rendered
+
+
+def test_an_explicit_key_still_wins_over_the_chain() -> None:
+    """Which is what makes "test locally, then against AWS" a change of
+    environment rather than of code."""
+    rendered = secret_sql(
+        S3Options(
+            endpoint="http://127.0.0.1:9000",
+            access_key="litelink",
+            secret_key="litelink-secret",
+            region="us-east-1",
+        )
+    )
+
+    assert "PROVIDER credential_chain" not in rendered
+    assert "KEY_ID 'litelink'" in rendered
+    # A non-AWS endpoint needs path-style addressing and the scheme split off:
+    # DuckDB takes host:port with USE_SSL, where pyiceberg takes a URL.
+    assert "ENDPOINT '127.0.0.1:9000'" in rendered
+    assert "USE_SSL false" in rendered
+    assert "URL_STYLE 'path'" in rendered
+
+
+def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> None:
+    """Two buffers must never ship to one replica path.
+
+    `<root>/<log>/buffer.db` flattened to `buffer.db` would send both logs'
+    buffers to the same object, which is two litestream instances writing one
+    replica — the corruption litestream is explicit about — and a restore that
+    hands back the other log's WAL.
+    """
+    shared = "s3://bucket/prefix"
+    with (
+        Log.new(tmp_path, "one", schema=SCHEMA, archive=shared) as first,
+        Log.new(tmp_path, "two", schema=SCHEMA, archive=shared) as second,
+    ):
+        keys = {
+            line.split("path: ", 1)[1]
+            for rendered in (first.replication_config(), second.replication_config())
+            for line in rendered.splitlines()
+            if "        path: " in line
+        }
+        buffers = {key for key in keys if key.endswith("buffer.db")}
+
+        assert len(buffers) == 2, f"buffers must not collide: {buffers}"
+
+
+def test_compact_min_files_below_one_is_refused(tmp_path: Path) -> None:
+    """A knob that can stall the log for ever should not accept the value.
+
+    Below one, no run ever satisfies `compact_min_files`, so `stable_prefix`
+    returns zero permanently: sync pushes nothing, the watermark stands still,
+    eviction pins on it, and the local table grows without bound. Nothing
+    raises and nothing logs — the log simply stops making progress.
+    """
+    with pytest.raises(ValueError, match="compact_min_files must be at least 1"):
+        Log.new(
+            tmp_path,
+            "s",
+            schema=SCHEMA,
+            sort_by=("event_ts",),
+            config=LogConfig(compact_min_files=0),
+        )

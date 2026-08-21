@@ -60,6 +60,60 @@ class Layout:
         return f"file://{self.root}"
 
     @property
+    def rewrite_db(self) -> Path:
+        """Scratch buffer for an archive rewrite.
+
+        Its own file, alongside the real one rather than inside it: the rewrite
+        re-ingests archived rows through an ordinary `Buffer` to re-cut them,
+        and that buffer must not be the log's own — appends are still landing
+        there, and its offsets are the live ones.
+        """
+        return self.root / f"{self.name}-rewrite.db"
+
+    @property
+    def archive_db(self) -> Path:
+        """The archive catalog, kept beside the local one (§2).
+
+        A local SQLite file describing a warehouse on object storage. §2
+        replicates this file to S3 as well, so another machine can attach to
+        the archive without this one; that replication is not built yet.
+        """
+        return self.root / "archive.db"
+
+    @property
+    def archive_catalog_uri(self) -> str:
+        return f"sqlite:///{self.archive_db}"
+
+    def archive_key(self, rel_path: str) -> str:
+        """Where a local file lands in the archive prefix.
+
+        The same root-relative name under the archive's prefix, so a file's
+        identity is its offset range in both tiers and neither has to translate
+        the other's paths.
+        """
+        return rel_path
+
+    @property
+    def databases(self) -> tuple[Path, ...]:
+        """Every SQLite file a restore needs, in dependency order (§3a).
+
+        What a WAL-shipping sidecar has to replicate. All three, not just the
+        buffer: the buffer holds rows no Parquet file has yet, `catalog.db`
+        holds which files the local table is made of, and `archive.db` holds
+        the same for the archive — so without it the objects in S3 are there
+        and nothing knows what they are.
+
+        The rewrite scratch is excluded. It is derived from the archive and
+        deleted at the end of the operation that makes it, so replicating it
+        would ship a temporary file to object storage to no purpose.
+
+        Listed here rather than assembled by a caller, because which files
+        matter is exactly what this class knows and nothing else should have to
+        rediscover by listing a directory.
+        """
+        return (self.buffer_db, self.catalog_db, self.archive_db)
+
+    @property
     def table_id(self) -> str:
         return f"{NAMESPACE}.{self.name}"
 

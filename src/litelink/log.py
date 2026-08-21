@@ -10,12 +10,13 @@ applications that need a small binary column declare an ordinary `binary`
 column in their own schema, which §15.2 already says is the right route for
 payloads that fit comfortably in the buffer.
 
-`sync`, `hydrate` and schema evolution are not implemented; their signatures
-are the design, and they raise.
+Schema evolution is not implemented; the signatures are the design, and they
+raise.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -28,20 +29,29 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
 from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._lease import Lease, new_owner
-from litelink._maintenance import Maintenance
+from litelink._maintenance import (
+    Maintenance,
+    checkpoint,
+    stable_prefix,
+)
 from litelink._read import Reader, duckdb_connection
+from litelink._replication import litestream_config
+from litelink._s3 import S3Options
 from litelink._table import LogTable
 from litelink._types import validate_schema
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
     from os import PathLike
     from types import TracebackType
     from typing import Self
+
+    from litelink._table import DataFile
 
     Row = Mapping[str, object]
 
@@ -62,8 +72,21 @@ SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
 
 _CONFIG_KEY = "config"
-_ARCHIVE_KEY = "archive"
+# One home, in `_archive`, because `evict` reads it too.
+_ARCHIVE_KEY = ARCHIVE_KEY
 _SCHEMA_KEY = "arrow_schema"
+
+
+# How much larger a compacted file is than a sealed one, when nothing says.
+#
+# The two are at odds by nature: §7 wants the seal small because the buffer is
+# what a hot read scans, and both object storage and Parquet want files large.
+# Eight is chosen to be comfortably past the point where per-file overhead
+# dominates — measured at 44 ms to read the offset boundary over 64 files
+# against 1.0 ms over one — while keeping compaction's peak memory, which is
+# one run held as a single Arrow table, to something a maintainer process can
+# hold. On the default 8 MiB seal that is 64 MiB.
+COMPACT_MULTIPLE = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,13 +98,39 @@ class LogConfig:
     target hardware.
     """
 
-    # Seal at min(target_size, max_age). §7: this is a READ-LATENCY knob before
-    # it is a file-size knob — the buffer is the entire variable cost of a hot
-    # read, so seal small and often and let compaction produce the big files.
+    # The ONLY seal trigger, and therefore the size of every file this library
+    # writes. §7 makes it a READ-LATENCY knob before a file-size one: the
+    # buffer is the entire variable cost of a hot read.
+    #
+    # There is deliberately no `max_age` beside it. A timer sealing a quiet
+    # stream emits a small file every interval for ever — the layout §6 exists
+    # to repair — and it made the knob do double duty as an RPO policy, so
+    # shrinking the window to lose less on a crash produced worse files. §3a
+    # names that trade and WAL replication is what breaks it: freshness in the
+    # cloud is replication's job, not the seal's. With the timer gone every cut
+    # lands exactly here, so no undersized file is ever written.
     #
     # BYTES, not rows. §13.3 is the deciding argument: a row-count bound can
     # exceed a byte-based memory limit, so it loses the race to the OOM killer
     # in exactly the situation the bound exists to prevent.
+    #
+    # UNCOMPRESSED bytes, in memory — not the size of the file that results.
+    # Deliberate, and the one thing to understand before setting it. A file
+    # holding 8 MiB of rows lands at 8 MiB on disk if they are incompressible
+    # and under 1 MiB if they repeat, so on-disk size is an OUTPUT here, never
+    # the target. Sizing by it instead would be sizing by the compression
+    # ratio: rows per file would swing with the data, and what a reader pays to
+    # hold a file — which is the uncompressed size, whatever the file cost to
+    # store — would be unbounded. This way it is bounded by construction, and
+    # bounded per file is what lets a scan bound its total: N files open at
+    # once cost N times this, which is the number to divide a memory budget by
+    # when choosing read parallelism.
+    #
+    # So expect files smaller than this on disk, and set it larger than an
+    # on-disk file target would be. Everything downstream is stated in the same
+    # currency — compaction sizes a merge by what its inputs HOLD, carried in
+    # the `extent` row the seal measured it into, never by what they compressed
+    # to (see `_maintenance.runs`).
     #
     # The 8 MiB default is §7's row guidance restated — its table puts a 20k-row
     # buffer at 8.0 MB at the 400-byte row it measured, and 20k rows is the
@@ -92,11 +141,83 @@ class LogConfig:
     # stream of 40-byte rows reaches 8 MiB at 200k rows and a read-latency
     # ceiling meant to hold at 20k is breached tenfold. Bytes bound memory; rows
     # bound read latency; they are different failure modes. A narrow-row stream
-    # may eventually need `min(target_size, target_rows, max_age)` —
+    # may eventually need `min(target_size, target_rows)` —
     # deliberately not added now, on one knob until a real workload demands the
     # second.
-    target_size: int = 8 * 1024 * 1024
-    max_age: timedelta = timedelta(minutes=5)
+    target_seal_size: int = 8 * 1024 * 1024
+    # The second half of §7's argument, and the one `target_size` cannot make.
+    # Buffer cost is per ROW — SQLite is row-oriented, 1.0 us/row at 20k and
+    # 2.3 us/row at 180k — so a stream of 40-byte rows reaches 8 MiB at 200k
+    # rows and breaches a read-latency ceiling meant to hold at 20k, tenfold,
+    # while every byte-based check reports the buffer is fine.
+    #
+    # Bytes bound memory; rows bound read latency. Both are CEILINGS on one
+    # file, so the seal cuts at whichever is reached FIRST — the mirror of
+    # `local_retention` and `local_rows`, which are floors and take whichever
+    # retains more.
+    #
+    # None means no row limit, which is the right default: a narrow-row stream
+    # is the case that needs this and a library cannot guess the row width.
+    target_seal_rows: int | None = None
+
+    # §6. How big a file should END UP, which is not the same question as how
+    # much may sit in the buffer, and the two pull in opposite directions.
+    #
+    # §7 wants the seal SMALL: the buffer is what a hot read scans, so its size
+    # is read latency. The archive wants files LARGE: measured against S3, a
+    # 9 kB file takes 648 ms to upload and almost all of that is the round
+    # trip, so halving file size doubles the cost of archiving the same stream.
+    # One knob cannot serve both — it did, and compaction could therefore never
+    # produce a file bigger than a seal, which is why it was a no-op.
+    #
+    # Splitting them gives compaction a job: converting sealed chunks into
+    # archive-shaped ones. Eligibility follows for free — `sync` only takes
+    # files compaction has finished with, so raising this above the seal size
+    # means a freshly sealed file is a merge candidate and is not archived
+    # until it has been converted.
+    #
+    # The price is write amplification, and it is bounded rather than ongoing:
+    # every row is written twice locally, once at seal and once at compaction,
+    # and read once in between. Bounded because a converted file is already at
+    # the target, so it is never a candidate again — eight seals become one
+    # compacted file, once.
+    #
+    # None means `COMPACT_MULTIPLE` times the seal size, and the conversion is
+    # therefore ON by default even with no archive. A local-only log gets the
+    # same benefit at read time: file count is a measured cost here, not a
+    # reputation — reading the offset boundary from manifest statistics
+    # measured 1.0 ms over one file and 44 ms over 64.
+    #
+    # It is a MULTIPLE for a reason. Sealed files are uniform, so merging whole
+    # files lands exactly on the target when it divides and short when it does
+    # not: three 1 MiB files against a 4 MiB target give 3 MiB files for ever,
+    # 25% under what was asked for, with nothing to indicate why.
+    target_compact_size: int | None = None
+    target_compact_rows: int | None = None
+
+    @property
+    def compact_size(self) -> int:
+        """The file size compaction aims for.
+
+        `COMPACT_MULTIPLE` times the seal size unless set. On the 8 MiB default
+        seal that is 64 MiB of rows — under Parquet's usual advice once
+        compression is applied, and far above the size at which per-file
+        overhead dominates a scan.
+        """
+        return self.target_compact_size or self.target_seal_size * COMPACT_MULTIPLE
+
+    @property
+    def compact_rows(self) -> int | None:
+        """The row ceiling compaction respects. Scaled like `compact_size`, so
+        setting only the seal's row limit does not silently cap conversion at
+        one seal's worth."""
+        if self.target_compact_rows is not None:
+            return self.target_compact_rows
+
+        if self.target_seal_rows is None:
+            return None
+
+        return self.target_seal_rows * COMPACT_MULTIPLE
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
@@ -106,17 +227,58 @@ class LogConfig:
     # soon as it sealed, so the pair is rejected at construction rather than
     # honoured.
     local_retention: timedelta | None = None
+    # §8, the other half of the same policy. A window in time and a count of
+    # rows bound different things, and which one binds depends on a rate the
+    # library cannot know: an hour of a quiet stream is a handful of rows, and
+    # an hour of a busy one is more local disk than the machine has. Set both
+    # and eviction keeps whichever retains MORE — they are floors on what must
+    # stay readable without touching the network, so the binding one is the one
+    # that keeps more.
+    #
+    # The mirror image of the seal's `min(target_size, target_rows)` in §12,
+    # deliberately: there the two are ceilings and the tighter wins, here they
+    # are floors and the looser does.
+    #
+    # Rows, not files, because it is a statement about the data — "the last
+    # million entries stay local" survives a change to `target_size`, and "the
+    # last ten files" does not.
+    #
+    # FOLLOW-UP: no third floor in BYTES, and deliberately. These two answer
+    # "what can I query without touching the network", which is how queries are
+    # written — the last hour, the last million rows. "The last 10 GB" is not a
+    # statement any query makes, and rows already stand in for bytes since
+    # bytes are roughly rows times width.
+    #
+    # What is genuinely missing is the opposite: nothing bounds local disk from
+    # ABOVE, so with both of these unset it grows without limit. That wants a
+    # CAP rather than a floor, and it composes the other way — `max` after the
+    # `min` below, because a cap evicts MORE and can therefore violate both
+    # floors. It would measure on-disk size (`DataFile.size`), one of the few
+    # places where that is the right unit. And it could not be honoured at all
+    # while sync is behind, since I4 forbids evicting what the archive lacks —
+    # a log breaching its floors to stay under a cap is misconfigured and
+    # should say so rather than quietly serving every read from object storage.
+    local_rows: int | None = None
+
+    # §3a. Continuous WAL shipping, which is the ONLY thing bounding RPO now
+    # that the seal has no timer: a stream that goes quiet holds its last
+    # partial file's worth of rows indefinitely.
+    #
+    # A declaration rather than a supervisor. It is read — `write_replication_
+    # config` needs it, and validation refuses it without an archive to
+    # replicate to — but litelink never starts the sidecar. That is a separate
+    # process reading the WAL, which is exactly why replication does not put
+    # the network in the write path, and litestream is explicit that two
+    # instances must never replicate one database. Supervising it belongs in
+    # deployment code, where it is visible: see `examples/maintainer.py`.
+    wal_replication: bool = False
     # §6/§8. Must exceed the longest scan: expiry deletes files an open scan is
     # still reading (I6).
     snapshot_retention: timedelta = timedelta(hours=1)
 
-    # §6. compact_below defaults to half of target_size when None.
-    compact_below: int | None = None
+    # §6. What counts as "big enough to leave alone" is `settled_size` of the
+    # target, not its own setting — see `_maintenance.settled_size`.
     compact_min_files: int = 4
-
-    # §3a. Continuous SQLite WAL shipping. Off by default; decouples RPO from
-    # max_age at the cost of a sidecar.
-    wal_replication: bool = False
 
     def to_json(self) -> str:
         """Serialised for the `meta` table, so `open` recovers the policy.
@@ -127,34 +289,80 @@ class LogConfig:
         """
         return json.dumps(
             {
-                "target_size": self.target_size,
-                "max_age": self.max_age.total_seconds(),
+                "target_seal_size": self.target_seal_size,
+                "target_compact_size": self.target_compact_size,
+                "target_seal_rows": self.target_seal_rows,
+                "target_compact_rows": self.target_compact_rows,
                 "local_retention": (
                     None
                     if self.local_retention is None
                     else self.local_retention.total_seconds()
                 ),
-                "snapshot_retention": self.snapshot_retention.total_seconds(),
-                "compact_below": self.compact_below,
-                "compact_min_files": self.compact_min_files,
+                "local_rows": self.local_rows,
                 "wal_replication": self.wal_replication,
+                "snapshot_retention": self.snapshot_retention.total_seconds(),
+                "compact_min_files": self.compact_min_files,
             }
         )
 
     @classmethod
     def from_json(cls, encoded: str) -> LogConfig:
+        """Recover the policy, tolerating a record written by another version.
+
+        Every field falls back to its default when absent, because that is what
+        an older record MEANS: the log was written before the setting existed,
+        so it was running the default. Reading them positionally instead made
+        adding any setting break `open` on every existing log — a config that
+        cannot be read is a log that cannot be opened, over a policy value that
+        was never load-bearing.
+
+        Unknown keys are ignored for the same reason from the other direction:
+        a log touched by a newer version stays openable by an older one, minus
+        the setting it does not have.
+        """
         raw = json.loads(encoded)
-        retention = raw["local_retention"]
+        defaults = cls()
+        retention = raw.get("local_retention", defaults.local_retention)
+        snapshots = raw.get("snapshot_retention")
 
         return cls(
-            target_size=raw["target_size"],
-            max_age=timedelta(seconds=raw["max_age"]),
-            local_retention=None if retention is None else timedelta(seconds=retention),
-            snapshot_retention=timedelta(seconds=raw["snapshot_retention"]),
-            compact_below=raw["compact_below"],
-            compact_min_files=raw["compact_min_files"],
-            wal_replication=raw["wal_replication"],
+            target_seal_size=raw.get("target_seal_size", defaults.target_seal_size),
+            target_compact_size=raw.get(
+                "target_compact_size", defaults.target_compact_size
+            ),
+            target_seal_rows=raw.get("target_seal_rows", defaults.target_seal_rows),
+            target_compact_rows=raw.get(
+                "target_compact_rows", defaults.target_compact_rows
+            ),
+            local_retention=(
+                retention
+                if isinstance(retention, timedelta) or retention is None
+                else timedelta(seconds=retention)
+            ),
+            local_rows=raw.get("local_rows", defaults.local_rows),
+            wal_replication=raw.get("wal_replication", defaults.wal_replication),
+            snapshot_retention=(
+                defaults.snapshot_retention
+                if snapshots is None
+                else timedelta(seconds=snapshots)
+            ),
+            compact_min_files=raw.get("compact_min_files", defaults.compact_min_files),
         )
+
+
+def _repointed_mid_push() -> RuntimeError:
+    """The log was pointed at another archive while a sync was pushing.
+
+    A push can outlive its lease — a register alone measured 4.1 s against S3,
+    and retries compound it — so the re-point that races it took the lease
+    lawfully. Nothing here is corrupt; the watermark this push earned simply
+    describes an archive the log has left, and recording it would tell eviction
+    (I4) that the new archive holds rows it has never been sent.
+    """
+    return RuntimeError(
+        "the archive was re-pointed while this sync was pushing; its watermark "
+        "belongs to the previous archive and is not recorded"
+    )
 
 
 class Log:
@@ -184,7 +392,7 @@ class Log:
         schema: pa.Schema,
         sort_by: tuple[str, ...],
         config: LogConfig,
-        archive: str | None = None,
+        archive: Archive,
         readonly: bool = False,
     ) -> None:
         self.name = layout.name
@@ -197,6 +405,12 @@ class Log:
         self._buffer = buffer
         self._schema = schema
         self._sort_by = sort_by
+        # The same object the reader and the maintainer were handed. See
+        # `_archive.Archive`: it owns the URI, the credentials and the lazily
+        # opened handle, so `set_archive` re-points all three at once instead
+        # of fanning out to each. Required rather than defaulted, because a
+        # collaborator this constructor builds for itself is one no caller can
+        # substitute — the reason `new` and `open` build every other one.
         self._archive = archive
         self._reader = reader
         self._maintenance = maintenance
@@ -236,9 +450,10 @@ class Log:
         name: str,
         *,
         schema: pa.Schema,
-        sort_by: Sequence[str],
+        sort_by: Sequence[str] | None = None,
         config: LogConfig | None = None,
         archive: str | None = None,
+        s3: S3Options | None = None,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
 
@@ -260,16 +475,34 @@ class Log:
         exactly: `string` is stored and returned as `large_string`, and types
         Iceberg would narrow silently are refused instead (see `_types`).
 
-        `sort_by` is required on purpose. §7 measures it as a read-shape
-        decision, not a tuning knob: it declares which predicates prune, only a
-        LEADING column prunes, and changing it later rewrites every file — see
-        `set_sort_by`. A capture workload usually wants `("event_ts", "key")`.
+        **`sort_by` defaults to offset order, and most logs should leave it
+        there.** §7 measures it as a read-shape decision rather than a tuning
+        knob: it declares which predicates prune, only a LEADING column prunes,
+        and changing it later rewrites every file (see `set_sort_by`).
+
+        The default is not a fallback — it is the order the rows are already
+        in, so it costs strictly less than any sort key. No sort runs at seal
+        time, and each file's offset range is contiguous and exact, which is
+        the tightest file-level statistic the table can carry.
+
+        Set it only for a column highly correlated with the offset, which for a
+        capture stream means an arrival timestamp. An UNCORRELATED key is worse
+        than it looks, and in two ways that no benchmark of the seal will show.
+        Files always hold contiguous offset ranges, so if the sort column is
+        scattered across them, every file's min/max on it spans nearly the whole
+        domain and file-level pruning does nothing — only row-group skipping
+        inside each file survives. And rows within a file end up in a random
+        permutation of offset order, so replay from an offset stops being
+        sequential and needs a sort after reading. For a log, replay is the
+        primary access pattern, which makes that the expensive half.
 
         `archive` is the remote warehouse prefix (e.g. `s3://bucket/prefix`).
         None means local-only: capture, seal, compaction, retention and reads
         all work with no network, forever (§11).
         """
-        order = tuple(sort_by)
+        # `None` and `()` mean the same thing — offset order — so nothing
+        # downstream has to distinguish "unset" from "explicitly unsorted".
+        order = tuple(sort_by or ())
         settings = config or LogConfig()
         validate(schema, order, settings, archive)
 
@@ -280,7 +513,12 @@ class Log:
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
-        buffer = Buffer.open(layout.buffer_db, schema, target_size=settings.target_size)
+        buffer = Buffer.open(
+            layout.buffer_db,
+            schema,
+            target_size=settings.target_seal_size,
+            target_rows=settings.target_seal_rows,
+        )
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
         # cast to. It is kept here because Iceberg cannot represent it: one
@@ -291,18 +529,27 @@ class Log:
         if archive is not None:
             buffer.set_meta(_ARCHIVE_KEY, archive)
 
+        # Built here and handed to all three, so each is given its archive at
+        # construction rather than having one pushed into it afterwards.
+        remote = Archive(layout, archive, s3, table_schema(schema))
+
         return cls(
             layout=layout,
             table=table,
             buffer=buffer,
             reader=Reader(
-                layout, table, buffer, table_schema(schema), duckdb_connection
+                layout,
+                table,
+                buffer,
+                table_schema(schema),
+                duckdb_connection,
+                archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, settings, order),
+            maintenance=Maintenance(table, buffer, layout, settings, order, remote),
             schema=schema,
             sort_by=order,
             config=settings,
-            archive=archive,
+            archive=remote,
         )
 
     @classmethod
@@ -312,6 +559,7 @@ class Log:
         name: str,
         *,
         read_only: bool = False,
+        s3: S3Options | None = None,
     ) -> Self:
         """Open an existing log, and recover it.
 
@@ -352,25 +600,33 @@ class Log:
         buffer = Buffer.open(
             layout.buffer_db,
             schema,
-            target_size=config.target_size,
+            target_size=config.target_seal_size,
+            target_rows=config.target_seal_rows,
             readonly=read_only,
         )
         sort_by = table.sort_by()
+        # `or None`: detaching stores an empty string rather than deleting the
+        # row, and an empty archive is no archive. Read once here because both
+        # the Log and its maintainer need it.
+        archive = buffer.get_meta(_ARCHIVE_KEY) or None
+        remote = Archive(layout, archive, s3, table_schema(schema))
         log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
             reader=Reader(
-                layout, table, buffer, table_schema(schema), duckdb_connection
+                layout,
+                table,
+                buffer,
+                table_schema(schema),
+                duckdb_connection,
+                archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, config, sort_by),
+            maintenance=Maintenance(table, buffer, layout, config, sort_by, remote),
             schema=schema,
             sort_by=sort_by,
             config=config,
-            # `or None`: detaching stores an empty string rather than deleting
-            # the row, and an empty archive is no archive. Without this it reads
-            # back truthy enough to make maintain() refuse to run.
-            archive=buffer.get_meta(_ARCHIVE_KEY) or None,
+            archive=remote,
             readonly=read_only,
         )
         if not read_only:
@@ -389,22 +645,182 @@ class Log:
         """
         with self._lock:
             self._writable()
-            validate(self._schema, self._sort_by, config, self._archive)
+            validate(self._schema, self._sort_by, config, self._archive.uri)
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
             self.config = config
             self._maintenance.set_config(config)
             # The buffer too, or `target_size` changes everywhere except where
             # the cut is actually made and the log quietly keeps sizing files
             # to the value it was opened with.
-            self._buffer.set_target_size(config.target_size)
+            self._buffer.set_target_size(
+                config.target_seal_size, config.target_seal_rows
+            )
+
+    def archived_through(self) -> int:
+        """Highest offset the archive holds, 0 if none (§5, I4).
+
+        Eviction never goes above it, so the lag between this and `end_offset`
+        is what an operator watches: a stalled sync shows up first as local
+        disk that stops being reclaimed.
+        """
+        return self._maintenance.archived_through()
+
+    @property
+    def databases(self) -> tuple[Path, ...]:
+        """The SQLite files a restore needs (§3a).
+
+        For a WAL-shipping sidecar to replicate. Public because deciding to run
+        one is a deployment choice, but knowing WHICH files carry the log's
+        state is not — it is this library's, and a sidecar configured by hand
+        against a guess is one that silently omits `archive.db` and leaves the
+        objects in S3 with nothing to say what they are.
+
+        litelink does not run the sidecar. It is a separate process reading the
+        WAL, which is exactly why it does not put the network in the write path
+        (§3a); a library that supervised it would.
+        """
+        return self._layout.databases
+
+    def archive_files(self) -> int:
+        """How many data files the archive holds, or 0 with no archive.
+
+        A network round trip, unlike `table_files()`: it reloads the remote
+        table to answer. Paired with `table_files()` it is the two halves of
+        where the data is — local disk and object storage — which is otherwise
+        only visible as a watermark in offsets.
+        """
+        archive = self._archive.table()
+        if archive is None:
+            return 0
+
+        archive.reload()
+
+        return len(archive.data_files())
+
+    def replication_config(self) -> str:
+        """A litestream config for this log (§3a).
+
+        Derived, not configured: the file set is `databases`, the destination
+        is `_wal` beside the archived data, and the endpoint comes from the
+        credentials this log was opened with. Everything a hand-written config
+        would have to restate, and each of those a way to get it silently
+        wrong.
+        """
+        if self._archive.uri is None:
+            msg = "replication needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        return litestream_config(
+            self.databases, self._layout.root, self._archive.uri, self._archive.s3
+        )
+
+    def write_replication_config(self) -> Path:
+        """Write that config next to the log, and return where.
+
+        Beside the data rather than at a configured path, for the same reason
+        every other path is derived: a setting for it would be one more thing
+        to keep in step with the log it describes.
+        """
+        destination = self._layout.root / "litestream.yml"
+        destination.write_text(self.replication_config())
+
+        return destination
+
+    @property
+    def archive(self) -> str | None:
+        """Where the archive is, or None for a local-only log.
+
+        The question a maintenance loop has to answer before calling `sync`,
+        and one only the log can: the archive is recovered from `meta` on
+        `open`, so a caller that restated it could disagree with the log.
+        """
+        return self._archive.uri
 
     def set_archive(self, archive: str | None) -> None:
-        """Point the log at an archive, or detach it (§5)."""
+        """Point the log at an archive, or detach it (§5).
+
+        Takes the maintenance lease, so it cannot interleave with a `sync` —
+        and raises if another owner holds it, rather than proceeding.
+
+        A sync that has already read `s3://old`, taken the lease and pushed to
+        it finishes by writing that archive's extent as the watermark. Land a
+        re-point in between and the log points at the new, empty archive while
+        carrying a watermark earned by the old one — eviction believes it and
+        deletes the only local copy of rows the new archive has never been
+        sent. Nothing lowers a watermark, so no later sync undoes it.
+
+        The shipped writer calls this on every restart, and the maintainer runs
+        in another process, so the two are exactly the pair that collide.
+        """
         with self._lock:
             self._writable()
             validate(self._schema, self._sort_by, self.config, archive)
-            self._buffer.set_meta(_ARCHIVE_KEY, archive or "")
-            self._archive = archive or None
+            # Before the first durable write, so a refusal changes nothing.
+            lease = self._lease(MAINTAIN_ROLE)
+            if not lease.acquire():
+                msg = (
+                    "another owner holds the maintenance lease; a sync may be "
+                    "pushing to the current archive. Retry."
+                )
+                raise RuntimeError(msg)
+
+            # Every write inside, so a failure — a full disk, a busy database —
+            # releases the lease instead of stranding it for its whole TTL.
+            try:
+                self._repoint(archive)
+            finally:
+                lease.release()
+
+    def _repoint(self, archive: str | None) -> None:
+        """Record the new location, with the maintenance lease held."""
+        # Normalised before anything compares it. Every path builder strips
+        # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same archive
+        # everywhere except here — where the difference would read as a move
+        # and reset the watermarks of an archive that genuinely holds data.
+        normalised = (archive or "").rstrip("/") or None
+        # ONE transaction, because the three facts are only true together.
+        #
+        # Where the archive is, and the two watermarks describing what the
+        # PREVIOUS one held: the confirmed one eviction acts on, and the
+        # frontier compaction reads to decide which files are already the
+        # archive's business. As separate writes a crash lands between them,
+        # and BOTH orders have cost a defect — watermark last leaves the new
+        # archive carrying the old one's promise, which eviction believes;
+        # watermark first leaves the old archive with a frontier of zero, and
+        # compaction does not wait for a sync the way eviction does, so it
+        # merges across a boundary the archive already holds. There is no
+        # ordering that is safe, so there is no ordering.
+        # Whether this is a move is decided against the DURABLE location, in
+        # the transaction that acts on the decision. This object's memory of
+        # where the archive is goes stale the moment another process re-points
+        # it, and nothing but a sync refreshes it — so a maintainer re-asserting
+        # the archive it already has would read its own staleness as a move and
+        # zero the watermarks of a bucket that holds the data.
+        self._buffer.set_meta_moved(
+            _ARCHIVE_KEY,
+            normalised or "",
+            {Maintenance.ARCHIVED_KEY: "0", Maintenance.PENDING_KEY: "0"},
+        )
+
+        # Reaches the maintainer and the reader because all three hold this
+        # object. `evict` asks it whether I4 is owed anything, and a setting
+        # that stopped at `Log` would leave the maintainer deleting the only
+        # copy of rows an archive was just configured to receive.
+        self._archive.set_uri(normalised)
+
+        # Repaired here as well as at open, and the difference is who waits.
+        # The catalog entry still names the previous archive until something
+        # replaces it, and only a lease holder may — so without this, ordinary
+        # re-pointing left every `include_archive` read raising until a
+        # maintenance pass happened to run.
+        #
+        # Best effort: the archive may not be reachable at all, and
+        # configuring one is a statement of intent, not a claim that the bucket
+        # exists yet. `sync` raises loudly the moment the location is used, and
+        # the check at open heals what this misses.
+        if self._archive.configured():
+            with contextlib.suppress(Exception):
+                self._archive.table(repair=True)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.
@@ -422,7 +838,7 @@ class Log:
         with self._lock:
             self._writable()
             requested = tuple(sort_by)
-            validate(self._schema, requested, self.config, self._archive)
+            validate(self._schema, requested, self.config, self._archive.uri)
             if requested == self._sort_by:
                 return
 
@@ -490,7 +906,7 @@ class Log:
 
         # No lock. `Buffer` serialises its own connection, which is the only
         # thing two appending threads share — and the append decides nothing
-        # beyond the cut it records (see `seal_group`). It does not measure,
+        # beyond the cut it records (see `extent`). It does not measure,
         # compare, signal, or start anything: a maintainer calls `seal_due` and
         # finds the work waiting, exactly as it calls `maintain` and finds
         # files to compact.
@@ -549,14 +965,10 @@ class Log:
         The escape hatch for what `scan` cannot express. Quote `"litelink_offset"` — it
         is a DuckDB reserved word.
         """
-        if include_archive:
-            msg = "archive reads are not implemented"
-            raise NotImplementedError(msg)
-
         # No lock here. `Reader` guards its own connection and `LogTable` its
         # own cache, both briefly — whereas this used to be the SAME lock a
         # whole maintenance pass held, so a read waited out a compaction.
-        return self._reader.query(query)
+        return self._reader.query(query, include_archive=include_archive)
 
     def end_offset(self) -> int:
         """The offset the next append will receive — an EXCLUSIVE upper bound.
@@ -847,7 +1259,15 @@ class Log:
         # `end` passed so the commit can decline if the range is already in
         # the table. The lease check above is the fence; this is what makes a
         # failure of that fence harmless rather than a duplicate.
-        if not self._table.register(str(dest), sealed_through=end):
+        if not self._table.register(
+            [str(dest)],
+            sealed_through=end,
+            # The archive too. An empty local table covers nothing, so after a
+            # stalled writer's range has been sealed, archived and evicted, the
+            # local check alone would let it re-register a file the log has
+            # already moved past.
+            archived_through=self._maintenance.archived_through(),
+        ):
             # Declined: another owner already sealed this range, so this file
             # is redundant and will never be referenced. Queue it, or it joins
             # the one category this design has no way to find — a file on disk
@@ -867,19 +1287,15 @@ class Log:
         can be run often; `maintain` reads table metadata and wants to be run
         rarely. That difference is the only reason they are two methods.
 
-        "Due" is §4's two triggers. `target_size` needs nothing here: the cut
-        was recorded by the append that crossed it, and this drains it. Age is
-        the other, and it has to be evaluated by whoever is sealing, because a
-        stream quiet enough to need it is by definition not appending.
+        "Due" means cut. `target_size` is the only trigger and it needs nothing
+        here: the cut was recorded by the append that crossed it, and this
+        writes the file. There is no age branch, so a quiet stream is simply
+        one whose rows stay in the buffer — durable, readable, and replicated
+        by §3a — until enough of them arrive to fill a file.
 
         A group whose lease is held elsewhere is left alone, not waited for.
         """
         self._writable()
-        # Before draining, not after: a quiet stream has no closed group at
-        # all, and this is the only thing that gives it one.
-        self._buffer.close_open_group(
-            int((datetime.now(UTC) - self.config.max_age).timestamp())
-        )
 
         end = None
         # Peeked before `_seal_queued` takes the lock, because almost every
@@ -965,33 +1381,69 @@ class Log:
         committed — so the table is already correct and the next `maintain()`
         will pick the same run up again. All that is owed is the half-written
         output, and `compacting` names it, so removing it costs one unlink
-        rather than a directory scan.
+        rather than a directory scan — or, for an archive rewrite, one DELETE
+        rather than a paginated LIST over object storage.
         """
         pending = self._buffer.pending_compaction()
         if pending is None:
             return
 
-        # Reloaded for the same reason `_recover_seal` is, and the consequence
-        # here is worse: this UNLINKS. A handle that predates another process's
-        # commit reports the output missing, and removing a file the table now
-        # references loses the rows outright — the sources it superseded are
-        # already out of the snapshot and queued for deletion.
-        self._table.reload()
+        # No reload. This used to decide from `file_paths()` and unlink, so it
+        # needed the freshest possible view — and still raced. It queues now,
+        # and the decision that matters is `drain`'s, which reloads at the
+        # moment it removes.
 
-        _, _, rel_path = pending
-        if str(self._layout.absolute(rel_path)) not in self._table.file_paths():
-            self._layout.absolute(rel_path).unlink(missing_ok=True)
+        # EVERY claim, not the first. An archive rewrite writes one file per
+        # re-cut segment and claims each before it exists (I2), so taking one
+        # row and then clearing the table left the rest as objects in a bucket
+        # that nothing references and only a paginated LIST could find — the
+        # one thing this design refuses to need.
+        # QUEUED, not unlinked. The check and the removal are two moments, and
+        # the owner this is recovering from may not be dead — a maintainer
+        # stalled past its lease can wake between them and commit the very file
+        # about to be deleted, taking the whole range with it, because its
+        # sources were queued before that commit and drain away behind it.
+        #
+        # The seal path never had this exposure: an abandoned seal goes through
+        # `pending_delete`, whose drain re-reads `referenced_paths` at unlink
+        # time and refuses anything the table has since adopted. Recovery now
+        # uses the same route, so the last word belongs to a check made when
+        # the file is actually removed.
+        claimed = self._buffer.pending_outputs()
+        self._maintenance.enqueue_recovered(key for _, _, key in claimed)
 
-        self._buffer.clear_compaction()
+        # The scratch database an interrupted rewrite left behind. It is
+        # rebuilt from the archive next time, so nothing in it is owed.
+        self._layout.rewrite_db.unlink(missing_ok=True)
+        # Only the rows just read. A rewrite whose lease lapsed mid-upload can
+        # be claiming its next segment while this runs, and clearing the table
+        # wholesale takes that claim with it — leaving an object in the bucket
+        # named by nothing, which is the state claims exist to prevent.
+        for _, _, key in claimed:
+            self._buffer.clear_compaction(key)
 
     # -- maintenance -------------------------------------------------------
 
     def sync(self) -> None:
-        """Push to the archive: upload, register, replicate compactions (§5).
+        """Push to the archive: upload, register, record the watermark (§5).
 
         Archive-facing work only. Lazy, restartable, and arbitrarily far
-        behind — no read depends on it. Raises if no archive is configured; with
-        `archive=None` there is nothing this could do.
+        behind — no read depends on it. Raises if no archive is configured;
+        with `archive=None` there is nothing this could do.
+
+        **Only files at or above the compaction threshold are pushed**, and
+        that one rule does three jobs. The archive never receives an undersized
+        file, so nothing ever has to merge one back out of object storage —
+        which would mean paying egress to fix a sizing decision made locally.
+        Such a file is also never a compaction input (`compact` only builds
+        runs from files BELOW the threshold), so nothing merges across what the
+        archive already holds, and no push can duplicate or strand a range.
+        And the undersized frontier stays local, bounded by roughly
+        `compact_min_files` files, until compaction grows it past the line.
+
+        There is therefore at most one undersized region in the system and it
+        is always the local one. The archive is well-sized by construction
+        rather than by a pass that repairs it afterwards.
 
         DEVIATES from §5, which also lists snapshot expiry (step 4) and local
         eviction (step 5). Both are local storage work and belong to `maintain`;
@@ -1000,10 +1452,208 @@ class Log:
         skipped. Sync's remaining obligation to eviction is the registration
         watermark it records in `meta`, which is what lets `maintain` enforce I4.
         """
-        raise NotImplementedError
+        self._writable()
+        if not self._archive.configured():
+            msg = "sync() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        # Re-read where the archive IS before pushing to it. `set_archive` is
+        # a durable change made by whichever process runs it, and every other
+        # process cached the old value when it opened — so a maintainer started
+        # before a re-point would go on pushing to the retired archive and,
+        # worse, reconcile the watermark from ITS extent. Eviction trusts that
+        # watermark and deletes local files the new archive has never been
+        # sent: the rows survive only in the bucket the re-point was retiring.
+        #
+        # One keyed read per sync, against a change that is rare and durable.
+        # `set_uri` is a no-op when nothing moved.
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            # UNDER the lease, not before it. Read first, the location can be
+            # re-pointed between the read and the acquire — `set_archive` takes
+            # the same lease, so it is free until this line — and the push then
+            # runs against the old archive while the log durably points at the
+            # new one. `_push` would reconcile the old archive's extent into
+            # the watermark with no network call at all, and eviction believes
+            # a watermark whatever earned it.
+            self._archive.set_uri(self._buffer.get_meta(_ARCHIVE_KEY) or None)
+            if not self._archive.configured():
+                msg = "sync() needs an archive; this log is local-only"
+                raise ValueError(msg)
+
+            # PINNED here, and every fence downstream compares against this
+            # string rather than re-reading the object. `Archive` is shared by
+            # the log, the reader and the maintainer precisely so a re-point
+            # reaches all three — which means a `set_archive` on another thread
+            # moves the value a fence was going to compare AGAINST, and both
+            # sides of the comparison change together. The fence passes, and
+            # the watermark this push earned is recorded against an archive
+            # that never received it.
+            self._push(lease, self._archive.uri)
+        finally:
+            lease.release()
+
+    def _push(self, lease: Lease, pinned: str | None) -> None:
+        """Upload and register everything above the archive's extent.
+
+        Everything compaction has finished with, which `stable_prefix` decides
+        from compaction's own rule rather than from a size of its own. A file
+        pushed and then merged locally would leave the archive holding rows
+        that have been rewritten underneath it, so the two must agree on which
+        files are still in play, and the only way to guarantee that is to ask
+        the same function.
+
+        The archive may still gain a small file: one stranded between larger
+        neighbours can never be merged, so holding it back would block the
+        watermark forever rather than improve anything. That is a cosmetic cost
+        with a deliberate cause, and `rewrite_archive` is the tool for it.
+        """
+        archive = self._archive.require()
+        self._table.reload()
+        # The ARCHIVE reloaded too, and for a stronger reason than the local
+        # table. A pyiceberg handle is a frozen snapshot view, and `Archive`
+        # caches it for the life of the process — so a second maintainer that
+        # synced, released the lease and took it back reads the extent as it
+        # was before the OTHER maintainer's register. Every other reader of
+        # this extent already reloads; this is the one place that turns it into
+        # a durable watermark, and a stale answer here retires the frontier
+        # against an archive that has since grown past it.
+        archive.reload()
+
+        covered = archive.extent()
+        floor = 0 if covered is None else covered[1]
+        # Both watermarks reconciled against the archive itself, in ONE
+        # transaction, before anything is pushed.
+        #
+        # The confirmed one is a cache of what the archive holds, so a commit
+        # that landed while the `meta` write after it did not would leave it
+        # behind for ever: the next pass computes `floor` from the archive,
+        # finds nothing left to push, and never revisits the number eviction
+        # depends on.
+        #
+        # The frontier is RESOLVED rather than advanced, whichever way it went.
+        # It stands in for a question — did the register land? — that the
+        # extent has just answered: reached, and it did; not reached, and it
+        # never did. Either way the guess must go, and clearing it here is what
+        # keeps it from deadlocking. Nothing but the NEXT successful push ever
+        # overwrote it, and it blocks compaction — so a register that failed
+        # where `stable_prefix` needed that very merge before anything could
+        # settle left sync waiting on a compaction the frontier forbade, while
+        # being the only thing that would clear it. Both passes returned
+        # success, for ever.
+        #
+        # One transaction because clearing the frontier is only safe once the
+        # confirmed watermark has caught up to the extent: separately, a crash
+        # between them leaves neither guarding the range, and compaction merges
+        # across a boundary the archive already holds.
+        # Compared and written in one transaction, not read and then written.
+        # Reconciling against an archive the log has been pointed away from is
+        # the loss this whole path is here to prevent, and a guard that reads
+        # first only reports where the archive was.
+        confirmed = max(self._maintenance.archived_through(), floor)
+        self._buffer.set_meta_if(
+            _ARCHIVE_KEY,
+            pinned,
+            {
+                Maintenance.ARCHIVED_KEY: str(confirmed),
+                Maintenance.PENDING_KEY: "0",
+            },
+        )
+
+        memory = self._maintenance.memory()
+        pending = [f for f in self._table.data_files() if f.hi > floor]
+        settled = stable_prefix(
+            pending,
+            self.config.compact_size,
+            self.config.compact_min_files,
+            memory,
+            self.config.compact_rows,
+        )
+
+        uploaded: list[tuple[DataFile, str]] = []
+        for data_file in pending[:settled]:
+            checkpoint(lease.renew)
+            rel_path = self._layout.relative(data_file.path)
+            archive.put(self._layout.absolute(rel_path), rel_path)
+            uploaded.append((data_file, rel_path))
+
+        if not uploaded:
+            return
+
+        # ONE commit for everything uploaded, because the commit is what costs.
+        # Measured against S3: 648 ms to upload a file and 4.1 s to register
+        # it, and registering does not get cheaper for holding one file instead
+        # of twenty — it reads a footer, writes a manifest, a manifest list and
+        # a fresh metadata.json whatever the count. Per file, that made `sync`
+        # take 83 s over sixteen files while the sealer sharing its thread
+        # waited, and the buffer grew for the whole of it.
+        checkpoint(lease.renew)
+        last = uploaded[-1][0]
+        # Recorded BEFORE the register, and never read by eviction. It is what
+        # lets compaction know, after a crash between the register and its
+        # confirming write, that these offsets may already be in the archive
+        # and must not be merged into a file that straddles its extent.
+        if not self._buffer.set_meta_if(
+            _ARCHIVE_KEY, pinned, {Maintenance.PENDING_KEY: str(last.hi)}
+        ):
+            # Declined, so the register does not happen either. The upload
+            # already spent longer than a lease TTL against S3 more than once,
+            # which is how the log gets re-pointed underneath a push — and
+            # registering into the archive it was pointed AWAY from writes the
+            # log's rows somewhere nothing will look for them again.
+            raise _repointed_mid_push()
+
+        if not archive.register(
+            [archive.uri(rel_path) for _, rel_path in uploaded],
+            sealed_through=last.hi + 1,
+        ):
+            return
+
+        for data_file, rel_path in uploaded:
+            # The archive's copy holds what the local one did, and this is the
+            # only moment both names are known. Nothing could re-derive it
+            # afterwards: the local entry goes when the local file is unlinked,
+            # and a Parquet footer records what the rows compressed from, not
+            # what the appender counted them as.
+            held = memory.get(data_file.path)
+            if held is not None:
+                # Same extent, second location. `end_offset` is exclusive, as
+                # it is on every other extent — the cut is recorded as the
+                # offset AFTER the last row.
+                self._buffer.record_file(
+                    archive.uri(rel_path), data_file.lo, data_file.hi + 1, held
+                )
+
+        # After the register, never before: the watermark is a promise that the
+        # archive HAS the range, and I4 lets `maintain` delete the local copy on
+        # the strength of it.
+        #
+        # And only if it is still a promise about the SAME archive. This push
+        # can outlive its lease — a register alone measured 4.1 s and retries
+        # compound it — and a re-point that takes the lease meanwhile leaves
+        # this about to record an extent earned by a bucket the log has left.
+        # Re-read rather than trusted, because nothing lowers a watermark
+        # afterwards.
+        # Re-read rather than trusted, and in the same transaction as the
+        # write: nothing lowers a watermark afterwards, so recording one earned
+        # by a bucket the log has left is not a mistake anything corrects.
+        if not self._buffer.set_meta_if(
+            _ARCHIVE_KEY, pinned, {Maintenance.ARCHIVED_KEY: str(last.hi)}
+        ):
+            raise _repointed_mid_push()
 
     def maintain(self) -> None:
         """Reclaim local storage: compact, evict, expire (§6, §8, §12).
+
+        The one call most deployments want, and it takes the lease once for
+        all three. `compact`, `evict` and `expire` are callable on their own
+        for the case this cannot express — schedules that differ because the
+        costs do, now that conversion reads and rewrites files while the other
+        two are metadata commits.
 
         Runs with or without an archive — this is the call that makes
         `local_retention` mean something on a local-only log.
@@ -1024,15 +1674,6 @@ class Log:
         returning None says nothing about it.
         """
         self._writable()
-        if self._archive is not None:
-            # I4 needs sync's registration watermark to decide what is safe
-            # to evict, and sync does not exist yet. Refusing beats evicting
-            # a file no archive has — that failure is silent and permanent.
-            msg = (
-                "maintain() with an archive configured requires sync(), "
-                "which is not implemented"
-            )
-            raise NotImplementedError(msg)
 
         # The lease is the exclusion, and it is the only one this needs. There
         # is no lock around the pass any more: a compaction reads every file it
@@ -1067,13 +1708,195 @@ class Log:
         # it is cheap enough to run far more often than the rest of this.
         self.seal_due()
 
+    def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """Convert sealed files into `target_compact_size` ones (§6).
+
+        The heavy half of `maintain`, and the reason the three passes are
+        callable separately: it reads and rewrites whole files, while eviction
+        and expiry are metadata commits that finish in milliseconds. A
+        deployment that wants them on different schedules — convert hourly,
+        expire every minute — can have that, and one that does not should call
+        `maintain` and get all three.
+        """
+        self._pass(self._maintenance.compact, heartbeat)
+
+    def evict(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """Drop files past `local_retention` from the local table (§8).
+
+        Never past what the archive holds when one is configured (I4), so a
+        sync that is behind delays this rather than losing data.
+        """
+        self._pass(lambda _: self._maintenance.evict(), heartbeat)
+
+    def expire(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        """Expire snapshots past `snapshot_retention`, then delete what has
+        come due (§6, §8)."""
+        self._pass(lambda _: self._maintenance.expire(), heartbeat)
+
+    def _pass(
+        self,
+        run: Callable[[Callable[[], bool] | None], None],
+        heartbeat: Callable[[], bool] | None,
+    ) -> None:
+        """One maintenance pass under the maintenance lease.
+
+        The same exclusion `maintain` takes, so running the passes separately
+        is not a way around it: a second owner is refused whichever entry point
+        it came through.
+        """
+        self._writable()
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            run(heartbeat or lease.renew)
+        finally:
+            lease.release()
+
+    def rewrite_archive(self) -> None:
+        """Merge undersized files already in the archive (§6, ad-hoc).
+
+        An operation, not a policy. Nothing calls it on a schedule and normal
+        operation does not need it: `sync` pushes only files compaction has
+        finished with, so the archive is well-sized by construction. It exists
+        for the two things that break that on purpose — an explicit `seal()`
+        stranding a small file, and a change to `target_size`, which applies to
+        the future while the archive is immutable history.
+
+        Run it when nothing else is maintaining the log: it takes the same
+        lease as `maintain` and `sync`, and it rewrites the same files they
+        would.
+        """
+        self._writable()
+        if not self._archive.configured():
+            msg = "rewrite_archive() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            self._maintenance.rewrite_archive(lease.renew)
+        finally:
+            lease.release()
+
     def hydrate(self, since: timedelta) -> None:
         """Re-register archived files into the local table (§8).
 
         Raising `local_retention` is an operation, not a config change: without
         this, a raised setting applies only to data captured afterwards.
+
+        `since` is measured against when the ARCHIVE took each file, which is
+        the only age still on record — the local snapshots that once dated them
+        went with the eviction, and the library stamps no timestamp of its own
+        (§2). So this reads "bring back what was archived in the last week",
+        not "what was captured then"; for a stream that fell behind, those
+        differ.
+
+        Files are copied down and registered under the name they have
+        remotely, so hydrating twice writes the same paths rather than
+        accumulating copies, and one interrupted halfway is finished by the
+        next run. Only ranges strictly below what the local table already holds
+        are considered, which is what keeps files contiguous and
+        non-overlapping (§4) — the archive's copy of a range the local table
+        still has would otherwise be added a second time and every row in it
+        read twice.
+
+        A hydrated file is not measured: nothing local counted its rows, and
+        its extent carries no size. That is deliberate and it is what
+        an unknown size means everywhere else — the file counts as full, so
+        compaction will not merge it and `sync` will not push it back to the
+        archive it just came from. Eviction still applies to it, which is the
+        point: this is temporary unless `local_retention` is raised too.
         """
-        raise NotImplementedError
+        self._writable()
+        if not self._archive.configured():
+            msg = "hydrate() needs an archive; this log is local-only"
+            raise ValueError(msg)
+
+        # The maintenance lease, because this writes the local table and copies
+        # files into the data directory — the same two things eviction and
+        # compaction do, and for the same reason they must not overlap.
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds the maintenance lease"
+            raise RuntimeError(msg)
+
+        try:
+            self._pull(lease, since)
+        finally:
+            lease.release()
+
+    def _pull(self, lease: Lease, since: timedelta) -> None:
+        """Copy down and register everything archived since `since`."""
+        archive = self._archive.require()
+        self._table.reload()
+
+        covered = self._table.extent()
+        # Nothing local means nothing to sit below, so everything qualifies.
+        floor = covered[0] if covered is not None else None
+        cutoff = datetime.now(UTC) - since
+        added = archive.snapshot_ages()
+        held = self._maintenance.memory()
+
+        eligible = [
+            data_file
+            for data_file in archive.data_files()
+            if (floor is None or data_file.hi < floor)
+            and (stamped := added.get(data_file.path)) is not None
+            and stamped.replace(tzinfo=UTC) >= cutoff
+        ]
+
+        # DOWNWARD from the local floor, and only across an unbroken join.
+        #
+        # Registering upward left a hole no later run could fill. The first
+        # file restored becomes the new lowest local range, so a failure before
+        # the next one — a lost lease, a network error, or a `since` window
+        # that selected a non-contiguous set because `rewrite_archive` re-dated
+        # a middle file — leaves the gap ABOVE what was restored. The next run
+        # takes its floor from that new lower bound, finds the gap no longer
+        # below it, and skips it for ever. `_union` bounds the archive leg by
+        # the local floor, so those offsets are then served by neither tier:
+        # rows silently missing from every query.
+        #
+        # Downward, every step keeps the local range contiguous, so an
+        # interruption is just a range that starts higher than intended and the
+        # next run continues from there. Stopping at a gap rather than stepping
+        # over it is the same rule: what cannot be joined onto cannot be
+        # restored without creating one.
+        for data_file in sorted(eligible, key=lambda f: f.hi, reverse=True):
+            if floor is not None and data_file.hi != floor - 1:
+                break
+
+            checkpoint(lease.renew)
+            rel_path = archive.key(data_file.path)
+            destination = self._layout.absolute(rel_path)
+            archive.fetch(data_file.path, destination)
+            # No `sealed_through`: that check exists to decline a range the
+            # table already covers, and every range here is deliberately below
+            # what it covers. The filter above is what prevents an overlap.
+            self._table.register([str(destination)])
+            # An extent for the local copy, carrying what the archive's copy
+            # holds. Restored data is subject to `local_retention` like
+            # anything else, and eviction dates a file by this record — so a
+            # hydrated file without one would sit undateable, treated as newly
+            # written, and never leave again.
+            # KNOWN GAP, dormant: this promises above that a hydrated file
+            # "counts as full", and a file the archive never measured records
+            # zero instead — the opposite. It stays dormant because a hydrated
+            # file sits at or below `archive_frontier` and every size consumer
+            # excludes it there; the value goes live only if a watermark reset
+            # drops the frontier beneath it, which is the archive-identity seam
+            # SPEC §13 item 0 owns. Align the two when that is redesigned,
+            # rather than now, on code that redesign will rewrite.
+            self._buffer.record_file(
+                rel_path, data_file.lo, data_file.hi + 1, held.get(data_file.path, 0)
+            )
+            floor = data_file.lo
 
     # -- schema evolution --------------------------------------------------
     #
@@ -1246,9 +2069,62 @@ def validate(
         msg = f"sort_by names columns not in the schema: {missing}"
         raise ValueError(msg)
 
-    if archive is None and config.local_retention == timedelta(0):
+    if (
+        archive is None
+        and config.local_retention == timedelta(0)
+        and not config.local_rows
+    ):
         msg = (
             "local_retention=0 means 'evict on upload' and presupposes an "
             "archive; with archive=None it would delete each file as it sealed"
         )
+        raise ValueError(msg)
+
+    if config.wal_replication and archive is None:
+        msg = (
+            "wal_replication needs an archive: WAL segments go beside the "
+            "archived data, and a local-only log has nowhere to ship them"
+        )
+        raise ValueError(msg)
+
+    if config.compact_min_files < 1:
+        msg = (
+            f"compact_min_files must be at least 1: {config.compact_min_files}. "
+            "It is how many files a run needs before compaction will merge it, "
+            "and below one nothing is ever settled: `stable_prefix` returns "
+            "zero for ever, so sync pushes nothing, the watermark stands still, "
+            "eviction pins on it and the local table grows without bound"
+        )
+        raise ValueError(msg)
+
+    if config.target_seal_rows is not None and config.target_seal_rows < 1:
+        msg = (
+            f"target_seal_rows must be at least 1: {config.target_seal_rows}. "
+            "It is the number of rows a file may hold, and a file has to hold "
+            "the row that crossed the limit"
+        )
+        raise ValueError(msg)
+
+    if config.compact_size < config.target_seal_size:
+        msg = (
+            f"target_compact_size ({config.compact_size}) must be at least "
+            f"target_seal_size ({config.target_seal_size}): compaction converts "
+            "sealed files into larger ones, and a smaller target would ask it "
+            "to shrink a file it just merged, for ever"
+        )
+        raise ValueError(msg)
+
+    if (
+        config.compact_rows is not None
+        and config.target_seal_rows is not None
+        and config.compact_rows < config.target_seal_rows
+    ):
+        msg = (
+            f"target_compact_rows ({config.compact_rows}) must be at least "
+            f"target_seal_rows ({config.target_seal_rows}), for the same reason"
+        )
+        raise ValueError(msg)
+
+    if config.local_rows is not None and config.local_rows < 0:
+        msg = f"local_rows must not be negative: {config.local_rows}"
         raise ValueError(msg)

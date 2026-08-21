@@ -18,10 +18,11 @@ from pathlib import Path
 from _stream import NAME
 
 from litelink import Log
+from litelink._s3 import S3Options
 
 
-def snapshot(log: Log) -> tuple[int, int, int, int]:
-    """(total rows, table rows, buffer rows, data files) — one read, one moment.
+def snapshot(log: Log) -> tuple[int, int, int, int, int]:
+    """(stream rows, local rows, buffer rows, local files, archived rows).
 
     Nothing here scans data. Iceberg tracks a row count per file, so the table's
     total comes off the manifest read that produced the boundary; the buffer is
@@ -30,13 +31,51 @@ def snapshot(log: Log) -> tuple[int, int, int, int]:
     The difference is the shape, not the constant. A `count(*)` over the log
     reads the offset column out of every Parquet file, so the poll got slower as
     the log grew — 24 ms at 50,000 rows and climbing. This is flat.
+
+    Everything here is local and free, which is what lets the `read` column
+    mean something. The archive's file count is neither, so it is not in here —
+    see `ArchiveCount`.
+
+    With an archive, `table + buffer` stops being the whole stream: eviction
+    removes files the archive has, so the local tiers SHRINK while the stream
+    only grows. `end_offset` is the count that keeps growing either way — it is
+    the next offset to be assigned, so one less than it is every row ever
+    appended, whichever tier now holds it. The watermark says how much of that
+    the archive has taken, and the gap between them is how far sync is behind.
     """
     return (
-        log.table_rows() + log.buffered_rows(),
+        log.end_offset() - 1,
         log.table_rows(),
         log.buffered_rows(),
         log.table_files(),
+        log.archived_through(),
     )
+
+
+class ArchiveCount:
+    """How many files the archive holds, fetched only when it can have changed.
+
+    Counting what object storage holds means asking object storage, so this is
+    the one number in the display that is not free — asking every tick took the
+    read from 8 ms to 300 ms and buried the local latency the `read` column is
+    there to show.
+
+    The watermark is the signal. It is a local read, and it moves exactly when
+    `sync` commits, which is exactly when the archive can have gained files. So
+    a tick with nothing new to report costs no round trip, and one that does
+    pays for it once.
+    """
+
+    def __init__(self) -> None:
+        self._watermark = -1
+        self._files = 0
+
+    def at(self, log: Log, watermark: int) -> int:
+        if watermark != self._watermark:
+            self._watermark = watermark
+            self._files = log.archive_files()
+
+        return self._files
 
 
 def main() -> None:
@@ -47,21 +86,38 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log = Log.open(args.root, NAME, read_only=True)
-    print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.\n")
-    print(f"{'total':>12} {'in table':>12} {'in buffer':>12} {'files':>7} {'read':>8}")
+    log = Log.open(args.root, NAME, read_only=True, s3=S3Options())
+    print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.")
+    if log.archive:
+        print(f"archive: {log.archive}")
+        print("local falls as archived rises; stream counts every row either way")
+
+    print()
+    # Named for what they are rather than for where they live. "in table"
+    # meant local rows and "files" meant local files, which asks the reader to
+    # remember the implementation to read the display.
+    archived_rows = f" {'archived rows':>14}" if log.archive else ""
+    archived_files = f" {'archived files':>14}" if log.archive else ""
+    print(
+        f"{'stream rows':>13} {'buffer rows':>13} {'local rows':>13}{archived_rows}"
+        f" {'local files':>12}{archived_files} {'read':>9}"
+    )
 
     previous = 0
+    archive = ArchiveCount()
     try:
         while True:
             started = time.monotonic()
-            total, table, buffered, files = snapshot(log)
+            total, table, buffered, files, archived = snapshot(log)
+            remote = archive.at(log, archived) if log.archive else 0
             elapsed_ms = (time.monotonic() - started) * 1000
 
             delta = f"+{total - previous:,}" if total > previous else ""
             print(
-                f"{total:>12,} {table:>12,} {buffered:>12,} {files:>7} "
-                f"{elapsed_ms:>7.1f}ms  {delta}"
+                f"{total:>13,} {buffered:>13,} {table:>13,}"
+                f"{f' {archived:>14,}' if log.archive else ''}"
+                f" {files:>12,}{f' {remote:>14,}' if log.archive else ''}"
+                f" {elapsed_ms:>7.1f}ms  {delta}"
             )
             previous = total
             time.sleep(args.every)

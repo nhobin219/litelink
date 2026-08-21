@@ -7,21 +7,28 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    NoSuchTableError,
+)
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
 
+from litelink._fs import fsync
 from litelink._predicates import offset_at_or_below, offset_between
+from litelink._s3 import S3Options
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from datetime import datetime
+    from pathlib import Path
 
     import pyarrow as pa
     from pyiceberg.table import Table
@@ -71,6 +78,67 @@ class DataFile:
     hi: int
 
 
+# The catalog name the archive's `SqlCatalog` is built with, and the key its
+# rows are stored under. One constant so the reader below and the writer above
+# cannot disagree about which rows are ours.
+ARCHIVE_CATALOG = "archive"
+
+
+class ArchiveAbsent(LookupError):
+    """No archive table exists at the prefix yet.
+
+    Distinct from a mismatch, because the two want opposite handling: absent is
+    the ordinary state of a log whose first sync has not run, and a reader
+    simply leaves that leg out of the union. A mismatch means the catalog names
+    somewhere the log is not pointed, which no reader should quietly work
+    around.
+    """
+
+
+def _recorded_location(layout: Layout) -> str | None:
+    """Where the archive's catalog entry says its metadata is, without a read.
+
+    Straight out of the catalog's own SQLite file, because the question — does
+    this entry belong to the prefix being opened? — has to be answerable when
+    the bucket it names is unreachable. `load_table` would fetch the metadata
+    to tell us, and that fetch is exactly the one that can fail for reasons
+    other than "there is no table".
+
+    None means there is definitely no entry — the catalog was readable and had
+    no row. Callers distinguish that from "cannot tell", so the two must not be
+    conflated: the empty string is used below as a third value meaning "carry
+    on and let pyiceberg decide". `LookupError` means the question could not be answered, which is
+    NOT the same thing: answering None there sends the caller down the create
+    path against an entry that still exists, and every open of that log then
+    fails on a unique constraint. A log nobody can open, from a query that was
+    only ever an optimisation.
+
+    The schema is pyiceberg's, not ours: table `iceberg_tables`, keyed by
+    catalog name, namespace and table name. Verified against a real catalog
+    rather than assumed. If a future version changes it, the query fails, the
+    caller falls back to loading, and pyiceberg answers for itself — slower and
+    correct, instead of fast and destructive.
+    """
+    if not layout.archive_db.exists():
+        return None
+
+    namespace, _, name = layout.table_id.rpartition(".")
+    connection = sqlite3.connect(f"file:{layout.archive_db}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT metadata_location FROM iceberg_tables"
+            " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
+            (ARCHIVE_CATALOG, namespace, name),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        msg = f"cannot read the archive catalog's own table: {exc}"
+        raise LookupError(msg) from exc
+    finally:
+        connection.close()
+
+    return None if row is None or row[0] is None else str(row[0])
+
+
 class LogTable:
     """The local Iceberg table for one log.
 
@@ -79,7 +147,13 @@ class LogTable:
     silently serves a stale snapshot.
     """
 
-    def __init__(self, catalog: SqlCatalog, layout: Layout, table: Table) -> None:
+    def __init__(
+        self,
+        catalog: SqlCatalog,
+        layout: Layout,
+        table: Table,
+        warehouse: str | None = None,
+    ) -> None:
         """Take the loaded table. `create` and `load` are what load it.
 
         Assigning only, so that a caller holding a `Table` from anywhere — a
@@ -98,6 +172,9 @@ class LogTable:
         # snapshot the NEXT caller sees.
         self._lock = threading.RLock()
         self._table = table
+        # Where this table's files live. The local one derives it from the
+        # layout; the archive is told, because its prefix is the caller's.
+        self._warehouse = warehouse or layout.warehouse_uri
         # Snapshot-derived facts, cached against the metadata pointer. See
         # `extent`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
@@ -109,6 +186,15 @@ class LogTable:
         self._extent_at: str | None = None
         self._extent: tuple[int, int] | None = None
         self._counts_at: str | None = None
+        # The entry walk, cached against the same pointer. Manifest MERGING
+        # already collapses one manifest per commit into one for the table —
+        # measured at 216 data files in a single manifest — but that is the
+        # wrong axis: the cost is decoding one entry per data FILE, each
+        # carrying per-column statistics, and merging cannot reduce their
+        # number. Measured 14.4 ms at 216 files against 0.0 ms for the manifest
+        # list, and a `maintain` pass asks three times over.
+        self._files_at: str | None = None
+        self._files: list[DataFile] = []
         self._file_count = 0
         self._record_count = 0
 
@@ -148,6 +234,163 @@ class LogTable:
         return SqlCatalog(
             "local", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
         )
+
+    @classmethod
+    def open_archive(
+        cls,
+        layout: Layout,
+        prefix: str,
+        options: S3Options,
+        schema: pa.Schema,
+        *,
+        repair: bool = False,
+    ) -> LogTable:
+        """The remote table, created on first use (§5).
+
+        Its catalog is a SQLite file beside the local one and its warehouse is
+        the object-store prefix — §2's two-catalog shape. Created lazily rather
+        than at `Log.new`, because a log may be configured with an archive long
+        before anything is pushed to it and creating a remote table costs a
+        round trip a local-only run should never pay.
+
+        The schema is the local table's, so the two cannot drift: one declared
+        shape, and the archive is the same rows later.
+
+        The catalog entry is keyed by table id, not by warehouse, so an entry
+        made for a DIFFERENT prefix would be found here and hand back a table
+        whose metadata still lives in the old bucket. So it is checked against
+        the prefix asked for, and replaced when it does not match.
+
+        Checked HERE rather than dropped when the archive is re-pointed, which
+        is what this did first. Re-pointing is three durable writes — the URI,
+        the watermark, the catalog entry — and a crash between any two leaves
+        them disagreeing; no ordering avoids it, because the damage differs in
+        each direction. A check at open is a repair that runs every time, so a
+        half-finished re-point corrects itself.
+
+        It is also what keeps detach-and-reattach working. Dropping the entry
+        eagerly meant pointing back at an archive that still held data built a
+        fresh empty table over it, and rows already evicted locally were then
+        reachable from nowhere.
+
+        Adopting an archive that holds data but has no entry here is a
+        different operation and is NOT supported: this creates an empty table
+        at the prefix rather than discovering what is already there.
+        """
+        # Asked BEFORE the catalog is constructed, because constructing one
+        # creates its tables in `archive.db` and registering the namespace adds
+        # a row — writes, from a path that promised to make none. A reader
+        # against a never-synced archive should touch nothing at all.
+        boundary = prefix.rstrip("/") + "/"
+        if not repair:
+            try:
+                known = _recorded_location(layout)
+            except LookupError:
+                # Could not tell offline. Fall through and let pyiceberg
+                # answer, accepting the local writes that costs.
+                known = ""
+
+            if known is None:
+                msg = f"no archive table at {prefix!r} yet"
+                raise ArchiveAbsent(msg)
+
+        catalog = SqlCatalog(
+            ARCHIVE_CATALOG,
+            uri=layout.archive_catalog_uri,
+            warehouse=prefix,
+            **options.resolved().catalog_properties(),
+        )
+        catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
+
+        # Read OFFLINE, before deciding anything. Whether the entry belongs to
+        # this prefix is answerable from the local catalog row, and asking it
+        # that way is what separates "this names another archive" from "this
+        # names ours and object storage is having a bad minute".
+        #
+        # On a separator, not a bare prefix: `s3://b/one` is a prefix of
+        # `s3://b/one-more` as a string, so a plain `startswith` accepts a
+        # SIBLING archive's entry as this one's, and the log then reads and
+        # writes into the neighbour it was pointed away from.
+        try:
+            recorded = _recorded_location(layout)
+        except LookupError:
+            # Could not tell. Let pyiceberg answer: it either loads the table
+            # or says there is none. Slower than the offline read, and it must
+            # still answer the SAME question — returning the loaded table here
+            # skipped the prefix check entirely, so a process that hit a locked
+            # catalog adopted the archive it had been pointed away from and
+            # read, pushed and reconciled its watermark from it for the rest of
+            # its life.
+            try:
+                recorded = catalog.load_table(layout.table_id).metadata_location
+            except NoSuchTableError:
+                recorded = None
+
+        # The entry this repair displaces, kept so a failed create can put it
+        # back. See below.
+        displaced: str | None = None
+        if recorded is not None and not recorded.startswith(boundary):
+            # Another archive's table, found by table id. No read of the old
+            # bucket is needed to know this, which matters when the archive
+            # being left has already been taken away.
+            if not repair:
+                # Only a caller holding the maintenance lease may fix it.
+                # Dropping and recreating is a mutation of shared state, and it
+                # was reachable from any `include_archive` read — two processes
+                # cold-opening after a re-point would both find the mismatch,
+                # and the second's drop could land after the first had already
+                # created, uploaded and committed, taking the live entry with
+                # it. A reader that cannot fix it must not pretend it can.
+                msg = (
+                    f"the archive catalog names {recorded!r}, which is not "
+                    f"under {prefix!r} — a maintenance pass repairs this"
+                )
+                raise ValueError(msg)
+
+            # The entry goes; the objects do not, because detaching an
+            # archive is not deleting one. Held onto, though: the create below
+            # can fail — the new prefix may not exist yet, which this design
+            # explicitly allows — and a drop that is not followed by a create
+            # destroys the only record of where the PREVIOUS archive's metadata
+            # is. `previous_metadata_location` dies with the row, so a later
+            # roll-back to that archive would build an empty table over data
+            # nothing could then reach.
+            catalog.drop_table(layout.table_id)
+            displaced, recorded = recorded, None
+
+        if recorded is None:
+            if not repair:
+                # Absent, not wrong. A log configured with an archive that
+                # nothing has pushed to yet is an ordinary state, and a reader
+                # asking for `include_archive` before the first sync should get
+                # a union without that leg — not an error, and not a table
+                # created as a side effect of reading.
+                msg = f"no archive table at {prefix!r} yet"
+                raise ArchiveAbsent(msg)
+
+            try:
+                table = catalog.create_table(
+                    layout.table_id, schema=schema, properties=METADATA_PROPERTIES
+                )
+            except Exception:
+                if displaced is not None:
+                    # Put the old entry back. The repair is meant to move the
+                    # log from one archive to another, and a half-done move
+                    # that leaves NEITHER is the one outcome worse than not
+                    # moving at all.
+                    catalog.register_table(layout.table_id, displaced)
+
+                raise
+        else:
+            # Deliberately unguarded. Catching everything here and rebuilding
+            # meant a 503, a timeout or an expired token read as "there is no
+            # table" — and the repair then dropped the only pointer to a live
+            # archive and wrote an empty table over it, while the watermark
+            # still promised eviction that those rows were safe. A failed read
+            # of OUR OWN metadata is an error, not an absence.
+            table = catalog.load_table(layout.table_id)
+
+        return cls(catalog, layout, table, prefix)
 
     def exists(self) -> bool:
         return True
@@ -235,6 +478,18 @@ class LogTable:
         opened — which is what makes the tier boundary cheap enough for §7 to
         derive it on every read.
         """
+        with self._lock:
+            location = self.metadata_location
+            if location == self._files_at:
+                return self._files
+
+            self._files = self._read_files()
+            self._files_at = location
+
+            return self._files
+
+    def _read_files(self) -> list[DataFile]:
+        """The entry walk itself. Cached by `data_files`."""
         if self.is_empty():
             return []
 
@@ -472,13 +727,108 @@ class LogTable:
                     raise
 
                 self.reload()
+                # Refreshed, so check it is still the same table. The catalog
+                # row is keyed by table id, not by identity, and a `set_archive`
+                # racing a slow register replaces what that row names — so the
+                # reload silently re-binds this operation to the NEW archive
+                # and the retry commits paths that live in the old bucket. The
+                # new archive's manifests would then reference objects the
+                # re-point retired, and the next sync's reconcile would launder
+                # that extent into the watermark eviction acts on.
+                self._verify_identity()
             else:
                 self.reload()
 
                 return
 
-    def register(self, path: str, sealed_through: int | None = None) -> bool:
-        """Add an already-written file to the table (§4 step 2).
+    def _verify_identity(self) -> None:
+        """Refuse to keep operating on a table that left this warehouse.
+
+        The one durable write in a push with no watermark fence around it is
+        the Iceberg commit itself, and `_commit`'s retry is where it can change
+        which table it means.
+        """
+        location = str(self._table.metadata_location)
+        boundary = self._warehouse.rstrip("/") + "/"
+        if not location.startswith(boundary):
+            msg = (
+                f"the table moved out of {self._warehouse!r} while this commit "
+                f"was in flight (now {location!r}); it was not retried"
+            )
+            raise RuntimeError(msg)
+
+    def uri(self, rel_path: str) -> str:
+        """Where a root-relative file lives in this table's warehouse."""
+        return f"{self._warehouse.rstrip('/')}/{rel_path}"
+
+    def put(self, source: Path, rel_path: str) -> None:
+        """Upload a local file into this table's warehouse (§5 step 1).
+
+        Through pyiceberg's own FileIO rather than a second S3 client, so the
+        credentials and endpoint that reach the archive are the ones the
+        catalog was built with — one place to configure, and no way for an
+        upload to land somewhere the table cannot then read.
+
+        Overwrites. The name carries a per-attempt token, so a repeat is the
+        same sync replaying the same file, and finishing it is what makes the
+        pass restartable.
+        """
+        destination = self.uri(rel_path)
+        with source.open("rb") as reading:
+            payload = reading.read()
+
+        output = self._table.io.new_output(destination)
+        with output.create(overwrite=True) as writing:
+            writing.write(payload)
+
+    def fetch(self, path: str, destination: Path) -> None:
+        """Download a file out of this table's warehouse. Inverse of `put`.
+
+        Through the catalog's own FileIO for the same reason `put` is: the
+        credentials that reach the archive are the ones the table was opened
+        with, so there is no second client to configure and no way to read from
+        somewhere the table does not point.
+
+        Whole-file, not streamed. These are `target_size` files, the same
+        amount a seal holds in memory to write one, and the caller is an
+        explicit operation rather than anything on a read path.
+        """
+        payload = self._table.io.new_input(path).open().read()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Written under a temporary name and renamed, so a crash cannot leave a
+        # short file under a name the table is about to reference. Rename is
+        # atomic within a directory; the fsync is what makes the bytes precede
+        # it (§2).
+        staged = destination.with_name(f"{destination.name}.partial")
+        staged.write_bytes(payload)
+        fsync(staged)
+        staged.replace(destination)
+
+    def remove(self, path: str) -> None:
+        """Delete a file from this table's warehouse.
+
+        Through the catalog's FileIO, like `put` and `fetch`, so one set of
+        credentials reaches object storage and a delete cannot be aimed
+        somewhere the table does not point.
+        """
+        self._table.io.delete(path)
+
+    def key(self, path: str) -> str:
+        """The warehouse-relative name of a file in this table.
+
+        The inverse of `uri`, and what lets an archived file be placed locally
+        under the same name it has remotely — so hydrating twice writes the
+        same path rather than accumulating copies.
+        """
+        return path.removeprefix(self._warehouse.rstrip("/") + "/")
+
+    def register(
+        self,
+        paths: list[str],
+        sealed_through: int | None = None,
+        archived_through: int = 0,
+    ) -> bool:
+        """Add already-written files to the table, in ONE commit (§4 step 2).
 
         `add_files` rather than `append`: pyiceberg's append writes the file
         itself and commits afterwards, so a crash in between orphans a file
@@ -499,6 +849,19 @@ class LogTable:
         range and does nothing. Both orderings are safe — a writer that reloads
         after the winner never attempts at all.
 
+        Takes a `list`, deliberately, not a `Sequence`: a `str` satisfies
+        `Sequence[str]`, so a single path passed unwrapped type-checks and then
+        registers the file's CHARACTERS. That is not hypothetical — it is what
+        happened when this signature changed.
+
+        **Several paths per commit, because a commit is the expensive part.**
+        Measured against S3: 648 ms to upload a file and 4.1 s to register it,
+        because each commit reads the new file's footer, writes a manifest, a
+        manifest list and a fresh metadata.json, and rewrites the catalog
+        pointer — none of which gets cheaper for holding one file instead of
+        twenty. One commit per file made `sync` take 83 s over sixteen files
+        and starved the sealer that shared its thread.
+
 
         Returns whether the file was added. False means the range was already
         covered, so this file is redundant — and the caller has to queue it for
@@ -508,13 +871,15 @@ class LogTable:
 
         def add() -> None:
             nonlocal added
-            if sealed_through is not None and self._covers(sealed_through):
+            if sealed_through is not None and (
+                self._covers(sealed_through) or archived_through >= sealed_through - 1
+            ):
                 added = False
 
                 return
 
             added = True
-            self._table.add_files([path])
+            self._table.add_files(paths)
 
         self._commit(add)
 
@@ -525,23 +890,36 @@ class LogTable:
 
         Data files cover contiguous, non-overlapping offset ranges (§4), so the
         extent's upper bound answers this on its own.
+
+        An EMPTY table answers False, which is why `register` also consults the
+        archive watermark. A writer stalled between renewing its lease and
+        registering, while another owner sealed the same range, archived it and
+        evicted the table to nothing, would otherwise resume and re-add its
+        stale file — and a local table holding only [100, 199] under an archive
+        holding [0, 999] serves 200-999 from no leg at all, until eviction
+        drops it again up to `local_retention` later.
         """
         extent = self.extent()
 
         return extent is not None and extent[1] >= sealed_through - 1
 
-    def replace_range(self, lo: int, hi: int, path: str) -> None:
-        """Swap `[lo, hi]` for one already-written file, in one snapshot (§6).
+    def replace_range(self, lo: int, hi: int, paths: Sequence[str]) -> None:
+        """Swap `[lo, hi]` for already-written files, in one snapshot (§6).
 
         `overwrite()` would do this in a single call, but it writes the output
         itself — putting a path on disk this process only learns about
         afterwards, which is what the deletion queue exists to avoid.
+
+        Several paths because an archive rewrite re-cuts a range into however
+        many correctly sized files it takes, and the swap has to be one
+        snapshot: committing them one at a time would mean each commit deleting
+        a sub-range of a file the next commit still needs.
         """
 
         def swap() -> None:
             with self._table.transaction() as transaction:
                 transaction.delete(delete_filter=offset_between(lo, hi))
-                transaction.add_files([path])
+                transaction.add_files(list(paths))
 
         self._commit(swap)
 

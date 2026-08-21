@@ -1,6 +1,6 @@
 """The seal queue: where the cut is made, and by whom (SPEC §4).
 
-`target_size` is the library's one promise about file size, and a running byte
+`target_seal_size` is the library's one promise about file size, and a running byte
 counter cannot keep it. A counter says a threshold was crossed, never where —
 so a sealer that polls one cuts wherever the buffer has reached by the time it
 looks, and the file it writes measures how far behind the sealer was rather
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import shutil
 import threading
-import time
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -53,12 +52,17 @@ def _today() -> date:
 
 
 def groups(log: Log) -> list[tuple[int, int | None, int | None, int]]:
-    """Every queue row: `(group_id, start, end, bytes)`, oldest first."""
+    """Every queue row: `(group_id, start, end, bytes)`, oldest first.
+
+    Unnamed extents only. A row keeps its identity after it seals — it gains
+    the file's name and stops being queue — so the queue is the extents that
+    have no file yet.
+    """
     return [
         (int(g), s, e, int(b))
         for g, s, e, b in log._buffer._con.execute(
-            "SELECT group_id, start_offset, end_offset, bytes FROM seal_group"
-            " ORDER BY group_id"
+            "SELECT group_id, start_offset, end_offset, bytes FROM extent"
+            " WHERE rel_path IS NULL ORDER BY group_id"
         ).fetchall()
     ]
 
@@ -70,11 +74,13 @@ def quiet(**kwargs: object) -> LogConfig:
     `seal`/`seal_due` are the only things that write files, so the queue stays
     exactly as the appends left it.
     """
-    return LogConfig(
-        target_size=TARGET,
-        snapshot_retention=timedelta(days=1),
-        **kwargs,  # ty: ignore[invalid-argument-type]
-    )
+    settings: dict[str, object] = {
+        "target_seal_size": TARGET,
+        "snapshot_retention": timedelta(days=1),
+    }
+    settings.update(kwargs)
+
+    return LogConfig(**settings)  # ty: ignore[invalid-argument-type]
 
 
 def test_a_closed_group_is_never_smaller_than_the_target(tmp_path: Path) -> None:
@@ -176,7 +182,7 @@ def test_an_explicit_seal_cuts_its_own_rows_whatever_else_is_running(
     in a deployment; the lease cannot tell the difference — because competition
     is what made it reproduce.
     """
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         stop = threading.Event()
 
@@ -216,7 +222,7 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
     """
     # A target nothing crosses, so the only cut is the explicit one below and
     # the group covers every row.
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         log.extend(rows(100))
 
@@ -247,54 +253,34 @@ def test_an_empty_group_is_never_closed(tmp_path: Path) -> None:
         assert log._table.data_files() == []
 
 
-def test_max_age_seals_a_stream_that_never_fills_a_group(tmp_path: Path) -> None:
-    """§4's other trigger, which was dead config until the queue existed.
+def test_a_quiet_stream_keeps_its_rows_in_the_buffer(tmp_path: Path) -> None:
+    """There is no timer, and that is the point (§3a).
 
-    Without it a quiet stream never reaches Iceberg at all: it sits in SQLite
-    indefinitely, because the only trigger was a byte threshold it never met.
+    A `max_age` seal emitted a small file every interval for ever on a quiet
+    stream — the layout §6 exists to repair — and made one knob serve as both a
+    file-size and an RPO policy, so shrinking it to lose less on a crash
+    produced worse files. Freshness in the cloud belongs to WAL replication.
+
+    So a stream that never fills a group never writes a file, and its rows stay
+    where they are: durable at commit, readable through the union, and waiting.
     """
-    config = quiet(max_age=timedelta(0))
-    with open_log(tmp_path, config) as log:
-        log.extend(rows(3))
-
-        assert log._table.data_files() == [], "nothing should have crossed the target"
-
-        closed = log._buffer.close_open_group(int(time.time()))
-
-        assert closed, "an aged group was not closed"
-        assert log.seal() == 4
-        assert log.table_rows() == 3
-
-
-def test_max_age_leaves_a_young_group_alone(tmp_path: Path) -> None:
-    """Or every poll would emit a stub file, which is §6's whole complaint."""
     with open_log(tmp_path, quiet()) as log:
         log.extend(rows(3))
 
-        assert not log._buffer.close_open_group(int(time.time()) - 3600)
-        assert log.seal() is not None, "an explicit seal still cuts"
+        assert log.seal_due() is None, "sealed without reaching target_seal_size"
+        assert log._table.data_files() == [], "wrote an undersized file"
+        assert log.buffered_rows() == 3, "the rows went somewhere else"
+        assert len(log.scan().read_all()) == 3, "buffered rows must still read"
 
 
-def test_the_age_clock_starts_with_the_first_row_not_the_group(tmp_path: Path) -> None:
-    """An idle group would otherwise seal a one-row file the moment it filled."""
+def test_only_an_explicit_seal_cuts_short(tmp_path: Path) -> None:
+    """The one way this library writes an undersized file, and it takes a call."""
     with open_log(tmp_path, quiet()) as log:
-        log.extend(rows(1))
-        log.seal()
+        log.extend(rows(3))
 
-        # A fresh, empty group now exists and is about to sit idle.
-        time.sleep(1.1)
-        opened_before = log._buffer._con.execute(
-            "SELECT opened_at FROM seal_group WHERE end_offset IS NULL"
-        ).fetchone()[0]
-
-        assert opened_before is None, "an empty group carries no age"
-
-        log.extend(rows(1, start=50))
-        opened_after = log._buffer._con.execute(
-            "SELECT opened_at FROM seal_group WHERE end_offset IS NULL"
-        ).fetchone()[0]
-
-        assert opened_after >= int(time.time()) - 1, "clock started before the row"
+        assert log.seal_due() is None, "something cut without being asked"
+        assert log.seal() is not None, "an explicit seal must still cut"
+        assert log.table_files() == 1
 
 
 def test_a_reopened_log_adopts_the_rows_it_finds(tmp_path: Path) -> None:
@@ -384,7 +370,7 @@ def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> No
     "database disk image is malformed", with a torn -shm mmap raising SIGBUS.
     """
     config = LogConfig(
-        target_size=TARGET,
+        target_seal_size=TARGET,
         snapshot_retention=timedelta(days=1),
     )
     with open_log(tmp_path, config) as log:
@@ -432,7 +418,7 @@ def test_a_retried_seal_takes_a_new_name_and_queues_the_old(tmp_path: Path) -> N
     name. The abandoned attempt is queued for deletion BEFORE the claim is
     replaced, which is what keeps every file on disk reachable from SQLite.
     """
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         log.extend(rows(50))
         log._buffer.close_open_group()
@@ -474,7 +460,7 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
     loser's retry does nothing — and a writer arriving afterwards never
     attempts at all.
     """
-    config = LogConfig(target_size=1 << 30, snapshot_retention=timedelta(days=1))
+    config = LogConfig(target_seal_size=1 << 30, snapshot_retention=timedelta(days=1))
     with open_log(tmp_path, config) as log:
         log.extend(rows(60))
         end = log.seal()
@@ -489,7 +475,59 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(log._table.data_files()[0].path, dest)
 
-        log._table.register(str(dest), sealed_through=end)
+        log._table.register([str(dest)], sealed_through=end)
 
         assert log.table_files() == 1, "a second file for the same range landed"
         assert log.table_rows() == 60, "rows were duplicated"
+
+
+def test_the_seal_cuts_on_whichever_limit_is_reached_first(tmp_path: Path) -> None:
+    """§7's other half, and the one `target_seal_size` cannot express.
+
+    Buffer cost is per ROW — SQLite is row-oriented — so a narrow-row stream
+    reaches a byte target only after far more rows than the read-latency
+    ceiling was sized for, while every byte-based check reports the buffer is
+    fine. Bytes bound memory, rows bound read latency, and both are ceilings on
+    one file, so the tighter one wins.
+    """
+    config = quiet(target_seal_size=1 << 30, target_seal_rows=10)
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(25))
+
+        cuts = [(start, end) for _, start, end, _ in groups(log) if end is not None]
+
+        assert cuts == [(1, 11), (11, 21)], (
+            "the row limit must cut every 10 rows, exactly, leaving the "
+            "remainder in the open group"
+        )
+
+
+def test_a_row_capped_cut_is_not_undone_by_compaction(tmp_path: Path) -> None:
+    """The half that is easy to miss.
+
+    A file cut on the row limit holds fewer BYTES than `target_seal_size`, so
+    judged by bytes alone it looks starved — and compaction would merge exactly
+    the files the row cap just created, straight past the ceiling. Compaction
+    respects a row ceiling as the seal does; the only difference is which one,
+    since conversion aims at a larger file than a seal does.
+    """
+    config = quiet(
+        target_seal_size=1 << 30,
+        target_seal_rows=10,
+        # Equal to the seal's, so this is about the ceiling being respected
+        # rather than about the conversion. Left to default it would be eight
+        # times larger and these files would merge — correctly.
+        target_compact_rows=10,
+        compact_min_files=2,
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(40))
+        log.seal_due()
+        before = len(log._table.data_files())
+        assert before >= 3, "the row cap must have produced several files"
+
+        log.maintain()
+
+        after = log._table.data_files()
+        assert len(after) == before, "compaction must not merge past the ceiling"
+        assert all(f.rows <= 10 for f in after)

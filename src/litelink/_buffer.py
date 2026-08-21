@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -26,12 +25,16 @@ from litelink._types import column_type
 # The library-owned column (§2).
 OFFSET = "litelink_offset"
 
+# Stands in for "no row limit" so the per-row check stays one comparison. Far
+# above any row count a buffer sized for read latency could reach.
+_NO_ROW_LIMIT = 1 << 62
+
 # How many appended-since-last-query slices the tail may accumulate before it
 # is compacted back into one.
 _MAX_TAIL_CHUNKS = 32
 
 # IMMEDIATE, never a bare BEGIN. Every transaction here writes, and several read
-# first — an append reads the open `seal_group` row before inserting anything.
+# first — an append reads the open `extent` row before inserting anything.
 # A deferred transaction that reads first takes a read snapshot, and if another
 # process has written since, SQLite refuses to upgrade it to a writer and
 # returns "database is locked" IMMEDIATELY: `busy_timeout` does not apply,
@@ -47,14 +50,9 @@ _BEGIN = "BEGIN IMMEDIATE"
 _BUSY_TIMEOUT_MS = 30_000
 
 
-def _now() -> int:
-    """Unix seconds. Whole seconds because `max_age` is a coarse policy."""
-    return int(time.time())
-
-
 @dataclass(slots=True)
 class _Group:
-    """The open `seal_group` row, while an append transaction fills it.
+    """The open `extent` row, while an append transaction fills it.
 
     Read once per transaction and written back once, so the per-row accounting
     that decides the cut is arithmetic rather than a statement per row.
@@ -63,7 +61,6 @@ class _Group:
     group_id: int
     start_offset: int | None
     bytes: int
-    opened_at: int | None
 
 
 class Buffer:
@@ -77,6 +74,7 @@ class Buffer:
         columns: tuple[str, ...],
         *,
         target_size: int,
+        target_rows: int | None = None,
     ) -> None:
         """Take built collaborators. `open` is what builds and validates them.
 
@@ -89,13 +87,14 @@ class Buffer:
         `schema` is the application's columns, without `offset`; `columns` is
         their names, passed rather than derived so this assigns and nothing
         else. `target_size` is here rather than only on the seal because the
-        cut it describes is made on the append path — see `seal_group`.
+        cut it describes is made on the append path — see `extent`.
         """
         self._con = writer
         self._reader = reader
         self._schema = schema
         self._columns = columns
         self._target_size = target_size
+        self._target_rows = target_rows
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
         # an append, a seal claiming and clearing its range, a maintenance pass
@@ -151,14 +150,15 @@ class Buffer:
 
                 raise
 
-    def set_target_size(self, target_size: int) -> None:
-        """Adopt a new cut size in place, rather than being rebuilt around it.
+    def set_target_size(self, target_size: int, target_rows: int | None) -> None:
+        """Adopt new cut limits in place, rather than being rebuilt around them.
 
         Policy can change under a running log (§12), and the cut is made here,
         so it has to arrive here. `Maintenance` takes the same shape.
         """
         with self._lock:
             self._target_size = target_size
+            self._target_rows = target_rows
 
     @classmethod
     def open(
@@ -167,7 +167,9 @@ class Buffer:
         schema: pa.Schema,
         *,
         target_size: int,
+        target_rows: int | None = None,
         readonly: bool = False,
+        durable: bool = True,
     ) -> Buffer:
         """Connect, configure, and create the tables. Then hand them to `cls`.
 
@@ -179,12 +181,27 @@ class Buffer:
         A readonly buffer opens the same file through SQLite's `mode=ro` URI so
         the handle cannot write even by mistake, and creates nothing. WAL allows
         any number of these alongside the single writer (§1).
+
+        `durable=False` is for a buffer whose contents are derived from
+        something that still exists — the scratch buffer an archive rewrite
+        re-cuts through, whose every row came from the archive and is still
+        there until the rewrite's final commit. A crash costs a re-run rather
+        than data, so the fsync per commit is paying for a guarantee nothing
+        depends on. Never for a log's own buffer: there, the fsync IS the
+        product (§3).
         """
         columns = tuple(schema.names)
         if readonly:
             con = cls._connect_readonly(path)
 
-            return cls(con, con, schema, columns, target_size=target_size)
+            return cls(
+                con,
+                con,
+                schema,
+                columns,
+                target_size=target_size,
+                target_rows=target_rows,
+            )
 
         # check_same_thread=False because scheduling maintenance on a background
         # thread is the ordinary operational shape, and Python's guard would
@@ -192,12 +209,14 @@ class Buffer:
         # (`sqlite3.threadsafety == 3`), so the connection itself is safe; the
         # lock is for the multi-statement sequences SQLite cannot know about.
         writer = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        # WAL either way, and not for durability: the reader below is a second
+        # connection to the same file, which is what WAL exists to allow.
         writer.execute("PRAGMA journal_mode=WAL")
         writer.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         # §3's durability claim rests on this line. WAL alone fsyncs at
         # checkpoint, not at commit, which would put committed rows back in the
         # OS page cache — the exact loss this library exists to prevent.
-        writer.execute("PRAGMA synchronous=FULL")
+        writer.execute(f"PRAGMA synchronous={'FULL' if durable else 'OFF'}")
 
         buffer = cls(
             writer,
@@ -205,6 +224,7 @@ class Buffer:
             schema,
             columns,
             target_size=target_size,
+            target_rows=target_rows,
         )
         buffer._create()
         buffer._seed_group()
@@ -284,13 +304,22 @@ class Buffer:
         # The same shape as `pending_delete`: work that must not be rediscovered
         # by scanning is recorded when it is created.
         self._con.execute("""
-            CREATE TABLE IF NOT EXISTS seal_group (
+            CREATE TABLE IF NOT EXISTS extent (
               group_id     INTEGER PRIMARY KEY AUTOINCREMENT,
               start_offset INTEGER,
               end_offset   INTEGER,
               bytes        INTEGER NOT NULL DEFAULT 0,
-              opened_at    INTEGER
+              rel_path     TEXT UNIQUE,
+              named_at     INTEGER
             )
+        """)
+        # The two states that are still work, which is what every hot query
+        # wants and what stays small however many files the log accumulates.
+        # Without it `_read_group` — once per append transaction — degrades
+        # into a scan of one row per file ever written.
+        self._con.execute("""
+            CREATE INDEX IF NOT EXISTS extent_unsealed ON extent (group_id)
+            WHERE rel_path IS NULL
         """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
@@ -306,7 +335,7 @@ class Buffer:
 
     # -- size accounting --------------------------------------------------
     #
-    # The running total lives in the open `seal_group` row and is written in the
+    # The running total lives in the open `extent` row and is written in the
     # same transaction as the rows it accounts for. That is what lets any
     # process read it — a keyed read of one row, rather than a SUM() over the
     # table being appended to — and what makes it impossible for the count and
@@ -323,29 +352,39 @@ class Buffer:
         The only SUM() left, and it runs once per open rather than per append.
         It fires for a log created before this table existed, and for one whose
         open group was closed by a sealer just before the process died.
-        """
-        if self._con.execute(
-            "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
-        ).fetchone():
-            return
 
-        covered = int(
-            self._con.execute(
-                "SELECT coalesce(max(end_offset), 0) FROM seal_group"
+        **The check and the insert are one transaction.** As two statements,
+        two processes opening the same log at once — a writer and a maintainer
+        starting together, which is the ordinary shape — both see no open group
+        and both insert one. Two open rows then take the same `start_offset`,
+        `close_open_group` closes BOTH at the same end, and `finish_seal` tries
+        to give both the same `rel_path`: a UNIQUE violation that rolls back
+        after the Iceberg commit has already landed, leaving the claim in place
+        and every retry, recovery included, failing the same way. The seal
+        queue wedges permanently and the buffer stops draining.
+        """
+        with self._transaction():
+            if self._con.execute(
+                "SELECT 1 FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+            ).fetchone():
+                return
+
+            covered = int(
+                self._con.execute(
+                    "SELECT coalesce(max(end_offset), 0) FROM extent"
+                ).fetchone()[0]
+            )
+            start = self._con.execute(
+                'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
+                (covered,),
             ).fetchone()[0]
-        )
-        start = self._con.execute(
-            'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
-            (covered,),
-        ).fetchone()[0]
-        # Restarting the max_age clock at open is deliberate. Nothing records
-        # when a row arrived — §2 stamps no timestamp — so the alternative is
-        # inventing an age, and inventing an old one seals a stub file on every
-        # restart, which is the failure §6 exists to clean up after.
-        self._con.execute(
-            "INSERT INTO seal_group (start_offset, bytes, opened_at) VALUES (?, ?, ?)",
-            (start, self._measure_from(covered), None if start is None else _now()),
-        )
+            # Adopting whatever is buffered, rather than starting a fresh group
+            # above it: those rows still have to become a file, and a group
+            # that skipped them would leave them unsealed for ever.
+            self._con.execute(
+                "INSERT INTO extent (start_offset, bytes) VALUES (?, ?)",
+                (start, self._measure_from(covered)),
+            )
 
     def _measure_from(self, floor: int) -> int:
         terms = ["8"]  # offset
@@ -422,6 +461,10 @@ class Buffer:
             # runs per row: routing it through a method cost 19 points of
             # overhead against raw SQLite at 1,000-row batches.
             target = self._target_size
+            # `_insert` runs per row, so both limits are bound once out here.
+            # A row cap of None becomes one nothing reaches, which keeps the
+            # inner test a comparison rather than a branch on None.
+            target_rows = self._target_rows or _NO_ROW_LIMIT
             row_bytes = self._row_bytes
             columns = self._columns
             for row in rows:
@@ -433,15 +476,17 @@ class Buffer:
                 offsets.append(offset)
 
                 if group.start_offset is None:
-                    # Stamped by the first row, not by the group's creation:
-                    # `max_age` measures how long data has waited, and a group
-                    # that sat empty for an hour would otherwise seal a one-row
-                    # file the moment it filled.
                     group.start_offset = offset
-                    group.opened_at = _now()
 
                 group.bytes += row_bytes(row)
-                if group.bytes >= target:
+                # Whichever is reached FIRST. Both are ceilings on one file —
+                # bytes bound memory, rows bound the read latency §7 sizes for
+                # — so the tighter one wins, which is the opposite of how
+                # `local_retention` and `local_rows` combine.
+                if (
+                    group.bytes >= target
+                    or offset - (group.start_offset or offset) + 1 >= target_rows
+                ):
                     group = self._cut(cursor, group, offset)
 
             self._write_group(cursor, group)
@@ -468,11 +513,11 @@ class Buffer:
     def _read_group(self, cursor: sqlite3.Cursor) -> _Group:
         """The open group, once per transaction rather than once per row."""
         row = cursor.execute(
-            "SELECT group_id, start_offset, bytes, opened_at FROM seal_group"
-            " WHERE end_offset IS NULL"
+            "SELECT group_id, start_offset, bytes FROM extent"
+            " WHERE end_offset IS NULL AND rel_path IS NULL"
         ).fetchone()
 
-        return _Group(int(row[0]), row[1], int(row[2]), row[3])
+        return _Group(int(row[0]), row[1], int(row[2]))
 
     def _cut(self, cursor: sqlite3.Cursor, group: _Group, offset: int) -> _Group:
         """Close the group at `offset` and open the next. Once per FILE.
@@ -484,9 +529,9 @@ class Buffer:
         large enough crosses several times and comes through here each time.
         """
         self._write_group(cursor, group, end_offset=offset + 1)
-        cursor.execute("INSERT INTO seal_group (bytes) VALUES (0)")
+        cursor.execute("INSERT INTO extent (bytes) VALUES (0)")
 
-        return _Group(int(cursor.lastrowid or 0), None, 0, None)
+        return _Group(int(cursor.lastrowid or 0), None, 0)
 
     def _write_group(
         self, cursor: sqlite3.Cursor, group: _Group, end_offset: int | None = None
@@ -497,12 +542,11 @@ class Buffer:
         just the running total being persisted for other processes to read.
         """
         cursor.execute(
-            "UPDATE seal_group SET start_offset = ?, bytes = ?, opened_at = ?,"
+            "UPDATE extent SET start_offset = ?, bytes = ?,"
             " end_offset = ? WHERE group_id = ?",
             (
                 group.start_offset,
                 group.bytes,
-                group.opened_at,
                 end_offset,
                 group.group_id,
             ),
@@ -567,6 +611,70 @@ class Buffer:
             ).fetchone()
 
         return int(row[0])
+
+    @property
+    def schema(self) -> pa.Schema:
+        """The declared Arrow schema, for building a second buffer like this
+        one — an archive rewrite re-ingests through a scratch buffer and must
+        cast the rows exactly as this one would."""
+        return self._schema
+
+    def seed_offsets(self, first: int) -> None:
+        """Make the next appended row take offset `first`.
+
+        Only for the scratch buffer an archive rewrite re-ingests through. Rows
+        being re-cut keep the offsets they already have — they are the same
+        rows, and §4's contiguous non-overlapping ranges are stated in them —
+        so the sequence has to resume where the range starts rather than at 1.
+
+        Seeded rather than supplied per row, so the rewrite goes through the
+        ordinary append path and I11 still holds: nothing hands an offset to
+        `extend`, the counter simply starts elsewhere.
+        """
+        # `sqlite_sequence` is SQLite's own, and documented as writable — but
+        # it carries no unique constraint, so this is an UPDATE with an INSERT
+        # behind it rather than an upsert. The row appears only after the first
+        # AUTOINCREMENT insert, which for a buffer opened seconds ago has not
+        # happened yet.
+        with self._lock, self._con:
+            # Loud, because the silent version is unrecoverable. SQLite assigns
+            # `max(largest existing rowid, seq) + 1`, so seeding DOWN past
+            # existing rows does nothing at all and every following row lands
+            # at an offset belonging to different data — which a rewrite then
+            # commits. Nothing downstream can detect it: the row counts match,
+            # the ranges look contiguous, and the payloads are simply attached
+            # to the wrong offsets.
+            if self._con.execute("SELECT 1 FROM buffer LIMIT 1").fetchone():
+                msg = (
+                    "cannot seed offsets on a buffer that already holds rows: "
+                    "SQLite ignores a sequence lowered past them"
+                )
+                raise ValueError(msg)
+
+            updated = self._con.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
+                (first - 1,),
+            )
+            if not updated.rowcount:
+                self._con.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
+                    (first - 1,),
+                )
+
+    def group_bytes(self, end: int) -> int:
+        """What the extent ending at `end` holds, before a file claims it.
+
+        Read out so it can be recorded against the archive's copy: the scratch
+        buffer measured these rows exactly as the appender would have, and that
+        count is the whole reason the rewrite goes through a buffer at all.
+        """
+        with self._lock:
+            row = self._con.execute(
+                "SELECT bytes FROM extent WHERE end_offset = ? AND rel_path IS NULL",
+                (end,),
+            ).fetchone()
+
+        return 0 if row is None else int(row[0])
 
     def rows_below(self, end: int) -> pa.Table:
         """Buffered rows with `offset < end`, as Arrow. The seal's input."""
@@ -724,8 +832,9 @@ class Buffer:
         """
         with self._lock:
             row = self._con.execute(
-                "SELECT start_offset, end_offset FROM seal_group"
-                " WHERE end_offset IS NOT NULL ORDER BY group_id LIMIT 1"
+                "SELECT start_offset, end_offset FROM extent"
+                " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
+                " ORDER BY group_id LIMIT 1"
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]))
@@ -738,46 +847,51 @@ class Buffer:
         """
         with self._lock:
             row = self._con.execute(
-                "SELECT max(end_offset) FROM seal_group WHERE end_offset IS NOT NULL"
+                "SELECT max(end_offset) FROM extent"
+                " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
             ).fetchone()
 
         return None if row[0] is None else int(row[0])
 
-    def close_open_group(self, cutoff: int | None = None) -> bool:
+    def close_open_group(self) -> bool:
         """Cut the open group short so a sealer can pick it up.
 
-        With `cutoff`, only if its first row landed at or before then. That is
-        `max_age` (§4), and it belongs to the sealer rather than the appender:
-        a quiet stream is one that is not appending, so the appender has no
-        moment at which to notice. Harmless to race — the predicate matches
-        nothing once another poller has closed it.
+        Only `seal()` calls this, and cutting short is exactly what "seal now"
+        means — the resulting file is under `target_size` by definition. It is
+        the one way this library writes an undersized file, and it takes a
+        deliberate call to do it.
 
-        Without one, unconditionally, which is what an explicit `seal()` means.
+        With `cutoff`, only if the group's first row landed at or before then.
+        That was `max_age`, which no longer exists; the parameter is kept
+        because the offline archive rewrite needs the same conditional cut.
+
         An empty group is never closed either way; there would be no file.
+        Harmless to race — the predicate matches nothing once another caller
+        has closed it.
         """
-        stale = "" if cutoff is None else " AND opened_at <= ?"
         # Asked before it is written. The sealer calls this on every poll, and
         # the answer is almost always "nothing to close" — issuing a write
         # transaction to discover that would put a commit and an fsync on a
         # timer, for every log, forever. The read is a single row.
         with self._lock:
             if not self._con.execute(
-                "SELECT 1 FROM seal_group WHERE end_offset IS NULL"
-                " AND start_offset IS NOT NULL" + stale,
-                () if cutoff is None else (cutoff,),
+                "SELECT 1 FROM extent WHERE end_offset IS NULL"
+                " AND rel_path IS NULL AND start_offset IS NOT NULL",
+                (),
             ).fetchone():
                 return False
 
         with self._transaction():
             cursor = self._con.execute(
-                "UPDATE seal_group SET end_offset ="
+                "UPDATE extent SET end_offset ="
                 ' (SELECT max("litelink_offset") + 1 FROM buffer)'
-                " WHERE end_offset IS NULL AND start_offset IS NOT NULL" + stale,
-                () if cutoff is None else (cutoff,),
+                " WHERE end_offset IS NULL AND rel_path IS NULL"
+                " AND start_offset IS NOT NULL",
+                (),
             )
             closed = bool(cursor.rowcount)
             if closed:
-                self._con.execute("INSERT INTO seal_group (bytes) VALUES (0)")
+                self._con.execute("INSERT INTO extent (bytes) VALUES (0)")
 
         return closed
 
@@ -834,9 +948,134 @@ class Buffer:
                 return False
 
             self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
-            self._con.execute("DELETE FROM seal_group WHERE end_offset = ?", (end,))
+            # NAMED, not deleted. The row is the same fact before and after —
+            # this range, these bytes — and sealing only settles where it
+            # lives. Deleting it and writing the size to a second table was
+            # half of this one reinvented, and left the two able to disagree.
+            # Same transaction as the rows it retires, so a file can never be
+            # committed with the count of what it holds lost.
+            self._con.execute(
+                "UPDATE extent SET rel_path = ?, named_at = unixepoch()"
+                " WHERE end_offset = ? AND rel_path IS NULL",
+                (rel_path, end),
+            )
 
         return True
+
+    # -- file sizes ---------------------------------------------------------
+
+    def file_bytes(self) -> dict[str, int]:
+        """What every known data file holds in memory, keyed by location.
+
+        Root-relative for local files, so a log directory stays movable; the
+        full URI for archived ones, which have no root to be relative to. A
+        named extent is a file; an unnamed one is still buffered.
+
+        All of it at once: the callers are compaction, sync and the archive
+        rewrite, all of which walk the whole file list, and one indexed read
+        beats a query per file.
+
+        A file missing from this is not an error. It means the log has files
+        this database never recorded — one written by a version that did not
+        keep them, or an archive whose local extents were lost — and the
+        callers treat an unknown size as "full", so an unmeasured file is never
+        merged on a guess about what it holds.
+        """
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, bytes FROM extent WHERE rel_path IS NOT NULL"
+            ).fetchall()
+
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def file_ages(self) -> dict[str, int]:
+        """When each file was written, as a unix timestamp, keyed by location.
+
+        A log's own record of its files' ages, because Iceberg's does not
+        survive. A file's age used to be read off the snapshot that added it,
+        and `expire` deletes that snapshot — after which the file appeared in
+        no age map, `evict` could not call it stale, and `local_retention`
+        silently stopped reclaiming anything.
+
+        The two settings are sized by unrelated things: §6 wants
+        `snapshot_retention` above the longest scan, §8 wants
+        `local_retention` above the longest hot lookback. Any deployment where
+        the second is longer than the first — which is the ordinary one — has
+        every file losing its Iceberg age before it is old enough to evict.
+        """
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, named_at FROM extent"
+                " WHERE rel_path IS NOT NULL AND named_at IS NOT NULL"
+            ).fetchall()
+
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def record_file(self, rel_path: str, start: int, end: int, held: int) -> None:
+        """Record a second file holding an extent the log already has.
+
+        What `sync` calls when it pushes: the archive's copy covers the same
+        offsets and holds the same bytes, so it gets its own row under its own
+        URI rather than a measurement of its own. It could not be measured
+        again anyway — nothing recoverable from a Parquet file is the
+        appender's count of what those rows cost in memory, and the local row
+        goes when the local file is unlinked.
+
+        This is why the mapping lives here. Iceberg has no per-file field to
+        hang it on: v2's data-file metadata is a fixed set — column sizes,
+        value counts, encryption key metadata — with nothing user-extensible,
+        and `add_files` offers no way to attach one. Table properties are per
+        table. So the coordinator that already records every path before its
+        file exists (I16) records this too, for both tiers, in one shape.
+        """
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO extent"
+                " (start_offset, end_offset, bytes, rel_path, named_at)"
+                " VALUES (?, ?, ?, ?, unixepoch())"
+                " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
+                (start, end, held, rel_path),
+            )
+
+    def record_merge(self, rel_path: str, sources: Iterable[str]) -> None:
+        """Replace the sources' extents with one covering all of them.
+
+        Addition, not re-measurement: a merge writes exactly the rows it read,
+        so the output holds what the inputs held and spans what they spanned.
+        That keeps the number in the same currency as the seal that first
+        measured it, however many rewrites later — which is the whole reason it
+        is carried rather than derived from whatever the merged file compresses
+        to. It is also what lets the archive rewrite build its extents with the
+        same arithmetic a local compaction uses.
+        """
+        paths = list(sources)
+        if not paths:
+            return
+
+        placeholders = ",".join("?" * len(paths))
+        with self._transaction():
+            summed = self._con.execute(
+                "SELECT sum(bytes), count(*), min(start_offset), max(end_offset)"  # noqa: S608
+                f" FROM extent WHERE rel_path IN ({placeholders})",
+                paths,
+            ).fetchone()
+            # Only when every source was recorded. Summing a subset would
+            # understate the output and invite a merge of something already
+            # full; leaving it absent marks it unknown, which every caller
+            # treats as "do not touch".
+            if summed[1] == len(paths):
+                self._con.execute(
+                    "INSERT INTO extent"
+                    " (start_offset, end_offset, bytes, rel_path, named_at)"
+                    " VALUES (?, ?, ?, ?, unixepoch())"
+                    " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
+                    (summed[2], summed[3], int(summed[0]), rel_path),
+                )
+
+            self._con.execute(
+                f"DELETE FROM extent WHERE rel_path IN ({placeholders})",  # noqa: S608
+                paths,
+            )
 
     # -- meta ---------------------------------------------------------------
     #
@@ -871,6 +1110,87 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
+    def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
+        """Record `value`, applying `reset` only if it is a MOVE.
+
+        The question "is this a change?" is answered against the durable value,
+        inside the transaction that acts on the answer. Asked of a process's
+        memory instead, both answers are wrong in a two-process deployment,
+        because nothing refreshes that memory except a sync:
+
+        * memory stale, argument current — re-asserting the archive the log
+          already has reads as a move and zeroes the watermarks of a bucket
+          that genuinely holds the data;
+        * memory stale, argument stale — re-pointing BACK to an archive reads
+          as a restatement, and the log keeps the other archive's watermark
+          over a bucket whose extent is lower. Eviction believes it (I4).
+
+        Returns whether it was a move.
+        """
+        with self._transaction():
+            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+            current = (row[0] if row is not None else None) or None
+            moved = current != (value or None)
+            pairs = {key: value, **(dict(reset) if moved else {})}
+            self._con.executemany(
+                "INSERT INTO meta (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                list(pairs.items()),
+            )
+            return moved
+
+    def set_meta_if(
+        self, key: str, expected: str | None, pairs: Mapping[str, str]
+    ) -> bool:
+        """Write `pairs`, but only while `meta[key]` still reads `expected`.
+
+        Compare-and-set, in ONE write transaction, for the guards that decide
+        whether a fact still belongs to the log it was computed for. Read and
+        write as separate statements, the check is only ever a statement about
+        the past: `sync` re-reads which archive it is pushing to before
+        recording a watermark, and a `set_archive` landing between the read and
+        the write leaves the log pointed at the NEW archive holding the OLD
+        one's extent — which eviction believes (I4) and nothing ever lowers.
+
+        The lease does not close that window, because the window opens when the
+        lease has already lapsed: a push that spent longer than the TTL in S3
+        is exactly the case the guard exists for, and the re-point that races
+        it took the lease lawfully. SPEC §4a states the rule — the read of a
+        conflicting claim and the write that depends on it happen in one SQLite
+        transaction, or they are not a guard.
+
+        Returns whether the write happened, so callers can decline rather than
+        record something they no longer have the right to record.
+        """
+        with self._transaction():
+            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+            current = (row[0] if row is not None else None) or None
+            if current != (expected or None):
+                return False
+
+            self._con.executemany(
+                "INSERT INTO meta (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                list(pairs.items()),
+            )
+            return True
+
+    def set_meta_all(self, pairs: Mapping[str, str]) -> None:
+        """Write several `meta` values in ONE transaction.
+
+        For facts that are only true together. Re-pointing an archive writes
+        where it is and resets the two watermarks that describe the previous
+        one, and as separate autocommit statements a crash lands between them:
+        either order leaves a log whose parts disagree, and both disagreements
+        have cost a defect. One transaction has no between.
+        """
+        with self._transaction():
+            self._con.executemany(
+                "INSERT INTO meta (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                list(pairs.items()),
+            )
+
     def set_meta(self, key: str, value: str) -> None:
         with self._lock:
             self._con.execute(
@@ -889,8 +1209,28 @@ class Buffer:
         only way to find it without a directory scan is to have written its
         name down first.
         """
-        with self._transaction():
-            self._con.execute("DELETE FROM compacting")
+        # Inserted, never replacing what is already there. Clearing first
+        # destroyed the claims of an operation that had CRASHED — an archive
+        # rewrite accumulates one per uploaded object, and recovery only runs
+        # at `open`, so a long-lived maintainer starting its next merge wiped
+        # them and left those objects referenced by nothing. Each operation
+        # clears its own.
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
+                (lo, hi, rel_path),
+            )
+
+    def claim_output(self, lo: int, hi: int, rel_path: str) -> None:
+        """Record one more output path, without clearing the others.
+
+        A compaction writes one file and `claim_compaction` says so by
+        replacing whatever was there. An archive rewrite writes several before
+        a single commit swaps them all in, and every one of them needs its name
+        recorded before it exists (I2) — so they accumulate, and recovery
+        removes each that the commit never claimed.
+        """
+        with self._lock:
             self._con.execute(
                 "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
                 (lo, hi, rel_path),
@@ -904,9 +1244,35 @@ class Buffer:
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
-    def clear_compaction(self) -> None:
+    def pending_outputs(self) -> list[tuple[int, int, str]]:
+        """Every claimed output, for recovery. One row for a compaction,
+        several for an interrupted archive rewrite."""
         with self._lock:
-            self._con.execute("DELETE FROM compacting")
+            rows = self._con.execute(
+                "SELECT lo, hi, rel_path FROM compacting ORDER BY rowid"
+            ).fetchall()
+
+        return [(int(lo), int(hi), str(path)) for lo, hi, path in rows]
+
+    def clear_compaction(self, rel_path: str | None = None) -> None:
+        """Retire one claim, or every claim.
+
+        One by default of the caller's choosing, because a claim belongs to an
+        operation and clearing another's is how a crashed rewrite's uploads
+        became unnameable. Recovery clears one at a time too, for the same
+        reason: a rewrite whose lease lapsed mid-upload can be claiming its
+        next segment while recovery is still resolving the last.
+
+        The whole-table form is left for a caller that has genuinely resolved
+        every row, and nothing does today.
+        """
+        with self._lock:
+            if rel_path is None:
+                self._con.execute("DELETE FROM compacting")
+            else:
+                self._con.execute(
+                    "DELETE FROM compacting WHERE rel_path = ?", (rel_path,)
+                )
 
     # -- deletion queue ---------------------------------------------------
 
@@ -944,6 +1310,13 @@ class Buffer:
             self._con.execute(
                 "DELETE FROM pending_delete WHERE rel_path = ?", (rel_path,)
             )
+            # The file is gone from disk, so what it held is no longer a fact
+            # about anything. Dropped here rather than when the table stopped
+            # referencing it: until the grace period passes an open scan may
+            # still be reading it (I6).
+            # The extent goes with the file. It described where those rows
+            # live, and they no longer live anywhere by that name.
+            self._con.execute("DELETE FROM extent WHERE rel_path = ?", (rel_path,))
 
     def queued_deletions(self) -> list[str]:
         with self._lock:

@@ -167,8 +167,10 @@ def test_a_rejected_maintain_does_not_strand_the_lease(tmp_path: Path) -> None:
     log = Log.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), archive="s3://bucket/x"
     )
-    with pytest.raises(NotImplementedError):
-        log.maintain()
+    # sync() refuses without credentials reaching a real endpoint; what matters
+    # is that a refusal hands the lease back rather than holding it for its TTL.
+    with pytest.raises(Exception):  # noqa: B017, PT011 - any refusal will do
+        log.sync()
 
     other = Lease(log._buffer._con, log._buffer._lock, "maintain", new_owner())
 
@@ -188,7 +190,7 @@ def test_threads_in_one_process_still_exclude_each_other(tmp_path: Path) -> None
     same one; what the lease decides is which of them writes it, and writing it
     twice is the failure worth catching.
     """
-    with open_log(tmp_path, config=LogConfig(target_size=1 << 30)) as log:
+    with open_log(tmp_path, config=LogConfig(target_seal_size=1 << 30)) as log:
         log.extend(rows(200))
         started = threading.Event()
         results: list[object] = []
@@ -218,7 +220,7 @@ def test_a_separate_process_can_seal(tmp_path: Path) -> None:
     The writer's threshold is set out of reach so that nothing it does can seal;
     everything here is the other process's work.
     """
-    config = LogConfig(target_size=1 << 30)
+    config = LogConfig(target_seal_size=1 << 30)
     with Log.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
@@ -261,7 +263,7 @@ def test_a_writer_defers_to_a_sealer_in_another_process(tmp_path: Path) -> None:
     """
     # Nothing seals here, so the only seals are the explicit ones below and
     # the assertions are not racing this log's own thread.
-    config = LogConfig(target_size=1 << 30)
+    config = LogConfig(target_seal_size=1 << 30)
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(400))
 
@@ -287,7 +289,7 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
     groups still queued and nothing able to pick them up for 30 seconds.
     """
 
-    config = LogConfig(target_size=1 << 30)
+    config = LogConfig(target_seal_size=1 << 30)
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(50))
 
@@ -317,7 +319,7 @@ def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
     each would clear from under the other — leaving a half-written file that
     nothing could name, which is the one thing §12's queue exists to prevent.
     """
-    with open_log(tmp_path, config=LogConfig(target_size=1 << 30)) as log:
+    with open_log(tmp_path, config=LogConfig(target_seal_size=1 << 30)) as log:
         log.extend(rows(20))
         log.seal()
 
@@ -352,7 +354,7 @@ def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
     nameable. And `finish_seal` clears only the claim it is given, so a lapsed
     writer cannot wipe the record its successor is working under.
     """
-    config = LogConfig(target_size=1 << 30)
+    config = LogConfig(target_seal_size=1 << 30)
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(40))
         log._buffer.close_open_group()

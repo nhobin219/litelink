@@ -44,7 +44,7 @@ SORT_BY = ("event_ts", "icao24")
 COLUMNS = ("event_ts", "ingest_ts", "icao24", "altitude_ft", "speed_kt", "note")
 
 # Large enough that nothing seals underneath a measurement by accident.
-NEVER_SEAL = LogConfig(target_size=1 << 40, snapshot_retention=timedelta(days=1))
+NEVER_SEAL = LogConfig(target_seal_size=1 << 40, snapshot_retention=timedelta(days=1))
 
 
 def observations(

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
-from litelink.log import Log, LogConfig
+from litelink._maintenance import runs, stable_prefix
+from litelink._table import DataFile
+from litelink.log import COMPACT_MULTIPLE, Log, LogConfig, validate
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
 
@@ -21,7 +24,7 @@ def seal_files(log: Log, count: int, per_file: int = 4) -> None:
 
 def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
     with open_log(
-        tmp_path, LogConfig(compact_below=1 << 30, compact_min_files=2)
+        tmp_path, LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     ) as log:
         seal_files(log, 4)
         assert len(log._table.data_files()) == 4
@@ -36,7 +39,7 @@ def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
 def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
     """Below the threshold the pass must leave the files alone."""
     with open_log(
-        tmp_path, LogConfig(compact_below=1 << 30, compact_min_files=5)
+        tmp_path, LogConfig(target_seal_size=1 << 30, compact_min_files=5)
     ) as log:
         seal_files(log, 4)
         log.maintain()
@@ -44,19 +47,40 @@ def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
         assert len(log._table.data_files()) == 4
 
 
-def test_compaction_skips_files_over_compact_below(tmp_path: Path) -> None:
-    with open_log(tmp_path, LogConfig(compact_below=1, compact_min_files=2)) as log:
-        seal_files(log, 3)
+def test_compaction_leaves_full_files_alone(tmp_path: Path) -> None:
+    """In normal operation compaction is a no-op.
+
+    Every file here came from a cut the appender made at `target_seal_size`, so each
+    already holds what a file should. Merging any two would produce one holding
+    twice that. The rule that decides this reads what the files hold in memory,
+    not their size on disk — these compress to a fraction of the target, and
+    judged that way every one of them looks starved.
+    """
+    config = LogConfig(
+        target_seal_size=2048,
+        # Equal, which is what makes this test about "already full" rather than
+        # about conversion. The default is eight times the seal size, and under
+        # that these files WOULD merge — correctly, into one archive-shaped
+        # file. See `test_compaction_converts_sealed_files_into_larger_ones`.
+        target_compact_size=2048,
+        compact_min_files=2,
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(200))
+        log.seal()
+        before = len(log._table.data_files())
+        assert before >= 3, "the target must be crossed several times"
+
         log.maintain()
 
-        assert len(log._table.data_files()) == 3
+        assert len(log._table.data_files()) == before
 
 
 def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
     """§6 step 2: re-sorted, not merely concatenated."""
     import pyarrow.parquet as pq
 
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with Log.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
@@ -73,7 +97,7 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
 
 
 def test_compaction_preserves_every_row(tmp_path: Path) -> None:
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 5, per_file=3)
         before = read_all(log)
@@ -126,24 +150,50 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
         assert len(read_all(log)) == 12
 
 
-def test_maintain_refuses_when_an_archive_is_configured(tmp_path: Path) -> None:
-    """I4 needs sync's registration watermark, and sync does not exist yet."""
+def test_eviction_waits_for_the_archive_watermark(tmp_path: Path) -> None:
+    """I4, and the only line of `maintain` that is correctness (§5, §8).
+
+    With an archive configured the local copy stops being the only one only
+    once sync says so. `maintain` used to refuse outright rather than risk it;
+    now it clamps the eviction boundary to what sync has recorded, so a sync
+    arbitrarily far behind delays eviction instead of losing data.
+
+    No object store needed: the watermark is a `meta` row, and what is under
+    test is that eviction reads it.
+    """
+    config = LogConfig(local_retention=timedelta(0))
     log = Log.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
+        config=config,
         archive="s3://bucket/prefix",
     )
-    with pytest.raises(NotImplementedError, match="sync"):
+    try:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+
+        # Nothing archived yet: retention says evict everything, I4 says none.
         log.maintain()
 
-    log.close()
+        assert log.table_files() == before, "evicted with an empty archive"
+
+        # Sync has reached the first file only.
+        first = min(f.hi for f in log._table.data_files())
+        log._buffer.set_meta("archive_through", str(first))
+        log.maintain()
+
+        assert log.table_files() == before - 1, "did not evict what was archived"
+    finally:
+        log.close()
 
 
 def test_reads_stay_correct_across_a_compaction(tmp_path: Path) -> None:
     """I8: once readable, a row stays readable."""
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.extend(rows(4, start=12))
@@ -214,13 +264,20 @@ def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
         assert written.exists(), "sweep deleted a file `sealing` had claimed"
 
 
-def test_recovery_removes_a_crashed_compaction_by_name(tmp_path: Path) -> None:
+def test_recovery_queues_a_crashed_compaction_by_name(tmp_path: Path) -> None:
     """§11: no snapshot was committed, so the output is dead — and it is named.
 
-    The point is that recovery unlinks one known path. Nothing scans a
+    The point is that recovery resolves one known path. Nothing scans a
     directory to discover that this file was garbage.
+
+    QUEUED rather than unlinked, because the owner being recovered from may not
+    be dead. A maintainer stalled past its lease can wake between the check and
+    the removal and commit the very file about to be deleted, taking the whole
+    range with it. The queue's drain re-reads what the table references at
+    unlink time, so the last word belongs to a check made when the file is
+    actually removed — the same route an abandoned seal has always taken.
     """
-    config = LogConfig(compact_min_files=99)
+    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
         rel_path = log._layout.compaction_path(1, 4, "deadbeef")
@@ -230,9 +287,38 @@ def test_recovery_removes_a_crashed_compaction_by_name(tmp_path: Path) -> None:
         half_written.write_bytes(b"a compaction that never committed")
 
     with open_log(tmp_path, config) as recovered:
-        assert not half_written.exists()
+        assert rel_path in recovered._buffer.queued_deletions()
         assert recovered._buffer.pending_compaction() is None
+
+        recovered._maintenance.drain()
+
+        assert not half_written.exists()
         # The inputs were never superseded, so the table is already correct.
+        assert len(read_all(recovered)) == 4
+
+
+def test_recovery_never_removes_a_file_the_table_adopted(tmp_path: Path) -> None:
+    """The reason recovery queues instead of unlinking.
+
+    An owner recovered from may still be alive — stalled past its lease — and
+    can commit its output between the check and the removal. Here the file IS
+    referenced, standing in for that commit having landed, and the drain must
+    refuse it. Unlinking on the strength of an earlier read would take the
+    whole range: the sources it superseded were queued before the commit and
+    drain away behind it.
+    """
+    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 1)
+        live = log._table.data_files()[0]
+        # Claimed as though a crashed compaction had produced it, while the
+        # table in fact references it.
+        log._buffer.claim_compaction(live.lo, live.hi, log._layout.relative(live.path))
+
+    with open_log(tmp_path, config) as recovered:
+        recovered._maintenance.drain()
+
+        assert Path(live.path).exists(), "a referenced file must survive recovery"
         assert len(read_all(recovered)) == 4
 
 
@@ -270,7 +356,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
     walk the filesystem; the library is not.
     """
     config = LogConfig(
-        compact_below=1 << 30,
+        target_seal_size=1 << 30,
         compact_min_files=2,
         local_retention=timedelta(days=365),
         snapshot_retention=timedelta(days=365),
@@ -293,7 +379,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
 
 
 def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -> None:
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.maintain()
@@ -304,7 +390,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
     # deadline is evaluated against the CURRENT setting, not one frozen at
     # enqueue time, so lowering it takes effect on what is already queued.
     impatient = LogConfig(
-        compact_below=1 << 30,
+        target_seal_size=1 << 30,
         compact_min_files=2,
         snapshot_retention=timedelta(microseconds=1),
     )
@@ -399,8 +485,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
     be counted.
     """
     config = LogConfig(
-        target_size=1 << 40,
-        compact_below=1 << 30,
+        target_seal_size=1 << 40,
         compact_min_files=2,
         local_retention=timedelta(microseconds=1),
     )
@@ -468,7 +553,7 @@ def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> N
     table-referenced file, and a crash mid-write destroyed the only copy of
     those rows. Two owners racing the role hit the same collision.
     """
-    config = LogConfig(compact_below=1 << 30, compact_min_files=2)
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.maintain()
@@ -483,3 +568,509 @@ def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> N
         assert len(after) == 1
         assert after[0] != before[0], "the rewrite reused the live file's path"
         assert len(read_all(log)) == 12
+
+
+def sized(*sizes: int) -> tuple[list[DataFile], dict[str, int]]:
+    """Files holding the given uncompressed sizes, adjacent and in order.
+
+    Sizes come as a separate mapping because that is how the real ones do: a
+    file's size on disk is what compression made of it, and what it holds in
+    memory is carried in the buffer beside it.
+    """
+    files, memory, offset = [], {}, 1
+    for size in sizes:
+        path = f"{offset}.parquet"
+        # A deliberately misleading on-disk size: every rule under test must
+        # read `memory`, and any that reaches for `size` gets a wrong answer.
+        files.append(DataFile(path=path, size=1, rows=1, lo=offset, hi=offset))
+        memory[path] = size
+        offset += 1
+
+    return files, memory
+
+
+def test_a_run_closes_before_it_exceeds_the_budget() -> None:
+    """The output cap. Without it, a hundred files just under the line merge
+    into one file a hundred times the target."""
+    files, memory = sized(30, 30, 30, 30, 30)
+    grouped = runs(files, 100, memory)
+
+    assert [len(run) for run in grouped] == [3, 2]
+    assert all(sum(memory[f.path] for f in run) <= 100 for run in grouped)
+
+
+def test_a_file_over_the_budget_forms_its_own_run() -> None:
+    """It has no room for a neighbour, so it must not drag one in."""
+    files, memory = sized(10, 500, 10)
+    grouped = runs(files, 100, memory)
+
+    assert [[memory[f.path] for f in run] for run in grouped] == [[10], [500], [10]]
+
+
+def test_an_unmeasured_file_counts_as_full() -> None:
+    """Unknown is not zero.
+
+    Treating an unrecorded size as small is what pulls an already-correct file
+    into a rewrite; the cost of leaving it alone is only a merge that did not
+    happen.
+    """
+    files, memory = sized(10, 10, 10)
+    del memory[files[1].path]
+
+    assert [len(run) for run in runs(files, 100, memory)] == [1, 1, 1]
+
+
+def test_the_trailing_run_is_never_settled() -> None:
+    """It is under budget, so a file that has not been written yet can still
+    join it — pushing it now would archive something compaction will replace.
+
+    Two files short of `min_files`, so compaction leaves them alone today; it
+    is room in the budget, not the merge, that makes them unsettled.
+    """
+    files, memory = sized(60, 60, 20)
+
+    assert stable_prefix(files, 100, 3, memory) == 1
+
+
+def test_a_full_trailing_run_is_settled() -> None:
+    """Nothing more fits, so nothing can change it."""
+    files, memory = sized(60, 60, 100)
+
+    assert stable_prefix(files, 100, 2, memory) == 3
+
+
+def test_nothing_before_a_mergeable_run_is_settled() -> None:
+    """Compaction is about to rewrite it, and the watermark is a prefix, so the
+    files ahead of it cannot be archived past it either."""
+    files, memory = sized(200, 200, 10, 10, 10)
+
+    assert stable_prefix(files, 100, 2, memory) == 2
+
+
+def test_a_stranded_small_file_is_still_settled() -> None:
+    """The regression that made a single explicit seal block the archive
+    forever. A small file between larger neighbours can never be merged — no
+    run containing it fits the budget — so waiting for it to grow waits
+    forever, and the watermark never advances past it again."""
+    files, memory = sized(98, 5, 98, 200)
+
+    assert stable_prefix(files, 100, 2, memory) == 4
+
+
+def test_sizing_does_not_depend_on_how_well_the_data_compressed() -> None:
+    """What the on-disk rule got wrong.
+
+    These files each hold a full target's worth of rows and compressed to an
+    eighth of it. Judged by their size on disk they all look starved, and
+    compaction merged eight at a time into a file holding eight times the
+    memory the target allows — while `sync`, asking whether a file had reached
+    half the target, found none and left the archive empty. Judged by what they
+    hold, each is already full: nothing to merge, everything archivable.
+    """
+    target = 64 * 1024
+    files, memory = sized(*([target] * 24))
+
+    assert runs(files, target, memory) == [[f] for f in files], "each already full"
+    assert stable_prefix(files, target, 2, memory) == 24
+
+
+def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> None:
+    """`local_retention` must not depend on `snapshot_retention`.
+
+    A file's age came from the snapshot that added it, and expiry deletes that
+    snapshot — after which the file was in no age map at all, `evict` could not
+    classify it as stale, and it stayed on local disk for ever.
+
+    The two settings are sized by unrelated things: §6 says `snapshot_retention`
+    must exceed the longest SCAN, §8 says `local_retention` must exceed the
+    longest hot LOOKBACK. So the ordinary configuration has expiry running in
+    minutes and retention in days — and every file lost its age long before it
+    was old enough to evict. Retention silently did nothing.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)
+        files = log._table.data_files()
+        assert len(files) == 4
+
+        # A commit AFTER the last seal, which is what makes every remaining
+        # file's adding snapshot expirable. Iceberg always keeps the current
+        # snapshot, so without this the newest file stays dateable and drags
+        # the rest out with it — which is why the fault only appears once a log
+        # has been running a while, and never in a test that just seals.
+        # Eviction itself is the commit that does it in practice.
+        log._table.evict_through(files[0].hi)
+        log._maintenance.expire()
+
+        remaining = log._table.data_files()
+        assert remaining, "the fixture must leave files behind to evict"
+        assert not set(log._table.snapshot_ages()) & {f.path for f in remaining}, (
+            "the fixture must leave every remaining file undateable"
+        )
+
+        log._maintenance.evict()
+
+        assert log._table.data_files() == [], (
+            "a file whose adding snapshot has expired must still be evictable"
+        )
+
+
+def test_local_rows_keeps_recent_data_a_time_window_would_drop(
+    tmp_path: Path,
+) -> None:
+    """The case a window alone cannot express.
+
+    An hour of a quiet stream is a handful of rows. A retention window sized
+    for a busy stream then evicts almost everything the moment it goes quiet,
+    and the next hot read — the thing `local_retention` exists to serve — goes
+    to the network for data written minutes ago.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        local_rows=8,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)  # 4 rows each, all older than the window
+        log._maintenance.evict()
+
+        kept = log._table.data_files()
+        assert sum(f.rows for f in kept) >= 8, (
+            "the row floor must hold data the window would have dropped"
+        )
+        assert kept[-1].hi == 16, "the newest rows are the ones kept"
+
+
+def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> None:
+    """Floors, not ceilings.
+
+    Both say what must stay readable without a network round trip, so the
+    binding one is whichever retains more — the opposite of how the seal
+    combines its limits, where they are ceilings and the tighter wins.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        # Retains everything: nothing is an hour old.
+        local_retention=timedelta(hours=1),
+        # Retains almost nothing on its own.
+        local_rows=1,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)
+        log._maintenance.evict()
+
+        assert len(log._table.data_files()) == 4, (
+            "the window retains everything, so the row floor must not evict"
+        )
+
+
+def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
+    """`local_retention=None` used to mean "never evict", full stop. With a row
+    floor set it means "no limit from TIME", and the floor still applies."""
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        local_retention=None,
+        local_rows=4,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 4)
+        log._maintenance.evict()
+
+        kept = log._table.data_files()
+        assert sum(f.rows for f in kept) == 4
+        assert kept[-1].hi == 16
+
+
+def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> None:
+    """The job the split gives it.
+
+    With one size knob a compacted file held exactly what a sealed file held,
+    so compaction could repair an undersized file and never produce a large
+    one — which is why it was a no-op in normal operation. Separating the two
+    makes it a conversion stage: seal at the size a hot read wants to scan,
+    compact at the size object storage wants to receive.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=4 * 4096,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        sealed = log._table.data_files()
+        held = log._maintenance.memory()
+        assert len(sealed) >= 4, "several full seals to convert"
+        assert all(held[f.path] <= 4096 * 1.5 for f in sealed), "seal-sized"
+
+        log.maintain()
+
+        compacted = log._table.data_files()
+        after = log._maintenance.memory()
+        assert len(compacted) < len(sealed), "compaction must merge"
+        assert max(after[f.path] for f in compacted) > 4096, (
+            "a compacted file must hold more than a sealed one"
+        )
+        assert all(after[f.path] <= 4 * 4096 for f in compacted), (
+            "and no more than the compaction target"
+        )
+        assert log.scan().read_all().num_rows == 1200
+
+
+def test_only_compacted_files_are_eligible_for_the_archive(tmp_path: Path) -> None:
+    """Eligibility falls out of the existing rule, with nothing added.
+
+    `sync` pushes what compaction has finished with. Raise the compaction
+    target above the seal size and a freshly sealed file is a merge candidate
+    by definition — so it is not settled, and not archived, until it has been
+    converted. No separate eligibility flag, and no way for the two to disagree
+    about which files are still in play.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8 * 4096,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(200))
+        log.seal_due()
+        sealed = log._table.data_files()
+        memory = log._maintenance.memory()
+
+        settled = stable_prefix(
+            sealed,
+            config.compact_size,
+            config.compact_min_files,
+            memory,
+            config.compact_rows,
+        )
+
+        assert settled == 0, (
+            "sealed files are merge candidates, so none may be archived yet"
+        )
+
+
+def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
+    tmp_path: Path,
+) -> None:
+    """Conversion is on by default, including with no archive.
+
+    File count is a measured read cost here rather than a reputation: reading
+    the offset boundary from manifest statistics measured 1.0 ms over one file
+    and 44 ms over 64. A local-only log gets that benefit too, which is why the
+    default is a multiple rather than "same as the seal, convert nothing".
+    """
+    config = LogConfig(target_seal_size=4096, compact_min_files=2)
+
+    assert config.compact_size == 4096 * COMPACT_MULTIPLE
+
+    with open_log(tmp_path, replace(config, snapshot_retention=timedelta(0))) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        before = len(log._table.data_files())
+        assert before >= 4
+
+        log.maintain()
+
+        assert len(log._table.data_files()) < before, (
+            "the conversion must run without an archive configured"
+        )
+        assert log.scan().read_all().num_rows == 1200
+
+
+def test_row_ceilings_scale_with_the_conversion_too() -> None:
+    """Setting only the seal's row limit must not cap conversion at one seal.
+
+    A ceiling that did not scale would make `compact_rows` equal
+    `target_seal_rows`, so every sealed file would already be at it and nothing
+    would ever merge — the conversion silently off for anyone who set a row
+    limit.
+    """
+    assert LogConfig(target_seal_size=4096, target_seal_rows=100).compact_rows == (
+        100 * COMPACT_MULTIPLE
+    )
+    assert LogConfig(target_seal_size=4096).compact_rows is None
+
+
+def test_a_compaction_target_under_the_seal_size_is_refused() -> None:
+    """It would ask compaction to shrink a file it just merged, for ever."""
+    config = LogConfig(target_seal_size=8192, target_compact_size=4096)
+    with pytest.raises(ValueError, match="target_compact_size"):
+        validate(SCHEMA, (), config, None)
+
+
+def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
+    """`maintain` is one call for all three; the parts are callable alone.
+
+    Their costs differ by orders of magnitude now that conversion reads and
+    rewrites whole files while eviction and expiry are metadata commits, so a
+    deployment may want them on different schedules. Running them separately
+    has to reach the same state as running them together.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8 * 4096,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        before = len(log._table.data_files())
+        assert before >= 4
+
+        log.compact()
+        converted = len(log._table.data_files())
+        assert converted < before, "compaction must run on its own"
+
+        log.evict()
+        log.expire()
+
+        assert log._table.data_files() == [], "eviction must run on its own"
+        # What is left is the unsealed tail, which never reached the seal
+        # target and is therefore still in the buffer. Eviction removes FILES;
+        # rows that are not in one are not its business.
+        assert log.scan().read_all().num_rows == log.buffered_rows()
+
+
+def test_a_single_pass_takes_the_maintenance_lease(tmp_path: Path) -> None:
+    """Running the parts separately is not a way around the exclusion.
+
+    Whichever entry point a second owner comes through, it is refused — the
+    lease is the thing that stops two maintainers compacting the same run to
+    the same deterministic path, which is a torn file rather than a conflict
+    Iceberg could resolve.
+    """
+    with open_log(tmp_path, LogConfig(target_seal_size=4096)) as log:
+        held = log._lease("maintain")
+        assert held.acquire()
+        try:
+            for pass_ in (log.compact, log.evict, log.expire):
+                with pytest.raises(RuntimeError, match="maintenance lease"):
+                    pass_()
+        finally:
+            held.release()
+
+        log.compact()
+
+
+def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
+    """A row floor lands mid-file; the boundary must not.
+
+    `evict_through` filters by ROW, so a boundary inside a file makes pyiceberg
+    rewrite it copy-on-write — and the replacement lands at a path this library
+    never learns, which breaks the rule every reclamation rests on: a file's
+    path is in SQLite before the file exists (I2). The superseded original is
+    left out of the deletion queue too, so once expiry drops the snapshots
+    naming it, nothing can name it again. `drain` is a keyed read and this
+    design refuses directory scans, so it is unreclaimable for good.
+
+    The age limit is already file-aligned — it is some file's `hi` — and so is
+    the archive clamp. Only the row floor is arbitrary, which is why it arrived
+    with `local_rows`.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        target_compact_size=1 << 30,
+        compact_min_files=2,
+        local_retention=timedelta(microseconds=1),
+        # Deliberately not a multiple of the 4 rows each sealed file holds, so
+        # the raw boundary falls inside one.
+        local_rows=6,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 5)
+        before = {f.path for f in log._table.data_files()}
+        assert len(before) == 5
+
+        log._maintenance.evict()
+
+        after = log._table.data_files()
+        assert {f.path for f in after} <= before, (
+            "eviction must not introduce a file, which is what a copy-on-write "
+            "rewrite of a straddling file would do"
+        )
+        # Whole files only: every survivor keeps the exact range it was sealed
+        # with, and the row floor is honoured by keeping MORE than asked.
+        assert sum(f.rows for f in after) >= 6
+        assert all(f.rows == 4 for f in after), "a file was split by the boundary"
+
+
+def test_compaction_will_not_merge_across_the_archive_frontier(
+    tmp_path: Path,
+) -> None:
+    """A watermark that is stale LOW must not put archived files back in a run.
+
+    The watermark is written after the archive commit lands, so a crash between
+    them leaves it lower than what the archive actually holds. Eviction is safe
+    with a low watermark — it waits. Compaction is not: it reads the same
+    number to decide which files are already the archive's business, and a low
+    one pulls an already-archived file into a merge. The merged file then spans
+    the archive's extent, and the next push registers a range partially
+    overlapping one the archive already holds — the same offsets in two files,
+    in the immutable tier, with nothing to repair it.
+
+    So compaction reads the FRONTIER: the higher of the confirmed watermark and
+    the range a push was about to register.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8 * 4096,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        files = log._table.data_files()
+        assert len(files) >= 4
+
+        # A push that registered through the second file and died before its
+        # confirming write: the watermark still says nothing is archived.
+        boundary = files[1].hi
+        log._buffer.set_meta("archive_pending", str(boundary))
+        assert log._maintenance.archived_through() == 0
+        assert log._maintenance.archive_frontier() == boundary
+
+        log.compact()
+
+        merged = log._table.data_files()
+        assert all(f.lo > boundary or f.hi <= boundary for f in merged), (
+            "no file may span the frontier, or the archive gets it twice"
+        )
+        assert log.scan().read_all().num_rows == 1200
+
+
+def test_repointing_clears_the_archive_frontier(tmp_path: Path) -> None:
+    """The frontier names a range the PREVIOUS archive may hold.
+
+    Compaction reads it to decide which files are already the archive's
+    business. Carried across a re-point it would go on refusing to merge files
+    the new archive has never seen — conservative rather than unsafe, but
+    permanently so, because nothing else ever lowers it.
+    """
+    config = LogConfig(target_seal_size=4096, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(400))
+        log.seal_due()
+        log._buffer.set_meta("archive_pending", "999999")
+        assert log._maintenance.archive_frontier() == 999999
+
+        log.set_archive("s3://bucket/somewhere-new")
+
+        assert log._maintenance.archive_frontier() == 0
