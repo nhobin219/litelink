@@ -1015,7 +1015,7 @@ The consequence worth planning for is that local disk holds roughly
 
 ## 13. Open questions
 
-0. **The archive's identity is local, and re-pointing has to reconcile it.** Four
+0. **The archive's identity is local, and re-pointing has to reconcile it.** Seven
    consecutive review rounds found defects in one seam, each fix adding a guard on top
    of the last. That is a design signal, and it is recorded here rather than patched
    again.
@@ -1041,9 +1041,30 @@ The consequence worth planning for is that local disk holds roughly
    `open_archive`), and a re-point becomes one durable fact to change rather than three
    that can disagree.
 
-   Not attempted here. It touches the same code four rounds of fixes just stabilised, and
-   the guards above are sufficient for the operations this library actually supports:
-   attach, detach, and re-point to a fresh prefix.
+   **The deferral has a measured cost, and this paragraph used to understate it.** It
+   claimed the guards above were sufficient for the operations the library supports —
+   attach, detach, re-point to a fresh prefix. A later round disproved that. It found
+   four more defects in this seam, and unlike their predecessors two of them needed no
+   race, no crash and no lease lapse: attaching an archive to a log a maintainer already
+   had open let that maintainer go on deleting the only copy of every row past
+   `local_retention`, because `evict` asked its own memory whether I4 was owed; and
+   re-asserting an archive from a process whose memory had gone stale read as a move and
+   zeroed the watermarks of a bucket that held the data. The findings got *less*
+   contrived, which is the opposite of what a converging seam does.
+
+   The reason is now legible. The archive's identity lives in four places — the `meta`
+   row, each process's `Archive` object, the `archive.db` catalog row, and each captured
+   pyiceberg handle — and every guard listed above synchronises one read-write pair. Each
+   round finds the next pair nobody has synchronised yet. The four latest fixes (pin the
+   URI per push, compare-and-set the re-point against the durable value, refresh `evict`
+   from the buffer, refuse a commit whose table left its warehouse) are the same shape
+   again, and they are not evidence the next round will be clean.
+
+   The identity token above is what ends it, because it gives every guard one immutable
+   value to compare and no second in-memory life. Until it exists, the honest statement
+   of the contract is narrower than the API suggests: **re-pointing a live log is
+   defended interleaving by interleaving, not by construction.** The regime the current
+   mechanism is actually sound in is a re-point with every other process stopped.
 
 0. **Per-operation claims, replacing the maintenance lease.** Designed in §4a, **not
    implemented.** Today `compact`, `evict`, `expire` and `sync` all take one `maintain`
