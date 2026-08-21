@@ -582,3 +582,44 @@ def test_a_transient_failure_does_not_replace_the_archive(
     assert _recorded_location(Layout(tmp_path, "s")) == recorded, (
         "and its catalog entry must survive"
     )
+
+
+def test_an_unreadable_catalog_schema_falls_back_rather_than_rebuilds(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Cannot tell" must not be answered as "there is nothing there".
+
+    The entry is located by reading pyiceberg's own catalog table directly,
+    which is fast and offline and depends on a schema this library does not
+    own. If that read fails — a future pyiceberg lays the rows out differently
+    — answering None sends the open down the create path against an entry that
+    still exists, and every open of that log then fails on a unique
+    constraint. Not data loss, but a log nobody can open, from a query that was
+    only ever an optimisation. It falls back to asking pyiceberg instead:
+    slower, and wrong in no direction.
+
+    The failure is injected rather than simulated by damaging the catalog,
+    because damaging it breaks pyiceberg too — which then rebuilds it empty and
+    makes the archive genuinely absent, testing something else entirely.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        where = log.archive
+        assert where is not None
+        expected = _recorded_location(log._layout)
+        assert expected is not None
+
+    def unanswerable(_: Layout) -> str | None:
+        msg = "cannot read the archive catalog's own table"
+        raise LookupError(msg)
+
+    monkeypatch.setattr("litelink._table._recorded_location", unanswerable)
+    table = LogTable.open_archive(
+        Layout(tmp_path, "s"), where, s3, table_schema(SCHEMA)
+    )
+
+    assert table.metadata_location == expected, (
+        "the existing archive must be found, not replaced"
+    )
