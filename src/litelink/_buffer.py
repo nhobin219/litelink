@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
-from litelink._lease import DEFAULT_TTL_MS, Lease
+from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import column_type
 
 # The library-owned column (§2).
@@ -336,9 +336,21 @@ class Buffer:
         # cannot say anything about a process that is no longer running, and
         # recovery has to know whether an interrupted operation was ours.
         self._con.execute("""
-            CREATE TABLE IF NOT EXISTS lease (
-              role TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS claim (
+              id         INTEGER PRIMARY KEY AUTOINCREMENT,
+              owner      TEXT NOT NULL,
+              expires_at INTEGER NOT NULL,
+              kind       TEXT NOT NULL,
+              lo         INTEGER NOT NULL,
+              hi         INTEGER NOT NULL,
+              rel_path   TEXT
             )
+        """)
+        # Every acquisition asks the same question — is a live claim covering
+        # this range — and asks it inside a write transaction, so it is the one
+        # query that must not degrade into a scan as claims accumulate.
+        self._con.execute("""
+            CREATE INDEX IF NOT EXISTS claim_live ON claim (expires_at, lo, hi)
         """)
 
     # -- size accounting --------------------------------------------------
@@ -821,12 +833,20 @@ class Buffer:
         except (pa.ArrowInvalid, pa.ArrowTypeError):
             return pa.array(values).cast(declared)
 
-    def lease(self, role: str, owner: str, ttl_ms: int = DEFAULT_TTL_MS) -> Lease:
-        """A claim on `role`, backed by this database.
+    def claim(
+        self,
+        kind: str,
+        lo: int,
+        hi: int,
+        owner: str,
+        rel_path: str | None = None,
+        ttl_ms: int = DEFAULT_TTL_MS,
+    ) -> Claim:
+        """A claim on the offset range `[lo, hi]`, backed by this database.
 
-        Handed the connection AND the lock that guards it — see `Lease`.
+        Handed the connection AND the lock that guards it — see `Claim`.
         """
-        return Lease(self._con, self._lock, role, owner, ttl_ms)
+        return Claim(self._con, self._lock, kind, lo, hi, owner, rel_path, ttl_ms)
 
     # -- the seal queue ---------------------------------------------------
 

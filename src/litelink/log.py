@@ -31,9 +31,9 @@ import pyarrow.parquet as pq
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
+from litelink._claim import Claim, new_owner
 from litelink._fs import fsync
 from litelink._layout import Layout
-from litelink._lease import Lease, new_owner
 from litelink._maintenance import (
     Maintenance,
     checkpoint,
@@ -70,6 +70,11 @@ _AWAIT_POLL = 0.05
 
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
+# Above every offset the log will ever assign. What an operation claims when it
+# is not an operation on an interval at all — a re-point, a config change, an
+# archive rewrite — so that it excludes every pass rather than commuting with
+# one it has nothing in common with.
+EVERYTHING = 1 << 62
 
 _CONFIG_KEY = "config"
 # One home, in `_archive`, because `evict` reads it too.
@@ -857,25 +862,32 @@ class Log:
             # other, leaving a half-written file nothing could name.
             lease = self._lease(MAINTAIN_ROLE)
             if not lease.acquire():
-                msg = "another owner holds the maintenance lease"
+                msg = "another owner holds a claim over this range"
                 raise RuntimeError(msg)
 
             try:
                 self._table.set_sort_order(requested)
                 self._sort_by = requested
                 self._maintenance.set_sort_by(requested)
-                self._maintenance.rewrite_sorted(heartbeat=lease.renew)
+                self._maintenance.rewrite_sorted(
+                    heartbeat=lease.renew, owner=lease.owner
+                )
             finally:
                 lease.release()
 
-    def _lease(self, role: str) -> Lease:
-        """A fresh claim on `role` for this attempt.
+    def _lease(self, role: str, lo: int = 0, hi: int = EVERYTHING) -> Claim:
+        """A fresh claim on `[lo, hi]` for this attempt.
 
         Minted per call rather than held as a field. A field would fix one owner
         for the whole Log, and two threads sharing it would then re-enter each
-        other's lease — leaving the role excluding nothing inside a process.
+        other's claim — leaving it excluding nothing inside a process.
+
+        The default range is the whole log, which is what a configuration change
+        needs: re-pointing an archive or rewriting its files is not an operation
+        on an offset interval, so it excludes every pass rather than commuting
+        with any of them.
         """
-        return self._buffer.lease(role, new_owner())
+        return self._buffer.claim(role, lo, hi, new_owner())
 
     def _writable(self) -> None:
         if self.readonly:
@@ -1111,25 +1123,32 @@ class Log:
         # row that refuses a sealer in another process refuses one in another
         # thread on the same terms — and it lapses if this attempt dies
         # mid-seal, so another may finish what `sealing` records.
-        lease = self._lease(SEAL_ROLE)
-        if not lease.acquire():
-            return None
-
-        # No lock here either: the lease is the exclusion, and it already
-        # refuses every other owner in this process and any other. A lock would
-        # be a second answer to a question already settled.
-        #
         # The range comes from the queue, not from whatever the buffer happens
         # to hold now. That is the difference between a file of `target_size`
         # and a file of however much arrived while the sealer was getting here
         # — and it costs one indexed row read instead of the SCAN that asking
         # the buffer for its extent used to.
+        #
+        # Read BEFORE the claim, because the claim is over this range and the
+        # queue is what names it. Nothing is decided by the read: a second
+        # sealer reading the same group loses the claim and returns.
         group = self._buffer.pending_group()
         if group is None:
-            lease.release()
             return None
 
         start, end = group
+        # No lock here: the claim is the exclusion, and it already refuses
+        # every other owner in this process and any other. A lock would be a
+        # second answer to a question already settled.
+        #
+        # One mechanism for both cases: owners are unique per attempt, so the
+        # row that refuses a sealer in another process refuses one in another
+        # thread on the same terms — and it lapses if this attempt dies
+        # mid-seal, so another may finish what `sealing` records.
+        lease = self._buffer.claim(SEAL_ROLE, start, end - 1, new_owner())
+        if not lease.acquire():
+            return None
+
         # A claim already naming this range means a previous attempt got at
         # least as far as recording it and then died — possibly AFTER its
         # commit landed. Replaying blindly re-registers a file the table
@@ -1219,7 +1238,7 @@ class Log:
             time.sleep(_AWAIT_POLL)
 
     def _write_and_commit(
-        self, end: int, rel_path: str, lease: Lease | None = None
+        self, end: int, rel_path: str, lease: Claim | None = None
     ) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
 
@@ -1335,7 +1354,7 @@ class Log:
             finally:
                 seal.release()
 
-    def _recover_seal(self, lease: Lease | None = None) -> None:
+    def _recover_seal(self, lease: Claim | None = None) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
         did not, the whole file is rewritten to the same path.
 
@@ -1469,7 +1488,7 @@ class Log:
         # `set_uri` is a no-op when nothing moved.
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
+            msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
@@ -1497,7 +1516,7 @@ class Log:
         finally:
             lease.release()
 
-    def _push(self, lease: Lease, pinned: str | None) -> None:
+    def _push(self, lease: Claim, pinned: str | None) -> None:
         """Upload and register everything above the archive's extent.
 
         Everything compaction has finished with, which `stable_prefix` decides
@@ -1682,21 +1701,8 @@ class Log:
         # Taken after the refusals above, so a rejected call does not leave
         # a lease behind for its TTL and lock out the process that could
         # have done the work.
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
-            raise RuntimeError(msg)
-
-        try:
-            # Renewed between passes, not merely held. A compaction can run for
-            # tens of seconds against a 30 s lease, and a second maintainer
-            # taking the role mid-pass would compact the same runs to the same
-            # deterministic path — a torn file, not a conflict Iceberg can
-            # resolve. Losing it is a hard error rather than something to plough
-            # on through.
-            self._maintenance.run(heartbeat=lease.renew)
-        finally:
-            lease.release()
+        # Each pass claims what it works on; see `_pass`.
+        self._maintenance.run(heartbeat=None)
 
         # Sealing IS maintenance — it is the first thing done with what the
         # writer leaves behind. Called here so that a caller running only this
@@ -1741,15 +1747,12 @@ class Log:
         it came through.
         """
         self._writable()
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
-            raise RuntimeError(msg)
-
-        try:
-            run(heartbeat or lease.renew)
-        finally:
-            lease.release()
+        # No claim here. Each pass claims the range it actually works on —
+        # compaction a run, eviction the prefix it removes — so two maintainers
+        # exclude each other only where their work overlaps, which is what §4a
+        # buys over one lease per role. An entry-point claim would put that
+        # back and cover every offset in the log while doing so.
+        run(heartbeat)
 
     def rewrite_archive(self) -> None:
         """Merge undersized files already in the archive (§6, ad-hoc).
@@ -1772,11 +1775,11 @@ class Log:
 
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
+            msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
-            self._maintenance.rewrite_archive(lease.renew)
+            self._maintenance.rewrite_archive(lease.renew, lease.owner)
         finally:
             lease.release()
 
@@ -1819,7 +1822,7 @@ class Log:
         # compaction do, and for the same reason they must not overlap.
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
+            msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
@@ -1827,7 +1830,7 @@ class Log:
         finally:
             lease.release()
 
-    def _pull(self, lease: Lease, since: timedelta) -> None:
+    def _pull(self, lease: Claim, since: timedelta) -> None:
         """Copy down and register everything archived since `since`."""
         archive = self._archive.require()
         self._table.reload()

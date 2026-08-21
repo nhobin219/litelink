@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
+from litelink._claim import new_owner
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
@@ -343,6 +344,7 @@ class Maintenance:
         heartbeat: Callable[[], bool] | None = None,
         *,
         upload: bool = False,
+        owner: str | None = None,
     ) -> None:
         """Replace one run of adjacent files with a single merged one.
 
@@ -364,8 +366,32 @@ class Maintenance:
         # without listing — which for the archive would be a paginated LIST
         # over object storage, the thing this design refuses. Claimed as the
         # TARGET, so recovery knows which tier to remove it from.
+        # The range claimed before a byte is written, and the two are one
+        # question: may this merge run, and is the record of it live work or a
+        # dead process's leavings. A claim answers both (§4a) — and the check
+        # and the insert are one transaction, so eviction cannot have decided
+        # to drop this range while this decided to rewrite it.
+        # The OPERATION's owner, not a fresh one. A rewrite driven by a config
+        # change runs inside that change's whole-log claim, and minting an
+        # owner here would make this merge a rival to the operation it is part
+        # of — refused by its own claim, silently doing nothing.
+        claim = self._buffer.claim(
+            "compact", lo, hi, owner or new_owner(), self._key(target)
+        )
+        if not claim.acquire():
+            return
+
         self._buffer.claim_compaction(lo, hi, self._key(target))
-        self._write_merge(table, run, rel_path, target, heartbeat, upload=upload)
+        try:
+            # The claim renews itself while the merge runs. A rewrite over a
+            # large run outlasts the TTL, and letting it lapse would invite
+            # another owner onto the same range mid-write.
+            self._write_merge(
+                table, run, rel_path, target, heartbeat or claim.renew, upload=upload
+            )
+        finally:
+            claim.release()
+
         # Only this one. Another operation's claim — a rewrite that crashed
         # before recovery ran — is not ours to retire.
         self._buffer.clear_compaction(self._key(target))
@@ -425,7 +451,11 @@ class Maintenance:
         # would leave every one of them unmeasured.
         self._buffer.record_merge(self._key(target), (self._key(f.path) for f in run))
 
-    def rewrite_sorted(self, heartbeat: Callable[[], bool] | None = None) -> None:
+    def rewrite_sorted(
+        self,
+        heartbeat: Callable[[], bool] | None = None,
+        owner: str | None = None,
+    ) -> None:
         """Re-cluster every data file under the current sort order (§7).
 
         File boundaries are preserved rather than merged: a rewrite is already
@@ -442,7 +472,7 @@ class Maintenance:
         # before it outlasts a user's patience. Per file rather than per pass,
         # because a pass here has no phases to sit between.
         for data_file in self._table.data_files():
-            self._rewrite_run(self._table, [data_file])
+            self._rewrite_run(self._table, [data_file], owner=owner)
             checkpoint(heartbeat)
 
     # -- eviction -----------------------------------------------------------
@@ -526,15 +556,32 @@ class Maintenance:
             if boundary <= 0:
                 return
 
+        # The prefix claimed before anything is removed, and eviction declares
+        # rather than merely consulting (§4a). An operation that only reads has
+        # decided and said nothing durable, so a merge claiming a range that
+        # straddles this boundary between the read and the commit puts back
+        # exactly what this is about to drop. Both sides declaring in one
+        # transaction is what makes the ordering total.
+        removal = self._buffer.claim("evict", 0, boundary, new_owner())
+        if not removal.acquire():
+            return
+
         # Everything the boundary REMOVES, not just what looked old enough to
         # trigger it. A compaction output has a fresh snapshot age, so it never
         # appears in `stale` — but its offsets can sit below a stale file's
         # `hi`, so the boundary drops it too. Queueing only `stale` left it
         # removed from the table and named by nothing.
-        self._enqueue(f.path for f in files if f.hi <= boundary)
-        self._table.evict_through(boundary)
+        try:
+            self._enqueue(f.path for f in files if f.hi <= boundary)
+            self._table.evict_through(boundary)
+        finally:
+            removal.release()
 
-    def rewrite_archive(self, heartbeat: Callable[[], bool] | None = None) -> None:
+    def rewrite_archive(
+        self,
+        heartbeat: Callable[[], bool] | None = None,
+        owner: str | None = None,
+    ) -> None:
         """Re-cut undersized archived files to `target_size` (§6, ad-hoc).
 
         Not part of `maintain`, and not expected to be needed. The archive is
@@ -592,7 +639,7 @@ class Maintenance:
         # refuses to delete anything the table still references, so an entry
         # made for a commit that never lands simply never comes due.
         self._enqueue(data_file.path for data_file in stale)
-        self._recut(archive, stale, heartbeat)
+        self._recut(archive, stale, heartbeat, owner)
 
     def _badly_sized(self, archive: LogTable) -> list[DataFile]:
         """The archived files from the first one under `target_size` on.
@@ -620,6 +667,7 @@ class Maintenance:
         archive: LogTable,
         stale: list[DataFile],
         heartbeat: Callable[[], bool] | None = None,
+        owner: str | None = None,
     ) -> None:
         """Append `stale` back through a buffer and seal it out again."""
         lo, hi = stale[0].lo, stale[-1].hi
