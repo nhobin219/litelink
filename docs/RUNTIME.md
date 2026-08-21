@@ -496,6 +496,20 @@ Note the direction, which is the opposite of retention's. These are ceilings on 
 and the tighter wins; `local_retention` and `local_rows` are floors on what stays readable
 and the looser wins.
 
+**One process per role is the deployable shape.** A seal is CPU-bound pure Python — most
+of its commit is pyiceberg copying table metadata — so it starves anything sharing its
+interpreter, which is why the writer is its own process (appends measured 45.2 ms behind an
+in-process seal). Compaction is the same work and more of it, so the argument repeats:
+sealing beside compaction waits on it, and the buffer grows for as long as it waits. A
+thread is not enough — it fixes blocking on the network, not contention for the interpreter.
+
+The cost is measured and worth stating: several processes committing to one Iceberg table
+race on pyiceberg's post-commit metadata cleanup, and the loser logs `Failed to delete
+metadata file` for one the winner already removed. A single-process control over the same
+workload logs none. It is noise — 817,760 rows read back contiguous with no gap or
+duplicate across a run that logged it — because the commit is protected by the CAS retry
+and the metadata this library depends on is deleted through its own expiry queue.
+
 **The passes are callable one at a time**, and worth doing when their costs diverge.
 Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
 finish in milliseconds; `sync` is the only one that can block on a network. `maintain()`

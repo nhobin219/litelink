@@ -4,9 +4,22 @@ Three scripts against a real log. None need an archive, a service, or a network.
 
 ```
 just demo-capture      # terminal 1: append, and nothing else
-just demo-maintain     # terminal 2: seal, compact, evict, expire
+just demo-maintain     # terminal 2: one process per storage role
 just demo-tail         # terminal 3: watch where the rows are
 ```
+
+`demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `sync` — and one
+command stops them all. They are separate processes rather than one, because a seal is
+CPU-bound pure Python and so is compaction, only more of it: run together, sealing waits on
+compaction through the interpreter and the buffer grows for as long as it waits. That is
+the same argument that makes the writer its own process, one level down. Each prints only
+when it does something, so silence is the healthy state.
+
+`maintainer.py --role all` is the single-process shape, and is right when the costs do not
+justify four. It is also quieter: four processes committing to one Iceberg table race on
+pyiceberg's post-commit metadata cleanup and log a `Failed to delete metadata file` now and
+then. Measured to be noise — 817,760 rows read back contiguous across a run that logged
+it — but a single process produces none.
 
 ## Adding the archive tier
 

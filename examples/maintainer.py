@@ -1,41 +1,51 @@
-"""The maintainer: everything that is not the append.
+"""One storage role, one process.
 
-    uv run python examples/maintainer.py [--root DIR] [--maintain-every SECONDS]
+    uv run python examples/maintainer.py --role seal|compact|reclaim|sync|all
 
-There are two roles, and this is the second one. The **writer** appends. The
-**maintainer** does the rest of the storage work: sealing the buffer into
-Parquet, then compacting, evicting and expiring what that produces.
+The **writer** appends and does nothing else. Everything else is storage work,
+and this runs one piece of it: sealing the buffer into Parquet, converting
+sealed files into archive-shaped ones, reclaiming local disk, or pushing to the
+archive. `just demo-maintain` starts all four.
 
-Sealing is maintenance. It is not a third role — it is the first thing the
-maintainer does with what the writer leaves behind.
+**Why one process each.** A seal is CPU-bound pure Python — most of its commit
+is pyiceberg copying table metadata — so it starves a thread sharing its
+interpreter even while holding no lock. Appends measured 45.2 ms behind an
+in-process seal, which is why the writer is its own process. Compaction is the
+same work and more of it, so the argument repeats one level down: run
+compaction beside sealing and sealing waits on it, and the buffer grows for as
+long as it waits. A thread is not enough — it fixes blocking on the network,
+not contention for the interpreter.
 
-**Why not the writer's own thread.** A seal is CPU-bound pure Python — most of
-its commit is pyiceberg copying table metadata — so a sealing thread starves
-the appending one through the GIL even while holding no lock. Appends measured
-45.2 ms behind an in-process seal. A separate process does not share the GIL,
-and the `lease` table is what makes handing the role over safe.
+**What this file used to say, and why it changed.** It argued against
+splitting, on two grounds. One is stale: `_table_lock` serialised a seal's
+commit against a maintenance pass within a process, and that lock is gone —
+both now rest on Iceberg's compare-and-swap retry, which is what makes them
+safe across processes too.
 
-Both are plain methods called on this loop's own schedule — `seal_due` often,
-because it is an indexed read of one row when there is nothing to do, and
-`maintain` rarely, because it reads table metadata. The library owns neither
-the thread nor the interval; it has no business deciding how often your
-storage process wakes up.
+The other still happens, and was measured again here rather than assumed away.
+Two processes committing to one table race on pyiceberg's delete-after-commit
+metadata cleanup, and the loser logs `Failed to delete metadata file` for one
+the winner has already removed. A single-process control over the same workload
+produced none, so it is the split that causes it.
 
-**Why sealing is not its own process.** It is the same kind of work as the
-rest: off the hot path, writing to the same Iceberg table, not
-latency-critical the way an append is. Sharing a GIL with compaction costs
-nothing that matters, and splitting them costs something real — `_table_lock`
-serialises a seal's commit against a maintenance pass *within* a process, and
-nothing does across processes. Run as two processes, they raced on Iceberg's
-delete-after-commit metadata cleanup and each warned about files the other had
-already removed.
+It is noise rather than damage, and that was checked too: across a four-process
+run that logged the race, 817,760 appended rows read back contiguous with no
+gap and no duplicate. The commit itself is protected by the CAS retry, and the
+metadata files this library depends on are deleted through its own expiry queue
+rather than pyiceberg's cleanup — so a cleanup that finds its file already gone
+has lost a race to do something that was done.
 
-The two leases (`seal`, `maintain`) stay separate anyway, because they guard
-different recovery records — `sealing` and `compacting` — and whoever replays
-one must not replay the other. That also means splitting this process in two
-later needs no code change, if a long compaction ever delays sealing enough to
-matter. A delayed seal costs latency, not file size: the cut was recorded when
-the rows arrived.
+**The library owns neither the thread nor the interval.** Each role here is a
+plain method on its own schedule. `seal_due` runs often because it is an
+indexed read of one row when there is nothing to do; the rest run rarely
+because they read table metadata. `maintain()` still exists and runs compact,
+evict and expire in one call under one lease — `--role all` is that, and is the
+right shape when the costs do not justify four processes.
+
+The leases are what make any of this safe. `seal` and `maintain` guard
+different recovery records (`sealing`, `compacting`), so whoever replays one
+must not replay the other, and an owner is minted per attempt — two processes
+and two threads are refused on identical terms.
 """
 
 from __future__ import annotations
@@ -44,7 +54,6 @@ import argparse
 import os
 import signal
 import subprocess
-import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -59,12 +68,98 @@ if TYPE_CHECKING:
 from litelink._s3 import S3Options
 
 
+def seal_pass(log: Log) -> str | None:
+    """Drain the seal queue. Reports only when it did something.
+
+    Silence is the healthy state: the queue is usually empty, and a line every
+    quarter second saying so would bury the ones that matter.
+    """
+    before = log.table_files()
+    sealed = log.seal_due()
+    if sealed is None:
+        return None
+
+    return (
+        f"sealed through {sealed:,}  "
+        f"local files {before} -> {log.table_files()}  "
+        f"buffer {log.buffered_rows():,} rows"
+    )
+
+
+def compact_pass(log: Log) -> str | None:
+    """Convert sealed files into `target_compact_size` ones."""
+    before = log.table_files()
+    log.compact()
+    after = log.table_files()
+    if after == before:
+        return None
+
+    return f"converted {before} files -> {after}  local {log.table_rows():,} rows"
+
+
+def reclaim_pass(log: Log, root: Path) -> str | None:
+    """Evict past `local_retention`, expire snapshots, delete what came due."""
+    before = log.table_files()
+    log.evict()
+    log.expire()
+    after = log.table_files()
+    if after == before:
+        return None
+
+    return (
+        f"released {before - after} files  local {log.table_rows():,} rows  "
+        f"disk {_disk(root) / 1e6:.1f} MB"
+    )
+
+
+def sync_pass(log: Log) -> str | None:
+    """Push what compaction has finished with, and record the watermark."""
+    before = log.archived_through()
+    log.sync()
+    after = log.archived_through()
+    if after == before:
+        return None
+
+    return f"archived through {after:,}  archive files {log.archive_files():,}"
+
+
+def all_passes(log: Log, root: Path) -> str | None:
+    """`maintain()` plus a push: every local pass under one lease, in the order
+    it encodes — eviction queues deletions that expiry then drains, so running
+    them the other way round only makes files wait a cycle."""
+    log.maintain()
+    report = (
+        f"local {log.table_rows():,} rows in {log.table_files()} files  "
+        f"buffer {log.buffered_rows():,} rows  disk {_disk(root) / 1e6:.1f} MB"
+    )
+    if log.archive:
+        log.sync()
+        report += f"  archived through {log.archived_through():,}"
+
+    return report
+
+
+# Cadence per role, and they differ by an order of magnitude because the costs
+# do: sealing is an indexed read when idle, conversion reads and rewrites whole
+# files, reclaiming is a metadata commit, and a push waits on a network.
+ROLES = {
+    "seal": 0.25,
+    "compact": 10.0,
+    "reclaim": 30.0,
+    "sync": 10.0,
+    "all": 10.0,
+}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("litelink-data"))
-    parser.add_argument("--seal-every", type=float, default=0.25, help="seconds")
-    parser.add_argument("--maintain-every", type=float, default=10.0, help="seconds")
+    parser.add_argument("--role", choices=sorted(ROLES), default="all")
+    parser.add_argument(
+        "--every", type=float, default=None, help="seconds; per-role default"
+    )
     args = parser.parse_args()
+    every = args.every if args.every is not None else ROLES[args.role]
 
     # open(), never new(): the shape, the sort order and the config all come
     # from the log itself. A maintainer that restated them could disagree with
@@ -81,25 +176,17 @@ def main() -> None:
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 
-    print(f"maintaining {NAME} in {args.root} — pid {os.getpid()}")
-    if log.archive:
-        print(f"pushing settled files to {log.archive}")
+    if args.role == "sync" and not log.archive:
+        # Not an error: `just demo-maintain` starts every role, and a
+        # local-only log simply has nothing for this one to do. Exiting quietly
+        # beats an error the reader has to learn to ignore.
+        print("[   sync] no archive configured, nothing to push", flush=True)
+        log.close()
 
-    print(
-        f"sealing every {args.seal_every:.2f}s, maintaining every "
-        f"{args.maintain_every:.0f}s"
-    )
-    print("run alongside `just demo-capture`. Ctrl-C to hand the leases back.\n")
-    # The same column names `tail.py` uses, because they describe the same
-    # numbers and two vocabularies for one pipeline is one too many.
-    archived_rows = f" {'archived rows':>14}" if log.archive else ""
-    archived_files = f" {'archived files':>14}" if log.archive else ""
-    sync_column = f" {'sync':>9}" if log.archive else ""
-    print(
-        f"{'local rows':>13} {'buffer rows':>13}{archived_rows}"
-        f" {'local files':>12}{archived_files}"
-        f" {'disk':>9} {'seal':>8} {'compact':>10} {'reclaim':>10}{sync_column}"
-    )
+        return
+
+    label = f"[{args.role:>7}]"
+    print(f"{label} pid {os.getpid()}, every {every:g}s", flush=True)
 
     # SIGTERM, not just Ctrl-C. Python does not unwind on it — the process
     # simply stops — so without this the `finally` below never runs and a
@@ -111,58 +198,60 @@ def main() -> None:
     # testing before this was here.
     signal.signal(signal.SIGTERM, _stop)
 
-    # Maintenance runs on its own thread, and this is not a detail. `sync`
-    # talks to object storage, so it takes as long as the network takes —
-    # measured at 83 s for sixteen files before registration was batched, and
-    # still seconds after. Sealing is local, has to keep pace with the writer,
-    # and is the only thing that bounds how far the buffer grows. Sharing one
-    # thread meant a slow upload stopped sealing: the buffer reached 170,540
-    # rows while the table sat at 69,920, and the log looked stalled.
-    #
-    # Safe because the roles are separate leases and an owner is minted per
-    # attempt (see `Log._lease`), so the seal this loop runs and the seal
-    # inside `maintain()` exclude each other exactly as two processes would —
-    # one is simply refused.
-    worker: threading.Thread | None = None
-    sidecar = Sidecar(log) if log.config.wal_replication else None
+    # The sidecar belongs to whichever process is already archive-facing, so it
+    # is not started four times over.
+    sidecar = (
+        Sidecar(log)
+        if log.config.wal_replication and args.role in {"sync", "all"}
+        else None
+    )
     if sidecar is not None:
-        print(f"replicating the WAL — config at {sidecar.config}")
+        print(f"{label} replicating the WAL — config at {sidecar.config}", flush=True)
 
-    # One thread, one loop, two calls at two cadences. Nothing here is a
-    # daemon, nothing is signalled, and stopping is just leaving the loop.
-    due = 0.0
+    passes = {
+        "seal": lambda: seal_pass(log),
+        "compact": lambda: compact_pass(log),
+        "reclaim": lambda: reclaim_pass(log, args.root),
+        "sync": lambda: sync_pass(log),
+        "all": lambda: all_passes(log, args.root),
+    }
+    run = passes[args.role]
+
+    global _running
+    _running = True
     try:
         while True:
-            log.seal_due()
+            started = time.monotonic()
+            try:
+                report = run()
+            except RuntimeError as exc:
+                # Another owner holds the lease this role needs. Not worth
+                # dying over: it means someone else is already doing this.
+                report = f"skipped: {exc}"
+
+            if report is not None:
+                elapsed = (time.monotonic() - started) * 1000
+                print(f"{label} {report}  ({elapsed:.0f} ms)", flush=True)
+
             if sidecar is not None:
                 sidecar.keep_running()
 
-            due += args.seal_every
-            if due >= args.maintain_every and not pass_running(worker):
-                due = 0.0
-                worker = threading.Thread(
-                    target=_maintain, args=(log, args.root), daemon=True
-                )
-                worker.start()
-
-            time.sleep(args.seal_every)
+            time.sleep(every)
     except (KeyboardInterrupt, SystemExit):
-        print("\nreleasing the seal and maintain leases")
+        print(f"{label} stopping, leases handed back", flush=True)
     finally:
+        _running = False
         if sidecar is not None:
             sidecar.stop()
 
         log.close()
 
 
-def pass_running(worker: threading.Thread | None) -> bool:
-    """Whether the last maintenance pass is still going.
-
-    Skipped rather than queued: passes are idempotent and the next one will
-    pick up whatever this one did not, so stacking them behind a slow upload
-    would only spend threads to arrive at the same place later.
-    """
-    return worker is not None and worker.is_alive()
+# Set while the loop is running, so a signal arriving after it has finished
+# does not raise into interpreter shutdown — which Python reports as
+# "Exception ignored in threading._shutdown" and looks like a crash on the way
+# out. Observed on every clean stop before this was here.
+_running = False
 
 
 def _stop(signum: int, frame: object) -> None:
@@ -172,6 +261,9 @@ def _stop(signum: int, frame: object) -> None:
     its time in `sleep`, and a flag would leave the sidecar running until the
     current interval elapsed.
     """
+    if not _running:
+        return
+
     raise SystemExit(128 + signum)
 
 

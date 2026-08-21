@@ -94,7 +94,31 @@ demo-maintain *args:
     # litestream reads its own, and only if wal_replication is on.
     export LITESTREAM_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
     export LITESTREAM_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
-    uv run python examples/maintainer.py {{args}}
+    # One process per role, one command to run them. Separate processes because
+    # compaction is CPU-bound Python and would otherwise starve sealing through
+    # the interpreter — the same argument that made the writer its own process,
+    # one level down. `just demo-tail` is the combined view; these print only
+    # when they do something.
+    # Every role, always. The sync one exits quietly on a local-only log
+    # rather than making the reader learn which roles apply.
+    roles="seal compact reclaim sync"
+    pids=""
+    stop() { kill $pids 2>/dev/null || true; }
+    # Ctrl-C reaches the children directly — they are in this process group —
+    # and each handles it: leases handed back, sidecar stopped. The trap is for
+    # the ways that do not, a `kill` of this shell or a supervisor stopping it.
+    # No `setsid` here on purpose: detaching them would put them OUT of the
+    # group Ctrl-C signals, making the trap the only thing standing between a
+    # stopped demo and four orphans holding leases.
+    trap 'stop' EXIT
+    # Ctrl-C is how this is meant to end, so it exits 0 rather than reporting a
+    # failed recipe.
+    trap 'stop; exit 0' INT TERM
+    for role in $roles; do
+        uv run python examples/maintainer.py --role "$role" {{args}} &
+        pids="$pids $!"
+    done
+    wait || true
 
 # Watch a running capture accumulate. Run alongside `just demo-capture`.
 demo-tail *args:
