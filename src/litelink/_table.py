@@ -7,13 +7,14 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import CommitFailedException, NoSuchTableError
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
 
@@ -184,6 +185,12 @@ class LogTable:
 
         The schema is the local table's, so the two cannot drift: one declared
         shape, and the archive is the same rows later.
+
+        The catalog entry is keyed by table id, not by warehouse, so pointing a
+        log at a DIFFERENT prefix does not by itself reach a different table —
+        `table_exists` finds the entry made for the old one and hands back a
+        table whose metadata still lives there. That is what `forget` is for,
+        and why `Archive.set_uri` calls it.
         """
         catalog = SqlCatalog(
             "archive",
@@ -198,6 +205,36 @@ class LogTable:
             )
 
         return cls(catalog, layout, catalog.load_table(layout.table_id), prefix)
+
+    @staticmethod
+    def forget_archive(layout: Layout, options: S3Options) -> None:
+        """Drop the archive's catalog entry, keeping every object it named.
+
+        Called when a log is pointed somewhere else. `archive.db` is local and
+        keyed by table id, so without this the entry made for the previous
+        prefix survives and `open_archive` hands back a table whose metadata
+        location is still in the OLD bucket: the handle reads it, `sync`
+        registers into it, and `_push`'s reconciliation writes the old
+        watermark back over the reset that was supposed to protect the new
+        one. Measured: watermark 3,856, re-point, reset to 0, one sync — 3,856
+        again, with the new bucket holding nothing.
+
+        Drops the entry only. The objects stay where they are, because
+        detaching an archive is not deleting one, and the whole point of
+        re-pointing is usually that the old bucket is about to be retired by
+        somebody who knows what is in it.
+        """
+        # Credentials because pyiceberg resolves a table by READING its
+        # metadata, even to answer whether it exists — and that metadata is in
+        # the bucket being left behind. `NoSuchTableError` rather than a
+        # `table_exists` check for the same reason: the check is the load.
+        catalog = SqlCatalog(
+            "archive",
+            uri=layout.archive_catalog_uri,
+            **options.resolved().catalog_properties(),
+        )
+        with contextlib.suppress(NoSuchTableError):
+            catalog.drop_table(layout.table_id)
 
     def exists(self) -> bool:
         return True
@@ -604,7 +641,12 @@ class LogTable:
         """
         return path.removeprefix(self._warehouse.rstrip("/") + "/")
 
-    def register(self, paths: list[str], sealed_through: int | None = None) -> bool:
+    def register(
+        self,
+        paths: list[str],
+        sealed_through: int | None = None,
+        archived_through: int = 0,
+    ) -> bool:
         """Add already-written files to the table, in ONE commit (§4 step 2).
 
         `add_files` rather than `append`: pyiceberg's append writes the file
@@ -648,7 +690,9 @@ class LogTable:
 
         def add() -> None:
             nonlocal added
-            if sealed_through is not None and self._covers(sealed_through):
+            if sealed_through is not None and (
+                self._covers(sealed_through) or archived_through >= sealed_through - 1
+            ):
                 added = False
 
                 return
@@ -665,6 +709,14 @@ class LogTable:
 
         Data files cover contiguous, non-overlapping offset ranges (§4), so the
         extent's upper bound answers this on its own.
+
+        An EMPTY table answers False, which is why `register` also consults the
+        archive watermark. A writer stalled between renewing its lease and
+        registering, while another owner sealed the same range, archived it and
+        evicted the table to nothing, would otherwise resume and re-add its
+        stale file — and a local table holding only [100, 199] under an archive
+        holding [0, 999] serves 200-999 from no leg at all, until eviction
+        drops it again up to `local_retention` later.
         """
         extent = self.extent()
 

@@ -1128,8 +1128,13 @@ class Buffer:
         only way to find it without a directory scan is to have written its
         name down first.
         """
-        with self._transaction():
-            self._con.execute("DELETE FROM compacting")
+        # Inserted, never replacing what is already there. Clearing first
+        # destroyed the claims of an operation that had CRASHED — an archive
+        # rewrite accumulates one per uploaded object, and recovery only runs
+        # at `open`, so a long-lived maintainer starting its next merge wiped
+        # them and left those objects referenced by nothing. Each operation
+        # clears its own.
+        with self._lock:
             self._con.execute(
                 "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
                 (lo, hi, rel_path),
@@ -1168,9 +1173,21 @@ class Buffer:
 
         return [(int(lo), int(hi), str(path)) for lo, hi, path in rows]
 
-    def clear_compaction(self) -> None:
+    def clear_compaction(self, rel_path: str | None = None) -> None:
+        """Retire one claim, or every claim.
+
+        One by default of the caller's choosing, because a claim belongs to an
+        operation and clearing another's is how a crashed rewrite's uploads
+        became unnameable. Recovery passes nothing and clears the lot, which is
+        correct there: it has just resolved every one of them.
+        """
         with self._lock:
-            self._con.execute("DELETE FROM compacting")
+            if rel_path is None:
+                self._con.execute("DELETE FROM compacting")
+            else:
+                self._con.execute(
+                    "DELETE FROM compacting WHERE rel_path = ?", (rel_path,)
+                )
 
     # -- deletion queue ---------------------------------------------------
 

@@ -1185,7 +1185,15 @@ class Log:
         # `end` passed so the commit can decline if the range is already in
         # the table. The lease check above is the fence; this is what makes a
         # failure of that fence harmless rather than a duplicate.
-        if not self._table.register([str(dest)], sealed_through=end):
+        if not self._table.register(
+            [str(dest)],
+            sealed_through=end,
+            # The archive too. An empty local table covers nothing, so after a
+            # stalled writer's range has been sealed, archived and evicted, the
+            # local check alone would let it re-register a file the log has
+            # already moved past.
+            archived_through=self._maintenance.archived_through(),
+        ):
             # Declined: another owner already sealed this range, so this file
             # is redundant and will never be referenced. Queue it, or it joins
             # the one category this design has no way to find — a file on disk

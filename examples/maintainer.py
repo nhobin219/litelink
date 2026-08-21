@@ -51,6 +51,7 @@ and two threads are refused on identical terms.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import signal
 import subprocess
@@ -210,8 +211,10 @@ def main() -> None:
         if log.config.wal_replication and args.role in {"sync", "all"}
         else None
     )
-    if sidecar is not None:
+    if sidecar is not None and sidecar.owner:
         print(f"{label} replicating the WAL — config at {sidecar.config}", flush=True)
+    elif sidecar is not None:
+        print(f"{label} another process is replicating the WAL", flush=True)
 
     passes = {
         "seal": lambda: seal_pass(log),
@@ -308,6 +311,22 @@ class Sidecar:
     def __init__(self, log: Log) -> None:
         self.config = log.write_replication_config()
         self._process: subprocess.Popen[bytes] | None = None
+        # An OS lock on a file beside the log, held for this process's whole
+        # life. The maintenance lease cannot do this job: it is acquired and
+        # RELEASED around each pass, so two maintainers polling every ten
+        # seconds both hold it at some point every round and both would keep a
+        # sidecar alive — two litestream instances on one database, which is
+        # the thing litestream forbids, and silent because each pass succeeds.
+        #
+        # `flock` because the kernel releases it when the process dies however
+        # it dies. A lock FILE would need liveness checks and would survive a
+        # SIGKILL as a stale lock nothing could clear.
+        self._lock = (log.root / "litestream.lock").open("w")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.owner = True
+        except OSError:
+            self.owner = False
 
     def keep_running(self) -> None:
         """Start it, or restart it if it has exited. Called every pass.
@@ -316,6 +335,9 @@ class Sidecar:
         second mechanism to notice a dead child would be a thread whose only
         job is to wait.
         """
+        if not self.owner:
+            return
+
         if self._process is not None and self._process.poll() is None:
             return
 
