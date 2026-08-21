@@ -631,3 +631,21 @@ def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> N
         buffers = {key for key in keys if key.endswith("buffer.db")}
 
         assert len(buffers) == 2, f"buffers must not collide: {buffers}"
+
+
+def test_compact_min_files_below_one_is_refused(tmp_path: Path) -> None:
+    """A knob that can stall the log for ever should not accept the value.
+
+    Below one, no run ever satisfies `compact_min_files`, so `stable_prefix`
+    returns zero permanently: sync pushes nothing, the watermark stands still,
+    eviction pins on it, and the local table grows without bound. Nothing
+    raises and nothing logs — the log simply stops making progress.
+    """
+    with pytest.raises(ValueError, match="compact_min_files must be at least 1"):
+        Log.new(
+            tmp_path,
+            "s",
+            schema=SCHEMA,
+            sort_by=("event_ts",),
+            config=LogConfig(compact_min_files=0),
+        )
