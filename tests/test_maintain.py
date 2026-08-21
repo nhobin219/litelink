@@ -150,16 +150,13 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
         assert len(read_all(log)) == 12
 
 
-def test_eviction_waits_for_the_archive_watermark(tmp_path: Path) -> None:
+def test_eviction_waits_for_the_archive_to_hold_the_file(tmp_path: Path) -> None:
     """I4, and the only line of `maintain` that is correctness (§5, §8).
 
-    With an archive configured the local copy stops being the only one only
-    once sync says so. `maintain` used to refuse outright rather than risk it;
-    now it clamps the eviction boundary to what sync has recorded, so a sync
-    arbitrarily far behind delays eviction instead of losing data.
-
-    No object store needed: the watermark is a `meta` row, and what is under
-    test is that eviction reads it.
+    With an archive configured the local copy stops being the only one once the
+    archive holds that FILE — a row `sync` writes when the copy exists, naming
+    the bucket it went to (§4a). Not a watermark: one summarised the same facts
+    and was the only boundary in the log that could move backwards.
     """
     config = LogConfig(local_retention=timedelta(0))
     log = Log.new(
@@ -181,9 +178,11 @@ def test_eviction_waits_for_the_archive_watermark(tmp_path: Path) -> None:
 
         assert log.table_files() == before, "evicted with an empty archive"
 
-        # Sync has reached the first file only.
-        first = min(f.hi for f in log._table.data_files())
-        log._buffer.set_meta("archive_through", str(first))
+        # The archive now holds the first file, and only that one.
+        first = min(log._table.data_files(), key=lambda f: f.lo)
+        log._buffer.record_file(
+            f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
+        )
         log.maintain()
 
         assert log.table_files() == before - 1, "did not evict what was archived"
@@ -1011,22 +1010,17 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
         assert all(f.rows == 4 for f in after), "a file was split by the boundary"
 
 
-def test_compaction_will_not_merge_across_the_archive_frontier(
-    tmp_path: Path,
-) -> None:
-    """A watermark that is stale LOW must not put archived files back in a run.
+def test_compaction_will_not_merge_a_file_the_archive_holds(tmp_path: Path) -> None:
+    """A merge spanning the archive's extent is a duplicate that cannot be undone.
 
-    The watermark is written after the archive commit lands, so a crash between
-    them leaves it lower than what the archive actually holds. Eviction is safe
-    with a low watermark — it waits. Compaction is not: it reads the same
-    number to decide which files are already the archive's business, and a low
-    one pulls an already-archived file into a merge. The merged file then spans
-    the archive's extent, and the next push registers a range partially
-    overlapping one the archive already holds — the same offsets in two files,
-    in the immutable tier, with nothing to repair it.
+    Its inputs would include files already pushed, so the merged file covers a
+    range partially overlapping one the archive holds — and `register` declines
+    only a range that is ENTIRELY covered, so the partial one is admitted and
+    the same offsets sit in two archive files for ever.
 
-    So compaction reads the FRONTIER: the higher of the confirmed watermark and
-    the range a push was about to register.
+    Compaction therefore skips a file the archive holds, asked per file (§4a).
+    That is also what keeps the two tiers' ranges aligned: a file the archive
+    holds is never rewritten locally, so the ranges stay comparable at all.
     """
     config = LogConfig(
         target_seal_size=4096,
@@ -1034,43 +1028,77 @@ def test_compaction_will_not_merge_across_the_archive_frontier(
         compact_min_files=2,
         snapshot_retention=timedelta(0),
     )
-    with open_log(tmp_path, config) as log:
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive="s3://bucket/prefix",
+    )
+    try:
         log.extend(rows(1200))
         log.seal_due()
-        files = log._table.data_files()
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
         assert len(files) >= 4
 
-        # A push that registered through the second file and died before its
-        # confirming write: the watermark still says nothing is archived.
-        boundary = files[1].hi
-        log._buffer.set_meta("archive_pending", str(boundary))
-        assert log._maintenance.archived_through() == 0
-        assert log._maintenance.archive_frontier() == boundary
+        # The archive holds the first two.
+        for data_file in files[:2]:
+            log._buffer.record_file(
+                f"s3://bucket/prefix/data/{data_file.lo}.parquet",
+                data_file.lo,
+                data_file.hi + 1,
+                1,
+            )
 
+        boundary = files[1].hi
         log.compact()
 
         merged = log._table.data_files()
+
         assert all(f.lo > boundary or f.hi <= boundary for f in merged), (
-            "no file may span the frontier, or the archive gets it twice"
+            "no file may span the archive's extent, or the archive gets it twice"
         )
         assert log.scan().read_all().num_rows == 1200
+    finally:
+        log.close()
 
 
-def test_repointing_clears_the_archive_frontier(tmp_path: Path) -> None:
-    """The frontier names a range the PREVIOUS archive may hold.
+def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None:
+    """A re-point changes where the NEXT file goes, and nothing else (§4a).
 
-    Compaction reads it to decide which files are already the archive's
-    business. Carried across a re-point it would go on refusing to merge files
-    the new archive has never seen — conservative rather than unsafe, but
-    permanently so, because nothing else ever lowers it.
+    The frontier this replaces had to be reset, because it named ranges of the
+    archive being left — and that reset was the only backwards boundary move in
+    the log, which is what made every reader that had cached the old position
+    wrong at once. Per segment there is nothing to reset: files already pushed
+    keep naming the bucket that holds them.
     """
-    config = LogConfig(target_seal_size=4096, compact_min_files=2)
-    with open_log(tmp_path, config) as log:
-        log.extend(rows(400))
-        log.seal_due()
-        log._buffer.set_meta("archive_pending", "999999")
-        assert log._maintenance.archive_frontier() == 999999
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 2)
+        first = min(log._table.data_files(), key=lambda f: f.lo)
+        log._buffer.record_file(
+            f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
+        )
+        local = log._table.data_files()
 
-        log.set_archive("s3://bucket/somewhere-new")
+        assert log._maintenance.archived_prefix(local) == first.hi
 
-        assert log._maintenance.archive_frontier() == 0
+        log.set_archive("s3://bucket/elsewhere")
+
+        assert log._maintenance.archived_prefix(local) == 0, (
+            "the new archive holds nothing, and says so without any reset"
+        )
+
+        log.set_archive("s3://bucket/prefix")
+
+        assert log._maintenance.archived_prefix(local) == first.hi, (
+            "pointing back finds the copies still recorded where they are"
+        )

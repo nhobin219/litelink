@@ -19,7 +19,6 @@ import pytest
 
 from litelink import Log, LogConfig
 from litelink._layout import Layout
-from litelink._maintenance import Maintenance
 from litelink._s3 import S3Options
 from litelink._table import LogTable, _recorded_location
 from litelink.log import OFFSET, table_schema
@@ -852,39 +851,82 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         )
 
 
-def test_a_failed_push_cannot_wedge_sync_and_compaction(
+def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The frontier must not outlive the question it answers.
+    """The crash window I4-per-segment has, and how it closes (§4a).
 
-    It is written before a register is attempted and blocks compaction, so a
-    register that failed left it standing — and if `stable_prefix` then needed
-    that very merge before anything could settle, sync waited on a compaction
-    the frontier forbade while being the only thing that cleared it. Both
-    passes returned success, for ever.
+    The row naming a file's archive copy is written AFTER the register, so a
+    crash between the two leaves the archive holding a range nothing local
+    records. Compaction decides from those rows, so it would merge that file
+    into one spanning the archive's extent, and the next push would register a
+    partially overlapping range — which `register` admits, because it declines
+    only a range entirely covered.
 
-    Reproduced at its narrowest: a pass that settles nothing at all. Before the
-    fix that pass returns early, above the only line that overwrote the
-    frontier, and the log never compacts or evicts again.
+    Nothing is promised beforehand to cover it. The archive's own manifest is
+    the truth, and the next push reads it anyway, so recovery is a backfill.
     """
     with archived_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
         log.sync()
-        settled = log.archived_through()
+        local = log._table.data_files()
+        settled = log._maintenance.archived_prefix(local)
+
         assert settled > 0
 
-        # A push that recorded its intent and then failed, with nothing left
-        # for the next pass to settle.
-        log._buffer.set_meta(Maintenance.PENDING_KEY, str(settled + 10_000))
-        assert log._maintenance.archive_frontier() > settled
+        # The register landed; the rows recording it did not.
+        with log._buffer._lock:
+            log._buffer._con.execute("DELETE FROM extent WHERE rel_path LIKE 's3://%'")
+            log._buffer._con.commit()
+
+        assert log._maintenance.archived_prefix(local) == 0, (
+            "the setup must actually reproduce the crash"
+        )
 
         log.sync()
 
-        assert log._maintenance.archive_frontier() == settled, (
-            "a frontier the extent has answered must not survive the pass"
+        assert log._maintenance.archived_prefix(log._table.data_files()) == settled, (
+            "the archive's manifest says what it holds; recover from it"
         )
-        assert log.archived_through() == settled
+        assert log.scan(include_archive=True).read_all().num_rows == ROWS
+
+
+def test_the_backfill_sees_copies_another_process_pushed(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The manifest is read as it IS, not as this handle last saw it.
+
+    A pyiceberg handle is a frozen snapshot and `Archive` caches it for the
+    life of the process, so a maintainer that synced, released the lease and
+    took it back would otherwise recover against an archive that has since
+    grown — and go on treating another maintainer's pushes as unarchived.
+    """
+    with archived_log(tmp_path, bucket, s3) as writer:
+        writer.extend(rows(ROWS))
+        writer.seal_due()
+        writer.sync()
+
+        with Log.open(tmp_path, "s", s3=s3) as other:
+            # `other` caches its archive handle here, at today's extent.
+            assert other.archive_files() > 0
+
+            writer.extend(rows(ROWS))
+            writer.seal_due()
+            writer.sync()
+            grown = writer._maintenance.archived_prefix(writer._table.data_files())
+
+            with other._buffer._lock:
+                other._buffer._con.execute(
+                    "DELETE FROM extent WHERE rel_path LIKE 's3://%'"
+                )
+                other._buffer._con.commit()
+
+            other.sync()
+
+            assert (
+                other._maintenance.archived_prefix(other._table.data_files()) == grown
+            ), "recovered against a stale manifest"
 
 
 def test_repointing_to_the_same_archive_spelled_differently_keeps_the_watermark(
@@ -964,59 +1006,6 @@ def test_a_repoint_is_all_or_nothing(
         else:
             assert log.archived_through() == 0, (
                 "a new archive must not inherit the old one's promise"
-            )
-
-
-def test_the_reconcile_reads_a_current_archive_extent(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A stale extent retires the frontier over a range the archive holds.
-
-    `sync` resolves the frontier on the strength of what the archive is
-    observed to contain, so the observation has to be current. A pyiceberg
-    handle is a frozen snapshot and `Archive` caches it for the life of the
-    process, so a maintainer that synced, released the lease and took it back
-    reads the archive as it was before another maintainer's register.
-
-    Set up at the state that makes it bite: a register that landed while the
-    watermark write after it did not. The frontier is then the only thing
-    standing between compaction and a merge straddling the archive's extent,
-    and a stale reconcile retires it while confirming nothing.
-    """
-    with archived_log(tmp_path, bucket, s3) as writer:
-        writer.extend(rows(ROWS))
-        writer.seal_due()
-        writer.sync()
-        settled = writer.archived_through()
-        assert settled > 0
-
-        with Log.open(tmp_path, "s", s3=s3) as other:
-            # `other` caches its archive handle here, at today's extent.
-            assert other.archive_files() > 0
-
-            writer.extend(rows(ROWS))
-            writer.seal_due()
-            writer.sync()
-            grown = writer.archived_through()
-            assert grown > settled
-
-            # That second push, as a crash between the register and its
-            # confirming write leaves it.
-            other._buffer.set_meta_all(
-                {
-                    Maintenance.ARCHIVED_KEY: str(settled),
-                    Maintenance.PENDING_KEY: str(grown),
-                }
-            )
-
-            other.sync()
-
-            assert other.archived_through() == grown, (
-                "the watermark must be reconciled against the archive as it is, "
-                "not as this handle last saw it"
-            )
-            assert other._maintenance.archive_frontier() == grown, (
-                "the frontier must not be retired over a range nothing confirmed"
             )
 
 
@@ -1183,7 +1172,6 @@ def test_restating_the_archive_from_a_stale_process_keeps_the_watermark(
             assert other.archived_through() == settled, (
                 "re-asserting the archive the log already has is not a move"
             )
-            assert other._maintenance.archive_frontier() == settled
 
 
 def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(

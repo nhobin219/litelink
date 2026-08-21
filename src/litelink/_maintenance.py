@@ -225,21 +225,6 @@ class Maintenance:
     # -- compaction ---------------------------------------------------------
 
     ARCHIVED_KEY = "archive_through"
-    # The range a push is ABOUT to register, written before it registers.
-    #
-    # `ARCHIVED_KEY` is written after the commit lands, so a crash between the
-    # two leaves it lower than what the archive actually holds. Eviction is
-    # safe with a low watermark — it simply waits — but compaction reads the
-    # same number to decide which files are already archived and therefore not
-    # its business, and a low one puts an ALREADY-ARCHIVED file back in a merge
-    # run. The merged file then spans the archive's extent, and the next push
-    # registers a range partially overlapping one the archive holds: the same
-    # offsets in two files, in the immutable tier, with nothing to repair it.
-    #
-    # So compaction takes the higher of the two. Pending may name a range the
-    # register never reached, which costs a merge that does not happen —
-    # nothing, next to a duplicate that cannot be undone.
-    PENDING_KEY = "archive_pending"
 
     def archived_through(self) -> int:
         """Highest offset the archive is known to hold, 0 if none (§5, I4).
@@ -255,17 +240,38 @@ class Maintenance:
 
         return 0 if recorded is None else int(recorded)
 
-    def archive_frontier(self) -> int:
-        """The highest offset the archive MAY hold — see `PENDING_KEY`.
+    def archived_prefix(self, files: Sequence[DataFile]) -> int:
+        """The highest `hi` whose whole prefix has a copy in the archive (§4a).
 
-        For compaction, which must not merge a file the archive already has.
-        Never for eviction: this can name a range no register reached, and
-        deleting a local file on the strength of that would delete the only
-        copy.
+        I4 asked of segments. Walking rather than comparing to a watermark: a
+        file is the archive's business if the archive holds THAT file, which
+        `sync` wrote down when it pushed it. The walk stops at the first file
+        without a copy, so the answer stays a prefix — which is what eviction
+        needs, since it removes one.
+
+        Exact rather than conservative in both directions, and that is the
+        point. A watermark had to be raised before a register to cover the
+        crash between the two, so it named ranges the archive might not hold
+        and could not be lowered afterwards; and it had to be reset when the
+        log was re-pointed, so it went backwards past ranges the archive did
+        hold. Neither failure is expressible here: the row is written when the
+        copy exists, and it names the bucket it went to.
         """
-        pending = self._buffer.get_meta(self.PENDING_KEY)
+        ordered = sorted(files, key=lambda f: f.lo)
+        if not ordered:
+            return 0
 
-        return max(self.archived_through(), 0 if pending is None else int(pending))
+        copies = self._buffer.archived_ranges(self._archive.uri or "", ordered[0].lo)
+        reached = 0
+        for data_file in ordered:
+            # `record_file` stores the end offset exclusive, as every extent
+            # does — the cut is the offset AFTER the last row.
+            if (data_file.lo, data_file.hi + 1) not in copies:
+                break
+
+            reached = data_file.hi
+
+        return reached
 
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Merge runs of undersized adjacent files (§6).
@@ -289,16 +295,19 @@ class Maintenance:
         # FRESH table, committing evicted data back into the log.
         self._table.reload()
 
-        # The FRONTIER, not the watermark: everything the archive may already
-        # hold, including a register whose confirming write never landed.
-        archived = self.archive_frontier()
-
-        # Archived files are never inputs. Marking compaction output archivable
-        # is not enough on its own: a merge spanning the archive watermark
-        # either duplicates the rows already pushed or strands the ones above
-        # them. Skipping them makes that unreachable. They are a prefix — the
-        # watermark is contiguous — so dropping them cannot break adjacency.
-        pending = [f for f in self._table.data_files() if f.hi > archived]
+        # Archived files are never inputs. A merge spanning the archive's
+        # extent either duplicates the rows already pushed or strands the ones
+        # above them, and skipping them makes that unreachable. They are a
+        # prefix, so dropping them cannot break adjacency.
+        #
+        # Asked per file (§4a). It also keeps the two tiers' ranges aligned:
+        # a file the archive holds is never rewritten locally, so the local
+        # range and the archived range stay the same range, which is what lets
+        # `archived_prefix` match them at all.
+        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
+        local = self._table.data_files()
+        archived = self.archived_prefix(local) if self._archive.configured() else 0
+        pending = [f for f in local if f.hi > archived]
 
         for run in runs(
             pending,
@@ -513,7 +522,7 @@ class Maintenance:
         # while the durable configuration promised I4.
         self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         if self._archive.configured():
-            boundary = min(boundary, self.archived_through())
+            boundary = min(boundary, self.archived_prefix(files))
             if boundary <= 0:
                 return
 
