@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from litelink.log import Log, LogConfig
+from litelink.log import OFFSET, Log, LogConfig
 
 SCHEMA = pa.schema(
     [
@@ -453,4 +453,62 @@ def test_set_config_reaches_the_thing_that_makes_the_cut(tmp_path: Path) -> None
 
         assert log._buffer.pending_group() is not None, (
             "the new target_size never reached the buffer"
+        )
+
+
+def test_a_log_needs_no_sort_by(tmp_path: Path) -> None:
+    """Offset order is the default, and it is what the rows are already in.
+
+    Not a fallback: the buffer returns rows ordered by offset, so leaving
+    `sort_by` unset means no sort runs at seal time at all. It is the cheapest
+    option as well as the safest one.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA) as log:
+        log.extend(rows(50))
+        log.seal()
+
+        assert log._sort_by == ()
+        assert log.table_files() == 1
+
+        stored = log.scan().read_all()
+        offsets = stored.column(OFFSET).to_pylist()
+        assert offsets == list(range(1, 51)), (
+            "a sealed file must hold its rows in offset order, so replay from "
+            "an offset is a sequential read rather than a sort"
+        )
+
+
+def test_an_unsorted_log_reopens_unsorted(tmp_path: Path) -> None:
+    """`open` recovers the shape from the table, and "no sort order" is a
+    shape — not a missing value to be guessed at."""
+    with Log.new(tmp_path, "s", schema=SCHEMA) as log:
+        log.extend(rows(4))
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._sort_by == ()
+
+
+def test_a_sort_key_correlated_with_the_offset_keeps_files_prunable(
+    tmp_path: Path,
+) -> None:
+    """Why the guidance is about CORRELATION rather than about sorting.
+
+    Files hold contiguous offset ranges however they are sorted internally. A
+    sort column that tracks arrival stays contiguous with them, so each file's
+    min/max on it covers a narrow slice and a predicate prunes whole files. A
+    scattered one gives every file nearly the whole domain, and there is
+    nothing left to prune with.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        for batch in range(4):
+            log.extend(rows(20, start=batch * 20))
+            log.seal()
+
+        files = log._table.data_files()
+        assert len(files) == 4
+
+        stored = [pq.read_table(f.path).column("event_ts").to_pylist() for f in files]
+        spans = [(min(c), max(c)) for c in stored]
+        assert all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1)), (
+            "correlated keys leave each file a disjoint slice, so files prune"
         )

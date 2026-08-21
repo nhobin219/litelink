@@ -485,6 +485,31 @@ sealers came to write the same file. The read-only connection needs no such lock
 that is the proof the rule is about transactions rather than about threads — nothing ever
 opens one on it.
 
+## Sorting, and why the default is not to
+
+`sort_by` is optional and defaults to offset order. That default is not a fallback — it is
+the order the buffer returns rows in — so it costs strictly less than any sort key: no sort
+runs at seal time, and every file's offset range is contiguous and exact, which is the
+tightest file-level statistic the table can carry.
+
+**Set it only for a column highly correlated with the offset.** For a capture stream that
+means an arrival timestamp. Files always hold contiguous offset ranges whatever they are
+sorted by internally, so a correlated key leaves each file a disjoint slice of that column
+and a predicate on it prunes whole files.
+
+An UNCORRELATED key costs twice, and neither cost shows up in a benchmark of the seal:
+
+- **Pruning stops working.** Every file's min/max on a scattered column spans nearly the
+  whole domain, so no file can be skipped. Only row-group skipping inside each file
+  survives, which is a fraction of the benefit the sort was for.
+- **Replay stops being sequential.** Rows inside a file end up in a random permutation of
+  offset order, so reading from an offset needs a sort after reading rather than a scan.
+  For a log this is the primary access pattern, which makes it the expensive half.
+
+Both are properties of the first seal, not of any later rewrite. `rewrite_archive` and
+`compact` re-sort what they rewrite, exactly as a seal does — they neither introduce this
+nor repair it.
+
 ## Losing the machine
 
 Sealed data is in the archive once `sync` has pushed it. Everything else — rows that have
