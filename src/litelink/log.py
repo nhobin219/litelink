@@ -321,7 +321,7 @@ class Log:
         name: str,
         *,
         schema: pa.Schema,
-        sort_by: Sequence[str],
+        sort_by: Sequence[str] | None = None,
         config: LogConfig | None = None,
         archive: str | None = None,
         s3: S3Options | None = None,
@@ -346,16 +346,34 @@ class Log:
         exactly: `string` is stored and returned as `large_string`, and types
         Iceberg would narrow silently are refused instead (see `_types`).
 
-        `sort_by` is required on purpose. §7 measures it as a read-shape
-        decision, not a tuning knob: it declares which predicates prune, only a
-        LEADING column prunes, and changing it later rewrites every file — see
-        `set_sort_by`. A capture workload usually wants `("event_ts", "key")`.
+        **`sort_by` defaults to offset order, and most logs should leave it
+        there.** §7 measures it as a read-shape decision rather than a tuning
+        knob: it declares which predicates prune, only a LEADING column prunes,
+        and changing it later rewrites every file (see `set_sort_by`).
+
+        The default is not a fallback — it is the order the rows are already
+        in, so it costs strictly less than any sort key. No sort runs at seal
+        time, and each file's offset range is contiguous and exact, which is
+        the tightest file-level statistic the table can carry.
+
+        Set it only for a column highly correlated with the offset, which for a
+        capture stream means an arrival timestamp. An UNCORRELATED key is worse
+        than it looks, and in two ways that no benchmark of the seal will show.
+        Files always hold contiguous offset ranges, so if the sort column is
+        scattered across them, every file's min/max on it spans nearly the whole
+        domain and file-level pruning does nothing — only row-group skipping
+        inside each file survives. And rows within a file end up in a random
+        permutation of offset order, so replay from an offset stops being
+        sequential and needs a sort after reading. For a log, replay is the
+        primary access pattern, which makes that the expensive half.
 
         `archive` is the remote warehouse prefix (e.g. `s3://bucket/prefix`).
         None means local-only: capture, seal, compaction, retention and reads
         all work with no network, forever (§11).
         """
-        order = tuple(sort_by)
+        # `None` and `()` mean the same thing — offset order — so nothing
+        # downstream has to distinguish "unset" from "explicitly unsorted".
+        order = tuple(sort_by or ())
         settings = config or LogConfig()
         validate(schema, order, settings, archive)
 
