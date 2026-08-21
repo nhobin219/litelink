@@ -225,8 +225,11 @@ class Maintenance:
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Merge runs of undersized adjacent files (§6).
 
-        Required, not opportunistic: the `max_age` seal branch guarantees a
-        quiet stream emits a small file every interval indefinitely.
+        A no-op in normal operation. The cut is exact and there is no timer to
+        cut early, so every file a seal writes already holds what it should.
+        This is for the deliberate exceptions: an explicit `seal()`, which cuts
+        short by definition, and a change to `target_size`, which leaves
+        existing files sized for the old value.
 
         The table is unpartitioned, so the compaction unit is a contiguous
         offset range — safe precisely because sealed files already cover

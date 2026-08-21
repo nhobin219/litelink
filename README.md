@@ -18,7 +18,7 @@ observations onto disk durably, into well-sized Parquet, and eventually into obj
 
 ```
 SQLite buffer          durable on commit. unsealed rows only.
-      │  seal at min(target_size, max_age)
+      │  seal at target_size
       ▼
 local Iceberg table    a rolling window. reads land here.
       │  sync: upload data files, register into the archive

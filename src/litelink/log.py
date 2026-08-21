@@ -125,7 +125,7 @@ class LogConfig:
     # stream of 40-byte rows reaches 8 MiB at 200k rows and a read-latency
     # ceiling meant to hold at 20k is breached tenfold. Bytes bound memory; rows
     # bound read latency; they are different failure modes. A narrow-row stream
-    # may eventually need `min(target_size, target_rows, max_age)` —
+    # may eventually need `min(target_size, target_rows)` —
     # deliberately not added now, on one knob until a real workload demands the
     # second.
     target_size: int = 8 * 1024 * 1024

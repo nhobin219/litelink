@@ -9,7 +9,7 @@
 ```
 SQLite buffer          durable on commit. unsealed rows only.
       │                WAL, synchronous=FULL, one db per stream
-      │  seal at min(target_size, max_age)
+      │  seal at target_size
       ▼
 local Iceberg table    a rolling WINDOW of recent data.
       │                SqlCatalog on SQLite, file:// warehouse
@@ -251,8 +251,12 @@ automatically.
 
 ## 4. Seal
 
-Triggered on `min(target_size, max_age)`, evaluated by the writer at commit time. Entirely
-local.
+Triggered on `target_size` alone, evaluated by the writer at commit time. Entirely local.
+
+There is no timer. A `max_age` branch was specified here and removed: it emitted a small
+file every interval on a quiet stream — the layout §6 exists to repair — and made one knob
+serve as both a file-size and an RPO policy, so shrinking it to lose less on a crash
+produced worse files. Freshness in the cloud is §3a's job.
 
 ```
 1. SQLite txn: choose [start, end), write it to `sealing`.
@@ -348,8 +352,11 @@ which reads that same watermark to enforce I4 and runs with or without an archiv
 
 ## 6. Compaction
 
-Required: the `max_age` seal branch guarantees undersized files, so a quiet stream emits a
-small file every interval indefinitely.
+Not required, and in normal operation a no-op. Every file a seal writes is already the
+size it was asked to be, because the cut is exact and there is no timer to cut early. What
+is left for compaction is the deliberate exceptions: an explicit `seal()`, which cuts
+short by definition, and a change to `target_size`, which leaves history sized for the old
+value.
 
 Hand-written, because `rewrite_data_files` is a Spark procedure with no pyiceberg
 equivalent.
@@ -562,7 +569,7 @@ it separates cleanly from compaction:
 
 | knob | controls |
 |---|---|
-| seal threshold (`target_size` / `max_age`) | how many rows sit in the buffer, hence hot-read latency |
+| seal threshold (`target_size`) | how many rows sit in the buffer, hence hot-read latency |
 | compaction | how large the files end up, hence scan cost |
 
 So **seal small and often, then compact** — rather than sealing at a large `target_size` to
@@ -605,7 +612,7 @@ directly*.
 **Fixed is a property of the implementation, not of the design, and it has to be earned.**
 The boundary comes from manifest statistics, and reading those costs time proportional to
 *file count*: measured at 1.0 ms over one file and 44 ms over 64, which at the small-file
-counts a `max_age` seal produces is most of a read. Two things bring it back to fixed.
+counts an undersized seal produces is most of a read. Two things bring it back to fixed.
 
 Read the offset bounds off the manifest entries rather than through a full file-metadata
 materialisation — pyiceberg's `inspect.files()` builds an eighteen-column Arrow table,
@@ -702,7 +709,7 @@ are registered in the archive, and the local table holds only what has not yet b
 uploaded. Hot reads are then limited to the buffer, and anything older goes to the archive
 over the network. That is the right setting for pure archival capture — litelink as a
 durable staging area into Iceberg — and the wrong one wherever a hot reader looks back
-further than `max_age`. It does not weaken I4: eviction still never precedes registration.
+further than the buffer holds. It does not weaken I4: eviction still never precedes registration.
 
 **With no archive, retention is deletion, and that is the intended contract.** I4 forbids
 evicting a file the archive still lacks — but nothing is owed to an archive that does not
@@ -1000,7 +1007,7 @@ The consequence worth planning for is that local disk holds roughly
    recovery replays only what it owns — which is the hazard above, resolved.
 
    Nothing configures where the sealer runs, because nothing in the library runs one.
-   `seal_due()` drains the queue and applies `max_age`; `maintain()` calls it and then
+   `seal_due()` drains the queue; `maintain()` calls it and then
    compacts, evicts and expires. Both are plain methods on their caller's schedule, and
    if another owner holds the lease the call is refused and returns rather than
    duplicating the work.
@@ -1131,7 +1138,7 @@ The consequence worth planning for is that local disk holds roughly
 
    - **What triggers a seal?** §4 says the writer evaluates it at commit time, and that is
      free because the writer already knows the buffer grew. A maintainer would poll. The
-     `max_age` branch is time-based and would not care, but it is not wired up at all today.
+     `max_age` branch would not have cared, being time-based, but it no longer exists.
    - ~~**The size counter is per-process.**~~ **Resolved by `extent`.** The running
      total lives in the open queue row and is written in the same transaction as the rows
      it accounts for, so any process reads it with a keyed read of one row — and there is
@@ -1188,7 +1195,11 @@ The consequence worth planning for is that local disk holds roughly
      §15's design already has binary payloads **bypass** the buffer rather than travel
      through it.
 
-   ### What `max_age` needs to know, and how little that is
+   ### ~~What `max_age` needs to know, and how little that is~~ (removed)
+
+   **Superseded: there is no `max_age`.** Kept because the reasoning about what the buffer
+   may record — and why a library-stamped timestamp is not it — still applies to anything
+   time-based that might be proposed later.
 
    A maintainer cannot evaluate `max_age` without knowing how old the unsealed data is, and
    the buffer records nothing temporal. The obvious move is a library-stamped timestamp

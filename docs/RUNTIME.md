@@ -48,8 +48,8 @@ also means splitting the role across two processes later needs no code change, i
 compaction ever delays sealing enough to matter. It costs latency, not file size — the
 cut was recorded when the rows arrived.
 
-**Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue
-and closes anything past `max_age`; `maintain()` compacts, evicts and expires — and calls
+**Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue;
+`maintain()` compacts, evicts and expires — and calls
 `seal_due()` first, because sealing is the first thing done with what the writer leaves
 behind. They are two methods rather than one only because their costs differ by an order
 of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
@@ -170,10 +170,10 @@ returns the cut it recorded whether or not this caller wrote it, and `await_seal
 the call for anyone who needs the table itself to have moved. Blocking inside `seal()`
 instead would put a caller behind another process's lease TTL, which is a worse bargain.
 
-`max_age` (§4's other trigger) is the same mechanism from the other side: the open group
-records when its **first row** landed, and a sealer closes it once that is old enough.
-Stamping the group's creation instead would seal a one-row file the moment an idle group
-finally got a row.
+There is no second trigger. A `max_age` branch was specified and removed: it emitted a
+small file every interval on a quiet stream, and coupled the file size to the RPO so that
+improving one wrecked the other. What bounds RPO now is WAL replication, which is a
+property of a sidecar rather than of the layout.
 
 ---
 
