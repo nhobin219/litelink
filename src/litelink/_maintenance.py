@@ -518,11 +518,27 @@ class Maintenance:
         # `_commit` would retry the swap onto the fresh table and put every
         # evicted row back.
         table.reload()
-        live = {f.path for f in table.data_files()}
+        current = table.data_files()
+        live = {f.path for f in current}
         if not all(f.path in live for f in run):
             claim.release()
 
             return
+
+        # The archive premise too, not only the inputs' liveness. The run was
+        # grouped at pass start against the watermark as it was then, and a
+        # sync that ran since — under a policy whose grouping settles a partial
+        # prefix of this run — can have pushed part of it. Merging what is left
+        # commits a LOCAL file straddling the archive's extent, and nothing
+        # re-cuts a local straddler: `rewrite_archive` works the other side.
+        # From then on every push is refused by `_refuse_straddle`, the
+        # watermark never advances again, and eviction pins on it.
+        if table is self._table and self._archive.configured():
+            archived = self.archived_prefix(current)
+            if any(f.lo <= archived for f in run):
+                claim.release()
+
+                return
 
         self._buffer.claim_compaction(lo, hi, self._key(target))
         try:

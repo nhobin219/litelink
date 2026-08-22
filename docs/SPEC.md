@@ -483,7 +483,20 @@ cannot disagree about which files are still in play. And the refresh happens in
 compaction and in `sync` as well as in eviction, because the shipped topology runs those two
 as SEPARATE PROCESSES: refreshing in one place only keeps them in step within a process,
 while across processes one restarting after a durable `set_config` and the other not would
-leave compaction grouping under a policy `sync` had never heard of, permanently.
+leave compaction grouping under a policy `sync` had never heard of, permanently. And
+compaction re-reads the archive premise under each RUN claim, not only at pass start: a sync
+that ran in between, under a grouping that settles a partial prefix of a run, leaves the
+rest of that run merging into a local file straddling the archive's extent — and nothing
+re-cuts a local straddler, so every later push is refused and the watermark never moves
+again.
+
+**`validate` checks a PAIR, so both halves are read durably.** An evict-on-upload policy
+with no archive to evict into is refused in one call, and each setter was checking its own
+new half against this process's memory of the other — so two processes could assemble the
+refused pair between them, after which the next maintenance pass executes it faithfully and
+deletes the only copy of everything sealed. And the rule itself has to match how eviction
+combines the floors: it takes the lower boundary, so the policy retaining MORE wins, and a
+config is "evict on upload" only when every floor it states is one.
 
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so

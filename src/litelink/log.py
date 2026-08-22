@@ -657,7 +657,21 @@ class Log:
         """
         with self._lock:
             self._writable()
-            validate(self._schema, self._sort_by, config, self._archive.uri)
+            # Validated against the archive the LOG records, not the one this
+            # process happens to remember. `validate` refuses a pair — an
+            # evict-on-upload policy with no archive to evict into — and each
+            # setter was checking its own new half against a stale copy of the
+            # other, so two processes could assemble the refused pair between
+            # them: one attaches a retention while an archive is configured,
+            # the other detaches the archive against a policy it read before
+            # that. The next maintenance pass then faithfully executes it, and
+            # deletes the only copy of everything sealed.
+            validate(
+                self._schema,
+                self._sort_by,
+                config,
+                self._buffer.get_meta(_ARCHIVE_KEY) or None,
+            )
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
             # One owner. `Maintenance` holds the policy and fans it out to the
             # buffer's seal target; a second copy here was kept in step by this
@@ -763,6 +777,10 @@ class Log:
         """
         with self._lock:
             self._writable()
+            # The other direction of the same pair: validated against the
+            # policy the LOG records. Both halves are read durably, so the
+            # combination that reaches `meta` is one `validate` has seen.
+            self._maintenance.refresh_config()
             validate(self._schema, self._sort_by, self.config, archive)
             # Before the first durable write, so a refusal changes nothing.
             lease = self._lease(MAINTAIN_ROLE)
@@ -2106,13 +2124,37 @@ def validate(
         msg = f"sort_by names columns not in the schema: {missing}"
         raise ValueError(msg)
 
-    if archive is None and (
-        config.local_retention == timedelta(0) or config.local_rows == 0
+    if config.local_retention is not None and config.local_retention < timedelta(0):
+        # The same check its twin above has always had, and the reason it
+        # matters more here: eviction computes `now - local_retention`, so a
+        # negative one puts the cutoff in the FUTURE and every file in the log
+        # is stale. On a local-only log that is silent deletion of the only
+        # copy of everything, at every negative value, from one sign slip.
+        msg = f"local_retention must not be negative: {config.local_retention}"
+        raise ValueError(msg)
+
+    # Both floors, and how eviction actually combines them. It takes the LOWER
+    # boundary — the policy that retains MORE wins (§12) — so a config is only
+    # "evict on upload" when EVERY floor it states is one. Stating one such
+    # floor beside a generous one is safe, and the previous version of this
+    # rule refused it with a message that was false for that pair.
+    floors = [
+        config.local_retention is not None and config.local_retention <= timedelta(0),
+        config.local_rows is not None and config.local_rows == 0,
+    ]
+    stated = [
+        config.local_retention is not None,
+        config.local_rows is not None,
+    ]
+    if (
+        archive is None
+        and any(stated)
+        and all(drops for drops, given in zip(floors, stated, strict=True) if given)
     ):
         msg = (
             "local_retention=0 and local_rows=0 both mean 'evict on upload' "
-            "and presuppose an archive; with archive=None either would delete "
-            "each file as it sealed"
+            "and presuppose an archive; with archive=None this config would "
+            "delete each file as it sealed"
         )
         raise ValueError(msg)
 
