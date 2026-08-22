@@ -30,11 +30,46 @@ import itertools
 import time
 from datetime import timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from _stream import NAME, SCHEMA, SORT_BY, observations
 
 from litelink import Log, LogConfig
 from litelink._s3 import S3Options
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# Six tries against the library's own ten-second wait: a minute of patience,
+# which covers the longest sync this repo has measured.
+_SETTLE_ATTEMPTS = 6
+
+
+def _settle(change: Callable[[], None], what: str) -> None:
+    """Apply a settings change, waiting out whatever maintenance is doing.
+
+    Both setters take a whole-log claim — `validate` refuses a PAIR, so the two
+    halves have to be decided together — which means they queue behind ordinary
+    maintenance. The library waits ten seconds and then reports rather than
+    hanging, and that is the right library behaviour: a wedged log should
+    surface. But a sync holds its claim for the whole push, measured at 83 s
+    over sixteen files, and a merge over a large run at 20 s — so a writer that
+    treated the report as fatal would crash on any restart that happened to
+    land during one, which is exactly when restarts are most likely.
+
+    The writer is a long-running process with nothing better to do here, so it
+    waits. Loudly, because a wait that never ends should look like one.
+    """
+    for attempt in range(_SETTLE_ATTEMPTS):
+        try:
+            change()
+
+            return
+        except RuntimeError as exc:
+            if attempt == _SETTLE_ATTEMPTS - 1:
+                raise
+
+            print(f"waiting on maintenance before {what}: {exc}", flush=True)
 
 
 def main() -> None:
@@ -119,9 +154,9 @@ def main() -> None:
         # local disk. `demo-clean` then sees no archive, skips the S3 removal,
         # and deletes the local state, leaving paid storage nothing can name.
         if args.archive is not None:
-            log.set_archive(args.archive)
+            _settle(lambda: log.set_archive(args.archive), "attaching the archive")
 
-        log.set_config(config)
+        _settle(lambda: log.set_config(config), "applying the config")
     except FileNotFoundError:
         log = Log.new(
             args.root,

@@ -1350,3 +1350,42 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
         assert local < total // 2, (
             f"eviction stalled after the re-cut: {local} of {total} rows still local"
         )
+
+
+def test_a_stale_handle_cannot_repair_the_archive_it_was_pointed_away_from(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Opening with `repair` is the most dangerous thing a handle does.
+
+    It lets `open_archive` drop a catalog entry naming another prefix and
+    create a fresh table at this one. The maintenance claim is what entitles a
+    caller to that; the durable location is what tells it WHICH archive to
+    repair, and every repairing caller except `sync` inherited the privilege
+    without the premise. A handle that remembers the archive the log has left
+    then destroys the live archive's catalog entry, and the next pass "repairs"
+    again by creating an empty table over its data.
+    """
+    with archived_log(tmp_path, bucket, s3) as writer:
+        writer.extend(rows(ROWS))
+        writer.seal_due()
+        writer.sync()
+
+        with Log.open(tmp_path, "s", s3=s3) as stale:
+            # `stale` remembers the first archive and never opens its handle.
+            assert stale._archive.uri == f"s3://{bucket}/prefix"
+
+            writer.set_archive(f"s3://{bucket}/second")
+            writer.extend(rows(ROWS))
+            writer.seal_due()
+            writer.sync()
+            readable = writer.scan(include_archive=True).read_all().num_rows
+
+            # The documented ad-hoc operation, run from the stale handle.
+            stale.rewrite_archive()
+
+            assert writer.scan(include_archive=True).read_all().num_rows == readable, (
+                "a stale handle repaired the wrong archive and lost history"
+            )
+            assert stale._archive.uri == f"s3://{bucket}/second", (
+                "the repairing open must adopt the location the log records"
+            )

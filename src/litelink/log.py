@@ -690,6 +690,15 @@ class Log:
                     config,
                     self._buffer.get_meta(_ARCHIVE_KEY) or None,
                 )
+                # Asked again at the write. The claim makes the read and the
+                # write one decision only while it is held, and a stall past
+                # the TTL between them is the threat the TTL exists for: the
+                # other setter takes the lapsed claim lawfully, validates
+                # against the half this one has not written yet, writes its
+                # own — and between them they record the pair `validate` just
+                # refused. Every data commit already asks this; the setters
+                # stopped one line short.
+                checkpoint(lease.renew)
                 self._buffer.set_meta(_CONFIG_KEY, config.to_json())
                 # One owner. `Maintenance` holds the policy and fans it out to
                 # the buffer's seal target; a second copy here was kept in step
@@ -815,6 +824,8 @@ class Log:
                 # applied to the configuration that governs it.
                 self._maintenance.refresh_config()
                 validate(self._schema, self._sort_by, self.config, archive)
+                # The other half of the same rule; see `set_config`.
+                checkpoint(lease.renew)
                 self._repoint(archive)
             finally:
                 lease.release()
@@ -868,7 +879,9 @@ class Log:
         # the check at open heals what this misses.
         if self._archive.configured():
             with contextlib.suppress(Exception):
-                self._archive.table(repair=True)
+                self._archive.adopt(
+                    self._buffer.get_meta(_ARCHIVE_KEY) or None, repair=True
+                )
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.
@@ -1926,7 +1939,11 @@ class Log:
 
     def _pull(self, lease: Claim, since: timedelta) -> None:
         """Copy down and register everything archived since `since`."""
-        archive = self._archive.require()
+        # The location the LOG records, read under the claim. This opens with
+        # `repair` on, which may drop a catalog entry naming somewhere else —
+        # a privilege the claim entitles it to, against the archive the log
+        # actually has rather than the one this process remembers.
+        archive = self._archive.require(self._buffer.get_meta(_ARCHIVE_KEY) or None)
         self._table.reload()
 
         covered = self._table.extent()
