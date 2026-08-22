@@ -690,3 +690,72 @@ def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="coordinated through a `lease` table"):
         Log.open(tmp_path, "s")
+
+
+def test_negative_local_retention_is_refused(tmp_path: Path) -> None:
+    """The sign check its twin has always had.
+
+    Eviction computes `now - local_retention`, so a negative one puts the
+    cutoff in the FUTURE and every file in the log is stale. On a local-only
+    log that is silent deletion of the only copy of everything, at every
+    negative value, from one sign slip — and the zero rule never caught it
+    because it tests equality.
+    """
+    with pytest.raises(ValueError, match="local_retention must not be negative"):
+        Log.new(
+            tmp_path,
+            "s",
+            schema=SCHEMA,
+            sort_by=("event_ts",),
+            config=LogConfig(local_retention=timedelta(hours=-1)),
+        )
+
+
+def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> None:
+    """Eviction takes the LOWER boundary, so the policy retaining more wins.
+
+    A config is only "evict on upload" when every floor it states is one.
+    Refusing `local_retention=0` beside `local_rows=1_000_000` would refuse a
+    config that keeps a million rows regardless of age, with a message that is
+    false for it.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=LogConfig(local_retention=timedelta(0), local_rows=1_000_000),
+    )
+    with log:
+        log.extend([{"event_ts": i, "key": "k", "payload": "p"} for i in range(8)])
+        log.seal()
+        log.maintain()
+
+        assert log.scan().read_all().num_rows == 8, "evicted under a generous floor"
+
+
+def test_two_processes_cannot_assemble_the_pair_validate_refuses(
+    tmp_path: Path,
+) -> None:
+    """`validate` refuses a PAIR, so both halves must be read durably.
+
+    Each setter checked its own new half against this process's memory of the
+    other, so two handles could assemble the refused combination between them:
+    one attaches an evict-on-upload policy while an archive is configured, the
+    other detaches the archive against a policy it read before that. The next
+    maintenance pass then executes it and deletes the only copy of everything.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log, Log.open(tmp_path, "s") as other:
+        # `other` opened while an archive was configured and a normal policy
+        # was in force; it still remembers both.
+        log.set_config(LogConfig(local_rows=0))
+
+        with pytest.raises(ValueError, match="evict on upload"):
+            other.set_archive(None)
