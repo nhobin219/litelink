@@ -39,12 +39,14 @@ if TYPE_CHECKING:
 def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
     """Renew the caller's claim, or refuse to carry on without it.
 
-    Losing the role mid-pass is not something to push through: another owner
-    is already redoing this work, and two of them writing the same table is
-    what the lease exists to prevent.
+    Losing the range mid-pass is not something to push through: another owner
+    may already be redoing this work, and two of them writing the same files is
+    what the claim exists to prevent. A claim ends by being TAKEN, not by
+    expiring — an uncontested holder renews fine — so a failed renew means
+    somebody else owns these offsets now.
     """
     if heartbeat is not None and not heartbeat():
-        msg = "lost the maintenance lease mid-pass"
+        msg = "lost the claim on this range mid-pass"
         raise RuntimeError(msg)
 
 

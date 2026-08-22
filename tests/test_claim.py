@@ -422,7 +422,7 @@ def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
 
         assert stolen.acquire(), "could not simulate the takeover"
 
-        with pytest.raises(RuntimeError, match="lost the seal lease"):
+        with pytest.raises(RuntimeError, match="lost the claim on this seal range"):
             log._write_and_commit(end, path, lapsed)
 
         assert log.table_files() == 0, "a lapsed writer committed anyway"
