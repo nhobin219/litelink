@@ -633,21 +633,41 @@ def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> N
         assert len(buffers) == 2, f"buffers must not collide: {buffers}"
 
 
-def test_compact_min_files_below_one_is_refused(tmp_path: Path) -> None:
+def test_compact_min_files_below_two_is_refused(tmp_path: Path) -> None:
     """A knob that can stall the log for ever should not accept the value.
 
-    Below one, no run ever satisfies `compact_min_files`, so `stable_prefix`
-    returns zero permanently: sync pushes nothing, the watermark stands still,
-    eviction pins on it, and the local table grows without bound. Nothing
-    raises and nothing logs — the log simply stops making progress.
+    The floor is TWO, not one, and the difference is the whole defect: a run
+    always holds at least one file, so at one every run looks mergeable,
+    nothing is ever settled, and `stable_prefix` returns zero permanently.
+    Sync pushes nothing, the watermark stands still, eviction pins on it and
+    the local table grows without bound — while every pass rewrites every file
+    to no purpose. Merging a run of one is a no-op rewrite in any case.
     """
-    with pytest.raises(ValueError, match="compact_min_files must be at least 1"):
+    for value in (0, 1):
+        with pytest.raises(ValueError, match="compact_min_files must be at least 2"):
+            Log.new(
+                tmp_path,
+                f"s{value}",
+                schema=SCHEMA,
+                sort_by=("event_ts",),
+                config=LogConfig(compact_min_files=value),
+            )
+
+
+def test_local_rows_zero_without_an_archive_is_refused(tmp_path: Path) -> None:
+    """The same intent, refused on one knob and accepted on its twin.
+
+    `local_retention=0` was refused on a local-only log as "would delete each
+    file as it sealed", and `local_rows=0` means exactly that — keep the newest
+    zero rows — and was accepted, evicting every sealed file as the only copy.
+    """
+    with pytest.raises(ValueError, match="evict on upload"):
         Log.new(
             tmp_path,
             "s",
             schema=SCHEMA,
             sort_by=("event_ts",),
-            config=LogConfig(compact_min_files=0),
+            config=LogConfig(local_rows=0),
         )
 
 

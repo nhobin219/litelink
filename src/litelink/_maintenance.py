@@ -29,10 +29,6 @@ from litelink._fs import fsync
 # `Log`'s private business, because eviction decides deletions from it.
 CONFIG_KEY = "config"
 
-# Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
-# `Log`'s private business, because eviction decides deletions from it.
-CONFIG_KEY = "config"
-
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
 
@@ -428,6 +424,14 @@ class Maintenance:
         # a file the archive holds is never rewritten locally, so the local
         # range and the archived range stay the same range, which is what lets
         # `archived_prefix` match them at all.
+        # The policy too, and this is not optional for compaction: `runs` is
+        # shared with `sync` so that the two cannot disagree about which files
+        # are still in play, and the shipped topology runs them as SEPARATE
+        # PROCESSES. Refreshing in one place only kept them in step within a
+        # process; across processes, one restarting after a durable
+        # `set_config` while the other did not would leave compaction grouping
+        # under a policy sync had never heard of, permanently.
+        self.refresh_config()
         self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         local = self._table.data_files()
         archived = self.archived_prefix(local) if self._archive.configured() else 0
