@@ -479,7 +479,11 @@ owner. `Log` used to keep a copy beside `Maintenance`'s, with the buffer's seal 
 third, kept in step by `set_config` writing all three. Two copies is one too many the moment
 anything else can change the policy — refreshing one would leave compaction reading the new
 grouping while `sync` read the old, and `runs` is shared by exactly those two so that they
-cannot disagree about which files are still in play.
+cannot disagree about which files are still in play. And the refresh happens in
+compaction and in `sync` as well as in eviction, because the shipped topology runs those two
+as SEPARATE PROCESSES: refreshing in one place only keeps them in step within a process,
+while across processes one restarting after a durable `set_config` and the other not would
+leave compaction grouping under a policy `sync` had never heard of, permanently.
 
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so

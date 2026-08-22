@@ -1535,6 +1535,14 @@ class Log:
         watermark forever rather than improve anything. That is a cosmetic cost
         with a deliberate cause, and `rewrite_archive` is the tool for it.
         """
+        # Read under the claim, the same as everything else that decides what
+        # this pass does. The grouping `stable_prefix` computes has to match
+        # the one compaction computes — `runs` is shared so they cannot
+        # disagree — and in the shipped topology they are separate processes,
+        # so agreement means both reading the policy the log records rather
+        # than the one each happened to open with.
+        self._maintenance.refresh_config()
+
         archive = self._archive.require()
         self._table.reload()
         # The ARCHIVE reloaded too, and for a stronger reason than the local
@@ -2098,14 +2106,13 @@ def validate(
         msg = f"sort_by names columns not in the schema: {missing}"
         raise ValueError(msg)
 
-    if (
-        archive is None
-        and config.local_retention == timedelta(0)
-        and not config.local_rows
+    if archive is None and (
+        config.local_retention == timedelta(0) or config.local_rows == 0
     ):
         msg = (
-            "local_retention=0 means 'evict on upload' and presupposes an "
-            "archive; with archive=None it would delete each file as it sealed"
+            "local_retention=0 and local_rows=0 both mean 'evict on upload' "
+            "and presuppose an archive; with archive=None either would delete "
+            "each file as it sealed"
         )
         raise ValueError(msg)
 
@@ -2116,13 +2123,16 @@ def validate(
         )
         raise ValueError(msg)
 
-    if config.compact_min_files < 1:
+    if config.compact_min_files < 2:
         msg = (
-            f"compact_min_files must be at least 1: {config.compact_min_files}. "
+            f"compact_min_files must be at least 2: {config.compact_min_files}. "
             "It is how many files a run needs before compaction will merge it, "
-            "and below one nothing is ever settled: `stable_prefix` returns "
-            "zero for ever, so sync pushes nothing, the watermark stands still, "
-            "eviction pins on it and the local table grows without bound"
+            "and a run always holds at least one — so at one, every run looks "
+            "mergeable, nothing is ever settled, and `stable_prefix` returns "
+            "zero for ever: sync pushes nothing, the watermark stands still, "
+            "eviction pins on it and the local table grows without bound, while "
+            "every pass rewrites every file to no purpose. Merging a run of one "
+            "is a no-op rewrite in any case"
         )
         raise ValueError(msg)
 
