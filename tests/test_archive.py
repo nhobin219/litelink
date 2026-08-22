@@ -1248,3 +1248,97 @@ def test_the_archive_refuses_a_range_that_starts_inside_its_extent(
 
         # And one that begins cleanly above it is not refused by this check.
         archive._refuse_straddle(covered[1] + 1)
+
+
+def test_the_log_keeps_working_after_the_archive_is_re_cut(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`rewrite_archive` while local files still overlap what it re-cuts.
+
+    The two tiers then hold the same rows at boundaries neither shares, which
+    is the state every later decision has to survive: I4 asking whether the
+    archive holds a local file's rows, compaction deciding what is already the
+    archive's business, and the archive refusing a range that starts inside its
+    extent. The existing rewrite test evicts everything first, so none of that
+    is exercised there.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=16 * 1024,
+        target_compact_size=32 * 1024,
+        compact_min_files=2,
+        local_rows=2000,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        total = 0
+        for _ in range(4):
+            log.extend(rows(3000))
+            total += 3000
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.archive_files() > 2, "expected several undersized archive files"
+        assert log._table.data_files(), "local files must still overlap the archive"
+
+        # The documented reason it exists: a raised target leaves history sized
+        # for the old one.
+        log.set_config(replace(config, target_compact_size=256 * 1024))
+        log.rewrite_archive()
+
+        assert log.scan(include_archive=True).read_all().num_rows == total
+
+        # The superseded rows still sit in `extent`: `drain` removes them only
+        # after the grace period, and until it does they still match the local
+        # cuts. The state that matters is the one AFTER that, so take it.
+        current = {(f.lo, f.hi + 1) for f in log._archive.require().data_files()}
+        with log._buffer._lock:
+            for lo, hi in log._buffer.archived_ranges(log._archive.uri or "", 0):
+                if (lo, hi) not in current:
+                    log._buffer._con.execute(
+                        "DELETE FROM extent WHERE start_offset = ? AND end_offset = ? "
+                        "AND rel_path LIKE 's3://%'",
+                        (lo, hi),
+                    )
+
+            log._buffer._con.commit()
+
+        # And the log has to keep going past a re-cut archive.
+        log.extend(rows(3000))
+        total += 3000
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        table = log.scan(include_archive=True).read_all()
+        offsets = (
+            log.scan(columns=["litelink_offset"], include_archive=True)
+            .read_all()
+            .column(0)
+            .to_pylist()
+        )
+
+        assert table.num_rows == total, "sync stalled or lost rows after the re-cut"
+        assert len(set(offsets)) == len(offsets), "duplicate offsets after the re-cut"
+
+        # And eviction must still be making progress. This is what the re-cut
+        # actually broke: reads keep answering correctly whether or not I4 can
+        # still recognise the archive's copies, so a row count says nothing.
+        # `local_rows` is what says it — asked for 2,000 and the archive holds
+        # every one of these, a local table still carrying all 15,000 means
+        # eviction has stopped and `local_retention` is silently void.
+        local = log.scan().read_all().num_rows
+
+        assert local < total // 2, (
+            f"eviction stalled after the re-cut: {local} of {total} rows still local"
+        )
