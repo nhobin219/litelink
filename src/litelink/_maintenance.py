@@ -15,12 +15,13 @@ pyiceberg's is metadata-only. Draining is what actually unlinks, and it waits
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 
-from litelink._archive import ARCHIVE_KEY, Archive
+from litelink._archive import Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
 from litelink._claim import EVERYTHING, new_owner
 from litelink._fs import fsync
@@ -238,14 +239,12 @@ class Maintenance:
         table: LogTable,
         buffer: Buffer,
         layout: Layout,
-        config: LogConfig,
         sort_by: tuple[str, ...],
         archive: Archive,
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
-        self._config = config
         self._sort_by = sort_by
         self._archive = archive
         # Read once per eviction pass rather than once per file. Cleared at the
@@ -254,60 +253,14 @@ class Maintenance:
 
     @property
     def config(self) -> LogConfig:
-        """The policy in force, and the ONLY copy of it.
+        """The policy in force, read from the log on every access.
 
-        `Log` used to keep its own beside this one, kept in step by
-        `set_config` writing both. Two copies is one too many the moment
-        anything else can change the policy: refreshing this one from the
-        durable value would leave compaction reading the new policy while
-        `sync` read the old, and `runs` exists precisely so those two cannot
-        disagree — a file `sync` settles under one grouping and compaction
-        merges under another leaves the archive holding rows rewritten
-        underneath it.
+        No copy is kept here. A second copy is what every one of this seam's
+        defects came down to: a decision read the copy while the durable row
+        said otherwise, and correctness then depended on a refresh call sitting
+        at each decision — twelve of them, and always one short somewhere.
         """
-        return self._config
-
-    def set_config(self, config: LogConfig) -> None:
-        """Adopt new policy in place, rather than being rebuilt around it.
-
-        The buffer too, or `target_seal_size` changes everywhere except where
-        the cut is actually made and the log quietly keeps sizing files to the
-        value it was opened with.
-        """
-        self._config = config
-        self._buffer.set_target_size(config.target_seal_size, config.target_seal_rows)
-
-    def refresh_config(self) -> None:
-        """Adopt the policy the log durably records.
-
-        The reasoning the archive location already earned, applied to the
-        settings beside it: `set_config` writes durable state, and a process
-        that read it at open otherwise answers for the policy the log had then,
-        for as long as it runs. Eviction is where that shows — it decides
-        deletions from `local_retention` and `local_rows`, so a maintainer
-        holding a stale copy goes on deleting the only copy of rows the durable
-        policy says to keep, and §8 reads as an obligation rather than a hint.
-
-        Tolerant of a value it cannot parse: refusing to maintain a log at all
-        is a worse failure than maintaining it under the settings this process
-        already had.
-        """
-        encoded = self._buffer.get_meta(CONFIG_KEY)
-        if encoded is None:
-            return
-
-        # Imported here rather than at module scope: `log` imports this module,
-        # so the other direction is a cycle. `sys.modules` makes the repeat
-        # cost nothing, and this runs once per eviction pass.
-        from litelink.log import LogConfig
-
-        try:
-            refreshed = LogConfig.from_json(encoded)
-        except (ValueError, TypeError):
-            return
-
-        if refreshed != self._config:
-            self.set_config(refreshed)
+        return self._buffer.config()
 
     def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
         self._sort_by = sort_by
@@ -424,24 +377,15 @@ class Maintenance:
         # a file the archive holds is never rewritten locally, so the local
         # range and the archived range stay the same range, which is what lets
         # `archived_prefix` match them at all.
-        # The policy too, and this is not optional for compaction: `runs` is
-        # shared with `sync` so that the two cannot disagree about which files
-        # are still in play, and the shipped topology runs them as SEPARATE
-        # PROCESSES. Refreshing in one place only kept them in step within a
-        # process; across processes, one restarting after a durable
-        # `set_config` while the other did not would leave compaction grouping
-        # under a policy sync had never heard of, permanently.
-        self.refresh_config()
-        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         local = self._table.data_files()
         archived = self.archived_prefix(local) if self._archive.configured() else 0
         pending = [f for f in local if f.hi > archived]
 
         for run in runs(
             pending,
-            self._config.compact_size,
+            self.config.compact_size,
             self.memory(),
-            self._config.compact_rows,
+            self.config.compact_rows,
         ):
             self._merge(run, heartbeat)
 
@@ -461,7 +405,7 @@ class Maintenance:
 
     def _merge(self, run: list[DataFile], heartbeat: Callable[[], bool] | None) -> None:
         """Compact a run, if there is enough of it to be worth a rewrite."""
-        if len(run) >= self._config.compact_min_files:
+        if len(run) >= self.config.compact_min_files:
             self._rewrite_run(self._table, run, heartbeat)
 
     def _rewrite_run(
@@ -540,7 +484,6 @@ class Maintenance:
         # has one, and skip itself entirely.
         # From then on every push is refused by `_refuse_straddle`, the
         # watermark never advances again, and eviction pins on it.
-        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         if table is self._table and self._archive.configured():
             archived = self.archived_prefix(current)
             if any(f.lo <= archived for f in run):
@@ -663,7 +606,7 @@ class Maintenance:
         claim, where the answer is the one acted on.
         """
         limits: list[int] = []
-        retention = self._config.local_retention
+        retention = self.config.local_retention
         if retention is not None:
             cutoff = datetime.now(UTC) - retention
             stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
@@ -671,12 +614,12 @@ class Maintenance:
             # means this policy would keep everything.
             limits.append(max((f.hi for f in stale), default=0))
 
-        if self._config.local_rows is not None:
+        if self.config.local_rows is not None:
             # Offsets are contiguous, so the newest `local_rows` of them start
             # here. AUTOINCREMENT can leave a gap where a transaction rolled
             # back, which makes this retain slightly more than asked rather
             # than less — the safe direction for a floor.
-            limits.append(self._buffer.next_offset() - 1 - self._config.local_rows)
+            limits.append(self._buffer.next_offset() - 1 - self.config.local_rows)
 
         return min(limits) if limits else 0
 
@@ -692,8 +635,7 @@ class Maintenance:
         # The POLICY re-read first, because it decides everything below. Read
         # again under the claim as well: this one only decides whether there is
         # work, and the one that decides the deletion has to be the guarded one.
-        self.refresh_config()
-        if self._config.local_retention is None and self._config.local_rows is None:
+        if self.config.local_retention is None and self.config.local_rows is None:
             return
 
         # Same reason as `compact`: this decides what to drop from the ages a
@@ -740,8 +682,6 @@ class Maintenance:
         # whose rows the read path no longer scans.
         self._table.reload()
         self._age_cache = None
-        self.refresh_config()
-        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         files = self._table.data_files()
         boundary = min(boundary, self._retention_boundary())
 
@@ -843,9 +783,7 @@ class Maintenance:
         # `repair=False` here meant `maintain` and `rewrite_archive` failed
         # after a re-point with an error telling the operator that a
         # maintenance pass would fix it — which they are.
-        archive = self._archive.adopt(
-            self._buffer.get_meta(ARCHIVE_KEY) or None, repair=True
-        )
+        archive = self._archive.table(repair=True)
         if archive is None:
             msg = "rewrite_archive() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -878,7 +816,7 @@ class Maintenance:
         guess about what it holds.
         """
         held = self.memory()
-        target = self._config.compact_size
+        target = self.config.compact_size
         files = archive.data_files()
         for index, data_file in enumerate(files):
             if held.get(data_file.path, target) < target:
@@ -915,8 +853,16 @@ class Maintenance:
         scratch = Buffer.open(
             self._layout.rewrite_db,
             self._buffer.schema,
-            target_size=self._config.compact_size,
             durable=False,
+        )
+        # The scratch reads its cut size from its OWN `meta`, like every
+        # buffer, so it needs a policy written into it. It is a fresh database
+        # with no config row, and without this it would silently size its cuts
+        # by the library defaults rather than by the target this rewrite is
+        # re-cutting to — which is the entire point of the operation.
+        scratch.set_meta(
+            CONFIG_KEY,
+            replace(self.config, target_seal_size=self.config.compact_size).to_json(),
         )
         written: list[str] = []
         expected = 0
@@ -1051,7 +997,7 @@ class Maintenance:
 
     def expire(self) -> None:
         """Expire snapshots past `snapshot_retention`, then reclaim (§6, §8)."""
-        cutoff = datetime.now(UTC) - self._config.snapshot_retention
+        cutoff = datetime.now(UTC) - self.config.snapshot_retention
 
         # Collect the doomed snapshots' manifest lists and manifests BEFORE
         # expiring them. Afterwards their names exist nowhere: the metadata that
@@ -1097,9 +1043,7 @@ class Maintenance:
         if not any(is_remote(p) for p in self._buffer.queued_deletions()):
             return
 
-        archive = self._archive.adopt(
-            self._buffer.get_meta(ARCHIVE_KEY) or None, repair=True
-        )
+        archive = self._archive.table(repair=True)
         if archive is None:
             return
 
@@ -1118,7 +1062,7 @@ class Maintenance:
         """
         # Read against the CURRENT snapshot_retention, so lowering it takes
         # effect on files already queued.
-        cutoff = datetime.now(UTC) - self._config.snapshot_retention
+        cutoff = datetime.now(UTC) - self.config.snapshot_retention
         due = self._buffer.due_deletions(int(cutoff.timestamp()))
         if not due:
             return
@@ -1152,9 +1096,7 @@ class Maintenance:
             # local-only log still opens nothing. `rewrite_archive` is what puts
             # remote entries here, and it is an operation somebody ran on purpose.
             remote = (
-                self._archive.adopt(
-                    self._buffer.get_meta(ARCHIVE_KEY) or None, repair=True
-                )
+                self._archive.table(repair=True)
                 if any(is_remote(p) for p in due)
                 else None
             )

@@ -17,7 +17,7 @@ keep in step. That the fan-out is gone is not only tidiness: the cached handle
 lives here too, so re-pointing the archive drops it, where before the Log
 changed the URI and went on serving reads from the table it had already opened.
 
-A local-only log gets one of these with `uri=None`, rather than the three
+A local-only log gets one of these too, rather than the three
 holders each taking `Archive | None`. It is the difference between "there is no
 archive" and "there is nowhere to look yet", and only the second survives
 `set_archive`: attaching one to a log that started local has to reach the
@@ -37,6 +37,7 @@ from litelink._table import ArchiveAbsent, LogTable
 if TYPE_CHECKING:
     import pyarrow as pa
 
+    from litelink._buffer import Buffer
     from litelink._layout import Layout
 
 
@@ -52,172 +53,110 @@ _UNSET = "\x00unset"
 
 
 class Archive:
-    """The remote tier: a URI, credentials, and the table they open."""
+    """Where the archive is, and the handle onto it.
+
+    **It holds no copy of the location.** That is the whole design of this
+    object now, and it is the answer to a defect found in eight review rounds
+    running: the location lived here as a field, kept in step with the log by a
+    `refresh` call at every decision that depended on it, and each round found
+    a decision that had no such call — a pass reading "no archive" from memory
+    while the log had one, a repairing open pointed at a bucket the log had
+    left, a fence comparing a value against itself because a re-point moved
+    both sides of the comparison together.
+
+    A design whose correctness needs N refresh calls is always one short
+    somewhere, because nothing tells you what N is. So there is one copy, in
+    `meta`, and this reads it: 1.8 us against a 5.4 ms query. A stale location
+    is no longer a bug to guard against; it is not a thing that can exist.
+    """
 
     def __init__(
         self,
         layout: Layout,
-        uri: str | None = None,
+        buffer: Buffer,
         s3: S3Options | None = None,
         schema: pa.Schema | None = None,
     ) -> None:
         self._layout = layout
-        # `or None` throughout: detaching writes an empty string to `meta`
-        # rather than deleting the row, and an empty archive is no archive.
-        self._uri = uri or None
+        self._buffer = buffer
         self._s3 = s3 or S3Options()
         self._schema = schema
         self._handle: LogTable | None = None
-        # Guards all three fields together, because they are one fact. The
-        # reader resolves the archive on a query thread while a maintainer
-        # syncs on another and `set_archive` can re-point it from a third, and
-        # without this the interleaving that matters is: `set_uri` clears the
-        # handle, then an open already in flight for the OLD uri stores its
-        # result, and every read after that is served from an archive the log
-        # has been told to stop using. Two threads opening at once would also
-        # each pay the round trip and one would use a handle the other has
-        # discarded.
-        #
-        # Cheap by construction: taken when an archive is opened or
-        # re-pointed, never per row and never per query once the handle
-        # exists. A leaf in the lock order — nothing here calls back into the
-        # Log, the reader or the maintainer — so it can be taken under any of
-        # their locks and adds no cycle.
-        self._lock = threading.Lock()
+        # What the cached handle was opened FOR. Keying the cache on the
+        # durable value is what keeps it from becoming the stale copy this
+        # class was rewritten to remove: when the log is re-pointed, the key
+        # changes and the handle is retired rather than surviving the move.
+        self._handle_uri: str | None = None
+        # Guards the handle and its key together, because they are one fact.
+        # The reader resolves the archive on a query thread while a maintainer
+        # syncs on another and `set_archive` re-points it from a third.
+        self._lock = threading.RLock()
+
+    def location(self) -> str | None:
+        """Where the archive is, according to the log.
+
+        `or None` because detaching writes an empty string to `meta` rather
+        than deleting the row, and an empty archive is no archive.
+        """
+        return self._buffer.get_meta(ARCHIVE_KEY) or None
 
     @property
     def uri(self) -> str | None:
-        """Where the archive is, or None when there is none."""
-        with self._lock:
-            return self._uri
+        """The location, for callers that read it as an attribute."""
+        return self.location()
 
     @property
     def s3(self) -> S3Options:
-        """Credentials, for callers that configure their own client — DuckDB's
-        S3 secret on the read path. Never persisted; see `_s3`."""
-        with self._lock:
-            return self._s3
+        """Credentials and endpoint, from the environment at the point of use.
+
+        Never persisted: a log directory gets copied and attached elsewhere,
+        and must not carry a key with it.
+        """
+        return self._s3
 
     def configured(self) -> bool:
-        """Whether there is an archive at all. Cheap, and opens nothing."""
-        with self._lock:
-            return self._uri is not None
-
-    def refresh(self, recorded: str | None) -> None:
-        """Adopt the location the log durably records.
-
-        This object is a process's MEMORY of where the archive is, and another
-        process can change where it is. Attaching one to a log a maintainer
-        already has open is a supported operation (§13.0), and until the
-        maintainer hears about it every reader of this object answers for the
-        configuration the log had at open — including `evict`, which asks
-        whether I4 owes the archive anything before deleting the only local
-        copy of a row. Answered from stale memory, the answer is no.
-
-        The detach direction heals on its own, because a push to an archive
-        that is gone fails. The attach direction has nothing that fails.
-        """
-        self.set_uri(recorded)
-
-    def set_uri(self, uri: str | None) -> None:
-        """Attach, re-point, or detach.
-
-        Drops the open handle. A cached table from the previous URI would
-        otherwise keep answering reads and taking pushes after the log has been
-        told to use a different one.
-        """
-        uri = uri or None
-        # Under the lock, like every other access. Without it, an open already
-        # in flight inside `table()` for the PREVIOUS uri stores its result
-        # after this has cleared the handle — and every read afterwards is
-        # served from an archive the log has been told to stop using, which is
-        # the exact interleaving the lock was added for.
-        with self._lock:
-            if uri != self._uri:
-                # The cached handle only. The catalog entry is checked against
-                # the prefix when the archive is next opened — `open_archive`
-                # explains why a repair that runs every time beats a step here
-                # that a crash can skip, and why detaching and reattaching the
-                # same archive has to keep working.
-                self._handle = None
-
-            self._uri = uri
+        """Whether the log has an archive at all. Opens nothing."""
+        return self.location() is not None
 
     def table(self, *, repair: bool = False) -> LogTable | None:
-        """The remote table, or None when unconfigured. Opened on first use.
+        """The remote table, or None when the log has no archive.
 
-        Lazy because opening it costs a round trip to object storage, which a
-        log that never syncs should not pay and a hot read must not pay at all
-        (I5): `include_archive=False` is the default, and a reader that never
-        opts in never reaches this.
+        `repair` lets `open_archive` drop a catalog entry naming another prefix
+        and create a fresh table at this one. The maintenance claim is what
+        entitles a caller to that; the location the LOG records is what says
+        which archive to do it to — and reading that location here, rather than
+        trusting one handed in at construction, is what makes the two
+        inseparable.
         """
         with self._lock:
-            if self._uri is None:
+            uri = self.location()
+            if uri is None:
+                self._handle = None
+                self._handle_uri = None
+
                 return None
 
-            if self._handle is None:
-                if self._schema is None:
-                    msg = "archive was constructed without a schema"
-                    raise ValueError(msg)
-
-                # Held across the open, which is a round trip. Deliberate: a
-                # second caller arriving mid-open should wait for that handle
-                # rather than start a second one, and `set_uri` should wait
-                # rather than clear a field the open is about to write.
+            if self._handle is None or self._handle_uri != uri:
                 try:
                     self._handle = LogTable.open_archive(
-                        self._layout, self._uri, self._s3, self._schema, repair=repair
+                        self._layout, uri, self._s3, self._schema, repair=repair
                     )
                 except ArchiveAbsent:
-                    # Nothing pushed yet. No leg, no error — and nothing
-                    # created, because creating a table is the write side's
-                    # business and a read must not have side effects.
                     return None
+
+                self._handle_uri = uri
 
             return self._handle
 
-    def adopt(self, recorded: str | None, *, repair: bool = False) -> LogTable | None:
-        """Refresh from the durable location, THEN open.
-
-        The two together, because opening with `repair=True` is the most
-        dangerous thing this object does: it lets `open_archive` drop a catalog
-        entry naming another prefix and create a fresh table at this one. That
-        privilege is justified by the caller holding the maintenance claim —
-        and the missing premise was that the caller's prefix is the one the LOG
-        records. Opened from a process's memory of an archive it was pointed
-        away from, the repair destroys the live archive's catalog entry, and
-        the next pass "repairs" again by creating an empty table over its data.
-        Measured end to end: 4,000 rows in, 550 readable, no error at the point
-        of the damage.
-
-        `sync` re-reads the location under its claim for exactly this reason
-        and says so; every other repairing caller inherited the privilege
-        without the premise.
-        """
-        self.refresh(recorded)
-
-        return self.table(repair=repair)
-
-    def require(
-        self, recorded: str | None = _UNSET, *, repair: bool = True
-    ) -> LogTable:
+    def require(self, *, repair: bool = True) -> LogTable:
         """The remote table, insisting there is one.
 
         For the write side of §5, where "no archive" is a caller error rather
-        than a leg of a union to leave out — and where the caller holds the
-        maintenance claim, which is what makes it the one allowed to create the
-        table or replace an entry naming somewhere else.
-
-        Pass `recorded` — the location the LOG records — whenever `repair` is
-        on. The claim is what entitles a caller to repair; the durable location
-        is what tells it which archive to repair. See `adopt`.
+        than a leg of a union to leave out.
         """
-        if recorded is not _UNSET:
-            self.refresh(recorded)
-
         table = self.table(repair=repair)
         if table is None:
-            msg = "this log is local-only; no archive is configured"
+            msg = "this log has no archive configured"
             raise ValueError(msg)
 
         return table

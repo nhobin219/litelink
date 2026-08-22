@@ -661,6 +661,41 @@ archive keeps as duplicate rows. Neither heals, because nothing re-cuts the arch
 The question I4 actually asks is whether the archive holds the ROWS, so adjacent archived
 files join and a gap ends the answer.
 
+### One copy of a fact, in the log
+
+Nine review rounds of this design found the same defect nine times, each in a place the
+previous round had not looked: **a fact with a durable home in `meta` also had a mutable
+copy in the process, and a decision read the copy.** A pass reading "no archive" from memory
+while the log had one. A repairing open pointed at a bucket the log had left, destroying the
+live archive's catalog entry. A fence comparing a value against itself, because a re-point
+moved both sides of the comparison together. Two setters each validating against a stale
+half of a pair. Compaction and `sync` grouping runs under different policies.
+
+The tell was not the defects but their remedy: twelve `refresh` calls, whose only work was
+dragging a copy back into agreement with the log. **A design whose correctness needs N of
+those is always one short somewhere, because nothing tells you what N is.**
+
+So the copies are gone. `Archive` stores no location and reads `meta`; `Buffer` owns the one
+`LogConfig` and everything that decides from the policy reads it there. All twelve refresh
+calls, and the methods behind them, deleted. A stale location or a stale policy is not a bug
+guarded against here — it is not a thing that can exist.
+
+What makes it affordable is that the reads are cheap and the expensive parts are cached
+**keyed on the durable value**: the parsed config on the raw JSON, the pyiceberg handle on
+the URI it was opened for. A key that comes from the log is what stops a cache becoming the
+next stale copy — when the log changes, the key changes and the cache retires itself. That
+is also, exactly, the archive-handle bug of the ninth round, gone by construction rather
+than by a rule.
+
+Measured: a `meta` read is 1.8 us against a 5.4 ms query, and an interleaved A/B of the
+append path — the only hot consumer — showed −0.3%, which is noise. Two earlier measurements
+of the same change showed 28% and 7% regressions; both were artifacts, one of a cold start
+and one of drift between blocks. Interleaving the runs is what settled it.
+
+What this does NOT cover: a pyiceberg table handle is a point-in-time snapshot of REMOTE
+state, with no local durable copy to derive from, so `reload()` before deciding remains a
+discipline. That is one method and a much smaller surface.
+
 ### Rejected: one settled watermark for both
 
 An earlier version of this section had a single `settled_through` that compaction worked

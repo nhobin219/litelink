@@ -1568,6 +1568,6 @@ def test_a_refreshed_policy_reaches_compaction_sync_and_the_buffer(
             "sync reads the policy through Log; it must be the refreshed one"
         )
         assert log._maintenance.config.local_rows == raised.local_rows
-        assert log._buffer._target_size == raised.target_seal_size, (
-            "the buffer sizes every file the log writes; it must hear too"
+        assert log._buffer.config().target_seal_size == raised.target_seal_size, (
+            "the buffer sizes every file the log writes; it reads the same row"
         )

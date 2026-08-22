@@ -524,8 +524,6 @@ class Log:
         buffer = Buffer.open(
             layout.buffer_db,
             schema,
-            target_size=settings.target_seal_size,
-            target_rows=settings.target_seal_rows,
         )
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
@@ -547,7 +545,7 @@ class Log:
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, archive, s3, table_schema(schema))
+        remote = Archive(layout, buffer, s3, table_schema(schema))
 
         return cls(
             layout=layout,
@@ -561,7 +559,7 @@ class Log:
                 duckdb_connection,
                 archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, settings, order, remote),
+            maintenance=Maintenance(table, buffer, layout, order, remote),
             schema=schema,
             sort_by=order,
             config=settings,
@@ -616,16 +614,10 @@ class Log:
         buffer = Buffer.open(
             layout.buffer_db,
             schema,
-            target_size=config.target_seal_size,
-            target_rows=config.target_seal_rows,
             readonly=read_only,
         )
         sort_by = table.sort_by()
-        # `or None`: detaching stores an empty string rather than deleting the
-        # row, and an empty archive is no archive. Read once here because both
-        # the Log and its maintainer need it.
-        archive = buffer.get_meta(_ARCHIVE_KEY) or None
-        remote = Archive(layout, archive, s3, table_schema(schema))
+        remote = Archive(layout, buffer, s3, table_schema(schema))
         log = cls(
             layout=layout,
             table=table,
@@ -638,7 +630,7 @@ class Log:
                 duckdb_connection,
                 archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, config, sort_by, remote),
+            maintenance=Maintenance(table, buffer, layout, sort_by, remote),
             schema=schema,
             sort_by=sort_by,
             config=config,
@@ -699,12 +691,10 @@ class Log:
                 # refused. Every data commit already asks this; the setters
                 # stopped one line short.
                 checkpoint(lease.renew)
+                # The only write. There is nothing to fan out: `Maintenance`,
+                # the seal target and `Log.config` all read this row rather
+                # than keeping copies of it.
                 self._buffer.set_meta(_CONFIG_KEY, config.to_json())
-                # One owner. `Maintenance` holds the policy and fans it out to
-                # the buffer's seal target; a second copy here was kept in step
-                # by this method alone, which is exactly the arrangement that
-                # breaks the moment anything else can change the policy.
-                self._maintenance.set_config(config)
             finally:
                 lease.release()
 
@@ -822,7 +812,6 @@ class Log:
                 # `set_config` takes this same claim, which is what makes the
                 # two serialise. It is the rule §4a already states for data,
                 # applied to the configuration that governs it.
-                self._maintenance.refresh_config()
                 validate(self._schema, self._sort_by, self.config, archive)
                 # The other half of the same rule; see `set_config`.
                 checkpoint(lease.renew)
@@ -865,7 +854,6 @@ class Log:
         # object. `evict` asks it whether I4 is owed anything, and a setting
         # that stopped at `Log` would leave the maintainer deleting the only
         # copy of rows an archive was just configured to receive.
-        self._archive.set_uri(normalised)
 
         # Repaired here as well as at open, and the difference is who waits.
         # The catalog entry still names the previous archive until something
@@ -879,9 +867,7 @@ class Log:
         # the check at open heals what this misses.
         if self._archive.configured():
             with contextlib.suppress(Exception):
-                self._archive.adopt(
-                    self._buffer.get_meta(_ARCHIVE_KEY) or None, repair=True
-                )
+                self._archive.table(repair=True)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.
@@ -1586,7 +1572,6 @@ class Log:
             # new one. `_push` would reconcile the old archive's extent into
             # the watermark with no network call at all, and eviction believes
             # a watermark whatever earned it.
-            self._archive.set_uri(self._buffer.get_meta(_ARCHIVE_KEY) or None)
             if not self._archive.configured():
                 msg = "sync() needs an archive; this log is local-only"
                 raise ValueError(msg)
@@ -1624,7 +1609,6 @@ class Log:
         # disagree — and in the shipped topology they are separate processes,
         # so agreement means both reading the policy the log records rather
         # than the one each happened to open with.
-        self._maintenance.refresh_config()
 
         archive = self._archive.require()
         self._table.reload()
@@ -1939,11 +1923,7 @@ class Log:
 
     def _pull(self, lease: Claim, since: timedelta) -> None:
         """Copy down and register everything archived since `since`."""
-        # The location the LOG records, read under the claim. This opens with
-        # `repair` on, which may drop a catalog entry naming somewhere else —
-        # a privilege the claim entitles it to, against the archive the log
-        # actually has rather than the one this process remembers.
-        archive = self._archive.require(self._buffer.get_meta(_ARCHIVE_KEY) or None)
+        archive = self._archive.require()
         self._table.reload()
 
         covered = self._table.extent()

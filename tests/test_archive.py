@@ -645,10 +645,13 @@ def test_a_read_never_repairs_the_archive_catalog(
         assert first is not None
 
     # The entry now names `first`, while the log is pointed at `second`.
+    # Written straight to `meta` rather than through `set_archive`, so nothing
+    # has had the chance to repair the entry before the read sees it.
     second = f"s3://{bucket}/elsewhere"
-    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
-        reader._archive.set_uri(second)
+    with Log.open(tmp_path, "s", s3=s3) as writer:
+        writer._buffer.set_meta("archive", second)
 
+    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         with pytest.raises(ValueError, match="not under"):
             reader._archive.table()
 
@@ -1166,9 +1169,9 @@ def test_restating_the_archive_from_a_stale_process_keeps_the_watermark(
         assert settled > 0
 
         with Log.open(tmp_path, "s", s3=s3) as other:
-            # This process's memory goes stale the way a long-running one does.
-            other._archive.set_uri(None)
-
+            # There is no per-process memory to go stale any more, so the
+            # case this once modelled cannot arise: re-asserting the archive
+            # the log already has reads the same durable value either way.
             other.set_archive(f"s3://{bucket}/prefix")
 
             assert other.archived_through() == settled, (
@@ -1205,7 +1208,6 @@ def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
         def racing(*args: object, **kwargs: object) -> bool:
             outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
             log._buffer.set_meta("archive", f"s3://{bucket}/elsewhere")
-            log._archive.set_uri(f"s3://{bucket}/elsewhere")
             return outcome
 
         archive.register = racing  # ty: ignore[invalid-assignment]
