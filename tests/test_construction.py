@@ -20,6 +20,7 @@ import pytest
 from litelink import Log, LogConfig
 from litelink._archive import Archive
 from litelink._buffer import Buffer
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection, secret_sql
@@ -858,3 +859,59 @@ def test_a_configuration_change_waits_for_maintenance(tmp_path: Path) -> None:
             assert log.config.local_rows == 500
         finally:
             thread.join(timeout=5)
+
+
+def test_a_setter_that_lost_its_claim_does_not_write(tmp_path: Path) -> None:
+    """The claim makes the read and the write one decision only while it is held.
+
+    Both setters read the other half, validate the pair, then write. A stall
+    past the TTL between the read and the write is the threat the TTL exists
+    for: the other setter takes the lapsed claim lawfully, validates against
+    the half this one has not written yet, writes its own — and between them
+    they record the pair `validate` just refused, which the next maintenance
+    pass carries out. Every data commit already asks the claim again at the
+    write; the setters stopped one line short.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        before = log.config.local_rows
+        original = log._buffer.get_meta
+        rivals: list[Claim] = []
+
+        def losing(key: str) -> str | None:
+            # Between the read of the other half and the write: the claim
+            # lapses and another owner takes it.
+            if key == "archive" and not rivals:
+                with log._buffer._lock:
+                    log._buffer._con.execute("UPDATE claim SET expires_at = 1")
+
+                rival = Claim(
+                    log._buffer._con,
+                    log._buffer._lock,
+                    "maintain",
+                    0,
+                    EVERYTHING,
+                    new_owner(),
+                )
+                assert rival.acquire()
+                rivals.append(rival)
+
+            return original(key)
+
+        log._buffer.get_meta = losing  # ty: ignore[invalid-assignment]
+        try:
+            with pytest.raises(RuntimeError, match="lost the claim"):
+                log.set_config(LogConfig(local_rows=7))
+
+        finally:
+            log._buffer.get_meta = original  # ty: ignore[invalid-assignment]
+            for rival in rivals:
+                rival.release()
+
+        assert log.config.local_rows == before, "wrote without holding the claim"

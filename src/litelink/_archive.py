@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 # owed anything.
 ARCHIVE_KEY = "archive"
 
+# Distinguishes "no location given" from "the log records no archive", which is
+# a real value meaning detached.
+_UNSET = "\x00unset"
+
 
 class Archive:
     """The remote tier: a URI, credentials, and the table they open."""
@@ -172,14 +176,45 @@ class Archive:
 
             return self._handle
 
-    def require(self, *, repair: bool = True) -> LogTable:
+    def adopt(self, recorded: str | None, *, repair: bool = False) -> LogTable | None:
+        """Refresh from the durable location, THEN open.
+
+        The two together, because opening with `repair=True` is the most
+        dangerous thing this object does: it lets `open_archive` drop a catalog
+        entry naming another prefix and create a fresh table at this one. That
+        privilege is justified by the caller holding the maintenance claim —
+        and the missing premise was that the caller's prefix is the one the LOG
+        records. Opened from a process's memory of an archive it was pointed
+        away from, the repair destroys the live archive's catalog entry, and
+        the next pass "repairs" again by creating an empty table over its data.
+        Measured end to end: 4,000 rows in, 550 readable, no error at the point
+        of the damage.
+
+        `sync` re-reads the location under its claim for exactly this reason
+        and says so; every other repairing caller inherited the privilege
+        without the premise.
+        """
+        self.refresh(recorded)
+
+        return self.table(repair=repair)
+
+    def require(
+        self, recorded: str | None = _UNSET, *, repair: bool = True
+    ) -> LogTable:
         """The remote table, insisting there is one.
 
         For the write side of §5, where "no archive" is a caller error rather
         than a leg of a union to leave out — and where the caller holds the
-        maintenance lease, which is what makes it the one allowed to create the
+        maintenance claim, which is what makes it the one allowed to create the
         table or replace an entry naming somewhere else.
+
+        Pass `recorded` — the location the LOG records — whenever `repair` is
+        on. The claim is what entitles a caller to repair; the durable location
+        is what tells it which archive to repair. See `adopt`.
         """
+        if recorded is not _UNSET:
+            self.refresh(recorded)
+
         table = self.table(repair=repair)
         if table is None:
             msg = "this log is local-only; no archive is configured"
