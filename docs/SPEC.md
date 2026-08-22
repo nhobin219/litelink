@@ -456,7 +456,23 @@ file that is not there, and every scan over that range raises until eviction age
 out. And it renews before EVERY deletion, not once at the top: the unlink is this pass's
 commit, everything slow in a drain sits between the veto being read and the deletions —
 opening the archive, walking its manifests, one remote round trip per queued object — and a
-claim held for the first of those is not a claim held for the last.
+claim held for the first of those is not a claim held for the last. `hydrate` renews after
+its fetch for the same reason and against the same partner: a whole file downloaded per
+iteration, and the name it is restoring is one the deletion queue still holds — drain's own
+per-deletion renewal cannot help there, because drain is then the legitimate holder and
+hydrate the lapsed one.
+
+**And everything a pass reads to decide a deletion is read under its claim, not before it.**
+`sync` learned this for itself and eviction did not, though it acts on the same facts: it
+read the archive location, and the policy, before claiming anything. `set_archive` is
+documented as something the shipped writer calls on every restart and it takes the whole
+log, which is free precisely while eviction holds nothing — so attaching an archive between
+the read and the acquire left eviction deleting the only copy of every aged row that archive
+was configured to receive, unrecoverably, since sync cannot push what has left the table.
+Eviction therefore claims on the UNCLAMPED retention boundary, which only ever falls, and
+recomputes everything under the claim. `set_config` gets the same treatment for the same
+reason: it writes durable state that no running process would otherwise hear about, and
+§8's retention reads as an obligation rather than a hint.
 
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so

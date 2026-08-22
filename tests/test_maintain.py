@@ -1474,3 +1474,69 @@ def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
         assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
             "deleted while another owner held the log"
         )
+
+
+def test_eviction_reads_the_archive_under_its_own_claim(tmp_path: Path) -> None:
+    """Everything that decides a deletion is read under the claim, or it is a
+    statement about the past.
+
+    `sync` learned this for itself — under the claim, not before it — and
+    eviction acts on the same fact. The window is not narrow: `set_archive` is
+    documented as something the shipped writer calls on every restart, and it
+    takes the whole log, which is free precisely while eviction holds nothing.
+    Attaching an archive between the read and the acquire left eviction
+    deleting the only copy of every aged row the new archive was configured to
+    receive — and sync can never push them afterwards, because they have left
+    the table.
+    """
+    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+        assert not log._archive.configured()
+
+        # The archive is attached between eviction's read and its claim.
+        original = Claim.acquire
+
+        def attaching(self: Claim) -> bool:
+            if self.kind == "evict":
+                log._buffer.set_meta("archive", "s3://bucket/prefix")
+
+            return original(self)
+
+        Claim.acquire = attaching
+        try:
+            log.evict()
+
+        finally:
+            Claim.acquire = original
+
+        assert log.table_files() == before, (
+            "deleted the only copy of rows an archive had just been configured for"
+        )
+
+
+def test_eviction_reads_the_policy_the_log_records(tmp_path: Path) -> None:
+    """`set_config` writes durable state; a maintainer has to hear about it.
+
+    The same reasoning the archive location already earned, applied to the
+    settings beside it. Eviction is where it shows: it decides deletions from
+    `local_retention` and `local_rows`, so a process holding the copy it read
+    at open goes on deleting the only copy of rows the durable policy now says
+    to keep — and §8 reads as an obligation, not a hint.
+    """
+    with open_log(tmp_path, LogConfig(local_rows=1, target_seal_size=1 << 30)) as log:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+
+        # Another process raises the floor to cover everything.
+        log._buffer.set_meta("config", LogConfig(local_rows=10_000).to_json())
+        log.evict()
+
+        assert log.table_files() == before, (
+            "evicted against the policy this process happened to read at open"
+        )
