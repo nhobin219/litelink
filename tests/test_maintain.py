@@ -1153,3 +1153,98 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
         assert log._maintenance.archived_prefix(local) == first.hi, (
             "pointing back finds the copies still recorded where they are"
         )
+
+
+def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) -> None:
+    """The two tiers cut the same rows independently, and I4 must not care.
+
+    `rewrite_archive` re-cuts the archive to different boundaries — that is its
+    whole job. Asking whether a local file's range EQUALS an archived one then
+    failed for every local file, permanently: eviction clamped to zero and
+    stopped, and compaction stopped treating archived files as the archive's
+    business and merged across its extent. Neither heals, because nothing ever
+    re-cuts the archive back.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 3, per_file=4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        assert len(files) == 3
+
+        # The archive holds every row of all three, cut its own way: two files
+        # whose boundaries line up with none of the local ones.
+        lo, hi = files[0].lo, files[-1].hi
+        middle = files[1].lo + 1
+        log._buffer.record_file("s3://bucket/prefix/data/a.parquet", lo, middle, 1)
+        log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, hi + 1, 1)
+
+        assert log._maintenance.archived_prefix(files) == hi, (
+            "the archive holds every row; how it cut them is not I4's business"
+        )
+
+
+def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
+    """Coverage must join adjacent files without inventing rows between them."""
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 3, per_file=4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        # The first file, then a hole, then the third.
+        log._buffer.record_file(
+            "s3://bucket/prefix/data/a.parquet", files[0].lo, files[0].hi + 1, 1
+        )
+        log._buffer.record_file(
+            "s3://bucket/prefix/data/c.parquet", files[2].lo, files[2].hi + 1, 1
+        )
+
+        assert log._maintenance.archived_prefix(files) == files[0].hi, (
+            "a range the archive does not hold must stop the walk"
+        )
+
+
+def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
+    tmp_path: Path,
+) -> None:
+    """A claim taken after the premise was read isolates nothing on its own.
+
+    Compaction lists the files once and claims per run, so eviction can claim
+    that range, commit its removal and release it in between. The sources are
+    still on disk under I6's grace, so the merge reads them happily and
+    `_commit` retries the swap onto the fresh table — committing evicted rows
+    back into the log, with a fresh `named_at` that shields them for another
+    whole retention period.
+    """
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        run = sorted(log._table.data_files(), key=lambda f: f.lo)
+        rows_before = len(read_all(log))
+
+        assert len(run) == 3
+
+        # Eviction happened after this run was chosen and before the merge
+        # takes its claim.
+        log._table.evict_through(run[0].hi)
+        remaining = len(read_all(log))
+
+        assert remaining < rows_before, "the setup must actually evict"
+
+        log._maintenance._rewrite_run(log._table, run, None)
+
+        assert len(read_all(log)) == remaining, (
+            "the merge put back rows eviction had removed"
+        )

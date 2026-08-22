@@ -437,27 +437,41 @@ def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
         assert log._buffer.pending_seal() is not None
 
 
-def test_a_lapsed_claim_cannot_renew_itself_back_to_life(tmp_path: Path) -> None:
-    """Once expired, it is lost — whether or not anyone has taken it yet.
+def test_a_lapsed_claim_renews_only_while_nobody_has_taken_it(
+    tmp_path: Path,
+) -> None:
+    """Expiry alone does not end a claim; being TAKEN does.
 
-    One row per operation means nothing overwrites a claim the way a per-role
-    row did, so a lapsed holder still finds its own row sitting there. Letting
-    it extend that row would hand the range back to a holder the log has
-    already moved past, and the window in which someone else may take it is
-    open from the moment it expires, not from the moment they do.
+    Refusing to renew once expired was tried and is worse: a slow but
+    uncontested operation then fails deterministically for ever, since the TTL
+    is fixed and every retry recomputes the same work and dies at the same
+    place. What ends a claim is the taker deleting its row on the way in, so a
+    renew that matches nothing is exactly a renew that lost.
     """
     with open_log(tmp_path) as log:
         stalled = log._buffer.claim("seal", 0, 100, new_owner())
 
         assert stalled.acquire()
-        assert stalled.renew(), "a live claim must renew"
 
-        # Expired in place, so the row is still there and still ours — which is
-        # exactly the state a per-role row could never be left in.
+        # Expired in place, and nobody wants the range.
         with log._buffer._lock:
             log._buffer._con.execute(
                 "UPDATE claim SET expires_at = 1 WHERE id = ?", (stalled.row_id,)
             )
 
         assert not stalled.held()
-        assert not stalled.renew(), "an expired claim renewed itself"
+        assert stalled.renew(), "an uncontested holder must be able to carry on"
+        assert stalled.held()
+
+        # Now expire it again and let another owner take the range.
+        with log._buffer._lock:
+            log._buffer._con.execute(
+                "UPDATE claim SET expires_at = 1 WHERE id = ?", (stalled.row_id,)
+            )
+
+        taker = log._buffer.claim("seal", 50, 150, new_owner())
+
+        assert taker.acquire()
+        assert not stalled.renew(), "renewed a range another owner had taken"
+
+        taker.release()

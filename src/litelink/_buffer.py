@@ -352,6 +352,22 @@ class Buffer:
         self._con.execute("""
             CREATE INDEX IF NOT EXISTS claim_live ON claim (expires_at, lo, hi)
         """)
+        # A buffer carrying the old `lease` table was last written by a build
+        # that coordinated through it, and this one coordinates through
+        # `claim`. Neither sees the other, so two sealers could claim the same
+        # queued group — the torn file the claim mechanism exists to prevent.
+        # Nothing here can make an OLD binary respect the new table, so the
+        # rename is an offline upgrade: refuse rather than run alongside one.
+        if self._con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lease'"
+        ).fetchone():
+            msg = (
+                "this log was last opened by a build that coordinated through a "
+                "`lease` table; ranged claims replaced it and the two do not "
+                "exclude each other. Stop every process using this log, then "
+                "run `DROP TABLE lease` on its buffer.db to complete the upgrade"
+            )
+            raise RuntimeError(msg)
 
     # -- size accounting --------------------------------------------------
     #
@@ -1138,8 +1154,8 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
-    def archived_ranges(self, prefix: str, floor: int) -> set[tuple[int, int]]:
-        """Offset ranges with a recorded copy under `prefix`, at or above `floor`.
+    def archived_ranges(self, prefix: str, floor: int) -> list[tuple[int, int]]:
+        """Offset ranges with a recorded copy under `prefix`, reaching `floor`.
 
         I4 asked of segments rather than of a watermark (§4a). `sync` records
         where each pushed file's copy went, so the archive's contents are
@@ -1157,11 +1173,11 @@ class Buffer:
         with self._lock:
             rows = self._con.execute(
                 "SELECT start_offset, end_offset, rel_path FROM extent "
-                "WHERE start_offset >= ? AND rel_path IS NOT NULL",
+                "WHERE end_offset > ? AND rel_path IS NOT NULL",
                 (floor,),
             ).fetchall()
 
-        return {(lo, hi) for lo, hi, path in rows if path.startswith(boundary)}
+        return sorted((lo, hi) for lo, hi, path in rows if path.startswith(boundary))
 
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.

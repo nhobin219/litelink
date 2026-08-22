@@ -1573,9 +1573,16 @@ class Log:
         # The archive's own manifest is the truth, so recover from it rather
         # than promising anything beforehand. Reading it costs nothing extra:
         # `extent()` above already walked it.
-        recorded = self._buffer.archived_ranges(pinned or "", 0)
+        # Bounded by the local window, not by the archive. Every decision the
+        # rows feed — what compaction may merge, what eviction may drop — is
+        # about files the local table still holds, so an archive file entirely
+        # below them changes no answer. Unbounded, this read and this loop grew
+        # with the archive and ran on every single sync.
+        local = self._table.data_files()
+        base = min((f.lo for f in local), default=0)
+        recorded = set(self._buffer.archived_ranges(pinned or "", base))
         for held in archive.data_files():
-            if (held.lo, held.hi + 1) not in recorded:
+            if held.hi >= base and (held.lo, held.hi + 1) not in recorded:
                 self._buffer.record_file(
                     held.path,
                     held.lo,

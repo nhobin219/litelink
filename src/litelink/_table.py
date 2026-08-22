@@ -7,8 +7,10 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import random
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -42,7 +44,16 @@ if TYPE_CHECKING:
 # see `expire_snapshots`.
 # Bounded: a commit that keeps losing is contention worth surfacing, not
 # something to retry forever behind a caller's back.
-_COMMIT_ATTEMPTS = 5
+# Eight, not five. Every loser of a CAS reloads and re-commits, so under real
+# contention — a writer sealing while two maintainers commit disjoint ranges —
+# five immediate attempts were exhausted in a 45 s run. The cost of an extra
+# attempt is one reload; the cost of exhausting them is a pass that did its
+# whole rewrite and threw the result away.
+_COMMIT_ATTEMPTS = 8
+# The first backoff ceiling, doubling per attempt. Small enough that an
+# uncontended retry is imperceptible, and by the last attempt wide enough that
+# several committers land on different milliseconds.
+_COMMIT_BACKOFF_MS = 20
 
 METADATA_PROPERTIES = {
     "write.metadata.delete-after-commit.enabled": "true",
@@ -726,6 +737,17 @@ class LogTable:
                 if attempt == _COMMIT_ATTEMPTS - 1:
                     raise
 
+                # Backed off, with jitter, before the retry. Five immediate
+                # attempts against a contended branch is a thundering herd:
+                # every loser reloads and re-commits at once, so they collide
+                # again, and the exception that escapes is not a failure of the
+                # work but of the timing. Reachable in ordinary operation now
+                # that passes claim ranges rather than a role — two maintainers
+                # on disjoint offsets is the point of that, and it means two of
+                # them committing to one Iceberg branch. Range-disjointness
+                # makes their DATA independent; it does nothing about the
+                # single branch pointer they both swap.
+                time.sleep(random.uniform(0, _COMMIT_BACKOFF_MS * (2**attempt)) / 1000)
                 self.reload()
                 # Refreshed, so check it is still the same table. The catalog
                 # row is keyed by table id, not by identity, and a `set_archive`

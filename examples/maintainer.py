@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from _stream import NAME
+from pyiceberg.exceptions import CommitFailedException
 
 from litelink import Log
 
@@ -234,9 +235,23 @@ def main() -> None:
             try:
                 report = run()
             except RuntimeError as exc:
-                # Another owner holds the lease this role needs. Not worth
-                # dying over: it means someone else is already doing this.
+                # Another owner holds a claim over the range this role wanted.
+                # Not worth dying over: it means someone else is already doing
+                # this.
                 report = f"skipped: {exc}"
+
+            except CommitFailedException as exc:
+                # The branch moved under this pass more times than `_commit`
+                # retries. Nothing landed — a failed commit lands nothing — and
+                # the work is still there next pass, so a maintainer that died
+                # here would be trading a delay for an outage.
+                #
+                # Reachable in ordinary operation now that passes claim ranges
+                # rather than a role: two maintainers working disjoint offsets
+                # is the point of that, and it means two of them committing to
+                # one Iceberg branch. It is NOT a RuntimeError, so the clause
+                # above never caught it.
+                report = f"lost the commit race, retrying next pass: {exc}"
 
             if report is not None:
                 elapsed = (time.monotonic() - started) * 1000

@@ -156,10 +156,19 @@ class Claim:
         find that out rather than carry on: the new owner may already be
         replaying the work it was doing.
 
-        So an EXPIRED claim cannot renew, even though its row may still be
-        there — one row per operation means nobody overwrote it, and letting it
-        extend itself would hand the range back to a holder the log has already
-        moved past.
+        An expired claim that NOBODY has taken may still renew, and must. The
+        alternative was tried and is worse: refusing once expired makes a slow
+        but uncontested operation fail deterministically and for ever, with no
+        configuration escape — one upload or one large merge over the fixed
+        30 s TTL, and every retry recomputes the same work and dies at the same
+        place. Slowness became fatal instead of merely slow.
+
+        What makes that safe is the row, not the clock. Whoever takes an
+        overlapping range DELETES this row on the way in (see `acquire`), so a
+        renew that matches nothing is exactly a renew that lost. SQLite
+        serialises the two, so either this extends first — and the taker then
+        sees a live claim and is refused — or the taker deletes first and this
+        matches nothing. There is no order in which both win.
         """
         if self.row_id is None:
             return False
@@ -167,9 +176,8 @@ class Claim:
         now = _now_ms()
         with self.lock:
             cursor = self.connection.execute(
-                "UPDATE claim SET expires_at = ? "
-                "WHERE id = ? AND owner = ? AND expires_at > ?",
-                (now + self.ttl_ms, self.row_id, self.owner, now),
+                "UPDATE claim SET expires_at = ? WHERE id = ? AND owner = ?",
+                (now + self.ttl_ms, self.row_id, self.owner),
             )
 
             return cursor.rowcount == 1
