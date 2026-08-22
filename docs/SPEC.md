@@ -505,7 +505,19 @@ change, so between them the two calls assembled the very pair neither would acce
 next maintenance pass carried it out. **`set_config` and `set_archive` therefore take the
 same claim**, which is §4a's own rule about data, applied to the configuration that governs
 it: the check and the act share a transaction, or they are not a guard. `Log.new` records
-the pair in one `meta` transaction for the same reason.
+the pair in one `meta` transaction for the same reason, and both setters ask for the claim
+again at the write — the read and the write are one decision only while it is held, and a
+stall past the TTL between them lets the other setter take the lapsed claim lawfully and
+record the other half.
+
+**Opening the archive with `repair` needs the durable location, not a remembered one.** That
+open may drop a catalog entry naming another prefix and create a fresh table at this one;
+the claim is what entitles a caller to do it, and the location the log records is what says
+WHICH archive to do it to. `sync` re-read the location for exactly this reason, and every
+other repairing caller inherited the privilege without the premise — so a handle still
+remembering an archive the log had left destroyed the live archive's catalog entry, after
+which the next pass "repaired" again by creating an empty table over its data. Measured end
+to end: 4,000 rows in, 550 readable, and no error at the point of the damage.
 
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so
