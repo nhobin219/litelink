@@ -31,7 +31,7 @@ import pyarrow.parquet as pq
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
-from litelink._claim import Claim, new_owner
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._maintenance import (
@@ -70,11 +70,7 @@ _AWAIT_POLL = 0.05
 
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
-# Above every offset the log will ever assign. What an operation claims when it
-# is not an operation on an interval at all — a re-point, a config change, an
-# archive rewrite — so that it excludes every pass rather than commuting with
-# one it has nothing in common with.
-EVERYTHING = 1 << 62
+
 
 _CONFIG_KEY = "config"
 # One home, in `_archive`, because `evict` reads it too.

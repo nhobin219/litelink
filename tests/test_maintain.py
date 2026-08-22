@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
-from litelink._claim import Claim, new_owner
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
 from litelink.log import COMPACT_MULTIPLE, Log, LogConfig, validate
@@ -1363,3 +1363,53 @@ def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) ->
             Claim.renew = original
 
         assert renewed, "the run claim was never renewed while a merge ran"
+
+
+def test_drain_will_not_unlink_while_another_owner_holds_the_log(
+    tmp_path: Path,
+) -> None:
+    """The unlink is not metadata, so it declares like everything else (§4a).
+
+    Expiry is safe claimless — a metadata commit that CAS orders, idempotent.
+    The deletion that follows it is not. Consulting the table without declaring
+    anything leaves the window every other pass here was built to close:
+    `hydrate` re-registers a file under the very name the queue still holds,
+    deliberately reusing the archived key, and can commit that between the veto
+    being read and the file being unlinked. The local table then references a
+    file that is not there.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        log.compact()
+
+        queued = log._buffer.due_deletions(2**62)
+
+        assert queued, "expected superseded files awaiting deletion"
+
+        other = Claim(
+            log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
+        )
+
+        assert other.acquire()
+
+        try:
+            log.expire()
+
+            # Expiry queues MORE as it goes, so what matters is that the
+            # entries already due are still due: nothing was unlinked.
+            assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
+                "unlinked while another owner held the log"
+            )
+        finally:
+            other.release()
+
+        log.expire()
+
+        assert not set(queued) & set(log._buffer.due_deletions(2**62)), (
+            "never drained once the log was free"
+        )

@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
-from litelink._claim import new_owner
+from litelink._claim import EVERYTHING, new_owner
 from litelink._fs import fsync
 
 if TYPE_CHECKING:
@@ -1008,62 +1008,88 @@ class Maintenance:
         if not due:
             return
 
-        # Reloaded first. This veto is the last thing standing between the
-        # deletion queue and an unrecoverable mistake, and asked of a handle
-        # that predates another process's commit it reports a live file as
-        # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
-        self._table.reload()
-        referenced = self._table.referenced_paths()
-        # Only if the queue holds something remote, so an ordinary drain on a
-        # local-only log still opens nothing. `rewrite_archive` is what puts
-        # remote entries here, and it is an operation somebody ran on purpose.
-        remote = (
-            self._archive.table(repair=True) if any(is_remote(p) for p in due) else None
-        )
-        remote_referenced = set() if remote is None else remote.referenced_paths()
+        # Claimed, because this UNLINKS. §4a calls expiry safe to run
+        # claimless on the grounds that it is a metadata commit ordered by CAS,
+        # and that is true of the expiry; it is not true of the deletion that
+        # follows it. Consulting the table without declaring anything leaves
+        # the window every other pass here was made to close: `hydrate`
+        # re-registers a file under the very name the queue still holds — it
+        # reuses the archived key deliberately — and it can commit that
+        # between this veto being read and the file being unlinked. The local
+        # table then references a file that is not there, and every scan over
+        # that range raises until eviction ages the entry out.
+        #
+        # The whole log, since the queue names files from anywhere in it. A
+        # refusal costs nothing: the entries stay due and the next pass takes
+        # them.
+        sweep = self._buffer.claim("drain", 0, EVERYTHING, new_owner())
+        if not sweep.acquire():
+            return
 
-        for rel_path in due:
-            if is_remote(rel_path):
-                if remote is None or rel_path in remote_referenced:
+        try:
+            # Reloaded first. This veto is the last thing standing between the
+            # deletion queue and an unrecoverable mistake, and asked of a handle
+            # that predates another process's commit it reports a live file as
+            # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
+            self._table.reload()
+            referenced = self._table.referenced_paths()
+            # Only if the queue holds something remote, so an ordinary drain on a
+            # local-only log still opens nothing. `rewrite_archive` is what puts
+            # remote entries here, and it is an operation somebody ran on purpose.
+            remote = (
+                self._archive.table(repair=True)
+                if any(is_remote(p) for p in due)
+                else None
+            )
+            remote_referenced = set() if remote is None else remote.referenced_paths()
+
+            for rel_path in due:
+                if is_remote(rel_path):
+                    if remote is None or rel_path in remote_referenced:
+                        continue
+
+                    # Only objects belonging to the archive this log is pointed at.
+                    # A queued remote path names the archive it was superseded in,
+                    # and the veto above asks the CURRENT one — so after a
+                    # re-point, entries left by a rewrite on the old archive would
+                    # be checked against a new archive that references nothing and
+                    # deleted from the old bucket, where they may still be live and
+                    # may be the only copy of rows already evicted locally.
+                    #
+                    # Left queued rather than forgotten: they are somebody's to
+                    # resolve, and the log that owns that archive is the one that
+                    # can say whether they are dead. A stranded queue row is a
+                    # bounded cost; deleting live data in a bucket this log no
+                    # longer understands is not.
+                    #
+                    # Normalised, because the configured URI may carry a trailing
+                    # slash while every queued path is built from it stripped. The
+                    # mismatch would classify this log's OWN objects as another
+                    # archive's and wedge the remote queue permanently.
+                    if not rel_path.startswith(
+                        f"{(self._archive.uri or '').rstrip('/')}/"
+                    ):
+                        continue
+
+                    remote.remove(rel_path)
+                    self._buffer.forget_deletion(rel_path)
                     continue
 
-                # Only objects belonging to the archive this log is pointed at.
-                # A queued remote path names the archive it was superseded in,
-                # and the veto above asks the CURRENT one — so after a
-                # re-point, entries left by a rewrite on the old archive would
-                # be checked against a new archive that references nothing and
-                # deleted from the old bucket, where they may still be live and
-                # may be the only copy of rows already evicted locally.
-                #
-                # Left queued rather than forgotten: they are somebody's to
-                # resolve, and the log that owns that archive is the one that
-                # can say whether they are dead. A stranded queue row is a
-                # bounded cost; deleting live data in a bucket this log no
-                # longer understands is not.
-                #
-                # Normalised, because the configured URI may carry a trailing
-                # slash while every queued path is built from it stripped. The
-                # mismatch would classify this log's OWN objects as another
-                # archive's and wedge the remote queue permanently.
-                if not rel_path.startswith(f"{(self._archive.uri or '').rstrip('/')}/"):
+                path = self._layout.absolute(rel_path)
+                if str(path) in referenced:
+                    # A compaction can re-register a path the queue still holds.
+                    # Deleting a referenced file is unrecoverable, so the check is
+                    # worth its cost even though the grace period should preclude it.
                     continue
 
-                remote.remove(rel_path)
+                # Unlink first, forget second. A crash between them leaves a row
+                # whose unlink is already a no-op; the reverse leaks the file with
+                # nothing left pointing at it.
+                path.unlink(missing_ok=True)
                 self._buffer.forget_deletion(rel_path)
-                continue
 
-            path = self._layout.absolute(rel_path)
-            if str(path) in referenced:
-                # A compaction can re-register a path the queue still holds.
-                # Deleting a referenced file is unrecoverable, so the check is
-                # worth its cost even though the grace period should preclude it.
-                continue
-
-            # Unlink first, forget second. A crash between them leaves a row
-            # whose unlink is already a no-op; the reverse leaks the file with
-            # nothing left pointing at it.
-            path.unlink(missing_ok=True)
-            self._buffer.forget_deletion(rel_path)
+        finally:
+            sweep.release()
 
     def _key(self, path: str) -> str:
         """How a file is named in SQLite, whichever tier it is in.

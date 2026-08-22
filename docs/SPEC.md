@@ -441,6 +441,20 @@ reviews. `_covers` declines only a range ENTIRELY covered, so a straddling one i
 and those offsets sit in two files at once, in the immutable tier, with nothing able to
 repair it. Refusing costs a stall an operator can see and re-cut; admitting costs silence.
 
+The test is `lo <= extent_hi`, with no lower bound. A lower bound was there first and was a
+hole rather than a safety condition: it exempted exactly the range that starts BELOW the
+extent and runs past it, engulfing the whole thing — every archived offset in two files,
+which is the worst version of this rather than an excused one.
+
+**And `drain` claims, because the unlink is not metadata.** Expiry is safe claimless — a
+metadata commit CAS orders, idempotent — and the deletion that follows it inherited that
+reasoning without earning it. Consulting the table without declaring anything leaves the
+window everything else here was built to close: `hydrate` re-registers a file under the very
+name the queue still holds, deliberately reusing the archived key, and can commit that
+between the veto being read and the file being unlinked. The local table then references a
+file that is not there, and every scan over that range raises until eviction ages the entry
+out.
+
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so
 the two would exclude nothing and put two sealers on one queued group. Opening such a log
