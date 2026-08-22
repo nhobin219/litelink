@@ -453,7 +453,10 @@ window everything else here was built to close: `hydrate` re-registers a file un
 name the queue still holds, deliberately reusing the archived key, and can commit that
 between the veto being read and the file being unlinked. The local table then references a
 file that is not there, and every scan over that range raises until eviction ages the entry
-out.
+out. And it renews before EVERY deletion, not once at the top: the unlink is this pass's
+commit, everything slow in a drain sits between the veto being read and the deletions —
+opening the archive, walking its manifests, one remote round trip per queued object — and a
+claim held for the first of those is not a claim held for the last.
 
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so

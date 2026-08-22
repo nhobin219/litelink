@@ -1071,6 +1071,7 @@ class Maintenance:
                     ):
                         continue
 
+                    checkpoint(sweep.renew)
                     remote.remove(rel_path)
                     self._buffer.forget_deletion(rel_path)
                     continue
@@ -1082,6 +1083,20 @@ class Maintenance:
                     # worth its cost even though the grace period should preclude it.
                     continue
 
+                # Still ours, asked before EVERY deletion rather than once at
+                # the top. The unlink is this pass's commit, and §4a's rule
+                # applies to it like any other: holding a claim is asked again
+                # at the commit. It matters here because everything slow in
+                # this pass sits between the veto being read and the deletions
+                # — opening the archive, walking its manifests, and one remote
+                # round trip per queued object, measured at ~650 ms each. Past
+                # the TTL, a `hydrate` may lawfully take the whole log, register
+                # a file under the very name still queued here, and release;
+                # this would then unlink it against a stale veto and leave the
+                # local table pointing at a file that is not there.
+                #
+                # Entries left behind cost nothing: they stay due.
+                checkpoint(sweep.renew)
                 # Unlink first, forget second. A crash between them leaves a row
                 # whose unlink is already a no-op; the reverse leaks the file with
                 # nothing left pointing at it.
