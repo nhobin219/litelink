@@ -1190,7 +1190,7 @@ class Log:
             # `target_size` file; a write that outlasts 30 s means the machine
             # is in trouble, and stopping is the right answer then too.
             if not lease.renew():
-                msg = "lost the seal lease before writing"
+                msg = "lost the claim on this seal range before writing"
                 raise RuntimeError(msg)
 
             self._write_and_commit(end, rel_path, lease)
@@ -1268,7 +1268,7 @@ class Log:
             self._buffer.enqueue_deletions(
                 [rel_path], int(datetime.now(UTC).timestamp())
             )
-            msg = "lost the seal lease before committing"
+            msg = "lost the claim on this seal range before committing"
             raise RuntimeError(msg)
 
         # `end` passed so the commit can decline if the range is already in
