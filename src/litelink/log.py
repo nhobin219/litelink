@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import random
 import threading
 import time
 import uuid
@@ -68,6 +69,11 @@ OFFSET = "litelink_offset"
 # lease is a write, so this is slower than a pure poll would need to be —
 # 20 attempts a second while a caller is blocked, and none otherwise.
 _AWAIT_POLL = 0.05
+
+# How long a configuration change waits for maintenance to finish before it
+# gives up. Long enough to cover an ordinary merge, short enough that a wedged
+# log is reported rather than hung.
+_SETTINGS_WAIT_S = 10.0
 
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
@@ -675,13 +681,7 @@ class Log:
             # refused pair between them. The next maintenance pass then
             # executes it faithfully and deletes the only copy of everything
             # sealed. Verified by execution before this claim existed.
-            lease = self._lease(MAINTAIN_ROLE)
-            if not lease.acquire():
-                msg = (
-                    "another owner holds a claim over this range; the archive "
-                    "may be being re-pointed. Retry."
-                )
-                raise RuntimeError(msg)
+            lease = self._claim_settings()
 
             try:
                 validate(
@@ -797,13 +797,7 @@ class Log:
         """
         with self._lock:
             self._writable()
-            lease = self._lease(MAINTAIN_ROLE)
-            if not lease.acquire():
-                msg = (
-                    "another owner holds a claim over this range; a sync may be "
-                    "pushing to the current archive. Retry."
-                )
-                raise RuntimeError(msg)
+            lease = self._claim_settings()
 
             # Every write inside, so a failure — a full disk, a busy database —
             # releases the claim instead of stranding it for its whole TTL.
@@ -923,6 +917,37 @@ class Log:
                 )
             finally:
                 lease.release()
+
+    def _claim_settings(self) -> Claim:
+        """Take the whole-log claim the configuration operations share.
+
+        Retried, not refused on the first try. `set_config` and `set_archive`
+        exclude each other because `validate` refuses a PAIR and the two halves
+        have to be decided together — but they also collide with ordinary
+        maintenance, and the shipped writer calls both on every restart while a
+        maintainer runs continuously. Measured before this wait existed: one
+        startup in six failed, which turns a routine restart into a coin toss.
+
+        Bounded, so a genuinely long merge still surfaces rather than hanging.
+        A configuration change is administrative and rare; waiting a few
+        seconds for a compaction to finish is the right trade, and failing
+        after that is honest.
+        """
+        wait = getattr(self, "_settings_wait", _SETTINGS_WAIT_S)
+        deadline = time.monotonic() + wait
+        while True:
+            claim = self._lease(MAINTAIN_ROLE)
+            if claim.acquire():
+                return claim
+
+            if time.monotonic() >= deadline:
+                msg = (
+                    "another owner has held a claim over this log for "
+                    f"{wait:.0f}s; maintenance may be mid-pass. Retry."
+                )
+                raise RuntimeError(msg)
+
+            time.sleep(random.uniform(0.01, 0.05))
 
     def _lease(self, role: str, lo: int = 0, hi: int = EVERYTHING) -> Claim:
         """A fresh claim on `[lo, hi]` for this attempt.
