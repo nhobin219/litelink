@@ -160,6 +160,30 @@ def stable_prefix(
     return settled
 
 
+def _both(
+    ours: Callable[[], bool], theirs: Callable[[], bool] | None
+) -> Callable[[], bool]:
+    """Renew our own claim AND report the caller's heartbeat.
+
+    `heartbeat or claim.renew` read naturally and was wrong: any caller passing
+    a heartbeat — which is what the role-lease era asked for, so it is a habit
+    people carry forward — silently stopped the run claim from being renewed at
+    all, and the pre-commit check then consulted a stranger's callback instead
+    of the claim. A merge over the TTL would lose its exclusion with no stall
+    required, and commit rows eviction had removed in the meantime.
+
+    Ours is renewed first and unconditionally, so a falsy caller heartbeat
+    cannot short-circuit it.
+    """
+
+    def beat() -> bool:
+        held = ours()
+
+        return held if theirs is None else held and theirs()
+
+    return beat
+
+
 def _covered(ranges: Sequence[tuple[int, int]], lo: int, hi: int) -> bool:
     """Whether `[lo, hi)` sits entirely inside `ranges`, which are sorted.
 
@@ -439,7 +463,12 @@ class Maintenance:
             # large run outlasts the TTL, and letting it lapse would invite
             # another owner onto the same range mid-write.
             self._write_merge(
-                table, run, rel_path, target, heartbeat or claim.renew, upload=upload
+                table,
+                run,
+                rel_path,
+                target,
+                _both(claim.renew, heartbeat),
+                upload=upload,
             )
         finally:
             claim.release()
@@ -639,6 +668,21 @@ class Maintenance:
         # `hi`, so the boundary drops it too. Queueing only `stale` left it
         # removed from the table and named by nothing.
         try:
+            # Still ours? The merge path asks this immediately before its
+            # commit and eviction did not, which left the asymmetry that
+            # matters: this claim expires 30 s after it was taken, and a stall
+            # past the TTL is the threat the TTL exists for. Lapsed, a
+            # compaction may claim a run below this boundary and pass its own
+            # premise check truthfully, because the sources ARE still live —
+            # and then this commit removes them and the merge, whose claim is
+            # valid throughout, commits them back with a fresh `named_at` that
+            # shields them for another whole retention period.
+            #
+            # In the other order it is worse: the merge lands first, this
+            # commit's CAS retries onto the fresh table, and the delete removes
+            # the merged output, which is in nobody's deletion queue. Once
+            # expiry drops the snapshots naming it, nothing can name it again.
+            checkpoint(removal.renew)
             self._enqueue(f.path for f in files if f.hi <= boundary)
             self._table.evict_through(boundary)
         finally:

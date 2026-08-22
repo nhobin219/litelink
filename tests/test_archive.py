@@ -1217,3 +1217,34 @@ def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
         assert log._maintenance.archived_through() == settled, (
             "an archive the log has never pushed to must not inherit a watermark"
         )
+
+
+def test_the_archive_refuses_a_range_that_starts_inside_its_extent(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The last line of defence, and the only one not reasoned around.
+
+    `_covers` declines a range entirely covered, which makes a replayed push
+    harmless. A range that starts inside the extent and ends beyond it is a
+    different thing: those offsets land in two files at once, in the immutable
+    tier, with nothing able to repair it. Everything upstream is arranged so a
+    merge never straddles the archive's extent, and every gap found in that
+    arrangement has been a fresh piece of reasoning — this check holds however
+    the reasoning turns out.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        archive = log._archive.require()
+        archive.reload()
+        covered = archive.extent()
+
+        assert covered is not None
+
+        # A file whose range begins inside what the archive already holds.
+        with pytest.raises(ValueError, match="two files at once"):
+            archive.register(["s3://nowhere/straddle.parquet"], lo=covered[1])
+
+        # And one that begins cleanly above it is not refused by this check.
+        archive._refuse_straddle(covered[1] + 1)

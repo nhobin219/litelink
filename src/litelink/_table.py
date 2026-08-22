@@ -849,6 +849,7 @@ class LogTable:
         paths: list[str],
         sealed_through: int | None = None,
         archived_through: int = 0,
+        lo: int | None = None,
     ) -> bool:
         """Add already-written files to the table, in ONE commit (§4 step 2).
 
@@ -900,12 +901,47 @@ class LogTable:
 
                 return
 
+            self._refuse_straddle(lo)
             added = True
             self._table.add_files(paths)
 
         self._commit(add)
 
         return added
+
+    def _refuse_straddle(self, lo: int | None) -> None:
+        """Refuse a range that PARTIALLY overlaps what this table holds.
+
+        The last line of defence, and the only one that cannot be reasoned
+        around. `_covers` declines a range entirely covered, which makes a
+        replayed push harmless — but a range that starts inside the extent and
+        ends beyond it is admitted, and those rows are then in two files at
+        once, in the immutable tier, with nothing able to repair it.
+
+        Everything upstream is arranged so this cannot arise: compaction skips
+        files the archive holds, so a merge never straddles its extent. That
+        argument has a gap, and it is narrow enough to have survived several
+        reviews — a crash between a register and the row recording it, then a
+        compaction-config change before the next sync backfills, regroups
+        pushed-but-unrecorded files into a mergeable run. The upstream fix for
+        each such path is a fresh piece of reasoning; this is one check that
+        holds however the reasoning turns out.
+
+        Refusing costs a stall: the straddling file never lands, the watermark
+        stops, and an operator has to re-cut it. That is a loud, recoverable
+        failure standing in for a silent, permanent one.
+        """
+        if lo is None:
+            return
+
+        covered = self.extent()
+        if covered is not None and covered[0] <= lo <= covered[1]:
+            msg = (
+                f"refusing a range starting at {lo}, which is inside this "
+                f"table's extent {covered} but not covered by it: admitting it "
+                "would put those offsets in two files at once"
+            )
+            raise ValueError(msg)
 
     def _covers(self, sealed_through: int) -> bool:
         """Whether the table already holds everything below `sealed_through`.

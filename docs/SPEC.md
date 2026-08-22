@@ -419,6 +419,28 @@ backoff; exhausting the retries is a legitimate outcome, and a caller looping ov
 has to treat a lost commit race as "not now" rather than as failure — nothing landed, and the
 work is still there next pass.
 
+**Holding a claim is asked again at the commit, not only at the start.** A claim expires
+30 s after it is taken and a stall past the TTL is the threat the TTL exists for, so a pass
+that re-read its premise under the claim can still lose the claim before it commits — after
+which a merge may legitimately take the range, pass its own premise check truthfully, and
+commit rows the lapsed eviction is about to remove. Each pass therefore renews immediately
+before its commit and refuses to carry on if it no longer holds the range. Note this is not
+the same as "expired": an expired claim nobody has taken may still be renewed, and what ends
+a claim is the taker deleting its row.
+
+**A caller's heartbeat is combined with the claim's, never substituted for it.** Passing one
+was the correct usage in the role-lease era, so it is a habit that survives; `heartbeat or
+claim.renew` then silently stopped renewing the claim at all and answered the pre-commit
+check with a stranger's callback.
+
+**And the archive refuses a range that starts inside its extent.** Everything upstream is
+arranged so a merge never straddles it, and each gap found in that arrangement has been a
+fresh piece of reasoning — a crash between a register and the row recording it, then a
+compaction-config change before the next sync backfills, is one that survived several
+reviews. `_covers` declines only a range ENTIRELY covered, so a straddling one is admitted
+and those offsets sit in two files at once, in the immutable tier, with nothing able to
+repair it. Refusing costs a stall an operator can see and re-cut; admitting costs silence.
+
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so
 the two would exclude nothing and put two sealers on one queued group. Opening such a log

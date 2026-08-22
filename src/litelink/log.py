@@ -1632,6 +1632,11 @@ class Log:
         if not archive.register(
             [archive.uri(rel_path) for _, rel_path in uploaded],
             sealed_through=last.hi + 1,
+            # The low end too, so the archive can refuse a range that starts
+            # inside what it already holds. Everything upstream is arranged so
+            # that cannot happen; this is the check that holds regardless of
+            # whether the arrangement has a gap.
+            lo=uploaded[0][0].lo,
         ):
             return
 
