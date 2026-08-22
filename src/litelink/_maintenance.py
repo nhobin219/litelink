@@ -160,6 +160,27 @@ def stable_prefix(
     return settled
 
 
+def _covered(ranges: Sequence[tuple[int, int]], lo: int, hi: int) -> bool:
+    """Whether `[lo, hi)` sits entirely inside `ranges`, which are sorted.
+
+    A walk rather than a set membership test, because the archive's cuts need
+    not line up with anyone else's. Adjacent archived files join — offsets are
+    contiguous, so `[1, 151)` and `[151, 301)` together hold `[101, 201)` even
+    though neither holds it alone — and a gap ends the answer.
+    """
+    reach = lo
+    for start, end in ranges:
+        if start > reach:
+            return False
+
+        if end > reach:
+            reach = end
+            if reach >= hi:
+                return True
+
+    return reach >= hi
+
+
 def is_remote(path: str) -> bool:
     """Whether a queued deletion names an object rather than a local file.
 
@@ -242,32 +263,40 @@ class Maintenance:
         return 0 if recorded is None else int(recorded)
 
     def archived_prefix(self, files: Sequence[DataFile]) -> int:
-        """The highest `hi` whose whole prefix has a copy in the archive (§4a).
+        """The highest `hi` whose whole prefix the archive holds (§4a).
 
-        I4 asked of segments. Walking rather than comparing to a watermark: a
-        file is the archive's business if the archive holds THAT file, which
-        `sync` wrote down when it pushed it. The walk stops at the first file
-        without a copy, so the answer stays a prefix — which is what eviction
-        needs, since it removes one.
+        I4 asked of segments. A file is the archive's business if the archive
+        holds THAT FILE'S ROWS, which `sync` wrote down when it pushed it. The
+        walk stops at the first file not fully held, so the answer stays a
+        prefix — which is what eviction needs, since it removes one.
+
+        **Coverage, not equality.** The two tiers cut the same rows into files
+        independently, and asking whether a local range EQUALS an archived one
+        was wrong the moment they could differ. `rewrite_archive` re-cuts the
+        archive to different boundaries by design — that is its entire job —
+        and every local file then matched nothing, for ever: eviction clamped
+        to zero and stopped, and compaction stopped seeing archived files as
+        the archive's business and merged across its extent. Neither heals,
+        because nothing ever re-cuts the archive back.
 
         Exact rather than conservative in both directions, and that is the
         point. A watermark had to be raised before a register to cover the
-        crash between the two, so it named ranges the archive might not hold
-        and could not be lowered afterwards; and it had to be reset when the
-        log was re-pointed, so it went backwards past ranges the archive did
-        hold. Neither failure is expressible here: the row is written when the
-        copy exists, and it names the bucket it went to.
+        crash between the two, so it named ranges the archive might not hold,
+        and it had to be reset when the log was re-pointed, so it went
+        backwards past ranges the archive did hold. Neither is expressible
+        here: the row is written when the copy exists, and it names the bucket
+        it went to.
         """
         ordered = sorted(files, key=lambda f: f.lo)
         if not ordered:
             return 0
 
-        copies = self._buffer.archived_ranges(self._archive.uri or "", ordered[0].lo)
+        covered = self._buffer.archived_ranges(self._archive.uri or "", ordered[0].lo)
         reached = 0
         for data_file in ordered:
             # `record_file` stores the end offset exclusive, as every extent
             # does — the cut is the offset AFTER the last row.
-            if (data_file.lo, data_file.hi + 1) not in copies:
+            if not _covered(covered, data_file.lo, data_file.hi + 1):
                 break
 
             reached = data_file.hi
@@ -379,6 +408,22 @@ class Maintenance:
             "compact", lo, hi, owner or new_owner(), self._key(target)
         )
         if not claim.acquire():
+            return
+
+        # The PREMISE re-read, now that the range is held. The file list came
+        # from before the claim, and a claim taken after the read isolates
+        # nothing on its own: eviction can have claimed this range, committed
+        # its removal and released it in between — which is a millisecond
+        # unless this thread stalls, and a stall past the TTL is precisely the
+        # threat the TTL exists for. The merge would then read the sources from
+        # a pre-eviction snapshot, still on disk under I6's grace, and
+        # `_commit` would retry the swap onto the fresh table and put every
+        # evicted row back.
+        table.reload()
+        live = {f.path for f in table.data_files()}
+        if not all(f.path in live for f in run):
+            claim.release()
+
             return
 
         self._buffer.claim_compaction(lo, hi, self._key(target))
@@ -564,6 +609,21 @@ class Maintenance:
         # transaction is what makes the ordering total.
         removal = self._buffer.claim("evict", 0, boundary, new_owner())
         if not removal.acquire():
+            return
+
+        # Re-read under the claim, and snap again. `boundary` and `files` were
+        # computed before it, so a merge that committed and released in between
+        # leaves this holding a file list that no longer exists — and a
+        # boundary that now lands mid-file on the merged output. `evict_through`
+        # filters by row, so pyiceberg rewrites the straddler copy-on-write at
+        # a path this library never records (I2), and the merged file leaves
+        # the table without ever being queued: unreclaimable for good.
+        self._table.reload()
+        files = self._table.data_files()
+        boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
+        if boundary <= 0:
+            removal.release()
+
             return
 
         # Everything the boundary REMOVES, not just what looked old enough to

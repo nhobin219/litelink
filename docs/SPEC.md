@@ -402,6 +402,28 @@ operation on an interval. For `sync` it is conservative: it cannot name the rang
 push until it has read the archive's extent, so narrowing it to `(floor, last]` is the
 remaining refinement, and until then `compact ∥ sync` still serialises.
 
+**A claim taken after the premise was read isolates nothing on its own.** Both passes choose
+their work from a file list, and the claim comes after: eviction can claim a range, commit
+its removal and release it before a merge that already chose those files takes its own
+claim. The sources are still on disk under I6's grace, so the merge reads them happily and
+`_commit` retries the swap onto the fresh table, putting every evicted row back — with a
+fresh `named_at` that shields them for another whole retention period. So each pass re-reads
+under its claim and revalidates: a merge checks its inputs are still in the table, and
+eviction recomputes its boundary, which otherwise lands mid-file on a merged output and
+makes pyiceberg rewrite the straddler at a path nothing records (I2).
+
+**Range-disjointness does not extend to the branch pointer.** Two operations on disjoint
+offsets have independent DATA and still swap the same Iceberg branch, so enabling
+concurrency raises CAS contention rather than removing it. `_commit` retries with jittered
+backoff; exhausting the retries is a legitimate outcome, and a caller looping over the passes
+has to treat a lost commit race as "not now" rather than as failure — nothing landed, and the
+work is still there next pass.
+
+**The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
+by a build that coordinated through it, and nothing can make that build respect `claim`, so
+the two would exclude nothing and put two sealers on one queued group. Opening such a log
+refuses rather than running beside one.
+
 ### The check and the claim are one transaction
 
 Claiming is not enough on its own, and this is the part that is easy to get wrong. Suppose
@@ -528,6 +550,16 @@ manifest, which it reads anyway.
 
 `archived_through` remains as a derived cache, for the push floor and for display. It no
 longer authorises a deletion, which was the whole of the problem.
+
+**Coverage, not equality.** The two tiers cut the same rows into files independently, so
+asking whether a local range EQUALS an archived one was wrong the moment they could differ.
+`rewrite_archive` re-cuts the archive to different boundaries by design — that is its entire
+job — and under an equality test every local file then matched nothing, for ever: eviction
+clamped to zero and stopped, and compaction stopped treating archived files as the archive's
+business and merged across its extent, which `register` admits as a partial overlap and the
+archive keeps as duplicate rows. Neither heals, because nothing re-cuts the archive back.
+The question I4 actually asks is whether the archive holds the ROWS, so adjacent archived
+files join and a gap ends the answer.
 
 ### Rejected: one settled watermark for both
 

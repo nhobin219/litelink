@@ -649,3 +649,24 @@ def test_compact_min_files_below_one_is_refused(tmp_path: Path) -> None:
             sort_by=("event_ts",),
             config=LogConfig(compact_min_files=0),
         )
+
+
+def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
+    """The rename is an offline upgrade, and silence would be the dangerous part.
+
+    A buffer carrying the old `lease` table was last written by a build that
+    coordinated through it, while this one coordinates through `claim`. Neither
+    sees the other, so a rolling upgrade would put two sealers on the same
+    queued group — the torn file the mechanism exists to prevent. Nothing can
+    make an old binary respect the new table, so refuse rather than run beside
+    one.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    with log:
+        with log._buffer._lock:
+            log._buffer._con.execute(
+                "CREATE TABLE lease (role TEXT PRIMARY KEY, owner TEXT, expires_at INT)"
+            )
+
+    with pytest.raises(RuntimeError, match="coordinated through a `lease` table"):
+        Log.open(tmp_path, "s")
