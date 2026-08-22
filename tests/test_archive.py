@@ -716,10 +716,12 @@ def test_repointing_cannot_interleave_with_a_sync(
         log.extend(rows(200))
         log.seal_due()
 
+        # Short, so the bounded wait does not make this test wait it out.
+        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
         held = log._lease("maintain")
         assert held.acquire()
         try:
-            with pytest.raises(RuntimeError, match="claim over this range"):
+            with pytest.raises(RuntimeError, match="has held a claim"):
                 log.set_archive(f"s3://{bucket}/elsewhere")
         finally:
             held.release()

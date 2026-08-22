@@ -9,6 +9,8 @@ having them as parameters is for.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -782,12 +784,15 @@ def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) ->
         archive="s3://bucket/prefix",
     )
     with log:
+        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
         held = log._lease("maintain")
 
         assert held.acquire()
 
         try:
-            with pytest.raises(RuntimeError, match="claim over this range"):
+            # Bounded: it waits for maintenance rather than refusing outright,
+            # and reports rather than hanging when the wait runs out.
+            with pytest.raises(RuntimeError, match="has held a claim"):
                 log.set_config(LogConfig(local_rows=0))
 
         finally:
@@ -819,3 +824,37 @@ def test_negative_snapshot_retention_is_refused(tmp_path: Path) -> None:
         sort_by=("event_ts",),
         config=LogConfig(snapshot_retention=timedelta(0)),
     ).close()
+
+
+def test_a_configuration_change_waits_for_maintenance(tmp_path: Path) -> None:
+    """It waits rather than refusing on the first try.
+
+    The two setters share a claim because `validate` refuses a pair, but they
+    also collide with ordinary maintenance — and the shipped writer calls both
+    on every restart while a maintainer runs continuously. Measured before this
+    wait existed: one startup in six failed, which turns a routine restart into
+    a coin toss.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    with log:
+        log._settings_wait = 5.0  # ty: ignore[unresolved-attribute]
+        held = log._lease("maintain")
+
+        assert held.acquire()
+
+        released = threading.Event()
+
+        def let_go() -> None:
+            time.sleep(0.3)
+            held.release()
+            released.set()
+
+        thread = threading.Thread(target=let_go)
+        thread.start()
+        try:
+            log.set_config(LogConfig(local_rows=500))
+
+            assert released.is_set(), "returned before the holder let go"
+            assert log.config.local_rows == 500
+        finally:
+            thread.join(timeout=5)
