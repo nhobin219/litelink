@@ -1413,3 +1413,64 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
         assert not set(queued) & set(log._buffer.due_deletions(2**62)), (
             "never drained once the log was free"
         )
+
+
+def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
+    """The unlink is this pass's commit, so the claim is asked again at it.
+
+    Everything slow in a drain sits between the veto being read and the
+    deletions — opening the archive, walking its manifests, one remote round
+    trip per queued object. Past the TTL another owner may lawfully take the
+    whole log, `hydrate` a file under the very name still queued here, and
+    release; a drain holding a dead claim would then unlink it against a stale
+    veto and leave the local table pointing at a file that is not there.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        log.compact()
+        queued = log._buffer.due_deletions(2**62)
+
+        assert queued, "expected superseded files awaiting deletion"
+
+        # The claim is taken and then lost, the way a slow remote leg loses it.
+        original = Claim.acquire
+        stolen: list[Claim] = []
+
+        def losing(self: Claim) -> bool:
+            if not original(self):
+                return False
+
+            if self.kind != "drain":
+                return True
+
+            with self.lock:
+                self.connection.execute(
+                    "UPDATE claim SET expires_at = 1 WHERE id = ?", (self.row_id,)
+                )
+
+            rival = Claim(
+                self.connection, self.lock, "maintain", 0, EVERYTHING, new_owner()
+            )
+            assert original(rival)
+            stolen.append(rival)
+
+            return True
+
+        Claim.acquire = losing
+        try:
+            with pytest.raises(RuntimeError, match="lost the"):
+                log.expire()
+
+        finally:
+            Claim.acquire = original
+            for rival in stolen:
+                rival.release()
+
+        assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
+            "deleted while another owner held the log"
+        )
