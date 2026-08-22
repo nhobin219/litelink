@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
-from litelink._maintenance import runs, stable_prefix
+from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
 from litelink.log import COMPACT_MULTIPLE, Log, LogConfig, validate
 from tests.test_log import SCHEMA, open_log, read_all, rows
@@ -1247,4 +1248,32 @@ def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
 
         assert len(read_all(log)) == remaining, (
             "the merge put back rows eviction had removed"
+        )
+
+
+def test_the_coverage_walk_agrees_with_the_offsets_it_stands_for() -> None:
+    """`_covered` is an optimisation of a set membership test; prove it is one.
+
+    I4 asks whether the archive holds a local file's rows. The honest way to
+    answer is to build the set of offsets the archive holds and test the file's
+    against it, which is unaffordable; the walk is what makes it affordable, so
+    it has to give the same answer for every shape — overlapping archived
+    ranges, duplicates, gaps, ranges reaching in from below.
+    """
+    random.seed(20260822)
+    for _ in range(4000):
+        ranges = []
+        for _ in range(random.randint(0, 4)):
+            start = random.randint(0, 12)
+            ranges.append((start, start + random.randint(0, 6)))
+
+        lo = random.randint(0, 12)
+        hi = lo + random.randint(0, 6)
+
+        held: set[int] = set()
+        for start, end in ranges:
+            held |= set(range(start, end))
+
+        assert _covered(sorted(ranges), lo, hi) == (set(range(lo, hi)) <= held), (
+            f"disagreed on {sorted(ranges)} covering [{lo}, {hi})"
         )

@@ -168,6 +168,13 @@ def _covered(ranges: Sequence[tuple[int, int]], lo: int, hi: int) -> bool:
     contiguous, so `[1, 151)` and `[151, 301)` together hold `[101, 201)` even
     though neither holds it alone — and a gap ends the answer.
     """
+    if hi <= lo:
+        # An empty range is held by anything, vacuously. Unreachable from I4,
+        # where a file always holds at least one row, but a predicate that
+        # answers "no" to a question with no rows in it is a trap for the next
+        # caller.
+        return True
+
     reach = lo
     for start, end in ranges:
         if start > reach:
