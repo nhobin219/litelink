@@ -39,13 +39,20 @@ has lost a race to do something that was done.
 plain method on its own schedule. `seal_due` runs often because it is an
 indexed read of one row when there is nothing to do; the rest run rarely
 because they read table metadata. `maintain()` still exists and runs compact,
-evict and expire in one call under one lease — `--role all` is that, and is the
-right shape when the costs do not justify four processes.
+evict and expire in one call — `--role all` is that, and is the right shape
+when the costs do not justify four processes.
 
-The leases are what make any of this safe. `seal` and `maintain` guard
-different recovery records (`sealing`, `compacting`), so whoever replays one
-must not replay the other, and an owner is minted per attempt — two processes
-and two threads are refused on identical terms.
+The claims are what make any of this safe. Each pass claims the offset RANGE it
+is about to work on, so passes on disjoint ranges run at once and only real
+overlap serialises — a compaction merging one run and a sync pushing another
+have nothing to say to each other. An owner is minted per attempt, so two
+processes and two threads are refused on identical terms, and the expiry on a
+claim is what tells recovery whether an interrupted operation is live work or a
+dead process's leavings. Seal and compaction keep different recovery records
+(`sealing`, `compacting`), so whoever replays one must not replay the other.
+
+A pass that finds its range claimed SKIPS it rather than failing: someone else
+is already doing that work, and what is left is still there next pass.
 """
 
 from __future__ import annotations
@@ -132,7 +139,7 @@ def sync_pass(log: Log) -> str | None:
 
 
 def all_passes(log: Log, root: Path) -> str | None:
-    """`maintain()` plus a push: every local pass under one lease, in the order
+    """`maintain()` plus a push: every local pass, in the order
     it encodes — eviction queues deletions that expiry then drains, so running
     them the other way round only makes files wait a cycle."""
     log.maintain()
@@ -258,9 +265,9 @@ def main() -> None:
                 print(f"{label} {report}  ({elapsed:.0f} ms)", flush=True)
 
             if sidecar is not None:
-                # Not gated on the lease. The flock is what stops two
+                # Not gated on any claim. The flock is what stops two
                 # instances, and it is held for this process's whole life —
-                # whereas the lease is taken and released around every pass, so
+                # whereas a claim is taken and released around every pass, so
                 # gating on it meant losing one pass to a busy compactor
                 # stopped replication while KEEPING the lock, and nobody
                 # replicated for as long as the contention lasted.
@@ -268,7 +275,7 @@ def main() -> None:
 
             time.sleep(every)
     except (KeyboardInterrupt, SystemExit):
-        print(f"{label} stopping, leases handed back", flush=True)
+        print(f"{label} stopping, claims handed back", flush=True)
     finally:
         _running = False
         if sidecar is not None:
@@ -323,7 +330,7 @@ class Sidecar:
     reaping, shutdown ordering. A library doing that would also risk the one
     thing litestream is explicit about, which is that two instances must never
     replicate the same database: a maintainer killed with SIGKILL holds its
-    lease for the full TTL and orphans its child, so whoever takes the lease
+    claim for the full TTL and orphans its child, so whoever takes it
     next would start a second against the same file.
 
     None of that goes away by being here. It becomes visible and editable, in
@@ -341,7 +348,7 @@ class Sidecar:
         self.config = log.write_replication_config()
         self._process: subprocess.Popen[bytes] | None = None
         # An OS lock on a file beside the log, held for this process's whole
-        # life. The maintenance lease cannot do this job: it is acquired and
+        # life. A range claim cannot do this job: it is acquired and
         # RELEASED around each pass, so two maintainers polling every ten
         # seconds both hold it at some point every round and both would keep a
         # sidecar alive — two litestream instances on one database, which is
@@ -443,7 +450,7 @@ def _maintain(log: Log, root: Path) -> None:
             phase()
             timings[name] = (time.monotonic() - started) * 1000
     except RuntimeError as exc:
-        # Another owner holds the maintenance lease. Not worth dying over: it
+        # Another owner holds a claim over this range. Not worth dying over: it
         # means someone else is already doing this.
         print(f"  skipped: {exc}")
         return
