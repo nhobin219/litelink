@@ -104,7 +104,14 @@ def main() -> None:
     s3 = S3Options()
     try:
         log = Log.open(args.root, NAME, s3=s3)
-        log.set_config(config)
+        # The ARCHIVE first, then the policy. `validate` refuses a pair, and
+        # each call is checked against the durable other half — so setting the
+        # policy first refuses `--local-retention 0` and `--replicate` on a log
+        # that has no archive YET, while the same command line attaches one on
+        # the next line. The final pair is valid; only the order made it
+        # unreachable, and the error told the user they had asked for something
+        # they had not.
+        #
         # Only when one was actually asked for. Unconditionally, a plain
         # `just demo-capture` on a log created by `just demo-archive` passes
         # None and DETACHES the archive — which succeeds without credentials,
@@ -113,6 +120,8 @@ def main() -> None:
         # and deletes the local state, leaving paid storage nothing can name.
         if args.archive is not None:
             log.set_archive(args.archive)
+
+        log.set_config(config)
     except FileNotFoundError:
         log = Log.new(
             args.root,

@@ -531,8 +531,16 @@ class Maintenance:
         # prefix of this run — can have pushed part of it. Merging what is left
         # commits a LOCAL file straddling the archive's extent, and nothing
         # re-cuts a local straddler: `rewrite_archive` works the other side.
+        #
+        # The archive read DURABLY here, not from this object's memory. A
+        # compaction pass holds no pass-level claim — only per-run ones — so a
+        # `set_archive` is free between two runs of one pass, and the shipped
+        # writer calls it on every restart. Answered from pass-start memory,
+        # this guard would report "no archive" for the rest of a pass that now
+        # has one, and skip itself entirely.
         # From then on every push is refused by `_refuse_straddle`, the
         # watermark never advances again, and eviction pins on it.
+        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         if table is self._table and self._archive.configured():
             archived = self.archived_prefix(current)
             if any(f.lo <= archived for f in run):
