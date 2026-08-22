@@ -73,13 +73,13 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     layout = Layout(tmp_path / "does-not-exist", "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = Buffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
+    buffer = Buffer.open(layout.buffer_db, SCHEMA)
 
     config = LogConfig()
     # Local-only, and still a real object: the reader, the maintainer and the
-    # Log are handed the same one, which is what lets `set_archive` reach all
-    # three later. `uri=None` says the slot is empty, not that there is no slot.
-    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
+    # Log are handed the same one. It stores no location — it reads the log's,
+    # so `set_archive` reaches all three by writing one row.
+    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
     log = Log(
         layout=layout,
         table=table,
@@ -87,7 +87,7 @@ def test_init_does_no_io(tmp_path: Path) -> None:
         reader=Reader(
             layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
         ),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
+        maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
@@ -114,9 +114,9 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     layout = Layout(tmp_path, "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = StubBuffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
+    buffer = StubBuffer.open(layout.buffer_db, SCHEMA)
     config = LogConfig()
-    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
+    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
 
     log = Log(
         layout=layout,
@@ -125,7 +125,7 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
         reader=Reader(
             layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
         ),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
+        maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
@@ -436,7 +436,7 @@ def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
     — the exact loss this library exists to prevent. 2 is SQLite's code for
     FULL.
     """
-    buffer = Buffer.open(tmp_path / "b.db", SCHEMA, target_size=1 << 20)
+    buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
     try:
         assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 2
     finally:
@@ -452,9 +452,7 @@ def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
     way: the read-only handle is a second connection to the same file, which is
     what WAL is for here — not durability.
     """
-    buffer = Buffer.open(
-        tmp_path / "scratch.db", SCHEMA, target_size=1 << 20, durable=False
-    )
+    buffer = Buffer.open(tmp_path / "scratch.db", SCHEMA, durable=False)
     try:
         assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 0
         assert buffer._con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -915,3 +913,33 @@ def test_a_setter_that_lost_its_claim_does_not_write(tmp_path: Path) -> None:
                 rival.release()
 
         assert log.config.local_rows == before, "wrote without holding the claim"
+
+
+def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -> None:
+    """Neither the policy nor the archive location is copied into a process.
+
+    This is the property that replaces twelve `refresh` calls. Each of them
+    existed to drag a process-local copy back into agreement with the log, and
+    every defect in this seam was a decision that read the copy where no such
+    call had been placed — eight review rounds running, each in a place the
+    previous round had not looked.
+
+    There is one copy now, in `meta`. A handle that has never heard of a change
+    cannot be wrong about it, because it holds nothing to be wrong with.
+    """
+    first = Log.new(
+        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=LogConfig()
+    )
+    with first, Log.open(tmp_path, "s") as second:
+        assert second.config.local_rows is None
+        assert not second._archive.configured()
+
+        first.set_config(LogConfig(local_rows=4242))
+        first.set_archive("s3://bucket/prefix")
+
+        # `second` was never told, and never asked.
+        assert second.config.local_rows == 4242
+        assert second._archive.configured()
+        assert second._archive.uri == "s3://bucket/prefix"
+        assert second._maintenance.config.local_rows == 4242
+        assert second._buffer.config().local_rows == 4242

@@ -19,8 +19,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
+    from litelink.log import LogConfig
+
 from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import column_type
+
+# Where the log records its settings. It lives here because this object owns
+# `meta`, and `meta` is the one place the policy exists.
+CONFIG_KEY = "config"
 
 # The library-owned column (§2).
 OFFSET = "litelink_offset"
@@ -72,9 +78,6 @@ class Buffer:
         reader: sqlite3.Connection,
         schema: pa.Schema,
         columns: tuple[str, ...],
-        *,
-        target_size: int,
-        target_rows: int | None = None,
     ) -> None:
         """Take built collaborators. `open` is what builds and validates them.
 
@@ -93,8 +96,7 @@ class Buffer:
         self._reader = reader
         self._schema = schema
         self._columns = columns
-        self._target_size = target_size
-        self._target_rows = target_rows
+        self._config_cache: tuple[str, LogConfig] | None = None
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
         # an append, a seal claiming and clearing its range, a maintenance pass
@@ -150,24 +152,12 @@ class Buffer:
 
                 raise
 
-    def set_target_size(self, target_size: int, target_rows: int | None) -> None:
-        """Adopt new cut limits in place, rather than being rebuilt around them.
-
-        Policy can change under a running log (§12), and the cut is made here,
-        so it has to arrive here. `Maintenance` takes the same shape.
-        """
-        with self._lock:
-            self._target_size = target_size
-            self._target_rows = target_rows
-
     @classmethod
     def open(
         cls,
         path: Path,
         schema: pa.Schema,
         *,
-        target_size: int,
-        target_rows: int | None = None,
         readonly: bool = False,
         durable: bool = True,
     ) -> Buffer:
@@ -199,8 +189,6 @@ class Buffer:
                 con,
                 schema,
                 columns,
-                target_size=target_size,
-                target_rows=target_rows,
             )
 
         # check_same_thread=False because scheduling maintenance on a background
@@ -223,8 +211,6 @@ class Buffer:
             cls._connect_readonly(path),
             schema,
             columns,
-            target_size=target_size,
-            target_rows=target_rows,
         )
         buffer._create()
         buffer._seed_group()
@@ -496,11 +482,11 @@ class Buffer:
             # Bound once, and the accounting inlined below, because this loop
             # runs per row: routing it through a method cost 19 points of
             # overhead against raw SQLite at 1,000-row batches.
-            target = self._target_size
+            target = self.config().target_seal_size
             # `_insert` runs per row, so both limits are bound once out here.
             # A row cap of None becomes one nothing reaches, which keeps the
             # inner test a comparison rather than a branch on None.
-            target_rows = self._target_rows or _NO_ROW_LIMIT
+            target_rows = self.config().target_seal_rows or _NO_ROW_LIMIT
             row_bytes = self._row_bytes
             columns = self._columns
             for row in rows:
@@ -1243,6 +1229,45 @@ class Buffer:
                 list(pairs.items()),
             )
             return True
+
+    def config(self) -> LogConfig:
+        """The policy in force, read from the log rather than remembered.
+
+        There is exactly one copy of this, and it is the `meta` row. Everything
+        that decides from the policy reads it here, so nothing can hold a stale
+        one — which is the failure this replaces: the policy used to live in
+        `Log`, in `Maintenance` and, derived, in this object's seal target, all
+        kept in step by `set_config` writing each. A refresh call had to sit
+        wherever a decision was made, and a design needing N of those is always
+        one short somewhere, because nothing says where N is.
+
+        The PARSE is cached, keyed on the raw value. Reading the row costs
+        1.8 us and decoding it costs far more, so the cache is what makes this
+        affordable — and keying it on the durable value is what stops it being
+        another stale copy: when the row changes, the key changes.
+        """
+        raw = self.get_meta(CONFIG_KEY)
+        if raw is None:
+            from litelink.log import LogConfig
+
+            return LogConfig()
+
+        cached = self._config_cache
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+
+        from litelink.log import LogConfig
+
+        try:
+            parsed = LogConfig.from_json(raw)
+        except (ValueError, TypeError):
+            # A value this build cannot read is not a reason to stop
+            # maintaining the log; the last good one governs.
+            return LogConfig() if cached is None else cached[1]
+
+        self._config_cache = (raw, parsed)
+
+        return parsed
 
     def set_meta_all(self, pairs: Mapping[str, str]) -> None:
         """Write several `meta` values in ONE transaction.
