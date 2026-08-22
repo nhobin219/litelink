@@ -927,6 +927,20 @@ class LogTable:
         each such path is a fresh piece of reasoning; this is one check that
         holds however the reasoning turns out.
 
+        The test is `lo <= covered[1]`, with no lower bound, and the missing
+        lower bound is the point. `covered[0] <= lo` was there first and was a
+        hole rather than a safety condition: it exempted exactly the range that
+        starts BELOW the extent and spans past it, engulfing the whole thing —
+        every archived offset in two files at once, which is the worst version
+        of what this exists to stop, not an excused one.
+
+        Nothing legitimate is refused. `sync` pushes only files above the
+        archive's extent, so a batch whose first file starts at or below
+        `covered[1]` necessarily contains that offset — the last row of the
+        archive's top file, a real archived row — and is a genuine overlap
+        however it is shaped. Whole-batch replays are excused earlier, by
+        `_covers`.
+
         Refusing costs a stall: the straddling file never lands, the watermark
         stops, and an operator has to re-cut it. That is a loud, recoverable
         failure standing in for a silent, permanent one.
@@ -935,11 +949,11 @@ class LogTable:
             return
 
         covered = self.extent()
-        if covered is not None and covered[0] <= lo <= covered[1]:
+        if covered is not None and lo <= covered[1]:
             msg = (
-                f"refusing a range starting at {lo}, which is inside this "
-                f"table's extent {covered} but not covered by it: admitting it "
-                "would put those offsets in two files at once"
+                f"refusing a range starting at {lo}, which reaches into this "
+                f"table's extent {covered} without being covered by it: "
+                "admitting it would put those offsets in two files at once"
             )
             raise ValueError(msg)
 

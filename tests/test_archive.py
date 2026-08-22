@@ -1246,6 +1246,12 @@ def test_the_archive_refuses_a_range_that_starts_inside_its_extent(
         with pytest.raises(ValueError, match="two files at once"):
             archive.register(["s3://nowhere/straddle.parquet"], lo=covered[1])
 
+        # And one that ENGULFS it — starting below the extent and running past
+        # it. This is the worse shape, not an excused one: it puts every
+        # archived offset in two files rather than some of them.
+        with pytest.raises(ValueError, match="two files at once"):
+            archive.register(["s3://nowhere/engulf.parquet"], lo=max(covered[0] - 5, 0))
+
         # And one that begins cleanly above it is not refused by this check.
         archive._refuse_straddle(covered[1] + 1)
 
