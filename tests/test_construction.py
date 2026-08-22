@@ -759,3 +759,63 @@ def test_two_processes_cannot_assemble_the_pair_validate_refuses(
 
         with pytest.raises(ValueError, match="evict on upload"):
             other.set_archive(None)
+
+
+def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) -> None:
+    """Reading the other half durably is not enough; the check must be atomic.
+
+    `validate` refuses a PAIR, and each setter reads the other half from
+    `meta`. Read and write as two transactions with nothing between them and
+    the check is only a statement about the past: each call passes against a
+    state the other is about to change, and between them they assemble the very
+    pair neither would accept. The next maintenance pass then executes it and
+    deletes the only copy of everything sealed.
+
+    Both setters take the same claim now, so the interleaving cannot happen —
+    modelled here by holding that claim while the second call runs.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        held = log._lease("maintain")
+
+        assert held.acquire()
+
+        try:
+            with pytest.raises(RuntimeError, match="claim over this range"):
+                log.set_config(LogConfig(local_rows=0))
+
+        finally:
+            held.release()
+
+
+def test_negative_snapshot_retention_is_refused(tmp_path: Path) -> None:
+    """The same sign slip, one field over.
+
+    Expiry computes `now - snapshot_retention`, so a negative one puts the
+    cutoff in the future: every superseded file is unlinked in the pass that
+    supersedes it, and I6's promise — the grace must exceed the longest scan —
+    is not shortened but inverted. Zero stays legal; it means "no grace", which
+    tests and demos ask for on purpose.
+    """
+    with pytest.raises(ValueError, match="snapshot_retention must not be negative"):
+        Log.new(
+            tmp_path,
+            "s",
+            schema=SCHEMA,
+            sort_by=("event_ts",),
+            config=LogConfig(snapshot_retention=timedelta(hours=-1)),
+        )
+
+    Log.new(
+        tmp_path,
+        "zero",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=LogConfig(snapshot_retention=timedelta(0)),
+    ).close()

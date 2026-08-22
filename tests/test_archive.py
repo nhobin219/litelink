@@ -719,7 +719,7 @@ def test_repointing_cannot_interleave_with_a_sync(
         held = log._lease("maintain")
         assert held.acquire()
         try:
-            with pytest.raises(RuntimeError, match="maintenance lease"):
+            with pytest.raises(RuntimeError, match="claim over this range"):
                 log.set_archive(f"s3://{bucket}/elsewhere")
         finally:
             held.release()

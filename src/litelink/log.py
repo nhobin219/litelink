@@ -527,9 +527,17 @@ class Log:
         # string type and one binary type, so `large_binary` would come back
         # `binary` and the declaration would be quietly overruled.
         buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
-        buffer.set_meta(_CONFIG_KEY, settings.to_json())
-        if archive is not None:
-            buffer.set_meta(_ARCHIVE_KEY, archive)
+        # The pair in ONE transaction. `validate` has just accepted these two
+        # together, and written separately a crash between them records the
+        # policy without the archive it presupposes — evict-on-upload with
+        # nothing to evict into, which `open` never re-checks and the first
+        # maintenance pass carries out.
+        buffer.set_meta_all(
+            {
+                _CONFIG_KEY: settings.to_json(),
+                **({_ARCHIVE_KEY: archive} if archive is not None else {}),
+            }
+        )
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
@@ -657,27 +665,39 @@ class Log:
         """
         with self._lock:
             self._writable()
-            # Validated against the archive the LOG records, not the one this
-            # process happens to remember. `validate` refuses a pair — an
-            # evict-on-upload policy with no archive to evict into — and each
-            # setter was checking its own new half against a stale copy of the
-            # other, so two processes could assemble the refused pair between
-            # them: one attaches a retention while an archive is configured,
-            # the other detaches the archive against a policy it read before
-            # that. The next maintenance pass then faithfully executes it, and
-            # deletes the only copy of everything sealed.
-            validate(
-                self._schema,
-                self._sort_by,
-                config,
-                self._buffer.get_meta(_ARCHIVE_KEY) or None,
-            )
-            self._buffer.set_meta(_CONFIG_KEY, config.to_json())
-            # One owner. `Maintenance` holds the policy and fans it out to the
-            # buffer's seal target; a second copy here was kept in step by this
-            # method alone, which is exactly the arrangement that breaks the
-            # moment anything else can change the policy.
-            self._maintenance.set_config(config)
+            # The same claim `set_archive` takes, and for the same reason.
+            # `validate` refuses a PAIR — an evict-on-upload policy with no
+            # archive to evict into — so the two halves have to be decided
+            # together. Reading the other half durably is not enough on its
+            # own: read and write as two transactions and the check is only a
+            # statement about the past, so the two setters could each pass
+            # against a state the other was about to change and assemble the
+            # refused pair between them. The next maintenance pass then
+            # executes it faithfully and deletes the only copy of everything
+            # sealed. Verified by execution before this claim existed.
+            lease = self._lease(MAINTAIN_ROLE)
+            if not lease.acquire():
+                msg = (
+                    "another owner holds a claim over this range; the archive "
+                    "may be being re-pointed. Retry."
+                )
+                raise RuntimeError(msg)
+
+            try:
+                validate(
+                    self._schema,
+                    self._sort_by,
+                    config,
+                    self._buffer.get_meta(_ARCHIVE_KEY) or None,
+                )
+                self._buffer.set_meta(_CONFIG_KEY, config.to_json())
+                # One owner. `Maintenance` holds the policy and fans it out to
+                # the buffer's seal target; a second copy here was kept in step
+                # by this method alone, which is exactly the arrangement that
+                # breaks the moment anything else can change the policy.
+                self._maintenance.set_config(config)
+            finally:
+                lease.release()
 
     def archived_through(self) -> int:
         """Highest offset the archive holds, 0 if none (§5, I4).
@@ -777,23 +797,30 @@ class Log:
         """
         with self._lock:
             self._writable()
-            # The other direction of the same pair: validated against the
-            # policy the LOG records. Both halves are read durably, so the
-            # combination that reaches `meta` is one `validate` has seen.
-            self._maintenance.refresh_config()
-            validate(self._schema, self._sort_by, self.config, archive)
-            # Before the first durable write, so a refusal changes nothing.
             lease = self._lease(MAINTAIN_ROLE)
             if not lease.acquire():
                 msg = (
-                    "another owner holds the maintenance lease; a sync may be "
+                    "another owner holds a claim over this range; a sync may be "
                     "pushing to the current archive. Retry."
                 )
                 raise RuntimeError(msg)
 
             # Every write inside, so a failure — a full disk, a busy database —
-            # releases the lease instead of stranding it for its whole TTL.
+            # releases the claim instead of stranding it for its whole TTL.
             try:
+                # Read, checked and written UNDER the claim. `validate` refuses
+                # a PAIR, and reading the other half durably is not enough on
+                # its own: read and write as two transactions with nothing
+                # between them, and the check is only a statement about the
+                # past — `set_config` could land its half in the gap, so
+                # between them the two calls assemble the very pair neither
+                # would accept, and the next maintenance pass executes it.
+                #
+                # `set_config` takes this same claim, which is what makes the
+                # two serialise. It is the rule §4a already states for data,
+                # applied to the configuration that governs it.
+                self._maintenance.refresh_config()
+                validate(self._schema, self._sort_by, self.config, archive)
                 self._repoint(archive)
             finally:
                 lease.release()
@@ -2122,6 +2149,16 @@ def validate(
     missing = [c for c in sort_by if c not in schema.names]
     if missing:
         msg = f"sort_by names columns not in the schema: {missing}"
+        raise ValueError(msg)
+
+    if config.snapshot_retention < timedelta(0):
+        # The same sign slip, one field over. Expiry computes
+        # `now - snapshot_retention`, so a negative one puts the cutoff in the
+        # future: every superseded file is unlinked in the pass that supersedes
+        # it, and I6's whole promise — the grace must exceed the longest scan —
+        # is not merely shortened but inverted. Zero is allowed deliberately;
+        # it means "no grace", which tests and demos ask for on purpose.
+        msg = f"snapshot_retention must not be negative: {config.snapshot_retention}"
         raise ValueError(msg)
 
     if config.local_retention is not None and config.local_retention < timedelta(0):

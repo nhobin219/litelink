@@ -498,6 +498,15 @@ deletes the only copy of everything sealed. And the rule itself has to match how
 combines the floors: it takes the lower boundary, so the policy retaining MORE wins, and a
 config is "evict on upload" only when every floor it states is one.
 
+Reading both halves durably is still not enough, and this is the part that took two rounds
+to see: read and write as two transactions with nothing between them, and the check is only
+a statement about the past. Each setter could pass against a state the other was about to
+change, so between them the two calls assembled the very pair neither would accept — and the
+next maintenance pass carried it out. **`set_config` and `set_archive` therefore take the
+same claim**, which is §4a's own rule about data, applied to the configuration that governs
+it: the check and the act share a transaction, or they are not a guard. `Log.new` records
+the pair in one `meta` transaction for the same reason.
+
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so
 the two would exclude nothing and put two sealers on one queued group. Opening such a log
