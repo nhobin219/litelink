@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
+from litelink._claim import Claim, new_owner
 from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
 from litelink.log import COMPACT_MULTIPLE, Log, LogConfig, validate
@@ -1277,3 +1278,88 @@ def test_the_coverage_walk_agrees_with_the_offsets_it_stands_for() -> None:
         assert _covered(sorted(ranges), lo, hi) == (set(range(lo, hi)) <= held), (
             f"disagreed on {sorted(ranges)} covering [{lo}, {hi})"
         )
+
+
+def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> None:
+    """The merge path asks this before its commit; eviction did not.
+
+    A claim expires 30 s after it is taken, and nothing between the acquire and
+    the commit consulted it again. Lapsed, a compaction may claim a run below
+    the boundary and pass its own premise check truthfully — the sources ARE
+    still live — and then this commit removes them while the merge, whose claim
+    is valid throughout, commits them back.
+    """
+    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+
+        # The eviction claim lapses and another owner takes the range, which is
+        # what "no longer ours" actually means: an expired claim nobody wants
+        # may still be renewed, by design.
+        original = Claim.acquire
+        rival: list[Claim] = []
+
+        def lapsing(self: Claim) -> bool:
+            if not original(self):
+                return False
+
+            if self.kind != "evict":
+                return True
+
+            with self.lock:
+                self.connection.execute(
+                    "UPDATE claim SET expires_at = 1 WHERE id = ?", (self.row_id,)
+                )
+
+            taker = Claim(
+                self.connection, self.lock, "compact", self.lo, self.hi, new_owner()
+            )
+            assert original(taker)
+            rival.append(taker)
+
+            return True
+
+        Claim.acquire = lapsing
+        try:
+            with pytest.raises(RuntimeError, match="lost the"):
+                log.evict()
+
+        finally:
+            Claim.acquire = original
+            for taker in rival:
+                taker.release()
+
+        assert log.table_files() == before, "committed without holding the claim"
+
+
+def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
+    """`heartbeat or claim.renew` read naturally and was wrong.
+
+    Any caller passing a heartbeat — which is what the role-lease era asked
+    for, so it is a habit carried forward — stopped the run claim from being
+    renewed at all, and the pre-commit check then consulted a stranger's
+    callback instead of the claim. A merge over the TTL lost its exclusion with
+    no stall required.
+    """
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        renewed: list[int] = []
+        original = Claim.renew
+
+        def counting(self: Claim) -> bool:
+            renewed.append(self.row_id or 0)
+
+            return original(self)
+
+        Claim.renew = counting
+        try:
+            log.compact(heartbeat=lambda: True)
+
+        finally:
+            Claim.renew = original
+
+        assert renewed, "the run claim was never renewed while a merge ran"
