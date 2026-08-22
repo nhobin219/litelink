@@ -35,6 +35,7 @@ from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import fsync
 from litelink._layout import Layout
 from litelink._maintenance import (
+    CONFIG_KEY,
     Maintenance,
     checkpoint,
     stable_prefix,
@@ -72,7 +73,8 @@ SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
 
 
-_CONFIG_KEY = "config"
+# One home, in `_maintenance`, because eviction reads it too.
+_CONFIG_KEY = CONFIG_KEY
 # One home, in `_archive`, because `evict` reads it too.
 _ARCHIVE_KEY = ARCHIVE_KEY
 _SCHEMA_KEY = "arrow_schema"
@@ -1883,6 +1885,19 @@ class Log:
             rel_path = archive.key(data_file.path)
             destination = self._layout.absolute(rel_path)
             archive.fetch(data_file.path, destination)
+            # Asked AGAIN, after the fetch and before the commit. The download
+            # is a whole file rather than a stream, so it is the slow leg, and
+            # the checkpoint above only says the claim was held before it. Past
+            # the TTL, `drain` may lawfully take the whole log and unlink this
+            # very name — the queue still holds it, since it is the eviction
+            # that motivated the hydrate — and its own per-deletion renewal
+            # cannot help, because there `drain` is the legitimate holder and
+            # this is the lapsed one. Registering afterwards points the table
+            # at a file that is not on disk: every scan over the range raises,
+            # and `record_file` stamps it fresh so eviction cannot age it out
+            # for a whole `local_retention`, while a re-run of `hydrate` skips
+            # the range because the local floor now covers it.
+            checkpoint(lease.renew)
             # No `sealed_through`: that check exists to decline a range the
             # table already covers, and every range here is deliberately below
             # what it covers. The filter above is what prevents an overlap.

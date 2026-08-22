@@ -25,6 +25,10 @@ from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
 from litelink._claim import EVERYTHING, new_owner
 from litelink._fs import fsync
 
+# Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
+# `Log`'s private business, because eviction decides deletions from it.
+CONFIG_KEY = "config"
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
 
@@ -251,6 +255,35 @@ class Maintenance:
     def set_config(self, config: LogConfig) -> None:
         """Adopt new policy in place, rather than being rebuilt around it."""
         self._config = config
+
+    def refresh_config(self) -> None:
+        """Adopt the policy the log durably records.
+
+        The reasoning the archive location already earned, applied to the
+        settings beside it: `set_config` writes durable state, and a process
+        that read it at open otherwise answers for the policy the log had then,
+        for as long as it runs. Eviction is where that shows — it decides
+        deletions from `local_retention` and `local_rows`, so a maintainer
+        holding a stale copy goes on deleting the only copy of rows the durable
+        policy says to keep, and §8 reads as an obligation rather than a hint.
+
+        Tolerant of a value it cannot parse: refusing to maintain a log at all
+        is a worse failure than maintaining it under the settings this process
+        already had.
+        """
+        encoded = self._buffer.get_meta(CONFIG_KEY)
+        if encoded is None:
+            return
+
+        # Imported here rather than at module scope: `log` imports this module,
+        # so the other direction is a cycle. `sys.modules` makes the repeat
+        # cost nothing, and this runs once per eviction pass.
+        from litelink.log import LogConfig
+
+        try:
+            self._config = LogConfig.from_json(encoded)
+        except (ValueError, TypeError):
+            return
 
     def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
         self._sort_by = sort_by
@@ -560,6 +593,37 @@ class Maintenance:
 
     # -- eviction -----------------------------------------------------------
 
+    def _retention_boundary(self) -> int:
+        """The highest offset the retention policies would drop, before I4.
+
+        Files cover contiguous non-overlapping ranges, so evicting a prefix is
+        a single upper bound. Anything newer is untouched — and each policy is
+        one such bound, so honouring both is taking the lower. They are floors
+        on what stays readable locally, so the one that retains MORE wins,
+        which is the opposite of how the seal combines its two limits (§12).
+
+        Its own method because eviction computes it twice: once to decide
+        whether there is work and what range to claim, and again under that
+        claim, where the answer is the one acted on.
+        """
+        limits: list[int] = []
+        retention = self._config.local_retention
+        if retention is not None:
+            cutoff = datetime.now(UTC) - retention
+            stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
+            # Nothing old enough is a limit of zero, not an absent one: it
+            # means this policy would keep everything.
+            limits.append(max((f.hi for f in stale), default=0))
+
+        if self._config.local_rows is not None:
+            # Offsets are contiguous, so the newest `local_rows` of them start
+            # here. AUTOINCREMENT can leave a gap where a transaction rolled
+            # back, which makes this retain slightly more than asked rather
+            # than less — the safe direction for a floor.
+            limits.append(self._buffer.next_offset() - 1 - self._config.local_rows)
+
+        return min(limits) if limits else 0
+
     def evict(self) -> None:
         """Drop files older than `local_retention` from the local table (§8).
 
@@ -569,9 +633,11 @@ class Maintenance:
         With no archive this is deletion of the only copy. That is the contract
         a local-only log with a retention asks for; see §8.
         """
-        retention = self._config.local_retention
-        keep_rows = self._config.local_rows
-        if retention is None and keep_rows is None:
+        # The POLICY re-read first, because it decides everything below. Read
+        # again under the claim as well: this one only decides whether there is
+        # work, and the one that decides the deletion has to be the guarded one.
+        self.refresh_config()
+        if self._config.local_retention is None and self._config.local_rows is None:
             return
 
         # Same reason as `compact`: this decides what to drop from the ages a
@@ -579,43 +645,49 @@ class Maintenance:
         self._table.reload()
         self._age_cache = None
 
-        # Files cover contiguous non-overlapping ranges, so evicting a prefix
-        # is a single upper bound. Anything newer is untouched — and each
-        # policy is one such bound, so honouring both is taking the lower.
-        # They are floors on what stays readable locally, so the one that
-        # retains MORE wins, which is the opposite of how the seal combines its
-        # two limits (§12).
-        limits: list[int] = []
-        if retention is not None:
-            cutoff = datetime.now(UTC) - retention
-            stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
-            # Nothing old enough is a limit of zero, not an absent one: it
-            # means this policy would keep everything.
-            limits.append(max((f.hi for f in stale), default=0))
-
-        if keep_rows is not None:
-            # Offsets are contiguous, so the newest `keep_rows` of them start
-            # here. AUTOINCREMENT can leave a gap where a transaction rolled
-            # back, which makes this retain slightly more than asked rather
-            # than less — the safe direction for a floor.
-            limits.append(self._buffer.next_offset() - 1 - keep_rows)
-
-        boundary = min(limits)
-        # Snapped DOWN to a file boundary. The age limit is already one — it is
-        # some file's `hi` — and so is the archive clamp, but the row floor is
-        # arbitrary and lands mid-file on most passes. A mid-file boundary is
-        # not a smaller eviction: `evict_through` filters by row, so pyiceberg
-        # rewrites the straddling file copy-on-write, and the replacement is
-        # written at a path this library never learns. That breaks the rule the
-        # whole deletion design rests on — every file's path is in SQLite
-        # before the file exists (I2) — and leaves the superseded original out
-        # of the queue, so once expiry drops the snapshots naming it, nothing
-        # can name it again. `drain` is a keyed read and this design refuses
-        # directory scans, so the file is unreclaimable for good.
+        # Provisional: enough to decide whether there is work at all, and what
+        # range to claim. The answer that gets acted on is recomputed below,
+        # under the claim.
+        boundary = self._retention_boundary()
         files = self._table.data_files()
         boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
         if boundary <= 0:
             return
+
+        # The prefix claimed before anything that decides a deletion is read
+        # under it, and eviction declares rather than merely consulting (§4a).
+        # An operation that only reads has decided and said nothing durable, so
+        # a merge claiming a range that straddles this boundary between the
+        # read and the commit puts back exactly what this is about to drop.
+        # Both sides declaring in one transaction makes the ordering total.
+        #
+        # Claimed on the UNCLAMPED boundary, which only ever falls from here —
+        # so this covers a superset of what is removed. Claiming the clamped
+        # range would mean reading the archive's premise outside the claim,
+        # which is the defect below.
+        removal = self._buffer.claim("evict", 0, boundary, new_owner())
+        if not removal.acquire():
+            return
+
+        # Everything that decides a deletion, re-read UNDER the claim, because
+        # everything read before it is a statement about the past.
+        #
+        # `sync` learned this for itself — "UNDER the lease, not before it" —
+        # and eviction acts on the same facts without having learned it. The
+        # window is not narrow: `set_archive` is documented as something the
+        # shipped writer calls on every restart, and it takes the whole log,
+        # which is free precisely while this holds nothing. Attaching an
+        # archive between the read and the acquire left this deleting the only
+        # copy of every aged row the new archive was configured to receive, and
+        # sync can never push them afterwards because they have left the table.
+        # Re-pointing left it evicting on a clamp earned by the OLD archive,
+        # whose rows the read path no longer scans.
+        self._table.reload()
+        self._age_cache = None
+        self.refresh_config()
+        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
+        files = self._table.data_files()
+        boundary = min(boundary, self._retention_boundary())
 
         # I4: a file the archive still lacks must not leave the local table,
         # because with an archive configured the local copy stops being the
@@ -626,38 +698,19 @@ class Maintenance:
         # With no archive there is nothing owed: §8 says `local_retention` is
         # then a deletion policy over the only copy, which is the contract the
         # operator asked for.
-        # Re-read from the buffer rather than trusted from memory. Another
-        # process can attach an archive to a log this maintainer already has
-        # open, and nothing else here would ever hear about it: `sync` is what
-        # refreshes this object, and a maintainer that believes the log is
-        # local-only never syncs. It would go on deleting the only copy of
-        # every row that ages past `local_retention`, for as long as it ran,
-        # while the durable configuration promised I4.
-        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         if self._archive.configured():
             boundary = min(boundary, self.archived_prefix(files))
-            if boundary <= 0:
-                return
 
-        # The prefix claimed before anything is removed, and eviction declares
-        # rather than merely consulting (§4a). An operation that only reads has
-        # decided and said nothing durable, so a merge claiming a range that
-        # straddles this boundary between the read and the commit puts back
-        # exactly what this is about to drop. Both sides declaring in one
-        # transaction is what makes the ordering total.
-        removal = self._buffer.claim("evict", 0, boundary, new_owner())
-        if not removal.acquire():
-            return
-
-        # Re-read under the claim, and snap again. `boundary` and `files` were
-        # computed before it, so a merge that committed and released in between
-        # leaves this holding a file list that no longer exists — and a
-        # boundary that now lands mid-file on the merged output. `evict_through`
-        # filters by row, so pyiceberg rewrites the straddler copy-on-write at
-        # a path this library never records (I2), and the merged file leaves
-        # the table without ever being queued: unreclaimable for good.
-        self._table.reload()
-        files = self._table.data_files()
+        # Snapped DOWN to a file boundary, against the list as it is now. The
+        # age limit is already one — some file's `hi` — and so is the archive
+        # clamp, but the row floor is arbitrary and lands mid-file on most
+        # passes. A mid-file boundary is not a smaller eviction:
+        # `evict_through` filters by row, so pyiceberg rewrites the straddling
+        # file copy-on-write at a path this library never learns. That breaks
+        # the rule the whole deletion design rests on — every file's path is in
+        # SQLite before the file exists (I2) — and leaves the superseded
+        # original out of the queue, so once expiry drops the snapshots naming
+        # it, nothing can name it again.
         boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
         if boundary <= 0:
             removal.release()
