@@ -1540,3 +1540,34 @@ def test_eviction_reads_the_policy_the_log_records(tmp_path: Path) -> None:
         assert log.table_files() == before, (
             "evicted against the policy this process happened to read at open"
         )
+
+
+def test_a_refreshed_policy_reaches_compaction_sync_and_the_buffer(
+    tmp_path: Path,
+) -> None:
+    """One owner, or compaction and sync can disagree about what is in play.
+
+    `Log` used to keep its own copy of the policy beside `Maintenance`'s, kept
+    in step by `set_config` writing both. Refreshing only one of them left
+    compaction reading the new policy while `sync` read the old — and `runs`
+    exists precisely so those two cannot disagree, because a file `sync`
+    settles under one grouping and compaction merges under another leaves the
+    archive holding rows rewritten underneath it. The buffer's seal target is
+    the third copy, and a stale one sizes every file the log writes.
+    """
+    with open_log(tmp_path, LogConfig(local_rows=1, target_seal_size=4096)) as log:
+        seal_files(log, 2)
+        raised = LogConfig(
+            local_rows=10_000, target_seal_size=1 << 20, target_compact_size=1 << 23
+        )
+        log._buffer.set_meta("config", raised.to_json())
+
+        log.evict()
+
+        assert log.config.target_compact_size == raised.target_compact_size, (
+            "sync reads the policy through Log; it must be the refreshed one"
+        )
+        assert log._maintenance.config.local_rows == raised.local_rows
+        assert log._buffer._target_size == raised.target_seal_size, (
+            "the buffer sizes every file the log writes; it must hear too"
+        )
