@@ -29,6 +29,10 @@ from litelink._fs import fsync
 # `Log`'s private business, because eviction decides deletions from it.
 CONFIG_KEY = "config"
 
+# Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
+# `Log`'s private business, because eviction decides deletions from it.
+CONFIG_KEY = "config"
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
 
@@ -252,9 +256,30 @@ class Maintenance:
         # top of `evict`, so a pass never decides from what a previous one saw.
         self._age_cache: dict[str, int] | None = None
 
+    @property
+    def config(self) -> LogConfig:
+        """The policy in force, and the ONLY copy of it.
+
+        `Log` used to keep its own beside this one, kept in step by
+        `set_config` writing both. Two copies is one too many the moment
+        anything else can change the policy: refreshing this one from the
+        durable value would leave compaction reading the new policy while
+        `sync` read the old, and `runs` exists precisely so those two cannot
+        disagree — a file `sync` settles under one grouping and compaction
+        merges under another leaves the archive holding rows rewritten
+        underneath it.
+        """
+        return self._config
+
     def set_config(self, config: LogConfig) -> None:
-        """Adopt new policy in place, rather than being rebuilt around it."""
+        """Adopt new policy in place, rather than being rebuilt around it.
+
+        The buffer too, or `target_seal_size` changes everywhere except where
+        the cut is actually made and the log quietly keeps sizing files to the
+        value it was opened with.
+        """
         self._config = config
+        self._buffer.set_target_size(config.target_seal_size, config.target_seal_rows)
 
     def refresh_config(self) -> None:
         """Adopt the policy the log durably records.
@@ -281,9 +306,12 @@ class Maintenance:
         from litelink.log import LogConfig
 
         try:
-            self._config = LogConfig.from_json(encoded)
+            refreshed = LogConfig.from_json(encoded)
         except (ValueError, TypeError):
             return
+
+        if refreshed != self._config:
+            self.set_config(refreshed)
 
     def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
         self._sort_by = sort_by

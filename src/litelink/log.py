@@ -400,7 +400,6 @@ class Log:
     ) -> None:
         self.name = layout.name
         self.root = layout.root
-        self.config = config
         self.readonly = readonly
 
         self._layout = layout
@@ -639,6 +638,16 @@ class Log:
 
     # -- settings ----------------------------------------------------------
 
+    @property
+    def config(self) -> LogConfig:
+        """The policy in force, owned by `Maintenance` (§12).
+
+        A property rather than a field, because two copies of a policy that
+        another process can change is a way for compaction and `sync` to
+        disagree about which files are still in play.
+        """
+        return self._maintenance.config
+
     def set_config(self, config: LogConfig) -> None:
         """Replace the operational policy (§12).
 
@@ -650,14 +659,11 @@ class Log:
             self._writable()
             validate(self._schema, self._sort_by, config, self._archive.uri)
             self._buffer.set_meta(_CONFIG_KEY, config.to_json())
-            self.config = config
+            # One owner. `Maintenance` holds the policy and fans it out to the
+            # buffer's seal target; a second copy here was kept in step by this
+            # method alone, which is exactly the arrangement that breaks the
+            # moment anything else can change the policy.
             self._maintenance.set_config(config)
-            # The buffer too, or `target_size` changes everywhere except where
-            # the cut is actually made and the log quietly keeps sizing files
-            # to the value it was opened with.
-            self._buffer.set_target_size(
-                config.target_seal_size, config.target_seal_rows
-            )
 
     def archived_through(self) -> int:
         """Highest offset the archive holds, 0 if none (§5, I4).

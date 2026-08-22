@@ -474,6 +474,13 @@ recomputes everything under the claim. `set_config` gets the same treatment for 
 reason: it writes durable state that no running process would otherwise hear about, and
 §8's retention reads as an obligation rather than a hint.
 
+That refresh also forced a correction worth stating on its own: the policy now has ONE
+owner. `Log` used to keep a copy beside `Maintenance`'s, with the buffer's seal target as a
+third, kept in step by `set_config` writing all three. Two copies is one too many the moment
+anything else can change the policy — refreshing one would leave compaction reading the new
+grouping while `sync` read the old, and `runs` is shared by exactly those two so that they
+cannot disagree about which files are still in play.
+
 **The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
 by a build that coordinated through it, and nothing can make that build respect `claim`, so
 the two would exclude nothing and put two sealers on one queued group. Opening such a log
