@@ -528,6 +528,20 @@ nothing, because only compacted files are ever pushed, so one with an archive co
 at the target. Eviction still asks about the CONFIGURED archive, because I4 is a promise about
 where the copy is.
 
+**And `sync` applies the same exclusion, or the two deadlock.** `stable_prefix` holds a file
+back when compaction might still merge it; compaction refuses to merge anything an archive
+holds. Those are one rule, and `runs` is shared between them precisely so they cannot
+disagree — giving compaction a second input `stable_prefix` could not see was enough to
+break it. After a re-point to a fresh prefix the floor is 0, so files the old archive covers
+return to `pending`, group into a mergeable run under a raised target, and are held back for
+ever against a merge that will never happen: nothing is pushed, the watermark never moves,
+eviction pins on it, and nothing raises. A file no merge can touch is settled by definition.
+
+Note what that correction cost the earlier justification: "a file with an archive copy is
+already at the target" is false the moment the target is RAISED after the copy was made —
+which is the scenario the exclusion exists for. Such a file stays at the size it was
+archived at, and `rewrite_archive` is the tool for that.
+
 **Opening the archive with `repair` needs the durable location, not a remembered one.** That
 open may drop a catalog entry naming another prefix and create a fresh table at this one;
 the claim is what entitles a caller to do it, and the location the log records is what says

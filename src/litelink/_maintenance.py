@@ -386,9 +386,13 @@ class Maintenance:
         # legitimate operations reach it — detach, raise the target, maintain,
         # re-attach — with no warning at any step.
         #
-        # Skipping them costs nothing. Only compacted files are ever pushed, so
-        # a file with an archive copy is already at the target and was never a
-        # candidate on merit.
+        # Skipping them is not free, and the earlier claim that it was — "a
+        # file with an archive copy is already at the target" — is false the
+        # moment the target is RAISED after the copy was made, which is the
+        # scenario this exists for. What it costs is that such a file stays at
+        # the size it was archived at; `rewrite_archive` is the tool for that.
+        # What it buys is that no merge can ever straddle a range an archive
+        # holds. `_push` applies the same exclusion, or the two deadlock.
         archived = self.archived_prefix(local, None)
         pending = [f for f in local if f.hi > archived]
 
