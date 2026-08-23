@@ -20,6 +20,7 @@ import pytest
 from litelink import Log, LogConfig
 from litelink._buffer import Buffer
 from litelink._layout import Layout
+from litelink._maintenance import Maintenance
 from litelink._s3 import S3Options
 from litelink._table import LogTable, _recorded_location
 from litelink.log import OFFSET, table_schema
@@ -1938,3 +1939,75 @@ def test_a_healed_row_carries_the_measured_bytes(
             "a healed row must carry the bytes its intent measured, not the "
             f"compact default: {healed} != {intended}"
         )
+
+
+def test_a_rewrite_that_lost_its_claim_does_not_commit(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The check between writing and committing, which `_recut` went without.
+
+    A rewrite that stalls past the TTL lets recovery take its claim and queue
+    every one of its outputs; `drain` snapshots its reference veto once per
+    pass while those objects are still unreferenced; and then the stalled
+    commit lands. Drain deletes the objects the manifest now names, the
+    superseded originals become unreferenced and go too, and the range exists
+    in no object at all — every guard behaving exactly as written.
+
+    Renewing before the commit makes that unreachable: recovery's acquire
+    deleted the claim's row, so the renew finds nothing and the rewrite aborts
+    while the originals are still live.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        before = log.archive_files()
+        readable = log.scan(include_archive=True).read_all().num_rows
+
+        assert before > 1
+
+        log.set_config(replace(config, target_compact_size=1 << 20))
+
+        # The claim survives every upload and is gone by the commit. The scratch
+        # teardown is the marker: the next checkpoint after it is the one
+        # guarding `replace_range`, and before this fix there was none.
+        # `_discard_scratch` runs TWICE — once clearing any leftover before the
+        # rewrite starts, once tearing down at the end — so the flag flips on
+        # the second. Flipping on the first aborted the rewrite before it
+        # uploaded anything, which passed whether or not the guard existed.
+        state = {"calls": 0}
+        discard = Maintenance._discard_scratch
+
+        def after_teardown(self: Maintenance) -> None:
+            discard(self)
+            state["calls"] += 1
+
+        Maintenance._discard_scratch = after_teardown
+        try:
+            with pytest.raises(RuntimeError, match="lost the claim"):
+                log._maintenance.rewrite_archive(heartbeat=lambda: state["calls"] < 2)
+
+        finally:
+            Maintenance._discard_scratch = discard
+
+        assert log.archive_files() == before, "committed without holding the claim"
+        assert log.scan(include_archive=True).read_all().num_rows == readable

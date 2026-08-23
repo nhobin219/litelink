@@ -1515,10 +1515,15 @@ class Log:
         # sources were queued before that commit and drain away behind it.
         #
         # The seal path never had this exposure: an abandoned seal goes through
-        # `pending_delete`, whose drain re-reads `referenced_paths` at unlink
-        # time and refuses anything the table has since adopted. Recovery now
-        # uses the same route, so the last word belongs to a check made when
-        # the file is actually removed.
+        # `pending_delete`, whose drain refuses anything the table references.
+        # Recovery uses the same route.
+        #
+        # That veto is read ONCE per drain pass, not per removal — this said
+        # otherwise, and the difference is the whole of a defect found on the
+        # archive side: a commit landing after the veto was read leaves drain
+        # deleting objects the manifest now names. What actually makes it safe
+        # is that the committer renews its claim immediately before committing,
+        # so a claim recovery has taken cannot commit at all.
         claimed = self._buffer.pending_outputs()
         self._maintenance.enqueue_recovered(key for _, _, key in claimed)
 
