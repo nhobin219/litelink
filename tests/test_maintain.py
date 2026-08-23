@@ -1143,19 +1143,30 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
         )
         local = log._table.data_files()
 
-        assert log._maintenance.archived_prefix(local, log._archive.uri) == first.hi
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == first.hi
+        )
 
         log.set_archive("s3://bucket/elsewhere")
 
-        assert log._maintenance.archived_prefix(local, log._archive.uri) == 0, (
-            "the new archive holds nothing, and says so without any reset"
-        )
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == 0
+        ), "the new archive holds nothing, and says so without any reset"
 
         log.set_archive("s3://bucket/prefix")
 
-        assert log._maintenance.archived_prefix(local, log._archive.uri) == first.hi, (
-            "pointing back finds the copies still recorded where they are"
-        )
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == first.hi
+        ), "pointing back finds the copies still recorded where they are"
 
 
 def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) -> None:
@@ -1188,9 +1199,12 @@ def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) ->
         log._buffer.record_file("s3://bucket/prefix/data/a.parquet", lo, middle, 1)
         log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, hi + 1, 1)
 
-        assert log._maintenance.archived_prefix(files, log._archive.uri) == hi, (
-            "the archive holds every row; how it cut them is not I4's business"
-        )
+        assert (
+            log._maintenance.archived_prefix(
+                files, log._archive.uri, include_intents=False
+            )
+            == hi
+        ), "the archive holds every row; how it cut them is not I4's business"
 
 
 def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
@@ -1215,7 +1229,10 @@ def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
         )
 
         assert (
-            log._maintenance.archived_prefix(files, log._archive.uri) == files[0].hi
+            log._maintenance.archived_prefix(
+                files, log._archive.uri, include_intents=False
+            )
+            == files[0].hi
         ), "a range the archive does not hold must stop the walk"
 
 
@@ -1736,7 +1753,9 @@ def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
                         1,
                     )
 
-            frozen = log._maintenance.archived_prefix(files, "s3://bucket/prefix")
+            frozen = log._maintenance.archived_prefix(
+                files, "s3://bucket/prefix", include_intents=False
+            )
             below = [f for f in files if f.lo <= frozen]
             above = [f for f in files if f.lo > frozen]
 

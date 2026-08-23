@@ -18,6 +18,7 @@ import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
+from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._s3 import S3Options
 from litelink._table import LogTable, _recorded_location
@@ -876,7 +877,9 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
         log.seal_due()
         log.sync()
         local = log._table.data_files()
-        settled = log._maintenance.archived_prefix(local, log._archive.uri)
+        settled = log._maintenance.archived_prefix(
+            local, log._archive.uri, include_intents=False
+        )
 
         assert settled > 0
 
@@ -885,14 +888,19 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
             log._buffer._con.execute("DELETE FROM extent WHERE rel_path LIKE 's3://%'")
             log._buffer._con.commit()
 
-        assert log._maintenance.archived_prefix(local, log._archive.uri) == 0, (
-            "the setup must actually reproduce the crash"
-        )
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == 0
+        ), "the setup must actually reproduce the crash"
 
         log.sync()
 
         assert (
-            log._maintenance.archived_prefix(log._table.data_files(), log._archive.uri)
+            log._maintenance.archived_prefix(
+                log._table.data_files(), log._archive.uri, include_intents=False
+            )
             == settled
         ), "the archive's manifest says what it holds; recover from it"
         assert log.scan(include_archive=True).read_all().num_rows == ROWS
@@ -921,7 +929,7 @@ def test_the_backfill_sees_copies_another_process_pushed(
             writer.seal_due()
             writer.sync()
             grown = writer._maintenance.archived_prefix(
-                writer._table.data_files(), writer._archive.uri
+                writer._table.data_files(), writer._archive.uri, include_intents=False
             )
 
             with other._buffer._lock:
@@ -934,7 +942,7 @@ def test_the_backfill_sees_copies_another_process_pushed(
 
             assert (
                 other._maintenance.archived_prefix(
-                    other._table.data_files(), other._archive.uri
+                    other._table.data_files(), other._archive.uri, include_intents=False
                 )
                 == grown
             ), "recovered against a stale manifest"
@@ -1319,7 +1327,9 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
         # cuts. The state that matters is the one AFTER that, so take it.
         current = {(f.lo, f.hi + 1) for f in log._archive.require().data_files()}
         with log._buffer._lock:
-            for lo, hi in log._buffer.archived_ranges(log._archive.uri or "", 0):
+            for lo, hi in log._buffer.archived_ranges(
+                log._archive.uri or "", 0, include_intents=False
+            ):
                 if (lo, hi) not in current:
                     log._buffer._con.execute(
                         "DELETE FROM extent WHERE start_offset = ? AND end_offset = ? "
@@ -1495,7 +1505,7 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
             log.sync()
 
         archived = log._maintenance.archived_prefix(
-            log._table.data_files(), log._archive.uri
+            log._table.data_files(), log._archive.uri, include_intents=False
         )
 
         assert archived > 0, "expected the archive to hold a prefix"
@@ -1701,3 +1711,164 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
             "disagree about which files are still in play"
         )
         assert log.archived_through() > 0, "the watermark never moved"
+
+
+def _crash_before_recording(log: Log) -> None:
+    """Sync, dying between the register and the rows recording it."""
+    original = Buffer.record_file
+
+    def dying(*args: object, **kwargs: object) -> None:
+        msg = "crash between the register and the record"
+        raise RuntimeError(msg)
+
+    Buffer.record_file = dying
+    try:
+        with pytest.raises(RuntimeError, match="crash between"):
+            log.sync()
+
+    finally:
+        Buffer.record_file = original
+
+
+def test_a_register_without_its_rows_cannot_wedge_the_log(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The window two polarities exist to close.
+
+    A register lands and the rows recording it do not. Compaction decides what
+    it may merge from those rows, so a compaction-target change before the next
+    sync regroups the pushed-but-unrecorded files and commits a LOCAL file
+    straddling the archive's extent — after which every push is refused for
+    ever and nothing re-cuts a local straddler.
+
+    The intent is written before the register, and compaction reads intents
+    while eviction does not: overstated coverage is compaction's safe
+    direction, understated is eviction's, and one record cannot be both.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(3):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+
+        _crash_before_recording(log)
+
+        archive = log._archive.require()
+        archive.reload()
+        extent = archive.extent()
+        intents = log._buffer.intents(log._archive.uri or "")
+
+        assert extent is not None
+        assert intents, "the crash must leave the intents behind"
+
+        local = log._table.data_files()
+
+        assert log._maintenance.archived_prefix(local, None, include_intents=True) > 0
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == 0
+        ), "eviction must not see an intended copy as a landed one"
+
+        # The ingredient that turns the crash into a permanent stall.
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.maintain()
+
+        assert all(
+            f.lo > extent[1] or f.hi <= extent[1] for f in log._table.data_files()
+        ), "merged across the archive's extent"
+
+        log.sync()
+
+        assert not log._buffer.intents(log._archive.uri or ""), "intents not reconciled"
+        assert log.scan(include_archive=True).read_all().num_rows == 1200
+
+
+def test_eviction_never_acts_on_an_intended_copy(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The understating half of the split, on its own.
+
+    An intent says a copy is coming, not that it is there. Eviction deletes the
+    only local copy on the strength of what it reads, so reading an intent as
+    coverage is the loss this whole record exists to prevent — and it is the
+    direction a `confirmed` column would have handed an older build for free.
+    """
+    config = replace(LogConfig(), local_rows=50, target_seal_size=1 << 30)
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        # Several files, so the row floor lands on an edge below the head —
+        # with one file there is no boundary to snap to and eviction returns
+        # early whatever it believes about coverage.
+        for _ in range(3):
+            log.extend(rows(100))
+            log.seal()
+
+        before = len(log._table.data_files())
+
+        assert before == 3
+
+        for data_file in log._table.data_files():
+            log._buffer.intend_file(
+                f"s3://{bucket}/prefix/data/{data_file.lo}.parquet",
+                data_file.lo,
+                data_file.hi + 1,
+                1,
+            )
+
+        log.evict()
+
+        assert len(log._table.data_files()) == before, (
+            "evicted the only copy on the strength of an intended one"
+        )
+
+
+def test_two_owners_intending_one_path_do_not_collide(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`intend_file` is an upsert, and a bare insert kills the wrong process.
+
+    A holder that stalled past its TTL and resumed can intend a path the owner
+    that took over is also intending. On a bare insert the primary key raises,
+    and neither the maintainer nor anything else catches it — so the takeover
+    race would end the LAWFUL holder's pass rather than the stale one's.
+
+    Nothing else in this suite drives two live intents onto one path: every
+    other scenario intends a path reconciliation has already cleared.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        path = f"s3://{bucket}/prefix/data/contested.parquet"
+
+        log._buffer.intend_file(path, 1, 101, 4096)
+        # The other owner, intending the same path with its own view of it.
+        log._buffer.intend_file(path, 1, 101, 8192)
+
+        intents = log._buffer.intents(f"s3://{bucket}/prefix")
+
+        assert len(intents) == 1, "one path, one intent"
+        assert intents[0] == (path, 1, 101, 8192), "the later intent must win"

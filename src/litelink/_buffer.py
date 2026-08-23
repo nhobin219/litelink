@@ -315,6 +315,27 @@ class Buffer:
             CREATE INDEX IF NOT EXISTS extent_archived ON extent (start_offset)
             WHERE rel_path IS NOT NULL
         """)
+        # A copy that was INTENDED, beside `extent`'s copies that exist. The
+        # two are read by collaborators whose safe directions are opposite:
+        # compaction must not merge across a range some archive may hold, so it
+        # is safe when coverage is OVERSTATED; eviction must not delete the only
+        # copy, so it is safe only when coverage is UNDERSTATED. One record
+        # cannot be both, and collapsing them into one is what left a crash
+        # between a register and the rows recording it able to wedge the log.
+        #
+        # A separate table rather than a column on `extent`, because a build
+        # that predates this has no idea it exists — so its eviction query is
+        # unchanged and reads only landed copies, which is the safe polarity by
+        # construction. A column would have read to it as coverage, and no
+        # check in a new build can stop an old one.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS extent_intent (
+              rel_path     TEXT PRIMARY KEY,
+              start_offset INTEGER NOT NULL,
+              end_offset   INTEGER NOT NULL,
+              bytes        INTEGER NOT NULL
+            )
+        """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
@@ -1059,13 +1080,99 @@ class Buffer:
         table. So the coordinator that already records every path before its
         file exists (I16) records this too, for both tiers, in one shape.
         """
-        with self._lock:
+        with self._transaction():
+            # The upsert is untouched. What is new is the `forget_intent`
+            # beside it: recording the copy and retiring the intent are one
+            # fact, and a crash between two statements would leave the log
+            # believing both. The upsert also has to be able to write a row
+            # from nothing, because an owner that took over a lapsed claim may
+            # have dropped this push's intents while its register was in flight.
             self._con.execute(
                 "INSERT INTO extent"
                 " (start_offset, end_offset, bytes, rel_path, named_at)"
                 " VALUES (?, ?, ?, ?, unixepoch())"
                 " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
                 (start, end, held, rel_path),
+            )
+            self._con.execute(
+                "DELETE FROM extent_intent WHERE rel_path = ?", (rel_path,)
+            )
+
+    def intend_file(self, rel_path: str, start: int, end: int, held: int) -> None:
+        """Record a copy this log is ABOUT to write, before it writes it.
+
+        The register that follows can land while the row recording it does not,
+        and compaction decides what it may merge from those rows — so without
+        this, a compaction-target change before the next sync regroups the
+        pushed-but-unrecorded files and commits a local file straddling the
+        archive's extent. Nothing re-cuts a local straddler, so every later
+        push is refused and the log stops advancing.
+
+        An UPSERT, and the difference is not cosmetic: a holder that stalled
+        past its TTL and resumed can intend a path the owner that took over is
+        also intending. A bare insert raises on the primary key, and the
+        maintainer catches neither that nor anything like it — so the takeover
+        race would kill the LAWFUL holder's pass rather than the stale one's.
+        """
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO extent_intent"
+                " (rel_path, start_offset, end_offset, bytes) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(rel_path) DO UPDATE SET"
+                " start_offset = excluded.start_offset,"
+                " end_offset = excluded.end_offset,"
+                " bytes = excluded.bytes",
+                (rel_path, start, end, held),
+            )
+
+    def intents(self, prefix: str) -> list[tuple[str, int, int, int]]:
+        """Intended copies under `prefix`: `(rel_path, start, end, bytes)`.
+
+        Unbounded by offset, deliberately. Reconciliation drops an intent the
+        archive's manifest does not name, and one below the local window has to
+        be reachable to be dropped — bounding this read would leave those rows
+        beyond judgement for ever.
+        """
+        boundary = prefix.rstrip("/") + "/"
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, start_offset, end_offset, bytes FROM extent_intent"
+            ).fetchall()
+
+        return [
+            (str(r[0]), int(r[1]), int(r[2]), int(r[3]))
+            for r in rows
+            if str(r[0]).startswith(boundary)
+        ]
+
+    def archive_records(
+        self, prefix: str, floor: int
+    ) -> list[tuple[str, int, int, int]]:
+        """Landed copies under `prefix`, keyed by PATH: `(rel_path, lo, hi, bytes)`.
+
+        Reconciliation matches by path, and `archived_ranges` answers in bare
+        offsets — so it cannot serve. Bounded by `floor` like the manifest walk
+        beside it, or it grows with the archive and runs on every sync.
+        """
+        boundary = prefix.rstrip("/") + "/"
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, start_offset, end_offset, bytes FROM extent"
+                " WHERE rel_path IS NOT NULL AND end_offset > ?",
+                (floor,),
+            ).fetchall()
+
+        return [
+            (str(r[0]), int(r[1]), int(r[2]), int(r[3]))
+            for r in rows
+            if str(r[0]).startswith(boundary)
+        ]
+
+    def forget_intent(self, rel_path: str) -> None:
+        """Drop an intent, whether it became a copy or never will."""
+        with self._lock:
+            self._con.execute(
+                "DELETE FROM extent_intent WHERE rel_path = ?", (rel_path,)
             )
 
     def record_merge(self, rel_path: str, sources: Iterable[str]) -> None:
@@ -1141,8 +1248,17 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
-    def archived_ranges(self, prefix: str | None, floor: int) -> list[tuple[int, int]]:
-        """Offset ranges with a recorded copy under `prefix`, reaching `floor`.
+    def archived_ranges(
+        self, prefix: str | None, floor: int, *, include_intents: bool
+    ) -> list[tuple[int, int]]:
+        """Offset ranges an archive holds or is about to, under `prefix`.
+
+        `include_intents` is keyword-only and has no default, so every caller
+        states which question it is asking. Compaction asks whether ANY archive
+        might hold a range, and is safe overstating it; eviction asks whether
+        one DOES, and is safe only understating. Getting that backwards at one
+        call site would be silent, which is the whole reason this parameter is
+        awkward to pass.
 
         I4 asked of segments rather than of a watermark (§4a). `sync` records
         where each pushed file's copy went, so the archive's contents are
@@ -1170,16 +1286,30 @@ class Buffer:
                 (floor,),
             ).fetchall()
 
-        return (
-            sorted(
+        def wanted(path: str) -> bool:
+            return path.startswith(boundary) if boundary is not None else "://" in path
+
+        found = [(lo, hi) for lo, hi, path in rows if wanted(path)]
+        if include_intents:
+            # The intent leg reads the same way: same prefix test, same floor.
+            # Every intent is remote by construction, so the `"://"` arm changes
+            # nothing here — it keeps the two legs from drifting apart.
+            found += [
                 (lo, hi)
-                for lo, hi, path in rows
-                if path.startswith(boundary)
-                if boundary is not None
-            )
-            if boundary is not None
-            else sorted((lo, hi) for lo, hi, path in rows if "://" in path)
-        )
+                for path, lo, hi, _ in self._all_intents()
+                if wanted(path) and hi > floor
+            ]
+
+        return sorted(found)
+
+    def _all_intents(self) -> list[tuple[str, int, int, int]]:
+        """Every intended copy, for the union above."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, start_offset, end_offset, bytes FROM extent_intent"
+            ).fetchall()
+
+        return [(str(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rows]
 
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.

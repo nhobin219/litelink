@@ -1681,14 +1681,47 @@ class Log:
         config = self.config
         local = self._table.data_files()
         base = min((f.lo for f in local), default=0)
-        recorded = set(self._buffer.archived_ranges(pinned or "", base))
-        for held in archive.data_files():
-            if held.hi >= base and (held.lo, held.hi + 1) not in recorded:
+
+        # RECONCILIATION, matched by path in the archive's manifest rather than
+        # by offset range. Range matching reads plausibly and is wrong: a
+        # rewrite's intents name new objects over a range the stale files being
+        # replaced still cover, so a crashed rewrite's dead intents would be
+        # confirmed rather than dropped.
+        #
+        # Bounds differ between the two reads and must. The manifest walk is
+        # bounded by the local window, or it grows with the archive and runs on
+        # every sync. The intent read is unbounded, because an intent below the
+        # window has to be reachable to be dropped.
+        held_paths = {f.path: f for f in archive.data_files() if f.hi >= base}
+        recorded = {
+            path for path, _, _, _ in self._buffer.archive_records(pinned or "", base)
+        }
+
+        for path, lo, hi, size in self._buffer.intents(pinned or ""):
+            landed = held_paths.get(path)
+            if landed is not None:
+                # 1. The register did land. Confirm it, with the bytes the
+                #    intent carried — the only measurement that survives a
+                #    crash between a rewrite's commit and its confirm.
+                self._buffer.record_file(path, lo, hi, size)
+            else:
+                # 3. It did not, and nothing in the manifest holds that path.
+                #    The intent is dead. Below the local window this also drops
+                #    intents whose register DID land — the manifest walk is
+                #    bounded, so they read as absent — and their sizes are then
+                #    never measured. No reader below the window asks, and the
+                #    forfeit is recorded in the plan rather than discovered.
+                self._buffer.forget_intent(path)
+
+        for path, landed in held_paths.items():
+            if path not in recorded:
+                # 2. In the manifest with no row of either kind: the backfill
+                #    this rule grew out of.
                 self._buffer.record_file(
-                    held.path,
-                    held.lo,
-                    held.hi + 1,
-                    memory.get(held.path, config.compact_size),
+                    path,
+                    landed.lo,
+                    landed.hi + 1,
+                    memory.get(path, config.compact_size),
                 )
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
@@ -1705,7 +1738,11 @@ class Log:
         #
         # A file no merge can touch is settled by definition. Only the part
         # above that line is still compaction's business.
-        frozen = self._maintenance.archived_prefix(pending, None)
+        # Intents included, so this exclusion is literally compaction's. The
+        # two share `runs` so they cannot disagree about what is in play, and
+        # a second input one of them could not see is what deadlocked them once
+        # already.
+        frozen = self._maintenance.archived_prefix(pending, None, include_intents=True)
         head = [f for f in pending if f.lo > frozen]
         settled = (len(pending) - len(head)) + stable_prefix(
             head,
@@ -1719,6 +1756,22 @@ class Log:
         for data_file in pending[:settled]:
             checkpoint(lease.renew)
             rel_path = self._layout.relative(data_file.path)
+            # The intent BEFORE the upload, which is the seal's I2 argument
+            # applied to the archive: the name goes down before the object
+            # exists. What it guards is the register that follows — that can
+            # land while the row recording it does not, and compaction decides
+            # what it may merge from those rows, so without this a
+            # compaction-target change before the next sync merges across a
+            # range the archive holds and every later push is refused for ever.
+            #
+            # For EVERY file, not only measured ones: the unmeasured are
+            # exactly the ones the confirm below used to skip.
+            self._buffer.intend_file(
+                archive.uri(rel_path),
+                data_file.lo,
+                data_file.hi + 1,
+                memory.get(data_file.path, config.compact_size),
+            )
             archive.put(self._layout.absolute(rel_path), rel_path)
             uploaded.append((data_file, rel_path))
 
@@ -1758,14 +1811,21 @@ class Log:
             # afterwards: the local entry goes when the local file is unlinked,
             # and a Parquet footer records what the rows compressed from, not
             # what the appender counted them as.
-            held = memory.get(data_file.path)
-            if held is not None:
-                # Same extent, second location. `end_offset` is exclusive, as
-                # it is on every other extent — the cut is recorded as the
-                # offset AFTER the last row.
-                self._buffer.record_file(
-                    archive.uri(rel_path), data_file.lo, data_file.hi + 1, held
-                )
+            #
+            # For every file, with the same default the intent used. The guard
+            # that used to skip unmeasured ones was a hole: in a takeover the
+            # confirm is the only thing that recreates rows a rival's
+            # reconciliation dropped, so skipping any file reopens the window
+            # for exactly the files the intent was added to protect.
+            #
+            # Same extent, second location. `end_offset` is exclusive, as it is
+            # on every other extent — the cut is the offset AFTER the last row.
+            self._buffer.record_file(
+                archive.uri(rel_path),
+                data_file.lo,
+                data_file.hi + 1,
+                memory.get(data_file.path, config.compact_size),
+            )
 
         # After the register, never before: the watermark is a promise that the
         # archive HAS the range, and I4 lets `maintain` delete the local copy on
