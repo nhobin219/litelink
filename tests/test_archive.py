@@ -1587,3 +1587,60 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
         assert not any(opened), (
             "opened the archive with repair while another owner held the log"
         )
+
+
+def test_re_pointing_leaves_the_old_archive_unreadable(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The documented cost of a re-point, pinned so it stays documented.
+
+    Rows already evicted into the old archive stay there, and the read path
+    resolves only the archive the log currently names — so they are not
+    readable through this log, silently. And pointing back does not undo it,
+    because re-attaching to an archive that already holds data is not
+    expressible (§13): the repair drops the catalog entry and creates a fresh,
+    empty table over the objects still sitting in the bucket.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        local_rows=200,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    first = f"s3://{bucket}/first"
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=first,
+        s3=s3,
+    )
+    with log:
+        written = 0
+        for _ in range(4):
+            log.extend(rows(400))
+            written += 400
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.scan(include_archive=True).read_all().num_rows == written
+
+        log.set_archive(f"s3://{bucket}/second")
+        moved = log.scan(include_archive=True).read_all().num_rows
+
+        assert moved < written, "expected the evicted history to be out of reach"
+
+        # And pointing BACK does not undo it: re-attaching to an archive that
+        # already holds data is not expressible (§13), so the repair creates an
+        # empty table over the objects still sitting there. The first draft of
+        # this test asserted the opposite, and the docstring said so too.
+        log.set_archive(first)
+
+        assert log.scan(include_archive=True).read_all().num_rows < written, (
+            "re-attaching to a populated archive is documented as unsupported"
+        )
