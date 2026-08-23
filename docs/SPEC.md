@@ -439,7 +439,25 @@ fresh piece of reasoning — a crash between a register and the row recording it
 compaction-config change before the next sync backfills, is one that survived several
 reviews. `_covers` declines only a range ENTIRELY covered, so a straddling one is admitted
 and those offsets sit in two files at once, in the immutable tier, with nothing able to
-repair it. Refusing costs a stall an operator can see and re-cut; admitting costs silence.
+repair it. Refusing costs a stall; admitting costs silence.
+
+**That stall has no remedy today, and this paragraph used to imply one.** Nothing re-cuts a
+LOCAL straddler — `rewrite_archive` works the other side — so the log stops advancing its
+watermark, eviction pins below the straddling file, and the shipped sync role dies on the
+`ValueError` because it catches `RuntimeError` and `CommitFailedException` only. The refusal
+is still the right trade against silent permanent duplication in the immutable tier, but
+"recoverable" was not true.
+
+Reaching it needs a crash between a register and the `extent` rows recording it, and then a
+compaction-target change before the next sync backfills those rows from the archive's
+manifest. The window exists because the rows and the manifest are two records of one fact and
+only `sync` reconciles them, while compaction decides from the rows alone. What would close
+it, in increasing order of work: reconcile the rows against the manifest on the compaction
+side too; or record a pushed range BEFORE the register and confirm it after, so the two
+readers can take opposite polarities — compaction is safe when coverage is OVERSTATED,
+eviction only when it is UNDERSTATED, which is why the pre-segment design kept two records
+and read one from each; or ship a tool that re-cuts a local straddler, which would also make
+the sentence above true.
 
 The test is `lo <= extent_hi`, with no lower bound. A lower bound was there first and was a
 hole rather than a safety condition: it exempted exactly the range that starts BELOW the

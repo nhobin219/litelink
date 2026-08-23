@@ -1734,10 +1734,6 @@ class Log:
         # waited, and the buffer grew for the whole of it.
         checkpoint(lease.renew)
         last = uploaded[-1][0]
-        # Recorded BEFORE the register, and never read by eviction. It is what
-        # lets compaction know, after a crash between the register and its
-        # confirming write, that these offsets may already be in the archive
-        # and must not be merged into a file that straddles its extent.
         if (self._buffer.get_meta(_ARCHIVE_KEY) or None) != pinned:
             # The upload already spent longer than a lease TTL against S3 more
             # than once, which is how the log gets re-pointed underneath a push
