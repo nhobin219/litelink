@@ -1,9 +1,14 @@
 # Plan: restore two polarities to the archive extent record
 
-**Status: reviewed, revised, ready to build.** The first draft was attacked before any code
-was written; the review found one self-answer wrong (Q3) and one detail that would have made
-a race *worse than today* (Q5). Both are corrected below, and the corrections are the reason
-this document exists.
+**Status: two review rounds, redesigned after the second.** The first round found a wrong
+self-answer and a detail that would have made a race worse than today. The second found three
+blocking defects in the fix — and the third of them, that an OLD build's evictor reads a new
+build's intents as landed coverage, could not be gated from the new side at all.
+
+That one changed the design. Intents no longer live in the `extent` table as a flagged
+column; they live in **a table of their own**. A reader that does not know the table exists
+sees exactly today's behaviour, which is what makes a rolling upgrade safe — and it dissolves
+the other two blocking defects with it.
 
 ## The window this closes
 
@@ -41,54 +46,84 @@ row and lost the distinction — which is exactly this window.
 
 ### 1. Schema
 
-`extent` gains one column:
+A new table, not a new column:
 
 ```sql
-ALTER TABLE extent ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1
+CREATE TABLE IF NOT EXISTS extent_intent (
+  rel_path   TEXT PRIMARY KEY,
+  start_offset INTEGER NOT NULL,
+  end_offset   INTEGER NOT NULL,
+  named_at     INTEGER NOT NULL
+)
 ```
 
-`DEFAULT 1` is the migration: every existing row was written *after* its register (or is a
-local file), so every existing row is confirmed. No backfill pass needed.
+`extent` keeps its exact shape and meaning: **a row there is a copy that exists.** A row in
+`extent_intent` is a copy that was *intended*. Confirming is moving the fact from one table
+to the other.
 
-There is no migration precedent in this buffer, so the `ALTER` goes in setup behind an
-idempotent `pragma table_info` check. A read-only open cannot `ALTER`, and must not need to:
-no read-only path names the new column. A log an older build crashed mid-push has no rows at
-all, so the migration marks nothing and the next backfill heals it — no worse than today, and
-the one case only a local re-cut tool could do better on.
+Three defects the second review found in the column design dissolve here, which is why the
+design changed rather than the column being patched:
 
-`confirmed = 0` means "a copy was *intended* here"; `1` means "a copy *is* here".
+- **Mixed versions.** An older build has no idea `extent_intent` exists, so its eviction
+  query is unchanged and reads only landed copies — the safe polarity, by construction rather
+  than by a flag it does not know to filter on. A column would have read to it as landed
+  coverage, and no gate in the new build can stop an old one; the `lease`-table refusal works
+  only because it makes the NEW build refuse.
+- **Migration.** `CREATE TABLE IF NOT EXISTS` is the idiom this buffer already uses ten times
+  over, and is atomic. The column design needed a `pragma table_info` check plus an `ALTER`,
+  which is check-then-act and races two processes opening together — the ordinary shape here,
+  a writer and a maintainer starting at once.
+- **The upsert.** `record_file`'s conflict action updates only `bytes`, so a confirm written
+  as that upsert would have taken the conflict branch and left `confirmed = 0` for ever:
+  eviction never advancing past the first synced file, a permanent pin on day one. With two
+  tables the confirm is the existing upsert, untouched, plus a delete from the intent table.
 
 ### 2. Writes
 
 | site | today | proposed |
 |---|---|---|
-| `log.py:1766` sync, after register | `record_file(...)` | **moves before the register** as `confirmed=0`, for EVERY uploaded file; the existing post-register call stays exactly where it is and becomes the confirm |
-| `log.py:1687` sync backfill from manifest | `record_file(...)` | `confirmed=1` — the manifest is proof |
-| `log.py:2030` hydrate | `record_file(...)` | `confirmed=1` — a local path, not an archive claim |
-| `_maintenance.py:1002` rewrite scratch | `record_file(...)` before `replace_range` | `confirmed=0`, confirmed after `replace_range` commits |
+| `log.py:1766` sync, after register | `record_file(...)` | unchanged, and it becomes the confirm; a new `intend_file(...)` is called for EVERY uploaded file before the register |
+| `log.py:1687` sync backfill from manifest | `record_file(...)` | unchanged — the manifest is proof |
+| `log.py:2030` hydrate | `record_file(...)` | unchanged — a local path, not an archive claim |
+| `_maintenance.py:1002` rewrite scratch | `record_file(...)` before `replace_range` | becomes `intend_file(...)`; `record_file` after `replace_range` commits |
 
-`record_file` gains `confirmed: bool = True`, so only the two intent sites change.
+`record_file` does not change at all. Two new methods carry the intent side:
 
-Two things about the confirm that the first draft got wrong:
+```python
+def intend_file(self, rel_path: str, start: int, end: int) -> None   # INSERT OR REPLACE
+def forget_intent(self, rel_path: str) -> None                       # DELETE by path
+```
 
-- **It is the existing upsert, not a bare `UPDATE`.** A takeover can delete this push's
-  intents while its register is in flight (rule 3), and an `UPDATE` would then match nothing
-  — register landed, no rows, which is precisely the window being closed. The upsert
-  recreates them, which is what today's code already does and must keep doing.
-- **It runs on register success regardless of the identity fence.** If the log was
-  re-pointed mid-push the register still landed in the pinned archive, so the copy is real
-  and recording it is what makes a later re-point *back* coherent. The fence gates the
-  watermark, as it does today, and eviction ignores foreign rows anyway.
+and `record_file` calls `forget_intent` for the same path in its own transaction, so
+confirming is one atomic move rather than two states a crash can sit between.
 
-The intent is written for **every** uploaded file. The post-register loop skips files with no
-measured size (`held is not None`); an intent must not, or the window stays open for exactly
-those files. Unknown sizes take `compact_size`, as the backfill already does.
+Three things about the confirm:
+
+- **It recreates, it does not merely mark.** A rival sync's reconciliation can delete this
+  push's intents while its register is in flight, so the confirm has to be able to write a
+  row from nothing. `record_file`'s upsert already is that; a bare `UPDATE` would match
+  nothing and leave register-landed-no-rows, which is the window being closed.
+- **It runs on register success regardless of the identity fence.** No code motion is needed:
+  the record loop already sits *before* the post-register fence, which raises after the rows
+  are written. A register that landed is a copy that exists, and recording it is what makes a
+  later re-point back coherent.
+- **Both the intent AND the confirm run for every uploaded file.** The post-register loop
+  skips files with no measured size (`held is not None`), which the second review caught: in
+  the takeover race the confirm is the only thing recreating deleted rows, so leaving the
+  guard on it reopens today's window for exactly the files the intent was added for. Unknown
+  sizes take `compact_size`, as the backfill already does.
 
 ### 3. Reads
 
-- `Buffer.archived_ranges(prefix, floor, *, confirmed_only: bool)`.
-- **compaction** → `confirmed_only=False` (sees intents; overstates; safe).
-- **eviction** → `confirmed_only=True` (sees only landed copies; understates; safe).
+- `Buffer.archived_ranges(prefix, floor, *, include_intents: bool)` — a `UNION` over
+  `extent_intent` when true, and today's query verbatim when false. Keyword-only with no
+  default, so no call site can get the polarity by accident.
+- **compaction** → `include_intents=True` (overstates; safe). Three call sites, which must
+  agree because they are one rule: the compact pass, the per-run recheck, and `_push`'s
+  `frozen`.
+- **eviction** → `include_intents=False` (understates; safe). Its SQL is then byte-identical
+  to today's, which is the point.
+- `archived_prefix` threads the flag through; it is the only caller of `archived_ranges`.
 - `archived_through()` → **no change.** It reads `meta`, not `extent`, and is written after
   the register and reconciled from the manifest, so it is already confirmed-polarity by
   construction. The first draft said "confirmed only", which is either a no-op or an
@@ -98,8 +133,13 @@ those files. Unknown sizes take `compact_size`, as the backfill already does.
 - `file_ages()` → **no change**, and it belongs in this list: the first draft claimed a
   complete reader inventory without having one. Eviction dates files by local root-relative
   key, so URI-keyed rows are never looked up.
-- The append path's `max(end_offset)` and `last_queued_end` → **no change**; both filter to
-  `rel_path IS NULL`, which no archive row satisfies.
+- `last_queued_end()` → **no change**; it filters to `rel_path IS NULL`, which no archive row
+  satisfies.
+- `_seed_group`'s `SELECT max(end_offset) FROM extent` → **no change**, and the second review
+  caught that the first inventory got its reason wrong: this one has **no filter** and already
+  reads archive rows today. It is safe because a push intent duplicates the range of a live
+  local file and a rewrite intent sits under the archive's extent, so neither can raise the
+  max — and with a separate table it does not see intents at all.
 
 **Ordering requirement.** Reconciliation runs under the push claim *before* `frozen` and
 `settled` are computed, so no unconfirmed row under the pinned archive survives into the
@@ -119,11 +159,43 @@ confirmed dead intents naming objects `drain` was about to delete. Path matching
 right in both directions — a crash after a register leaves paths present, a crash before
 `replace_range` leaves them absent.
 
-1. path in the manifest, row unconfirmed → **confirm it** (the upsert of rule 2).
-2. path in the manifest, no row → **insert confirmed** (today's backfill).
-3. path absent, row unconfirmed **and older than the claim TTL** → **delete it**. The
-   register never landed. The TTL clause matters: without it, a sync that took over a lapsed
-   claim would delete the intents of a register still in flight.
+1. path in the manifest, intent row present → **confirm it**: `record_file` + `forget_intent`.
+2. path in the manifest, no row in either table → **insert into `extent`** (today's backfill).
+3. path absent from the manifest, intent row present → **drop the intent.** The register
+   never landed.
+
+**Rule 3 needs no TTL clause, and the first draft's justification for one was wrong.** It
+claimed the clause protects a register still in flight from a rival's reconciliation. It
+cannot: a rival can only acquire the claim once it has lapsed, and the claim is renewed at
+the very point the intents are written — so by the time any rival reconciles, those intents
+are already a full TTL old and the clause deletes them anyway. What actually protects the
+race is the confirm recreating the rows, plus the rival writing its own intents over the same
+range. Adding a TTL test would buy a marginal case and delay cleanup of genuinely dead
+intents by a pass; leaving it out keeps rule 3 a plain statement about the manifest.
+
+The residual window this leaves, named rather than papered over: a rival deletes the live
+intents, then crashes *before writing its own*, while the stalled register lands and its
+holder dies before the confirm. Rule 2 heals it at the next sync from the manifest; between
+the two, compaction can regroup those files. Orders of magnitude narrower than S6 — it needs
+two crashes and a lapse — but not zero.
+
+**What rule 3 discards.** Dropping an intent discards the only local record of an
+uploaded-but-unregistered object's name. That object is reclaimed today by the retry
+overwriting the same deterministic key, and this matches the existing behaviour of a declined
+register, which returns without queueing its uploads. Queueing them instead has its own cost:
+a raced path whose register does land stays vetoed and queued for ever, and any remote queue
+entry makes `_expire_archive` claim and open the archive on every expire pass. **Decision:
+bare delete**, consistent with the declined-register path — recorded here so it is a choice
+rather than an oversight.
+
+**The API this needs, which the plan previously left unspecified.** `archived_ranges` returns
+bare `(lo, hi)` tuples and cannot serve path matching, and nothing today deletes extent rows
+except `forget_deletion` and `record_merge`. Reconciliation needs one read — intent rows
+under a prefix, bounded by the local window, returning `(rel_path, lo, hi)` — and
+`forget_intent`. The manifest set is bounded the same way the backfill already bounds it, by
+`base = min(local lo)`: an intent below `base` reads as absent and is dropped, which is
+harmless because no local file sits there for any reader to care about, and is a deliberate
+choice rather than an inherited accident.
 
 Rows under a **different** archive's URI are left alone, confirmed or not. We cannot check
 them without opening that archive.
@@ -160,8 +232,13 @@ confirmed rows under the new URI unpin eviction. Re-pointing back resolves them 
 
 ## Test plan
 
-- The takeover race: a lapsed claim, a rival reconcile deleting live intents, the register
-  landing anyway — the confirm must recreate the rows.
+- The takeover race: a lapsed claim, a rival reconcile dropping live intents, the register
+  landing anyway — the confirm must recreate the rows in `extent`, asserted by reading the
+  table rather than by the absence of an error.
+- The residual window: rival drops the intents, crashes before writing its own, register
+  lands, holder dies before the confirm — rule 2 must heal it at the next sync.
+- A mixed-version log: rows written by this build, read by the previous one's eviction query
+  — it must see only landed copies, which the separate table gives for free.
 - A recut crash before `replace_range`: the dead intents must be deleted, not confirmed.
 - A declined register (`_covers`): its intents must not survive as confirmed rows.
 - A fence failure mid-push: the register landed, so the rows must still be confirmed.
@@ -187,10 +264,20 @@ confirmed rows under the new URI unpin eviction. Re-pointing back resolves them 
   the crash window", which is wrong. Both are benign — compaction skipping in-flight files is
   desirable, and during a recut the stale files' rows keep eviction's answer unchanged — but
   the exposure is continuous, not exceptional.
-- **Rule 3's DELETE is the one genuinely new subtraction.** Deleting a real row understates
-  coverage, which is compaction's unsafe direction. Every available conservatism is stacked
-  on it: pinned prefix only, unconfirmed only, path-absent, older than the TTL, and ordered
-  under the claim before anything reads the result.
+- **Rule 3's delete is the one genuinely new subtraction.** Dropping a real intent
+  understates coverage, which is compaction's unsafe direction. Its conservatisms: pinned
+  prefix only, intent table only (never `extent`), path-absent from the manifest, and ordered
+  under the claim before anything reads the result. Not, as the first draft claimed, a TTL
+  test — see rule 3.
+- **`forget_deletion` can delete a live rewrite's confirmed row**, since it deletes by
+  `rel_path` and a recovered-but-not-dead rewrite's output carries the same URI. Healed by
+  the post-commit confirm, which is one more thing resting on the confirm being able to write
+  a row from nothing.
+- **A crash between `replace_range` and the rewrite's confirm loop** leaves the new files live
+  but only intended. Eviction's answer is carried by the superseded files' rows until drain
+  removes them, so confirmation depends on a sync running rule 1 within the
+  `snapshot_retention` grace; otherwise eviction pins below the rewritten range until one
+  does. A stall, not a loss.
 - One extra SQLite statement per push and one per rewrite output. Negligible next to
   the register.
 - `confirmed_only` is a new parameter on a hot-ish path; wrong default = wrong polarity
