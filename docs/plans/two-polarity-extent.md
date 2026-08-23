@@ -61,12 +61,16 @@ CREATE TABLE IF NOT EXISTS extent_intent (
 `extent_intent` is a copy that was *intended*. Confirming is moving the fact from one table
 to the other.
 
-**`bytes` is on the intent because the fact includes it**, and the third review caught that
-the plan had nowhere else to get it. A rewrite's confirm runs after `replace_range`, by which
-point the scratch buffer — the only source of `group_bytes` — has been closed and deleted in
-a `finally` that runs *before* the commit. Without the column the confirm has no size, and
-the crash-heal path records every re-cut output at `compact_size`, including the deliberately
-undersized tail, which `_badly_sized` then treats as full for ever. `named_at` is not on the
+**`bytes` is on the intent because RULE 1 needs it**, and only rule 1. The live confirm gets
+its sizes from memory (see §2) — an earlier draft of this paragraph said the column existed
+because the confirm had nowhere else to get them, which the memory-carried design made false
+and which contradicted §2 two pages later.
+
+What needs it is the crash-heal. A rewrite's scratch buffer, the only source of
+`group_bytes`, is closed and deleted in a `finally` that runs *before* `replace_range`; so a
+crash between the commit and the confirm leaves rule 1 to record those files at the next
+sync, and without the column it records every re-cut output at `compact_size` — including the
+deliberately undersized tail, which `_badly_sized` then treats as full for ever. `named_at` is not on the
 intent: nothing reads it once rule 3 has no TTL clause.
 
 Three defects the second review found in the column design dissolve here, which is why the
@@ -99,7 +103,7 @@ design changed rather than the column being patched:
 | `log.py:1766` sync, after register | `record_file(...)` | unchanged, and it becomes the confirm; a new `intend_file(...)` is called for EVERY uploaded file before the register |
 | `log.py:1687` sync backfill from manifest | `record_file(...)` | unchanged — the manifest is proof |
 | `log.py:2030` hydrate | `record_file(...)` | unchanged — a local path, not an archive claim |
-| `_maintenance.py:1002` rewrite scratch | `record_file(...)` before `replace_range` | becomes `intend_file(...)`; `record_file` after `replace_range` commits |
+| `_maintenance.py:1002` rewrite scratch | `record_file(...)` before `replace_range` | becomes `intend_file(...)`, moved to before the `archive.put` above it; `record_file` after `replace_range` commits |
 
 `record_file`'s upsert — its columns, its conflict action — does not change; that was the
 point, since the column design failed precisely there. The METHOD does change: it grows a
@@ -112,10 +116,24 @@ Two new methods carry the intent side:
 ```python
 def intend_file(self, rel_path: str, start: int, end: int, held: int) -> None
 def forget_intent(self, rel_path: str) -> None
+
+# intend_file is an UPSERT:
+#   INSERT INTO extent_intent (...) VALUES (...)
+#   ON CONFLICT(rel_path) DO UPDATE SET
+#     start_offset = excluded.start_offset,
+#     end_offset   = excluded.end_offset,
+#     bytes        = excluded.bytes
 ```
 
 and `record_file` calls `forget_intent` for the same path in its own transaction, so
 confirming is one atomic move rather than two states a crash can sit between.
+
+`intend_file` **must** be an upsert, and a bare INSERT bites in this design's own centrepiece
+race: a zombie holder resuming its upload loop writes an intent for a path the lawful rival
+is also intending, and the `PRIMARY KEY` collision raises an `IntegrityError` — which the
+shipped role does not catch, so the LAWFUL holder's pass dies. No durable damage; a restart
+reconciles. But it is the takeover race killing the wrong process, which is not a thing to
+discover in production.
 
 **`intend_file` runs immediately before each upload**, not batched before the register. Both
 close the window, but per-upload also gives the archive object the path-before-file property
@@ -158,10 +176,15 @@ Three things about the confirm:
   `frozen`.
 - **eviction** → `include_intents=False` (understates; safe). Its SQL is then byte-identical
   to today's, which is the point.
-- `archived_prefix` threads the flag through, and is the only PRODUCTION caller once
+- `archived_prefix` takes the flag the same way — **keyword-only, no default** — and is the
+  only PRODUCTION caller once
   `_push`'s `recorded` computation is replaced. `tests/test_archive.py` calls
   `archived_ranges` positionally; the keyword-only flag breaks it at build time, which is the
-  point of making it keyword-only.
+  point of making it keyword-only. Roughly a dozen `archived_prefix` call sites in
+  `test_archive.py` and `test_maintain.py` break the same way, and each needs a deliberate
+  polarity: assertions about what EVICTION would do take `include_intents=False`, assertions
+  about what compaction or `frozen` would do take `True`. Breaking them is the design working
+  — every one is a place someone has to choose which question is being asked.
 - The intent leg of the union carries the same `"://"` filter as the extent leg. Every intent
   is remote by construction, so it changes nothing — it keeps the two legs reading alike.
 - No index on `extent_intent`. It is bounded by in-flight work, not by history.
@@ -244,10 +267,15 @@ Reconciliation needs two reads — intent rows under a prefix returning
 This **replaces** `_push`'s existing `recorded` computation, which today derefs
 `archived_ranges` and matches by range tuple. The writes table above calls the backfill
 "unchanged", which is true of its *effect* and not of its code; and the claim elsewhere that
-`archived_prefix` is the only caller of `archived_ranges` is only true after this rewrite. The manifest set is bounded the same way the backfill already bounds it, by
-`base = min(local lo)`: an intent below `base` reads as absent and is dropped, which is
-harmless because no local file sits there for any reader to care about, and is a deliberate
-choice rather than an inherited accident.
+`archived_prefix` is the only caller of `archived_ranges` is only true after this rewrite. Bounds, which differ between the two reads and must:
+
+- the manifest set and the extent-by-path read are bounded by `base = min(local lo)`, as the
+  backfill already bounds its walk — otherwise the archive-proportional scan the current code
+  explicitly avoids comes back.
+- the **intent read is unbounded**. That is what makes "an intent below `base` reads as absent
+  and is dropped" possible at all; bounding it would leave those rows unreachable for ever.
+  Dropping them is harmless because no local file sits there for any reader to care about,
+  and it is a deliberate choice rather than an inherited accident.
 
 Rows under a **different** archive's URI are left alone, confirmed or not. We cannot check
 them without opening that archive.
@@ -273,6 +301,14 @@ and are answered or obsolete. What survived the attacks, and what did not:
   inputs being untouched; that this closes the original window; that a foreign intent cannot
   stall eviction, because `frozen` settles those files and they are re-pushed.
 
+## Two cases deliberately left open
+
+- **A permanently detached log.** Rule 3 runs only under `sync`, which raises on a local-only
+  log, so dead intents there are never swept. Cosmetic permanent over-block, the same class
+  as the foreign-URI rows above.
+- **`_rewrite_run(upload=True)`.** No caller passes it today. If it is ever activated it needs
+  the same intent treatment, or it reopens this shape on the archive side.
+
 ## Test plan
 
 - The takeover race: a lapsed claim, a rival reconcile dropping live intents, the register
@@ -283,6 +319,10 @@ and are answered or obsolete. What survived the attacks, and what did not:
 - A mixed-version log: rows written by this build, read by the previous one's eviction query
   — it must see only landed copies, which the separate table gives for free.
 - A recut crash before `replace_range`: the dead intents must be deleted, not confirmed.
+- **A confirmed row carries the MEASURED bytes, not the default** — specifically a rewrite's
+  undersized tail confirmed through rule 1's crash-heal. Without this the whole test list
+  passes against a confirm that records `compact_size` everywhere, which is precisely the
+  failure the `bytes` column exists to prevent. Falsify it against exactly that.
 - A declined register. Two cases, and the first draft of this line asserted the wrong one:
   when a rival registered the SAME deterministic paths, the copies exist and rule 1 *should*
   confirm them — asserting otherwise would fail against correct code. The case worth testing
