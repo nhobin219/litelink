@@ -941,9 +941,19 @@ class LogTable:
         however it is shaped. Whole-batch replays are excused earlier, by
         `_covers`.
 
-        Refusing costs a stall: the straddling file never lands, the watermark
-        stops, and an operator has to re-cut it. That is a loud, recoverable
-        failure standing in for a silent, permanent one.
+        Refusing costs a stall, and the stall is worse than this used to say.
+        The straddling file never lands, the watermark stops, eviction pins
+        below it, and **nothing re-cuts a local straddler**: `rewrite_archive`
+        works the other side, and no tool does this one. The refusal is still
+        right — a loud permanent stall beats a silent permanent duplication —
+        but calling it recoverable was wrong, and the operator's only route
+        today is to lower the compaction target so the straddler is left alone,
+        or to start a fresh archive prefix.
+
+        Reaching it at all takes a crash between a register and the rows
+        recording it, and then a compaction-target change before the next sync
+        backfills those rows from the archive's manifest. SPEC §4a records the
+        window and what would close it.
         """
         if lo is None:
             return
