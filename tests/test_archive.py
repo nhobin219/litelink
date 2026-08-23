@@ -1644,3 +1644,60 @@ def test_re_pointing_leaves_the_old_archive_unreadable(
         assert log.scan(include_archive=True).read_all().num_rows < written, (
             "re-attaching to a populated archive is documented as unsupported"
         )
+
+
+def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Compaction and `sync` must exclude the same files, or they deadlock.
+
+    `stable_prefix` holds a file back when compaction might still merge it, and
+    compaction refuses to merge anything some archive already holds. Give
+    compaction that second input without giving it to `sync` and the two stop
+    agreeing: after a re-point to a FRESH prefix the floor is 0, so files the
+    old archive covers are back in `pending`, group into a mergeable run under
+    the raised target, and are held back for ever against a merge that will
+    never happen. Nothing is ever pushed, the watermark never moves, eviction
+    pins on it, and no error surfaces anywhere.
+
+    The re-attach test next to this one hides it, because re-attaching the SAME
+    archive leaves its own extent as the floor, which keeps those files out of
+    `pending` entirely.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/first",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.set_archive(f"s3://{bucket}/second")
+
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.archive_files() > 0, (
+            "nothing was ever pushed to the new archive: sync and compaction "
+            "disagree about which files are still in play"
+        )
+        assert log.archived_through() > 0, "the watermark never moved"

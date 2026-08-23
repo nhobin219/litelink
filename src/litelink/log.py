@@ -1692,8 +1692,23 @@ class Log:
                 )
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
-        settled = stable_prefix(
-            pending,
+        # `stable_prefix` holds a file back when compaction might still merge
+        # it, and compaction refuses to merge anything some archive already
+        # holds — so the two need the SAME exclusion or they deadlock. They
+        # share `runs` for exactly this reason, and giving compaction a second
+        # input this could not see was enough to break it: after a re-point to
+        # a fresh prefix the floor is 0, so files an old archive covers are
+        # back in `pending`, group into a mergeable run under a raised target,
+        # and are held back for ever against a merge that will never happen.
+        # Nothing is pushed, the watermark never moves, eviction pins on it,
+        # and no error surfaces anywhere.
+        #
+        # A file no merge can touch is settled by definition. Only the part
+        # above that line is still compaction's business.
+        frozen = self._maintenance.archived_prefix(pending, None)
+        head = [f for f in pending if f.lo > frozen]
+        settled = (len(pending) - len(head)) + stable_prefix(
+            head,
             config.compact_size,
             config.compact_min_files,
             memory,
