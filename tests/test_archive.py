@@ -1872,3 +1872,69 @@ def test_two_owners_intending_one_path_do_not_collide(
 
         assert len(intents) == 1, "one path, one intent"
         assert intents[0] == (path, 1, 101, 8192), "the later intent must win"
+
+
+def test_a_healed_row_carries_the_measured_bytes(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The test the plan mandated, which the first build shipped without.
+
+    The `bytes` column on an intent exists for exactly one reader: rule 1,
+    healing a crash with the only measurement that survives it. Without this
+    assertion the whole suite passes against a reconciliation that records the
+    compact target everywhere — which is what the first build did, because rule
+    2 re-fired for the paths rule 1 had just confirmed and its conflict clause
+    overwrote them.
+
+    What that costs is not cosmetic: a rewrite's deliberately undersized tail
+    recorded as full is never flagged by `_badly_sized` again, so
+    `rewrite_archive` stops converging it, and nothing re-measures an archived
+    file.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=64 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(3):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+
+        _crash_before_recording(log)
+
+        intended = {
+            path: size
+            for path, _, _, size in log._buffer.intents(log._archive.uri or "")
+        }
+
+        assert intended, "the crash must leave intents behind"
+        assert all(size != config.compact_size for size in intended.values()), (
+            "the fixture must not coincide with the default it is testing for"
+        )
+
+        log.sync()
+
+        healed = {
+            path: size
+            for path, size in log._buffer.file_bytes().items()
+            if path in intended
+        }
+
+        assert healed, "the intents were never confirmed"
+        assert healed == intended, (
+            "a healed row must carry the bytes its intent measured, not the "
+            f"compact default: {healed} != {intended}"
+        )

@@ -1279,37 +1279,33 @@ class Buffer:
         # create a range no archive's cuts line up with — and detaching does
         # not make those copies stop existing.
         boundary = None if prefix is None else prefix.rstrip("/") + "/"
+        # ONE statement, so one snapshot. Read as two, the tables are two
+        # separate WAL reads and a `record_file` committing between them moves
+        # a range out of the first and into the second AFTER the second was
+        # taken — so it appears in neither, and compaction's read, which is
+        # safe only when it OVERSTATES coverage, momentarily understates it.
+        # That is the straddle this whole record exists to prevent, reopened by
+        # the shape of the query rather than by the design.
+        sql = (
+            "SELECT start_offset, end_offset, rel_path FROM extent"
+            " WHERE end_offset > ? AND rel_path IS NOT NULL"
+        )
+        args: tuple[int, ...] = (floor,)
+        if include_intents:
+            sql += (
+                " UNION ALL"
+                " SELECT start_offset, end_offset, rel_path FROM extent_intent"
+                " WHERE end_offset > ?"
+            )
+            args = (floor, floor)
+
         with self._lock:
-            rows = self._con.execute(
-                "SELECT start_offset, end_offset, rel_path FROM extent "
-                "WHERE end_offset > ? AND rel_path IS NOT NULL",
-                (floor,),
-            ).fetchall()
+            rows = self._con.execute(sql, args).fetchall()
 
         def wanted(path: str) -> bool:
             return path.startswith(boundary) if boundary is not None else "://" in path
 
-        found = [(lo, hi) for lo, hi, path in rows if wanted(path)]
-        if include_intents:
-            # The intent leg reads the same way: same prefix test, same floor.
-            # Every intent is remote by construction, so the `"://"` arm changes
-            # nothing here — it keeps the two legs from drifting apart.
-            found += [
-                (lo, hi)
-                for path, lo, hi, _ in self._all_intents()
-                if wanted(path) and hi > floor
-            ]
-
-        return sorted(found)
-
-    def _all_intents(self) -> list[tuple[str, int, int, int]]:
-        """Every intended copy, for the union above."""
-        with self._lock:
-            rows = self._con.execute(
-                "SELECT rel_path, start_offset, end_offset, bytes FROM extent_intent"
-            ).fetchall()
-
-        return [(str(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rows]
+        return sorted((lo, hi) for lo, hi, path in rows if wanted(path))
 
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.
