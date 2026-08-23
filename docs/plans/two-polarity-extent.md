@@ -110,12 +110,27 @@ holds one, so the wrap is safe.
 Two new methods carry the intent side:
 
 ```python
-def intend_file(self, rel_path: str, start: int, end: int) -> None   # INSERT OR REPLACE
-def forget_intent(self, rel_path: str) -> None                       # DELETE by path
+def intend_file(self, rel_path: str, start: int, end: int, held: int) -> None
+def forget_intent(self, rel_path: str) -> None
 ```
 
 and `record_file` calls `forget_intent` for the same path in its own transaction, so
 confirming is one atomic move rather than two states a crash can sit between.
+
+**`intend_file` runs immediately before each upload**, not batched before the register. Both
+close the window, but per-upload also gives the archive object the path-before-file property
+(I2) that the rest of this design leans on — the same reason a seal writes its path down
+first.
+
+**The confirm takes its facts from memory, not from the intent table.** `_recut`'s `written`
+list becomes `(rel_path, start, end, bytes)` tuples carried across `replace_range`, and
+`_push` already has everything it needs in `uploaded`. The intent table is the *durable*
+record, for rule 1 to heal a crash from — it is not the confirm's data source, and a confirm
+must never skip a file because the intent is missing. That case is reachable: a rival sync
+that lawfully acquired after a lapse can run rule 3 mid-rewrite, when the outputs are not yet
+in the manifest, and drop a live rewrite's intents. If the confirm depended on those rows it
+would silently degrade to rule 2's `compact_size` default — the exact failure the `bytes`
+column was added to prevent, reappearing in a narrower window.
 
 Three things about the confirm:
 
@@ -143,7 +158,13 @@ Three things about the confirm:
   `frozen`.
 - **eviction** → `include_intents=False` (understates; safe). Its SQL is then byte-identical
   to today's, which is the point.
-- `archived_prefix` threads the flag through; it is the only caller of `archived_ranges`.
+- `archived_prefix` threads the flag through, and is the only PRODUCTION caller once
+  `_push`'s `recorded` computation is replaced. `tests/test_archive.py` calls
+  `archived_ranges` positionally; the keyword-only flag breaks it at build time, which is the
+  point of making it keyword-only.
+- The intent leg of the union carries the same `"://"` filter as the extent leg. Every intent
+  is remote by construction, so it changes nothing — it keeps the two legs reading alike.
+- No index on `extent_intent`. It is bounded by in-flight work, not by history.
 - `archived_through()` → **no change.** It reads `meta`, not `extent`, and is written after
   the register and reconciled from the manifest, so it is already confirmed-polarity by
   construction. The first draft said "confirmed only", which is either a no-op or an
@@ -195,9 +216,12 @@ intents by a pass; leaving it out keeps rule 3 a plain statement about the manif
 
 The residual window this leaves, named rather than papered over: a rival deletes the live
 intents, then crashes *before writing its own*, while the stalled register lands and its
-holder dies before the confirm. Rule 2 heals it at the next sync from the manifest; between
-the two, compaction can regroup those files. Orders of magnitude narrower than S6 — it needs
-two crashes and a lapse — but not zero.
+holder dies before the confirm. If nothing else happens, rule 2 heals it at the next sync from the manifest. If a
+compaction-target change lands first, compaction regroups those files and commits a straddler
+— and that branch is **the original failure, permanently**, not something a later sync
+repairs. It needs a lapse, a rival crash inside a sub-second gap, the holder's death, and a
+config change, so it is orders of magnitude narrower than the window being closed. It is not
+zero, and it is the same shape, which is worth saying rather than implying.
 
 **What rule 3 discards.** Dropping an intent discards the only local record of an
 uploaded-but-unregistered object's name. For a PUSH intent that object is reclaimed by the retry overwriting the same deterministic
@@ -299,6 +323,10 @@ and are answered or obsolete. What survived the attacks, and what did not:
   `rel_path` and a recovered-but-not-dead rewrite's output carries the same URI. Healed by
   the post-commit confirm, which is one more thing resting on the confirm being able to write
   a row from nothing.
+- **`forget_deletion` must NOT also clear `extent_intent`.** Symmetry invites it and it would
+  be wrong: rule 3 already sweeps dead intents, and a symmetric delete destroys a live
+  recovered-but-not-dead rewrite's intent at precisely the moment the line above needs it to
+  survive. Said here because an implementer tidying up would add it without noticing.
 - **A crash between `replace_range` and the rewrite's confirm loop** leaves the new files live
   but only intended. Eviction's answer is carried by the superseded files' rows until drain
   removes them, so confirmation depends on a sync running rule 1 within the
