@@ -163,7 +163,7 @@ Three things about the confirm:
 
 **Ordering requirement.** Reconciliation runs under the push claim *before* `frozen` and
 `settled` are computed, so no unconfirmed row under the pinned archive survives into the
-decision. The three sites that must pass `confirmed_only=False` are `_maintenance.py` compact
+decision. The three sites that must pass `include_intents=True` are `_maintenance.py` compact
 (pass level), `_maintenance.py` the per-run recheck, and `log.py` `_push`'s `frozen` — the
 same rule in three places, which is why they take the same call.
 
@@ -306,6 +306,6 @@ and are answered or obsolete. What survived the attacks, and what did not:
   does. A stall, not a loss.
 - One extra SQLite statement per push and one per rewrite output. Negligible next to
   the register.
-- `confirmed_only` is a new parameter on a hot-ish path; wrong default = wrong polarity
+- `include_intents` is a new parameter on a hot-ish path; wrong default = wrong polarity
   silently. Mitigation: **keyword-only, no default**, so every call site states which
   question it is asking.
