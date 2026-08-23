@@ -1764,3 +1764,43 @@ def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
             )
             assert files[: len(below)] == below, "the split is not a prefix"
             assert files[len(below) :] == above, "the remainder is not a suffix"
+
+
+def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
+    """The union is one query, so it is one snapshot.
+
+    Read as two statements, `extent` and `extent_intent` are two separate WAL
+    reads — and a confirm committing between them moves a range out of the
+    first after the second was taken, so it appears in NEITHER. Compaction's
+    read is safe only when it overstates coverage; that understates it, which
+    is the straddle this record exists to prevent, reopened by the shape of the
+    query rather than by the design.
+
+    Asserted by counting the statements, because the race itself is
+    microseconds wide and a test that tried to land inside it would be a test
+    of the harness.
+    """
+    with open_log(tmp_path, LogConfig(target_seal_size=4096)) as log:
+        seal_files(log, 2)
+        log._buffer.intend_file("s3://bucket/prefix/data/a.parquet", 1, 5, 99)
+
+        statements: list[str] = []
+
+        def watching(sql: str) -> None:
+            if "extent" in sql and "SELECT" in sql:
+                statements.append(sql)
+
+        # SQLite's own hook: `Connection.execute` is read-only and cannot be
+        # wrapped.
+        log._buffer._con.set_trace_callback(watching)
+        try:
+            log._buffer.archived_ranges("s3://bucket/prefix", 0, include_intents=True)
+
+        finally:
+            log._buffer._con.set_trace_callback(None)
+
+        assert len(statements) == 1, (
+            f"coverage read in {len(statements)} statements; two snapshots can "
+            "disagree and a range can fall out of both"
+        )
+        assert "extent_intent" in statements[0], "the intents must be in that statement"

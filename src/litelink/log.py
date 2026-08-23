@@ -1696,25 +1696,28 @@ class Log:
         recorded = {
             path for path, _, _, _ in self._buffer.archive_records(pinned or "", base)
         }
+        intended = {
+            path: (lo, hi, size)
+            for path, lo, hi, size in self._buffer.intents(pinned or "")
+        }
 
-        for path, lo, hi, size in self._buffer.intents(pinned or ""):
-            landed = held_paths.get(path)
-            if landed is not None:
-                # 1. The register did land. Confirm it, with the bytes the
-                #    intent carried — the only measurement that survives a
-                #    crash between a rewrite's commit and its confirm.
-                self._buffer.record_file(path, lo, hi, size)
-            else:
-                # 3. It did not, and nothing in the manifest holds that path.
-                #    The intent is dead. Below the local window this also drops
-                #    intents whose register DID land — the manifest walk is
-                #    bounded, so they read as absent — and their sizes are then
-                #    never measured. No reader below the window asks, and the
-                #    forfeit is recorded in the plan rather than discovered.
-                self._buffer.forget_intent(path)
-
+        # ONE rule per path, decided by which of the two tables holds it. An
+        # earlier shape ran the rules as separate loops over a `recorded` set
+        # snapshotted before either — so rule 2 re-fired for every path rule 1
+        # had just confirmed, and `record_file`'s conflict clause overwrote the
+        # intent's measured bytes with the default. That made the `bytes`
+        # column dead in every reachable path: the rewrite tail this exists to
+        # size correctly was durably recorded as full, and nothing re-measures
+        # an archived file.
         for path, landed in held_paths.items():
-            if path not in recorded:
+            recovered = intended.get(path)
+            if recovered is not None:
+                # 1. The register landed. Confirm it with the bytes the intent
+                #    carried — the only measurement that survives a crash
+                #    between a rewrite's commit and its confirm.
+                lo, hi, size = recovered
+                self._buffer.record_file(path, lo, hi, size)
+            elif path not in recorded:
                 # 2. In the manifest with no row of either kind: the backfill
                 #    this rule grew out of.
                 self._buffer.record_file(
@@ -1723,6 +1726,15 @@ class Log:
                     landed.hi + 1,
                     memory.get(path, config.compact_size),
                 )
+
+        for path in intended:
+            if path not in held_paths:
+                # 3. Nothing in the manifest holds that path, so the register
+                #    never landed and the intent is dead. Below the local
+                #    window this also drops intents whose register DID land —
+                #    the manifest walk is bounded — and their sizes are then
+                #    never measured. No reader below the window asks.
+                self._buffer.forget_intent(path)
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
         # `stable_prefix` holds a file back when compaction might still merge
