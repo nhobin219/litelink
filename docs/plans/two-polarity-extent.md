@@ -277,6 +277,13 @@ This **replaces** `_push`'s existing `recorded` computation, which today derefs
   Dropping them is harmless because no local file sits there for any reader to care about,
   and it is a deliberate choice rather than an inherited accident.
 
+  What it forfeits, so that this is a choice and not an oversight: a rewrite lying entirely
+  below the local window, crashed between `replace_range` and its confirm, has its intent
+  dropped by rule 3 rather than healed by rule 1 — and rule 2 is bounded too, so no `extent`
+  row ever appears and `_badly_sized` treats that tail as full for ever. No loss and no
+  stall, and it matches the existing "unmeasured counts as full, leave it alone" direction,
+  but §1's claim that rule 1 heals the sizes is not total.
+
 Rows under a **different** archive's URI are left alone, confirmed or not. We cannot check
 them without opening that archive.
 
@@ -319,6 +326,11 @@ and are answered or obsolete. What survived the attacks, and what did not:
 - A mixed-version log: rows written by this build, read by the previous one's eviction query
   — it must see only landed copies, which the separate table gives for free.
 - A recut crash before `replace_range`: the dead intents must be deleted, not confirmed.
+- **Two live intents on one path.** The upsert is mandated above and nothing in this list
+  drives it: in every other scenario each `intend_file` runs against a path rule 3 has already
+  cleared, so a bare `INSERT` passes the whole suite. Interleave the zombie's resumed upload
+  loop with the rival's, both intending path P, and assert the lawful pass survives. Falsify
+  against a bare `INSERT`.
 - **A confirmed row carries the MEASURED bytes, not the default** — specifically a rewrite's
   undersized tail confirmed through rule 1's crash-heal. Without this the whole test list
   passes against a confirm that records `compact_size` everywhere, which is precisely the
@@ -326,7 +338,9 @@ and are answered or obsolete. What survived the attacks, and what did not:
 - A declined register. Two cases, and the first draft of this line asserted the wrong one:
   when a rival registered the SAME deterministic paths, the copies exist and rule 1 *should*
   confirm them — asserting otherwise would fail against correct code. The case worth testing
-  is the different-path decline, through `register`'s watermark branch.
+  is the different-path decline — which from a push goes through `_covers`, not the watermark
+  branch: `_push` calls `register` without `archived_through`, so that disjunct is always
+  false and an author sent to it would be hunting an unreachable line.
 - A fence failure mid-push: the register landed, so the rows must still be confirmed.
 - The migration default on a log written by an older build.
 - Reproduce round 13's S6 end to end (crash between register and rows, raise the
