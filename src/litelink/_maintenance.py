@@ -582,6 +582,13 @@ class Maintenance:
         # this commit is still reading them (I6).
         self._enqueue(f.path for f in run)
         table.replace_range(lo, hi, [target])
+        # Re-dated to the commit, for the reason `restamp_deletions` gives: a
+        # merge that failed between the queueing and this line and was retried
+        # later would otherwise supersede these files against a stamp already
+        # spent.
+        self._buffer.restamp_deletions(
+            (self._key(f.path) for f in run), int(datetime.now(UTC).timestamp())
+        )
         # After the commit: until it lands the sources are still the live
         # files, and moving their sizes onto an output that never became real
         # would leave every one of them unmeasured.
@@ -970,6 +977,14 @@ class Maintenance:
         # rewrite aborts while the originals are still live.
         checkpoint(heartbeat)
         archive.replace_range(lo, hi, [archive.uri(p) for p, _, _, _ in written])
+        # The grace period starts HERE, not when they were queued. A reader
+        # cannot hold a file the commit has not yet superseded, and a rewrite
+        # slower than `snapshot_retention` would otherwise have burnt the whole
+        # of it before this line — leaving the originals due the instant they
+        # stopped being referenced.
+        self._buffer.restamp_deletions(
+            (self._key(f.path) for f in stale), int(datetime.now(UTC).timestamp())
+        )
         # Now they are the archive's, so the intents become records.
         for path, start, end, held in written:
             self._buffer.record_file(archive.uri(path), start, end, held)

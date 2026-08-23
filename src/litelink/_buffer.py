@@ -1524,6 +1524,32 @@ class Buffer:
                 [(p, superseded_at) for p in rel_paths],
             )
 
+    def restamp_deletions(self, rel_paths: Iterable[str], superseded_at: int) -> None:
+        """Re-date queued files to when they ACTUALLY left the table.
+
+        The queue is written before the commit that supersedes them, because a
+        crash in between would otherwise lose the only record of those paths.
+        But the grace period is about readers still holding them (I6), and a
+        reader cannot be holding a file the commit has not yet superseded — so
+        the clock has to start at the commit, not at the queueing.
+
+        Stamped at the queueing, a rewrite slower than `snapshot_retention`
+        burns the whole grace before it commits: the moment the originals stop
+        being referenced they are already due, and drain takes them out from
+        under any scan resolved a moment earlier. Measured at a 5 s retention:
+        a reader 0.4 s old lost all fourteen files its snapshot named, and its
+        scan failed mid-read with a 404. An attempt that ABORTS and is retried
+        later is worse — it commits against a stamp burned days ago.
+
+        `INSERT OR IGNORE` deliberately keeps the first stamp on re-enqueue, so
+        this is an explicit update rather than a second insert.
+        """
+        with self._transaction():
+            self._con.executemany(
+                "UPDATE pending_delete SET superseded_at = ? WHERE rel_path = ?",
+                [(superseded_at, p) for p in rel_paths],
+            )
+
     def due_deletions(self, cutoff: int) -> list[str]:
         """Files superseded at or before `cutoff` — now minus the grace period."""
         with self._lock:
