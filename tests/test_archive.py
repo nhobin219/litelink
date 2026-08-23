@@ -876,7 +876,7 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
         log.seal_due()
         log.sync()
         local = log._table.data_files()
-        settled = log._maintenance.archived_prefix(local)
+        settled = log._maintenance.archived_prefix(local, log._archive.uri)
 
         assert settled > 0
 
@@ -885,15 +885,16 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
             log._buffer._con.execute("DELETE FROM extent WHERE rel_path LIKE 's3://%'")
             log._buffer._con.commit()
 
-        assert log._maintenance.archived_prefix(local) == 0, (
+        assert log._maintenance.archived_prefix(local, log._archive.uri) == 0, (
             "the setup must actually reproduce the crash"
         )
 
         log.sync()
 
-        assert log._maintenance.archived_prefix(log._table.data_files()) == settled, (
-            "the archive's manifest says what it holds; recover from it"
-        )
+        assert (
+            log._maintenance.archived_prefix(log._table.data_files(), log._archive.uri)
+            == settled
+        ), "the archive's manifest says what it holds; recover from it"
         assert log.scan(include_archive=True).read_all().num_rows == ROWS
 
 
@@ -919,7 +920,9 @@ def test_the_backfill_sees_copies_another_process_pushed(
             writer.extend(rows(ROWS))
             writer.seal_due()
             writer.sync()
-            grown = writer._maintenance.archived_prefix(writer._table.data_files())
+            grown = writer._maintenance.archived_prefix(
+                writer._table.data_files(), writer._archive.uri
+            )
 
             with other._buffer._lock:
                 other._buffer._con.execute(
@@ -930,7 +933,10 @@ def test_the_backfill_sees_copies_another_process_pushed(
             other.sync()
 
             assert (
-                other._maintenance.archived_prefix(other._table.data_files()) == grown
+                other._maintenance.archived_prefix(
+                    other._table.data_files(), other._archive.uri
+                )
+                == grown
             ), "recovered against a stale manifest"
 
 
@@ -1445,3 +1451,139 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
             f"the rewrite fragmented the archive: {before} files became {after}"
         )
         assert log.scan(include_archive=True).read_all().num_rows == 2400
+
+
+def test_compaction_while_detached_does_not_wedge_a_reattach(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Four legitimate operations, no warning at any step, and a dead log.
+
+    Detach, raise the compaction target so history is undersized again,
+    maintain, re-attach. While detached, compaction had no archive to ask
+    about, so it merged across ranges the archive still holds — and nothing
+    re-cuts a LOCAL straddler: `rewrite_archive` works the other side. On
+    re-attach, eviction pins below the straddler for ever and every push is
+    refused by `_refuse_straddle`, which the shipped maintainer does not catch.
+
+    Detaching does not make the archive's copies stop existing, so compaction
+    asks whether ANY archive holds a file, not whether the configured one
+    does. It costs nothing: only compacted files are ever pushed, so a file
+    with an archive copy is already at the target.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    archive = f"s3://{bucket}/prefix"
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=archive,
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        archived = log._maintenance.archived_prefix(
+            log._table.data_files(), log._archive.uri
+        )
+
+        assert archived > 0, "expected the archive to hold a prefix"
+
+        log.set_archive(None)
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.extend(rows(400))
+        log.seal_due()
+        log.maintain()
+
+        assert all(
+            f.lo > archived or f.hi <= archived for f in log._table.data_files()
+        ), "merged across a range the archive holds while detached"
+
+        log.set_archive(archive)
+        log.maintain()
+        log.sync()
+
+        assert log.scan(include_archive=True).read_all().num_rows == 2000
+
+
+def test_expiring_the_archive_will_not_repair_it_without_a_claim(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A repairing open is a claim holder's privilege, and expiry had neither.
+
+    Expiry is exempt from claims because it is a metadata commit CAS orders.
+    That is true of the snapshot expiry and not of the repairing open beside
+    it, which DROPS a catalog entry naming another prefix and creates a table
+    in its place. Two of those at once collide on the first attempt, because
+    pyiceberg writes the metadata object before inserting the catalog row — and
+    the loser raises a bare `Exception` the shipped maintainer does not catch.
+
+    Rounds nine and ten fixed which archive a repairing open targets; this is
+    the other half, who is entitled to open one.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        # A rewrite is the one thing that queues a REMOTE deletion, which is
+        # the signal `_expire_archive` acts on.
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.rewrite_archive()
+
+        assert any("://" in p for p in log._buffer.queued_deletions()), (
+            "expected a remote entry to make expiry reach the archive"
+        )
+
+        opened: list[bool] = []
+        original = log._archive.table
+
+        def watching(*, repair: bool = False) -> object:
+            opened.append(repair)
+
+            return original(repair=repair)
+
+        held = log._lease("maintain")
+
+        assert held.acquire()
+
+        log._archive.table = watching  # ty: ignore[invalid-assignment]
+        try:
+            log.expire()
+
+        finally:
+            log._archive.table = original  # ty: ignore[invalid-assignment]
+            held.release()
+
+        assert not any(opened), (
+            "opened the archive with repair while another owner held the log"
+        )

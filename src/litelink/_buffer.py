@@ -1141,7 +1141,7 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
-    def archived_ranges(self, prefix: str, floor: int) -> list[tuple[int, int]]:
+    def archived_ranges(self, prefix: str | None, floor: int) -> list[tuple[int, int]]:
         """Offset ranges with a recorded copy under `prefix`, reaching `floor`.
 
         I4 asked of segments rather than of a watermark (§4a). `sync` records
@@ -1156,7 +1156,13 @@ class Buffer:
         Python because SQLite's `LIKE` would not use the index that `floor`
         selects on.
         """
-        boundary = prefix.rstrip("/") + "/"
+        # `None` means ANY archive, not the configured one. Two questions ask
+        # this and they are not the same question. I4 asks whether THIS archive
+        # holds a file, because it authorises a deletion. Compaction asks
+        # whether ANY archive does, because it decides whether merging could
+        # create a range no archive's cuts line up with — and detaching does
+        # not make those copies stop existing.
+        boundary = None if prefix is None else prefix.rstrip("/") + "/"
         with self._lock:
             rows = self._con.execute(
                 "SELECT start_offset, end_offset, rel_path FROM extent "
@@ -1164,7 +1170,16 @@ class Buffer:
                 (floor,),
             ).fetchall()
 
-        return sorted((lo, hi) for lo, hi, path in rows if path.startswith(boundary))
+        return (
+            sorted(
+                (lo, hi)
+                for lo, hi, path in rows
+                if path.startswith(boundary)
+                if boundary is not None
+            )
+            if boundary is not None
+            else sorted((lo, hi) for lo, hi, path in rows if "://" in path)
+        )
 
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.
