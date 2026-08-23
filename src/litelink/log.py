@@ -748,12 +748,15 @@ class Log:
         would have to restate, and each of those a way to get it silently
         wrong.
         """
-        if self._archive.uri is None:
+        # One read, checked and used. Read twice, a detach landing between them
+        # hands `litestream_config` a None it has no branch for.
+        archive = self._archive.uri
+        if archive is None:
             msg = "replication needs an archive; this log is local-only"
             raise ValueError(msg)
 
         return litestream_config(
-            self.databases, self._layout.root, self._archive.uri, self._archive.s3
+            self.databases, self._layout.root, archive, self._archive.s3
         )
 
     def write_replication_config(self) -> Path:
@@ -1657,6 +1660,10 @@ class Log:
         # about files the local table still holds, so an archive file entirely
         # below them changes no answer. Unbounded, this read and this loop grew
         # with the archive and ran on every single sync.
+        # Bound before the first use. The backfill below sizes an unmeasured
+        # archive file by the compact target, and `stable_prefix` groups by the
+        # same policy — two reads, and nothing that makes them agree.
+        config = self.config
         local = self._table.data_files()
         base = min((f.lo for f in local), default=0)
         recorded = set(self._buffer.archived_ranges(pinned or "", base))
@@ -1666,13 +1673,10 @@ class Log:
                     held.path,
                     held.lo,
                     held.hi + 1,
-                    memory.get(held.path, self.config.compact_size),
+                    memory.get(held.path, config.compact_size),
                 )
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
-        # One read for all three, so the grouping this settles by is a single
-        # policy rather than a blend of two.
-        config = self.config
         settled = stable_prefix(
             pending,
             config.compact_size,
