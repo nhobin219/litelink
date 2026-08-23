@@ -305,7 +305,9 @@ class Maintenance:
 
         return 0 if recorded is None else int(recorded)
 
-    def archived_prefix(self, files: Sequence[DataFile], prefix: str | None) -> int:
+    def archived_prefix(
+        self, files: Sequence[DataFile], prefix: str | None, *, include_intents: bool
+    ) -> int:
         """The highest `hi` whose whole prefix the archive holds (§4a).
 
         I4 asked of segments. A file is the archive's business if the archive
@@ -334,7 +336,9 @@ class Maintenance:
         if not ordered:
             return 0
 
-        covered = self._buffer.archived_ranges(prefix, ordered[0].lo)
+        covered = self._buffer.archived_ranges(
+            prefix, ordered[0].lo, include_intents=include_intents
+        )
         reached = 0
         for data_file in ordered:
             # `record_file` stores the end offset exclusive, as every extent
@@ -393,7 +397,7 @@ class Maintenance:
         # the size it was archived at; `rewrite_archive` is the tool for that.
         # What it buys is that no merge can ever straddle a range an archive
         # holds. `_push` applies the same exclusion, or the two deadlock.
-        archived = self.archived_prefix(local, None)
+        archived = self.archived_prefix(local, None, include_intents=True)
         pending = [f for f in local if f.hi > archived]
 
         # One read, so the two limits describe the same policy.
@@ -502,7 +506,7 @@ class Maintenance:
         # From then on every push is refused by `_refuse_straddle`, the
         # watermark never advances again, and eviction pins on it.
         if table is self._table:
-            archived = self.archived_prefix(current, None)
+            archived = self.archived_prefix(current, None, include_intents=True)
             if any(f.lo <= archived for f in run):
                 claim.release()
 
@@ -724,7 +728,13 @@ class Maintenance:
         # then a deletion policy over the only copy, which is the contract the
         # operator asked for.
         if self._archive.configured():
-            boundary = min(boundary, self.archived_prefix(files, self._archive.uri))
+            boundary = min(
+                boundary,
+                # I4 asks whether the archive HAS it, so intents are excluded:
+                # deleting the only local copy on the strength of an intended
+                # one is the loss this whole record exists to prevent.
+                self.archived_prefix(files, self._archive.uri, include_intents=False),
+            )
 
         # Snapped DOWN to a file boundary, against the list as it is now. The
         # age limit is already one — some file's `hi` — and so is the archive
@@ -905,7 +915,7 @@ class Maintenance:
                 target_seal_rows=config.compact_rows,
             ).to_json(),
         )
-        written: list[str] = []
+        written: list[tuple[str, int, int, int]] = []
         expected = 0
         try:
             # The rows keep the offsets they already have (§4), so the counter
@@ -944,11 +954,15 @@ class Maintenance:
             msg = f"archive rewrite read {expected} rows for offsets {lo}-{hi}"
             raise RuntimeError(msg)
 
-        archive.replace_range(lo, hi, [archive.uri(path) for path in written])
+        archive.replace_range(lo, hi, [archive.uri(p) for p, _, _, _ in written])
+        # Now they are the archive's, so the intents become records.
+        for path, start, end, held in written:
+            self._buffer.record_file(archive.uri(path), start, end, held)
+
         # Each of this rewrite's own claims, now that the commit names every
         # object they described. Clearing the table wholesale would also retire
         # claims left by an operation that crashed and has not been recovered.
-        for path in written:
+        for path, _, _, _ in written:
             self._buffer.clear_compaction(archive.uri(path))
 
     def _discard_scratch(self) -> None:
@@ -963,11 +977,11 @@ class Maintenance:
         scratch: Buffer,
         archive: LogTable,
         heartbeat: Callable[[], bool] | None = None,
-    ) -> list[str]:
+    ) -> list[tuple[str, int, int, int]]:
         """Write out every extent the scratch buffer has cut, and return their
         names. The seal's own loop: take the queued range, claim the path
         before the file exists, write, and retire the extent."""
-        written: list[str] = []
+        written: list[tuple[str, int, int, int]] = []
         while True:
             queued = scratch.pending_group()
             if queued is None:
@@ -992,18 +1006,30 @@ class Maintenance:
             dest.parent.mkdir(parents=True, exist_ok=True)
             pq.write_table(rows, dest)
             fsync(dest)
+            # The bytes the scratch buffer counted for exactly these rows,
+            # which is the same number the appender would have recorded had
+            # they been cut this way the first time — and the scratch is torn
+            # down before the commit, so this is the last moment they exist.
+            held = scratch.group_bytes(end)
+            # INTENDED before the object is written, and only recorded once
+            # `replace_range` has committed. Until then these files are not the
+            # archive's, so a row saying they are would let eviction drop the
+            # local copies of rows the archive does not yet hold. The intent
+            # says the opposite thing to the opposite reader: compaction must
+            # not merge across them, because it is about to.
+            self._buffer.intend_file(archive.uri(rel_path), start, end, held)
             archive.put(dest, rel_path)
             dest.unlink(missing_ok=True)
             checkpoint(heartbeat)
 
-            # The bytes the scratch buffer counted for exactly these rows,
-            # which is the same number the appender would have recorded had
-            # they been cut this way the first time.
-            self._buffer.record_file(
-                archive.uri(rel_path), start, end, scratch.group_bytes(end)
-            )
             scratch.finish_seal(end, rel_path)
-            written.append(rel_path)
+            # Carried in memory, not read back from the intent: a rival sync
+            # that took over a lapsed claim may drop these rows while this
+            # rewrite is still running, and a confirm that depended on them
+            # would silently record the default size instead — which for the
+            # deliberately undersized tail means `_badly_sized` treats it as
+            # full for ever.
+            written.append((rel_path, start, end, held))
 
     def _written(self, data_file: DataFile) -> datetime:
         """When a file was written, for `local_retention` to measure against.
