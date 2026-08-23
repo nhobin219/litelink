@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import threading
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -1571,3 +1572,71 @@ def test_a_refreshed_policy_reaches_compaction_sync_and_the_buffer(
         assert log._buffer.config().target_seal_size == raised.target_seal_size, (
             "the buffer sizes every file the log writes; it reads the same row"
         )
+
+
+def test_maintenance_survives_the_policy_changing_underneath_it(
+    tmp_path: Path,
+) -> None:
+    """The hazard removing the cached copy introduces, and why it is tolerable.
+
+    A value that was stable for a whole pass is now read live, so it can change
+    between two reads inside one decision — `stable_prefix` alone reads three
+    fields. What keeps that safe is that the policy is a POLICY: it decides how
+    big to cut and when to merge, never which rows go where. A torn read makes
+    a badly-sized file, not a wrong one.
+
+    The one place it could have been an invariant is `runs`, which compaction
+    and `sync` share so they cannot disagree about what is in play — and per
+    segment I4 closes that: a file the archive holds is never merged again, so
+    a disagreement costs an undersized archive file, which `_push` already
+    documents as tolerated.
+    """
+    config = LogConfig(target_seal_size=4096, compact_min_files=2, local_rows=200)
+    with open_log(tmp_path, config) as log:
+        stop = threading.Event()
+        churned = 0
+        failures: list[str] = []
+
+        def flip() -> None:
+            nonlocal churned
+            sizes = (8192, 16384, 32768)
+            while not stop.is_set():
+                churned += 1
+                try:
+                    log.set_config(
+                        replace(
+                            config,
+                            target_compact_size=sizes[churned % 3],
+                            compact_min_files=2 + (churned % 3),
+                        )
+                    )
+                except RuntimeError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=flip, daemon=True)
+        thread.start()
+        try:
+            written = 0
+            for _ in range(12):
+                log.extend(rows(120, start=written))
+                written += 120
+                log.seal()
+                try:
+                    log.maintain()
+                except RuntimeError:
+                    pass
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert not failures, failures[:3]
+        assert churned > 1, "the policy never actually changed"
+
+        offsets = [r[0] for r in read_all(log)]
+
+        assert len(set(offsets)) == len(offsets), (
+            "duplicate rows under a churning policy"
+        )
+        assert log.scan().read_all().num_rows == len(offsets)
