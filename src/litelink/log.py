@@ -784,18 +784,33 @@ class Log:
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5).
 
-        Takes the maintenance lease, so it cannot interleave with a `sync` —
-        and raises if another owner holds it, rather than proceeding.
+        Takes the whole-log claim, so it cannot interleave with a sync, a
+        merge, an eviction or the other setter — `validate` refuses a PAIR, so
+        the policy and the location have to be decided together. The shipped
+        writer calls this on every restart while a maintainer runs in another
+        process, so it waits for maintenance rather than failing on the first
+        try; see `_claim_settings`.
 
-        A sync that has already read `s3://old`, taken the lease and pushed to
-        it finishes by writing that archive's extent as the watermark. Land a
-        re-point in between and the log points at the new, empty archive while
-        carrying a watermark earned by the old one — eviction believes it and
-        deletes the only local copy of rows the new archive has never been
-        sent. Nothing lowers a watermark, so no later sync undoes it.
+        **Re-pointing does not move anything, and is not reversible.** Rows
+        already evicted into the old archive stay there, and the read path
+        resolves only the archive the log currently names — so after a re-point
+        they are not readable through this log, and `scan(include_archive=True)`
+        returns fewer rows than were written, silently.
 
-        The shipped writer calls this on every restart, and the maintainer runs
-        in another process, so the two are exactly the pair that collide.
+        Pointing BACK does not undo it. Re-attaching to an archive that already
+        holds data is not expressible today (§13): the catalog entry is
+        repaired by dropping it and creating a fresh table at the prefix, which
+        gives an EMPTY table over the objects still sitting there. So the old
+        data becomes unreachable through this log by any sequence of calls, and
+        an operator moving between buckets has to copy the objects across
+        before re-pointing. §13 lists the supported operations as attach,
+        detach, and re-point to a FRESH prefix for exactly this reason.
+
+        What re-pointing no longer does is disturb what the log already knows.
+        There is no watermark to carry across: each pushed file records the
+        bucket its copy went to (§4a), so ranges the old archive holds go on
+        naming it, eviction keeps asking about the archive that is configured
+        now, and compaction keeps refusing to merge across any of them.
         """
         with self._lock:
             self._writable()
