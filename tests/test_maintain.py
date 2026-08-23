@@ -1608,6 +1608,15 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
                             config,
                             target_compact_size=sizes[churned % 3],
                             compact_min_files=2 + (churned % 3),
+                            # The OPTIONAL fields too, which the first version
+                            # of this test missed: it churned only ints, and a
+                            # torn read of two ints is merely an odd size. A
+                            # field seen as an int by the guard and as None by
+                            # the arithmetic after it is `int - None`.
+                            local_rows=None if churned % 2 else 200,
+                            local_retention=None
+                            if churned % 3
+                            else timedelta(seconds=30),
                         )
                     )
                 except RuntimeError:
@@ -1640,3 +1649,44 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
             "duplicate rows under a churning policy"
         )
         assert log.scan().read_all().num_rows == len(offsets)
+
+
+def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
+    """The invariant itself, rather than a crash staged to prove it.
+
+    Each `self.config` is now an independent read of the durable row, so two
+    of them inside one decision can disagree — and here they did arithmetic on
+    each other: `local_rows` seen as an int by the guard and as None by the
+    subtraction after it is `int - None`, a TypeError out of `maintain()`. The
+    shipped maintainer catches RuntimeError and CommitFailedException, so that
+    stopped maintenance entirely.
+
+    Counting the reads tests that directly. Staging the crash instead means
+    engineering an exact ordering, which is a test of the harness rather than
+    of the code — the first attempt at this passed against the broken version
+    because the values happened to line up harmlessly.
+    """
+    config = LogConfig(target_seal_size=1 << 30, local_rows=200, local_retention=None)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        original = log._buffer.config
+        reads = 0
+
+        def counting() -> LogConfig:
+            nonlocal reads
+            reads += 1
+
+            return original()
+
+        log._buffer.config = counting  # ty: ignore[invalid-assignment]
+        try:
+            boundary = log._maintenance._retention_boundary()
+
+        finally:
+            log._buffer.config = original  # ty: ignore[invalid-assignment]
+
+        assert isinstance(boundary, int)
+        assert reads == 1, (
+            f"read the policy {reads} times in one decision; two reads can "
+            "disagree, and these two do arithmetic on each other"
+        )

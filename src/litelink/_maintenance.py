@@ -381,11 +381,13 @@ class Maintenance:
         archived = self.archived_prefix(local) if self._archive.configured() else 0
         pending = [f for f in local if f.hi > archived]
 
+        # One read, so the two limits describe the same policy.
+        config = self.config
         for run in runs(
             pending,
-            self.config.compact_size,
+            config.compact_size,
             self.memory(),
-            self.config.compact_rows,
+            config.compact_rows,
         ):
             self._merge(run, heartbeat)
 
@@ -605,8 +607,19 @@ class Maintenance:
         whether there is work and what range to claim, and again under that
         claim, where the answer is the one acted on.
         """
+        # ONE read, held for the whole decision. Each `self.config` is an
+        # independent read of the durable row now, so two of them inside one
+        # decision can disagree — and here they did arithmetic on each other:
+        # `local_rows` seen as an int by the test and as None by the
+        # subtraction is `int - None`, a TypeError out of `maintain()`. The
+        # shipped maintainer catches RuntimeError and CommitFailedException, so
+        # that killed the process and stopped maintenance entirely.
+        #
+        # The fix is not a lock: it is that a decision reads the policy once.
+        # Fresh per decision, coherent within it.
+        config = self.config
         limits: list[int] = []
-        retention = self.config.local_retention
+        retention = config.local_retention
         if retention is not None:
             cutoff = datetime.now(UTC) - retention
             stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
@@ -614,12 +627,12 @@ class Maintenance:
             # means this policy would keep everything.
             limits.append(max((f.hi for f in stale), default=0))
 
-        if self.config.local_rows is not None:
+        if config.local_rows is not None:
             # Offsets are contiguous, so the newest `local_rows` of them start
             # here. AUTOINCREMENT can leave a gap where a transaction rolled
             # back, which makes this retain slightly more than asked rather
             # than less — the safe direction for a floor.
-            limits.append(self._buffer.next_offset() - 1 - self.config.local_rows)
+            limits.append(self._buffer.next_offset() - 1 - config.local_rows)
 
         return min(limits) if limits else 0
 
@@ -635,7 +648,8 @@ class Maintenance:
         # The POLICY re-read first, because it decides everything below. Read
         # again under the claim as well: this one only decides whether there is
         # work, and the one that decides the deletion has to be the guarded one.
-        if self.config.local_retention is None and self.config.local_rows is None:
+        config = self.config
+        if config.local_retention is None and config.local_rows is None:
             return
 
         # Same reason as `compact`: this decides what to drop from the ages a
@@ -860,9 +874,21 @@ class Maintenance:
         # with no config row, and without this it would silently size its cuts
         # by the library defaults rather than by the target this rewrite is
         # re-cutting to — which is the entire point of the operation.
+        # BOTH targets mapped, not only the size. The scratch cuts at whichever
+        # ceiling comes first, so carrying the live seal ROW cap made a rewrite
+        # cut its outputs at the seal's row limit while the archive holds files
+        # sized to the compact one — eight times more files than it started
+        # with, each still undersized by bytes, so the next `rewrite_archive`
+        # flags the same tail again and the operation never converges. It is
+        # meant to merge undersized archived files; that inverted it.
+        config = self.config
         scratch.set_meta(
             CONFIG_KEY,
-            replace(self.config, target_seal_size=self.config.compact_size).to_json(),
+            replace(
+                config,
+                target_seal_size=config.compact_size,
+                target_seal_rows=config.compact_rows,
+            ).to_json(),
         )
         written: list[str] = []
         expected = 0

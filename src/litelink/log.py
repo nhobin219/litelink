@@ -1670,12 +1670,15 @@ class Log:
                 )
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
+        # One read for all three, so the grouping this settles by is a single
+        # policy rather than a blend of two.
+        config = self.config
         settled = stable_prefix(
             pending,
-            self.config.compact_size,
-            self.config.compact_min_files,
+            config.compact_size,
+            config.compact_min_files,
             memory,
-            self.config.compact_rows,
+            config.compact_rows,
         )
 
         uploaded: list[tuple[DataFile, str]] = []

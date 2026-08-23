@@ -482,11 +482,12 @@ class Buffer:
             # Bound once, and the accounting inlined below, because this loop
             # runs per row: routing it through a method cost 19 points of
             # overhead against raw SQLite at 1,000-row batches.
-            target = self.config().target_seal_size
+            config = self.config()
+            target = config.target_seal_size
             # `_insert` runs per row, so both limits are bound once out here.
             # A row cap of None becomes one nothing reaches, which keeps the
             # inner test a comparison rather than a branch on None.
-            target_rows = self.config().target_seal_rows or _NO_ROW_LIMIT
+            target_rows = config.target_seal_rows or _NO_ROW_LIMIT
             row_bytes = self._row_bytes
             columns = self._columns
             for row in rows:
