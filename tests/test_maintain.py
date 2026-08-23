@@ -1690,3 +1690,58 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
             f"read the policy {reads} times in one decision; two reads can "
             "disagree, and these two do arithmetic on each other"
         )
+
+
+def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
+    """What `_push`'s arithmetic rests on.
+
+    It splits `pending` at `archived_prefix` and counts the part below as
+    settled, which is only a prefix count if the split lands on a file edge —
+    otherwise `pending[:settled]` names a different set than the one the split
+    described, and the watermark is written from the wrong file.
+
+    Files are ordered by offset and the walk stops at the first file the
+    archive does not fully hold, so the answer is either 0 or some file's `hi`,
+    and everything at or below it is a prefix. Asserted over random coverage
+    rather than argued.
+    """
+    random.seed(20260823)
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 5, per_file=4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        assert len(files) == 5
+
+        for trial in range(40):
+            with log._buffer._lock:
+                log._buffer._con.execute(
+                    "DELETE FROM extent WHERE rel_path LIKE 's3://%'"
+                )
+                log._buffer._con.commit()
+
+            # A random subset of the files gets an archive copy.
+            for index, data_file in enumerate(files):
+                if random.random() < 0.6:
+                    log._buffer.record_file(
+                        f"s3://bucket/prefix/data/{trial}-{index}.parquet",
+                        data_file.lo,
+                        data_file.hi + 1,
+                        1,
+                    )
+
+            frozen = log._maintenance.archived_prefix(files, "s3://bucket/prefix")
+            below = [f for f in files if f.lo <= frozen]
+            above = [f for f in files if f.lo > frozen]
+
+            assert frozen == 0 or frozen in {f.hi for f in files}, (
+                f"{frozen} is not a file boundary"
+            )
+            assert files[: len(below)] == below, "the split is not a prefix"
+            assert files[len(below) :] == above, "the remainder is not a suffix"
