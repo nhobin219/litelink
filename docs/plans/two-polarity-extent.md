@@ -50,16 +50,24 @@ A new table, not a new column:
 
 ```sql
 CREATE TABLE IF NOT EXISTS extent_intent (
-  rel_path   TEXT PRIMARY KEY,
+  rel_path     TEXT PRIMARY KEY,
   start_offset INTEGER NOT NULL,
   end_offset   INTEGER NOT NULL,
-  named_at     INTEGER NOT NULL
+  bytes        INTEGER NOT NULL
 )
 ```
 
 `extent` keeps its exact shape and meaning: **a row there is a copy that exists.** A row in
 `extent_intent` is a copy that was *intended*. Confirming is moving the fact from one table
 to the other.
+
+**`bytes` is on the intent because the fact includes it**, and the third review caught that
+the plan had nowhere else to get it. A rewrite's confirm runs after `replace_range`, by which
+point the scratch buffer — the only source of `group_bytes` — has been closed and deleted in
+a `finally` that runs *before* the commit. Without the column the confirm has no size, and
+the crash-heal path records every re-cut output at `compact_size`, including the deliberately
+undersized tail, which `_badly_sized` then treats as full for ever. `named_at` is not on the
+intent: nothing reads it once rule 3 has no TTL clause.
 
 Three defects the second review found in the column design dissolve here, which is why the
 design changed rather than the column being patched:
@@ -69,6 +77,12 @@ design changed rather than the column being patched:
   than by a flag it does not know to filter on. A column would have read to it as landed
   coverage, and no gate in the new build can stop an old one; the `lease`-table refusal works
   only because it makes the NEW build refuse.
+
+  That is mixed-version **safety, not protection**: an old compactor beside a new syncer
+  reproduces the original window exactly, because "today's behaviour" includes today's bug.
+  The window closes only once every process that runs `compact` or `sync` is upgraded. An old
+  build's `record_file` also confirms without forgetting, leaving a duplicate intent whose
+  range equals the row it duplicates — no extra over-block, swept by rule 1 later.
 - **Migration.** `CREATE TABLE IF NOT EXISTS` is the idiom this buffer already uses ten times
   over, and is atomic. The column design needed a `pragma table_info` check plus an `ALTER`,
   which is check-then-act and races two processes opening together — the ordinary shape here,
@@ -87,7 +101,13 @@ design changed rather than the column being patched:
 | `log.py:2030` hydrate | `record_file(...)` | unchanged — a local path, not an archive claim |
 | `_maintenance.py:1002` rewrite scratch | `record_file(...)` before `replace_range` | becomes `intend_file(...)`; `record_file` after `replace_range` commits |
 
-`record_file` does not change at all. Two new methods carry the intent side:
+`record_file`'s upsert — its columns, its conflict action — does not change; that was the
+point, since the column design failed precisely there. The METHOD does change: it grows a
+`forget_intent` beside the upsert and therefore a transaction wrapper, where today it is a
+single locked statement. `_transaction` is not re-entrant and no caller of `record_file`
+holds one, so the wrap is safe.
+
+Two new methods carry the intent side:
 
 ```python
 def intend_file(self, rel_path: str, start: int, end: int) -> None   # INSERT OR REPLACE
@@ -180,19 +200,27 @@ the two, compaction can regroup those files. Orders of magnitude narrower than S
 two crashes and a lapse — but not zero.
 
 **What rule 3 discards.** Dropping an intent discards the only local record of an
-uploaded-but-unregistered object's name. That object is reclaimed today by the retry
-overwriting the same deterministic key, and this matches the existing behaviour of a declined
+uploaded-but-unregistered object's name. For a PUSH intent that object is reclaimed by the retry overwriting the same deterministic
+key. For a REWRITE intent — which is most of what rule 3 sees — that reasoning does not
+apply, because rewrite outputs carry per-attempt UUID names; their reclamation rests on the
+`compacting` claims, recovery, and drain instead. Both work; the first draft gave the
+first reason for both cases. Either way this matches the existing behaviour of a declined
 register, which returns without queueing its uploads. Queueing them instead has its own cost:
 a raced path whose register does land stays vetoed and queued for ever, and any remote queue
 entry makes `_expire_archive` claim and open the archive on every expire pass. **Decision:
 bare delete**, consistent with the declined-register path — recorded here so it is a choice
 rather than an oversight.
 
-**The API this needs, which the plan previously left unspecified.** `archived_ranges` returns
-bare `(lo, hi)` tuples and cannot serve path matching, and nothing today deletes extent rows
-except `forget_deletion` and `record_merge`. Reconciliation needs one read — intent rows
-under a prefix, bounded by the local window, returning `(rel_path, lo, hi)` — and
-`forget_intent`. The manifest set is bounded the same way the backfill already bounds it, by
+**The API this needs, which the plan previously left unspecified.** Both sides of the match
+are path-keyed, and neither exists today: `archived_ranges` returns bare `(lo, hi)` tuples.
+Reconciliation needs two reads — intent rows under a prefix returning
+`(rel_path, lo, hi, bytes)`, and the archive-side rows of `extent` keyed by path — plus
+`forget_intent`.
+
+This **replaces** `_push`'s existing `recorded` computation, which today derefs
+`archived_ranges` and matches by range tuple. The writes table above calls the backfill
+"unchanged", which is true of its *effect* and not of its code; and the claim elsewhere that
+`archived_prefix` is the only caller of `archived_ranges` is only true after this rewrite. The manifest set is bounded the same way the backfill already bounds it, by
 `base = min(local lo)`: an intent below `base` reads as absent and is dropped, which is
 harmless because no local file sits there for any reader to care about, and is a deliberate
 choice rather than an inherited accident.
@@ -206,29 +234,20 @@ eviction does not stall behind them: `_push` counts foreign coverage in `frozen`
 files are settled by definition and pushed again to the current archive, after which
 confirmed rows under the new URI unpin eviction. Re-pointing back resolves them properly.
 
-## What I want attacked
+## What three rounds attacked
 
-1. **Is `confirmed=0` + delete-on-absence actually safe against a re-point mid-push?**
-   Rows are written for the pinned archive; the fence already aborts the push if the
-   log is re-pointed. But the rows are already durable by then. They would be
-   unconfirmed and belong to an archive we may have left — permanently unreconcilable.
-   Cost is over-blocking compaction on those ranges. Acceptable, or a leak?
-2. **Does moving the write before the register change `_refuse_straddle`'s inputs?**
-   `lo=uploaded[0][0].lo` is computed from `uploaded`, not from rows. I believe not.
-3. **`rewrite_archive`'s scratch rows.** They are written per sealed output before one
-   `replace_range` commits them all. If that commit fails, all of them are dead intents
-   under the *current* archive, so rule 3 deletes them at the next sync. But `_recut`
-   also enqueues the superseded objects — does an unconfirmed row interact with
-   `drain`'s veto or `_expire_archive`?
-4. **Does eviction reading confirmed-only reintroduce the round-12 stall?** `_push`
-   settles what compaction cannot merge, computed from `archived_prefix(pending, None)`
-   — which under this change sees intents too. Is `sync`'s exclusion still exactly
-   compaction's? They must stay the same rule.
-5. **Two syncs racing.** They serialise on the whole-log claim, so I believe intents
-   cannot interleave — but a lapsed claim plus a takeover?
-6. **Is `DEFAULT 1` right for a log written by an older build mid-crash?** Such a log
-   may have exactly the unrecorded range this closes. Migration marks nothing, which
-   is today's behaviour — no worse, but worth stating.
+The six doubts this section used to list were written against the `confirmed`-column design
+and are answered or obsolete. What survived the attacks, and what did not:
+
+- **Wrong when written**: reconciliation matching by range rather than path; the confirm as a
+  bare `UPDATE`; rule 3's TTL justification; "intents only exist inside the crash window";
+  "`archived_through` reads extent rows"; a reader inventory claimed complete twice and
+  incomplete both times.
+- **Redesigned rather than patched**: intents in a column, which no gate could make safe for
+  an old build's evictor.
+- **Held under attack**: the polarity split itself; the ordering requirement; `_refuse_straddle`'s
+  inputs being untouched; that this closes the original window; that a foreign intent cannot
+  stall eviction, because `frozen` settles those files and they are re-pushed.
 
 ## Test plan
 
@@ -240,7 +259,10 @@ confirmed rows under the new URI unpin eviction. Re-pointing back resolves them 
 - A mixed-version log: rows written by this build, read by the previous one's eviction query
   — it must see only landed copies, which the separate table gives for free.
 - A recut crash before `replace_range`: the dead intents must be deleted, not confirmed.
-- A declined register (`_covers`): its intents must not survive as confirmed rows.
+- A declined register. Two cases, and the first draft of this line asserted the wrong one:
+  when a rival registered the SAME deterministic paths, the copies exist and rule 1 *should*
+  confirm them — asserting otherwise would fail against correct code. The case worth testing
+  is the different-path decline, through `register`'s watermark branch.
 - A fence failure mid-push: the register landed, so the rows must still be confirmed.
 - The migration default on a log written by an older build.
 - Reproduce round 13's S6 end to end (crash between register and rows, raise the
@@ -269,6 +291,10 @@ confirmed rows under the new URI unpin eviction. Re-pointing back resolves them 
   prefix only, intent table only (never `extent`), path-absent from the manifest, and ordered
   under the claim before anything reads the result. Not, as the first draft claimed, a TTL
   test — see rule 3.
+- **The healing rests on deterministic keys, and the intents protect them.** A retry
+  re-uploads to the same path only because compaction has not merged the local files
+  underneath it — which is exactly what the intents prevent while they exist. The mechanism
+  guards its own precondition.
 - **`forget_deletion` can delete a live rewrite's confirmed row**, since it deletes by
   `rel_path` and a recovered-but-not-dead rewrite's output carries the same URI. Healed by
   the post-commit confirm, which is one more thing resting on the confirm being able to write
