@@ -316,6 +316,13 @@ retention came to silently stop reclaiming anything. The grace period before a f
 actually unlinked is a different clock again, stamped on `pending_delete` when the file
 left the table, because that one is about readers still holding it (I6).
 
+"When it left the table" is the commit, not the queueing — and the two are not the same
+moment. Files are queued BEFORE the commit that supersedes them, since a crash in between
+would lose the only record of their paths, so the stamp is corrected at the commit. Left at
+the queueing, a rewrite slower than `snapshot_retention` spends the whole grace before it
+commits and the originals fall due the instant they stop being referenced: measured at a 5 s
+retention, a reader 0.4 s old lost every file its snapshot named and failed mid-scan.
+
 **Sync holds back exactly what compaction might still rewrite**, which it decides by asking
 compaction's own rule rather than a size of its own — a file pushed and then merged locally
 would leave the archive holding rows that have been rewritten underneath it, so the two

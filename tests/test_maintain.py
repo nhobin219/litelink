@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import threading
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1804,3 +1804,41 @@ def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
             "disagree and a range can fall out of both"
         )
         assert "extent_intent" in statements[0], "the intents must be in that statement"
+
+
+def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:
+    """A reader cannot hold a file the commit has not yet superseded.
+
+    Superseded files are queued BEFORE the commit, because a crash in between
+    would lose the only record of their paths. But the grace period is about
+    readers still holding them (I6), so it has to be measured from when they
+    actually left the table — stamped at the queueing, a merge slower than
+    `snapshot_retention` burns the whole grace before it commits, and the
+    originals are due the instant they stop being referenced.
+
+    Worse for an attempt that aborts and is retried later: it commits against
+    a stamp spent whenever the first attempt began.
+    """
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        sources = [f.path for f in log._table.data_files()]
+
+        assert len(sources) == 3
+
+        # Queued as a slow merge would leave them: long before the commit.
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+        log._buffer.enqueue_deletions(
+            [log._maintenance._key(p) for p in sources], stale
+        )
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        log.compact()
+
+        # After the merge that superseded them, the clock reads from now.
+        overdue = log._buffer.due_deletions(stale + 1)
+
+        assert not overdue, (
+            f"still due against a stamp from before the commit: {overdue}"
+        )
