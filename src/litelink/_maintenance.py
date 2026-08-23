@@ -954,6 +954,21 @@ class Maintenance:
             msg = f"archive rewrite read {expected} rows for offsets {lo}-{hi}"
             raise RuntimeError(msg)
 
+        # Checked between writing and committing, the same as `_write_merge`
+        # and for the same reason — those are the two halves a lapsed claim
+        # separates. This one went without, and the archive side is where it
+        # costs most: a rewrite that stalls past the TTL lets recovery take the
+        # claim and queue every one of its outputs, `drain` snapshots its
+        # reference veto once per pass while they are still unreferenced, and
+        # then this commit lands. Drain deletes the objects the manifest now
+        # names, the superseded originals become unreferenced and are deleted
+        # in turn, and the range exists in no object at all — with every guard
+        # behaving exactly as written.
+        #
+        # Renewing here makes that unreachable rather than unlikely: recovery's
+        # acquire deleted this claim's row, so the renew finds nothing and the
+        # rewrite aborts while the originals are still live.
+        checkpoint(heartbeat)
         archive.replace_range(lo, hi, [archive.uri(p) for p, _, _, _ in written])
         # Now they are the archive's, so the intents become records.
         for path, start, end, held in written:
