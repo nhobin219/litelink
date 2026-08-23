@@ -692,6 +692,19 @@ append path — the only hot consumer — showed −0.3%, which is noise. Two ea
 of the same change showed 28% and 7% regressions; both were artifacts, one of a cold start
 and one of drift between blocks. Interleaving the runs is what settled it.
 
+**A decision reads the policy ONCE.** That is the hazard this trades for, and it is a real
+one: each read is now independent, so two of them inside a single decision can disagree. It
+bit immediately — `local_rows` seen as an int by the guard and as None by the subtraction
+after it is `int - None`, a TypeError out of `maintain()`, which the shipped maintainer does
+not catch, so maintenance stopped entirely. The rule is not a lock; it is that every
+decision binds the policy to a local first: fresh per decision, coherent within it.
+
+Where a torn read would merely produce an odd file size it is harmless, because the policy
+is a POLICY — it decides how big to cut and when to merge, never which rows go where. The
+one place it could have been an invariant is `runs`, shared by compaction and `sync` so the
+two cannot disagree about what is in play, and per-segment I4 closes that: a file the
+archive holds is never merged again.
+
 What this does NOT cover: a pyiceberg table handle is a point-in-time snapshot of REMOTE
 state, with no local durable copy to derive from, so `reload()` before deciding remains a
 discipline. That is one method and a much smaller surface.

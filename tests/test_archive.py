@@ -1391,3 +1391,57 @@ def test_a_stale_handle_cannot_repair_the_archive_it_was_pointed_away_from(
             assert stale._archive.uri == f"s3://{bucket}/second", (
                 "the repairing open must adopt the location the log records"
             )
+
+
+def test_a_rewrite_re_cuts_to_the_compact_row_target(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The scratch takes BOTH targets from compaction, not one from each.
+
+    It cuts at whichever ceiling comes first, so carrying the live seal ROW cap
+    made a rewrite cut its outputs at the seal's row limit while the archive
+    holds files sized to the compact one — many times more files than it
+    started with, each still undersized by bytes, so the next
+    `rewrite_archive` flags the same tail again and it never converges. The
+    operation exists to merge undersized archived files; that inverted it.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_seal_rows=40,
+        target_compact_size=16 * 1024,
+        target_compact_rows=80,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(6):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        before = log.archive_files()
+
+        assert before > 1, "expected several archived files to re-cut"
+
+        # A raised target makes the history undersized, which is the reason
+        # this operation exists.
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.rewrite_archive()
+
+        after = log.archive_files()
+
+        assert after <= before, (
+            f"the rewrite fragmented the archive: {before} files became {after}"
+        )
+        assert log.scan(include_archive=True).read_all().num_rows == 2400
