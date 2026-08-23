@@ -1143,17 +1143,17 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
         )
         local = log._table.data_files()
 
-        assert log._maintenance.archived_prefix(local) == first.hi
+        assert log._maintenance.archived_prefix(local, log._archive.uri) == first.hi
 
         log.set_archive("s3://bucket/elsewhere")
 
-        assert log._maintenance.archived_prefix(local) == 0, (
+        assert log._maintenance.archived_prefix(local, log._archive.uri) == 0, (
             "the new archive holds nothing, and says so without any reset"
         )
 
         log.set_archive("s3://bucket/prefix")
 
-        assert log._maintenance.archived_prefix(local) == first.hi, (
+        assert log._maintenance.archived_prefix(local, log._archive.uri) == first.hi, (
             "pointing back finds the copies still recorded where they are"
         )
 
@@ -1188,7 +1188,7 @@ def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) ->
         log._buffer.record_file("s3://bucket/prefix/data/a.parquet", lo, middle, 1)
         log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, hi + 1, 1)
 
-        assert log._maintenance.archived_prefix(files) == hi, (
+        assert log._maintenance.archived_prefix(files, log._archive.uri) == hi, (
             "the archive holds every row; how it cut them is not I4's business"
         )
 
@@ -1214,9 +1214,9 @@ def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
             "s3://bucket/prefix/data/c.parquet", files[2].lo, files[2].hi + 1, 1
         )
 
-        assert log._maintenance.archived_prefix(files) == files[0].hi, (
-            "a range the archive does not hold must stop the walk"
-        )
+        assert (
+            log._maintenance.archived_prefix(files, log._archive.uri) == files[0].hi
+        ), "a range the archive does not hold must stop the walk"
 
 
 def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(

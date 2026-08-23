@@ -510,6 +510,24 @@ again at the write — the read and the write are one decision only while it is 
 stall past the TTL between them lets the other setter take the lapsed claim lawfully and
 record the other half.
 
+**And a repairing open is a CLAIM HOLDER's privilege.** That is the other half of the same
+rule, and it went unenforced at one call site: expiry is exempt from claims because it is a
+metadata commit CAS orders — true of the snapshot expiry, and not true of the repairing open
+beside it. Two claimless repairs collide on the first attempt, because pyiceberg writes the
+metadata object before inserting the catalog row, and the loser raises a bare `Exception` no
+maintainer catches; worse, a claimless drop can land after a claim holder has already created
+and registered, taking the live entry with it.
+
+**Compaction asks whether ANY archive holds a file, not the configured one.** Detaching does
+not make the copies stop existing. Merging across a range some archive holds makes a LOCAL
+file whose boundaries line up with nothing there, and nothing re-cuts a local straddler —
+`rewrite_archive` works the other side — so re-attaching stalls the log for good: eviction
+pins below it and every push is refused. Four legitimate operations reach it, with no warning
+at any step: detach, raise the target, maintain, re-attach. Skipping those files costs
+nothing, because only compacted files are ever pushed, so one with an archive copy is already
+at the target. Eviction still asks about the CONFIGURED archive, because I4 is a promise about
+where the copy is.
+
 **Opening the archive with `repair` needs the durable location, not a remembered one.** That
 open may drop a catalog entry naming another prefix and create a fresh table at this one;
 the claim is what entitles a caller to do it, and the location the log records is what says

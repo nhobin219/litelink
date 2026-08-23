@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 
 from litelink._archive import Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
-from litelink._claim import EVERYTHING, new_owner
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import fsync
 
 # Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
@@ -305,7 +305,7 @@ class Maintenance:
 
         return 0 if recorded is None else int(recorded)
 
-    def archived_prefix(self, files: Sequence[DataFile]) -> int:
+    def archived_prefix(self, files: Sequence[DataFile], prefix: str | None) -> int:
         """The highest `hi` whose whole prefix the archive holds (§4a).
 
         I4 asked of segments. A file is the archive's business if the archive
@@ -334,7 +334,7 @@ class Maintenance:
         if not ordered:
             return 0
 
-        covered = self._buffer.archived_ranges(self._archive.uri or "", ordered[0].lo)
+        covered = self._buffer.archived_ranges(prefix, ordered[0].lo)
         reached = 0
         for data_file in ordered:
             # `record_file` stores the end offset exclusive, as every extent
@@ -378,7 +378,18 @@ class Maintenance:
         # range and the archived range stay the same range, which is what lets
         # `archived_prefix` match them at all.
         local = self._table.data_files()
-        archived = self.archived_prefix(local) if self._archive.configured() else 0
+        # Asked of ANY archive, and asked even when none is configured. A
+        # merge across a range some archive holds makes a local file whose
+        # boundaries line up with nothing there — and nothing re-cuts a LOCAL
+        # straddler, so re-attaching that archive stalls the log for good:
+        # eviction pins below the straddler and every push is refused. Four
+        # legitimate operations reach it — detach, raise the target, maintain,
+        # re-attach — with no warning at any step.
+        #
+        # Skipping them costs nothing. Only compacted files are ever pushed, so
+        # a file with an archive copy is already at the target and was never a
+        # candidate on merit.
+        archived = self.archived_prefix(local, None)
         pending = [f for f in local if f.hi > archived]
 
         # One read, so the two limits describe the same policy.
@@ -486,8 +497,8 @@ class Maintenance:
         # has one, and skip itself entirely.
         # From then on every push is refused by `_refuse_straddle`, the
         # watermark never advances again, and eviction pins on it.
-        if table is self._table and self._archive.configured():
-            archived = self.archived_prefix(current)
+        if table is self._table:
+            archived = self.archived_prefix(current, None)
             if any(f.lo <= archived for f in run):
                 claim.release()
 
@@ -709,7 +720,7 @@ class Maintenance:
         # then a deletion policy over the only copy, which is the contract the
         # operator asked for.
         if self._archive.configured():
-            boundary = min(boundary, self.archived_prefix(files))
+            boundary = min(boundary, self.archived_prefix(files, self._archive.uri))
 
         # Snapped DOWN to a file boundary, against the list as it is now. The
         # age limit is already one — some file's `hi` — and so is the archive
@@ -1069,9 +1080,36 @@ class Maintenance:
         if not any(is_remote(p) for p in self._buffer.queued_deletions()):
             return
 
+        # CLAIMED, because what follows opens the archive with `repair` on.
+        # Expiry is exempt from claims on the grounds that it is a metadata
+        # commit CAS orders — true of the snapshot expiry, and not true of a
+        # repairing open, which DROPS a catalog entry naming another prefix and
+        # creates a table in its place. That privilege belongs to a claim
+        # holder: two of them at once collide on the first attempt, because
+        # pyiceberg writes the metadata object before inserting the catalog
+        # row, and the loser raises a bare `Exception` the shipped maintainer
+        # does not catch. Worse, a claimless drop can land after a claim holder
+        # has already created and registered, taking the live entry with it.
+        #
+        # Rounds nine and ten fixed WHICH archive a repairing open targets.
+        # This is the other half — who is entitled to repair one — and this
+        # call site inherited expiry's exemption without it applying.
+        sweep = self._buffer.claim("expire-archive", 0, EVERYTHING, new_owner())
+        if not sweep.acquire():
+            return
+
+        try:
+            self._expire_archive_claimed(cutoff, sweep)
+        finally:
+            sweep.release()
+
+    def _expire_archive_claimed(self, cutoff: datetime, sweep: Claim) -> None:
+        """The archive half of expiry, with the claim held. See `_expire_archive`."""
         archive = self._archive.table(repair=True)
         if archive is None:
             return
+
+        checkpoint(sweep.renew)
 
         self._enqueue(archive.metadata_paths(archive.snapshots_older_than(cutoff)))
         archive.expire_snapshots_older_than(cutoff)
