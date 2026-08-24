@@ -21,6 +21,10 @@ litelink-data/
 *.db-wal
 *.db-shm
 
+# Fetched binaries: the litestream sidecar (`just litestream`). Not a project
+# dependency — a separate process, pinned rather than vendored.
+.bin/
+
 # Claude work artifacts
 .claude/worktrees/
 /.roborev/

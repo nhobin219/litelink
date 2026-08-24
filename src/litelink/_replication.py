@@ -83,22 +83,27 @@ def litestream_config(
         # is explicit about, and a restore that hands back the other log's WAL.
         name = database.relative_to(root).as_posix()
         key = f"{prefix}/{name}" if prefix else name
+        # `replica`, singular. litestream v0.5.0 made it one replica per
+        # database and carries the `replicas` list as deprecated
+        # (cmd/litestream/main.go: `Replicas []*ReplicaConfig // Deprecated`).
+        # This never emitted more than one element, so the list bought nothing
+        # and dated the file.
         lines += [
             f"  - path: {database}",
-            "    replicas:",
-            "      - type: s3",
-            f"        bucket: {bucket}",
-            f"        path: {key}",
+            "    replica:",
+            "      type: s3",
+            f"      bucket: {bucket}",
+            f"      path: {key}",
         ]
         if resolved.region:
-            lines.append(f"        region: {resolved.region}")
+            lines.append(f"      region: {resolved.region}")
 
         if resolved.endpoint:
             # Anything that is not AWS also needs path-style addressing:
             # `bucket.host` is a DNS name only AWS actually serves.
             lines += [
-                f"        endpoint: {resolved.endpoint}",
-                "        force-path-style: true",
+                f"      endpoint: {resolved.endpoint}",
+                "      force-path-style: true",
             ]
 
     return "\n".join(lines) + "\n"
