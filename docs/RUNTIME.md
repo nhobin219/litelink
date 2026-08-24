@@ -602,6 +602,21 @@ region against real AWS unless the replica names one, so against anything else i
 with "cannot lookup bucket region" while the credentials it needs sit unused in the
 environment.
 
+**The archive says where its own metadata is.** Every archive commit writes
+`version-hint.text` beside the metadata JSONs it names, which is what makes a bucket
+recoverable without the local root and a re-point reversible — `archive.db`'s catalog row
+is otherwise the only pointer to the current metadata, and re-pointing drops it. An engine
+with no catalog at all reads the prefix directly:
+
+```sql
+SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/litelink/positions',
+                                  version_name_format = '%s%s.metadata.json');
+```
+
+That parameter is not optional. DuckDB defaults to the Hadoop `v%s%s.metadata.json` while
+pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the hint carries that stem
+and the format has to stop prepending a `v`.
+
 **Restore is correct by construction.** A restored buffer may hold rows already sealed into
 the table. Nothing reconciles them, because the read boundary comes from the table's
 committed extent (I3), so those rows fall outside the buffer's contribution automatically.

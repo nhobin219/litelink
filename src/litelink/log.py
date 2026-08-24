@@ -791,20 +791,26 @@ class Log:
         process, so it waits for maintenance rather than failing on the first
         try; see `_claim_settings`.
 
-        **Re-pointing does not move anything, and is not reversible.** Rows
+        **Re-pointing does not move anything, but it is reversible.** Rows
         already evicted into the old archive stay there, and the read path
-        resolves only the archive the log currently names — so after a re-point
-        they are not readable through this log, and `scan(include_archive=True)`
-        returns fewer rows than were written, silently.
+        resolves only the archive the log currently names — so while pointed
+        elsewhere they are not readable through this log, and
+        `scan(include_archive=True)` returns fewer rows than were written,
+        silently.
 
-        Pointing BACK does not undo it. Re-attaching to an archive that already
-        holds data is not expressible today (§13): the catalog entry is
-        repaired by dropping it and creating a fresh table at the prefix, which
-        gives an EMPTY table over the objects still sitting there. So the old
-        data becomes unreachable through this log by any sequence of calls, and
-        an operator moving between buckets has to copy the objects across
-        before re-pointing. §13 lists the supported operations as attach,
-        detach, and re-point to a FRESH prefix for exactly this reason.
+        Pointing BACK undoes that. Each archive publishes `version-hint.text`
+        beside its metadata at every commit, so a prefix whose catalog entry
+        this log dropped is registered from what the bucket itself says rather
+        than created empty over the top of it. Only a repairing caller adopts,
+        which `set_archive` is; a plain `include_archive` read still leaves the
+        leg out until one has run.
+
+        **One writer per archive is assumed, not checked.** The hint records
+        where the metadata was at the last commit THIS log made. Another writer
+        touching that archive while it was detached would leave the hint behind
+        its true state, and adopting it would strand the commits made in
+        between. That is §13's archive-identity seam; the contract is one
+        writer per log, and nothing here enforces it.
 
         What re-pointing no longer does is disturb what the log already knows.
         There is no watermark to carry across: each pushed file records the

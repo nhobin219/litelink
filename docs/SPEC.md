@@ -649,8 +649,11 @@ An equality check on a recorded value, and the consequences fall out:
   wrote down, not an inference from a prefix, a catalog row keyed by table id, or a
   process's memory of its own configuration.
 - **Several archives coexist.** Old ranges name the old bucket and new ranges the new one,
-  which is what makes re-attaching to an archive that already holds data expressible — today
-  it is not.
+  which is half of what makes re-attaching to an archive that already holds data
+  expressible. The other half is the archive naming its own current metadata: `SqlCatalog`
+  keeps that pointer in the catalog, so the local `archive.db` row was the only thing that
+  had it, and a re-point drops that row. Each commit now writes `version-hint.text` beside
+  the metadata, and `open_archive` registers from it instead of creating an empty table.
 - **The compaction frontier goes.** `archive_pending` exists to stop a merge straddling a
   range the archive may hold; per segment, compaction skips a file that records an archive
   copy and needs no frontier, no crash window between writing it and using it, and no
@@ -1381,10 +1384,14 @@ The consequence worth planning for is that local disk holds roughly
    What would replace them: give the archive an IDENTITY the entry carries — a token
    written into the archive's own table properties at creation and recorded beside the
    URI locally, so "is this mine?" is an equality check on a value rather than an
-   inference from a path. Prefix comparison then stops being load-bearing, re-attaching
-   to an archive that already holds data becomes expressible (today it is not — see
-   `open_archive`), and a re-point becomes one durable fact to change rather than three
-   that can disagree.
+   inference from a path. Prefix comparison then stops being load-bearing and a re-point
+   becomes one durable fact to change rather than three that can disagree.
+
+   Re-attaching to an archive that already holds data no longer waits on that: the
+   archive publishes `version-hint.text` at every commit and `open_archive` registers
+   from it. What the token would add is a CHECK. The hint says where this log left the
+   metadata, and adopting it trusts that nothing else wrote the archive in between —
+   true under the one-writer-per-log contract, and unverifiable without an identity.
 
    **The deferral has a measured cost, and this paragraph used to understate it.** It
    claimed the guards above were sufficient for the operations the library supports —
