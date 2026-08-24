@@ -19,10 +19,11 @@ import pytest
 
 from litelink import Log, LogConfig
 from litelink._buffer import Buffer
-from litelink._layout import Layout
+from litelink._layout import NAMESPACE, Layout
 from litelink._maintenance import Maintenance
+from litelink._read import load_extension, secret_sql
 from litelink._s3 import S3Options
-from litelink._table import LogTable, _recorded_location
+from litelink._table import VERSION_HINT, LogTable, _recorded_location
 from litelink.log import OFFSET, table_schema
 from tests.conftest import filesystem
 
@@ -1600,17 +1601,115 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
         )
 
 
-def test_re_pointing_leaves_the_old_archive_unreadable(
+def test_the_published_hint_names_the_metadata_the_commit_produced(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The documented cost of a re-point, pinned so it stays documented.
+    """The hint has to name the metadata the table is actually at.
 
-    Rows already evicted into the old archive stay there, and the read path
-    resolves only the archive the log currently names — so they are not
-    readable through this log, silently. And pointing back does not undo it,
-    because re-attaching to an archive that already holds data is not
-    expressible (§13): the repair drops the catalog entry and creates a fresh,
-    empty table over the objects still sitting in the bucket.
+    Asserted against the pointer directly, which is why this sits beside the
+    re-attach test rather than inside it: a round trip through `set_archive`
+    recovers a hint that is one version stale often enough to pass, because the
+    missing snapshot's rows may still be in the local tier.
+
+    It does NOT pin publish-after-reload. That was the intent, and falsifying
+    it showed the ordering is not observable: pyiceberg updates the handle in
+    place when a commit lands, so publishing before `_commit`'s reload writes
+    the same hint. The claim the code makes has been narrowed to match.
+    """
+    where = f"s3://{bucket}/hinted"
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2),
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend(rows(400))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        archive = log._archive.require()  # noqa: SLF001
+        archive.reload()
+        current = str(archive.metadata_location)
+
+    fs = filesystem(s3)
+    published = fs.cat(f"{bucket}/hinted/{NAMESPACE}/s/metadata/{VERSION_HINT}")
+
+    assert current.endswith(f"/{published.decode().strip()}.metadata.json"), (
+        f"hint {published!r} does not name {current!r}"
+    )
+
+
+def test_the_archive_reads_as_a_directory_with_no_catalog_at_all(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """What the hint buys beyond re-attach: an archive nothing local can read.
+
+    litelink resolves the archive through `archive.db` and hands DuckDB a
+    metadata path (§7). This is the other reader — an engine pointed at the
+    prefix, with no catalog, no local root, and nothing but the bucket.
+
+    **`version_name_format` is required, and that is the documented cost.**
+    DuckDB's default is the Hadoop `v%s%s.metadata.json`; pyiceberg names its
+    metadata `00003-<uuid>.metadata.json`, so the hint holds that stem and the
+    format has to stop prepending a `v`. Writing a second copy under the
+    Hadoop name would remove the parameter and add an object per commit that
+    nothing collects — see `VERSION_HINT`.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    where = f"s3://{bucket}/standalone"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        local_rows=200,
+    )
+    with Log.new(
+        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        archived = log.archived_through()
+
+    assert archived > 0, "nothing reached the archive to read back"
+
+    connection = duckdb.connect()
+    load_extension(connection, "iceberg", remote=False)
+    load_extension(connection, "httpfs", remote=True)
+    connection.execute(secret_sql(s3))
+    directory = f"{where}/{NAMESPACE}/s"
+    rows_read = connection.execute(
+        f"SELECT count(*) FROM iceberg_scan('{directory}',"
+        " version_name_format = '%s%s.metadata.json')"
+    ).fetchone()
+
+    assert rows_read is not None
+    assert rows_read[0] == archived
+
+
+def test_pointing_back_at_an_archive_restores_everything_it_held(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A re-point costs reach, not data — and pointing back gets it back.
+
+    Both halves matter and they are different claims. While pointed elsewhere,
+    rows evicted into the old archive are out of reach: the read path resolves
+    exactly one archive, so `scan(include_archive=True)` returns fewer rows
+    than were written, silently. That has not changed.
+
+    What has is the way back. This test asserted the opposite until the archive
+    began publishing `version-hint.text` beside its metadata — before that, the
+    local catalog row was the only thing naming the archive's current metadata,
+    and re-pointing drops it, so returning built an EMPTY table over objects
+    still sitting in the bucket. Now the bucket says where its own metadata is,
+    and `open_archive` registers from that instead of creating.
     """
     config = replace(
         LogConfig(),
@@ -1646,15 +1745,19 @@ def test_re_pointing_leaves_the_old_archive_unreadable(
 
         assert moved < written, "expected the evicted history to be out of reach"
 
-        # And pointing BACK does not undo it: re-attaching to an archive that
-        # already holds data is not expressible (§13), so the repair creates an
-        # empty table over the objects still sitting there. The first draft of
-        # this test asserted the opposite, and the docstring said so too.
+        # ALL of them, not merely more than `moved`. Adopting the archive has
+        # to hand back the extent it actually holds; a partial recovery would
+        # mean registering a metadata JSON older than the last commit, which is
+        # the failure mode a remembered-at-open pointer would have had and this
+        # one must not.
         log.set_archive(first)
 
-        assert log.scan(include_archive=True).read_all().num_rows < written, (
-            "re-attaching to a populated archive is documented as unsupported"
-        )
+        assert log.scan(include_archive=True).read_all().num_rows == written
+
+        # And it is genuinely the old table, not a new one that happens to
+        # read: an empty table created over the objects would show no files at
+        # all while the union still answered from the local tier.
+        assert log.archive_files() > 0
 
 
 def test_a_fresh_prefix_after_a_target_raise_does_not_stall(

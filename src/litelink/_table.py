@@ -20,6 +20,7 @@ from pyiceberg.exceptions import (
     CommitFailedException,
     NoSuchTableError,
 )
+from pyiceberg.io import load_file_io
 from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.transforms import IdentityTransform
 
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import pyarrow as pa
+    from pyiceberg.io import FileIO
     from pyiceberg.table import Table
     from pyiceberg.table.snapshots import Snapshot
 
@@ -150,6 +152,69 @@ def _recorded_location(layout: Layout) -> str | None:
     return None if row is None or row[0] is None else str(row[0])
 
 
+# Where an archive says which of its metadata JSONs is current, written beside
+# them at every commit. `SqlCatalog` keeps that pointer in the catalog rather
+# than in the warehouse (§7), so without this the local `archive.db` is the
+# ONLY thing that names the archive's current metadata — and `open_archive`
+# says what that costs: a re-point drops the row, and "a drop that is not
+# followed by a create destroys the only record of where the PREVIOUS
+# archive's metadata is."
+#
+# The name is the one DuckDB's iceberg extension looks for, so a reader can
+# scan the directory rather than being handed a pointer:
+#
+#     iceberg_scan(dir, version_name_format = '%s%s.metadata.json')
+#
+# **That parameter is needed, and it is the cost of not copying anything.**
+# DuckDB's default format is `v%s%s.metadata.json`, the Hadoop convention, and
+# pyiceberg names its metadata `00003-<uuid>.metadata.json` — so the hint holds
+# that stem and the format has to stop prepending a `v`. Both spellings were
+# verified against duckdb 1.5.5.
+#
+# **Rejected: the Hadoop convention, by copying.** Writing the metadata a
+# second time as `v3.metadata.json` and putting `3` in the hint reads with
+# DuckDB's defaults and with anything else expecting a Hadoop table — verified
+# too. It also adds an object per commit that nothing collects: deleting the
+# previous one races a reader between its hint read and its metadata read,
+# which is the race `pending_delete` exists to avoid for snapshots and would
+# have to be extended to cover. Growth with no collector, or a new class of
+# deletion to sequence — against one parameter in one documented query.
+VERSION_HINT = "version-hint.text"
+
+
+def _hint_for(metadata_location: str) -> tuple[str, str]:
+    """Where the hint goes for a metadata pointer, and what it should say."""
+    directory, _, name = metadata_location.rpartition("/")
+
+    return f"{directory}/{VERSION_HINT}", name.removesuffix(".metadata.json")
+
+
+def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
+    """What the archive at `prefix` says its current metadata is, or None.
+
+    Read from the bucket, which is the point: it answers for an archive this
+    log has no catalog row for. The directory is reconstructed from pyiceberg's
+    layout — `{prefix}/{namespace}/{name}/metadata` — rather than from a table
+    handle, because there is no handle yet; that is the situation.
+
+    None covers both "no hint" and "unreadable", deliberately. A caller uses
+    this to decide between adopting and creating, and the only safe reading of
+    a hint it cannot get is that there is nothing to adopt.
+    """
+    namespace, _, name = layout.table_id.rpartition(".")
+    directory = f"{prefix.rstrip('/')}/{namespace}/{name}/metadata"
+    try:
+        source = io.new_input(f"{directory}/{VERSION_HINT}")
+        if not source.exists():
+            return None
+
+        version = source.open().read().decode().strip()
+    except Exception:
+        return None
+
+    return f"{directory}/{version}.metadata.json" if version else None
+
+
 class LogTable:
     """The local Iceberg table for one log.
 
@@ -186,6 +251,13 @@ class LogTable:
         # Where this table's files live. The local one derives it from the
         # layout; the archive is told, because its prefix is the caller's.
         self._warehouse = warehouse or layout.warehouse_uri
+        # Which of the two this is, and the only thing that turns on it: the
+        # ARCHIVE publishes a pointer to its own metadata, because it is the
+        # one whose catalog can be lost or pointed away from. The local table's
+        # catalog sits in the same directory as its warehouse — lose one and
+        # you have lost the other, so a hint beside it would answer a question
+        # nobody can be in a position to ask.
+        self._is_archive = warehouse is not None
         # Snapshot-derived facts, cached against the metadata pointer. See
         # `extent`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
@@ -284,9 +356,16 @@ class LogTable:
         fresh empty table over it, and rows already evicted locally were then
         reachable from nowhere.
 
-        Adopting an archive that holds data but has no entry here is a
-        different operation and is NOT supported: this creates an empty table
-        at the prefix rather than discovering what is already there.
+        Adopting an archive that holds data but has no entry here IS
+        supported, and is what makes a re-point reversible. The archive names
+        its own current metadata in `version-hint.text` beside it, written at
+        every commit, so a prefix with no catalog row is registered from that
+        rather than created empty over the top of it.
+
+        **Only a repairing caller adopts.** `register_table` is a write to
+        `archive.db`, and a reader promised to make none — so a reader still
+        gets `ArchiveAbsent` here and sees the archive once a maintenance pass
+        has adopted it. Same rule as the drop above, for the same reason.
         """
         # Asked BEFORE the catalog is constructed, because constructing one
         # creates its tables in `archive.db` and registering the namespace adds
@@ -361,11 +440,14 @@ class LogTable:
             # The entry goes; the objects do not, because detaching an
             # archive is not deleting one. Held onto, though: the create below
             # can fail — the new prefix may not exist yet, which this design
-            # explicitly allows — and a drop that is not followed by a create
-            # destroys the only record of where the PREVIOUS archive's metadata
-            # is. `previous_metadata_location` dies with the row, so a later
-            # roll-back to that archive would build an empty table over data
-            # nothing could then reach.
+            # explicitly allows — and a half-done move that leaves NEITHER
+            # entry is worse than not moving.
+            #
+            # It is no longer the only record of where the previous archive's
+            # metadata is. It was, and that is what made a roll-back build an
+            # empty table over unreachable data; `version-hint.text` in the
+            # bucket is that record now, and it survives this drop because it
+            # is not here.
             catalog.drop_table(layout.table_id)
             displaced, recorded = recorded, None
 
@@ -379,10 +461,39 @@ class LogTable:
                 msg = f"no archive table at {prefix!r} yet"
                 raise ArchiveAbsent(msg)
 
+            # ADOPT BEFORE CREATING. This is what makes re-attaching to an
+            # archive expressible, which `open_archive` used to say plainly it
+            # was not: "Adopting an archive that holds data but has no entry
+            # here is a different operation and is NOT supported: this creates
+            # an empty table at the prefix rather than discovering what is
+            # already there."
+            #
+            # Discovering it is what `version-hint.text` is for. No listing is
+            # involved — that is one GET of a known key, not the paginated walk
+            # of the prefix this design refuses everywhere else.
+            published = _published_location(
+                load_file_io(options.resolved().catalog_properties(), prefix),
+                layout,
+                prefix,
+            )
             try:
-                table = catalog.create_table(
-                    layout.table_id, schema=schema, properties=METADATA_PROPERTIES
-                )
+                if published is None:
+                    table = catalog.create_table(
+                        layout.table_id, schema=schema, properties=METADATA_PROPERTIES
+                    )
+                    # So a freshly created archive names its own metadata from
+                    # the start, rather than only from its first commit. An
+                    # archive detached before anything was pushed to it holds
+                    # nothing, so creating over it would be harmless — but the
+                    # invariant is cheaper to hold than to reason about.
+                    cls(catalog, layout, table, prefix).publish_pointer()
+                else:
+                    # Deliberately unguarded, like the load below. A hint
+                    # naming metadata that cannot be read is a broken archive,
+                    # and the fallback available here — create an empty table —
+                    # is the single worst response to it: it writes over data
+                    # that is still there, having just been told where it is.
+                    table = catalog.register_table(layout.table_id, published)
             except Exception:
                 if displaced is not None:
                     # Put the old entry back. The repair is meant to move the
@@ -760,6 +871,9 @@ class LogTable:
                 self._verify_identity()
             else:
                 self.reload()
+                # After the reload, so it names the metadata this commit
+                # actually produced rather than the one it was built from.
+                self.publish_pointer()
 
                 return
 
@@ -802,6 +916,46 @@ class LogTable:
         output = self._table.io.new_output(destination)
         with output.create(overwrite=True) as writing:
             writing.write(payload)
+
+    def publish_pointer(self) -> None:
+        """Record which metadata JSON is current, beside them in the warehouse.
+
+        Called after every archive commit, so the bucket always names its own
+        current metadata. Two things need that and neither can get it from
+        `archive.db`: re-attaching to an archive this log was pointed away from
+        (the catalog row is gone — that is what re-pointing does), and reading
+        the archive from anywhere that is not this machine.
+
+        **Best effort, and it has to be.** The commit has already landed; the
+        table is correct whether or not this succeeds. Raising here would turn
+        a published archive into a failed sync and send the caller into a retry
+        of work that is done. A hint that fails to write is a hint that still
+        names the previous metadata — behind, never wrong, and corrected by the
+        next commit.
+
+        Written AFTER the commit, never as part of it. A hint published from
+        inside an attempt would name metadata that a CAS retry then superseded,
+        pointing readers at a snapshot the table moved off.
+
+        Published after `_commit`'s reload rather than before it, though that
+        turns out not to be load-bearing: pyiceberg updates the handle in place
+        when a commit lands, so `metadata_location` already names the winner
+        before the reload re-reads it from the catalog. Measured — publishing
+        first produces the same hint. Kept in this order because reading the
+        pointer at the point the table is known-current needs no argument.
+        """
+        if not self._is_archive:
+            return
+
+        path, version = _hint_for(str(self._table.metadata_location))
+        try:
+            with self._table.io.new_output(path).create(overwrite=True) as writing:
+                writing.write(version.encode())
+        except Exception:
+            # Deliberately swallowed, and deliberately not logged from a
+            # library. The next commit rewrites it; a sync that raised here
+            # would be reporting a failure that did not happen.
+            return
 
     def fetch(self, path: str, destination: Path) -> None:
         """Download a file out of this table's warehouse. Inverse of `put`.
