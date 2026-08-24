@@ -19,8 +19,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
-from litelink._lease import DEFAULT_TTL_MS, Lease
+    from litelink.log import LogConfig
+
+from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import column_type
+
+# Where the log records its settings. It lives here because this object owns
+# `meta`, and `meta` is the one place the policy exists.
+CONFIG_KEY = "config"
 
 # The library-owned column (§2).
 OFFSET = "litelink_offset"
@@ -72,9 +78,6 @@ class Buffer:
         reader: sqlite3.Connection,
         schema: pa.Schema,
         columns: tuple[str, ...],
-        *,
-        target_size: int,
-        target_rows: int | None = None,
     ) -> None:
         """Take built collaborators. `open` is what builds and validates them.
 
@@ -93,8 +96,7 @@ class Buffer:
         self._reader = reader
         self._schema = schema
         self._columns = columns
-        self._target_size = target_size
-        self._target_rows = target_rows
+        self._config_cache: tuple[str, LogConfig] | None = None
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
         # an append, a seal claiming and clearing its range, a maintenance pass
@@ -150,24 +152,12 @@ class Buffer:
 
                 raise
 
-    def set_target_size(self, target_size: int, target_rows: int | None) -> None:
-        """Adopt new cut limits in place, rather than being rebuilt around them.
-
-        Policy can change under a running log (§12), and the cut is made here,
-        so it has to arrive here. `Maintenance` takes the same shape.
-        """
-        with self._lock:
-            self._target_size = target_size
-            self._target_rows = target_rows
-
     @classmethod
     def open(
         cls,
         path: Path,
         schema: pa.Schema,
         *,
-        target_size: int,
-        target_rows: int | None = None,
         readonly: bool = False,
         durable: bool = True,
     ) -> Buffer:
@@ -199,8 +189,6 @@ class Buffer:
                 con,
                 schema,
                 columns,
-                target_size=target_size,
-                target_rows=target_rows,
             )
 
         # check_same_thread=False because scheduling maintenance on a background
@@ -223,8 +211,6 @@ class Buffer:
             cls._connect_readonly(path),
             schema,
             columns,
-            target_size=target_size,
-            target_rows=target_rows,
         )
         buffer._create()
         buffer._seed_group()
@@ -321,6 +307,35 @@ class Buffer:
             CREATE INDEX IF NOT EXISTS extent_unsealed ON extent (group_id)
             WHERE rel_path IS NULL
         """)
+        # I4 per segment (§4a) reads the archive copies covering what the local
+        # table still holds. Without this the lookup is a scan of one row per
+        # file ever archived, which grows without limit — the local file count
+        # does not.
+        self._con.execute("""
+            CREATE INDEX IF NOT EXISTS extent_archived ON extent (start_offset)
+            WHERE rel_path IS NOT NULL
+        """)
+        # A copy that was INTENDED, beside `extent`'s copies that exist. The
+        # two are read by collaborators whose safe directions are opposite:
+        # compaction must not merge across a range some archive may hold, so it
+        # is safe when coverage is OVERSTATED; eviction must not delete the only
+        # copy, so it is safe only when coverage is UNDERSTATED. One record
+        # cannot be both, and collapsing them into one is what left a crash
+        # between a register and the rows recording it able to wedge the log.
+        #
+        # A separate table rather than a column on `extent`, because a build
+        # that predates this has no idea it exists — so its eviction query is
+        # unchanged and reads only landed copies, which is the safe polarity by
+        # construction. A column would have read to it as coverage, and no
+        # check in a new build can stop an old one.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS extent_intent (
+              rel_path     TEXT PRIMARY KEY,
+              start_offset INTEGER NOT NULL,
+              end_offset   INTEGER NOT NULL,
+              bytes        INTEGER NOT NULL
+            )
+        """)
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
@@ -328,10 +343,38 @@ class Buffer:
         # cannot say anything about a process that is no longer running, and
         # recovery has to know whether an interrupted operation was ours.
         self._con.execute("""
-            CREATE TABLE IF NOT EXISTS lease (
-              role TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS claim (
+              id         INTEGER PRIMARY KEY AUTOINCREMENT,
+              owner      TEXT NOT NULL,
+              expires_at INTEGER NOT NULL,
+              kind       TEXT NOT NULL,
+              lo         INTEGER NOT NULL,
+              hi         INTEGER NOT NULL,
+              rel_path   TEXT
             )
         """)
+        # Every acquisition asks the same question — is a live claim covering
+        # this range — and asks it inside a write transaction, so it is the one
+        # query that must not degrade into a scan as claims accumulate.
+        self._con.execute("""
+            CREATE INDEX IF NOT EXISTS claim_live ON claim (expires_at, lo, hi)
+        """)
+        # A buffer carrying the old `lease` table was last written by a build
+        # that coordinated through it, and this one coordinates through
+        # `claim`. Neither sees the other, so two sealers could claim the same
+        # queued group — the torn file the claim mechanism exists to prevent.
+        # Nothing here can make an OLD binary respect the new table, so the
+        # rename is an offline upgrade: refuse rather than run alongside one.
+        if self._con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lease'"
+        ).fetchone():
+            msg = (
+                "this log was last opened by a build that coordinated through a "
+                "`lease` table; ranged claims replaced it and the two do not "
+                "exclude each other. Stop every process using this log, then "
+                "run `DROP TABLE lease` on its buffer.db to complete the upgrade"
+            )
+            raise RuntimeError(msg)
 
     # -- size accounting --------------------------------------------------
     #
@@ -460,11 +503,12 @@ class Buffer:
             # Bound once, and the accounting inlined below, because this loop
             # runs per row: routing it through a method cost 19 points of
             # overhead against raw SQLite at 1,000-row batches.
-            target = self._target_size
+            config = self.config()
+            target = config.target_seal_size
             # `_insert` runs per row, so both limits are bound once out here.
             # A row cap of None becomes one nothing reaches, which keeps the
             # inner test a comparison rather than a branch on None.
-            target_rows = self._target_rows or _NO_ROW_LIMIT
+            target_rows = config.target_seal_rows or _NO_ROW_LIMIT
             row_bytes = self._row_bytes
             columns = self._columns
             for row in rows:
@@ -813,12 +857,20 @@ class Buffer:
         except (pa.ArrowInvalid, pa.ArrowTypeError):
             return pa.array(values).cast(declared)
 
-    def lease(self, role: str, owner: str, ttl_ms: int = DEFAULT_TTL_MS) -> Lease:
-        """A claim on `role`, backed by this database.
+    def claim(
+        self,
+        kind: str,
+        lo: int,
+        hi: int,
+        owner: str,
+        rel_path: str | None = None,
+        ttl_ms: int = DEFAULT_TTL_MS,
+    ) -> Claim:
+        """A claim on the offset range `[lo, hi]`, backed by this database.
 
-        Handed the connection AND the lock that guards it — see `Lease`.
+        Handed the connection AND the lock that guards it — see `Claim`.
         """
-        return Lease(self._con, self._lock, role, owner, ttl_ms)
+        return Claim(self._con, self._lock, kind, lo, hi, owner, rel_path, ttl_ms)
 
     # -- the seal queue ---------------------------------------------------
 
@@ -1028,13 +1080,99 @@ class Buffer:
         table. So the coordinator that already records every path before its
         file exists (I16) records this too, for both tiers, in one shape.
         """
-        with self._lock:
+        with self._transaction():
+            # The upsert is untouched. What is new is the `forget_intent`
+            # beside it: recording the copy and retiring the intent are one
+            # fact, and a crash between two statements would leave the log
+            # believing both. The upsert also has to be able to write a row
+            # from nothing, because an owner that took over a lapsed claim may
+            # have dropped this push's intents while its register was in flight.
             self._con.execute(
                 "INSERT INTO extent"
                 " (start_offset, end_offset, bytes, rel_path, named_at)"
                 " VALUES (?, ?, ?, ?, unixepoch())"
                 " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
                 (start, end, held, rel_path),
+            )
+            self._con.execute(
+                "DELETE FROM extent_intent WHERE rel_path = ?", (rel_path,)
+            )
+
+    def intend_file(self, rel_path: str, start: int, end: int, held: int) -> None:
+        """Record a copy this log is ABOUT to write, before it writes it.
+
+        The register that follows can land while the row recording it does not,
+        and compaction decides what it may merge from those rows — so without
+        this, a compaction-target change before the next sync regroups the
+        pushed-but-unrecorded files and commits a local file straddling the
+        archive's extent. Nothing re-cuts a local straddler, so every later
+        push is refused and the log stops advancing.
+
+        An UPSERT, and the difference is not cosmetic: a holder that stalled
+        past its TTL and resumed can intend a path the owner that took over is
+        also intending. A bare insert raises on the primary key, and the
+        maintainer catches neither that nor anything like it — so the takeover
+        race would kill the LAWFUL holder's pass rather than the stale one's.
+        """
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO extent_intent"
+                " (rel_path, start_offset, end_offset, bytes) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(rel_path) DO UPDATE SET"
+                " start_offset = excluded.start_offset,"
+                " end_offset = excluded.end_offset,"
+                " bytes = excluded.bytes",
+                (rel_path, start, end, held),
+            )
+
+    def intents(self, prefix: str) -> list[tuple[str, int, int, int]]:
+        """Intended copies under `prefix`: `(rel_path, start, end, bytes)`.
+
+        Unbounded by offset, deliberately. Reconciliation drops an intent the
+        archive's manifest does not name, and one below the local window has to
+        be reachable to be dropped — bounding this read would leave those rows
+        beyond judgement for ever.
+        """
+        boundary = prefix.rstrip("/") + "/"
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, start_offset, end_offset, bytes FROM extent_intent"
+            ).fetchall()
+
+        return [
+            (str(r[0]), int(r[1]), int(r[2]), int(r[3]))
+            for r in rows
+            if str(r[0]).startswith(boundary)
+        ]
+
+    def archive_records(
+        self, prefix: str, floor: int
+    ) -> list[tuple[str, int, int, int]]:
+        """Landed copies under `prefix`, keyed by PATH: `(rel_path, lo, hi, bytes)`.
+
+        Reconciliation matches by path, and `archived_ranges` answers in bare
+        offsets — so it cannot serve. Bounded by `floor` like the manifest walk
+        beside it, or it grows with the archive and runs on every sync.
+        """
+        boundary = prefix.rstrip("/") + "/"
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT rel_path, start_offset, end_offset, bytes FROM extent"
+                " WHERE rel_path IS NOT NULL AND end_offset > ?",
+                (floor,),
+            ).fetchall()
+
+        return [
+            (str(r[0]), int(r[1]), int(r[2]), int(r[3]))
+            for r in rows
+            if str(r[0]).startswith(boundary)
+        ]
+
+    def forget_intent(self, rel_path: str) -> None:
+        """Drop an intent, whether it became a copy or never will."""
+        with self._lock:
+            self._con.execute(
+                "DELETE FROM extent_intent WHERE rel_path = ?", (rel_path,)
             )
 
     def record_merge(self, rel_path: str, sources: Iterable[str]) -> None:
@@ -1110,6 +1248,65 @@ class Buffer:
 
         return None if row is None else str(row[0])
 
+    def archived_ranges(
+        self, prefix: str | None, floor: int, *, include_intents: bool
+    ) -> list[tuple[int, int]]:
+        """Offset ranges an archive holds or is about to, under `prefix`.
+
+        `include_intents` is keyword-only and has no default, so every caller
+        states which question it is asking. Compaction asks whether ANY archive
+        might hold a range, and is safe overstating it; eviction asks whether
+        one DOES, and is safe only understating. Getting that backwards at one
+        call site would be silent, which is the whole reason this parameter is
+        awkward to pass.
+
+        I4 asked of segments rather than of a watermark (§4a). `sync` records
+        where each pushed file's copy went, so the archive's contents are
+        already durable here per file — a watermark summarising them is a
+        second copy of the same fact, and the only boundary in the log that can
+        move backwards.
+
+        Bounded by `floor` rather than by the prefix alone: the archive grows
+        without limit and this only ever asks about ranges the local table
+        still holds, which compaction bounds. The prefix match is applied in
+        Python because SQLite's `LIKE` would not use the index that `floor`
+        selects on.
+        """
+        # `None` means ANY archive, not the configured one. Two questions ask
+        # this and they are not the same question. I4 asks whether THIS archive
+        # holds a file, because it authorises a deletion. Compaction asks
+        # whether ANY archive does, because it decides whether merging could
+        # create a range no archive's cuts line up with — and detaching does
+        # not make those copies stop existing.
+        boundary = None if prefix is None else prefix.rstrip("/") + "/"
+        # ONE statement, so one snapshot. Read as two, the tables are two
+        # separate WAL reads and a `record_file` committing between them moves
+        # a range out of the first and into the second AFTER the second was
+        # taken — so it appears in neither, and compaction's read, which is
+        # safe only when it OVERSTATES coverage, momentarily understates it.
+        # That is the straddle this whole record exists to prevent, reopened by
+        # the shape of the query rather than by the design.
+        sql = (
+            "SELECT start_offset, end_offset, rel_path FROM extent"
+            " WHERE end_offset > ? AND rel_path IS NOT NULL"
+        )
+        args: tuple[int, ...] = (floor,)
+        if include_intents:
+            sql += (
+                " UNION ALL"
+                " SELECT start_offset, end_offset, rel_path FROM extent_intent"
+                " WHERE end_offset > ?"
+            )
+            args = (floor, floor)
+
+        with self._lock:
+            rows = self._con.execute(sql, args).fetchall()
+
+        def wanted(path: str) -> bool:
+            return path.startswith(boundary) if boundary is not None else "://" in path
+
+        return sorted((lo, hi) for lo, hi, path in rows if wanted(path))
+
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.
 
@@ -1174,6 +1371,45 @@ class Buffer:
                 list(pairs.items()),
             )
             return True
+
+    def config(self) -> LogConfig:
+        """The policy in force, read from the log rather than remembered.
+
+        There is exactly one copy of this, and it is the `meta` row. Everything
+        that decides from the policy reads it here, so nothing can hold a stale
+        one — which is the failure this replaces: the policy used to live in
+        `Log`, in `Maintenance` and, derived, in this object's seal target, all
+        kept in step by `set_config` writing each. A refresh call had to sit
+        wherever a decision was made, and a design needing N of those is always
+        one short somewhere, because nothing says where N is.
+
+        The PARSE is cached, keyed on the raw value. Reading the row costs
+        1.8 us and decoding it costs far more, so the cache is what makes this
+        affordable — and keying it on the durable value is what stops it being
+        another stale copy: when the row changes, the key changes.
+        """
+        raw = self.get_meta(CONFIG_KEY)
+        if raw is None:
+            from litelink.log import LogConfig
+
+            return LogConfig()
+
+        cached = self._config_cache
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+
+        from litelink.log import LogConfig
+
+        try:
+            parsed = LogConfig.from_json(raw)
+        except (ValueError, TypeError):
+            # A value this build cannot read is not a reason to stop
+            # maintaining the log; the last good one governs.
+            return LogConfig() if cached is None else cached[1]
+
+        self._config_cache = (raw, parsed)
+
+        return parsed
 
     def set_meta_all(self, pairs: Mapping[str, str]) -> None:
         """Write several `meta` values in ONE transaction.
@@ -1286,6 +1522,32 @@ class Buffer:
             self._con.executemany(
                 "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at) VALUES (?, ?)",
                 [(p, superseded_at) for p in rel_paths],
+            )
+
+    def restamp_deletions(self, rel_paths: Iterable[str], superseded_at: int) -> None:
+        """Re-date queued files to when they ACTUALLY left the table.
+
+        The queue is written before the commit that supersedes them, because a
+        crash in between would otherwise lose the only record of those paths.
+        But the grace period is about readers still holding them (I6), and a
+        reader cannot be holding a file the commit has not yet superseded — so
+        the clock has to start at the commit, not at the queueing.
+
+        Stamped at the queueing, a rewrite slower than `snapshot_retention`
+        burns the whole grace before it commits: the moment the originals stop
+        being referenced they are already due, and drain takes them out from
+        under any scan resolved a moment earlier. Measured at a 5 s retention:
+        a reader 0.4 s old lost all fourteen files its snapshot named, and its
+        scan failed mid-read with a 404. An attempt that ABORTS and is retried
+        later is worse — it commits against a stamp burned days ago.
+
+        `INSERT OR IGNORE` deliberately keeps the first stamp on re-enqueue, so
+        this is an explicit update rather than a second insert.
+        """
+        with self._transaction():
+            self._con.executemany(
+                "UPDATE pending_delete SET superseded_at = ? WHERE rel_path = ?",
+                [(superseded_at, p) for p in rel_paths],
             )
 
     def due_deletions(self, cutoff: int) -> list[str]:

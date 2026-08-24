@@ -15,14 +15,20 @@ pyiceberg's is metadata-only. Draining is what actually unlinks, and it waits
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 
-from litelink._archive import ARCHIVE_KEY, Archive
+from litelink._archive import Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import fsync
+
+# Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
+# `Log`'s private business, because eviction decides deletions from it.
+CONFIG_KEY = "config"
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -38,12 +44,14 @@ if TYPE_CHECKING:
 def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
     """Renew the caller's claim, or refuse to carry on without it.
 
-    Losing the role mid-pass is not something to push through: another owner
-    is already redoing this work, and two of them writing the same table is
-    what the lease exists to prevent.
+    Losing the range mid-pass is not something to push through: another owner
+    may already be redoing this work, and two of them writing the same files is
+    what the claim exists to prevent. A claim ends by being TAKEN, not by
+    expiring — an uncontested holder renews fine — so a failed renew means
+    somebody else owns these offsets now.
     """
     if heartbeat is not None and not heartbeat():
-        msg = "lost the maintenance lease mid-pass"
+        msg = "lost the claim on this range mid-pass"
         raise RuntimeError(msg)
 
 
@@ -159,6 +167,58 @@ def stable_prefix(
     return settled
 
 
+def _both(
+    ours: Callable[[], bool], theirs: Callable[[], bool] | None
+) -> Callable[[], bool]:
+    """Renew our own claim AND report the caller's heartbeat.
+
+    `heartbeat or claim.renew` read naturally and was wrong: any caller passing
+    a heartbeat — which is what the role-lease era asked for, so it is a habit
+    people carry forward — silently stopped the run claim from being renewed at
+    all, and the pre-commit check then consulted a stranger's callback instead
+    of the claim. A merge over the TTL would lose its exclusion with no stall
+    required, and commit rows eviction had removed in the meantime.
+
+    Ours is renewed first and unconditionally, so a falsy caller heartbeat
+    cannot short-circuit it.
+    """
+
+    def beat() -> bool:
+        held = ours()
+
+        return held if theirs is None else held and theirs()
+
+    return beat
+
+
+def _covered(ranges: Sequence[tuple[int, int]], lo: int, hi: int) -> bool:
+    """Whether `[lo, hi)` sits entirely inside `ranges`, which are sorted.
+
+    A walk rather than a set membership test, because the archive's cuts need
+    not line up with anyone else's. Adjacent archived files join — offsets are
+    contiguous, so `[1, 151)` and `[151, 301)` together hold `[101, 201)` even
+    though neither holds it alone — and a gap ends the answer.
+    """
+    if hi <= lo:
+        # An empty range is held by anything, vacuously. Unreachable from I4,
+        # where a file always holds at least one row, but a predicate that
+        # answers "no" to a question with no rows in it is a trap for the next
+        # caller.
+        return True
+
+    reach = lo
+    for start, end in ranges:
+        if start > reach:
+            return False
+
+        if end > reach:
+            reach = end
+            if reach >= hi:
+                return True
+
+    return reach >= hi
+
+
 def is_remote(path: str) -> bool:
     """Whether a queued deletion names an object rather than a local file.
 
@@ -179,23 +239,28 @@ class Maintenance:
         table: LogTable,
         buffer: Buffer,
         layout: Layout,
-        config: LogConfig,
         sort_by: tuple[str, ...],
         archive: Archive,
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
-        self._config = config
         self._sort_by = sort_by
         self._archive = archive
         # Read once per eviction pass rather than once per file. Cleared at the
         # top of `evict`, so a pass never decides from what a previous one saw.
         self._age_cache: dict[str, int] | None = None
 
-    def set_config(self, config: LogConfig) -> None:
-        """Adopt new policy in place, rather than being rebuilt around it."""
-        self._config = config
+    @property
+    def config(self) -> LogConfig:
+        """The policy in force, read from the log on every access.
+
+        No copy is kept here. A second copy is what every one of this seam's
+        defects came down to: a decision read the copy while the durable row
+        said otherwise, and correctness then depended on a refresh call sitting
+        at each decision — twelve of them, and always one short somewhere.
+        """
+        return self._buffer.config()
 
     def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
         self._sort_by = sort_by
@@ -225,21 +290,6 @@ class Maintenance:
     # -- compaction ---------------------------------------------------------
 
     ARCHIVED_KEY = "archive_through"
-    # The range a push is ABOUT to register, written before it registers.
-    #
-    # `ARCHIVED_KEY` is written after the commit lands, so a crash between the
-    # two leaves it lower than what the archive actually holds. Eviction is
-    # safe with a low watermark — it simply waits — but compaction reads the
-    # same number to decide which files are already archived and therefore not
-    # its business, and a low one puts an ALREADY-ARCHIVED file back in a merge
-    # run. The merged file then spans the archive's extent, and the next push
-    # registers a range partially overlapping one the archive holds: the same
-    # offsets in two files, in the immutable tier, with nothing to repair it.
-    #
-    # So compaction takes the higher of the two. Pending may name a range the
-    # register never reached, which costs a merge that does not happen —
-    # nothing, next to a duplicate that cannot be undone.
-    PENDING_KEY = "archive_pending"
 
     def archived_through(self) -> int:
         """Highest offset the archive is known to hold, 0 if none (§5, I4).
@@ -255,17 +305,50 @@ class Maintenance:
 
         return 0 if recorded is None else int(recorded)
 
-    def archive_frontier(self) -> int:
-        """The highest offset the archive MAY hold — see `PENDING_KEY`.
+    def archived_prefix(
+        self, files: Sequence[DataFile], prefix: str | None, *, include_intents: bool
+    ) -> int:
+        """The highest `hi` whose whole prefix the archive holds (§4a).
 
-        For compaction, which must not merge a file the archive already has.
-        Never for eviction: this can name a range no register reached, and
-        deleting a local file on the strength of that would delete the only
-        copy.
+        I4 asked of segments. A file is the archive's business if the archive
+        holds THAT FILE'S ROWS, which `sync` wrote down when it pushed it. The
+        walk stops at the first file not fully held, so the answer stays a
+        prefix — which is what eviction needs, since it removes one.
+
+        **Coverage, not equality.** The two tiers cut the same rows into files
+        independently, and asking whether a local range EQUALS an archived one
+        was wrong the moment they could differ. `rewrite_archive` re-cuts the
+        archive to different boundaries by design — that is its entire job —
+        and every local file then matched nothing, for ever: eviction clamped
+        to zero and stopped, and compaction stopped seeing archived files as
+        the archive's business and merged across its extent. Neither heals,
+        because nothing ever re-cuts the archive back.
+
+        Exact rather than conservative in both directions, and that is the
+        point. A watermark had to be raised before a register to cover the
+        crash between the two, so it named ranges the archive might not hold,
+        and it had to be reset when the log was re-pointed, so it went
+        backwards past ranges the archive did hold. Neither is expressible
+        here: the row is written when the copy exists, and it names the bucket
+        it went to.
         """
-        pending = self._buffer.get_meta(self.PENDING_KEY)
+        ordered = sorted(files, key=lambda f: f.lo)
+        if not ordered:
+            return 0
 
-        return max(self.archived_through(), 0 if pending is None else int(pending))
+        covered = self._buffer.archived_ranges(
+            prefix, ordered[0].lo, include_intents=include_intents
+        )
+        reached = 0
+        for data_file in ordered:
+            # `record_file` stores the end offset exclusive, as every extent
+            # does — the cut is the offset AFTER the last row.
+            if not _covered(covered, data_file.lo, data_file.hi + 1):
+                break
+
+            reached = data_file.hi
+
+        return reached
 
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Merge runs of undersized adjacent files (§6).
@@ -289,22 +372,41 @@ class Maintenance:
         # FRESH table, committing evicted data back into the log.
         self._table.reload()
 
-        # The FRONTIER, not the watermark: everything the archive may already
-        # hold, including a register whose confirming write never landed.
-        archived = self.archive_frontier()
+        # Archived files are never inputs. A merge spanning the archive's
+        # extent either duplicates the rows already pushed or strands the ones
+        # above them, and skipping them makes that unreachable. They are a
+        # prefix, so dropping them cannot break adjacency.
+        #
+        # Asked per file (§4a). It also keeps the two tiers' ranges aligned:
+        # a file the archive holds is never rewritten locally, so the local
+        # range and the archived range stay the same range, which is what lets
+        # `archived_prefix` match them at all.
+        local = self._table.data_files()
+        # Asked of ANY archive, and asked even when none is configured. A
+        # merge across a range some archive holds makes a local file whose
+        # boundaries line up with nothing there — and nothing re-cuts a LOCAL
+        # straddler, so re-attaching that archive stalls the log for good:
+        # eviction pins below the straddler and every push is refused. Four
+        # legitimate operations reach it — detach, raise the target, maintain,
+        # re-attach — with no warning at any step.
+        #
+        # Skipping them is not free, and the earlier claim that it was — "a
+        # file with an archive copy is already at the target" — is false the
+        # moment the target is RAISED after the copy was made, which is the
+        # scenario this exists for. What it costs is that such a file stays at
+        # the size it was archived at; `rewrite_archive` is the tool for that.
+        # What it buys is that no merge can ever straddle a range an archive
+        # holds. `_push` applies the same exclusion, or the two deadlock.
+        archived = self.archived_prefix(local, None, include_intents=True)
+        pending = [f for f in local if f.hi > archived]
 
-        # Archived files are never inputs. Marking compaction output archivable
-        # is not enough on its own: a merge spanning the archive watermark
-        # either duplicates the rows already pushed or strands the ones above
-        # them. Skipping them makes that unreachable. They are a prefix — the
-        # watermark is contiguous — so dropping them cannot break adjacency.
-        pending = [f for f in self._table.data_files() if f.hi > archived]
-
+        # One read, so the two limits describe the same policy.
+        config = self.config
         for run in runs(
             pending,
-            self._config.compact_size,
+            config.compact_size,
             self.memory(),
-            self._config.compact_rows,
+            config.compact_rows,
         ):
             self._merge(run, heartbeat)
 
@@ -324,7 +426,7 @@ class Maintenance:
 
     def _merge(self, run: list[DataFile], heartbeat: Callable[[], bool] | None) -> None:
         """Compact a run, if there is enough of it to be worth a rewrite."""
-        if len(run) >= self._config.compact_min_files:
+        if len(run) >= self.config.compact_min_files:
             self._rewrite_run(self._table, run, heartbeat)
 
     def _rewrite_run(
@@ -334,6 +436,7 @@ class Maintenance:
         heartbeat: Callable[[], bool] | None = None,
         *,
         upload: bool = False,
+        owner: str | None = None,
     ) -> None:
         """Replace one run of adjacent files with a single merged one.
 
@@ -355,8 +458,76 @@ class Maintenance:
         # without listing — which for the archive would be a paginated LIST
         # over object storage, the thing this design refuses. Claimed as the
         # TARGET, so recovery knows which tier to remove it from.
+        # The range claimed before a byte is written, and the two are one
+        # question: may this merge run, and is the record of it live work or a
+        # dead process's leavings. A claim answers both (§4a) — and the check
+        # and the insert are one transaction, so eviction cannot have decided
+        # to drop this range while this decided to rewrite it.
+        # The OPERATION's owner, not a fresh one. A rewrite driven by a config
+        # change runs inside that change's whole-log claim, and minting an
+        # owner here would make this merge a rival to the operation it is part
+        # of — refused by its own claim, silently doing nothing.
+        claim = self._buffer.claim(
+            "compact", lo, hi, owner or new_owner(), self._key(target)
+        )
+        if not claim.acquire():
+            return
+
+        # The PREMISE re-read, now that the range is held. The file list came
+        # from before the claim, and a claim taken after the read isolates
+        # nothing on its own: eviction can have claimed this range, committed
+        # its removal and released it in between — which is a millisecond
+        # unless this thread stalls, and a stall past the TTL is precisely the
+        # threat the TTL exists for. The merge would then read the sources from
+        # a pre-eviction snapshot, still on disk under I6's grace, and
+        # `_commit` would retry the swap onto the fresh table and put every
+        # evicted row back.
+        table.reload()
+        current = table.data_files()
+        live = {f.path for f in current}
+        if not all(f.path in live for f in run):
+            claim.release()
+
+            return
+
+        # The archive premise too, not only the inputs' liveness. The run was
+        # grouped at pass start against the watermark as it was then, and a
+        # sync that ran since — under a policy whose grouping settles a partial
+        # prefix of this run — can have pushed part of it. Merging what is left
+        # commits a LOCAL file straddling the archive's extent, and nothing
+        # re-cuts a local straddler: `rewrite_archive` works the other side.
+        #
+        # The archive read DURABLY here, not from this object's memory. A
+        # compaction pass holds no pass-level claim — only per-run ones — so a
+        # `set_archive` is free between two runs of one pass, and the shipped
+        # writer calls it on every restart. Answered from pass-start memory,
+        # this guard would report "no archive" for the rest of a pass that now
+        # has one, and skip itself entirely.
+        # From then on every push is refused by `_refuse_straddle`, the
+        # watermark never advances again, and eviction pins on it.
+        if table is self._table:
+            archived = self.archived_prefix(current, None, include_intents=True)
+            if any(f.lo <= archived for f in run):
+                claim.release()
+
+                return
+
         self._buffer.claim_compaction(lo, hi, self._key(target))
-        self._write_merge(table, run, rel_path, target, heartbeat, upload=upload)
+        try:
+            # The claim renews itself while the merge runs. A rewrite over a
+            # large run outlasts the TTL, and letting it lapse would invite
+            # another owner onto the same range mid-write.
+            self._write_merge(
+                table,
+                run,
+                rel_path,
+                target,
+                _both(claim.renew, heartbeat),
+                upload=upload,
+            )
+        finally:
+            claim.release()
+
         # Only this one. Another operation's claim — a rewrite that crashed
         # before recovery ran — is not ours to retire.
         self._buffer.clear_compaction(self._key(target))
@@ -411,12 +582,23 @@ class Maintenance:
         # this commit is still reading them (I6).
         self._enqueue(f.path for f in run)
         table.replace_range(lo, hi, [target])
+        # Re-dated to the commit, for the reason `restamp_deletions` gives: a
+        # merge that failed between the queueing and this line and was retried
+        # later would otherwise supersede these files against a stamp already
+        # spent.
+        self._buffer.restamp_deletions(
+            (self._key(f.path) for f in run), int(datetime.now(UTC).timestamp())
+        )
         # After the commit: until it lands the sources are still the live
         # files, and moving their sizes onto an output that never became real
         # would leave every one of them unmeasured.
         self._buffer.record_merge(self._key(target), (self._key(f.path) for f in run))
 
-    def rewrite_sorted(self, heartbeat: Callable[[], bool] | None = None) -> None:
+    def rewrite_sorted(
+        self,
+        heartbeat: Callable[[], bool] | None = None,
+        owner: str | None = None,
+    ) -> None:
         """Re-cluster every data file under the current sort order (§7).
 
         File boundaries are preserved rather than merged: a rewrite is already
@@ -433,10 +615,52 @@ class Maintenance:
         # before it outlasts a user's patience. Per file rather than per pass,
         # because a pass here has no phases to sit between.
         for data_file in self._table.data_files():
-            self._rewrite_run(self._table, [data_file])
+            self._rewrite_run(self._table, [data_file], owner=owner)
             checkpoint(heartbeat)
 
     # -- eviction -----------------------------------------------------------
+
+    def _retention_boundary(self) -> int:
+        """The highest offset the retention policies would drop, before I4.
+
+        Files cover contiguous non-overlapping ranges, so evicting a prefix is
+        a single upper bound. Anything newer is untouched — and each policy is
+        one such bound, so honouring both is taking the lower. They are floors
+        on what stays readable locally, so the one that retains MORE wins,
+        which is the opposite of how the seal combines its two limits (§12).
+
+        Its own method because eviction computes it twice: once to decide
+        whether there is work and what range to claim, and again under that
+        claim, where the answer is the one acted on.
+        """
+        # ONE read, held for the whole decision. Each `self.config` is an
+        # independent read of the durable row now, so two of them inside one
+        # decision can disagree — and here they did arithmetic on each other:
+        # `local_rows` seen as an int by the test and as None by the
+        # subtraction is `int - None`, a TypeError out of `maintain()`. The
+        # shipped maintainer catches RuntimeError and CommitFailedException, so
+        # that killed the process and stopped maintenance entirely.
+        #
+        # The fix is not a lock: it is that a decision reads the policy once.
+        # Fresh per decision, coherent within it.
+        config = self.config
+        limits: list[int] = []
+        retention = config.local_retention
+        if retention is not None:
+            cutoff = datetime.now(UTC) - retention
+            stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
+            # Nothing old enough is a limit of zero, not an absent one: it
+            # means this policy would keep everything.
+            limits.append(max((f.hi for f in stale), default=0))
+
+        if config.local_rows is not None:
+            # Offsets are contiguous, so the newest `local_rows` of them start
+            # here. AUTOINCREMENT can leave a gap where a transaction rolled
+            # back, which makes this retain slightly more than asked rather
+            # than less — the safe direction for a floor.
+            limits.append(self._buffer.next_offset() - 1 - config.local_rows)
+
+        return min(limits) if limits else 0
 
     def evict(self) -> None:
         """Drop files older than `local_retention` from the local table (§8).
@@ -447,9 +671,11 @@ class Maintenance:
         With no archive this is deletion of the only copy. That is the contract
         a local-only log with a retention asks for; see §8.
         """
-        retention = self._config.local_retention
-        keep_rows = self._config.local_rows
-        if retention is None and keep_rows is None:
+        # The POLICY re-read first, because it decides everything below. Read
+        # again under the claim as well: this one only decides whether there is
+        # work, and the one that decides the deletion has to be the guarded one.
+        config = self.config
+        if config.local_retention is None and config.local_rows is None:
             return
 
         # Same reason as `compact`: this decides what to drop from the ages a
@@ -457,43 +683,47 @@ class Maintenance:
         self._table.reload()
         self._age_cache = None
 
-        # Files cover contiguous non-overlapping ranges, so evicting a prefix
-        # is a single upper bound. Anything newer is untouched — and each
-        # policy is one such bound, so honouring both is taking the lower.
-        # They are floors on what stays readable locally, so the one that
-        # retains MORE wins, which is the opposite of how the seal combines its
-        # two limits (§12).
-        limits: list[int] = []
-        if retention is not None:
-            cutoff = datetime.now(UTC) - retention
-            stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
-            # Nothing old enough is a limit of zero, not an absent one: it
-            # means this policy would keep everything.
-            limits.append(max((f.hi for f in stale), default=0))
-
-        if keep_rows is not None:
-            # Offsets are contiguous, so the newest `keep_rows` of them start
-            # here. AUTOINCREMENT can leave a gap where a transaction rolled
-            # back, which makes this retain slightly more than asked rather
-            # than less — the safe direction for a floor.
-            limits.append(self._buffer.next_offset() - 1 - keep_rows)
-
-        boundary = min(limits)
-        # Snapped DOWN to a file boundary. The age limit is already one — it is
-        # some file's `hi` — and so is the archive clamp, but the row floor is
-        # arbitrary and lands mid-file on most passes. A mid-file boundary is
-        # not a smaller eviction: `evict_through` filters by row, so pyiceberg
-        # rewrites the straddling file copy-on-write, and the replacement is
-        # written at a path this library never learns. That breaks the rule the
-        # whole deletion design rests on — every file's path is in SQLite
-        # before the file exists (I2) — and leaves the superseded original out
-        # of the queue, so once expiry drops the snapshots naming it, nothing
-        # can name it again. `drain` is a keyed read and this design refuses
-        # directory scans, so the file is unreclaimable for good.
+        # Provisional: enough to decide whether there is work at all, and what
+        # range to claim. The answer that gets acted on is recomputed below,
+        # under the claim.
+        boundary = self._retention_boundary()
         files = self._table.data_files()
         boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
         if boundary <= 0:
             return
+
+        # The prefix claimed before anything that decides a deletion is read
+        # under it, and eviction declares rather than merely consulting (§4a).
+        # An operation that only reads has decided and said nothing durable, so
+        # a merge claiming a range that straddles this boundary between the
+        # read and the commit puts back exactly what this is about to drop.
+        # Both sides declaring in one transaction makes the ordering total.
+        #
+        # Claimed on the UNCLAMPED boundary, which only ever falls from here —
+        # so this covers a superset of what is removed. Claiming the clamped
+        # range would mean reading the archive's premise outside the claim,
+        # which is the defect below.
+        removal = self._buffer.claim("evict", 0, boundary, new_owner())
+        if not removal.acquire():
+            return
+
+        # Everything that decides a deletion, re-read UNDER the claim, because
+        # everything read before it is a statement about the past.
+        #
+        # `sync` learned this for itself — "UNDER the lease, not before it" —
+        # and eviction acts on the same facts without having learned it. The
+        # window is not narrow: `set_archive` is documented as something the
+        # shipped writer calls on every restart, and it takes the whole log,
+        # which is free precisely while this holds nothing. Attaching an
+        # archive between the read and the acquire left this deleting the only
+        # copy of every aged row the new archive was configured to receive, and
+        # sync can never push them afterwards because they have left the table.
+        # Re-pointing left it evicting on a clamp earned by the OLD archive,
+        # whose rows the read path no longer scans.
+        self._table.reload()
+        self._age_cache = None
+        files = self._table.data_files()
+        boundary = min(boundary, self._retention_boundary())
 
         # I4: a file the archive still lacks must not leave the local table,
         # because with an archive configured the local copy stops being the
@@ -504,28 +734,74 @@ class Maintenance:
         # With no archive there is nothing owed: §8 says `local_retention` is
         # then a deletion policy over the only copy, which is the contract the
         # operator asked for.
-        # Re-read from the buffer rather than trusted from memory. Another
-        # process can attach an archive to a log this maintainer already has
-        # open, and nothing else here would ever hear about it: `sync` is what
-        # refreshes this object, and a maintainer that believes the log is
-        # local-only never syncs. It would go on deleting the only copy of
-        # every row that ages past `local_retention`, for as long as it ran,
-        # while the durable configuration promised I4.
-        self._archive.refresh(self._buffer.get_meta(ARCHIVE_KEY) or None)
         if self._archive.configured():
-            boundary = min(boundary, self.archived_through())
-            if boundary <= 0:
-                return
+            boundary = min(
+                boundary,
+                # I4 asks whether the archive HAS it, so intents are excluded:
+                # deleting the only local copy on the strength of an intended
+                # one is the loss this whole record exists to prevent.
+                self.archived_prefix(files, self._archive.uri, include_intents=False),
+            )
+
+        # Snapped DOWN to a file boundary, against the list as it is now. The
+        # age limit is already one — some file's `hi` — and so is the archive
+        # clamp, but the row floor is arbitrary and lands mid-file on most
+        # passes. A mid-file boundary is not a smaller eviction:
+        # `evict_through` filters by row, so pyiceberg rewrites the straddling
+        # file copy-on-write at a path this library never learns. That breaks
+        # the rule the whole deletion design rests on — every file's path is in
+        # SQLite before the file exists (I2) — and leaves the superseded
+        # original out of the queue, so once expiry drops the snapshots naming
+        # it, nothing can name it again.
+        boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
+        if boundary <= 0:
+            removal.release()
+
+            return
 
         # Everything the boundary REMOVES, not just what looked old enough to
         # trigger it. A compaction output has a fresh snapshot age, so it never
         # appears in `stale` — but its offsets can sit below a stale file's
         # `hi`, so the boundary drops it too. Queueing only `stale` left it
         # removed from the table and named by nothing.
-        self._enqueue(f.path for f in files if f.hi <= boundary)
-        self._table.evict_through(boundary)
+        try:
+            # Still ours? The merge path asks this immediately before its
+            # commit and eviction did not, which left the asymmetry that
+            # matters: this claim expires 30 s after it was taken, and a stall
+            # past the TTL is the threat the TTL exists for. Lapsed, a
+            # compaction may claim a run below this boundary and pass its own
+            # premise check truthfully, because the sources ARE still live —
+            # and then this commit removes them and the merge, whose claim is
+            # valid throughout, commits them back with a fresh `named_at` that
+            # shields them for another whole retention period.
+            #
+            # In the other order it is worse: the merge lands first, this
+            # commit's CAS retries onto the fresh table, and the delete removes
+            # the merged output, which is in nobody's deletion queue. Once
+            # expiry drops the snapshots naming it, nothing can name it again.
+            checkpoint(removal.renew)
+            dropped = [f.path for f in files if f.hi <= boundary]
+            self._enqueue(dropped)
+            self._table.evict_through(boundary)
+            # Re-dated to the commit, like every other supersession. Eviction
+            # needs it without any failure at all: `hydrate` re-registers a
+            # file under the very path the queue still holds, drain's veto then
+            # preserves that entry rather than draining it, and the re-enqueue
+            # when the hydrated file is evicted again is an INSERT OR IGNORE
+            # that keeps the FIRST eviction's stamp — from `local_retention`
+            # ago. Measured: files unlinked 0.078 s after leaving the table
+            # against a three-second grace.
+            self._buffer.restamp_deletions(
+                (self._key(p) for p in dropped), int(datetime.now(UTC).timestamp())
+            )
+        finally:
+            removal.release()
 
-    def rewrite_archive(self, heartbeat: Callable[[], bool] | None = None) -> None:
+    def rewrite_archive(
+        self,
+        heartbeat: Callable[[], bool] | None = None,
+        owner: str | None = None,
+    ) -> None:
         """Re-cut undersized archived files to `target_size` (§6, ad-hoc).
 
         Not part of `maintain`, and not expected to be needed. The archive is
@@ -583,7 +859,7 @@ class Maintenance:
         # refuses to delete anything the table still references, so an entry
         # made for a commit that never lands simply never comes due.
         self._enqueue(data_file.path for data_file in stale)
-        self._recut(archive, stale, heartbeat)
+        self._recut(archive, stale, heartbeat, owner)
 
     def _badly_sized(self, archive: LogTable) -> list[DataFile]:
         """The archived files from the first one under `target_size` on.
@@ -598,7 +874,7 @@ class Maintenance:
         guess about what it holds.
         """
         held = self.memory()
-        target = self._config.compact_size
+        target = self.config.compact_size
         files = archive.data_files()
         for index, data_file in enumerate(files):
             if held.get(data_file.path, target) < target:
@@ -611,6 +887,7 @@ class Maintenance:
         archive: LogTable,
         stale: list[DataFile],
         heartbeat: Callable[[], bool] | None = None,
+        owner: str | None = None,
     ) -> None:
         """Append `stale` back through a buffer and seal it out again."""
         lo, hi = stale[0].lo, stale[-1].hi
@@ -634,10 +911,30 @@ class Maintenance:
         scratch = Buffer.open(
             self._layout.rewrite_db,
             self._buffer.schema,
-            target_size=self._config.compact_size,
             durable=False,
         )
-        written: list[str] = []
+        # The scratch reads its cut size from its OWN `meta`, like every
+        # buffer, so it needs a policy written into it. It is a fresh database
+        # with no config row, and without this it would silently size its cuts
+        # by the library defaults rather than by the target this rewrite is
+        # re-cutting to — which is the entire point of the operation.
+        # BOTH targets mapped, not only the size. The scratch cuts at whichever
+        # ceiling comes first, so carrying the live seal ROW cap made a rewrite
+        # cut its outputs at the seal's row limit while the archive holds files
+        # sized to the compact one — eight times more files than it started
+        # with, each still undersized by bytes, so the next `rewrite_archive`
+        # flags the same tail again and the operation never converges. It is
+        # meant to merge undersized archived files; that inverted it.
+        config = self.config
+        scratch.set_meta(
+            CONFIG_KEY,
+            replace(
+                config,
+                target_seal_size=config.compact_size,
+                target_seal_rows=config.compact_rows,
+            ).to_json(),
+        )
+        written: list[tuple[str, int, int, int]] = []
         expected = 0
         try:
             # The rows keep the offsets they already have (§4), so the counter
@@ -676,11 +973,38 @@ class Maintenance:
             msg = f"archive rewrite read {expected} rows for offsets {lo}-{hi}"
             raise RuntimeError(msg)
 
-        archive.replace_range(lo, hi, [archive.uri(path) for path in written])
+        # Checked between writing and committing, the same as `_write_merge`
+        # and for the same reason — those are the two halves a lapsed claim
+        # separates. This one went without, and the archive side is where it
+        # costs most: a rewrite that stalls past the TTL lets recovery take the
+        # claim and queue every one of its outputs, `drain` snapshots its
+        # reference veto once per pass while they are still unreferenced, and
+        # then this commit lands. Drain deletes the objects the manifest now
+        # names, the superseded originals become unreferenced and are deleted
+        # in turn, and the range exists in no object at all — with every guard
+        # behaving exactly as written.
+        #
+        # Renewing here makes that unreachable rather than unlikely: recovery's
+        # acquire deleted this claim's row, so the renew finds nothing and the
+        # rewrite aborts while the originals are still live.
+        checkpoint(heartbeat)
+        archive.replace_range(lo, hi, [archive.uri(p) for p, _, _, _ in written])
+        # The grace period starts HERE, not when they were queued. A reader
+        # cannot hold a file the commit has not yet superseded, and a rewrite
+        # slower than `snapshot_retention` would otherwise have burnt the whole
+        # of it before this line — leaving the originals due the instant they
+        # stopped being referenced.
+        self._buffer.restamp_deletions(
+            (self._key(f.path) for f in stale), int(datetime.now(UTC).timestamp())
+        )
+        # Now they are the archive's, so the intents become records.
+        for path, start, end, held in written:
+            self._buffer.record_file(archive.uri(path), start, end, held)
+
         # Each of this rewrite's own claims, now that the commit names every
         # object they described. Clearing the table wholesale would also retire
         # claims left by an operation that crashed and has not been recovered.
-        for path in written:
+        for path, _, _, _ in written:
             self._buffer.clear_compaction(archive.uri(path))
 
     def _discard_scratch(self) -> None:
@@ -695,11 +1019,11 @@ class Maintenance:
         scratch: Buffer,
         archive: LogTable,
         heartbeat: Callable[[], bool] | None = None,
-    ) -> list[str]:
+    ) -> list[tuple[str, int, int, int]]:
         """Write out every extent the scratch buffer has cut, and return their
         names. The seal's own loop: take the queued range, claim the path
         before the file exists, write, and retire the extent."""
-        written: list[str] = []
+        written: list[tuple[str, int, int, int]] = []
         while True:
             queued = scratch.pending_group()
             if queued is None:
@@ -724,18 +1048,30 @@ class Maintenance:
             dest.parent.mkdir(parents=True, exist_ok=True)
             pq.write_table(rows, dest)
             fsync(dest)
+            # The bytes the scratch buffer counted for exactly these rows,
+            # which is the same number the appender would have recorded had
+            # they been cut this way the first time — and the scratch is torn
+            # down before the commit, so this is the last moment they exist.
+            held = scratch.group_bytes(end)
+            # INTENDED before the object is written, and only recorded once
+            # `replace_range` has committed. Until then these files are not the
+            # archive's, so a row saying they are would let eviction drop the
+            # local copies of rows the archive does not yet hold. The intent
+            # says the opposite thing to the opposite reader: compaction must
+            # not merge across them, because it is about to.
+            self._buffer.intend_file(archive.uri(rel_path), start, end, held)
             archive.put(dest, rel_path)
             dest.unlink(missing_ok=True)
             checkpoint(heartbeat)
 
-            # The bytes the scratch buffer counted for exactly these rows,
-            # which is the same number the appender would have recorded had
-            # they been cut this way the first time.
-            self._buffer.record_file(
-                archive.uri(rel_path), start, end, scratch.group_bytes(end)
-            )
             scratch.finish_seal(end, rel_path)
-            written.append(rel_path)
+            # Carried in memory, not read back from the intent: a rival sync
+            # that took over a lapsed claim may drop these rows while this
+            # rewrite is still running, and a confirm that depended on them
+            # would silently record the default size instead — which for the
+            # deliberately undersized tail means `_badly_sized` treats it as
+            # full for ever.
+            written.append((rel_path, start, end, held))
 
     def _written(self, data_file: DataFile) -> datetime:
         """When a file was written, for `local_retention` to measure against.
@@ -770,7 +1106,7 @@ class Maintenance:
 
     def expire(self) -> None:
         """Expire snapshots past `snapshot_retention`, then reclaim (§6, §8)."""
-        cutoff = datetime.now(UTC) - self._config.snapshot_retention
+        cutoff = datetime.now(UTC) - self.config.snapshot_retention
 
         # Collect the doomed snapshots' manifest lists and manifests BEFORE
         # expiring them. Afterwards their names exist nowhere: the metadata that
@@ -790,8 +1126,22 @@ class Maintenance:
         # a live snapshot is skipped every pass until that snapshot expires too,
         # and then retired. The cost is queue rows that wait, against files that
         # could not be found at all.
+        doomed = list(doomed)
         self._enqueue(doomed)
         self._table.expire_snapshots_older_than(cutoff)
+        # The same correction, for the same reason. Narrower here — a manifest
+        # is read at query bind rather than throughout a streaming scan — but
+        # an expiry that failed between the queue and the commit and ran again
+        # a pass later would otherwise retire these the instant they became
+        # unreferenced.
+        # Through `_key`, like the enqueue above it. `metadata_paths` returns
+        # absolute paths and the queue is keyed root-relative, so passing them
+        # raw made this an UPDATE matching nothing — silently, because that is
+        # what SQL does. Every other restamp site happens to be key-invariant
+        # (an `s3://` URI) or already mapped, which is why only this one hid.
+        self._buffer.restamp_deletions(
+            (self._key(p) for p in doomed), int(datetime.now(UTC).timestamp())
+        )
         self._expire_archive(cutoff)
         self.drain()
 
@@ -816,12 +1166,41 @@ class Maintenance:
         if not any(is_remote(p) for p in self._buffer.queued_deletions()):
             return
 
+        # CLAIMED, because what follows opens the archive with `repair` on.
+        # Expiry is exempt from claims on the grounds that it is a metadata
+        # commit CAS orders — true of the snapshot expiry, and not true of a
+        # repairing open, which DROPS a catalog entry naming another prefix and
+        # creates a table in its place. That privilege belongs to a claim
+        # holder: two of them at once collide on the first attempt, because
+        # pyiceberg writes the metadata object before inserting the catalog
+        # row, and the loser raises a bare `Exception` the shipped maintainer
+        # does not catch. Worse, a claimless drop can land after a claim holder
+        # has already created and registered, taking the live entry with it.
+        #
+        # Rounds nine and ten fixed WHICH archive a repairing open targets.
+        # This is the other half — who is entitled to repair one — and this
+        # call site inherited expiry's exemption without it applying.
+        sweep = self._buffer.claim("expire-archive", 0, EVERYTHING, new_owner())
+        if not sweep.acquire():
+            return
+
+        try:
+            self._expire_archive_claimed(cutoff, sweep)
+        finally:
+            sweep.release()
+
+    def _expire_archive_claimed(self, cutoff: datetime, sweep: Claim) -> None:
+        """The archive half of expiry, with the claim held. See `_expire_archive`."""
         archive = self._archive.table(repair=True)
         if archive is None:
             return
 
-        self._enqueue(archive.metadata_paths(archive.snapshots_older_than(cutoff)))
+        checkpoint(sweep.renew)
+
+        retiring = list(archive.metadata_paths(archive.snapshots_older_than(cutoff)))
+        self._enqueue(retiring)
         archive.expire_snapshots_older_than(cutoff)
+        self._buffer.restamp_deletions(retiring, int(datetime.now(UTC).timestamp()))
 
     def drain(self) -> None:
         """Delete files whose grace period has passed.
@@ -835,67 +1214,108 @@ class Maintenance:
         """
         # Read against the CURRENT snapshot_retention, so lowering it takes
         # effect on files already queued.
-        cutoff = datetime.now(UTC) - self._config.snapshot_retention
+        cutoff = datetime.now(UTC) - self.config.snapshot_retention
         due = self._buffer.due_deletions(int(cutoff.timestamp()))
         if not due:
             return
 
-        # Reloaded first. This veto is the last thing standing between the
-        # deletion queue and an unrecoverable mistake, and asked of a handle
-        # that predates another process's commit it reports a live file as
-        # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
-        self._table.reload()
-        referenced = self._table.referenced_paths()
-        # Only if the queue holds something remote, so an ordinary drain on a
-        # local-only log still opens nothing. `rewrite_archive` is what puts
-        # remote entries here, and it is an operation somebody ran on purpose.
-        remote = (
-            self._archive.table(repair=True) if any(is_remote(p) for p in due) else None
-        )
-        remote_referenced = set() if remote is None else remote.referenced_paths()
+        # Claimed, because this UNLINKS. §4a calls expiry safe to run
+        # claimless on the grounds that it is a metadata commit ordered by CAS,
+        # and that is true of the expiry; it is not true of the deletion that
+        # follows it. Consulting the table without declaring anything leaves
+        # the window every other pass here was made to close: `hydrate`
+        # re-registers a file under the very name the queue still holds — it
+        # reuses the archived key deliberately — and it can commit that
+        # between this veto being read and the file being unlinked. The local
+        # table then references a file that is not there, and every scan over
+        # that range raises until eviction ages the entry out.
+        #
+        # The whole log, since the queue names files from anywhere in it. A
+        # refusal costs nothing: the entries stay due and the next pass takes
+        # them.
+        sweep = self._buffer.claim("drain", 0, EVERYTHING, new_owner())
+        if not sweep.acquire():
+            return
 
-        for rel_path in due:
-            if is_remote(rel_path):
-                if remote is None or rel_path in remote_referenced:
+        try:
+            # Reloaded first. This veto is the last thing standing between the
+            # deletion queue and an unrecoverable mistake, and asked of a handle
+            # that predates another process's commit it reports a live file as
+            # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
+            self._table.reload()
+            referenced = self._table.referenced_paths()
+            # Only if the queue holds something remote, so an ordinary drain on a
+            # local-only log still opens nothing. `rewrite_archive` is what puts
+            # remote entries here, and it is an operation somebody ran on purpose.
+            remote = (
+                self._archive.table(repair=True)
+                if any(is_remote(p) for p in due)
+                else None
+            )
+            remote_referenced = set() if remote is None else remote.referenced_paths()
+
+            for rel_path in due:
+                if is_remote(rel_path):
+                    if remote is None or rel_path in remote_referenced:
+                        continue
+
+                    # Only objects belonging to the archive this log is pointed at.
+                    # A queued remote path names the archive it was superseded in,
+                    # and the veto above asks the CURRENT one — so after a
+                    # re-point, entries left by a rewrite on the old archive would
+                    # be checked against a new archive that references nothing and
+                    # deleted from the old bucket, where they may still be live and
+                    # may be the only copy of rows already evicted locally.
+                    #
+                    # Left queued rather than forgotten: they are somebody's to
+                    # resolve, and the log that owns that archive is the one that
+                    # can say whether they are dead. A stranded queue row is a
+                    # bounded cost; deleting live data in a bucket this log no
+                    # longer understands is not.
+                    #
+                    # Normalised, because the configured URI may carry a trailing
+                    # slash while every queued path is built from it stripped. The
+                    # mismatch would classify this log's OWN objects as another
+                    # archive's and wedge the remote queue permanently.
+                    if not rel_path.startswith(
+                        f"{(self._archive.uri or '').rstrip('/')}/"
+                    ):
+                        continue
+
+                    checkpoint(sweep.renew)
+                    remote.remove(rel_path)
+                    self._buffer.forget_deletion(rel_path)
                     continue
 
-                # Only objects belonging to the archive this log is pointed at.
-                # A queued remote path names the archive it was superseded in,
-                # and the veto above asks the CURRENT one — so after a
-                # re-point, entries left by a rewrite on the old archive would
-                # be checked against a new archive that references nothing and
-                # deleted from the old bucket, where they may still be live and
-                # may be the only copy of rows already evicted locally.
-                #
-                # Left queued rather than forgotten: they are somebody's to
-                # resolve, and the log that owns that archive is the one that
-                # can say whether they are dead. A stranded queue row is a
-                # bounded cost; deleting live data in a bucket this log no
-                # longer understands is not.
-                #
-                # Normalised, because the configured URI may carry a trailing
-                # slash while every queued path is built from it stripped. The
-                # mismatch would classify this log's OWN objects as another
-                # archive's and wedge the remote queue permanently.
-                if not rel_path.startswith(f"{(self._archive.uri or '').rstrip('/')}/"):
+                path = self._layout.absolute(rel_path)
+                if str(path) in referenced:
+                    # A compaction can re-register a path the queue still holds.
+                    # Deleting a referenced file is unrecoverable, so the check is
+                    # worth its cost even though the grace period should preclude it.
                     continue
 
-                remote.remove(rel_path)
+                # Still ours, asked before EVERY deletion rather than once at
+                # the top. The unlink is this pass's commit, and §4a's rule
+                # applies to it like any other: holding a claim is asked again
+                # at the commit. It matters here because everything slow in
+                # this pass sits between the veto being read and the deletions
+                # — opening the archive, walking its manifests, and one remote
+                # round trip per queued object, measured at ~650 ms each. Past
+                # the TTL, a `hydrate` may lawfully take the whole log, register
+                # a file under the very name still queued here, and release;
+                # this would then unlink it against a stale veto and leave the
+                # local table pointing at a file that is not there.
+                #
+                # Entries left behind cost nothing: they stay due.
+                checkpoint(sweep.renew)
+                # Unlink first, forget second. A crash between them leaves a row
+                # whose unlink is already a no-op; the reverse leaks the file with
+                # nothing left pointing at it.
+                path.unlink(missing_ok=True)
                 self._buffer.forget_deletion(rel_path)
-                continue
 
-            path = self._layout.absolute(rel_path)
-            if str(path) in referenced:
-                # A compaction can re-register a path the queue still holds.
-                # Deleting a referenced file is unrecoverable, so the check is
-                # worth its cost even though the grace period should preclude it.
-                continue
-
-            # Unlink first, forget second. A crash between them leaves a row
-            # whose unlink is already a no-op; the reverse leaks the file with
-            # nothing left pointing at it.
-            path.unlink(missing_ok=True)
-            self._buffer.forget_deletion(rel_path)
+        finally:
+            sweep.release()
 
     def _key(self, path: str) -> str:
         """How a file is named in SQLite, whichever tier it is in.

@@ -11,13 +11,14 @@ three tiers that only means anything when one of them is genuinely remote.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
+from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._s3 import S3Options
@@ -646,10 +647,13 @@ def test_a_read_never_repairs_the_archive_catalog(
         assert first is not None
 
     # The entry now names `first`, while the log is pointed at `second`.
+    # Written straight to `meta` rather than through `set_archive`, so nothing
+    # has had the chance to repair the entry before the read sees it.
     second = f"s3://{bucket}/elsewhere"
-    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
-        reader._archive.set_uri(second)
+    with Log.open(tmp_path, "s", s3=s3) as writer:
+        writer._buffer.set_meta("archive", second)
 
+    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         with pytest.raises(ValueError, match="not under"):
             reader._archive.table()
 
@@ -717,10 +721,12 @@ def test_repointing_cannot_interleave_with_a_sync(
         log.extend(rows(200))
         log.seal_due()
 
+        # Short, so the bounded wait does not make this test wait it out.
+        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
         held = log._lease("maintain")
         assert held.acquire()
         try:
-            with pytest.raises(RuntimeError, match="maintenance lease"):
+            with pytest.raises(RuntimeError, match="has held a claim"):
                 log.set_archive(f"s3://{bucket}/elsewhere")
         finally:
             held.release()
@@ -852,39 +858,95 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         )
 
 
-def test_a_failed_push_cannot_wedge_sync_and_compaction(
+def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The frontier must not outlive the question it answers.
+    """The crash window I4-per-segment has, and how it closes (§4a).
 
-    It is written before a register is attempted and blocks compaction, so a
-    register that failed left it standing — and if `stable_prefix` then needed
-    that very merge before anything could settle, sync waited on a compaction
-    the frontier forbade while being the only thing that cleared it. Both
-    passes returned success, for ever.
+    The row naming a file's archive copy is written AFTER the register, so a
+    crash between the two leaves the archive holding a range nothing local
+    records. Compaction decides from those rows, so it would merge that file
+    into one spanning the archive's extent, and the next push would register a
+    partially overlapping range — which `register` admits, because it declines
+    only a range entirely covered.
 
-    Reproduced at its narrowest: a pass that settles nothing at all. Before the
-    fix that pass returns early, above the only line that overwrote the
-    frontier, and the log never compacts or evicts again.
+    Nothing is promised beforehand to cover it. The archive's own manifest is
+    the truth, and the next push reads it anyway, so recovery is a backfill.
     """
     with archived_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
         log.sync()
-        settled = log.archived_through()
+        local = log._table.data_files()
+        settled = log._maintenance.archived_prefix(
+            local, log._archive.uri, include_intents=False
+        )
+
         assert settled > 0
 
-        # A push that recorded its intent and then failed, with nothing left
-        # for the next pass to settle.
-        log._buffer.set_meta(Maintenance.PENDING_KEY, str(settled + 10_000))
-        assert log._maintenance.archive_frontier() > settled
+        # The register landed; the rows recording it did not.
+        with log._buffer._lock:
+            log._buffer._con.execute("DELETE FROM extent WHERE rel_path LIKE 's3://%'")
+            log._buffer._con.commit()
+
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == 0
+        ), "the setup must actually reproduce the crash"
 
         log.sync()
 
-        assert log._maintenance.archive_frontier() == settled, (
-            "a frontier the extent has answered must not survive the pass"
-        )
-        assert log.archived_through() == settled
+        assert (
+            log._maintenance.archived_prefix(
+                log._table.data_files(), log._archive.uri, include_intents=False
+            )
+            == settled
+        ), "the archive's manifest says what it holds; recover from it"
+        assert log.scan(include_archive=True).read_all().num_rows == ROWS
+
+
+def test_the_backfill_sees_copies_another_process_pushed(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The manifest is read as it IS, not as this handle last saw it.
+
+    A pyiceberg handle is a frozen snapshot and `Archive` caches it for the
+    life of the process, so a maintainer that synced, released the lease and
+    took it back would otherwise recover against an archive that has since
+    grown — and go on treating another maintainer's pushes as unarchived.
+    """
+    with archived_log(tmp_path, bucket, s3) as writer:
+        writer.extend(rows(ROWS))
+        writer.seal_due()
+        writer.sync()
+
+        with Log.open(tmp_path, "s", s3=s3) as other:
+            # `other` caches its archive handle here, at today's extent.
+            assert other.archive_files() > 0
+
+            writer.extend(rows(ROWS))
+            writer.seal_due()
+            writer.sync()
+            grown = writer._maintenance.archived_prefix(
+                writer._table.data_files(), writer._archive.uri, include_intents=False
+            )
+
+            with other._buffer._lock:
+                other._buffer._con.execute(
+                    "DELETE FROM extent WHERE rel_path LIKE 's3://%'"
+                )
+                other._buffer._con.commit()
+
+            other.sync()
+
+            assert (
+                other._maintenance.archived_prefix(
+                    other._table.data_files(), other._archive.uri, include_intents=False
+                )
+                == grown
+            ), "recovered against a stale manifest"
 
 
 def test_repointing_to_the_same_archive_spelled_differently_keeps_the_watermark(
@@ -964,59 +1026,6 @@ def test_a_repoint_is_all_or_nothing(
         else:
             assert log.archived_through() == 0, (
                 "a new archive must not inherit the old one's promise"
-            )
-
-
-def test_the_reconcile_reads_a_current_archive_extent(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A stale extent retires the frontier over a range the archive holds.
-
-    `sync` resolves the frontier on the strength of what the archive is
-    observed to contain, so the observation has to be current. A pyiceberg
-    handle is a frozen snapshot and `Archive` caches it for the life of the
-    process, so a maintainer that synced, released the lease and took it back
-    reads the archive as it was before another maintainer's register.
-
-    Set up at the state that makes it bite: a register that landed while the
-    watermark write after it did not. The frontier is then the only thing
-    standing between compaction and a merge straddling the archive's extent,
-    and a stale reconcile retires it while confirming nothing.
-    """
-    with archived_log(tmp_path, bucket, s3) as writer:
-        writer.extend(rows(ROWS))
-        writer.seal_due()
-        writer.sync()
-        settled = writer.archived_through()
-        assert settled > 0
-
-        with Log.open(tmp_path, "s", s3=s3) as other:
-            # `other` caches its archive handle here, at today's extent.
-            assert other.archive_files() > 0
-
-            writer.extend(rows(ROWS))
-            writer.seal_due()
-            writer.sync()
-            grown = writer.archived_through()
-            assert grown > settled
-
-            # That second push, as a crash between the register and its
-            # confirming write leaves it.
-            other._buffer.set_meta_all(
-                {
-                    Maintenance.ARCHIVED_KEY: str(settled),
-                    Maintenance.PENDING_KEY: str(grown),
-                }
-            )
-
-            other.sync()
-
-            assert other.archived_through() == grown, (
-                "the watermark must be reconciled against the archive as it is, "
-                "not as this handle last saw it"
-            )
-            assert other._maintenance.archive_frontier() == grown, (
-                "the frontier must not be retired over a range nothing confirmed"
             )
 
 
@@ -1175,15 +1184,14 @@ def test_restating_the_archive_from_a_stale_process_keeps_the_watermark(
         assert settled > 0
 
         with Log.open(tmp_path, "s", s3=s3) as other:
-            # This process's memory goes stale the way a long-running one does.
-            other._archive.set_uri(None)
-
+            # There is no per-process memory to go stale any more, so the
+            # case this once modelled cannot arise: re-asserting the archive
+            # the log already has reads the same durable value either way.
             other.set_archive(f"s3://{bucket}/prefix")
 
             assert other.archived_through() == settled, (
                 "re-asserting the archive the log already has is not a move"
             )
-            assert other._maintenance.archive_frontier() == settled
 
 
 def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
@@ -1215,7 +1223,6 @@ def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
         def racing(*args: object, **kwargs: object) -> bool:
             outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
             log._buffer.set_meta("archive", f"s3://{bucket}/elsewhere")
-            log._archive.set_uri(f"s3://{bucket}/elsewhere")
             return outcome
 
         archive.register = racing  # ty: ignore[invalid-assignment]
@@ -1228,4 +1235,838 @@ def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
 
         assert log._maintenance.archived_through() == settled, (
             "an archive the log has never pushed to must not inherit a watermark"
+        )
+
+
+def test_the_archive_refuses_a_range_that_starts_inside_its_extent(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The last line of defence, and the only one not reasoned around.
+
+    `_covers` declines a range entirely covered, which makes a replayed push
+    harmless. A range that starts inside the extent and ends beyond it is a
+    different thing: those offsets land in two files at once, in the immutable
+    tier, with nothing able to repair it. Everything upstream is arranged so a
+    merge never straddles the archive's extent, and every gap found in that
+    arrangement has been a fresh piece of reasoning — this check holds however
+    the reasoning turns out.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        archive = log._archive.require()
+        archive.reload()
+        covered = archive.extent()
+
+        assert covered is not None
+
+        # A file whose range begins inside what the archive already holds.
+        with pytest.raises(ValueError, match="two files at once"):
+            archive.register(["s3://nowhere/straddle.parquet"], lo=covered[1])
+
+        # And one that ENGULFS it — starting below the extent and running past
+        # it. This is the worse shape, not an excused one: it puts every
+        # archived offset in two files rather than some of them.
+        with pytest.raises(ValueError, match="two files at once"):
+            archive.register(["s3://nowhere/engulf.parquet"], lo=max(covered[0] - 5, 0))
+
+        # And one that begins cleanly above it is not refused by this check.
+        archive._refuse_straddle(covered[1] + 1)
+
+
+def test_the_log_keeps_working_after_the_archive_is_re_cut(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`rewrite_archive` while local files still overlap what it re-cuts.
+
+    The two tiers then hold the same rows at boundaries neither shares, which
+    is the state every later decision has to survive: I4 asking whether the
+    archive holds a local file's rows, compaction deciding what is already the
+    archive's business, and the archive refusing a range that starts inside its
+    extent. The existing rewrite test evicts everything first, so none of that
+    is exercised there.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=16 * 1024,
+        target_compact_size=32 * 1024,
+        compact_min_files=2,
+        local_rows=2000,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        total = 0
+        for _ in range(4):
+            log.extend(rows(3000))
+            total += 3000
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.archive_files() > 2, "expected several undersized archive files"
+        assert log._table.data_files(), "local files must still overlap the archive"
+
+        # The documented reason it exists: a raised target leaves history sized
+        # for the old one.
+        log.set_config(replace(config, target_compact_size=256 * 1024))
+        log.rewrite_archive()
+
+        assert log.scan(include_archive=True).read_all().num_rows == total
+
+        # The superseded rows still sit in `extent`: `drain` removes them only
+        # after the grace period, and until it does they still match the local
+        # cuts. The state that matters is the one AFTER that, so take it.
+        current = {(f.lo, f.hi + 1) for f in log._archive.require().data_files()}
+        with log._buffer._lock:
+            for lo, hi in log._buffer.archived_ranges(
+                log._archive.uri or "", 0, include_intents=False
+            ):
+                if (lo, hi) not in current:
+                    log._buffer._con.execute(
+                        "DELETE FROM extent WHERE start_offset = ? AND end_offset = ? "
+                        "AND rel_path LIKE 's3://%'",
+                        (lo, hi),
+                    )
+
+            log._buffer._con.commit()
+
+        # And the log has to keep going past a re-cut archive.
+        log.extend(rows(3000))
+        total += 3000
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        table = log.scan(include_archive=True).read_all()
+        offsets = (
+            log.scan(columns=["litelink_offset"], include_archive=True)
+            .read_all()
+            .column(0)
+            .to_pylist()
+        )
+
+        assert table.num_rows == total, "sync stalled or lost rows after the re-cut"
+        assert len(set(offsets)) == len(offsets), "duplicate offsets after the re-cut"
+
+        # And eviction must still be making progress. This is what the re-cut
+        # actually broke: reads keep answering correctly whether or not I4 can
+        # still recognise the archive's copies, so a row count says nothing.
+        # `local_rows` is what says it — asked for 2,000 and the archive holds
+        # every one of these, a local table still carrying all 15,000 means
+        # eviction has stopped and `local_retention` is silently void.
+        local = log.scan().read_all().num_rows
+
+        assert local < total // 2, (
+            f"eviction stalled after the re-cut: {local} of {total} rows still local"
+        )
+
+
+def test_a_stale_handle_cannot_repair_the_archive_it_was_pointed_away_from(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Opening with `repair` is the most dangerous thing a handle does.
+
+    It lets `open_archive` drop a catalog entry naming another prefix and
+    create a fresh table at this one. The maintenance claim is what entitles a
+    caller to that; the durable location is what tells it WHICH archive to
+    repair, and every repairing caller except `sync` inherited the privilege
+    without the premise. A handle that remembers the archive the log has left
+    then destroys the live archive's catalog entry, and the next pass "repairs"
+    again by creating an empty table over its data.
+    """
+    with archived_log(tmp_path, bucket, s3) as writer:
+        writer.extend(rows(ROWS))
+        writer.seal_due()
+        writer.sync()
+
+        with Log.open(tmp_path, "s", s3=s3) as stale:
+            # `stale` remembers the first archive and never opens its handle.
+            assert stale._archive.uri == f"s3://{bucket}/prefix"
+
+            writer.set_archive(f"s3://{bucket}/second")
+            writer.extend(rows(ROWS))
+            writer.seal_due()
+            writer.sync()
+            readable = writer.scan(include_archive=True).read_all().num_rows
+
+            # The documented ad-hoc operation, run from the stale handle.
+            stale.rewrite_archive()
+
+            assert writer.scan(include_archive=True).read_all().num_rows == readable, (
+                "a stale handle repaired the wrong archive and lost history"
+            )
+            assert stale._archive.uri == f"s3://{bucket}/second", (
+                "the repairing open must adopt the location the log records"
+            )
+
+
+def test_a_rewrite_re_cuts_to_the_compact_row_target(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The scratch takes BOTH targets from compaction, not one from each.
+
+    It cuts at whichever ceiling comes first, so carrying the live seal ROW cap
+    made a rewrite cut its outputs at the seal's row limit while the archive
+    holds files sized to the compact one — many times more files than it
+    started with, each still undersized by bytes, so the next
+    `rewrite_archive` flags the same tail again and it never converges. The
+    operation exists to merge undersized archived files; that inverted it.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_seal_rows=40,
+        target_compact_size=16 * 1024,
+        target_compact_rows=80,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(6):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        before = log.archive_files()
+
+        assert before > 1, "expected several archived files to re-cut"
+
+        # A raised target makes the history undersized, which is the reason
+        # this operation exists.
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.rewrite_archive()
+
+        after = log.archive_files()
+
+        assert after <= before, (
+            f"the rewrite fragmented the archive: {before} files became {after}"
+        )
+        assert log.scan(include_archive=True).read_all().num_rows == 2400
+
+
+def test_compaction_while_detached_does_not_wedge_a_reattach(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Four legitimate operations, no warning at any step, and a dead log.
+
+    Detach, raise the compaction target so history is undersized again,
+    maintain, re-attach. While detached, compaction had no archive to ask
+    about, so it merged across ranges the archive still holds — and nothing
+    re-cuts a LOCAL straddler: `rewrite_archive` works the other side. On
+    re-attach, eviction pins below the straddler for ever and every push is
+    refused by `_refuse_straddle`, which the shipped maintainer does not catch.
+
+    Detaching does not make the archive's copies stop existing, so compaction
+    asks whether ANY archive holds a file, not whether the configured one
+    does. It costs nothing: only compacted files are ever pushed, so a file
+    with an archive copy is already at the target.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    archive = f"s3://{bucket}/prefix"
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=archive,
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        archived = log._maintenance.archived_prefix(
+            log._table.data_files(), log._archive.uri, include_intents=False
+        )
+
+        assert archived > 0, "expected the archive to hold a prefix"
+
+        log.set_archive(None)
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.extend(rows(400))
+        log.seal_due()
+        log.maintain()
+
+        assert all(
+            f.lo > archived or f.hi <= archived for f in log._table.data_files()
+        ), "merged across a range the archive holds while detached"
+
+        log.set_archive(archive)
+        log.maintain()
+        log.sync()
+
+        assert log.scan(include_archive=True).read_all().num_rows == 2000
+
+
+def test_expiring_the_archive_will_not_repair_it_without_a_claim(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A repairing open is a claim holder's privilege, and expiry had neither.
+
+    Expiry is exempt from claims because it is a metadata commit CAS orders.
+    That is true of the snapshot expiry and not of the repairing open beside
+    it, which DROPS a catalog entry naming another prefix and creates a table
+    in its place. Two of those at once collide on the first attempt, because
+    pyiceberg writes the metadata object before inserting the catalog row — and
+    the loser raises a bare `Exception` the shipped maintainer does not catch.
+
+    Rounds nine and ten fixed which archive a repairing open targets; this is
+    the other half, who is entitled to open one.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        # A rewrite is the one thing that queues a REMOTE deletion, which is
+        # the signal `_expire_archive` acts on.
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.rewrite_archive()
+
+        assert any("://" in p for p in log._buffer.queued_deletions()), (
+            "expected a remote entry to make expiry reach the archive"
+        )
+
+        opened: list[bool] = []
+        original = log._archive.table
+
+        def watching(*, repair: bool = False) -> object:
+            opened.append(repair)
+
+            return original(repair=repair)
+
+        held = log._lease("maintain")
+
+        assert held.acquire()
+
+        log._archive.table = watching  # ty: ignore[invalid-assignment]
+        try:
+            log.expire()
+
+        finally:
+            log._archive.table = original  # ty: ignore[invalid-assignment]
+            held.release()
+
+        assert not any(opened), (
+            "opened the archive with repair while another owner held the log"
+        )
+
+
+def test_re_pointing_leaves_the_old_archive_unreadable(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The documented cost of a re-point, pinned so it stays documented.
+
+    Rows already evicted into the old archive stay there, and the read path
+    resolves only the archive the log currently names — so they are not
+    readable through this log, silently. And pointing back does not undo it,
+    because re-attaching to an archive that already holds data is not
+    expressible (§13): the repair drops the catalog entry and creates a fresh,
+    empty table over the objects still sitting in the bucket.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        local_rows=200,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    first = f"s3://{bucket}/first"
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=first,
+        s3=s3,
+    )
+    with log:
+        written = 0
+        for _ in range(4):
+            log.extend(rows(400))
+            written += 400
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.scan(include_archive=True).read_all().num_rows == written
+
+        log.set_archive(f"s3://{bucket}/second")
+        moved = log.scan(include_archive=True).read_all().num_rows
+
+        assert moved < written, "expected the evicted history to be out of reach"
+
+        # And pointing BACK does not undo it: re-attaching to an archive that
+        # already holds data is not expressible (§13), so the repair creates an
+        # empty table over the objects still sitting there. The first draft of
+        # this test asserted the opposite, and the docstring said so too.
+        log.set_archive(first)
+
+        assert log.scan(include_archive=True).read_all().num_rows < written, (
+            "re-attaching to a populated archive is documented as unsupported"
+        )
+
+
+def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Compaction and `sync` must exclude the same files, or they deadlock.
+
+    `stable_prefix` holds a file back when compaction might still merge it, and
+    compaction refuses to merge anything some archive already holds. Give
+    compaction that second input without giving it to `sync` and the two stop
+    agreeing: after a re-point to a FRESH prefix the floor is 0, so files the
+    old archive covers are back in `pending`, group into a mergeable run under
+    the raised target, and are held back for ever against a merge that will
+    never happen. Nothing is ever pushed, the watermark never moves, eviction
+    pins on it, and no error surfaces anywhere.
+
+    The re-attach test next to this one hides it, because re-attaching the SAME
+    archive leaves its own extent as the floor, which keeps those files out of
+    `pending` entirely.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/first",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.set_archive(f"s3://{bucket}/second")
+
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.archive_files() > 0, (
+            "nothing was ever pushed to the new archive: sync and compaction "
+            "disagree about which files are still in play"
+        )
+        assert log.archived_through() > 0, "the watermark never moved"
+
+
+def _crash_before_recording(log: Log) -> None:
+    """Sync, dying between the register and the rows recording it."""
+    original = Buffer.record_file
+
+    def dying(*args: object, **kwargs: object) -> None:
+        msg = "crash between the register and the record"
+        raise RuntimeError(msg)
+
+    Buffer.record_file = dying
+    try:
+        with pytest.raises(RuntimeError, match="crash between"):
+            log.sync()
+
+    finally:
+        Buffer.record_file = original
+
+
+def test_a_register_without_its_rows_cannot_wedge_the_log(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The window two polarities exist to close.
+
+    A register lands and the rows recording it do not. Compaction decides what
+    it may merge from those rows, so a compaction-target change before the next
+    sync regroups the pushed-but-unrecorded files and commits a LOCAL file
+    straddling the archive's extent — after which every push is refused for
+    ever and nothing re-cuts a local straddler.
+
+    The intent is written before the register, and compaction reads intents
+    while eviction does not: overstated coverage is compaction's safe
+    direction, understated is eviction's, and one record cannot be both.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(3):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+
+        _crash_before_recording(log)
+
+        archive = log._archive.require()
+        archive.reload()
+        extent = archive.extent()
+        intents = log._buffer.intents(log._archive.uri or "")
+
+        assert extent is not None
+        assert intents, "the crash must leave the intents behind"
+
+        local = log._table.data_files()
+
+        assert log._maintenance.archived_prefix(local, None, include_intents=True) > 0
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == 0
+        ), "eviction must not see an intended copy as a landed one"
+
+        # The ingredient that turns the crash into a permanent stall.
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.maintain()
+
+        assert all(
+            f.lo > extent[1] or f.hi <= extent[1] for f in log._table.data_files()
+        ), "merged across the archive's extent"
+
+        log.sync()
+
+        assert not log._buffer.intents(log._archive.uri or ""), "intents not reconciled"
+        assert log.scan(include_archive=True).read_all().num_rows == 1200
+
+
+def test_eviction_never_acts_on_an_intended_copy(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The understating half of the split, on its own.
+
+    An intent says a copy is coming, not that it is there. Eviction deletes the
+    only local copy on the strength of what it reads, so reading an intent as
+    coverage is the loss this whole record exists to prevent — and it is the
+    direction a `confirmed` column would have handed an older build for free.
+    """
+    config = replace(LogConfig(), local_rows=50, target_seal_size=1 << 30)
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        # Several files, so the row floor lands on an edge below the head —
+        # with one file there is no boundary to snap to and eviction returns
+        # early whatever it believes about coverage.
+        for _ in range(3):
+            log.extend(rows(100))
+            log.seal()
+
+        before = len(log._table.data_files())
+
+        assert before == 3
+
+        for data_file in log._table.data_files():
+            log._buffer.intend_file(
+                f"s3://{bucket}/prefix/data/{data_file.lo}.parquet",
+                data_file.lo,
+                data_file.hi + 1,
+                1,
+            )
+
+        log.evict()
+
+        assert len(log._table.data_files()) == before, (
+            "evicted the only copy on the strength of an intended one"
+        )
+
+
+def test_two_owners_intending_one_path_do_not_collide(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`intend_file` is an upsert, and a bare insert kills the wrong process.
+
+    A holder that stalled past its TTL and resumed can intend a path the owner
+    that took over is also intending. On a bare insert the primary key raises,
+    and neither the maintainer nor anything else catches it — so the takeover
+    race would end the LAWFUL holder's pass rather than the stale one's.
+
+    Nothing else in this suite drives two live intents onto one path: every
+    other scenario intends a path reconciliation has already cleared.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        path = f"s3://{bucket}/prefix/data/contested.parquet"
+
+        log._buffer.intend_file(path, 1, 101, 4096)
+        # The other owner, intending the same path with its own view of it.
+        log._buffer.intend_file(path, 1, 101, 8192)
+
+        intents = log._buffer.intents(f"s3://{bucket}/prefix")
+
+        assert len(intents) == 1, "one path, one intent"
+        assert intents[0] == (path, 1, 101, 8192), "the later intent must win"
+
+
+def test_a_healed_row_carries_the_measured_bytes(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The test the plan mandated, which the first build shipped without.
+
+    The `bytes` column on an intent exists for exactly one reader: rule 1,
+    healing a crash with the only measurement that survives it. Without this
+    assertion the whole suite passes against a reconciliation that records the
+    compact target everywhere — which is what the first build did, because rule
+    2 re-fired for the paths rule 1 had just confirmed and its conflict clause
+    overwrote them.
+
+    What that costs is not cosmetic: a rewrite's deliberately undersized tail
+    recorded as full is never flagged by `_badly_sized` again, so
+    `rewrite_archive` stops converging it, and nothing re-measures an archived
+    file.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=64 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(3):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+
+        _crash_before_recording(log)
+
+        intended = {
+            path: size
+            for path, _, _, size in log._buffer.intents(log._archive.uri or "")
+        }
+
+        assert intended, "the crash must leave intents behind"
+        assert all(size != config.compact_size for size in intended.values()), (
+            "the fixture must not coincide with the default it is testing for"
+        )
+
+        log.sync()
+
+        healed = {
+            path: size
+            for path, size in log._buffer.file_bytes().items()
+            if path in intended
+        }
+
+        assert healed, "the intents were never confirmed"
+        assert healed == intended, (
+            "a healed row must carry the bytes its intent measured, not the "
+            f"compact default: {healed} != {intended}"
+        )
+
+
+def test_a_rewrite_that_lost_its_claim_does_not_commit(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The check between writing and committing, which `_recut` went without.
+
+    A rewrite that stalls past the TTL lets recovery take its claim and queue
+    every one of its outputs; `drain` snapshots its reference veto once per
+    pass while those objects are still unreferenced; and then the stalled
+    commit lands. Drain deletes the objects the manifest now names, the
+    superseded originals become unreferenced and go too, and the range exists
+    in no object at all — every guard behaving exactly as written.
+
+    Renewing before the commit makes that unreachable: recovery's acquire
+    deleted the claim's row, so the renew finds nothing and the rewrite aborts
+    while the originals are still live.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        before = log.archive_files()
+        readable = log.scan(include_archive=True).read_all().num_rows
+
+        assert before > 1
+
+        log.set_config(replace(config, target_compact_size=1 << 20))
+
+        # The claim survives every upload and is gone by the commit. The scratch
+        # teardown is the marker: the next checkpoint after it is the one
+        # guarding `replace_range`, and before this fix there was none.
+        # `_discard_scratch` runs TWICE — once clearing any leftover before the
+        # rewrite starts, once tearing down at the end — so the flag flips on
+        # the second. Flipping on the first aborted the rewrite before it
+        # uploaded anything, which passed whether or not the guard existed.
+        state = {"calls": 0}
+        discard = Maintenance._discard_scratch
+
+        def after_teardown(self: Maintenance) -> None:
+            discard(self)
+            state["calls"] += 1
+
+        Maintenance._discard_scratch = after_teardown
+        try:
+            with pytest.raises(RuntimeError, match="lost the claim"):
+                log._maintenance.rewrite_archive(heartbeat=lambda: state["calls"] < 2)
+
+        finally:
+            Maintenance._discard_scratch = discard
+
+        assert log.archive_files() == before, "committed without holding the claim"
+        assert log.scan(include_archive=True).read_all().num_rows == readable
+
+
+def test_a_rewrite_restamps_the_files_it_supersedes(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The archive half of the grace fix, where the loss was demonstrated.
+
+    `rewrite_archive` queues the files it is replacing when it STARTS, and they
+    stop being referenced only when `replace_range` commits. Left at the
+    queueing, a rewrite slower than `snapshot_retention` — and re-cutting an
+    archive is the slowest thing here — spends the whole grace before it
+    commits, so drain takes the originals out from under any reader that
+    resolved the pre-rewrite snapshot.
+
+    An end-to-end reader test does not reproduce it: a scan resolved after the
+    rewrite reads the new files and never asks about the old ones. What the
+    reader depends on is the stamp, so the stamp is what this asserts.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.archive_files() > 1
+
+        # A rewrite that began a day ago, as a slow one effectively has.
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+        superseded = [f.path for f in log._archive.require().data_files()]
+        log._buffer.enqueue_deletions(superseded, stale)
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.rewrite_archive()
+
+        overdue = [p for p in log._buffer.due_deletions(stale + 1) if p in superseded]
+
+        assert not overdue, (
+            "superseded archive files are still due against a stamp from "
+            f"before the commit that superseded them: {overdue}"
         )

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import random
+import threading
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
-from litelink._maintenance import runs, stable_prefix
+from litelink._claim import EVERYTHING, Claim, new_owner
+from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
 from litelink.log import COMPACT_MULTIPLE, Log, LogConfig, validate
 from tests.test_log import SCHEMA, open_log, read_all, rows
@@ -150,16 +153,13 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
         assert len(read_all(log)) == 12
 
 
-def test_eviction_waits_for_the_archive_watermark(tmp_path: Path) -> None:
+def test_eviction_waits_for_the_archive_to_hold_the_file(tmp_path: Path) -> None:
     """I4, and the only line of `maintain` that is correctness (§5, §8).
 
-    With an archive configured the local copy stops being the only one only
-    once sync says so. `maintain` used to refuse outright rather than risk it;
-    now it clamps the eviction boundary to what sync has recorded, so a sync
-    arbitrarily far behind delays eviction instead of losing data.
-
-    No object store needed: the watermark is a `meta` row, and what is under
-    test is that eviction reads it.
+    With an archive configured the local copy stops being the only one once the
+    archive holds that FILE — a row `sync` writes when the copy exists, naming
+    the bucket it went to (§4a). Not a watermark: one summarised the same facts
+    and was the only boundary in the log that could move backwards.
     """
     config = LogConfig(local_retention=timedelta(0))
     log = Log.new(
@@ -181,9 +181,11 @@ def test_eviction_waits_for_the_archive_watermark(tmp_path: Path) -> None:
 
         assert log.table_files() == before, "evicted with an empty archive"
 
-        # Sync has reached the first file only.
-        first = min(f.hi for f in log._table.data_files())
-        log._buffer.set_meta("archive_through", str(first))
+        # The archive now holds the first file, and only that one.
+        first = min(log._table.data_files(), key=lambda f: f.lo)
+        log._buffer.record_file(
+            f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
+        )
         log.maintain()
 
         assert log.table_files() == before - 1, "did not evict what was archived"
@@ -947,25 +949,76 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         assert log.scan().read_all().num_rows == log.buffered_rows()
 
 
-def test_a_single_pass_takes_the_maintenance_lease(tmp_path: Path) -> None:
-    """Running the parts separately is not a way around the exclusion.
+def test_a_pass_defers_to_a_claim_over_the_range_it_wanted(tmp_path: Path) -> None:
+    """Exclusion is by range now, not by role (§4a).
 
-    Whichever entry point a second owner comes through, it is refused — the
-    lease is the thing that stops two maintainers compacting the same run to
-    the same deterministic path, which is a torn file rather than a conflict
-    Iceberg could resolve.
+    What stops two maintainers compacting the same run to the same
+    deterministic path — a torn file rather than a conflict Iceberg could
+    resolve — is that the second finds the range claimed. It skips rather than
+    raising: another owner working there is ordinary, not an error, and the
+    work is still there next pass.
     """
-    with open_log(tmp_path, LogConfig(target_seal_size=4096)) as log:
+    with open_log(
+        tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
+    ) as log:
+        seal_files(log, 3)
+        before = len(log._table.data_files())
+
+        assert before >= 2
+
         held = log._lease("maintain")
+
         assert held.acquire()
+
         try:
-            for pass_ in (log.compact, log.evict, log.expire):
-                with pytest.raises(RuntimeError, match="maintenance lease"):
-                    pass_()
+            log.compact()
+
+            assert len(log._table.data_files()) == before, (
+                "compacted a range another owner had claimed"
+            )
         finally:
             held.release()
 
         log.compact()
+
+        assert len(log._table.data_files()) < before, "did not compact once free"
+
+
+def test_two_owners_compact_disjoint_ranges_at_once(tmp_path: Path) -> None:
+    """The point of claiming a range instead of a role (§4a).
+
+    Two operations on disjoint offsets commute, so nothing needs to serialise
+    them. Under one lease per role the second waited on the first for the whole
+    of its work — reading and rewriting Parquet, none of which touches anything
+    the other reads.
+    """
+    with open_log(
+        tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
+    ) as log:
+        seal_files(log, 4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        assert len(files) >= 4
+
+        # One owner is working on the bottom of the log.
+        low = log._buffer.claim("compact", files[0].lo, files[1].hi, "other-owner")
+
+        assert low.acquire()
+
+        try:
+            # A second owner claims the top, and is not refused.
+            high = log._buffer.claim("compact", files[2].lo, files[-1].hi, "mine")
+
+            assert high.acquire(), "disjoint ranges must not exclude each other"
+
+            high.release()
+
+            # Overlapping, and it is.
+            clash = log._buffer.claim("compact", files[1].lo, files[2].hi, "mine")
+
+            assert not clash.acquire(), "overlapping ranges must exclude"
+        finally:
+            low.release()
 
 
 def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
@@ -1011,22 +1064,17 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
         assert all(f.rows == 4 for f in after), "a file was split by the boundary"
 
 
-def test_compaction_will_not_merge_across_the_archive_frontier(
-    tmp_path: Path,
-) -> None:
-    """A watermark that is stale LOW must not put archived files back in a run.
+def test_compaction_will_not_merge_a_file_the_archive_holds(tmp_path: Path) -> None:
+    """A merge spanning the archive's extent is a duplicate that cannot be undone.
 
-    The watermark is written after the archive commit lands, so a crash between
-    them leaves it lower than what the archive actually holds. Eviction is safe
-    with a low watermark — it waits. Compaction is not: it reads the same
-    number to decide which files are already the archive's business, and a low
-    one pulls an already-archived file into a merge. The merged file then spans
-    the archive's extent, and the next push registers a range partially
-    overlapping one the archive already holds — the same offsets in two files,
-    in the immutable tier, with nothing to repair it.
+    Its inputs would include files already pushed, so the merged file covers a
+    range partially overlapping one the archive holds — and `register` declines
+    only a range that is ENTIRELY covered, so the partial one is admitted and
+    the same offsets sit in two archive files for ever.
 
-    So compaction reads the FRONTIER: the higher of the confirmed watermark and
-    the range a push was about to register.
+    Compaction therefore skips a file the archive holds, asked per file (§4a).
+    That is also what keeps the two tiers' ranges aligned: a file the archive
+    holds is never rewritten locally, so the ranges stay comparable at all.
     """
     config = LogConfig(
         target_seal_size=4096,
@@ -1034,43 +1082,848 @@ def test_compaction_will_not_merge_across_the_archive_frontier(
         compact_min_files=2,
         snapshot_retention=timedelta(0),
     )
-    with open_log(tmp_path, config) as log:
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive="s3://bucket/prefix",
+    )
+    try:
         log.extend(rows(1200))
         log.seal_due()
-        files = log._table.data_files()
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
         assert len(files) >= 4
 
-        # A push that registered through the second file and died before its
-        # confirming write: the watermark still says nothing is archived.
-        boundary = files[1].hi
-        log._buffer.set_meta("archive_pending", str(boundary))
-        assert log._maintenance.archived_through() == 0
-        assert log._maintenance.archive_frontier() == boundary
+        # The archive holds the first two.
+        for data_file in files[:2]:
+            log._buffer.record_file(
+                f"s3://bucket/prefix/data/{data_file.lo}.parquet",
+                data_file.lo,
+                data_file.hi + 1,
+                1,
+            )
 
+        boundary = files[1].hi
         log.compact()
 
         merged = log._table.data_files()
+
         assert all(f.lo > boundary or f.hi <= boundary for f in merged), (
-            "no file may span the frontier, or the archive gets it twice"
+            "no file may span the archive's extent, or the archive gets it twice"
         )
         assert log.scan().read_all().num_rows == 1200
+    finally:
+        log.close()
 
 
-def test_repointing_clears_the_archive_frontier(tmp_path: Path) -> None:
-    """The frontier names a range the PREVIOUS archive may hold.
+def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None:
+    """A re-point changes where the NEXT file goes, and nothing else (§4a).
 
-    Compaction reads it to decide which files are already the archive's
-    business. Carried across a re-point it would go on refusing to merge files
-    the new archive has never seen — conservative rather than unsafe, but
-    permanently so, because nothing else ever lowers it.
+    The frontier this replaces had to be reset, because it named ranges of the
+    archive being left — and that reset was the only backwards boundary move in
+    the log, which is what made every reader that had cached the old position
+    wrong at once. Per segment there is nothing to reset: files already pushed
+    keep naming the bucket that holds them.
     """
-    config = LogConfig(target_seal_size=4096, compact_min_files=2)
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 2)
+        first = min(log._table.data_files(), key=lambda f: f.lo)
+        log._buffer.record_file(
+            f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
+        )
+        local = log._table.data_files()
+
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == first.hi
+        )
+
+        log.set_archive("s3://bucket/elsewhere")
+
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == 0
+        ), "the new archive holds nothing, and says so without any reset"
+
+        log.set_archive("s3://bucket/prefix")
+
+        assert (
+            log._maintenance.archived_prefix(
+                local, log._archive.uri, include_intents=False
+            )
+            == first.hi
+        ), "pointing back finds the copies still recorded where they are"
+
+
+def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) -> None:
+    """The two tiers cut the same rows independently, and I4 must not care.
+
+    `rewrite_archive` re-cuts the archive to different boundaries — that is its
+    whole job. Asking whether a local file's range EQUALS an archived one then
+    failed for every local file, permanently: eviction clamped to zero and
+    stopped, and compaction stopped treating archived files as the archive's
+    business and merged across its extent. Neither heals, because nothing ever
+    re-cuts the archive back.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 3, per_file=4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        assert len(files) == 3
+
+        # The archive holds every row of all three, cut its own way: two files
+        # whose boundaries line up with none of the local ones.
+        lo, hi = files[0].lo, files[-1].hi
+        middle = files[1].lo + 1
+        log._buffer.record_file("s3://bucket/prefix/data/a.parquet", lo, middle, 1)
+        log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, hi + 1, 1)
+
+        assert (
+            log._maintenance.archived_prefix(
+                files, log._archive.uri, include_intents=False
+            )
+            == hi
+        ), "the archive holds every row; how it cut them is not I4's business"
+
+
+def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
+    """Coverage must join adjacent files without inventing rows between them."""
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 3, per_file=4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        # The first file, then a hole, then the third.
+        log._buffer.record_file(
+            "s3://bucket/prefix/data/a.parquet", files[0].lo, files[0].hi + 1, 1
+        )
+        log._buffer.record_file(
+            "s3://bucket/prefix/data/c.parquet", files[2].lo, files[2].hi + 1, 1
+        )
+
+        assert (
+            log._maintenance.archived_prefix(
+                files, log._archive.uri, include_intents=False
+            )
+            == files[0].hi
+        ), "a range the archive does not hold must stop the walk"
+
+
+def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
+    tmp_path: Path,
+) -> None:
+    """A claim taken after the premise was read isolates nothing on its own.
+
+    Compaction lists the files once and claims per run, so eviction can claim
+    that range, commit its removal and release it in between. The sources are
+    still on disk under I6's grace, so the merge reads them happily and
+    `_commit` retries the swap onto the fresh table — committing evicted rows
+    back into the log, with a fresh `named_at` that shields them for another
+    whole retention period.
+    """
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
-        log.extend(rows(400))
-        log.seal_due()
-        log._buffer.set_meta("archive_pending", "999999")
-        assert log._maintenance.archive_frontier() == 999999
+        seal_files(log, 3)
+        run = sorted(log._table.data_files(), key=lambda f: f.lo)
+        rows_before = len(read_all(log))
 
-        log.set_archive("s3://bucket/somewhere-new")
+        assert len(run) == 3
 
-        assert log._maintenance.archive_frontier() == 0
+        # Eviction happened after this run was chosen and before the merge
+        # takes its claim.
+        log._table.evict_through(run[0].hi)
+        remaining = len(read_all(log))
+
+        assert remaining < rows_before, "the setup must actually evict"
+
+        log._maintenance._rewrite_run(log._table, run, None)
+
+        assert len(read_all(log)) == remaining, (
+            "the merge put back rows eviction had removed"
+        )
+
+
+def test_the_coverage_walk_agrees_with_the_offsets_it_stands_for() -> None:
+    """`_covered` is an optimisation of a set membership test; prove it is one.
+
+    I4 asks whether the archive holds a local file's rows. The honest way to
+    answer is to build the set of offsets the archive holds and test the file's
+    against it, which is unaffordable; the walk is what makes it affordable, so
+    it has to give the same answer for every shape — overlapping archived
+    ranges, duplicates, gaps, ranges reaching in from below.
+    """
+    random.seed(20260822)
+    for _ in range(4000):
+        ranges = []
+        for _ in range(random.randint(0, 4)):
+            start = random.randint(0, 12)
+            ranges.append((start, start + random.randint(0, 6)))
+
+        lo = random.randint(0, 12)
+        hi = lo + random.randint(0, 6)
+
+        held: set[int] = set()
+        for start, end in ranges:
+            held |= set(range(start, end))
+
+        assert _covered(sorted(ranges), lo, hi) == (set(range(lo, hi)) <= held), (
+            f"disagreed on {sorted(ranges)} covering [{lo}, {hi})"
+        )
+
+
+def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> None:
+    """The merge path asks this before its commit; eviction did not.
+
+    A claim expires 30 s after it is taken, and nothing between the acquire and
+    the commit consulted it again. Lapsed, a compaction may claim a run below
+    the boundary and pass its own premise check truthfully — the sources ARE
+    still live — and then this commit removes them while the merge, whose claim
+    is valid throughout, commits them back.
+    """
+    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+
+        # The eviction claim lapses and another owner takes the range, which is
+        # what "no longer ours" actually means: an expired claim nobody wants
+        # may still be renewed, by design.
+        original = Claim.acquire
+        rival: list[Claim] = []
+
+        def lapsing(self: Claim) -> bool:
+            if not original(self):
+                return False
+
+            if self.kind != "evict":
+                return True
+
+            with self.lock:
+                self.connection.execute(
+                    "UPDATE claim SET expires_at = 1 WHERE id = ?", (self.row_id,)
+                )
+
+            taker = Claim(
+                self.connection, self.lock, "compact", self.lo, self.hi, new_owner()
+            )
+            assert original(taker)
+            rival.append(taker)
+
+            return True
+
+        Claim.acquire = lapsing
+        try:
+            with pytest.raises(RuntimeError, match="lost the"):
+                log.evict()
+
+        finally:
+            Claim.acquire = original
+            for taker in rival:
+                taker.release()
+
+        assert log.table_files() == before, "committed without holding the claim"
+
+
+def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
+    """`heartbeat or claim.renew` read naturally and was wrong.
+
+    Any caller passing a heartbeat — which is what the role-lease era asked
+    for, so it is a habit carried forward — stopped the run claim from being
+    renewed at all, and the pre-commit check then consulted a stranger's
+    callback instead of the claim. A merge over the TTL lost its exclusion with
+    no stall required.
+    """
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        renewed: list[int] = []
+        original = Claim.renew
+
+        def counting(self: Claim) -> bool:
+            renewed.append(self.row_id or 0)
+
+            return original(self)
+
+        Claim.renew = counting
+        try:
+            log.compact(heartbeat=lambda: True)
+
+        finally:
+            Claim.renew = original
+
+        assert renewed, "the run claim was never renewed while a merge ran"
+
+
+def test_drain_will_not_unlink_while_another_owner_holds_the_log(
+    tmp_path: Path,
+) -> None:
+    """The unlink is not metadata, so it declares like everything else (§4a).
+
+    Expiry is safe claimless — a metadata commit that CAS orders, idempotent.
+    The deletion that follows it is not. Consulting the table without declaring
+    anything leaves the window every other pass here was built to close:
+    `hydrate` re-registers a file under the very name the queue still holds,
+    deliberately reusing the archived key, and can commit that between the veto
+    being read and the file being unlinked. The local table then references a
+    file that is not there.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        log.compact()
+
+        queued = log._buffer.due_deletions(2**62)
+
+        assert queued, "expected superseded files awaiting deletion"
+
+        other = Claim(
+            log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
+        )
+
+        assert other.acquire()
+
+        try:
+            log.expire()
+
+            # Expiry queues MORE as it goes, so what matters is that the
+            # entries already due are still due: nothing was unlinked.
+            assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
+                "unlinked while another owner held the log"
+            )
+        finally:
+            other.release()
+
+        log.expire()
+
+        assert not set(queued) & set(log._buffer.due_deletions(2**62)), (
+            "never drained once the log was free"
+        )
+
+
+def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
+    """The unlink is this pass's commit, so the claim is asked again at it.
+
+    Everything slow in a drain sits between the veto being read and the
+    deletions — opening the archive, walking its manifests, one remote round
+    trip per queued object. Past the TTL another owner may lawfully take the
+    whole log, `hydrate` a file under the very name still queued here, and
+    release; a drain holding a dead claim would then unlink it against a stale
+    veto and leave the local table pointing at a file that is not there.
+    """
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        compact_min_files=2,
+        snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        log.compact()
+        queued = log._buffer.due_deletions(2**62)
+
+        assert queued, "expected superseded files awaiting deletion"
+
+        # The claim is taken and then lost, the way a slow remote leg loses it.
+        original = Claim.acquire
+        stolen: list[Claim] = []
+
+        def losing(self: Claim) -> bool:
+            if not original(self):
+                return False
+
+            if self.kind != "drain":
+                return True
+
+            with self.lock:
+                self.connection.execute(
+                    "UPDATE claim SET expires_at = 1 WHERE id = ?", (self.row_id,)
+                )
+
+            rival = Claim(
+                self.connection, self.lock, "maintain", 0, EVERYTHING, new_owner()
+            )
+            assert original(rival)
+            stolen.append(rival)
+
+            return True
+
+        Claim.acquire = losing
+        try:
+            with pytest.raises(RuntimeError, match="lost the"):
+                log.expire()
+
+        finally:
+            Claim.acquire = original
+            for rival in stolen:
+                rival.release()
+
+        assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
+            "deleted while another owner held the log"
+        )
+
+
+def test_eviction_reads_the_archive_under_its_own_claim(tmp_path: Path) -> None:
+    """Everything that decides a deletion is read under the claim, or it is a
+    statement about the past.
+
+    `sync` learned this for itself — under the claim, not before it — and
+    eviction acts on the same fact. The window is not narrow: `set_archive` is
+    documented as something the shipped writer calls on every restart, and it
+    takes the whole log, which is free precisely while eviction holds nothing.
+    Attaching an archive between the read and the acquire left eviction
+    deleting the only copy of every aged row the new archive was configured to
+    receive — and sync can never push them afterwards, because they have left
+    the table.
+    """
+    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+        assert not log._archive.configured()
+
+        # The archive is attached between eviction's read and its claim.
+        original = Claim.acquire
+
+        def attaching(self: Claim) -> bool:
+            if self.kind == "evict":
+                log._buffer.set_meta("archive", "s3://bucket/prefix")
+
+            return original(self)
+
+        Claim.acquire = attaching
+        try:
+            log.evict()
+
+        finally:
+            Claim.acquire = original
+
+        assert log.table_files() == before, (
+            "deleted the only copy of rows an archive had just been configured for"
+        )
+
+
+def test_eviction_reads_the_policy_the_log_records(tmp_path: Path) -> None:
+    """`set_config` writes durable state; a maintainer has to hear about it.
+
+    The same reasoning the archive location already earned, applied to the
+    settings beside it. Eviction is where it shows: it decides deletions from
+    `local_retention` and `local_rows`, so a process holding the copy it read
+    at open goes on deleting the only copy of rows the durable policy now says
+    to keep — and §8 reads as an obligation, not a hint.
+    """
+    with open_log(tmp_path, LogConfig(local_rows=1, target_seal_size=1 << 30)) as log:
+        seal_files(log, 3)
+        before = log.table_files()
+
+        assert before == 3
+
+        # Another process raises the floor to cover everything.
+        log._buffer.set_meta("config", LogConfig(local_rows=10_000).to_json())
+        log.evict()
+
+        assert log.table_files() == before, (
+            "evicted against the policy this process happened to read at open"
+        )
+
+
+def test_a_refreshed_policy_reaches_compaction_sync_and_the_buffer(
+    tmp_path: Path,
+) -> None:
+    """One owner, or compaction and sync can disagree about what is in play.
+
+    `Log` used to keep its own copy of the policy beside `Maintenance`'s, kept
+    in step by `set_config` writing both. Refreshing only one of them left
+    compaction reading the new policy while `sync` read the old — and `runs`
+    exists precisely so those two cannot disagree, because a file `sync`
+    settles under one grouping and compaction merges under another leaves the
+    archive holding rows rewritten underneath it. The buffer's seal target is
+    the third copy, and a stale one sizes every file the log writes.
+    """
+    with open_log(tmp_path, LogConfig(local_rows=1, target_seal_size=4096)) as log:
+        seal_files(log, 2)
+        raised = LogConfig(
+            local_rows=10_000, target_seal_size=1 << 20, target_compact_size=1 << 23
+        )
+        log._buffer.set_meta("config", raised.to_json())
+
+        log.evict()
+
+        assert log.config.target_compact_size == raised.target_compact_size, (
+            "sync reads the policy through Log; it must be the refreshed one"
+        )
+        assert log._maintenance.config.local_rows == raised.local_rows
+        assert log._buffer.config().target_seal_size == raised.target_seal_size, (
+            "the buffer sizes every file the log writes; it reads the same row"
+        )
+
+
+def test_maintenance_survives_the_policy_changing_underneath_it(
+    tmp_path: Path,
+) -> None:
+    """The hazard removing the cached copy introduces, and why it is tolerable.
+
+    A value that was stable for a whole pass is now read live, so it can change
+    between two reads inside one decision — `stable_prefix` alone reads three
+    fields. What keeps that safe is that the policy is a POLICY: it decides how
+    big to cut and when to merge, never which rows go where. A torn read makes
+    a badly-sized file, not a wrong one.
+
+    The one place it could have been an invariant is `runs`, which compaction
+    and `sync` share so they cannot disagree about what is in play — and per
+    segment I4 closes that: a file the archive holds is never merged again, so
+    a disagreement costs an undersized archive file, which `_push` already
+    documents as tolerated.
+    """
+    config = LogConfig(target_seal_size=4096, compact_min_files=2, local_rows=200)
+    with open_log(tmp_path, config) as log:
+        stop = threading.Event()
+        churned = 0
+        failures: list[str] = []
+
+        def flip() -> None:
+            nonlocal churned
+            sizes = (8192, 16384, 32768)
+            while not stop.is_set():
+                churned += 1
+                try:
+                    log.set_config(
+                        replace(
+                            config,
+                            target_compact_size=sizes[churned % 3],
+                            compact_min_files=2 + (churned % 3),
+                            # The OPTIONAL fields too, which the first version
+                            # of this test missed: it churned only ints, and a
+                            # torn read of two ints is merely an odd size. A
+                            # field seen as an int by the guard and as None by
+                            # the arithmetic after it is `int - None`.
+                            local_rows=None if churned % 2 else 200,
+                            local_retention=None
+                            if churned % 3
+                            else timedelta(seconds=30),
+                        )
+                    )
+                except RuntimeError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=flip, daemon=True)
+        thread.start()
+        try:
+            written = 0
+            for _ in range(12):
+                log.extend(rows(120, start=written))
+                written += 120
+                log.seal()
+                try:
+                    log.maintain()
+                except RuntimeError:
+                    pass
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert not failures, failures[:3]
+        assert churned > 1, "the policy never actually changed"
+
+        offsets = [r[0] for r in read_all(log)]
+
+        assert len(set(offsets)) == len(offsets), (
+            "duplicate rows under a churning policy"
+        )
+        assert log.scan().read_all().num_rows == len(offsets)
+
+
+def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
+    """The invariant itself, rather than a crash staged to prove it.
+
+    Each `self.config` is now an independent read of the durable row, so two
+    of them inside one decision can disagree — and here they did arithmetic on
+    each other: `local_rows` seen as an int by the guard and as None by the
+    subtraction after it is `int - None`, a TypeError out of `maintain()`. The
+    shipped maintainer catches RuntimeError and CommitFailedException, so that
+    stopped maintenance entirely.
+
+    Counting the reads tests that directly. Staging the crash instead means
+    engineering an exact ordering, which is a test of the harness rather than
+    of the code — the first attempt at this passed against the broken version
+    because the values happened to line up harmlessly.
+    """
+    config = LogConfig(target_seal_size=1 << 30, local_rows=200, local_retention=None)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        original = log._buffer.config
+        reads = 0
+
+        def counting() -> LogConfig:
+            nonlocal reads
+            reads += 1
+
+            return original()
+
+        log._buffer.config = counting  # ty: ignore[invalid-assignment]
+        try:
+            boundary = log._maintenance._retention_boundary()
+
+        finally:
+            log._buffer.config = original  # ty: ignore[invalid-assignment]
+
+        assert isinstance(boundary, int)
+        assert reads == 1, (
+            f"read the policy {reads} times in one decision; two reads can "
+            "disagree, and these two do arithmetic on each other"
+        )
+
+
+def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
+    """What `_push`'s arithmetic rests on.
+
+    It splits `pending` at `archived_prefix` and counts the part below as
+    settled, which is only a prefix count if the split lands on a file edge —
+    otherwise `pending[:settled]` names a different set than the one the split
+    described, and the watermark is written from the wrong file.
+
+    Files are ordered by offset and the walk stops at the first file the
+    archive does not fully hold, so the answer is either 0 or some file's `hi`,
+    and everything at or below it is a prefix. Asserted over random coverage
+    rather than argued.
+    """
+    random.seed(20260823)
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        seal_files(log, 5, per_file=4)
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+
+        assert len(files) == 5
+
+        for trial in range(40):
+            with log._buffer._lock:
+                log._buffer._con.execute(
+                    "DELETE FROM extent WHERE rel_path LIKE 's3://%'"
+                )
+                log._buffer._con.commit()
+
+            # A random subset of the files gets an archive copy.
+            for index, data_file in enumerate(files):
+                if random.random() < 0.6:
+                    log._buffer.record_file(
+                        f"s3://bucket/prefix/data/{trial}-{index}.parquet",
+                        data_file.lo,
+                        data_file.hi + 1,
+                        1,
+                    )
+
+            frozen = log._maintenance.archived_prefix(
+                files, "s3://bucket/prefix", include_intents=False
+            )
+            below = [f for f in files if f.lo <= frozen]
+            above = [f for f in files if f.lo > frozen]
+
+            assert frozen == 0 or frozen in {f.hi for f in files}, (
+                f"{frozen} is not a file boundary"
+            )
+            assert files[: len(below)] == below, "the split is not a prefix"
+            assert files[len(below) :] == above, "the remainder is not a suffix"
+
+
+def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
+    """The union is one query, so it is one snapshot.
+
+    Read as two statements, `extent` and `extent_intent` are two separate WAL
+    reads — and a confirm committing between them moves a range out of the
+    first after the second was taken, so it appears in NEITHER. Compaction's
+    read is safe only when it overstates coverage; that understates it, which
+    is the straddle this record exists to prevent, reopened by the shape of the
+    query rather than by the design.
+
+    Asserted by counting the statements, because the race itself is
+    microseconds wide and a test that tried to land inside it would be a test
+    of the harness.
+    """
+    with open_log(tmp_path, LogConfig(target_seal_size=4096)) as log:
+        seal_files(log, 2)
+        log._buffer.intend_file("s3://bucket/prefix/data/a.parquet", 1, 5, 99)
+
+        statements: list[str] = []
+
+        def watching(sql: str) -> None:
+            if "extent" in sql and "SELECT" in sql:
+                statements.append(sql)
+
+        # SQLite's own hook: `Connection.execute` is read-only and cannot be
+        # wrapped.
+        log._buffer._con.set_trace_callback(watching)
+        try:
+            log._buffer.archived_ranges("s3://bucket/prefix", 0, include_intents=True)
+
+        finally:
+            log._buffer._con.set_trace_callback(None)
+
+        assert len(statements) == 1, (
+            f"coverage read in {len(statements)} statements; two snapshots can "
+            "disagree and a range can fall out of both"
+        )
+        assert "extent_intent" in statements[0], "the intents must be in that statement"
+
+
+def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:
+    """A reader cannot hold a file the commit has not yet superseded.
+
+    Superseded files are queued BEFORE the commit, because a crash in between
+    would lose the only record of their paths. But the grace period is about
+    readers still holding them (I6), so it has to be measured from when they
+    actually left the table — stamped at the queueing, a merge slower than
+    `snapshot_retention` burns the whole grace before it commits, and the
+    originals are due the instant they stop being referenced.
+
+    Worse for an attempt that aborts and is retried later: it commits against
+    a stamp spent whenever the first attempt began.
+    """
+    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        sources = [f.path for f in log._table.data_files()]
+
+        assert len(sources) == 3
+
+        # Queued as a slow merge would leave them: long before the commit.
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+        log._buffer.enqueue_deletions(
+            [log._maintenance._key(p) for p in sources], stale
+        )
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        log.compact()
+
+        # After the merge that superseded them, the clock reads from now.
+        overdue = log._buffer.due_deletions(stale + 1)
+
+        assert not overdue, (
+            f"still due against a stamp from before the commit: {overdue}"
+        )
+
+
+def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
+    """Eviction is the third supersession commit, and the one reachable
+    without any failure at all.
+
+    `hydrate` re-registers a file under the very rel_path the deletion queue
+    still holds — deliberately, it reuses the archived key — and drain's
+    reference veto then preserves that entry rather than draining it. When the
+    hydrated file is evicted again, `local_retention` later, the re-enqueue is
+    an `INSERT OR IGNORE` that keeps the FIRST eviction's stamp, so the file
+    leaves the table already overdue and drain takes it out from under any
+    reader streaming it. Measured by review: unlinked 0.078 s after leaving the
+    table, against a three-second grace.
+
+    Asserted at the stamp rather than by staging the hydrate, because the
+    reader's safety rests on the stamp and staging it takes a live archive plus
+    an eviction the archive coverage permits — conditions that make the test
+    about its own setup.
+    """
+    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        dropped = [log._maintenance._key(f.path) for f in log._table.data_files()]
+
+        assert len(dropped) == 3
+
+        # Queued by an eviction a day ago, as the hydrate round-trip leaves it.
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+        log._buffer.enqueue_deletions(dropped, stale)
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        log.evict()
+
+        # Only what actually LEFT the table. Eviction keeps the newest file,
+        # and one it did not supersede is rightly still carrying the stamp
+        # invented above.
+        still = {log._maintenance._key(f.path) for f in log._table.data_files()}
+        removed = [p for p in dropped if p not in still]
+
+        assert removed, "eviction dropped nothing, so this asserts nothing"
+
+        overdue = [p for p in log._buffer.due_deletions(stale + 1) if p in removed]
+
+        assert not overdue, f"evicted files still due against a spent stamp: {overdue}"
+
+
+def test_expiry_restamps_the_metadata_it_supersedes(tmp_path: Path) -> None:
+    """The restamp has to speak the queue's key language.
+
+    `metadata_paths` returns absolute paths and the queue is keyed
+    root-relative, so passing them raw makes the UPDATE match nothing —
+    silently, because that is what SQL does. Expiry's own trailing `drain()`
+    then unlinks every just-superseded manifest in the same call with no grace,
+    out from under a reader that planned its scan through them.
+
+    Tested at the mapping rather than by staging the route, because the route
+    needs a manifest shared between snapshots and this log merges manifests on
+    every commit — the natural case is rare, while the mistake is not.
+    """
+    with open_log(tmp_path, LogConfig(target_seal_size=1 << 30)) as log:
+        maintenance = log._maintenance
+        absolute = str(log._layout.absolute("s/metadata/shared-m0.avro"))
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+
+        maintenance._enqueue([absolute])
+        with log._buffer._lock:
+            log._buffer._con.execute(
+                "UPDATE pending_delete SET superseded_at = ?", (stale,)
+            )
+            log._buffer._con.commit()
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        # Exactly what `expire` does after its commit.
+        log._buffer.restamp_deletions(
+            (maintenance._key(p) for p in [absolute]),
+            int(datetime.now(UTC).timestamp()),
+        )
+
+        assert not log._buffer.due_deletions(stale + 1), (
+            "the restamp matched nothing: it must key paths the way the "
+            "enqueue beside it does"
+        )
