@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import timedelta
     from pathlib import Path
 
     from litelink._s3 import S3Options
@@ -51,8 +52,35 @@ def destination(archive: str) -> str:
     return f"{archive.rstrip('/')}/{WAL_PREFIX}"
 
 
+def snapshot_block(retention: timedelta) -> list[str]:
+    """The per-database `snapshot:` lines for a retention window.
+
+    **`interval` is derived, and it has to be shorter than `retention`.**
+    litestream keeps snapshots and the LTX files belonging to them for
+    `retention`, and a restore needs a snapshot at or before the point it is
+    restoring to. An interval longer than the retention leaves windows with no
+    snapshot in them at all, which deletes the chain a restore needs. Half is
+    the simplest value that always leaves one inside.
+
+    Seconds, spelled as a Go duration. litestream parses these with
+    `time.ParseDuration`, which takes `21600s` as readily as `6h`, and seconds
+    are the one encoding that cannot drift the way a hand-rounded `6h30m` can.
+    """
+    seconds = retention.total_seconds()
+
+    return [
+        "    snapshot:",
+        f"      interval: {seconds / 2:g}s",
+        f"      retention: {seconds:g}s",
+    ]
+
+
 def litestream_config(
-    databases: Sequence[Path], root: Path, archive: str, s3: S3Options
+    databases: Sequence[Path],
+    root: Path,
+    archive: str,
+    s3: S3Options,
+    retention: timedelta | None = None,
 ) -> str:
     """A litestream config replicating every database the log needs.
 
@@ -88,8 +116,14 @@ def litestream_config(
         # (cmd/litestream/main.go: `Replicas []*ReplicaConfig // Deprecated`).
         # This never emitted more than one element, so the list bought nothing
         # and dated the file.
+        lines.append(f"  - path: {database}")
+        if retention is not None:
+            # Per database rather than in the global `snapshot:` block, so a
+            # root holding several logs can carry one config with a window each
+            # — the global one would make the shortest of them everyone's.
+            lines += snapshot_block(retention)
+
         lines += [
-            f"  - path: {database}",
             "    replica:",
             "      type: s3",
             f"      bucket: {bucket}",

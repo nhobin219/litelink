@@ -594,6 +594,72 @@ def test_the_config_uses_litestreams_current_single_replica_key(
         assert f"\n      {field}" in rendered, field
 
 
+def test_wal_retention_writes_a_snapshot_window_the_sidecar_can_act_on(
+    tmp_path: Path,
+) -> None:
+    """§3a. The un-archived window, stated as the only thing litestream takes.
+
+    "Retain WAL above the archived offset" is the way to say what this is for
+    and it is not expressible: litestream v0.5.16's knobs are all durations —
+    `snapshot.interval`, `snapshot.retention`, `l0-retention` — and its CLI has
+    no `snapshot` verb to force one after a sync and make a duration behave
+    like an offset.
+
+    **`interval` must come out SHORTER than `retention`.** litestream keeps
+    snapshots and their LTX files for `retention`, and a restore needs one at
+    or before the point it restores to; a longer interval leaves windows
+    holding no snapshot and deletes the chain the restore needs.
+
+    Verified against the real binary, which is the part a substring assertion
+    cannot do: `litestream databases -config` accepts this file, and rejects it
+    with "cannot unmarshal into time.Duration" when the retention is replaced
+    with a non-duration — so the field is genuinely parsed, not ignored.
+    """
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True, wal_retention=timedelta(hours=6)),
+        archive="s3://bucket/prefix",
+    ) as log:
+        rendered = log.replication_config()
+        databases = len(log.databases)
+
+    assert (
+        "    snapshot:\n      interval: 10800s\n      retention: 21600s\n" in rendered
+    )
+    # One block per database, not one for the file. A root holding several logs
+    # gets a window each; the global `snapshot:` block would make the shortest
+    # of them everyone's.
+    assert rendered.count("    snapshot:") == databases
+
+
+def test_wal_retention_is_refused_without_a_sidecar_to_read_it(tmp_path: Path) -> None:
+    """It is a window written into the sidecar's config. With nothing shipping
+    the WAL it is a setting nothing reads, which is the failure that looks
+    exactly like a working one."""
+    with pytest.raises(ValueError, match="wal_retention needs wal_replication"):
+        validate(SCHEMA, (), LogConfig(wal_retention=timedelta(hours=6)), None)
+
+
+def test_a_zero_wal_retention_is_refused(tmp_path: Path) -> None:
+    """Zero is not "keep nothing", it is "expire every snapshot as you take
+    it" — a replica that cannot restore to any point at all, reported by
+    nothing. None is how you ask for litestream's own default."""
+    config = LogConfig(wal_replication=True, wal_retention=timedelta(0))
+
+    with pytest.raises(ValueError, match="wal_retention must be positive"):
+        validate(SCHEMA, (), config, "s3://bucket/prefix")
+
+
+def test_wal_retention_survives_the_round_trip_through_meta(tmp_path: Path) -> None:
+    """Durations go to `meta` as seconds, like every other one."""
+    config = LogConfig(wal_replication=True, wal_retention=timedelta(hours=6))
+
+    assert LogConfig.from_json(config.to_json()).wal_retention == timedelta(hours=6)
+    assert LogConfig.from_json(LogConfig().to_json()).wal_retention is None
+
+
 def test_replication_needs_somewhere_to_ship_to(tmp_path: Path) -> None:
     """WAL segments go beside the archived data, so a local-only log has
     nowhere to put them — refused at construction rather than at the first

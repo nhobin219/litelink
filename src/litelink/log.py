@@ -281,6 +281,30 @@ class LogConfig:
     # instances must never replicate one database. Supervising it belongs in
     # deployment code, where it is visible: see `examples/maintainer.py`.
     wal_replication: bool = False
+    # §3a. How far BACK a restore can go, which is not how much is kept safe.
+    #
+    # The distinction is the whole of this setting. A restore always recovers
+    # the LATEST replicated state; retention bounds point-in-time depth and
+    # never endangers the current point. So the question it answers is "how old
+    # a moment might I want to restore to", and the answer follows from the
+    # archive: once sync has pushed a range, that range is recoverable from
+    # object storage, and WAL history older than the un-archived window is
+    # covering something that is covered twice.
+    #
+    # **A duration, because litestream has nothing else.** The obvious spelling
+    # is "retain WAL above the archived offset" and it is not expressible:
+    # v0.5.16's knobs are `snapshot.interval`, `snapshot.retention` and
+    # `l0-retention`, all durations, and its CLI has no `snapshot` verb to
+    # force one after a sync and make a duration behave like an offset. So this
+    # is the un-archived window stated as time.
+    #
+    # That window is append -> seal -> compact -> sync, which no library can
+    # know in advance: it depends on the arrival rate and on how often a
+    # maintainer runs. `examples/tail.py` reports the lag it actually is. Set
+    # this from that, with margin.
+    #
+    # None leaves litestream on its own defaults (24h/24h as of v0.5.16).
+    wal_retention: timedelta | None = None
     # §6/§8. Must exceed the longest scan: expiry deletes files an open scan is
     # still reading (I6).
     snapshot_retention: timedelta = timedelta(hours=1)
@@ -309,6 +333,11 @@ class LogConfig:
                 ),
                 "local_rows": self.local_rows,
                 "wal_replication": self.wal_replication,
+                "wal_retention": (
+                    None
+                    if self.wal_retention is None
+                    else self.wal_retention.total_seconds()
+                ),
                 "snapshot_retention": self.snapshot_retention.total_seconds(),
                 "compact_min_files": self.compact_min_files,
             }
@@ -332,6 +361,7 @@ class LogConfig:
         raw = json.loads(encoded)
         defaults = cls()
         retention = raw.get("local_retention", defaults.local_retention)
+        wal = raw.get("wal_retention", defaults.wal_retention)
         snapshots = raw.get("snapshot_retention")
 
         return cls(
@@ -350,6 +380,11 @@ class LogConfig:
             ),
             local_rows=raw.get("local_rows", defaults.local_rows),
             wal_replication=raw.get("wal_replication", defaults.wal_replication),
+            wal_retention=(
+                wal
+                if isinstance(wal, timedelta) or wal is None
+                else timedelta(seconds=wal)
+            ),
             snapshot_retention=(
                 defaults.snapshot_retention
                 if snapshots is None
@@ -756,7 +791,11 @@ class Log:
             raise ValueError(msg)
 
         return litestream_config(
-            self.databases, self._layout.root, archive, self._archive.s3
+            self.databases,
+            self._layout.root,
+            archive,
+            self._archive.s3,
+            self.config.wal_retention,
         )
 
     def write_replication_config(self) -> Path:
@@ -2337,6 +2376,24 @@ def validate(
         msg = (
             "wal_replication needs an archive: WAL segments go beside the "
             "archived data, and a local-only log has nowhere to ship them"
+        )
+        raise ValueError(msg)
+
+    if config.wal_retention is not None and not config.wal_replication:
+        msg = (
+            "wal_retention needs wal_replication: it is a window written into "
+            "the sidecar's config, so with nothing shipping the WAL it is a "
+            "setting nothing reads"
+        )
+        raise ValueError(msg)
+
+    if config.wal_retention is not None and config.wal_retention.total_seconds() <= 0:
+        msg = (
+            f"wal_retention must be positive: {config.wal_retention}. It is how "
+            "far back a restore may go, and at or below zero litestream is "
+            "being asked to expire every snapshot as it takes it — which "
+            "leaves the replica unable to restore to any point at all. Leave "
+            "it None for litestream's own default"
         )
         raise ValueError(msg)
 
