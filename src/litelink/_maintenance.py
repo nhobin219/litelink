@@ -780,8 +780,20 @@ class Maintenance:
             # the merged output, which is in nobody's deletion queue. Once
             # expiry drops the snapshots naming it, nothing can name it again.
             checkpoint(removal.renew)
-            self._enqueue(f.path for f in files if f.hi <= boundary)
+            dropped = [f.path for f in files if f.hi <= boundary]
+            self._enqueue(dropped)
             self._table.evict_through(boundary)
+            # Re-dated to the commit, like every other supersession. Eviction
+            # needs it without any failure at all: `hydrate` re-registers a
+            # file under the very path the queue still holds, drain's veto then
+            # preserves that entry rather than draining it, and the re-enqueue
+            # when the hydrated file is evicted again is an INSERT OR IGNORE
+            # that keeps the FIRST eviction's stamp — from `local_retention`
+            # ago. Measured: files unlinked 0.078 s after leaving the table
+            # against a three-second grace.
+            self._buffer.restamp_deletions(
+                (self._key(p) for p in dropped), int(datetime.now(UTC).timestamp())
+            )
         finally:
             removal.release()
 
@@ -1114,8 +1126,15 @@ class Maintenance:
         # a live snapshot is skipped every pass until that snapshot expires too,
         # and then retired. The cost is queue rows that wait, against files that
         # could not be found at all.
+        doomed = list(doomed)
         self._enqueue(doomed)
         self._table.expire_snapshots_older_than(cutoff)
+        # The same correction, for the same reason. Narrower here — a manifest
+        # is read at query bind rather than throughout a streaming scan — but
+        # an expiry that failed between the queue and the commit and ran again
+        # a pass later would otherwise retire these the instant they became
+        # unreferenced.
+        self._buffer.restamp_deletions(doomed, int(datetime.now(UTC).timestamp()))
         self._expire_archive(cutoff)
         self.drain()
 
@@ -1171,8 +1190,10 @@ class Maintenance:
 
         checkpoint(sweep.renew)
 
-        self._enqueue(archive.metadata_paths(archive.snapshots_older_than(cutoff)))
+        retiring = list(archive.metadata_paths(archive.snapshots_older_than(cutoff)))
+        self._enqueue(retiring)
         archive.expire_snapshots_older_than(cutoff)
+        self._buffer.restamp_deletions(retiring, int(datetime.now(UTC).timestamp()))
 
     def drain(self) -> None:
         """Delete files whose grace period has passed.

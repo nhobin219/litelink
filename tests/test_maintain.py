@@ -1842,3 +1842,49 @@ def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:
         assert not overdue, (
             f"still due against a stamp from before the commit: {overdue}"
         )
+
+
+def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
+    """Eviction is the third supersession commit, and the one reachable
+    without any failure at all.
+
+    `hydrate` re-registers a file under the very rel_path the deletion queue
+    still holds — deliberately, it reuses the archived key — and drain's
+    reference veto then preserves that entry rather than draining it. When the
+    hydrated file is evicted again, `local_retention` later, the re-enqueue is
+    an `INSERT OR IGNORE` that keeps the FIRST eviction's stamp, so the file
+    leaves the table already overdue and drain takes it out from under any
+    reader streaming it. Measured by review: unlinked 0.078 s after leaving the
+    table, against a three-second grace.
+
+    Asserted at the stamp rather than by staging the hydrate, because the
+    reader's safety rests on the stamp and staging it takes a live archive plus
+    an eviction the archive coverage permits — conditions that make the test
+    about its own setup.
+    """
+    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        dropped = [log._maintenance._key(f.path) for f in log._table.data_files()]
+
+        assert len(dropped) == 3
+
+        # Queued by an eviction a day ago, as the hydrate round-trip leaves it.
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+        log._buffer.enqueue_deletions(dropped, stale)
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        log.evict()
+
+        # Only what actually LEFT the table. Eviction keeps the newest file,
+        # and one it did not supersede is rightly still carrying the stamp
+        # invented above.
+        still = {log._maintenance._key(f.path) for f in log._table.data_files()}
+        removed = [p for p in dropped if p not in still]
+
+        assert removed, "eviction dropped nothing, so this asserts nothing"
+
+        overdue = [p for p in log._buffer.due_deletions(stale + 1) if p in removed]
+
+        assert not overdue, f"evicted files still due against a spent stamp: {overdue}"
