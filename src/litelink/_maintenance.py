@@ -1134,7 +1134,14 @@ class Maintenance:
         # an expiry that failed between the queue and the commit and ran again
         # a pass later would otherwise retire these the instant they became
         # unreferenced.
-        self._buffer.restamp_deletions(doomed, int(datetime.now(UTC).timestamp()))
+        # Through `_key`, like the enqueue above it. `metadata_paths` returns
+        # absolute paths and the queue is keyed root-relative, so passing them
+        # raw made this an UPDATE matching nothing — silently, because that is
+        # what SQL does. Every other restamp site happens to be key-invariant
+        # (an `s3://` URI) or already mapped, which is why only this one hid.
+        self._buffer.restamp_deletions(
+            (self._key(p) for p in doomed), int(datetime.now(UTC).timestamp())
+        )
         self._expire_archive(cutoff)
         self.drain()
 

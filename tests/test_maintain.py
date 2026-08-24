@@ -1888,3 +1888,42 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
         overdue = [p for p in log._buffer.due_deletions(stale + 1) if p in removed]
 
         assert not overdue, f"evicted files still due against a spent stamp: {overdue}"
+
+
+def test_expiry_restamps_the_metadata_it_supersedes(tmp_path: Path) -> None:
+    """The restamp has to speak the queue's key language.
+
+    `metadata_paths` returns absolute paths and the queue is keyed
+    root-relative, so passing them raw makes the UPDATE match nothing —
+    silently, because that is what SQL does. Expiry's own trailing `drain()`
+    then unlinks every just-superseded manifest in the same call with no grace,
+    out from under a reader that planned its scan through them.
+
+    Tested at the mapping rather than by staging the route, because the route
+    needs a manifest shared between snapshots and this log merges manifests on
+    every commit — the natural case is rare, while the mistake is not.
+    """
+    with open_log(tmp_path, LogConfig(target_seal_size=1 << 30)) as log:
+        maintenance = log._maintenance
+        absolute = str(log._layout.absolute("s/metadata/shared-m0.avro"))
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+
+        maintenance._enqueue([absolute])
+        with log._buffer._lock:
+            log._buffer._con.execute(
+                "UPDATE pending_delete SET superseded_at = ?", (stale,)
+            )
+            log._buffer._con.commit()
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        # Exactly what `expire` does after its commit.
+        log._buffer.restamp_deletions(
+            (maintenance._key(p) for p in [absolute]),
+            int(datetime.now(UTC).timestamp()),
+        )
+
+        assert not log._buffer.due_deletions(stale + 1), (
+            "the restamp matched nothing: it must key paths the way the "
+            "enqueue beside it does"
+        )
