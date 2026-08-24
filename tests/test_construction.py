@@ -548,6 +548,52 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
         assert "secret" not in rendered.lower(), "credentials must stay in the env"
 
 
+def test_the_config_uses_litestreams_current_single_replica_key(
+    tmp_path: Path,
+) -> None:
+    """`replica`, not the deprecated `replicas` list.
+
+    litestream v0.5.0 made it one replica per database and kept the list only
+    for compatibility — `Replicas []*ReplicaConfig // Deprecated` in
+    cmd/litestream/main.go as of v0.5.16, which is what `just litestream`
+    pins. This never emitted more than one element, so the list bought nothing
+    and dated the file.
+
+    Checked as a shape, not a substring: `"replica:" in rendered` is also true
+    of `replicas:`, so the assertion has to be that the plural is ABSENT, and
+    that the fields sit under the singular at the indentation a mapping needs
+    rather than the one a list item needs.
+    """
+    # An endpoint and a region, so every optional field is rendered — the
+    # ones most likely to be left behind at the old indentation are exactly
+    # the ones a bare `S3Options()` omits.
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True),
+        archive="s3://bucket/prefix",
+        s3=S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1"),
+    ) as log:
+        rendered = log.replication_config()
+
+    assert "replicas:" not in rendered
+    assert "- type: s3" not in rendered, "a list item where a mapping belongs"
+    assert "    replica:\n      type: s3\n" in rendered
+
+    # Every replica field moved with it. Left at the list indentation they
+    # parse as siblings of `replica` — which litestream ignores, so the
+    # failure is a config that loads and replicates to the wrong place.
+    for field in (
+        "bucket:",
+        "path: prefix/",
+        "region:",
+        "endpoint:",
+        "force-path-style:",
+    ):
+        assert f"\n      {field}" in rendered, field
+
+
 def test_replication_needs_somewhere_to_ship_to(tmp_path: Path) -> None:
     """WAL segments go beside the archived data, so a local-only log has
     nowhere to put them — refused at construction rather than at the first
@@ -623,11 +669,16 @@ def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> N
         Log.new(tmp_path, "one", schema=SCHEMA, archive=shared) as first,
         Log.new(tmp_path, "two", schema=SCHEMA, archive=shared) as second,
     ):
+        # The REPLICA path, not the database path — both spell themselves
+        # `path:`. Told apart by indentation: the database's sits at the list
+        # item (`  - path:`) and the replica's inside the `replica` mapping
+        # under it. Tracks `_replication.litestream_config`, which is why the
+        # prefix is written out rather than stripped.
         keys = {
             line.split("path: ", 1)[1]
             for rendered in (first.replication_config(), second.replication_config())
             for line in rendered.splitlines()
-            if "        path: " in line
+            if line.startswith("      path: ")
         }
         buffers = {key for key in keys if key.endswith("buffer.db")}
 

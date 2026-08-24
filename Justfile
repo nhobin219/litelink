@@ -14,6 +14,12 @@ RUSTFS_KEY := "litelink"
 RUSTFS_SECRET := "litelink-secret"
 RUSTFS_BUCKET := "litelink-demo"
 
+# The WAL-shipping sidecar (§3a). PINNED, not "latest": v0.5.0 changed the
+# config format — one `replica` where there was a `replicas` list — so a demo
+# that fetched whatever is current would make the next such change somebody
+# else's silent breakage, with nothing in a diff to point at.
+LITESTREAM_VERSION := "0.5.16"
+
 # Default recipe: list available commands
 default:
     @just --list
@@ -40,6 +46,48 @@ bootstrap:
 # Provision the DuckDB extensions the read path needs
 duckdb-extensions *args:
     uv run python scripts/install_duckdb_extensions.py {{args}}
+
+# litestream is a single Go binary, not a project dependency: it is a sidecar,
+# and a library that pulled it in would be claiming to run it. This fetches the
+# pinned build into `.bin/`, which `demo-replicate` and the maintainer both
+# prefer over whatever is on PATH — the config format is version-dependent, so
+# "whichever one is installed" is not a detail.
+#
+#   just litestream     fetch it; idempotent, and a no-op if the pin is there
+
+# Fetch the pinned litestream binary into .bin/
+litestream:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -x .bin/litestream ] \
+        && .bin/litestream version 2>/dev/null | grep -q "{{LITESTREAM_VERSION}}"; then
+        echo "litestream {{LITESTREAM_VERSION}} already in .bin/"
+        exit 0
+    fi
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    arch=$(uname -m)
+    case "$arch" in
+        aarch64|arm64) arch=arm64 ;;
+        x86_64|amd64)  arch=x86_64 ;;
+        *) echo "no litestream build published for $arch" >&2; exit 1 ;;
+    esac
+    asset="litestream-{{LITESTREAM_VERSION}}-${os}-${arch}.tar.gz"
+    base="https://github.com/benbjohnson/litestream/releases/download/v{{LITESTREAM_VERSION}}"
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    echo "fetching $asset"
+    curl -fsSL "$base/$asset" -o "$tmp/$asset"
+    curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt"
+    # Verified, not trusted. This binary is fetched over the network and then
+    # pointed at the demo's databases with write access to the replica; a
+    # checksum is the cheapest thing that makes "what the release published"
+    # and "what arrived here" the same question. sha256sum on Linux, shasum on
+    # macOS — the same check, two spellings.
+    if command -v sha256sum >/dev/null; then verify="sha256sum -c -"; else verify="shasum -a 256 -c -"; fi
+    ( cd "$tmp" && grep " ${asset}$" checksums.txt | $verify )
+    mkdir -p .bin
+    tar -xzf "$tmp/$asset" -C .bin litestream
+    echo "installed .bin/litestream ($(.bin/litestream version))"
 
 # Repo-wide, matching the pre-commit hook's `pass_filenames: false`: a recipe
 # scoped to src/ lets tests/ and scripts/ drift out of compliance while CI
@@ -159,10 +207,10 @@ demo-archive *args:
             --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
     fi
 
-# Needs `just rustfs`, a capture running, and the litestream binary on PATH
-# (https://litestream.io/install — a single Go binary, not a project dependency:
-# it is a sidecar, and a library that pulled it in would be claiming to run it).
+# Needs `just rustfs`, a capture running, and the litestream binary — either
+# from `just litestream` (the pinned build, into `.bin/`) or on PATH.
 #
+#   just litestream       # once
 #   just demo-archive     # terminal 1
 #   just demo-replicate   # terminal 2: ship the WAL continuously
 #
@@ -175,10 +223,19 @@ demo-archive *args:
 demo-replicate root="litelink-data":
     #!/usr/bin/env bash
     set -euo pipefail
-    command -v litestream >/dev/null || {
-        echo "litestream not on PATH — see https://litestream.io/install" >&2
+    # The pinned build first, PATH second. A checkout should replicate with
+    # the version it pinned rather than whatever the machine happens to carry,
+    # because the config this generates is version-dependent.
+    if [ -x .bin/litestream ]; then
+        litestream="$PWD/.bin/litestream"
+    elif command -v litestream >/dev/null; then
+        litestream=litestream
+    else
+        echo "litestream not found. Fetch the pinned build:" >&2
+        echo "    just litestream" >&2
+        echo "or install it yourself: https://litestream.io/install" >&2
         exit 1
-    }
+    fi
     # rustfs unless `.env` names a real bucket, as everywhere else.
     if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
@@ -192,7 +249,7 @@ demo-replicate root="litelink-data":
     export LITESTREAM_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
     # Destination and file set both come from the log — see `replicate.py`.
     uv run python examples/replicate.py --root {{root}}
-    litestream replicate -config {{root}}/litestream.yml
+    "$litestream" replicate -config {{root}}/litestream.yml
 
 # Create the demo bucket. Idempotent, and through the same s3fs the library
 # uses rather than an AWS CLI nobody is required to have installed.
