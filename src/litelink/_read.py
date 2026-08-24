@@ -74,6 +74,54 @@ def secret_sql(options: S3Options) -> str:
     return f"CREATE OR REPLACE SECRET litelink_s3 ({', '.join(parts)})"
 
 
+class ExtensionMissing(RuntimeError):
+    """A DuckDB extension the read path needs is not on this machine (§7)."""
+
+
+def load_extension(
+    connection: duckdb.DuckDBPyConnection, name: str, *, remote: bool
+) -> None:
+    """`LOAD name`, with an error that says what to do about it.
+
+    **LOAD-time autoinstall is per-extension, and not to be relied on either
+    way.** Verified against duckdb 1.5.5, each in a fresh process with an empty
+    `extension_directory` and `autoinstall_known_extensions` reporting True:
+    `LOAD iceberg` silently downloads and succeeds, `LOAD httpfs` raises. So
+    the reported failure is not a machine with autoinstall switched off — the
+    two extensions simply behave differently, and nothing here should assume
+    which.
+
+    What the caller got instead was DuckDB's error: a filesystem path inside
+    `~/.duckdb`, and advice to run `INSTALL httpfs` — a remedy §7 argues
+    against, naming nothing this repo ships. `iceberg` reaches the same error
+    the moment the machine is genuinely offline, which is the case §7 is about,
+    so both go through here.
+
+    **Installing here instead is the other way to make that traceback go away,
+    and it is refused.** §7 makes provisioning an obligation discharged at
+    build or deploy time, and `install_duckdb_extensions.py --check` exists to
+    assert a machine has discharged it. A read path that quietly downloads is
+    precisely what that check is written to detect, so adding one would leave
+    the check passing on a machine it was meant to fail.
+
+    `remote` picks the flag to name, which is the only thing the two callers
+    differ on: `httpfs` is behind `--remote` because a local-first log never
+    loads it.
+    """
+    try:
+        connection.execute(f"LOAD {name}")
+    except duckdb.IOException as exc:
+        flag = " --remote" if remote else ""
+        msg = (
+            f"the DuckDB `{name}` extension is not installed on this machine. "
+            f"It is not compiled into the duckdb wheel, and an explicit LOAD "
+            f"does not fetch it, so it has to be provisioned:\n"
+            f"    just duckdb-extensions{flag}\n"
+            f"    python scripts/install_duckdb_extensions.py{flag}"
+        )
+        raise ExtensionMissing(msg) from exc
+
+
 def duckdb_connection() -> duckdb.DuckDBPyConnection:
     """A connection with the read path's extensions loaded.
 
@@ -86,7 +134,7 @@ def duckdb_connection() -> duckdb.DuckDBPyConnection:
     appends should not pay at `open`.
     """
     connection = duckdb.connect()
-    connection.execute("LOAD iceberg")
+    load_extension(connection, "iceberg", remote=False)
     # No ATTACH of the buffer database. `Buffer.rows_above` records what that
     # cost: two SQLite libraries in one process is silent corruption, not a
     # slow path.
@@ -159,7 +207,7 @@ class Reader:
             # Once per connection. `httpfs` is not in the local read path, so a
             # log that never opts in never pays for it — §7's rule that a hot
             # read is offline.
-            self._connect().execute("LOAD httpfs")
+            load_extension(self._connect(), "httpfs", remote=True)
             self._remote_ready = True
 
         cursor.execute(secret_sql(self._archive.s3.resolved()))

@@ -22,7 +22,10 @@ import sys
 import textwrap
 from typing import TYPE_CHECKING
 
+import duckdb
 import pytest
+
+from litelink._read import ExtensionMissing, load_extension
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -160,3 +163,74 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
     assert result.returncode == 0, f"offline run failed:\\n{result.stderr}"
     assert "ROWS 800 BOUNDED 20 END 801" in result.stdout, result.stdout
     assert "REOPENED 800" in result.stdout, result.stdout
+
+
+def test_an_unprovisioned_extension_names_the_command_that_fixes_it(
+    tmp_path: Path,
+) -> None:
+    """The traceback a fresh machine used to get, and what replaced it.
+
+    Reported from a working install: `log.scan(include_archive=True)` raised
+    `IOException: Extension ".../httpfs.duckdb_extension" not found`, advising
+    `INSTALL httpfs` — a remedy this repo does not use and §7 argues against.
+
+    **`autoinstall_known_extensions` reports True below and the LOAD still
+    fails**, which is the part that surprises — so the report is not a machine
+    with autoinstall switched off. Measured beside it in a fresh process with
+    the same empty directory, `LOAD iceberg` silently DOWNLOADS and succeeds.
+    LOAD-time autoinstall is per-extension, and this asserts only the half that
+    litelink has to survive.
+    """
+    empty = tmp_path / "extensions"
+    empty.mkdir()
+    connection = duckdb.connect(config={"extension_directory": str(empty)})
+
+    assert connection.execute(
+        "SELECT current_setting('autoinstall_known_extensions')"
+    ).fetchone() == (True,), "the point of this test is that LOAD ignores it"
+
+    with pytest.raises(ExtensionMissing) as caught:
+        load_extension(connection, "httpfs", remote=True)
+
+    message = str(caught.value)
+    # The flag, not just the script. `httpfs` is behind `--remote`, and an
+    # error naming the bare command sends the reader to a run that installs
+    # everything except the extension they are missing.
+    assert "just duckdb-extensions --remote" in message
+    assert "install_duckdb_extensions.py --remote" in message
+    # DuckDB's own error is kept as the cause rather than swallowed: it names
+    # the exact path that was searched, which is the only way to tell a missing
+    # extension from one installed under a different HOME.
+    assert isinstance(caught.value.__cause__, duckdb.IOException)
+
+
+def test_the_read_path_extension_is_not_offered_the_remote_flag(
+    tmp_path: Path,
+) -> None:
+    """`iceberg` is in the required set, so `--remote` would be wrong advice.
+
+    Two extensions, two provisioning commands, and the error has to pick the
+    right one — this is the half of the pair a single hard-coded message would
+    get wrong.
+
+    **Autoinstall is disabled here, and it has to be.** Unlike `httpfs`, a
+    `LOAD iceberg` against an empty directory downloads the extension and
+    succeeds, so an empty directory alone does not reproduce anything. What
+    does is the offline machine, which is the case §7 cares about and the one
+    `install_duckdb_extensions.py --check` models with these same two settings.
+    """
+    empty = tmp_path / "extensions"
+    empty.mkdir()
+    connection = duckdb.connect(
+        config={
+            "extension_directory": str(empty),
+            "autoinstall_known_extensions": False,
+            "autoload_known_extensions": False,
+        }
+    )
+
+    with pytest.raises(ExtensionMissing) as caught:
+        load_extension(connection, "iceberg", remote=False)
+
+    assert "--remote" not in str(caught.value)
+    assert "just duckdb-extensions" in str(caught.value)
