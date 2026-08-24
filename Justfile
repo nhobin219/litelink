@@ -22,7 +22,11 @@ default:
 bootstrap:
     uv sync
     uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
-    @just duckdb-extensions
+    # `--remote` here, though httpfs is opt-in for the LIBRARY. Anyone working
+    # in this repo runs `just demo-archive` sooner or later, and an explicit
+    # LOAD does not autoinstall — so leaving it out buys nothing and costs a
+    # cryptic DuckDB error on the first archive read.
+    @just duckdb-extensions --remote
 
 # Of what the SPEC §7 read path touches, only `parquet` is compiled into the
 # duckdb wheel; `iceberg` and the sqlite scanner are fetched from
