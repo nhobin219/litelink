@@ -11,7 +11,7 @@ three tiers that only means anything when one of them is genuinely remote.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -2011,3 +2011,62 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
 
         assert log.archive_files() == before, "committed without holding the claim"
         assert log.scan(include_archive=True).read_all().num_rows == readable
+
+
+def test_a_rewrite_restamps_the_files_it_supersedes(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The archive half of the grace fix, where the loss was demonstrated.
+
+    `rewrite_archive` queues the files it is replacing when it STARTS, and they
+    stop being referenced only when `replace_range` commits. Left at the
+    queueing, a rewrite slower than `snapshot_retention` — and re-cutting an
+    archive is the slowest thing here — spends the whole grace before it
+    commits, so drain takes the originals out from under any reader that
+    resolved the pre-rewrite snapshot.
+
+    An end-to-end reader test does not reproduce it: a scan resolved after the
+    rewrite reads the new files and never asks about the old ones. What the
+    reader depends on is the stamp, so the stamp is what this asserts.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    )
+    with log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        assert log.archive_files() > 1
+
+        # A rewrite that began a day ago, as a slow one effectively has.
+        stale = int(datetime.now(UTC).timestamp()) - 86_400
+        superseded = [f.path for f in log._archive.require().data_files()]
+        log._buffer.enqueue_deletions(superseded, stale)
+
+        assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
+
+        log.set_config(replace(config, target_compact_size=1 << 20))
+        log.rewrite_archive()
+
+        overdue = [p for p in log._buffer.due_deletions(stale + 1) if p in superseded]
+
+        assert not overdue, (
+            "superseded archive files are still due against a stamp from "
+            f"before the commit that superseded them: {overdue}"
+        )
