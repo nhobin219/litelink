@@ -9,6 +9,8 @@ having them as parameters is for.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -18,6 +20,7 @@ import pytest
 from litelink import Log, LogConfig
 from litelink._archive import Archive
 from litelink._buffer import Buffer
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection, secret_sql
@@ -70,13 +73,13 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     layout = Layout(tmp_path / "does-not-exist", "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = Buffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
+    buffer = Buffer.open(layout.buffer_db, SCHEMA)
 
     config = LogConfig()
     # Local-only, and still a real object: the reader, the maintainer and the
-    # Log are handed the same one, which is what lets `set_archive` reach all
-    # three later. `uri=None` says the slot is empty, not that there is no slot.
-    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
+    # Log are handed the same one. It stores no location — it reads the log's,
+    # so `set_archive` reaches all three by writing one row.
+    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
     log = Log(
         layout=layout,
         table=table,
@@ -84,7 +87,7 @@ def test_init_does_no_io(tmp_path: Path) -> None:
         reader=Reader(
             layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
         ),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
+        maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
@@ -111,9 +114,9 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     layout = Layout(tmp_path, "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = StubBuffer.open(layout.buffer_db, SCHEMA, target_size=1 << 20)
+    buffer = StubBuffer.open(layout.buffer_db, SCHEMA)
     config = LogConfig()
-    archive = Archive(layout, None, S3Options(), table_schema(SCHEMA))
+    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
 
     log = Log(
         layout=layout,
@@ -122,7 +125,7 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
         reader=Reader(
             layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
         ),
-        maintenance=Maintenance(table, buffer, layout, config, ("event_ts",), archive),
+        maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
@@ -433,7 +436,7 @@ def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
     — the exact loss this library exists to prevent. 2 is SQLite's code for
     FULL.
     """
-    buffer = Buffer.open(tmp_path / "b.db", SCHEMA, target_size=1 << 20)
+    buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
     try:
         assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 2
     finally:
@@ -449,9 +452,7 @@ def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
     way: the read-only handle is a second connection to the same file, which is
     what WAL is for here — not durability.
     """
-    buffer = Buffer.open(
-        tmp_path / "scratch.db", SCHEMA, target_size=1 << 20, durable=False
-    )
+    buffer = Buffer.open(tmp_path / "scratch.db", SCHEMA, durable=False)
     try:
         assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 0
         assert buffer._con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -633,19 +634,312 @@ def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> N
         assert len(buffers) == 2, f"buffers must not collide: {buffers}"
 
 
-def test_compact_min_files_below_one_is_refused(tmp_path: Path) -> None:
+def test_compact_min_files_below_two_is_refused(tmp_path: Path) -> None:
     """A knob that can stall the log for ever should not accept the value.
 
-    Below one, no run ever satisfies `compact_min_files`, so `stable_prefix`
-    returns zero permanently: sync pushes nothing, the watermark stands still,
-    eviction pins on it, and the local table grows without bound. Nothing
-    raises and nothing logs — the log simply stops making progress.
+    The floor is TWO, not one, and the difference is the whole defect: a run
+    always holds at least one file, so at one every run looks mergeable,
+    nothing is ever settled, and `stable_prefix` returns zero permanently.
+    Sync pushes nothing, the watermark stands still, eviction pins on it and
+    the local table grows without bound — while every pass rewrites every file
+    to no purpose. Merging a run of one is a no-op rewrite in any case.
     """
-    with pytest.raises(ValueError, match="compact_min_files must be at least 1"):
+    for value in (0, 1):
+        with pytest.raises(ValueError, match="compact_min_files must be at least 2"):
+            Log.new(
+                tmp_path,
+                f"s{value}",
+                schema=SCHEMA,
+                sort_by=("event_ts",),
+                config=LogConfig(compact_min_files=value),
+            )
+
+
+def test_local_rows_zero_without_an_archive_is_refused(tmp_path: Path) -> None:
+    """The same intent, refused on one knob and accepted on its twin.
+
+    `local_retention=0` was refused on a local-only log as "would delete each
+    file as it sealed", and `local_rows=0` means exactly that — keep the newest
+    zero rows — and was accepted, evicting every sealed file as the only copy.
+    """
+    with pytest.raises(ValueError, match="evict on upload"):
         Log.new(
             tmp_path,
             "s",
             schema=SCHEMA,
             sort_by=("event_ts",),
-            config=LogConfig(compact_min_files=0),
+            config=LogConfig(local_rows=0),
         )
+
+
+def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
+    """The rename is an offline upgrade, and silence would be the dangerous part.
+
+    A buffer carrying the old `lease` table was last written by a build that
+    coordinated through it, while this one coordinates through `claim`. Neither
+    sees the other, so a rolling upgrade would put two sealers on the same
+    queued group — the torn file the mechanism exists to prevent. Nothing can
+    make an old binary respect the new table, so refuse rather than run beside
+    one.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    with log:
+        with log._buffer._lock:
+            log._buffer._con.execute(
+                "CREATE TABLE lease (role TEXT PRIMARY KEY, owner TEXT, expires_at INT)"
+            )
+
+    with pytest.raises(RuntimeError, match="coordinated through a `lease` table"):
+        Log.open(tmp_path, "s")
+
+
+def test_negative_local_retention_is_refused(tmp_path: Path) -> None:
+    """The sign check its twin has always had.
+
+    Eviction computes `now - local_retention`, so a negative one puts the
+    cutoff in the FUTURE and every file in the log is stale. On a local-only
+    log that is silent deletion of the only copy of everything, at every
+    negative value, from one sign slip — and the zero rule never caught it
+    because it tests equality.
+    """
+    with pytest.raises(ValueError, match="local_retention must not be negative"):
+        Log.new(
+            tmp_path,
+            "s",
+            schema=SCHEMA,
+            sort_by=("event_ts",),
+            config=LogConfig(local_retention=timedelta(hours=-1)),
+        )
+
+
+def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> None:
+    """Eviction takes the LOWER boundary, so the policy retaining more wins.
+
+    A config is only "evict on upload" when every floor it states is one.
+    Refusing `local_retention=0` beside `local_rows=1_000_000` would refuse a
+    config that keeps a million rows regardless of age, with a message that is
+    false for it.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=LogConfig(local_retention=timedelta(0), local_rows=1_000_000),
+    )
+    with log:
+        log.extend([{"event_ts": i, "key": "k", "payload": "p"} for i in range(8)])
+        log.seal()
+        log.maintain()
+
+        assert log.scan().read_all().num_rows == 8, "evicted under a generous floor"
+
+
+def test_two_processes_cannot_assemble_the_pair_validate_refuses(
+    tmp_path: Path,
+) -> None:
+    """`validate` refuses a PAIR, so both halves must be read durably.
+
+    Each setter checked its own new half against this process's memory of the
+    other, so two handles could assemble the refused combination between them:
+    one attaches an evict-on-upload policy while an archive is configured, the
+    other detaches the archive against a policy it read before that. The next
+    maintenance pass then executes it and deletes the only copy of everything.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log, Log.open(tmp_path, "s") as other:
+        # `other` opened while an archive was configured and a normal policy
+        # was in force; it still remembers both.
+        log.set_config(LogConfig(local_rows=0))
+
+        with pytest.raises(ValueError, match="evict on upload"):
+            other.set_archive(None)
+
+
+def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) -> None:
+    """Reading the other half durably is not enough; the check must be atomic.
+
+    `validate` refuses a PAIR, and each setter reads the other half from
+    `meta`. Read and write as two transactions with nothing between them and
+    the check is only a statement about the past: each call passes against a
+    state the other is about to change, and between them they assemble the very
+    pair neither would accept. The next maintenance pass then executes it and
+    deletes the only copy of everything sealed.
+
+    Both setters take the same claim now, so the interleaving cannot happen —
+    modelled here by holding that claim while the second call runs.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
+        held = log._lease("maintain")
+
+        assert held.acquire()
+
+        try:
+            # Bounded: it waits for maintenance rather than refusing outright,
+            # and reports rather than hanging when the wait runs out.
+            with pytest.raises(RuntimeError, match="has held a claim"):
+                log.set_config(LogConfig(local_rows=0))
+
+        finally:
+            held.release()
+
+
+def test_negative_snapshot_retention_is_refused(tmp_path: Path) -> None:
+    """The same sign slip, one field over.
+
+    Expiry computes `now - snapshot_retention`, so a negative one puts the
+    cutoff in the future: every superseded file is unlinked in the pass that
+    supersedes it, and I6's promise — the grace must exceed the longest scan —
+    is not shortened but inverted. Zero stays legal; it means "no grace", which
+    tests and demos ask for on purpose.
+    """
+    with pytest.raises(ValueError, match="snapshot_retention must not be negative"):
+        Log.new(
+            tmp_path,
+            "s",
+            schema=SCHEMA,
+            sort_by=("event_ts",),
+            config=LogConfig(snapshot_retention=timedelta(hours=-1)),
+        )
+
+    Log.new(
+        tmp_path,
+        "zero",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=LogConfig(snapshot_retention=timedelta(0)),
+    ).close()
+
+
+def test_a_configuration_change_waits_for_maintenance(tmp_path: Path) -> None:
+    """It waits rather than refusing on the first try.
+
+    The two setters share a claim because `validate` refuses a pair, but they
+    also collide with ordinary maintenance — and the shipped writer calls both
+    on every restart while a maintainer runs continuously. Measured before this
+    wait existed: one startup in six failed, which turns a routine restart into
+    a coin toss.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    with log:
+        log._settings_wait = 5.0  # ty: ignore[unresolved-attribute]
+        held = log._lease("maintain")
+
+        assert held.acquire()
+
+        released = threading.Event()
+
+        def let_go() -> None:
+            time.sleep(0.3)
+            held.release()
+            released.set()
+
+        thread = threading.Thread(target=let_go)
+        thread.start()
+        try:
+            log.set_config(LogConfig(local_rows=500))
+
+            assert released.is_set(), "returned before the holder let go"
+            assert log.config.local_rows == 500
+        finally:
+            thread.join(timeout=5)
+
+
+def test_a_setter_that_lost_its_claim_does_not_write(tmp_path: Path) -> None:
+    """The claim makes the read and the write one decision only while it is held.
+
+    Both setters read the other half, validate the pair, then write. A stall
+    past the TTL between the read and the write is the threat the TTL exists
+    for: the other setter takes the lapsed claim lawfully, validates against
+    the half this one has not written yet, writes its own — and between them
+    they record the pair `validate` just refused, which the next maintenance
+    pass carries out. Every data commit already asks the claim again at the
+    write; the setters stopped one line short.
+    """
+    log = Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        archive="s3://bucket/prefix",
+    )
+    with log:
+        before = log.config.local_rows
+        original = log._buffer.get_meta
+        rivals: list[Claim] = []
+
+        def losing(key: str) -> str | None:
+            # Between the read of the other half and the write: the claim
+            # lapses and another owner takes it.
+            if key == "archive" and not rivals:
+                with log._buffer._lock:
+                    log._buffer._con.execute("UPDATE claim SET expires_at = 1")
+
+                rival = Claim(
+                    log._buffer._con,
+                    log._buffer._lock,
+                    "maintain",
+                    0,
+                    EVERYTHING,
+                    new_owner(),
+                )
+                assert rival.acquire()
+                rivals.append(rival)
+
+            return original(key)
+
+        log._buffer.get_meta = losing  # ty: ignore[invalid-assignment]
+        try:
+            with pytest.raises(RuntimeError, match="lost the claim"):
+                log.set_config(LogConfig(local_rows=7))
+
+        finally:
+            log._buffer.get_meta = original  # ty: ignore[invalid-assignment]
+            for rival in rivals:
+                rival.release()
+
+        assert log.config.local_rows == before, "wrote without holding the claim"
+
+
+def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -> None:
+    """Neither the policy nor the archive location is copied into a process.
+
+    This is the property that replaces twelve `refresh` calls. Each of them
+    existed to drag a process-local copy back into agreement with the log, and
+    every defect in this seam was a decision that read the copy where no such
+    call had been placed — eight review rounds running, each in a place the
+    previous round had not looked.
+
+    There is one copy now, in `meta`. A handle that has never heard of a change
+    cannot be wrong about it, because it holds nothing to be wrong with.
+    """
+    first = Log.new(
+        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=LogConfig()
+    )
+    with first, Log.open(tmp_path, "s") as second:
+        assert second.config.local_rows is None
+        assert not second._archive.configured()
+
+        first.set_config(LogConfig(local_rows=4242))
+        first.set_archive("s3://bucket/prefix")
+
+        # `second` was never told, and never asked.
+        assert second.config.local_rows == 4242
+        assert second._archive.configured()
+        assert second._archive.uri == "s3://bucket/prefix"
+        assert second._maintenance.config.local_rows == 4242
+        assert second._buffer.config().local_rows == 4242

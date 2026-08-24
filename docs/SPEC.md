@@ -388,6 +388,192 @@ a live claim covers; recovery means reclaiming an expired one and removing the f
 named. The intent record and the lease become the same row — which is what allows several
 passes to run at once without any of them excluding the others by kind.
 
+**Implemented**, with two consequences of one-row-per-operation that one-row-per-role hid.
+Nothing overwrites a lapsed claim the way a keyed row did, so it sits there still naming its
+owner: `acquire` clears expired overlapping rows and `renew` refuses once expired, or a
+stalled holder extends itself back onto a range the log has moved past. And a nested claim
+must carry the OPERATION's owner rather than mint one — a rewrite running inside a config
+change's whole-log claim was refused by the operation it was part of, and silently did
+nothing.
+
+Two ranges are still coarser than the design wants: `sync` and the configuration changes
+claim the whole log. For a configuration change that is correct — a re-point is not an
+operation on an interval. For `sync` it is conservative: it cannot name the range it will
+push until it has read the archive's extent, so narrowing it to `(floor, last]` is the
+remaining refinement, and until then `compact ∥ sync` still serialises.
+
+**A claim taken after the premise was read isolates nothing on its own.** Both passes choose
+their work from a file list, and the claim comes after: eviction can claim a range, commit
+its removal and release it before a merge that already chose those files takes its own
+claim. The sources are still on disk under I6's grace, so the merge reads them happily and
+`_commit` retries the swap onto the fresh table, putting every evicted row back — with a
+fresh `named_at` that shields them for another whole retention period. So each pass re-reads
+under its claim and revalidates: a merge checks its inputs are still in the table, and
+eviction recomputes its boundary, which otherwise lands mid-file on a merged output and
+makes pyiceberg rewrite the straddler at a path nothing records (I2).
+
+**Range-disjointness does not extend to the branch pointer.** Two operations on disjoint
+offsets have independent DATA and still swap the same Iceberg branch, so enabling
+concurrency raises CAS contention rather than removing it. `_commit` retries with jittered
+backoff; exhausting the retries is a legitimate outcome, and a caller looping over the passes
+has to treat a lost commit race as "not now" rather than as failure — nothing landed, and the
+work is still there next pass.
+
+**Holding a claim is asked again at the commit, not only at the start.** A claim expires
+30 s after it is taken and a stall past the TTL is the threat the TTL exists for, so a pass
+that re-read its premise under the claim can still lose the claim before it commits — after
+which a merge may legitimately take the range, pass its own premise check truthfully, and
+commit rows the lapsed eviction is about to remove. Each pass therefore renews immediately
+before its commit and refuses to carry on if it no longer holds the range. Note this is not
+the same as "expired": an expired claim nobody has taken may still be renewed, and what ends
+a claim is the taker deleting its row.
+
+**A caller's heartbeat is combined with the claim's, never substituted for it.** Passing one
+was the correct usage in the role-lease era, so it is a habit that survives; `heartbeat or
+claim.renew` then silently stopped renewing the claim at all and answered the pre-commit
+check with a stranger's callback.
+
+**And the archive refuses a range that starts inside its extent.** Everything upstream is
+arranged so a merge never straddles it, and each gap found in that arrangement has been a
+fresh piece of reasoning — a crash between a register and the row recording it, then a
+compaction-config change before the next sync backfills, is one that survived several
+reviews. `_covers` declines only a range ENTIRELY covered, so a straddling one is admitted
+and those offsets sit in two files at once, in the immutable tier, with nothing able to
+repair it. Refusing costs a stall; admitting costs silence.
+
+**That stall has no remedy today, and this paragraph used to imply one.** Nothing re-cuts a
+LOCAL straddler — `rewrite_archive` works the other side — so the log stops advancing its
+watermark, eviction pins below the straddling file, and the shipped sync role dies on the
+`ValueError` because it catches `RuntimeError` and `CommitFailedException` only. The refusal
+is still the right trade against silent permanent duplication in the immutable tier, but
+"recoverable" was not true.
+
+Reaching it needs a crash between a register and the `extent` rows recording it, and then a
+compaction-target change before the next sync backfills those rows from the archive's
+manifest. The window exists because the rows and the manifest are two records of one fact and
+only `sync` reconciles them, while compaction decides from the rows alone. What would close
+it, in increasing order of work: reconcile the rows against the manifest on the compaction
+side too; or record a pushed range BEFORE the register and confirm it after, so the two
+readers can take opposite polarities — compaction is safe when coverage is OVERSTATED,
+eviction only when it is UNDERSTATED, which is why the pre-segment design kept two records
+and read one from each; or ship a tool that re-cuts a local straddler, which would also make
+the sentence above true.
+
+The test is `lo <= extent_hi`, with no lower bound. A lower bound was there first and was a
+hole rather than a safety condition: it exempted exactly the range that starts BELOW the
+extent and runs past it, engulfing the whole thing — every archived offset in two files,
+which is the worst version of this rather than an excused one.
+
+**And `drain` claims, because the unlink is not metadata.** Expiry is safe claimless — a
+metadata commit CAS orders, idempotent — and the deletion that follows it inherited that
+reasoning without earning it. Consulting the table without declaring anything leaves the
+window everything else here was built to close: `hydrate` re-registers a file under the very
+name the queue still holds, deliberately reusing the archived key, and can commit that
+between the veto being read and the file being unlinked. The local table then references a
+file that is not there, and every scan over that range raises until eviction ages the entry
+out. And it renews before EVERY deletion, not once at the top: the unlink is this pass's
+commit, everything slow in a drain sits between the veto being read and the deletions —
+opening the archive, walking its manifests, one remote round trip per queued object — and a
+claim held for the first of those is not a claim held for the last. `hydrate` renews after
+its fetch for the same reason and against the same partner: a whole file downloaded per
+iteration, and the name it is restoring is one the deletion queue still holds — drain's own
+per-deletion renewal cannot help there, because drain is then the legitimate holder and
+hydrate the lapsed one.
+
+**And everything a pass reads to decide a deletion is read under its claim, not before it.**
+`sync` learned this for itself and eviction did not, though it acts on the same facts: it
+read the archive location, and the policy, before claiming anything. `set_archive` is
+documented as something the shipped writer calls on every restart and it takes the whole
+log, which is free precisely while eviction holds nothing — so attaching an archive between
+the read and the acquire left eviction deleting the only copy of every aged row that archive
+was configured to receive, unrecoverably, since sync cannot push what has left the table.
+Eviction therefore claims on the UNCLAMPED retention boundary, which only ever falls, and
+recomputes everything under the claim. `set_config` gets the same treatment for the same
+reason: it writes durable state that no running process would otherwise hear about, and
+§8's retention reads as an obligation rather than a hint.
+
+That refresh also forced a correction worth stating on its own: the policy now has ONE
+owner. `Log` used to keep a copy beside `Maintenance`'s, with the buffer's seal target as a
+third, kept in step by `set_config` writing all three. Two copies is one too many the moment
+anything else can change the policy — refreshing one would leave compaction reading the new
+grouping while `sync` read the old, and `runs` is shared by exactly those two so that they
+cannot disagree about which files are still in play. And the refresh happens in
+compaction and in `sync` as well as in eviction, because the shipped topology runs those two
+as SEPARATE PROCESSES: refreshing in one place only keeps them in step within a process,
+while across processes one restarting after a durable `set_config` and the other not would
+leave compaction grouping under a policy `sync` had never heard of, permanently. And
+compaction re-reads the archive premise under each RUN claim, not only at pass start: a sync
+that ran in between, under a grouping that settles a partial prefix of a run, leaves the
+rest of that run merging into a local file straddling the archive's extent — and nothing
+re-cuts a local straddler, so every later push is refused and the watermark never moves
+again.
+
+**`validate` checks a PAIR, so both halves are read durably.** An evict-on-upload policy
+with no archive to evict into is refused in one call, and each setter was checking its own
+new half against this process's memory of the other — so two processes could assemble the
+refused pair between them, after which the next maintenance pass executes it faithfully and
+deletes the only copy of everything sealed. And the rule itself has to match how eviction
+combines the floors: it takes the lower boundary, so the policy retaining MORE wins, and a
+config is "evict on upload" only when every floor it states is one.
+
+Reading both halves durably is still not enough, and this is the part that took two rounds
+to see: read and write as two transactions with nothing between them, and the check is only
+a statement about the past. Each setter could pass against a state the other was about to
+change, so between them the two calls assembled the very pair neither would accept — and the
+next maintenance pass carried it out. **`set_config` and `set_archive` therefore take the
+same claim**, which is §4a's own rule about data, applied to the configuration that governs
+it: the check and the act share a transaction, or they are not a guard. `Log.new` records
+the pair in one `meta` transaction for the same reason, and both setters ask for the claim
+again at the write — the read and the write are one decision only while it is held, and a
+stall past the TTL between them lets the other setter take the lapsed claim lawfully and
+record the other half.
+
+**And a repairing open is a CLAIM HOLDER's privilege.** That is the other half of the same
+rule, and it went unenforced at one call site: expiry is exempt from claims because it is a
+metadata commit CAS orders — true of the snapshot expiry, and not true of the repairing open
+beside it. Two claimless repairs collide on the first attempt, because pyiceberg writes the
+metadata object before inserting the catalog row, and the loser raises a bare `Exception` no
+maintainer catches; worse, a claimless drop can land after a claim holder has already created
+and registered, taking the live entry with it.
+
+**Compaction asks whether ANY archive holds a file, not the configured one.** Detaching does
+not make the copies stop existing. Merging across a range some archive holds makes a LOCAL
+file whose boundaries line up with nothing there, and nothing re-cuts a local straddler —
+`rewrite_archive` works the other side — so re-attaching stalls the log for good: eviction
+pins below it and every push is refused. Four legitimate operations reach it, with no warning
+at any step: detach, raise the target, maintain, re-attach. Skipping those files costs
+nothing, because only compacted files are ever pushed, so one with an archive copy is already
+at the target. Eviction still asks about the CONFIGURED archive, because I4 is a promise about
+where the copy is.
+
+**And `sync` applies the same exclusion, or the two deadlock.** `stable_prefix` holds a file
+back when compaction might still merge it; compaction refuses to merge anything an archive
+holds. Those are one rule, and `runs` is shared between them precisely so they cannot
+disagree — giving compaction a second input `stable_prefix` could not see was enough to
+break it. After a re-point to a fresh prefix the floor is 0, so files the old archive covers
+return to `pending`, group into a mergeable run under a raised target, and are held back for
+ever against a merge that will never happen: nothing is pushed, the watermark never moves,
+eviction pins on it, and nothing raises. A file no merge can touch is settled by definition.
+
+Note what that correction cost the earlier justification: "a file with an archive copy is
+already at the target" is false the moment the target is RAISED after the copy was made —
+which is the scenario the exclusion exists for. Such a file stays at the size it was
+archived at, and `rewrite_archive` is the tool for that.
+
+**Opening the archive with `repair` needs the durable location, not a remembered one.** That
+open may drop a catalog entry naming another prefix and create a fresh table at this one;
+the claim is what entitles a caller to do it, and the location the log records is what says
+WHICH archive to do it to. `sync` re-read the location for exactly this reason, and every
+other repairing caller inherited the privilege without the premise — so a handle still
+remembering an archive the log had left destroyed the live archive's catalog entry, after
+which the next pass "repaired" again by creating an empty table over its data. Measured end
+to end: 4,000 rows in, 550 readable, and no error at the point of the damage.
+
+**The rename is an offline upgrade.** A buffer carrying the old `lease` table was last opened
+by a build that coordinated through it, and nothing can make that build respect `claim`, so
+the two would exclude nothing and put two sealers on one queued group. Opening such a log
+refuses rather than running beside one.
+
 ### The check and the claim are one transaction
 
 Claiming is not enough on its own, and this is the part that is easy to get wrong. Suppose
@@ -501,11 +687,77 @@ So eviction, in both configurations, is one rule: **drop what retention no longe
 except what a live claim covers, and except — where an archive is configured — what has no
 recorded copy in it.**
 
-**Not implemented.** Three things to establish first: `extent` has no index on the offset
-columns, so the per-file check needs one on the eviction path; the boundary eviction snaps
-to a file edge has to be shown equivalent under the per-segment test; and `hydrate` records
-a byte count of zero for a file the archive never measured, which is dormant only while a
-watermark keeps such files out of every size consumer.
+**Implemented.** `archive_pending` and the frontier are gone; `archived_prefix` walks the
+local files and stops at the first without a recorded copy, and both compaction and eviction
+ask it. Compaction skipping archived files is not optional here — it is what keeps a local
+range and its archived range the same range, so the per-segment test can match them at all.
+
+One window survives the change and closes differently. The row naming a file's archive copy
+is written after the register, so a crash between the two leaves the archive holding a range
+nothing local records. Nothing is promised beforehand to cover it — that is what made the
+watermark inexact in both directions — so the next push backfills from the archive's own
+manifest, which it reads anyway.
+
+`archived_through` remains as a derived cache, for the push floor and for display. It no
+longer authorises a deletion, which was the whole of the problem.
+
+**Coverage, not equality.** The two tiers cut the same rows into files independently, so
+asking whether a local range EQUALS an archived one was wrong the moment they could differ.
+`rewrite_archive` re-cuts the archive to different boundaries by design — that is its entire
+job — and under an equality test every local file then matched nothing, for ever: eviction
+clamped to zero and stopped, and compaction stopped treating archived files as the archive's
+business and merged across its extent, which `register` admits as a partial overlap and the
+archive keeps as duplicate rows. Neither heals, because nothing re-cuts the archive back.
+The question I4 actually asks is whether the archive holds the ROWS, so adjacent archived
+files join and a gap ends the answer.
+
+### One copy of a fact, in the log
+
+Nine review rounds of this design found the same defect nine times, each in a place the
+previous round had not looked: **a fact with a durable home in `meta` also had a mutable
+copy in the process, and a decision read the copy.** A pass reading "no archive" from memory
+while the log had one. A repairing open pointed at a bucket the log had left, destroying the
+live archive's catalog entry. A fence comparing a value against itself, because a re-point
+moved both sides of the comparison together. Two setters each validating against a stale
+half of a pair. Compaction and `sync` grouping runs under different policies.
+
+The tell was not the defects but their remedy: twelve `refresh` calls, whose only work was
+dragging a copy back into agreement with the log. **A design whose correctness needs N of
+those is always one short somewhere, because nothing tells you what N is.**
+
+So the copies are gone. `Archive` stores no location and reads `meta`; `Buffer` owns the one
+`LogConfig` and everything that decides from the policy reads it there. All twelve refresh
+calls, and the methods behind them, deleted. A stale location or a stale policy is not a bug
+guarded against here — it is not a thing that can exist.
+
+What makes it affordable is that the reads are cheap and the expensive parts are cached
+**keyed on the durable value**: the parsed config on the raw JSON, the pyiceberg handle on
+the URI it was opened for. A key that comes from the log is what stops a cache becoming the
+next stale copy — when the log changes, the key changes and the cache retires itself. That
+is also, exactly, the archive-handle bug of the ninth round, gone by construction rather
+than by a rule.
+
+Measured: a `meta` read is 1.8 us against a 5.4 ms query, and an interleaved A/B of the
+append path — the only hot consumer — showed −0.3%, which is noise. Two earlier measurements
+of the same change showed 28% and 7% regressions; both were artifacts, one of a cold start
+and one of drift between blocks. Interleaving the runs is what settled it.
+
+**A decision reads the policy ONCE.** That is the hazard this trades for, and it is a real
+one: each read is now independent, so two of them inside a single decision can disagree. It
+bit immediately — `local_rows` seen as an int by the guard and as None by the subtraction
+after it is `int - None`, a TypeError out of `maintain()`, which the shipped maintainer does
+not catch, so maintenance stopped entirely. The rule is not a lock; it is that every
+decision binds the policy to a local first: fresh per decision, coherent within it.
+
+Where a torn read would merely produce an odd file size it is harmless, because the policy
+is a POLICY — it decides how big to cut and when to merge, never which rows go where. The
+one place it could have been an invariant is `runs`, shared by compaction and `sync` so the
+two cannot disagree about what is in play, and per-segment I4 closes that: a file the
+archive holds is never merged again.
+
+What this does NOT cover: a pyiceberg table handle is a point-in-time snapshot of REMOTE
+state, with no local durable copy to derive from, so `reload()` before deciding remains a
+discipline. That is one method and a much smaller surface.
 
 ### Rejected: one settled watermark for both
 

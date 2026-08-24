@@ -31,7 +31,7 @@ A reader is not a role in this sense. Any number of processes may open the log
 its commit is pyiceberg copying table metadata — so doing it on a *thread* inside the
 writer starves the appending thread through the GIL even while holding no lock. Appends
 measured 45.2 ms behind an in-process seal. A separate process does not share the GIL.
-That is the whole reason the leases exist.
+That is the whole reason the claims exist.
 
 **Why it is one process and not two.** Sealing and compaction are the same kind of work:
 off the hot path, committing to the same Iceberg table, neither latency-critical the way
@@ -41,9 +41,10 @@ pass *within* a process, and nothing does across processes, so two maintainer pr
 race on Iceberg's delete-after-commit metadata cleanup and each warns about files the
 other already removed.
 
-The one role does hold **two leases**, `seal` and `maintain`, because they guard
-different recovery records: `sealing` belongs to whoever holds the first and `compacting`
-to whoever holds the second, and a process replaying one must not replay the other. That
+The one role does hold **two kinds of claim**, over the seal's queued range and over the
+range a pass is working on, because they guard different recovery records: `sealing`
+belongs to whoever claimed the first and `compacting` to whoever claimed the second, and a
+process replaying one must not replay the other. That
 also means splitting the role across two processes later needs no code change, if a long
 compaction ever delays sealing enough to matter. It costs latency, not file size — the
 cut was recorded when the rows arrived.
@@ -62,8 +63,9 @@ draining, which is what `maintain()` already was. A library that spawns threads 
 behalf is also a library whose tests interfere with themselves, which is how two of the
 bugs above were found.
 
-Whichever process calls them, **the `lease` table decides** who does the work: a second
-caller is refused and returns rather than duplicating it.
+Whichever process calls them, **the `claim` table decides** who does the work — by offset
+RANGE, not by role (§4a). Two passes on disjoint ranges run at once; one that finds its
+range claimed skips it and finds the work still there next pass.
 
 ---
 
@@ -84,15 +86,16 @@ caller is refused and returns rather than duplicating it.
                               │ no queue object, no event, no signal
                               ▼
  ┌──────────────────── buffer.db  (SQLite, WAL) ────────────────────────┐
- │  buffer │ extent │ sealing │ compacting │ pending_delete │ lease │
+ │ buffer │ extent │ extent_intent │ sealing │ compacting │ claim │
+ │ pending_delete                                                       │
  │                                                                      │
  │  the coordinator (I16). every hand-off below is a row in here, so    │
  │  it works between THREADS and between PROCESSES on identical terms   │
  └──────────────────────────────────────────────────────────────────────┘
-        ▲ lease('seal')                          ▲ lease('maintain')
+        ▲ claim(seal range)                       ▲ claim(pass range)
         │                                        │
  ═══════╧═══════════════ MAINTAINER PROCESS ══════╧══════════════════════
-  ─────── seal lease ───────────           ─────── maintain lease ────────
+  ─────── seal claim ───────────           ─────── pass claim ────────────
   poll extent (one indexed            maintain() in a loop
   row read; no lock taken if
   there is nothing queued)                _table_lock + lease
@@ -188,7 +191,8 @@ Nothing in Python. Every arrow in the diagram is a SQLite row:
 | "I am writing that file, at this path" | `sealing` |
 | "I am rewriting these files" | `compacting` |
 | "this file may be deleted after its grace" | `pending_delete` |
-| "I hold this role until this time" | `lease` |
+| "I own these offsets until this time" | `claim` |
+| "this copy is intended, not yet made" | `extent_intent` |
 
 The one in-process shortcut is a `threading.Event` used to stop the sealer at `close()`.
 Nothing about correctness depends on it.
@@ -316,6 +320,22 @@ retention came to silently stop reclaiming anything. The grace period before a f
 actually unlinked is a different clock again, stamped on `pending_delete` when the file
 left the table, because that one is about readers still holding it (I6).
 
+"When it left the table" is the COMMIT, not the queueing, and the two are not the same
+moment. Files are queued before the commit that supersedes them, since a crash in between
+would lose the only record of their paths, so every supersession corrects the stamp
+afterwards — a merge, an archive rewrite, an eviction and both expiries. Left at the
+queueing, an operation slower than `snapshot_retention` spends the whole grace before it
+commits and the files fall due the instant they stop being referenced: measured at a five
+second retention, a reader 0.4 s old lost every file its snapshot named and failed
+mid-scan.
+
+"When it left the table" is the commit, not the queueing — and the two are not the same
+moment. Files are queued BEFORE the commit that supersedes them, since a crash in between
+would lose the only record of their paths, so the stamp is corrected at the commit. Left at
+the queueing, a rewrite slower than `snapshot_retention` spends the whole grace before it
+commits and the originals fall due the instant they stop being referenced: measured at a 5 s
+retention, a reader 0.4 s old lost every file its snapshot named and failed mid-scan.
+
 **Sync holds back exactly what compaction might still rewrite**, which it decides by asking
 compaction's own rule rather than a size of its own — a file pushed and then merged locally
 would leave the archive holding rows that have been rewritten underneath it, so the two
@@ -352,8 +372,8 @@ listed is not one.
 | | |
 |---|---|
 | one writer process per log | §1. Two processes appending to one log is unsupported and unchecked |
-| any number of reader processes | `Log.open(..., read_only=True)`. They hold no lease and mutate nothing |
-| one maintainer at a time, enforced | the `seal` and `maintain` leases refuse a second holder and lapse if one dies |
+| any number of reader processes | `Log.open(..., read_only=True)`. They claim nothing and mutate nothing |
+| maintainers on disjoint offsets | claims exclude by RANGE, so two passes that cannot touch each other's files run at once; one that finds its range claimed skips it |
 | open the log *after* forking | a SQLite handle does not survive `fork`, and neither does a DuckDB one |
 
 **Between threads, within a process**
@@ -513,9 +533,13 @@ and the metadata this library depends on is deleted through its own expiry queue
 **The passes are callable one at a time**, and worth doing when their costs diverge.
 Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
 finish in milliseconds; `sync` is the only one that can block on a network. `maintain()`
-runs the three local ones under a single lease and is what most deployments want —
-`compact()`, `evict()` and `expire()` exist for the schedules it cannot express, and take
-the same lease, so running them separately is not a way around the exclusion.
+runs the three local ones and is what most deployments want; `compact()`, `evict()` and
+`expire()` exist for the schedules it cannot express.
+
+None of those four takes a claim of its own. Each PASS claims the range it is about to work
+on — a merge claims its run, eviction the prefix it removes — so running them separately is
+not a way around anything, and two maintainers working different parts of the log do not
+wait for each other (§4a).
 
 Measured on the demo against local object storage, one pass: seal 0 ms, compact 147–920 ms,
 reclaim 20–400 ms, sync 11–712 ms. A combined number reports an S3 timeout as slow

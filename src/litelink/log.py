@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import random
 import threading
 import time
 import uuid
@@ -31,10 +32,11 @@ import pyarrow.parquet as pq
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import fsync
 from litelink._layout import Layout
-from litelink._lease import Lease, new_owner
 from litelink._maintenance import (
+    CONFIG_KEY,
     Maintenance,
     checkpoint,
     stable_prefix,
@@ -68,10 +70,17 @@ OFFSET = "litelink_offset"
 # 20 attempts a second while a caller is blocked, and none otherwise.
 _AWAIT_POLL = 0.05
 
+# How long a configuration change waits for maintenance to finish before it
+# gives up. Long enough to cover an ordinary merge, short enough that a wedged
+# log is reported rather than hung.
+_SETTINGS_WAIT_S = 10.0
+
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
 
-_CONFIG_KEY = "config"
+
+# One home, in `_maintenance`, because eviction reads it too.
+_CONFIG_KEY = CONFIG_KEY
 # One home, in `_archive`, because `evict` reads it too.
 _ARCHIVE_KEY = ARCHIVE_KEY
 _SCHEMA_KEY = "arrow_schema"
@@ -397,7 +406,6 @@ class Log:
     ) -> None:
         self.name = layout.name
         self.root = layout.root
-        self.config = config
         self.readonly = readonly
 
         self._layout = layout
@@ -516,8 +524,6 @@ class Log:
         buffer = Buffer.open(
             layout.buffer_db,
             schema,
-            target_size=settings.target_seal_size,
-            target_rows=settings.target_seal_rows,
         )
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
@@ -525,13 +531,21 @@ class Log:
         # string type and one binary type, so `large_binary` would come back
         # `binary` and the declaration would be quietly overruled.
         buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
-        buffer.set_meta(_CONFIG_KEY, settings.to_json())
-        if archive is not None:
-            buffer.set_meta(_ARCHIVE_KEY, archive)
+        # The pair in ONE transaction. `validate` has just accepted these two
+        # together, and written separately a crash between them records the
+        # policy without the archive it presupposes — evict-on-upload with
+        # nothing to evict into, which `open` never re-checks and the first
+        # maintenance pass carries out.
+        buffer.set_meta_all(
+            {
+                _CONFIG_KEY: settings.to_json(),
+                **({_ARCHIVE_KEY: archive} if archive is not None else {}),
+            }
+        )
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, archive, s3, table_schema(schema))
+        remote = Archive(layout, buffer, s3, table_schema(schema))
 
         return cls(
             layout=layout,
@@ -545,7 +559,7 @@ class Log:
                 duckdb_connection,
                 archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, settings, order, remote),
+            maintenance=Maintenance(table, buffer, layout, order, remote),
             schema=schema,
             sort_by=order,
             config=settings,
@@ -600,16 +614,10 @@ class Log:
         buffer = Buffer.open(
             layout.buffer_db,
             schema,
-            target_size=config.target_seal_size,
-            target_rows=config.target_seal_rows,
             readonly=read_only,
         )
         sort_by = table.sort_by()
-        # `or None`: detaching stores an empty string rather than deleting the
-        # row, and an empty archive is no archive. Read once here because both
-        # the Log and its maintainer need it.
-        archive = buffer.get_meta(_ARCHIVE_KEY) or None
-        remote = Archive(layout, archive, s3, table_schema(schema))
+        remote = Archive(layout, buffer, s3, table_schema(schema))
         log = cls(
             layout=layout,
             table=table,
@@ -622,7 +630,7 @@ class Log:
                 duckdb_connection,
                 archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, config, sort_by, remote),
+            maintenance=Maintenance(table, buffer, layout, sort_by, remote),
             schema=schema,
             sort_by=sort_by,
             config=config,
@@ -636,6 +644,16 @@ class Log:
 
     # -- settings ----------------------------------------------------------
 
+    @property
+    def config(self) -> LogConfig:
+        """The policy in force, owned by `Maintenance` (§12).
+
+        A property rather than a field, because two copies of a policy that
+        another process can change is a way for compaction and `sync` to
+        disagree about which files are still in play.
+        """
+        return self._maintenance.config
+
     def set_config(self, config: LogConfig) -> None:
         """Replace the operational policy (§12).
 
@@ -645,16 +663,40 @@ class Log:
         """
         with self._lock:
             self._writable()
-            validate(self._schema, self._sort_by, config, self._archive.uri)
-            self._buffer.set_meta(_CONFIG_KEY, config.to_json())
-            self.config = config
-            self._maintenance.set_config(config)
-            # The buffer too, or `target_size` changes everywhere except where
-            # the cut is actually made and the log quietly keeps sizing files
-            # to the value it was opened with.
-            self._buffer.set_target_size(
-                config.target_seal_size, config.target_seal_rows
-            )
+            # The same claim `set_archive` takes, and for the same reason.
+            # `validate` refuses a PAIR — an evict-on-upload policy with no
+            # archive to evict into — so the two halves have to be decided
+            # together. Reading the other half durably is not enough on its
+            # own: read and write as two transactions and the check is only a
+            # statement about the past, so the two setters could each pass
+            # against a state the other was about to change and assemble the
+            # refused pair between them. The next maintenance pass then
+            # executes it faithfully and deletes the only copy of everything
+            # sealed. Verified by execution before this claim existed.
+            lease = self._claim_settings()
+
+            try:
+                validate(
+                    self._schema,
+                    self._sort_by,
+                    config,
+                    self._buffer.get_meta(_ARCHIVE_KEY) or None,
+                )
+                # Asked again at the write. The claim makes the read and the
+                # write one decision only while it is held, and a stall past
+                # the TTL between them is the threat the TTL exists for: the
+                # other setter takes the lapsed claim lawfully, validates
+                # against the half this one has not written yet, writes its
+                # own — and between them they record the pair `validate` just
+                # refused. Every data commit already asks this; the setters
+                # stopped one line short.
+                checkpoint(lease.renew)
+                # The only write. There is nothing to fan out: `Maintenance`,
+                # the seal target and `Log.config` all read this row rather
+                # than keeping copies of it.
+                self._buffer.set_meta(_CONFIG_KEY, config.to_json())
+            finally:
+                lease.release()
 
     def archived_through(self) -> int:
         """Highest offset the archive holds, 0 if none (§5, I4).
@@ -706,12 +748,15 @@ class Log:
         would have to restate, and each of those a way to get it silently
         wrong.
         """
-        if self._archive.uri is None:
+        # One read, checked and used. Read twice, a detach landing between them
+        # hands `litestream_config` a None it has no branch for.
+        archive = self._archive.uri
+        if archive is None:
             msg = "replication needs an archive; this log is local-only"
             raise ValueError(msg)
 
         return litestream_config(
-            self.databases, self._layout.root, self._archive.uri, self._archive.s3
+            self.databases, self._layout.root, archive, self._archive.s3
         )
 
     def write_replication_config(self) -> Path:
@@ -739,34 +784,55 @@ class Log:
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5).
 
-        Takes the maintenance lease, so it cannot interleave with a `sync` —
-        and raises if another owner holds it, rather than proceeding.
+        Takes the whole-log claim, so it cannot interleave with a sync, a
+        merge, an eviction or the other setter — `validate` refuses a PAIR, so
+        the policy and the location have to be decided together. The shipped
+        writer calls this on every restart while a maintainer runs in another
+        process, so it waits for maintenance rather than failing on the first
+        try; see `_claim_settings`.
 
-        A sync that has already read `s3://old`, taken the lease and pushed to
-        it finishes by writing that archive's extent as the watermark. Land a
-        re-point in between and the log points at the new, empty archive while
-        carrying a watermark earned by the old one — eviction believes it and
-        deletes the only local copy of rows the new archive has never been
-        sent. Nothing lowers a watermark, so no later sync undoes it.
+        **Re-pointing does not move anything, and is not reversible.** Rows
+        already evicted into the old archive stay there, and the read path
+        resolves only the archive the log currently names — so after a re-point
+        they are not readable through this log, and `scan(include_archive=True)`
+        returns fewer rows than were written, silently.
 
-        The shipped writer calls this on every restart, and the maintainer runs
-        in another process, so the two are exactly the pair that collide.
+        Pointing BACK does not undo it. Re-attaching to an archive that already
+        holds data is not expressible today (§13): the catalog entry is
+        repaired by dropping it and creating a fresh table at the prefix, which
+        gives an EMPTY table over the objects still sitting there. So the old
+        data becomes unreachable through this log by any sequence of calls, and
+        an operator moving between buckets has to copy the objects across
+        before re-pointing. §13 lists the supported operations as attach,
+        detach, and re-point to a FRESH prefix for exactly this reason.
+
+        What re-pointing no longer does is disturb what the log already knows.
+        There is no watermark to carry across: each pushed file records the
+        bucket its copy went to (§4a), so ranges the old archive holds go on
+        naming it, eviction keeps asking about the archive that is configured
+        now, and compaction keeps refusing to merge across any of them.
         """
         with self._lock:
             self._writable()
-            validate(self._schema, self._sort_by, self.config, archive)
-            # Before the first durable write, so a refusal changes nothing.
-            lease = self._lease(MAINTAIN_ROLE)
-            if not lease.acquire():
-                msg = (
-                    "another owner holds the maintenance lease; a sync may be "
-                    "pushing to the current archive. Retry."
-                )
-                raise RuntimeError(msg)
+            lease = self._claim_settings()
 
             # Every write inside, so a failure — a full disk, a busy database —
-            # releases the lease instead of stranding it for its whole TTL.
+            # releases the claim instead of stranding it for its whole TTL.
             try:
+                # Read, checked and written UNDER the claim. `validate` refuses
+                # a PAIR, and reading the other half durably is not enough on
+                # its own: read and write as two transactions with nothing
+                # between them, and the check is only a statement about the
+                # past — `set_config` could land its half in the gap, so
+                # between them the two calls assemble the very pair neither
+                # would accept, and the next maintenance pass executes it.
+                #
+                # `set_config` takes this same claim, which is what makes the
+                # two serialise. It is the rule §4a already states for data,
+                # applied to the configuration that governs it.
+                validate(self._schema, self._sort_by, self.config, archive)
+                # The other half of the same rule; see `set_config`.
+                checkpoint(lease.renew)
                 self._repoint(archive)
             finally:
                 lease.release()
@@ -799,14 +865,13 @@ class Log:
         self._buffer.set_meta_moved(
             _ARCHIVE_KEY,
             normalised or "",
-            {Maintenance.ARCHIVED_KEY: "0", Maintenance.PENDING_KEY: "0"},
+            {Maintenance.ARCHIVED_KEY: "0"},
         )
 
         # Reaches the maintainer and the reader because all three hold this
         # object. `evict` asks it whether I4 is owed anything, and a setting
         # that stopped at `Log` would leave the maintainer deleting the only
         # copy of rows an archive was just configured to receive.
-        self._archive.set_uri(normalised)
 
         # Repaired here as well as at open, and the difference is who waits.
         # The catalog entry still names the previous archive until something
@@ -857,25 +922,63 @@ class Log:
             # other, leaving a half-written file nothing could name.
             lease = self._lease(MAINTAIN_ROLE)
             if not lease.acquire():
-                msg = "another owner holds the maintenance lease"
+                msg = "another owner holds a claim over this range"
                 raise RuntimeError(msg)
 
             try:
                 self._table.set_sort_order(requested)
                 self._sort_by = requested
                 self._maintenance.set_sort_by(requested)
-                self._maintenance.rewrite_sorted(heartbeat=lease.renew)
+                self._maintenance.rewrite_sorted(
+                    heartbeat=lease.renew, owner=lease.owner
+                )
             finally:
                 lease.release()
 
-    def _lease(self, role: str) -> Lease:
-        """A fresh claim on `role` for this attempt.
+    def _claim_settings(self) -> Claim:
+        """Take the whole-log claim the configuration operations share.
+
+        Retried, not refused on the first try. `set_config` and `set_archive`
+        exclude each other because `validate` refuses a PAIR and the two halves
+        have to be decided together — but they also collide with ordinary
+        maintenance, and the shipped writer calls both on every restart while a
+        maintainer runs continuously. Measured before this wait existed: one
+        startup in six failed, which turns a routine restart into a coin toss.
+
+        Bounded, so a genuinely long merge still surfaces rather than hanging.
+        A configuration change is administrative and rare; waiting a few
+        seconds for a compaction to finish is the right trade, and failing
+        after that is honest.
+        """
+        wait = getattr(self, "_settings_wait", _SETTINGS_WAIT_S)
+        deadline = time.monotonic() + wait
+        while True:
+            claim = self._lease(MAINTAIN_ROLE)
+            if claim.acquire():
+                return claim
+
+            if time.monotonic() >= deadline:
+                msg = (
+                    "another owner has held a claim over this log for "
+                    f"{wait:.0f}s; maintenance may be mid-pass. Retry."
+                )
+                raise RuntimeError(msg)
+
+            time.sleep(random.uniform(0.01, 0.05))
+
+    def _lease(self, role: str, lo: int = 0, hi: int = EVERYTHING) -> Claim:
+        """A fresh claim on `[lo, hi]` for this attempt.
 
         Minted per call rather than held as a field. A field would fix one owner
         for the whole Log, and two threads sharing it would then re-enter each
-        other's lease — leaving the role excluding nothing inside a process.
+        other's claim — leaving it excluding nothing inside a process.
+
+        The default range is the whole log, which is what a configuration change
+        needs: re-pointing an archive or rewriting its files is not an operation
+        on an offset interval, so it excludes every pass rather than commuting
+        with any of them.
         """
-        return self._buffer.lease(role, new_owner())
+        return self._buffer.claim(role, lo, hi, new_owner())
 
     def _writable(self) -> None:
         if self.readonly:
@@ -1111,25 +1214,32 @@ class Log:
         # row that refuses a sealer in another process refuses one in another
         # thread on the same terms — and it lapses if this attempt dies
         # mid-seal, so another may finish what `sealing` records.
-        lease = self._lease(SEAL_ROLE)
-        if not lease.acquire():
-            return None
-
-        # No lock here either: the lease is the exclusion, and it already
-        # refuses every other owner in this process and any other. A lock would
-        # be a second answer to a question already settled.
-        #
         # The range comes from the queue, not from whatever the buffer happens
         # to hold now. That is the difference between a file of `target_size`
         # and a file of however much arrived while the sealer was getting here
         # — and it costs one indexed row read instead of the SCAN that asking
         # the buffer for its extent used to.
+        #
+        # Read BEFORE the claim, because the claim is over this range and the
+        # queue is what names it. Nothing is decided by the read: a second
+        # sealer reading the same group loses the claim and returns.
         group = self._buffer.pending_group()
         if group is None:
-            lease.release()
             return None
 
         start, end = group
+        # No lock here: the claim is the exclusion, and it already refuses
+        # every other owner in this process and any other. A lock would be a
+        # second answer to a question already settled.
+        #
+        # One mechanism for both cases: owners are unique per attempt, so the
+        # row that refuses a sealer in another process refuses one in another
+        # thread on the same terms — and it lapses if this attempt dies
+        # mid-seal, so another may finish what `sealing` records.
+        lease = self._buffer.claim(SEAL_ROLE, start, end - 1, new_owner())
+        if not lease.acquire():
+            return None
+
         # A claim already naming this range means a previous attempt got at
         # least as far as recording it and then died — possibly AFTER its
         # commit landed. Replaying blindly re-registers a file the table
@@ -1175,7 +1285,7 @@ class Log:
             # `target_size` file; a write that outlasts 30 s means the machine
             # is in trouble, and stopping is the right answer then too.
             if not lease.renew():
-                msg = "lost the seal lease before writing"
+                msg = "lost the claim on this seal range before writing"
                 raise RuntimeError(msg)
 
             self._write_and_commit(end, rel_path, lease)
@@ -1219,7 +1329,7 @@ class Log:
             time.sleep(_AWAIT_POLL)
 
     def _write_and_commit(
-        self, end: int, rel_path: str, lease: Lease | None = None
+        self, end: int, rel_path: str, lease: Claim | None = None
     ) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
 
@@ -1253,7 +1363,7 @@ class Log:
             self._buffer.enqueue_deletions(
                 [rel_path], int(datetime.now(UTC).timestamp())
             )
-            msg = "lost the seal lease before committing"
+            msg = "lost the claim on this seal range before committing"
             raise RuntimeError(msg)
 
         # `end` passed so the commit can decline if the range is already in
@@ -1335,7 +1445,7 @@ class Log:
             finally:
                 seal.release()
 
-    def _recover_seal(self, lease: Lease | None = None) -> None:
+    def _recover_seal(self, lease: Claim | None = None) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
         did not, the whole file is rewritten to the same path.
 
@@ -1405,10 +1515,15 @@ class Log:
         # sources were queued before that commit and drain away behind it.
         #
         # The seal path never had this exposure: an abandoned seal goes through
-        # `pending_delete`, whose drain re-reads `referenced_paths` at unlink
-        # time and refuses anything the table has since adopted. Recovery now
-        # uses the same route, so the last word belongs to a check made when
-        # the file is actually removed.
+        # `pending_delete`, whose drain refuses anything the table references.
+        # Recovery uses the same route.
+        #
+        # That veto is read ONCE per drain pass, not per removal — this said
+        # otherwise, and the difference is the whole of a defect found on the
+        # archive side: a commit landing after the veto was read leaves drain
+        # deleting objects the manifest now names. What actually makes it safe
+        # is that the committer renews its claim immediately before committing,
+        # so a claim recovery has taken cannot commit at all.
         claimed = self._buffer.pending_outputs()
         self._maintenance.enqueue_recovered(key for _, _, key in claimed)
 
@@ -1469,7 +1584,7 @@ class Log:
         # `set_uri` is a no-op when nothing moved.
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
+            msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
@@ -1480,7 +1595,6 @@ class Log:
             # new one. `_push` would reconcile the old archive's extent into
             # the watermark with no network call at all, and eviction believes
             # a watermark whatever earned it.
-            self._archive.set_uri(self._buffer.get_meta(_ARCHIVE_KEY) or None)
             if not self._archive.configured():
                 msg = "sync() needs an archive; this log is local-only"
                 raise ValueError(msg)
@@ -1497,7 +1611,7 @@ class Log:
         finally:
             lease.release()
 
-    def _push(self, lease: Lease, pinned: str | None) -> None:
+    def _push(self, lease: Claim, pinned: str | None) -> None:
         """Upload and register everything above the archive's extent.
 
         Everything compaction has finished with, which `stable_prefix` decides
@@ -1512,6 +1626,13 @@ class Log:
         watermark forever rather than improve anything. That is a cosmetic cost
         with a deliberate cause, and `rewrite_archive` is the tool for it.
         """
+        # Read under the claim, the same as everything else that decides what
+        # this pass does. The grouping `stable_prefix` computes has to match
+        # the one compaction computes — `runs` is shared so they cannot
+        # disagree — and in the shipped topology they are separate processes,
+        # so agreement means both reading the policy the log records rather
+        # than the one each happened to open with.
+
         archive = self._archive.require()
         self._table.reload()
         # The ARCHIVE reloaded too, and for a stronger reason than the local
@@ -1526,58 +1647,148 @@ class Log:
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
-        # Both watermarks reconciled against the archive itself, in ONE
-        # transaction, before anything is pushed.
+        # The watermark reconciled against the archive itself. It is a cache of
+        # what the archive holds — kept for the push floor and for display, and
+        # no longer for anything that authorises a deletion — so a commit that
+        # landed while the `meta` write after it did not would leave it behind
+        # for ever: the next pass computes `floor` from the archive, finds
+        # nothing left to push, and never revisits it.
         #
-        # The confirmed one is a cache of what the archive holds, so a commit
-        # that landed while the `meta` write after it did not would leave it
-        # behind for ever: the next pass computes `floor` from the archive,
-        # finds nothing left to push, and never revisits the number eviction
-        # depends on.
-        #
-        # The frontier is RESOLVED rather than advanced, whichever way it went.
-        # It stands in for a question — did the register land? — that the
-        # extent has just answered: reached, and it did; not reached, and it
-        # never did. Either way the guess must go, and clearing it here is what
-        # keeps it from deadlocking. Nothing but the NEXT successful push ever
-        # overwrote it, and it blocks compaction — so a register that failed
-        # where `stable_prefix` needed that very merge before anything could
-        # settle left sync waiting on a compaction the frontier forbade, while
-        # being the only thing that would clear it. Both passes returned
-        # success, for ever.
-        #
-        # One transaction because clearing the frontier is only safe once the
-        # confirmed watermark has caught up to the extent: separately, a crash
-        # between them leaves neither guarding the range, and compaction merges
-        # across a boundary the archive already holds.
         # Compared and written in one transaction, not read and then written.
         # Reconciling against an archive the log has been pointed away from is
-        # the loss this whole path is here to prevent, and a guard that reads
-        # first only reports where the archive was.
+        # the loss this path is here to prevent, and a guard that reads first
+        # only reports where the archive was.
         confirmed = max(self._maintenance.archived_through(), floor)
         self._buffer.set_meta_if(
-            _ARCHIVE_KEY,
-            pinned,
-            {
-                Maintenance.ARCHIVED_KEY: str(confirmed),
-                Maintenance.PENDING_KEY: "0",
-            },
+            _ARCHIVE_KEY, pinned, {Maintenance.ARCHIVED_KEY: str(confirmed)}
         )
 
         memory = self._maintenance.memory()
+
+        # BACKFILL, and it is what makes I4-per-segment recoverable. The row
+        # naming a file's archive copy is written after the register, so a
+        # crash between the two leaves the archive holding a range that nothing
+        # local records — and compaction, which now decides from those rows,
+        # would merge it into a file spanning the archive's extent. The next
+        # push would register a partial overlap, which `register` admits.
+        #
+        # The archive's own manifest is the truth, so recover from it rather
+        # than promising anything beforehand. Reading it costs nothing extra:
+        # `extent()` above already walked it.
+        # Bounded by the local window, not by the archive. Every decision the
+        # rows feed — what compaction may merge, what eviction may drop — is
+        # about files the local table still holds, so an archive file entirely
+        # below them changes no answer. Unbounded, this read and this loop grew
+        # with the archive and ran on every single sync.
+        # Bound before the first use. The backfill below sizes an unmeasured
+        # archive file by the compact target, and `stable_prefix` groups by the
+        # same policy — two reads, and nothing that makes them agree.
+        config = self.config
+        local = self._table.data_files()
+        base = min((f.lo for f in local), default=0)
+
+        # RECONCILIATION, matched by path in the archive's manifest rather than
+        # by offset range. Range matching reads plausibly and is wrong: a
+        # rewrite's intents name new objects over a range the stale files being
+        # replaced still cover, so a crashed rewrite's dead intents would be
+        # confirmed rather than dropped.
+        #
+        # Bounds differ between the two reads and must. The manifest walk is
+        # bounded by the local window, or it grows with the archive and runs on
+        # every sync. The intent read is unbounded, because an intent below the
+        # window has to be reachable to be dropped.
+        held_paths = {f.path: f for f in archive.data_files() if f.hi >= base}
+        recorded = {
+            path for path, _, _, _ in self._buffer.archive_records(pinned or "", base)
+        }
+        intended = {
+            path: (lo, hi, size)
+            for path, lo, hi, size in self._buffer.intents(pinned or "")
+        }
+
+        # ONE rule per path, decided by which of the two tables holds it. An
+        # earlier shape ran the rules as separate loops over a `recorded` set
+        # snapshotted before either — so rule 2 re-fired for every path rule 1
+        # had just confirmed, and `record_file`'s conflict clause overwrote the
+        # intent's measured bytes with the default. That made the `bytes`
+        # column dead in every reachable path: the rewrite tail this exists to
+        # size correctly was durably recorded as full, and nothing re-measures
+        # an archived file.
+        for path, landed in held_paths.items():
+            recovered = intended.get(path)
+            if recovered is not None:
+                # 1. The register landed. Confirm it with the bytes the intent
+                #    carried — the only measurement that survives a crash
+                #    between a rewrite's commit and its confirm.
+                lo, hi, size = recovered
+                self._buffer.record_file(path, lo, hi, size)
+            elif path not in recorded:
+                # 2. In the manifest with no row of either kind: the backfill
+                #    this rule grew out of.
+                self._buffer.record_file(
+                    path,
+                    landed.lo,
+                    landed.hi + 1,
+                    memory.get(path, config.compact_size),
+                )
+
+        for path in intended:
+            if path not in held_paths:
+                # 3. Nothing in the manifest holds that path, so the register
+                #    never landed and the intent is dead. Below the local
+                #    window this also drops intents whose register DID land —
+                #    the manifest walk is bounded — and their sizes are then
+                #    never measured. No reader below the window asks.
+                self._buffer.forget_intent(path)
+
         pending = [f for f in self._table.data_files() if f.hi > floor]
-        settled = stable_prefix(
-            pending,
-            self.config.compact_size,
-            self.config.compact_min_files,
+        # `stable_prefix` holds a file back when compaction might still merge
+        # it, and compaction refuses to merge anything some archive already
+        # holds — so the two need the SAME exclusion or they deadlock. They
+        # share `runs` for exactly this reason, and giving compaction a second
+        # input this could not see was enough to break it: after a re-point to
+        # a fresh prefix the floor is 0, so files an old archive covers are
+        # back in `pending`, group into a mergeable run under a raised target,
+        # and are held back for ever against a merge that will never happen.
+        # Nothing is pushed, the watermark never moves, eviction pins on it,
+        # and no error surfaces anywhere.
+        #
+        # A file no merge can touch is settled by definition. Only the part
+        # above that line is still compaction's business.
+        # Intents included, so this exclusion is literally compaction's. The
+        # two share `runs` so they cannot disagree about what is in play, and
+        # a second input one of them could not see is what deadlocked them once
+        # already.
+        frozen = self._maintenance.archived_prefix(pending, None, include_intents=True)
+        head = [f for f in pending if f.lo > frozen]
+        settled = (len(pending) - len(head)) + stable_prefix(
+            head,
+            config.compact_size,
+            config.compact_min_files,
             memory,
-            self.config.compact_rows,
+            config.compact_rows,
         )
 
         uploaded: list[tuple[DataFile, str]] = []
         for data_file in pending[:settled]:
             checkpoint(lease.renew)
             rel_path = self._layout.relative(data_file.path)
+            # The intent BEFORE the upload, which is the seal's I2 argument
+            # applied to the archive: the name goes down before the object
+            # exists. What it guards is the register that follows — that can
+            # land while the row recording it does not, and compaction decides
+            # what it may merge from those rows, so without this a
+            # compaction-target change before the next sync merges across a
+            # range the archive holds and every later push is refused for ever.
+            #
+            # For EVERY file, not only measured ones: the unmeasured are
+            # exactly the ones the confirm below used to skip.
+            self._buffer.intend_file(
+                archive.uri(rel_path),
+                data_file.lo,
+                data_file.hi + 1,
+                memory.get(data_file.path, config.compact_size),
+            )
             archive.put(self._layout.absolute(rel_path), rel_path)
             uploaded.append((data_file, rel_path))
 
@@ -1593,23 +1804,21 @@ class Log:
         # waited, and the buffer grew for the whole of it.
         checkpoint(lease.renew)
         last = uploaded[-1][0]
-        # Recorded BEFORE the register, and never read by eviction. It is what
-        # lets compaction know, after a crash between the register and its
-        # confirming write, that these offsets may already be in the archive
-        # and must not be merged into a file that straddles its extent.
-        if not self._buffer.set_meta_if(
-            _ARCHIVE_KEY, pinned, {Maintenance.PENDING_KEY: str(last.hi)}
-        ):
-            # Declined, so the register does not happen either. The upload
-            # already spent longer than a lease TTL against S3 more than once,
-            # which is how the log gets re-pointed underneath a push — and
-            # registering into the archive it was pointed AWAY from writes the
-            # log's rows somewhere nothing will look for them again.
+        if (self._buffer.get_meta(_ARCHIVE_KEY) or None) != pinned:
+            # The upload already spent longer than a lease TTL against S3 more
+            # than once, which is how the log gets re-pointed underneath a push
+            # — and registering into the archive it was pointed AWAY from
+            # writes the log's rows somewhere nothing will look for them again.
             raise _repointed_mid_push()
 
         if not archive.register(
             [archive.uri(rel_path) for _, rel_path in uploaded],
             sealed_through=last.hi + 1,
+            # The low end too, so the archive can refuse a range that starts
+            # inside what it already holds. Everything upstream is arranged so
+            # that cannot happen; this is the check that holds regardless of
+            # whether the arrangement has a gap.
+            lo=uploaded[0][0].lo,
         ):
             return
 
@@ -1619,14 +1828,21 @@ class Log:
             # afterwards: the local entry goes when the local file is unlinked,
             # and a Parquet footer records what the rows compressed from, not
             # what the appender counted them as.
-            held = memory.get(data_file.path)
-            if held is not None:
-                # Same extent, second location. `end_offset` is exclusive, as
-                # it is on every other extent — the cut is recorded as the
-                # offset AFTER the last row.
-                self._buffer.record_file(
-                    archive.uri(rel_path), data_file.lo, data_file.hi + 1, held
-                )
+            #
+            # For every file, with the same default the intent used. The guard
+            # that used to skip unmeasured ones was a hole: in a takeover the
+            # confirm is the only thing that recreates rows a rival's
+            # reconciliation dropped, so skipping any file reopens the window
+            # for exactly the files the intent was added to protect.
+            #
+            # Same extent, second location. `end_offset` is exclusive, as it is
+            # on every other extent — the cut is the offset AFTER the last row.
+            self._buffer.record_file(
+                archive.uri(rel_path),
+                data_file.lo,
+                data_file.hi + 1,
+                memory.get(data_file.path, config.compact_size),
+            )
 
         # After the register, never before: the watermark is a promise that the
         # archive HAS the range, and I4 lets `maintain` delete the local copy on
@@ -1686,21 +1902,8 @@ class Log:
         # Taken after the refusals above, so a rejected call does not leave
         # a lease behind for its TTL and lock out the process that could
         # have done the work.
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
-            raise RuntimeError(msg)
-
-        try:
-            # Renewed between passes, not merely held. A compaction can run for
-            # tens of seconds against a 30 s lease, and a second maintainer
-            # taking the role mid-pass would compact the same runs to the same
-            # deterministic path — a torn file, not a conflict Iceberg can
-            # resolve. Losing it is a hard error rather than something to plough
-            # on through.
-            self._maintenance.run(heartbeat=lease.renew)
-        finally:
-            lease.release()
+        # Each pass claims what it works on; see `_pass`.
+        self._maintenance.run(heartbeat=None)
 
         # Sealing IS maintenance — it is the first thing done with what the
         # writer leaves behind. Called here so that a caller running only this
@@ -1745,15 +1948,12 @@ class Log:
         it came through.
         """
         self._writable()
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
-            raise RuntimeError(msg)
-
-        try:
-            run(heartbeat or lease.renew)
-        finally:
-            lease.release()
+        # No claim here. Each pass claims the range it actually works on —
+        # compaction a run, eviction the prefix it removes — so two maintainers
+        # exclude each other only where their work overlaps, which is what §4a
+        # buys over one lease per role. An entry-point claim would put that
+        # back and cover every offset in the log while doing so.
+        run(heartbeat)
 
     def rewrite_archive(self) -> None:
         """Merge undersized files already in the archive (§6, ad-hoc).
@@ -1776,11 +1976,11 @@ class Log:
 
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
+            msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
-            self._maintenance.rewrite_archive(lease.renew)
+            self._maintenance.rewrite_archive(lease.renew, lease.owner)
         finally:
             lease.release()
 
@@ -1823,7 +2023,7 @@ class Log:
         # compaction do, and for the same reason they must not overlap.
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
-            msg = "another owner holds the maintenance lease"
+            msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
@@ -1831,7 +2031,7 @@ class Log:
         finally:
             lease.release()
 
-    def _pull(self, lease: Lease, since: timedelta) -> None:
+    def _pull(self, lease: Claim, since: timedelta) -> None:
         """Copy down and register everything archived since `since`."""
         archive = self._archive.require()
         self._table.reload()
@@ -1876,6 +2076,19 @@ class Log:
             rel_path = archive.key(data_file.path)
             destination = self._layout.absolute(rel_path)
             archive.fetch(data_file.path, destination)
+            # Asked AGAIN, after the fetch and before the commit. The download
+            # is a whole file rather than a stream, so it is the slow leg, and
+            # the checkpoint above only says the claim was held before it. Past
+            # the TTL, `drain` may lawfully take the whole log and unlink this
+            # very name — the queue still holds it, since it is the eviction
+            # that motivated the hydrate — and its own per-deletion renewal
+            # cannot help, because there `drain` is the legitimate holder and
+            # this is the lapsed one. Registering afterwards points the table
+            # at a file that is not on disk: every scan over the range raises,
+            # and `record_file` stamps it fresh so eviction cannot age it out
+            # for a whole `local_retention`, while a re-run of `hydrate` skips
+            # the range because the local floor now covers it.
+            checkpoint(lease.renew)
             # No `sealed_through`: that check exists to decline a range the
             # table already covers, and every range here is deliberately below
             # what it covers. The filter above is what prevents an overlap.
@@ -1885,16 +2098,17 @@ class Log:
             # anything else, and eviction dates a file by this record — so a
             # hydrated file without one would sit undateable, treated as newly
             # written, and never leave again.
-            # KNOWN GAP, dormant: this promises above that a hydrated file
-            # "counts as full", and a file the archive never measured records
-            # zero instead — the opposite. It stays dormant because a hydrated
-            # file sits at or below `archive_frontier` and every size consumer
-            # excludes it there; the value goes live only if a watermark reset
-            # drops the frontier beneath it, which is the archive-identity seam
-            # SPEC §13 item 0 owns. Align the two when that is redesigned,
-            # rather than now, on code that redesign will rewrite.
+            # A file the archive never measured counts as FULL, matching what
+            # this promises above. Zero was the opposite, and it was dormant
+            # only while a watermark kept hydrated files out of every size
+            # consumer — removing the watermark is what wakes it: a file
+            # recorded at zero bytes is a permanent compaction candidate that
+            # merging can never make big enough to stop being one.
             self._buffer.record_file(
-                rel_path, data_file.lo, data_file.hi + 1, held.get(data_file.path, 0)
+                rel_path,
+                data_file.lo,
+                data_file.hi + 1,
+                held.get(data_file.path, self.config.compact_size),
             )
             floor = data_file.lo
 
@@ -2069,14 +2283,47 @@ def validate(
         msg = f"sort_by names columns not in the schema: {missing}"
         raise ValueError(msg)
 
+    if config.snapshot_retention < timedelta(0):
+        # The same sign slip, one field over. Expiry computes
+        # `now - snapshot_retention`, so a negative one puts the cutoff in the
+        # future: every superseded file is unlinked in the pass that supersedes
+        # it, and I6's whole promise — the grace must exceed the longest scan —
+        # is not merely shortened but inverted. Zero is allowed deliberately;
+        # it means "no grace", which tests and demos ask for on purpose.
+        msg = f"snapshot_retention must not be negative: {config.snapshot_retention}"
+        raise ValueError(msg)
+
+    if config.local_retention is not None and config.local_retention < timedelta(0):
+        # The same check its twin above has always had, and the reason it
+        # matters more here: eviction computes `now - local_retention`, so a
+        # negative one puts the cutoff in the FUTURE and every file in the log
+        # is stale. On a local-only log that is silent deletion of the only
+        # copy of everything, at every negative value, from one sign slip.
+        msg = f"local_retention must not be negative: {config.local_retention}"
+        raise ValueError(msg)
+
+    # Both floors, and how eviction actually combines them. It takes the LOWER
+    # boundary — the policy that retains MORE wins (§12) — so a config is only
+    # "evict on upload" when EVERY floor it states is one. Stating one such
+    # floor beside a generous one is safe, and the previous version of this
+    # rule refused it with a message that was false for that pair.
+    floors = [
+        config.local_retention is not None and config.local_retention <= timedelta(0),
+        config.local_rows is not None and config.local_rows == 0,
+    ]
+    stated = [
+        config.local_retention is not None,
+        config.local_rows is not None,
+    ]
     if (
         archive is None
-        and config.local_retention == timedelta(0)
-        and not config.local_rows
+        and any(stated)
+        and all(drops for drops, given in zip(floors, stated, strict=True) if given)
     ):
         msg = (
-            "local_retention=0 means 'evict on upload' and presupposes an "
-            "archive; with archive=None it would delete each file as it sealed"
+            "local_retention=0 and local_rows=0 both mean 'evict on upload' "
+            "and presuppose an archive; with archive=None this config would "
+            "delete each file as it sealed"
         )
         raise ValueError(msg)
 
@@ -2087,13 +2334,16 @@ def validate(
         )
         raise ValueError(msg)
 
-    if config.compact_min_files < 1:
+    if config.compact_min_files < 2:
         msg = (
-            f"compact_min_files must be at least 1: {config.compact_min_files}. "
+            f"compact_min_files must be at least 2: {config.compact_min_files}. "
             "It is how many files a run needs before compaction will merge it, "
-            "and below one nothing is ever settled: `stable_prefix` returns "
-            "zero for ever, so sync pushes nothing, the watermark stands still, "
-            "eviction pins on it and the local table grows without bound"
+            "and a run always holds at least one — so at one, every run looks "
+            "mergeable, nothing is ever settled, and `stable_prefix` returns "
+            "zero for ever: sync pushes nothing, the watermark stands still, "
+            "eviction pins on it and the local table grows without bound, while "
+            "every pass rewrites every file to no purpose. Merging a run of one "
+            "is a no-op rewrite in any case"
         )
         raise ValueError(msg)
 

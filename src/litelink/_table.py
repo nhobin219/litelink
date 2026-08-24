@@ -7,8 +7,10 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import random
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -42,7 +44,16 @@ if TYPE_CHECKING:
 # see `expire_snapshots`.
 # Bounded: a commit that keeps losing is contention worth surfacing, not
 # something to retry forever behind a caller's back.
-_COMMIT_ATTEMPTS = 5
+# Eight, not five. Every loser of a CAS reloads and re-commits, so under real
+# contention — a writer sealing while two maintainers commit disjoint ranges —
+# five immediate attempts were exhausted in a 45 s run. The cost of an extra
+# attempt is one reload; the cost of exhausting them is a pass that did its
+# whole rewrite and threw the result away.
+_COMMIT_ATTEMPTS = 8
+# The first backoff ceiling, doubling per attempt. Small enough that an
+# uncontended retry is imperceptible, and by the last attempt wide enough that
+# several committers land on different milliseconds.
+_COMMIT_BACKOFF_MS = 20
 
 METADATA_PROPERTIES = {
     "write.metadata.delete-after-commit.enabled": "true",
@@ -726,6 +737,17 @@ class LogTable:
                 if attempt == _COMMIT_ATTEMPTS - 1:
                     raise
 
+                # Backed off, with jitter, before the retry. Five immediate
+                # attempts against a contended branch is a thundering herd:
+                # every loser reloads and re-commits at once, so they collide
+                # again, and the exception that escapes is not a failure of the
+                # work but of the timing. Reachable in ordinary operation now
+                # that passes claim ranges rather than a role — two maintainers
+                # on disjoint offsets is the point of that, and it means two of
+                # them committing to one Iceberg branch. Range-disjointness
+                # makes their DATA independent; it does nothing about the
+                # single branch pointer they both swap.
+                time.sleep(random.uniform(0, _COMMIT_BACKOFF_MS * (2**attempt)) / 1000)
                 self.reload()
                 # Refreshed, so check it is still the same table. The catalog
                 # row is keyed by table id, not by identity, and a `set_archive`
@@ -827,6 +849,7 @@ class LogTable:
         paths: list[str],
         sealed_through: int | None = None,
         archived_through: int = 0,
+        lo: int | None = None,
     ) -> bool:
         """Add already-written files to the table, in ONE commit (§4 step 2).
 
@@ -878,12 +901,71 @@ class LogTable:
 
                 return
 
+            self._refuse_straddle(lo)
             added = True
             self._table.add_files(paths)
 
         self._commit(add)
 
         return added
+
+    def _refuse_straddle(self, lo: int | None) -> None:
+        """Refuse a range that PARTIALLY overlaps what this table holds.
+
+        The last line of defence, and the only one that cannot be reasoned
+        around. `_covers` declines a range entirely covered, which makes a
+        replayed push harmless — but a range that starts inside the extent and
+        ends beyond it is admitted, and those rows are then in two files at
+        once, in the immutable tier, with nothing able to repair it.
+
+        Everything upstream is arranged so this cannot arise: compaction skips
+        files the archive holds, so a merge never straddles its extent. That
+        argument has a gap, and it is narrow enough to have survived several
+        reviews — a crash between a register and the row recording it, then a
+        compaction-config change before the next sync backfills, regroups
+        pushed-but-unrecorded files into a mergeable run. The upstream fix for
+        each such path is a fresh piece of reasoning; this is one check that
+        holds however the reasoning turns out.
+
+        The test is `lo <= covered[1]`, with no lower bound, and the missing
+        lower bound is the point. `covered[0] <= lo` was there first and was a
+        hole rather than a safety condition: it exempted exactly the range that
+        starts BELOW the extent and spans past it, engulfing the whole thing —
+        every archived offset in two files at once, which is the worst version
+        of what this exists to stop, not an excused one.
+
+        Nothing legitimate is refused. `sync` pushes only files above the
+        archive's extent, so a batch whose first file starts at or below
+        `covered[1]` necessarily contains that offset — the last row of the
+        archive's top file, a real archived row — and is a genuine overlap
+        however it is shaped. Whole-batch replays are excused earlier, by
+        `_covers`.
+
+        Refusing costs a stall, and the stall is worse than this used to say.
+        The straddling file never lands, the watermark stops, eviction pins
+        below it, and **nothing re-cuts a local straddler**: `rewrite_archive`
+        works the other side, and no tool does this one. The refusal is still
+        right — a loud permanent stall beats a silent permanent duplication —
+        but calling it recoverable was wrong, and the operator's only route
+        today is to lower the compaction target so the straddler is left alone,
+        or to start a fresh archive prefix.
+
+        Reaching it at all takes a crash between a register and the rows
+        recording it, and then a compaction-target change before the next sync
+        backfills those rows from the archive's manifest. SPEC §4a records the
+        window and what would close it.
+        """
+        if lo is None:
+            return
+
+        covered = self.extent()
+        if covered is not None and lo <= covered[1]:
+            msg = (
+                f"refusing a range starting at {lo}, which reaches into this "
+                f"table's extent {covered} without being covered by it: "
+                "admitting it would put those offsets in two files at once"
+            )
+            raise ValueError(msg)
 
     def _covers(self, sealed_through: int) -> bool:
         """Whether the table already holds everything below `sealed_through`.
