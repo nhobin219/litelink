@@ -104,31 +104,34 @@ embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 
 ## Using it
 
+The shape below is `examples/websocket.py`, which captures a live exchange feed
+end to end — run it with `just demo-websocket`.
+
 ```python
 import pyarrow as pa
 from litelink import Log
 
-# An ADS-B position feed: durable the moment it arrives, queryable a moment later.
+# A trade feed: durable the moment it arrives, queryable a moment later.
 schema = pa.schema([
-    pa.field("event_ts", pa.int64()),    # when the aircraft transmitted
-    pa.field("ingest_ts", pa.int64()),   # stamped by you, never by the library
-    pa.field("icao24", pa.string()),
-    pa.field("altitude_ft", pa.int64()),
-    pa.field("speed_kt", pa.float64()),
+    pa.field("trade_id", pa.int64()),
+    pa.field("event_ts", pa.int64()),    # microseconds, as the exchange sends them
+    pa.field("price", pa.float64()),
+    pa.field("amount", pa.float64()),
+    pa.field("side", pa.int64()),        # 0 buy, 1 sell
 ])
 
 # new() takes the shape; it is fixed at creation.
-log = Log.new("data", "positions", schema=schema, sort_by=("event_ts", "icao24"))
-log.append({"event_ts": 1, "ingest_ts": 2, "icao24": "a0f31c",
-            "altitude_ft": 37000, "speed_kt": 461.2})   # durable when this returns
+log = Log.new("data", "trades", schema=schema, sort_by=("event_ts",))
+log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
+            "price": 78501.62, "amount": 0.0076, "side": 0})  # durable on return
 
 # open() takes none of it — schema, sort order, config and archive all come
 # from the log itself.
-log = Log.open("data", "positions")
-log = Log.open("data", "positions", read_only=True)   # alongside a live writer
+log = Log.open("data", "trades")
+log = Log.open("data", "trades", read_only=True)   # alongside a live writer
 
-recent = log.scan(where="event_ts > 1000").read_all()
-log.maintain()                                        # compact, evict, expire
+recent = log.scan(where="event_ts > 1787772776000000").read_all()
+log.maintain()                                     # compact, evict, expire
 ```
 
 ## Sizing: two targets, not one
