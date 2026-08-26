@@ -176,6 +176,23 @@ demo-maintain *args:
     done
     wait || true
 
+# The smallest shape that still produces a durable, queryable log: one
+# process, no maintainer, no threads. `append` then `seal_due`, in-line in the
+# event loop — the opposite end of the range from `demo-maintain`'s four
+# processes, and worth reading beside it.
+#
+# With no --url it serves its own feed over loopback, so it needs no network.
+
+# Capture a websocket feed in-line, in one process.
+demo-websocket *args:
+    uv run --group dev python examples/websocket.py {{args}}
+
+# The `read` column is flat by construction — it answers from statistics — and
+# `scan` beside it reads every row, so its cost grows with the log. That
+# contrast is what the display is for.
+#
+#   just demo-tail --scan-every 0    metadata only; no full scans
+
 # Watch a running capture accumulate. Run alongside `just demo-capture`.
 demo-tail *args:
     uv run python examples/tail.py {{args}}

@@ -1,12 +1,28 @@
 # examples
 
-Three scripts against a real log. None need an archive, a service, or a network.
+Scripts against a real log. None need an archive, a service, or a network.
 
 ```
 just demo-capture      # terminal 1: append, and nothing else
 just demo-maintain     # terminal 2: one process per storage role
 just demo-tail         # terminal 3: watch where the rows are
 ```
+
+**Or the whole thing in one process**, which is the other end of the range:
+
+```
+just demo-websocket    # capture a feed in-line: append, seal_due, query
+```
+
+`websocket.py` is the smallest thing that is still a durable, queryable log —
+no maintainer, no threads, no second process. The loop is `log.append(...)`
+then `log.seal_due()`, and `seal_due` is an indexed read of one row when there
+is nothing to do, so calling it per message costs almost nothing. With no
+`--url` it serves its own feed over loopback, so it runs offline.
+
+Read it beside `maintainer.py` and the difference is the argument for splitting:
+a seal is CPU-bound pure Python, so at real rates it blocks the event loop that
+is trying to receive. The file says where that line is and what to do about it.
 
 `demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `sync` — and one
 command stops them all. They are separate processes rather than one, because a seal is

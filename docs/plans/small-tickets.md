@@ -296,6 +296,14 @@ work.** Closed.
 
 ---
 
+## Status
+
+All seven landed. T3 grew well past its ticket: publishing `version-hint.text`
+made the archive self-describing, which exposed that a WAL restore onto another
+machine fails outright — `catalog.db` records absolute paths to local Iceberg
+metadata no sidecar ships. That became `docs/plans/failover.md` and
+`Log.restore`.
+
 ## Order
 
 T7 is done → T1, T2 (independent, unblock the demo) → T3 → T4 (needs T3) →
