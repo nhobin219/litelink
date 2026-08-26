@@ -1,146 +1,116 @@
-"""Capture a websocket feed in-line: no maintainer, no threads, no processes.
+"""The whole library, against a live public feed, in one process.
 
-    uv run --group dev python examples/websocket.py [--url URL] [--seconds N]
+    uv run --group dev python examples/websocket.py
 
-Every other example splits the work up, because a real deployment should: a
-seal is CPU-bound pure Python and starves anything sharing its interpreter, so
-`maintainer.py` runs it elsewhere. This is the other end of the range — the
-smallest thing that is still a durable, queryable log — and the whole loop is:
+No producer to start, no credentials, no maintainer, no threads. Bitstamp
+publishes BTC/USD trades over an unauthenticated websocket; this subscribes,
+appends each one, and seals when there is enough to seal. That is the entire
+loop — everything else in this file is argument parsing and a closing query.
 
-    async for message in websocket:
-        log.append(decode(message))
-        log.seal_due()
+`seal_due` is an indexed read of one row when there is nothing to do, so
+calling it per message costs almost nothing, and when a group is queued it
+writes that one file and returns.
 
-`seal_due` is the entire maintenance story here. It is an indexed read of one
-row when there is nothing to do, so calling it per message costs almost
-nothing, and when a group is queued it writes that one file and returns. No
-lease dance, because there is only one process; no thread, because there is
-nothing to overlap with.
+**It blocks the event loop, and it is the SEAL that does it** — not the append.
+Measured: an append runs at a 405 us median, a `seal_due` that actually writes
+a file at 43 ms. So a trade arriving mid-seal waits for it. At this feed's rate
+that is invisible; the fix at real rates is to run the seal in another process,
+which is what `adsb/maintainer.py` is and why it exists.
 
-**With no --url it serves its own feed**, from `_stream.observations`, over a
-loopback websocket in this same event loop. So it runs offline, and the test
-suite can exercise it without reaching the network.
-
-**This blocks the event loop, and it is the SEAL that does it — not the
-append.** Measured on this file's own config: `append` runs at a 405 us median,
-while a `seal_due` that actually writes a file takes 43 ms, two orders of
-magnitude more. So a frame arriving during a seal waits for it, and at real
-rates that is where the backpressure shows up. Moving `append` to a thread —
-the obvious fix, and the wrong one — leaves the stall exactly where it is.
-
-What fixes it is running the seal elsewhere, which is what `maintainer.py`
-does and why it exists. Until then this shape holds as long as the gap between
-seals is comfortably longer than a seal takes.
+`adsb/` is the other end of the range: four processes, one per storage role,
+against a synthetic feed that can be driven as hard as you like.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from _stream import NAME, SCHEMA, SORT_BY, observations
+import pyarrow as pa
 
 from litelink import Log, LogConfig
 
-if TYPE_CHECKING:
-    import websockets
+FEED = "wss://ws.bitstamp.net"
+CHANNEL = "live_trades_btcusd"
+
+# Every field the feed sends that is worth a column. §7 prunes on Iceberg
+# statistics, so a query for one minute of trades never reads the rest — which
+# is the reason to declare a schema rather than store the frame whole.
+SCHEMA = pa.schema(
+    [
+        pa.field("trade_id", pa.int64(), nullable=False),
+        pa.field("event_ts", pa.int64(), nullable=False),
+        pa.field("price", pa.float64()),
+        pa.field("amount", pa.float64()),
+        # 0 buy, 1 sell, as the feed spells it.
+        pa.field("side", pa.int64()),
+    ]
+)
 
 
-async def serve(host: str, port: int) -> websockets.Server:
-    """A local feed, so this example needs no network and no credentials."""
-    import websockets
-
-    async def publish(connection: websockets.ServerConnection) -> None:
-        feed = observations(seed=7)
-        with contextlib.suppress(Exception):
-            while True:
-                await connection.send(json.dumps(next(feed)))
-                # Fast enough to seal several files in a short run, slow enough
-                # that the demo is watchable.
-                await asyncio.sleep(0.0005)
-
-    return await websockets.serve(publish, host, port)
-
-
-async def capture(url: str, log: Log, seconds: float) -> tuple[int, int]:
-    """Append every frame until `seconds` elapse. Returns (appended, sealed)."""
-    import websockets
-
-    appended = 0
-    sealed = 0
-    deadline = time.monotonic() + seconds
-    async with websockets.connect(url) as connection:
-        while time.monotonic() < deadline:
-            try:
-                message = await asyncio.wait_for(connection.recv(), timeout=1.0)
-            except TimeoutError:
-                continue
-
-            # One row, one durable append. `append` returns the offset it was
-            # given, which is what a caller records if it needs to correlate
-            # with anything outside the log.
-            log.append(json.loads(message))
-            appended += 1
-            # In-line, per message. Nothing else seals, so leaving this out
-            # means rows accumulate in SQLite for ever — durable and readable
-            # the whole time, but never reaching Parquet.
-            if log.seal_due() is not None:
-                sealed += 1
-
-    return appended, sealed
+def row(trade: dict) -> dict:
+    """One frame, as columns. Microseconds, because the feed sends them."""
+    return {
+        "trade_id": int(trade["id"]),
+        "event_ts": int(trade["microtimestamp"]),
+        "price": float(trade["price"]),
+        "amount": float(trade["amount"]),
+        "side": int(trade["type"]),
+    }
 
 
 async def main() -> None:
+    import websockets
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("litelink-ws"))
-    parser.add_argument("--url", help="feed to read; omitted, one is served here")
-    parser.add_argument("--seconds", type=float, default=10.0)
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--seconds", type=float, default=30.0)
     args = parser.parse_args()
 
-    # Small, so a short run seals more than once and the demo shows a file
-    # count moving. A real deployment leaves this at the default.
-    config = LogConfig(target_seal_size=64 * 1024, compact_min_files=2)
-    server = None if args.url else await serve("127.0.0.1", args.port)
-    url = args.url or f"ws://127.0.0.1:{args.port}"
-
-    # Open-or-new, the same shape `capture.py` uses and for the same reason:
-    # `Log.new` alone raises on the second run, which is a poor first
-    # impression for the example that is meant to be the easy one.
+    # Small, so a short run seals more than once and the file count moves. A
+    # real deployment leaves this at the default.
+    config = LogConfig(target_seal_size=16 * 1024, compact_min_files=2)
     try:
-        log = Log.open(args.root, NAME)
+        log = Log.open(args.root, "trades")
     except FileNotFoundError:
-        log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
+        log = Log.new(args.root, "trades", schema=SCHEMA, config=config)
 
     with log:
-        print(f"capturing {url} into {args.root}/{NAME} for {args.seconds:g}s")
-        appended, sealed = await capture(url, log, args.seconds)
+        print(f"capturing {CHANNEL} into {args.root}/trades for {args.seconds:g}s")
+        deadline = time.monotonic() + args.seconds
+        async with websockets.connect(FEED) as feed:
+            await feed.send(
+                json.dumps({"event": "bts:subscribe", "data": {"channel": CHANNEL}})
+            )
+            while time.monotonic() < deadline:
+                try:
+                    frame = json.loads(await asyncio.wait_for(feed.recv(), timeout=5))
+                except TimeoutError:
+                    continue
 
-        # `seal()`, not `seal_due()`. The loop above drains groups the appender
-        # has already CUT; the open group is not one of them, so ending on
-        # `seal_due` left the tail in SQLite — measured, 320 of 3,599 rows —
-        # while this print claimed everything was in Parquet. `seal` closes the
-        # open group first, which is exactly what an orderly shutdown wants and
-        # what nothing on the hot path should do.
+                # The feed also sends subscription acks and reconnect notices.
+                if frame.get("event") != "trade":
+                    continue
+
+                log.append(row(frame["data"]))
+                log.seal_due()
+
+        # `seal()`, not `seal_due()`: the loop above drains groups the appender
+        # already CUT, and the open group is not one of them. An orderly
+        # shutdown closes it, which is the one moment that is the right thing
+        # to do.
         while log.seal() is not None:
-            sealed += 1
+            pass
 
-        print(f"  appended {appended:,} rows, sealed {sealed} file(s)")
-        print(f"  table holds {log.table_rows():,} rows in {log.table_files()} file(s)")
-        busiest = log.sql(
-            "SELECT callsign, count(*) AS reports, max(altitude_ft) AS ceiling"
-            " FROM log GROUP BY callsign ORDER BY reports DESC LIMIT 3"
+        print(f"  {log.end_offset() - 1:,} trades, {log.table_files()} file(s)")
+        summary = log.sql(
+            "SELECT count(*) AS trades, min(price) AS low, max(price) AS high,"
+            " round(sum(amount), 4) AS btc FROM log"
         ).read_all()
-        print(f"  busiest callsigns: {busiest.to_pylist()}")
-
-    if server is not None:
-        server.close()
-        await server.wait_closed()
+        print(f"  {summary.to_pylist()[0]}")
 
 
 if __name__ == "__main__":

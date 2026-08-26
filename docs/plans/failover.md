@@ -31,7 +31,7 @@ sealed:       FileNotFoundError .../litelink/b/metadata/00004-....metadata.json
 ```
 
 Whatever RUNTIME:624-626 measured, it was not `Log.open` on a WAL restore into
-a fresh root. The correction belongs in RUNTIME, and `examples/replicate.py`
+a fresh root. The correction belongs in RUNTIME, and `examples/adsb/replicate.py`
 restates the same claim.
 
 ## What litestream already covers

@@ -347,7 +347,7 @@ def test_readonly_will_not_create_a_log(tmp_path: Path) -> None:
 
 
 def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
-    """The shape examples/capture.py uses (§1: one process, threads within it).
+    """The shape examples/adsb/capture.py uses (§1: one process, threads within it).
 
     Python's sqlite3 defaults to check_same_thread=True, so without the
     connection flag and the lock, every background maintain() raises and the

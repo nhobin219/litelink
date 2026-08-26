@@ -129,7 +129,7 @@ build:
 
 # Appends only — nothing seals here. Rows stay buffered until demo-maintain runs.
 demo-capture *args:
-    uv run python examples/capture.py {{args}}
+    uv run python examples/adsb/capture.py {{args}}
 
 # Seal, compact, evict and expire — the second role. Run with demo-capture.
 demo-maintain *args:
@@ -171,19 +171,20 @@ demo-maintain *args:
         # argparse takes the last, and `just demo-maintain --role all` would
         # otherwise start four processes all in role `all` — four sidecars
         # against one database.
-        uv run python examples/maintainer.py {{args}} --role "$role" &
+        uv run python examples/adsb/maintainer.py {{args}} --role "$role" &
         pids="$pids $!"
     done
     wait || true
 
-# The smallest shape that still produces a durable, queryable log: one
-# process, no maintainer, no threads. `append` then `seal_due`, in-line in the
-# event loop — the opposite end of the range from `demo-maintain`'s four
-# processes, and worth reading beside it.
+# START HERE. The whole library against a live public feed, in one process:
+# no producer to start, no credentials, no maintainer, no threads. Bitstamp
+# publishes BTC/USD trades over an unauthenticated websocket.
 #
-# With no --url it serves its own feed over loopback, so it needs no network.
+# `just demo-capture` and friends are the other end of the range — four
+# processes, one per storage role, against a synthetic feed under `adsb/` that
+# can be driven as hard as you like.
 
-# Capture a websocket feed in-line, in one process.
+# Capture a live public websocket feed, in one process.
 demo-websocket *args:
     uv run --group dev python examples/websocket.py {{args}}
 
@@ -195,7 +196,7 @@ demo-websocket *args:
 
 # Watch a running capture accumulate. Run alongside `just demo-capture`.
 demo-tail *args:
-    uv run python examples/tail.py {{args}}
+    uv run python examples/adsb/tail.py {{args}}
 
 # Needs `just rustfs` first, and a maintainer alongside — the writer seals,
 # archives and evicts nothing on its own.
@@ -214,13 +215,13 @@ demo-archive *args:
     # difference between the local demo and a production deployment.
     if [ -n "${LITELINK_DEMO_ARCHIVE:-}" ]; then
         echo "archiving to $LITELINK_DEMO_ARCHIVE (credentials from the environment)"
-        uv run python examples/capture.py --archive "$LITELINK_DEMO_ARCHIVE" {{args}}
+        uv run python examples/adsb/capture.py --archive "$LITELINK_DEMO_ARCHIVE" {{args}}
     else
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
         export AWS_REGION=us-east-1
-        uv run python examples/capture.py \
+        uv run python examples/adsb/capture.py \
             --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
     fi
 
@@ -265,7 +266,7 @@ demo-replicate root="litelink-data":
     export LITESTREAM_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
     export LITESTREAM_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
     # Destination and file set both come from the log — see `replicate.py`.
-    uv run python examples/replicate.py --root {{root}}
+    uv run python examples/adsb/replicate.py --root {{root}}
     "$litestream" replicate -config {{root}}/litestream.yml
 
 # Create the demo bucket. Idempotent, and through the same s3fs the library
@@ -359,7 +360,7 @@ demo-clean root="litelink-data":
     uv run --extra s3 python -c "
     import sys
     from pathlib import Path
-    sys.path.insert(0, 'examples')
+    sys.path.insert(0, 'examples/adsb')
     from _stream import NAME
     from litelink import Log
     try:

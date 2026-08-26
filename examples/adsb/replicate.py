@@ -1,6 +1,6 @@
 """Write the litestream config for a log, for continuous RPO (§3a).
 
-    uv run python examples/replicate.py [--root DIR]
+    uv run python examples/adsb/replicate.py [--root DIR]
 
 Everything in it is derived: which SQLite files carry the log's state, where
 they go (`_wal` beside the archived data), and the endpoint they go through.
@@ -15,7 +15,7 @@ You do not need to run this to get replication: with `wal_replication=True` the
 maintainer writes the config and runs the sidecar itself. This is for running
 litestream as an independent process instead —
 
-    uv run python examples/replicate.py --root DIR
+    uv run python examples/adsb/replicate.py --root DIR
     litestream replicate -config DIR/litestream.yml
 
 To restore, per database:

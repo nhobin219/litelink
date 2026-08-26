@@ -1,8 +1,8 @@
 """The reader: watch a live position feed accumulate.
 
-    uv run python examples/tail.py [--root DIR] [--every SECONDS]
+    uv run python examples/adsb/tail.py [--root DIR] [--every SECONDS]
 
-Opens the same log readonly while examples/capture.py writes it, and prints
+Opens the same log readonly while examples/adsb/capture.py writes it, and prints
 where the rows are. The interesting column is the split: rows move from the
 buffer into the Iceberg table at each seal, and the total never double-counts
 across that boundary because both legs are derived from one committed extent

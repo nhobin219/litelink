@@ -231,6 +231,26 @@ def is_remote(path: str) -> bool:
     return "://" in path
 
 
+def _undersized_from(
+    run: Sequence[DataFile], held: Mapping[str, int], target: int
+) -> list[DataFile]:
+    """The tail of `run` from its first under-target file, or nothing.
+
+    §6's rule inside one dense segment: everything before the first short file
+    already holds a full target and re-cutting it would rewrite bytes to
+    reproduce them; everything after has to move regardless of its own size,
+    because the shortfall ahead of it shifts every boundary behind it.
+
+    A file whose size was never recorded counts as full, so an archive whose
+    local extents were lost is left alone rather than rewritten on a guess.
+    """
+    for index, data_file in enumerate(run):
+        if held.get(data_file.path, target) < target:
+            return list(run[index:])
+
+    return []
+
+
 class Maintenance:
     """The reclamation passes for one log."""
 
@@ -909,17 +929,33 @@ class Maintenance:
         """
         held = self.memory()
         target = self.config.compact_size
-        files = archive.data_files()
-        for index, data_file in enumerate(files):
-            if data_file.rows != data_file.hi - data_file.lo + 1:
-                # Gapped. Everything from here on would be re-cut across it,
-                # since a run is contiguous, so the candidate list ends here.
-                return []
 
-            if held.get(data_file.path, target) < target:
-                return files[index:]
+        # By dense SEGMENT, and an earlier version got this wrong in the
+        # ordering that actually occurs. It tested density before size per
+        # file and returned `files[index:]` from the first undersized one —
+        # which still CONTAINS any gapped file after it. That is the normal
+        # shape: the archive's tail file before a failover is undersized, and
+        # the reserve's gapped file lands after it. Measured, `rewrite_archive`
+        # went on raising for the life of every restored log.
+        #
+        # A gap bounds a segment at both ends: a file with one inside it, and a
+        # file that does not continue the previous file's range.
+        segment: list[DataFile] = []
+        for data_file in archive.data_files():
+            dense = data_file.rows == data_file.hi - data_file.lo + 1
+            if dense and (not segment or data_file.lo == segment[-1].hi + 1):
+                segment.append(data_file)
+                continue
 
-        return []
+            candidate = _undersized_from(segment, held, target)
+            if candidate:
+                return candidate
+
+            # A gapped file cannot start a segment either — nothing may re-cut
+            # across it — so only a dense one carries over.
+            segment = [data_file] if dense else []
+
+        return _undersized_from(segment, held, target)
 
     def _recut(
         self,

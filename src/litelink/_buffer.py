@@ -1713,6 +1713,23 @@ class Buffer:
 
         return int(released), ceiling + 1
 
+    def reseed_group(self) -> None:
+        """Rebuild the open group from what is buffered NOW.
+
+        `_seed_group` returns early whenever an open group exists, which is
+        what keeps it idempotent at open — so re-running it after rows have
+        left the buffer changes nothing. This drops the stale row first.
+
+        For the restore path, where the group was seeded from a replica's view
+        of the archive and the archive has since moved on: see `Log.restore`.
+        """
+        with self._transaction():
+            self._con.execute(
+                "DELETE FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+            )
+
+        self._seed_group()
+
     def release_archived(self, boundary: int) -> int:
         """Drop buffer rows the archive now holds. Returns how many.
 
