@@ -95,8 +95,10 @@ hot read a hot read.
 ## Continuous RPO
 
 Add `--replicate` to `demo-archive` and the maintainer runs litestream alongside itself,
-shipping the SQLite WAL to `_wal` beside the archived data. Needs the binary on PATH
-([install](https://litestream.io/install)) and an archive to ship to.
+shipping the SQLite WAL to `_wal` beside the archived data. Needs an archive to ship to and
+the binary — `just litestream` fetches a checksum-verified pinned build into `.bin/`, which
+both the maintainer and `just demo-replicate` prefer over whatever is on PATH, because the
+config format is version-dependent.
 
 That supervision lives in `adsb/maintainer.py`, not in the library: replication is a separate
 process reading the WAL, which is exactly why it keeps the network out of the write path,
@@ -105,7 +107,7 @@ independently instead, generate the same config and use it directly:
 
 ```
 uv run python examples/adsb/replicate.py --root litelink-data
-litestream replicate -config litelink-data/litestream.yml
+.bin/litestream replicate -config litelink-data/litestream.yml
 ```
 
 Two roles, because there are two kinds of work: **the hot path, and everything else.**
@@ -119,7 +121,7 @@ readable the whole time — `scan()` unions the buffer with the table — so not
 by starting the maintainer late. Start it and the rows move into Parquet at exactly the
 cuts recorded while it was not running.
 
-Nothing coordinates that but the `lease` table. The writer holds no lease and never
+Nothing coordinates that but the `claim` table. The writer holds no lease and never
 tries; the maintainer takes both when it starts, and if it dies they lapse and the next
 one takes over.
 
@@ -133,11 +135,12 @@ just demo-clean        # delete the captured data when you are done
 
 Benchmarks live in [`benchmarks/`](../benchmarks/).
 
-Only the maintainer commits to the Iceberg table, which is what keeps the log
-free of pyiceberg's `Failed to delete metadata file …` warnings. Two committing processes
-race on `write.metadata.delete-after-commit` and the loser complains about a file the
-winner already removed. Data files are never affected either way — those go through
-`pending_delete`, transactionally.
+The four maintainer processes all commit to the Iceberg table, and they race on
+pyiceberg's `write.metadata.delete-after-commit` cleanup: the loser logs `Failed to delete
+metadata file …` about a file the winner already removed. Noise rather than damage — 817,760
+rows read back contiguous across a run that logged it — and `maintainer.py --role all`
+produces none. Data files are never affected either way; those go through `pending_delete`,
+transactionally.
 
 The demo keeps its data on purpose — `adsb/tail.py` reads it after the writer stops, and it is
 there to poke at — so nothing removes it automatically, and `local_retention` is left unset
@@ -145,7 +148,7 @@ so the window grows without bound. Roughly 25 MB per 30 seconds at the default r
 deployment sets a retention and lets `maintain()` hold the size; the benchmarks, which have
 nothing to inspect afterwards, run in a temp directory and clean up on exit.
 
-The stream is an ADS-B position feed over a websocket, parsed into columns rather than
+The stream is a synthetic ADS-B position feed, generated in-process, parsed into columns rather than
 stored as raw frames — which is the point of declaring a schema, since every field then
 prunes from Iceberg statistics.
 
@@ -178,7 +181,7 @@ than an object in Python, and WAL serialises the processes. Reading is safe for 
 reason — but note that DuckDB must never open the buffer database itself, which
 [`docs/RUNTIME.md`](../docs/RUNTIME.md) explains at some cost.
 
-`adsb/tail.py` opens the same log `readonly` while the writer runs, and prints where the rows
+`adsb/tail.py` opens the same log `read_only` while the writer runs, and prints where the rows
 are. The column worth watching is the split: rows move from the buffer into the Iceberg
 table at each seal, and the total never double-counts across that boundary because both
 legs derive from one committed extent (§7, I3). It counts in DuckDB rather than

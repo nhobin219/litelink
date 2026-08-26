@@ -165,7 +165,8 @@ class Log:
     writes the buffer database, so it is a writer, and two of those is the case
     §1 excludes.
 
-    Construct through `open` or `open_readonly`. The initialiser takes already
+    Construct through `new`, `open`, or `restore`; `open(read_only=True)`
+    gives a second view alongside a live writer. The initialiser takes already
     built collaborators and does no I/O, so a test can substitute any of them.
     """
 
@@ -193,9 +194,10 @@ class Log:
         self._schema = schema
         self._sort_by = sort_by
         # The same object the reader and the maintainer were handed. See
-        # `_archive.Archive`: it owns the URI, the credentials and the lazily
-        # opened handle, so `set_archive` re-points all three at once instead
-        # of fanning out to each. Required rather than defaulted, because a
+        # `_archive.Archive`: it owns the credentials and the lazily opened
+        # handle, and reads the URI from `meta` on every access rather than
+        # holding a copy — so `set_archive` moves what all three see by
+        # changing one row, instead of fanning out to each. Required rather than defaulted, because a
         # collaborator this constructor builds for itself is one no caller can
         # substitute — the reason `new` and `open` build every other one.
         self._archive = archive
@@ -873,8 +875,7 @@ class Log:
         For a WAL-shipping sidecar to replicate. Public because deciding to run
         one is a deployment choice, but knowing WHICH files carry the log's
         state is not — it is this library's, and a sidecar configured by hand
-        against a guess is one that silently omits `archive.db` and leaves the
-        objects in S3 with nothing to say what they are.
+        against a guess is one that silently omits a file.
 
         litelink does not run the sidecar. It is a separate process reading the
         WAL, which is exactly why it does not put the network in the write path
