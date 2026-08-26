@@ -879,11 +879,18 @@ which reads that same watermark to enforce I4 and runs with or without an archiv
 
 ## 6. Compaction
 
-Not required, and in normal operation a no-op. Every file a seal writes is already the
-size it was asked to be, because the cut is exact and there is no timer to cut early. What
-is left for compaction is the deliberate exceptions: an explicit `seal()`, which cuts
-short by definition, and a change to `target_size`, which leaves history sized for the old
-value.
+Runs on the happy path, and has real work to do there. Not because seals come out
+undersized — every file a seal writes is already the size it was asked to be, since the cut
+is exact and there is no timer to cut early — but because the seal size and the file size
+are two different targets (§12). `target_compact_size` defaults to eight times
+`target_seal_size`, so eight sealed files become one, and that conversion is on **with no
+archive configured**: file count is a read cost locally too, measured at 1.0 ms to read the
+offset boundary over one file against 44 ms over 64.
+
+It picks up the deliberate exceptions on the way — an explicit `seal()`, which cuts short by
+definition, and a change to `target_seal_size`, which leaves history sized for the old value.
+It is a no-op only where `target_compact_size` is set equal to the seal size, which is how
+the conversion is turned off.
 
 Hand-written, because `rewrite_data_files` is a Spark procedure with no pyiceberg
 equivalent.
