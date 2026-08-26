@@ -10,6 +10,9 @@ three tiers that only means anything when one of them is genuinely remote.
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,8 +26,13 @@ from litelink._layout import NAMESPACE, Layout
 from litelink._maintenance import Maintenance
 from litelink._read import load_extension, secret_sql
 from litelink._s3 import S3Options
-from litelink._table import VERSION_HINT, LogTable, _recorded_location
-from litelink.log import OFFSET, table_schema
+from litelink._table import (
+    VERSION_HINT,
+    LogTable,
+    _recorded_location,
+    forget_archive_entry,
+)
+from litelink.log import OFFSET, RESTORE_RESERVE, table_schema
 from tests.conftest import filesystem
 
 pytestmark = pytest.mark.s3
@@ -2434,3 +2442,201 @@ def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
         log.set_archive(prefix)
 
         assert log.archive == prefix
+
+
+@pytest.mark.slow
+def test_a_log_is_recovered_onto_another_machine(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """§3a failover, end to end, against the real sidecar.
+
+    The procedure this replaces — restore the databases and open — does not
+    work: `catalog.db` records ABSOLUTE paths to local Iceberg metadata that no
+    sidecar ships, so a restored catalog names files on a machine that is gone.
+    That failure is asserted first, so this test says what it fixes.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/failover"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        # More on top, sealed but never synced: the band that used to be lost.
+        log.extend(rows(400))
+        log.seal_due()
+        archived = log.archived_through()
+        replicated = log.end_offset() - 1
+        served = log.scan(include_archive=True).read_all().num_rows
+
+        assert archived < replicated, "nothing left unsynced, so the band is untested"
+
+        replication = log.write_replication_config()
+
+    # Ship it. `-config` names all three databases; only the buffer is restored.
+    environment = dict(os.environ)
+    resolved = s3.resolved()
+    if resolved.access_key and resolved.secret_key:
+        environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
+        environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
+
+    subprocess.run(  # noqa: S603
+        [str(binary), "replicate", "-config", str(replication), "-exec", "sleep 3"],
+        check=True,
+        env=environment,
+        capture_output=True,
+        timeout=120,
+    )
+
+    # AFTER the sidecar stops: rows the primary served and never shipped. This
+    # is hole B, and it is what makes the offset reserve necessary rather than
+    # decorative — without these the replica's frontier equals the primary's
+    # and no reuse is possible to detect.
+    with Log.open(primary, "s", s3=s3) as log:
+        log.extend(rows(50))
+        written = log.end_offset() - 1
+
+    assert written > replicated, "the unreplicated tail did not happen"
+
+    # The machine dies.
+    second = tmp_path / "second"
+
+    with Log.restore(second, "s", archive=where, s3=s3, binary=str(binary)) as revived:
+        report = revived.recovery()
+
+        assert report is not None
+        # Every row is readable again — including the sealed-but-unsynced band,
+        # which survives because a seal keeps its rows until the archive has
+        # them when wal_replication is on.
+        assert revived.scan(include_archive=True).read_all().num_rows == served
+        # The shape came from `meta`, not from the catalog that was not restored.
+        assert revived._sort_by == ("event_ts",)  # noqa: SLF001
+        assert revived.config.target_seal_size == 8 * 1024
+        # And it resumes ABOVE everything the primary ever assigned, so no
+        # offset the dead machine served is handed to different data.
+        resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
+
+        assert resumed > written, f"reissued offset {resumed}, primary served {written}"
+        assert report.skipped[1] - report.skipped[0] + 1 == RESTORE_RESERVE
+
+        # And it goes on working. `maintain` is where a stale local `extent`
+        # row would surface: compaction reads those rows to decide what to
+        # merge, and they name Parquet that is on the machine that died.
+        revived.seal_due()
+        revived.maintain()
+        revived.sync()
+
+        assert revived.scan(include_archive=True).read_all().num_rows == served + 1
+
+        # And this database describes a filesystem that exists. Every local
+        # path it names is a file that is here — the dead machine's are gone.
+        for path in revived._buffer.file_bytes():  # noqa: SLF001
+            if "://" not in path:
+                assert (second / path).exists(), (
+                    f"names a file that is not here: {path}"
+                )
+
+
+def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The measured 261-vs-1061 case, and the one line that fixes it.
+
+    `open_archive` consults `version-hint.text` only when the catalog has NO
+    row for the table. With a stale row present it calls `load_table` on
+    whatever that names — and old metadata JSONs survive in the bucket until
+    expiry, so the load SUCCEEDS and reports the archive as it was several
+    syncs ago. Silent, and in the losing direction.
+
+    Worse than under-reading: the next sync commits onto that lineage and
+    `publish_pointer` republishes the hint over the fork, destroying the
+    pointer a later recovery depends on.
+
+    Both halves are asserted here — the hazard, so it stays documented, and
+    that `forget_archive_entry` removes it. `Log.restore` calls that before
+    opening, so an operator who restored all three databases by hand gets the
+    same protection as one who did not.
+    """
+    where = f"s3://{bucket}/stale"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+    )
+    root = tmp_path / "log"
+    layout = Layout(root, "s")
+    with Log.new(root, "s", schema=SCHEMA, config=config, archive=where, s3=s3) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        early = log.archive_files()
+
+    # A replica of `archive.db` taken here — the state a WAL restore would
+    # bring back — and then the archive grows past it.
+    stale = tmp_path / "stale-archive.db"
+    shutil.copyfile(layout.archive_db, stale)
+
+    with Log.open(root, "s", s3=s3) as log:
+        for _ in range(3):
+            log.extend(rows(600))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        current = log.archive_files()
+
+    assert current > early, "the archive did not grow, so staleness is untestable"
+
+    # The hazard: the old catalog wins over the bucket's own pointer.
+    shutil.copyfile(stale, layout.archive_db)
+    with Log.open(root, "s", s3=s3) as log:
+        assert log.archive_files() == early, (
+            "expected the stale catalog to be believed; the case has changed"
+        )
+
+    # And the fix, which is what `restore` does before it opens anything.
+    assert forget_archive_entry(layout), "there was no entry to drop"
+
+    with Log.open(root, "s", s3=s3) as log:
+        # A reader may not adopt — that is a write to `archive.db` — so it
+        # still sees nothing until a repairing caller runs.
+        assert log.archive_files() == 0
+        log.sync()
+
+        assert log.archive_files() == current, "adoption did not recover the archive"
+
+
+def test_forgetting_an_archive_entry_that_is_not_there_is_a_no_op(
+    tmp_path: Path,
+) -> None:
+    """A fresh restore has no `archive.db` at all, which is the ordinary case.
+
+    Constructing a `SqlCatalog` to drop one row would create that catalog's own
+    tables as a side effect — a write, from a path whose whole purpose is to
+    leave less behind.
+    """
+    layout = Layout(tmp_path, "s")
+
+    assert forget_archive_entry(layout) is False
+    assert not layout.archive_db.exists(), "it created the database it was checking"

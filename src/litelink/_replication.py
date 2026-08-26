@@ -26,12 +26,14 @@ put each log in its own root, or write that config by hand.
 
 from __future__ import annotations
 
+import os
+import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import timedelta
-    from pathlib import Path
 
     from litelink._s3 import S3Options
 
@@ -141,3 +143,68 @@ def litestream_config(
             ]
 
     return "\n".join(lines) + "\n"
+
+
+def litestream_binary(override: str | None = None) -> str:
+    """The sidecar binary to run, pinned build first.
+
+    `just litestream` puts a checksum-verified release in `.bin/`, and a
+    checkout should restore with the version it pinned rather than whatever
+    the machine carries: v0.5.0 changed the config format, and this module
+    writes one shape.
+
+    Resolved against the REPO rather than the cwd, so running from a
+    subdirectory finds it. Falls through to PATH, which is what an installed
+    package uses.
+    """
+    if override is not None:
+        return override
+
+    pinned = Path(__file__).resolve().parents[2] / ".bin" / "litestream"
+
+    return str(pinned) if os.access(pinned, os.X_OK) else "litestream"
+
+
+def restore_buffer(
+    config: Path, destination: Path, options: S3Options, binary: str | None = None
+) -> None:
+    """Restore one database from its replica, into `destination`.
+
+    **No `-if-replica-exists`.** That flag exits 0 when no backup is found, so
+    a missing replica would be indistinguishable from a restored one — and the
+    caller's whole decision is whether there was anything to restore. Absence
+    has to be visible, so this lets the command fail and the caller checks for
+    the file.
+
+    Credentials go to the child through the ENVIRONMENT, never into the config
+    file, which is why that file is safe to commit and hand around. litestream
+    reads its own names first and falls back to the AWS ones.
+    """
+    environment = dict(os.environ)
+    resolved = options.resolved()
+    if resolved.access_key and resolved.secret_key:
+        environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
+        environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        litestream_binary(binary),
+        "restore",
+        "-config",
+        str(config),
+        "-o",
+        str(destination),
+        str(destination),
+    ]
+    try:
+        subprocess.run(command, check=True, env=environment, capture_output=True)  # noqa: S603
+    except FileNotFoundError:
+        msg = (
+            "litestream was not found. Fetch the pinned build with "
+            "`just litestream`, or install it: https://litestream.io/install"
+        )
+        raise RuntimeError(msg) from None
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace").strip()
+        msg = f"litestream restore failed: {detail or exc}"
+        raise RuntimeError(msg) from exc

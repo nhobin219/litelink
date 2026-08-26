@@ -1927,3 +1927,41 @@ def test_expiry_restamps_the_metadata_it_supersedes(tmp_path: Path) -> None:
             "the restamp matched nothing: it must key paths the way the "
             "enqueue beside it does"
         )
+
+
+def test_local_rows_counts_rows_rather_than_differencing_offsets(
+    tmp_path: Path,
+) -> None:
+    """§8's floor has to survive a hole in the offset space.
+
+    It used to be `next_offset() - 1 - local_rows`, which reads naturally and
+    assumes offsets are dense. A rollback's occasional gap makes that retain
+    slightly MORE than asked — the safe direction. A reservation does the
+    opposite: a restore skips 2**20 offsets to keep I9, so the subtraction puts
+    the boundary far above every local file and the first `maintain()` evicts
+    the entire local window.
+
+    Simulated here by seeding the sequence forward, which is what a restore
+    does. The rows already sealed must stay.
+    """
+    config = replace(
+        LogConfig(), target_seal_size=2048, compact_min_files=2, local_rows=1_000_000
+    )
+    with open_log(tmp_path, config=config) as log:
+        log.extend(rows(400))
+        log.seal_due()
+        before = log.table_rows()
+
+        assert before > 0, "nothing sealed, so there is nothing to evict"
+
+        # ROWS, not files: `maintain` also compacts, so a file count falls for
+        # a reason that has nothing to do with this.
+        #
+        # The hole. `Buffer.seed_offsets` is what a restore uses; here it
+        # stands in for one, moving `next_offset` far above every sealed row.
+        log._buffer.seed_offsets(log._buffer.next_offset() + (1 << 20))  # noqa: SLF001
+        log.maintain()
+
+        assert log.table_rows() == before, (
+            "the reserved hole was read as a million rows and evicted the window"
+        )

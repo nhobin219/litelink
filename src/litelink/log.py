@@ -42,9 +42,9 @@ from litelink._maintenance import (
     stable_prefix,
 )
 from litelink._read import Reader, duckdb_connection
-from litelink._replication import litestream_config
+from litelink._replication import litestream_config, restore_buffer
 from litelink._s3 import S3Options
-from litelink._table import LogTable, archive_extent
+from litelink._table import LogTable, archive_extent, forget_archive_entry
 from litelink._types import validate_schema
 
 if TYPE_CHECKING:
@@ -93,6 +93,30 @@ _SCHEMA_KEY = "arrow_schema"
 # has to be told what order to declare. `open_archive` never declared one
 # either, so the archive could not answer it.
 _SORT_KEY = "sort_by"
+
+# How many offsets a restore skips before resuming (§3a).
+#
+# `sqlite_sequence` comes back from the replica, so it resumes above everything
+# the REPLICA received — not above everything the primary ASSIGNED. Rows
+# appended inside the replication lag were returned to callers by `append` and
+# never shipped, so resuming at the replica's frontier hands those same
+# integers to different data. I9 says offsets are never reused for the life of
+# a stream, and §6 needs files adjacent in offset order rather than free of
+# integer gaps — so a gap is expressible and a reuse is not.
+#
+# 2**20 is generous against any plausible replication lag and free against
+# int64. It errs large on purpose: a gap is visible to a consumer, and a
+# rewind looks like ordinary operation.
+RESTORE_RESERVE = 1 << 20
+
+
+@dataclass(frozen=True)
+class _Recovery:
+    """What a restore recovered and what it skipped, for the caller to report."""
+
+    recovered: int
+    resumed_at: int
+    skipped: tuple[int, int]
 
 
 # How much larger a compacted file is than a sealed one, when nothing says.
@@ -464,6 +488,12 @@ class Log:
         # collaborator this constructor builds for itself is one no caller can
         # substitute — the reason `new` and `open` build every other one.
         self._archive = archive
+        # Set only by `restore`, and read only by `recovery()`. What a failover
+        # recovered and what it skipped are facts about one operation, knowable
+        # at the moment it runs and not afterwards — the skipped range leaves no
+        # trace once the sequence has moved, and the recovered count is
+        # indistinguishable from ordinary buffered rows a second later.
+        self._restored_from: _Recovery | None = None
         self._reader = reader
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
@@ -696,6 +726,190 @@ class Log:
 
         return log
 
+    @classmethod
+    def replication_config_for(
+        cls,
+        root: PathLike[str] | str,
+        name: str,
+        archive: str,
+        s3: S3Options | None = None,
+        retention: timedelta | None = None,
+    ) -> str:
+        """A litestream config for a log that may not exist here yet (§3a).
+
+        The same file `replication_config` produces, without needing an open
+        log to produce it — which is the chicken-and-egg a failover hits. The
+        config names the databases to restore, and you need it BEFORE you have
+        them. `Layout` is pure path arithmetic, so everything the file says is
+        derivable from a root, a name and an archive.
+        """
+        layout = Layout(Path(root), name)
+
+        return litestream_config(
+            layout.databases, layout.root, archive, s3 or S3Options(), retention
+        )
+
+    @classmethod
+    def restore(
+        cls,
+        root: PathLike[str] | str,
+        name: str,
+        *,
+        archive: str,
+        s3: S3Options | None = None,
+        binary: str | None = None,
+    ) -> Self:
+        """Recover a log onto a machine that is not the one that wrote it (§3a).
+
+        Point it at the archive, get a working log back, resume appending. The
+        procedure this replaces was "restore the databases and open it", which
+        does not work: `catalog.db` records ABSOLUTE paths to the local Iceberg
+        metadata, and a sidecar ships the `.db` files and nothing else — not
+        that metadata, not the Parquet. So a restored catalog names files on a
+        machine that is gone, and `open` raises `FileNotFoundError`.
+
+        What is recovered, and what is not:
+
+        - **The archive**, in full. It names its own current metadata in
+          `version-hint.text`, so it is adopted rather than rebuilt.
+        - **The unsealed tail and everything the archive lacks**, from
+          `buffer.db`. A seal keeps its rows until the archive has them when
+          `wal_replication` is on, so the band between the two frontiers comes
+          back too — that is what change makes possible.
+        - **The local table**, rebuilt EMPTY. Its Parquet is on the dead
+          machine and its metadata was never replicated.
+        - **NOT** rows appended inside the replication lag. They were served to
+          callers and never shipped. Their offsets are skipped rather than
+          reissued; see below.
+
+        **`archive.db` is deliberately not restored**, even though it is
+        replicated. `open_archive` consults `version-hint.text` only when the
+        catalog has no row for the table — with a stale row present it loads
+        whatever that names, and old metadata survives in the bucket until
+        expiry, so it succeeds. Measured: a stale replica reported one archive
+        file where the bucket held five, and a union read 261 rows instead of
+        1061. Worse, the next sync commits onto that lineage and republishes
+        the hint over it, destroying the pointer this recovery depends on.
+        Stale is worse than absent, and absent is already handled.
+
+        **`catalog.db` is not restored either**, and stays in the replication
+        set regardless: same-machine recovery is where its absolute paths still
+        resolve, and it is the only record of which Parquet the local table is
+        made of in a design that refuses directory listing.
+        """
+        layout = Layout(Path(root), name)
+        if layout.buffer_db.exists():
+            msg = (
+                f"a log already exists at {layout.root}/{name}; restore refuses to "
+                f"overwrite it. Remove it, or restore into another root"
+            )
+            raise FileExistsError(msg)
+
+        # One config per ROOT, and `litestream_config` describes the log it was
+        # asked about — so writing one here over a root that already replicates
+        # another log would leave that log unreplicated at the sidecar's next
+        # restart, silently. Refused rather than merged: §3a's advice is one
+        # log per root until a per-root generator exists, and this is that
+        # advice enforced.
+        config_path = layout.root / "litestream.yml"
+        if config_path.exists() and f"path: {layout.buffer_db}" not in (
+            config_path.read_text()
+        ):
+            msg = (
+                f"{config_path} already replicates another log; restoring here would "
+                f"stop it. Restore into a root of its own"
+            )
+            raise FileExistsError(msg)
+
+        options = s3 or S3Options()
+        layout.root.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            litestream_config(layout.databases, layout.root, archive, options)
+        )
+
+        # ONLY the buffer, and with no `-if-replica-exists`: that flag exits 0
+        # when there is no backup, which would make the check below unable to
+        # tell a restored database from an absent one.
+        restore_buffer(config_path, layout.buffer_db, options, binary)
+        if not layout.buffer_db.exists():
+            msg = (
+                f"no replica of {layout.buffer_db.name} under {archive} — there is "
+                f"nothing to restore. A log with wal_replication off has no off-box "
+                f"copy of its unsealed rows, and cannot be recovered onto another "
+                f"machine"
+            )
+            raise FileNotFoundError(msg)
+
+        # A stale entry, if an operator restored all three by hand. Not merely
+        # unnecessary — actively destructive: `open_archive` consults
+        # `version-hint.text` ONLY when the catalog has no row, so a stale row
+        # is loaded instead, and old metadata survives in the bucket until
+        # expiry so the load succeeds. Measured: a stale replica reported one
+        # archive file where the bucket held five, and a union read 261 rows
+        # instead of 1061. The next sync then commits onto that lineage and
+        # republishes the hint over it, destroying the pointer this recovery
+        # depends on. Dropped so adoption is the only path.
+        forget_archive_entry(layout)
+
+        # The shape comes from `meta`, which the restored buffer carries: the
+        # declared Arrow schema, the policy, and the sort order. Read before
+        # the table is built, because the table is built FROM them.
+        encoded = Buffer.peek_meta(layout.buffer_db, _CONFIG_KEY)
+        raw_schema = Buffer.peek_meta(layout.buffer_db, _SCHEMA_KEY)
+        raw_sort = Buffer.peek_meta(layout.buffer_db, _SORT_KEY)
+        if encoded is None or raw_schema is None or raw_sort is None:
+            msg = (
+                f"the restored {layout.buffer_db.name} carries no stored shape; it "
+                f"is not a litelink buffer, or it is corrupt"
+            )
+            raise ValueError(msg)
+
+        schema = pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
+        sort_by = tuple(json.loads(raw_sort))
+
+        # REBUILT, not restored. Its Parquet is on the machine that died and
+        # its Iceberg metadata was never replicated, so there is nothing to
+        # point at — see this method's docstring.
+        LogTable.create(layout, table_schema(schema), sort_by)
+
+        buffer = Buffer.open(layout.buffer_db, schema)
+        try:
+            released, resumed = buffer.strip_local_state(RESTORE_RESERVE)
+        finally:
+            buffer.close()
+
+        log = cls.open(layout.root, name, s3=options)
+        # ADOPTED, explicitly. `archive.db` was deliberately not restored, so
+        # nothing here has a catalog row for the archive — and an ordinary
+        # `open` will not create one: adoption is a write to that catalog, and
+        # `open_archive` reserves it for a repairing caller. Without this the
+        # log comes back holding only what the buffer carried, and every
+        # `include_archive` read silently leaves the archive leg out.
+        #
+        # Not best-effort. A restore that cannot reach the archive has
+        # recovered the unsealed tail and nothing else, and returning it as a
+        # success is the "partial recovery that looks whole" this refuses
+        # elsewhere.
+        if log._archive.table(repair=True) is None and log.archive is not None:
+            log.close()
+            msg = (
+                f"restored the buffer but could not adopt the archive at "
+                f"{log.archive!r}: it holds nothing this log can read. The rows "
+                f"below the archive frontier are not recovered"
+            )
+            raise RuntimeError(msg)
+
+        # Recorded after the adoption, so the archive is resolved and its
+        # frontier readable. Both numbers are what an operator needs and
+        # neither is recoverable afterwards.
+        log._restored_from = _Recovery(  # noqa: SLF001
+            recovered=released,
+            resumed_at=resumed,
+            skipped=(resumed - RESTORE_RESERVE, resumed - 1),
+        )
+
+        return log
+
     # -- settings ----------------------------------------------------------
 
     @property
@@ -828,6 +1042,15 @@ class Log:
         destination.write_text(self.replication_config())
 
         return destination
+
+    def recovery(self) -> _Recovery | None:
+        """What `restore` recovered, or None on a log opened normally.
+
+        Two numbers an operator needs and cannot get later: how many rows came
+        back from the replica, and which offsets were skipped to avoid
+        reissuing ones the dead machine had already served.
+        """
+        return self._restored_from
 
     @property
     def archive(self) -> str | None:
