@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
@@ -741,6 +742,16 @@ class Log:
         # ordering above exists to guarantee.
         try:
             LogTable.create(layout, table_schema(schema), sort_by)
+        except TableAlreadyExistsError:
+            # Undo NOTHING here. The row was already there, so this call did
+            # not make it and dropping it would destroy a live log's only
+            # pointer to its local files. Reached with `buffer.db` absent and
+            # the row present — which the `FileExistsError` guard above cannot
+            # catch, keying as it does on the buffer — and reproduced: a table
+            # at offsets 1..1152 with the archive at 504 lost the reference to
+            # 505..1152, sealed locally and never archived, with `Log.open`
+            # then answering "use new() to create one".
+            raise
         except Exception:
             with contextlib.suppress(Exception):
                 LogTable.forget(layout)
