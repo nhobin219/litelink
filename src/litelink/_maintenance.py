@@ -940,6 +940,15 @@ class Maintenance:
         #
         # A gap bounds a segment at both ends: a file with one inside it, and a
         # file that does not continue the previous file's range.
+        #
+        # A segment yielding a SINGLE file is skipped rather than returned.
+        # `rewrite_archive` declines a run of one — merging one file is a
+        # no-op rewrite — so returning it stopped the walk and left every later
+        # segment unreachable. That made the tool a permanent no-op on exactly
+        # the shape it was fixed for: an undersized archive tail, then the
+        # reserve's gapped file, then everything a failed-over log goes on to
+        # write. The tail alone was the candidate, and nothing above the gap
+        # was ever re-cut however much accumulated there.
         segment: list[DataFile] = []
         for data_file in archive.data_files():
             dense = data_file.rows == data_file.hi - data_file.lo + 1
@@ -948,14 +957,16 @@ class Maintenance:
                 continue
 
             candidate = _undersized_from(segment, held, target)
-            if candidate:
+            if len(candidate) > 1:
                 return candidate
 
             # A gapped file cannot start a segment either — nothing may re-cut
             # across it — so only a dense one carries over.
             segment = [data_file] if dense else []
 
-        return _undersized_from(segment, held, target)
+        candidate = _undersized_from(segment, held, target)
+
+        return candidate if len(candidate) > 1 else []
 
     def _recut(
         self,

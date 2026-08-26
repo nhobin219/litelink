@@ -949,6 +949,18 @@ class Buffer:
         because the offline archive rewrite needs the same conditional cut.
 
         An empty group is never closed either way; there would be no file.
+        That is asked of the BUFFER, not of `start_offset`, and it used to be
+        asked of neither — a group whose rows had gone set `end_offset` to the
+        max of nothing, reported a rowcount of 1 anyway, and got a second open
+        group inserted behind it. Two open rows is the permanent seal-queue
+        wedge `_seed_group` documents: `close_open_group` closes both at the
+        same end, and `finish_seal` then hits the `rel_path` UNIQUE after the
+        Iceberg commit has already landed.
+
+        Unreachable until `Log.restore` began releasing archived rows out from
+        under a knowingly-stale group (§3a), which is one transaction away from
+        the reseed that fixes it.
+
         Harmless to race — the predicate matches nothing once another caller
         has closed it.
         """
@@ -959,7 +971,9 @@ class Buffer:
         with self._lock:
             if not self._con.execute(
                 "SELECT 1 FROM extent WHERE end_offset IS NULL"
-                " AND rel_path IS NULL AND start_offset IS NOT NULL",
+                " AND rel_path IS NULL AND start_offset IS NOT NULL"
+                " AND EXISTS (SELECT 1 FROM buffer"
+                '             WHERE "litelink_offset" >= extent.start_offset)',
                 (),
             ).fetchone():
                 return False
@@ -969,7 +983,9 @@ class Buffer:
                 "UPDATE extent SET end_offset ="
                 ' (SELECT max("litelink_offset") + 1 FROM buffer)'
                 " WHERE end_offset IS NULL AND rel_path IS NULL"
-                " AND start_offset IS NOT NULL",
+                " AND start_offset IS NOT NULL"
+                " AND EXISTS (SELECT 1 FROM buffer"
+                '             WHERE "litelink_offset" >= extent.start_offset)',
                 (),
             )
             closed = bool(cursor.rowcount)

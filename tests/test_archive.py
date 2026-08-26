@@ -22,6 +22,7 @@ import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
+from litelink._archive import Archive
 from litelink._buffer import Buffer
 from litelink._layout import NAMESPACE, Layout
 from litelink._maintenance import Maintenance
@@ -2986,3 +2987,73 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
         assert resumed > served, (
             f"reissued offset {resumed}; the primary served through {served}"
         )
+
+
+def test_a_failed_restore_never_leaves_an_openable_root(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`LogTable.create` is the commit point, and must be the LAST write.
+
+    That table is what makes a root openable. Wherever it sits, an interruption
+    AFTER it leaves a root `restore` refuses to retry — both databases exist —
+    and `Log.open` cheerfully accepts, reporting `recovery() is None`. An
+    earlier ordering put it second and claimed no such state existed; it had
+    one, one write later, and the measured consequence was worse than the
+    offset reuse that ordering was fixing: the open group still at the
+    replica's stale frontier, the first seal straddling the archive's extent,
+    and 712 archived offsets vanishing from every `scan(include_archive=True)`
+    with no error anywhere.
+
+    So the property, rather than any one window: if `restore` raises, nothing
+    can open the root. Asserted for each step that can fail — and a bad minute
+    in object storage is enough to fail the adoption, no crash required.
+    """
+    where = f"s3://{bucket}/failed"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+    def die(*args: object, **kwargs: object) -> object:
+        msg = "a bad minute in object storage"
+        raise RuntimeError(msg)
+
+    for attempt, (target, method) in enumerate(
+        [(Buffer, "strip_local_state"), (Archive, "table"), (Buffer, "reseed_group")]
+    ):
+        root = tmp_path / f"try{attempt}"
+        (root / "s").mkdir(parents=True)
+        source = sqlite3.connect(Layout(primary, "s").buffer_db)
+        copy = sqlite3.connect(Layout(root, "s").buffer_db)
+        source.backup(copy)
+        source.close()
+        copy.close()
+
+        with monkeypatch.context() as patched:
+            patched.setattr(target, method, die)
+
+            with pytest.raises(RuntimeError, match="bad minute"):
+                Log.restore(root, "s", archive=where, s3=s3)
+
+        # The root is not a log. Whatever failed, nothing here can be opened
+        # and handed offsets, because the table that would make it openable is
+        # written only once everything else has landed.
+        assert not LogTable.exists_for(Layout(root, "s")), (
+            f"{method} failed and still left an openable root"
+        )
+        with pytest.raises(FileNotFoundError):
+            Log.open(root, "s", s3=s3)
+
+        # And it is resumable rather than a dead end.
+        with Log.restore(root, "s", archive=where, s3=s3) as revived:
+            assert revived.scan(include_archive=True).read_all().num_rows > 0

@@ -97,6 +97,11 @@ class DataFile:
 # cannot disagree about which rows are ours.
 ARCHIVE_CATALOG = "archive"
 
+# The local catalog's name, spelled once. `exists_for` reads `iceberg_tables`
+# by it directly, so a literal here and a different one in `_catalog_for` would
+# make that read answer False for every table that exists.
+LOCAL_CATALOG = "local"
+
 
 class ArchiveAbsent(LookupError):
     """No archive table exists at the prefix yet.
@@ -386,7 +391,7 @@ class LogTable:
     @staticmethod
     def _catalog_for(layout: Layout) -> SqlCatalog:
         return SqlCatalog(
-            "local", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
+            LOCAL_CATALOG, uri=layout.catalog_uri, warehouse=layout.warehouse_uri
         )
 
     @classmethod
@@ -600,6 +605,38 @@ class LogTable:
             table = catalog.load_table(layout.table_id)
 
         return cls(catalog, layout, table, prefix)
+
+    @staticmethod
+    def exists_for(layout: Layout) -> bool:
+        """Whether the LOCAL catalog holds a table for this log.
+
+        Not whether `catalog.db` is there: that file is shared by every log
+        under the root (§2), so its presence says nothing about this one.
+
+        Read straight out of the catalog's own SQLite, like
+        `_recorded_location` and for the same reason — the question has to be
+        answerable without loading the table, whose metadata may not exist yet.
+        A catalog too old or too new to have that shape answers False, which
+        sends the caller down the create path where pyiceberg decides for
+        itself.
+        """
+        if not layout.catalog_db.exists():
+            return False
+
+        namespace, _, name = layout.table_id.rpartition(".")
+        connection = sqlite3.connect(f"file:{layout.catalog_db}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM iceberg_tables"
+                " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
+                (LOCAL_CATALOG, namespace, name),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        finally:
+            connection.close()
+
+        return row is not None
 
     def exists(self) -> bool:
         return True
