@@ -108,8 +108,9 @@ one writer per stream does not require.
 Grouping rows by the transaction that wrote them looks useful and is not, because the
 boundary the library could label is the wrong one.
 
-**The library's commit boundary is batching.** It decides when to flush a batch to SQLite;
-that grouping carries no information about the data. The boundary that *means* something
+**The library's commit boundary is batching.** It is the size of whatever `extend()` call
+happened to carry — the caller's flow control, not a decision the library makes — and that
+grouping carries no information about the data. The boundary that *means* something
 belongs to the application, and splits by how the stream arrives:
 
 - **Streamed sources have no grouping at all.** Each message is independent and is committed
@@ -201,9 +202,16 @@ A REST catalog is a drop-in replacement once more than one machine needs to writ
 Rows append to `buffer`, one transaction per batch. Durable on commit — that is the whole
 durability story.
 
+**The batch is whatever one `extend()` call carried**, and `append(row)` is `extend([row])`.
+So the batch size is a property of the call site, not a setting: nothing in `LogConfig`
+tunes it, and no throughput figure here means anything without it stated.
+
 Reference throughput on network-backed storage at a 2 KB row: 21,850 rows/s at
 `synchronous=FULL` (46 µs/row), against a raw `append+fdatasync` floor of 30,464 rows/s.
-Re-measure on target hardware; on local NVMe the fixed per-commit cost is a larger fraction.
+The batch size behind that pair predates the benchmark harness and was not recorded, which
+is the mistake this section now warns about — `just bench` prints the whole curve, one row
+per batch size, and is the number to trust on target hardware. On local NVMe the fixed
+per-commit cost is a larger fraction.
 
 ---
 

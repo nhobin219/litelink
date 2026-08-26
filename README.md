@@ -77,6 +77,11 @@ log = Log.new("data", "trades", schema=schema, sort_by=("event_ts",))
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076, "side": 0})  # durable on return
 
+# When rows arrive in groups, extend() commits the whole group in ONE
+# transaction — one fsync for the batch, not one per row. That call size is the
+# write throughput lever, and a call-site choice: no LogConfig setting tunes it.
+log.extend(group_of_rows)                          # append(row) is extend([row])
+
 # open() takes none of it — schema, sort order, config and archive all come
 # from the log itself.
 log = Log.open("data", "trades")

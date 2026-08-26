@@ -13,6 +13,10 @@ What to look for:
   - **The buffer is the variable cost of a read.** SQLite is row-oriented, so
     its leg costs per row what Parquet costs per 40 rows. That is why §7 calls
     the seal threshold a read-latency knob (§7).
+
+Both points are printed as a takeaway line under their table, computed from the
+run rather than asserted: a reader who knows what the numbers mean does not
+need it, and one who does not should not have to infer it from a grid.
 """
 
 from __future__ import annotations
@@ -27,9 +31,17 @@ from _bench import best_of, fresh_log, observations
 
 
 def bench_writes(root: Path, payload: int, batches: list[int], rows_each: int) -> None:
-    print(f"\nwrite — {rows_each:,} rows per run, {payload} B wide, synchronous=FULL")
-    print(f"  {'batch':>7} {'rows/s':>12} {'us/row':>10} {'commits':>9}")
+    print("\nWRITE  how fast rows land durably, by how many rows one extend()")
+    print("       call carries. extend() is ONE transaction, so its size is one")
+    print("       fsync amortised — the whole of §3's throughput story. this is a")
+    print("       call-site choice, not a setting: nothing in LogConfig tunes it.")
+    print(f"       {rows_each:,} rows per run, {payload} B wide, synchronous=FULL\n")
+    print(
+        f"  {'rows per extend()':>17} {'rows/s':>12} {'per row':>12}"
+        f" {'transactions':>13}"
+    )
 
+    measured: list[tuple[int, float, int]] = []
     for batch in batches:
         log = fresh_log(root)
         source = observations(payload, seed=batch)
@@ -44,10 +56,27 @@ def bench_writes(root: Path, payload: int, batches: list[int], rows_each: int) -
             log.close()
 
         rows = commits * batch
+        measured.append((batch, rows / elapsed, commits))
         print(
-            f"  {batch:>7,} {rows / elapsed:>12,.0f} {elapsed / rows * 1e6:>10.1f}"
-            f" {commits:>9,}"
+            f"  {batch:>17,} {rows / elapsed:>12,.0f}"
+            f" {elapsed / rows * 1e6:>9,.0f} us {commits:>13,}"
         )
+
+    slowest, fastest = measured[0], measured[-1]
+    print(
+        f"\n  -> one extend() of {fastest[0]:,} rows is"
+        f" {fastest[1] / slowest[1]:,.0f}x faster than {fastest[0]:,} append()"
+        " calls."
+    )
+    print(
+        f"     the same rows and the same work: {slowest[2]:,} fsyncs against"
+        f" {fastest[2]:,}."
+    )
+    print(
+        f"     hand extend() whole batches where the feed allows it."
+        f" {slowest[1]:,.0f} rows/s"
+    )
+    print("     is the ceiling where it does not.")
 
 
 def bench_reads(
@@ -63,11 +92,13 @@ def bench_reads(
         # tier boundary from manifest statistics. Fixed, not proportional, and
         # paid by every read — so it is worth knowing before reading the rest.
         overhead = best_of(5, log.table_extent) * 1000
-        print(f"\nfixed overhead — resolve catalog + boundary: {overhead:.2f} ms")
 
-        print(f"\nread — {sealed_rows:,} rows sealed into the table, then N buffered")
-        print(f"  {'buffered':>9} {'total rows':>11} {'union ms':>10} {'rows/s':>12}")
+        print("\nREAD   every read merges two places: Parquet files, already sealed,")
+        print("       and the SQLite buffer, not yet. the buffer is the variable cost.")
+        print(f"       {sealed_rows:,} rows sealed, then a buffer that grows\n")
+        print(f"  {'buffered':>9} {'rows read':>11} {'time':>11} {'rows/s':>12}")
 
+        measured: list[tuple[int, float]] = []
         buffered = 0
         for target in buffer_sizes:
             log.extend(itertools.islice(source, target - buffered))
@@ -75,10 +106,40 @@ def bench_reads(
 
             elapsed = best_of(3, lambda: log.scan().read_all())
             total = sealed_rows + buffered
-
+            measured.append((buffered, elapsed * 1000))
             print(
-                f"  {buffered:>9,} {total:>11,} {elapsed * 1000:>10.1f}"
+                f"  {buffered:>9,} {total:>11,} {elapsed * 1000:>8.1f} ms"
                 f" {total / elapsed:>12,.0f}"
+            )
+
+        print(
+            f"\n  -> before a single row is touched, any read costs {overhead:.2f} ms:"
+            "\n     resolving the catalog and finding the sealed/buffered boundary."
+        )
+
+        # Only claimed when the run actually shows it. A quick run buffers too
+        # few rows for the buffer's slope to clear the noise, and printing a
+        # trend the numbers above contradict is worse than printing none.
+        first, last = measured[0], measured[-1]
+        # A bare "it went up" is not enough: two timings 0.7 ms apart on a
+        # 19 ms read is scheduling noise, and reporting a slope from it invents
+        # a trend. The full sweep clears both floors by an order of magnitude.
+        grew = (
+            last[0] > first[0]
+            and last[1] - first[1] > 1.0
+            and last[1] > first[1] * 1.05
+        )
+        if grew:
+            per_thousand = (last[1] - first[1]) / ((last[0] - first[0]) / 1_000)
+            print(
+                f"  -> each 1,000 rows left in the buffer cost {per_thousand:.1f} ms"
+                " here.\n     sealing more often is the knob that bounds it (§7)."
+            )
+
+        else:
+            print(
+                "  -> this run is too small to separate the buffer's cost from"
+                " noise.\n     re-run without --quick for the full sweep."
             )
 
         # The projection lever from §7: excluding the wide column roughly halves
@@ -93,8 +154,9 @@ def bench_reads(
             * 1000
         )
         print(
-            f"\nprojection — all columns {wide:.1f} ms vs two columns {narrow:.1f} ms"
-            f"  ({wide - narrow:+.1f} ms)"
+            f"  -> asking for two columns instead of all of them: {narrow:.1f} ms"
+            f" against {wide:.1f} ms,\n     {wide - narrow:.1f} ms less. the one"
+            " lever that does not need sealing more often (§7)."
         )
     finally:
         log.close()
@@ -112,6 +174,10 @@ def main() -> None:
     rows_each = 2_000 if args.quick else 20_000
     sealed = 20_000 if args.quick else 200_000
     buffer_sizes = [1_000, 5_000] if args.quick else [1_000, 5_000, 20_000, 60_000]
+
+    run = "quick" if args.quick else "full"
+    print(f"litelink throughput on this machine — {run} run, {args.payload} B rows.")
+    print("every number below is measured here and now; nothing is a published figure.")
 
     with tempfile.TemporaryDirectory(prefix="litelink-bench-") as tmp:
         root = Path(tmp) / "data"
