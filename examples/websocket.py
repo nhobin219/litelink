@@ -75,7 +75,9 @@ async def main() -> None:
     try:
         log = Log.open(args.root, "trades")
     except FileNotFoundError:
-        log = Log.new(args.root, "trades", schema=SCHEMA, config=config)
+        log = Log.new(
+            args.root, "trades", schema=SCHEMA, sort_by=("event_ts",), config=config
+        )
 
     with log:
         print(f"capturing {CHANNEL} into {args.root}/trades for {args.seconds:g}s")

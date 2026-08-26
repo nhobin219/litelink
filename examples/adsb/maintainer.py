@@ -334,7 +334,12 @@ def _litestream() -> str:
     otherwise silently fall through to PATH — the failure being a different
     litestream, not a missing one, which is the harder one to see.
     """
-    pinned = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    # `parents[2]`, because this file is `examples/adsb/maintainer.py`. It was
+    # `parent.parent` before the move and resolved to `examples/.bin/`, which
+    # never exists — so `--replicate` fell through to whatever was on PATH,
+    # silently, which is the failure the paragraph above calls the harder one
+    # to see. `_replication.litestream_binary` has always used `parents[2]`.
+    pinned = Path(__file__).resolve().parents[2] / ".bin" / "litestream"
 
     return str(pinned) if os.access(pinned, os.X_OK) else "litestream"
 

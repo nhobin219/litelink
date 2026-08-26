@@ -26,6 +26,11 @@ litelink-ws/
 # dependency — a separate process, pinned rather than vendored.
 .bin/
 
+# Working plans. Scaffolding for a change rather than documentation of the
+# system — what survives a plan belongs in SPEC or RUNTIME, and what does not
+# is answered by the commit messages.
+docs/plans/
+
 # Claude work artifacts
 .claude/worktrees/
 /.roborev/

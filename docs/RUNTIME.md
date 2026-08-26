@@ -2,7 +2,7 @@
 
 Who does what, in which process, and what crosses between them.
 
-[`SPEC.md`](SPEC.md) says what the system is. This says how it runs: three roles, what
+[`SPEC.md`](SPEC.md) says what the system is. This says how it runs: two roles, what
 each one touches, and why every hand-off is a row in SQLite rather than an object in
 Python. If you are trying to work out whether some step lands on the append that
 triggered it, this is the page.
@@ -110,12 +110,12 @@ range claimed skips it and finds the work still there next pass.
           file exists  (I2)                 │    ENQUEUE their paths.
                                             │    never unlinks here
   §4 step 2   NO _lock  ← all the cost      │
-    rows_below(end) on a 2nd connection     └─ expire() → drain()
+    rows_between(start,end) on 2nd conn      └─ expire() → drain()
     sort → write Parquet → fsync                 snapshots past
     commit to Iceberg ────────────────┐          snapshot_retention, then
                                       │          unlink files whose grace
   §4 step 3   with _lock:             │          has passed, in the SAME
-    DELETE buffer rows < end          │          txn that clears the queue
+    DELETE rows < end IF discarding  │          txn that clears the queue
     NAME the extent's row          │
     lease.release()                   ▼
                     ┌─────────────────────────────┐
@@ -130,10 +130,14 @@ range claimed skips it and finds the work still there next pass.
 
 Two different things get called "eviction". They happen in different roles:
 
-- **Buffer rows** are deleted by the **maintainer**, at step 3 of a seal, once the
-  Iceberg commit has landed. The appending call never does this. Step 3 does take the write lock briefly,
-  so a concurrent append waits for it — but it is a delete by primary key, not work
-  proportional to the seal.
+- **Buffer rows** are deleted by the **maintainer**, and WHEN depends on one setting.
+  Without `wal_replication` they go at step 3 of a seal, once the Iceberg commit has
+  landed. With it, the seal keeps them and `sync` drops them once the archive holds the
+  range — a seal moves rows into a Parquet file no sidecar replicates, so deleting them
+  earlier removes the only off-box copy (§3a). `Log._discard_on_seal` is the one place
+  that decides. The appending call never does either. The delete takes the write lock
+  briefly, so a concurrent append waits for it — but it is a delete by primary key, not
+  work proportional to the seal.
 - **Parquet files** are removed from the table by the **maintainer** under
   `local_retention`, and *unlinked* only later by `drain()`, once `snapshot_retention`
   has passed.
@@ -196,7 +200,8 @@ Nothing in Python. Every arrow in the diagram is a SQLite row:
 | "I own these offsets until this time" | `claim` |
 | "this copy is intended, not yet made" | `extent_intent` |
 
-The one in-process shortcut is a `threading.Event` used to stop the sealer at `close()`.
+There is no in-process shortcut left: `close()` has nothing to stop, because nothing
+was started — the caller owns the loop.
 Nothing about correctness depends on it.
 
 **Concurrency, by axis.** Any number of *processes* may read at once, each with its own
@@ -330,13 +335,6 @@ queueing, an operation slower than `snapshot_retention` spends the whole grace b
 commits and the files fall due the instant they stop being referenced: measured at a five
 second retention, a reader 0.4 s old lost every file its snapshot named and failed
 mid-scan.
-
-"When it left the table" is the commit, not the queueing — and the two are not the same
-moment. Files are queued BEFORE the commit that supersedes them, since a crash in between
-would lose the only record of their paths, so the stamp is corrected at the commit. Left at
-the queueing, a rewrite slower than `snapshot_retention` spends the whole grace before it
-commits and the originals fall due the instant they stop being referenced: measured at a 5 s
-retention, a reader 0.4 s old lost every file its snapshot named and failed mid-scan.
 
 **Sync holds back exactly what compaction might still rewrite**, which it decides by asking
 compaction's own rule rather than a size of its own — a file pushed and then merged locally
@@ -586,15 +584,28 @@ stream that goes quiet holds its last partial file's worth of rows indefinitely.
 the RPO; removing it made replication the only mechanism rather than one of two.
 
 ```
+just litestream          # once: fetch the pinned, checksum-verified binary into .bin/
 just demo-replicate      # generates litestream.yml from the log, runs the sidecar
 ```
+
+**`wal_retention` bounds how far BACK a restore can go**, and nothing else. A restore always
+recovers the latest replicated state; retention only trims point-in-time depth. Set it from
+the un-archived window — which `adsb/tail.py` shows as the gap between `stream rows` and
+`archived rows` — with margin. `write_replication_config()` emits it as a per-database
+`snapshot:` block, deriving `interval` as half the retention so the window can never hold
+zero snapshots. Leave it `None` for litestream's own defaults.
 
 **Three databases, not one.** `examples/adsb/replicate.py` generates the config from
 `Log.databases` rather than leaving it to be written by hand, because the set is not
 obvious and getting it wrong is silent: `buffer.db` holds rows no Parquet file has yet,
 `catalog.db` says which files the local table is made of, and `archive.db` says the same
-for the archive — omit it and the objects in S3 survive with nothing able to say what they
-are. `archive.db` is created on first use, so a log that has never opened its archive has
+for the archive.
+
+That last one used to be justified as the only thing able to name the objects in S3. It is
+not: the archive publishes `version-hint.text` at every commit and names its own metadata.
+It stays in the set for the SAME-machine case, where it saves a round trip — and a failover
+deliberately does NOT restore it, because a stale copy wins over the bucket's own pointer.
+See "Failing over". `archive.db` is created on first use, so a log that has never opened its archive has
 none to restore, and a restore procedure has to tolerate that.
 
 **The endpoint goes in the config, the credentials do not.** litestream reads keys from the
@@ -619,7 +630,7 @@ That parameter is not optional. DuckDB defaults to the Hadoop `v%s%s.metadata.js
 pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the hint carries that stem
 and the format has to stop prepending a `v`.
 
-**A restored buffer holding sealed rows needs no reconciliation.** The read boundary comes
+**A restored buffer holding sealed rows needs no reconciliation — on the SAME machine.** The read boundary comes
 from the table's committed extent (I3), so those rows fall outside the buffer's
 contribution automatically.
 
@@ -681,7 +692,7 @@ than free of gaps. So 2²⁰ offsets are skipped, and `recovery()` reports which
 
 **What is not recovered:** rows appended inside the replication lag. They are
 gone, and no mechanism here returns them — that is the RPO the sidecar's
-`sync-interval` sets. Everything below the seal frontier comes back, including
+replication lag sets. Everything below the seal frontier comes back, including
 the sealed-but-unsynced band, because a seal keeps its rows until the archive
 has them.
 

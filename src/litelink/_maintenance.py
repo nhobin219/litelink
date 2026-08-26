@@ -708,8 +708,12 @@ class Maintenance:
     def evict(self) -> None:
         """Drop files older than `local_retention` from the local table (§8).
 
-        Age comes from the snapshot that added the file, not from any data
-        column — the library stamps no timestamp (§2).
+        Age comes from `extent.named_at` — the log's own record of when the
+        file was named — falling back to the Iceberg snapshot that added it
+        when there is no row. Not from any data column: the library stamps no
+        timestamp on rows (§2). Snapshot-only was the earlier version and the
+        bug that silently stopped reclaiming anything, because expiry retires
+        the snapshot the age was being read from.
 
         With no archive this is deletion of the only copy. That is the contract
         a local-only log with a retention asks for; see §8.
