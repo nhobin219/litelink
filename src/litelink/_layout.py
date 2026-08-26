@@ -74,9 +74,13 @@ class Layout:
     def archive_db(self) -> Path:
         """The archive catalog, kept beside the local one (§2).
 
-        A local SQLite file describing a warehouse on object storage. §2
-        replicates this file to S3 as well, so another machine can attach to
-        the archive without this one; that replication is not built yet.
+        A local SQLite file describing a warehouse on object storage. It is
+        replicated like the others — but it is deliberately NOT restored onto
+        another machine. Its paths are `s3://` and so machine-independent, yet
+        it is TIME-dependent, and a stale copy is worse than none:
+        `open_archive` consults `version-hint.text` only when the catalog has
+        no row, so a stale row wins over the bucket's own pointer and the
+        archive reads short, silently. See `Log.restore`.
         """
         return self.root / "archive.db"
 

@@ -688,10 +688,23 @@ class Buffer:
             # commits. Nothing downstream can detect it: the row counts match,
             # the ranges look contiguous, and the payloads are simply attached
             # to the wrong offsets.
-            if self._con.execute("SELECT 1 FROM buffer LIMIT 1").fetchone():
+            # The hazard is DOWNWARD only, and this used to refuse any
+            # non-empty buffer. Raising the sequence past the rows present is
+            # safe — SQLite assigns `max(max(rowid), seq) + 1` either way — and
+            # it is what a restore needs: reserving an offset range (§3a) has
+            # to work on a buffer holding the recovered tail, which is exactly
+            # a buffer with rows in it.
+            #
+            # Narrowed rather than bypassed. A second writer of this sequence
+            # would be a second place to get the direction wrong, and the
+            # direction is the whole of the danger.
+            highest = self._con.execute(
+                'SELECT max("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+            if highest is not None and first - 1 < highest:
                 msg = (
-                    "cannot seed offsets on a buffer that already holds rows: "
-                    "SQLite ignores a sequence lowered past them"
+                    f"cannot seed offsets to {first} on a buffer holding rows up "
+                    f"to {highest}: SQLite ignores a sequence lowered past them"
                 )
                 raise ValueError(msg)
 
@@ -1622,6 +1635,77 @@ class Buffer:
             # The extent goes with the file. It described where those rows
             # live, and they no longer live anywhere by that name.
             self._con.execute("DELETE FROM extent WHERE rel_path = ?", (rel_path,))
+
+    def strip_local_state(self, reserve: int) -> tuple[int, int]:
+        """Drop everything that describes the machine this came FROM (§3a).
+
+        A restored `buffer.db` is a faithful copy of a database that belonged
+        to a box which no longer exists, and some of what it says is about that
+        box rather than about the log. Returns `(released, next_offset)`.
+
+        - **`extent` rows naming LOCAL files** go. They name Parquet on the
+          machine that died, so `file_bytes` — and through it `memory`, which
+          sizes merges — would describe files nothing can open. Rows naming
+          ARCHIVE copies stay: that is the coverage I4 acts on, and it is still
+          true.
+
+          Narrower than it first looks, and worth saying so: compaction decides
+          what to merge from the Iceberg table's `data_files`, not from these
+          rows, and that table is rebuilt empty. So a stale row cannot make a
+          merge reach for a missing file. What it can do is make this database
+          describe a filesystem that does not exist, which is the thing every
+          other path here is arranged to prevent.
+        - **The open group** goes with them, and `_seed_group` reruns. Without
+          this the recovered band is orphaned — its own rows have just been
+          dropped as local, and `_seed_group` returns early whenever an open
+          group exists, which a restored buffer always has because `_cut`
+          inserts one after every cut. The surviving row starts at the dead
+          box's UNSEALED floor, above the band, so the band would fall into no
+          leg of a read and be lost at the first seal after recovery.
+        - **`pending_delete` rows naming local files** go; REMOTE ones stay,
+          and that half is required. `rewrite_archive` is the only thing that
+          queues a remote entry, and this design refuses directory listing, so
+          dropping them leaks archive objects nothing can ever find again.
+        - **`claim` rows** go. They carry the dead box's owners and a future
+          expiry, so keeping them makes this one wait out a TTL for processes
+          that do not exist.
+        - **`sealing` and `compacting` stay.** `_recover_seal` finds the
+          rebuilt table empty and rewrites the interrupted file from the
+          surviving buffer rows, which RECOVERS data rather than losing it.
+
+        Finally the offset sequence is raised by `reserve`. See `Log.restore`.
+        """
+        with self._transaction():
+            self._con.execute(
+                "DELETE FROM extent WHERE rel_path IS NULL OR rel_path NOT LIKE '%://%'"
+            )
+            self._con.execute(
+                "DELETE FROM pending_delete WHERE rel_path NOT LIKE '%://%'"
+            )
+            self._con.execute("DELETE FROM claim")
+            released = self._con.execute("SELECT count(*) FROM buffer").fetchone()[0]
+            highest = self._con.execute(
+                'SELECT max("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+            seq = self._con.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone()
+            ceiling = max(int(seq[0]) if seq else 0, int(highest or 0)) + reserve
+            self._con.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
+                (ceiling,),
+            )
+            if not self._con.execute(
+                "SELECT 1 FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone():
+                self._con.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
+                    (ceiling,),
+                )
+
+        self._seed_group()
+
+        return int(released), ceiling + 1
 
     def release_archived(self, boundary: int) -> int:
         """Drop buffer rows the archive now holds. Returns how many.

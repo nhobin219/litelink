@@ -645,6 +645,49 @@ Failing over to another box therefore rebuilds the local table rather than resto
 recovery, where those paths still resolve, is exactly where it is the only record of which
 Parquet the table is made of.
 
+### Failing over
+
+```python
+log = Log.restore("/data", "positions", archive="s3://bucket/prefix")
+print(log.recovery())      # what came back, and which offsets were skipped
+```
+
+One call. It refuses a root that already holds this log, or whose
+`litestream.yml` replicates a different one; writes the config from the layout
+alone — which is the chicken-and-egg, since you need the config to name the
+databases you are restoring; restores `buffer.db`; rebuilds the local Iceberg
+table empty; drops what described the dead machine; adopts the archive through
+`version-hint.text`; and reserves an offset gap.
+
+**`archive.db` is not restored, deliberately.** It is replicated and it is
+machine-independent — but it is *time*-dependent, and stale is worse than
+absent here. `open_archive` reads `version-hint.text` only when the catalog has
+no row, so a stale row wins over the bucket's own pointer: measured, one archive
+file reported where the bucket held five, and a union reading 261 rows instead
+of 1061. The next sync then commits onto that lineage and republishes the hint
+over the fork, destroying the pointer the next recovery would need. `restore`
+drops any entry it finds before opening, so a hand restore of all three gets the
+same protection.
+
+**Offsets resume above everything the primary served, with a gap.**
+`sqlite_sequence` comes back from the replica, so it resumes above what the
+replica RECEIVED — not above what was ASSIGNED. Rows appended inside the
+replication lag were returned to callers by `append` and never shipped, so
+resuming at the replica's frontier would hand those integers to different data.
+I9 says offsets are never reused; §6 needs files adjacent in offset order rather
+than free of gaps. So 2²⁰ offsets are skipped, and `recovery()` reports which.
+
+**What is not recovered:** rows appended inside the replication lag. They are
+gone, and no mechanism here returns them — that is the RPO the sidecar's
+`sync-interval` sets. Everything below the seal frontier comes back, including
+the sealed-but-unsynced band, because a seal keeps its rows until the archive
+has them.
+
+**Split-brain is not detected.** If the primary is not actually dead you have
+two writers on one archive, and if both replicate, two litestream instances on
+one replica path — the thing litestream is explicit about. Nothing here checks
+it; §13's archive-identity token is what would.
+
 ## Operating it
 
 ```

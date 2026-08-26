@@ -216,6 +216,41 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     return f"{directory}/{version}.metadata.json" if version else None
 
 
+def forget_archive_entry(layout: Layout) -> bool:
+    """Drop the archive's catalog row, so the next open must ADOPT.
+
+    For a restore: a row that survived onto this machine describes an archive
+    as it was when the replica was taken, and `open_archive` reads
+    `version-hint.text` only when there is no row. A stale row therefore wins
+    over the bucket's own pointer, silently and in the losing direction.
+
+    Returns whether a row was there. Touches the table `SqlCatalog` owns
+    directly rather than through pyiceberg, because constructing a catalog to
+    drop one row would create the catalog's own tables as a side effect — and
+    on a fresh restore there is no `archive.db` at all, which is the ordinary
+    case and must stay a no-op.
+    """
+    if not layout.archive_db.exists():
+        return False
+
+    namespace, _, name = layout.table_id.rpartition(".")
+    connection = sqlite3.connect(layout.archive_db)
+    try:
+        cursor = connection.execute(
+            "DELETE FROM iceberg_tables"
+            " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
+            (ARCHIVE_CATALOG, namespace, name),
+        )
+        connection.commit()
+    except sqlite3.Error:
+        # No such table means no entry, which is what this wanted anyway.
+        return False
+    finally:
+        connection.close()
+
+    return bool(cursor.rowcount)
+
+
 def archive_extent(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[int, int] | None:

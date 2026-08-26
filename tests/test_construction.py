@@ -1133,3 +1133,32 @@ def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
 
     with Log.open(tmp_path, "s") as reopened:
         assert reopened._sort_by == ()  # noqa: SLF001
+
+
+def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
+    tmp_path: Path,
+) -> None:
+    """The guard is about DIRECTION, not about the buffer being empty.
+
+    It used to refuse any non-empty buffer, which blocked the one caller that
+    needs it: a restore reserves an offset range (§3a) on a buffer holding the
+    recovered tail — exactly a buffer with rows in it. Raising past those rows
+    is safe, because SQLite assigns `max(max(rowid), seq) + 1` either way.
+
+    Lowering is the unrecoverable one, and stays refused: the sequence is
+    ignored, every following row lands on an offset belonging to different
+    data, and nothing downstream can detect it.
+    """
+    buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
+    try:
+        buffer.append([{"event_ts": i, "key": "k", "payload": "p"} for i in range(2)])
+        highest = buffer.next_offset() - 1
+
+        buffer.seed_offsets(highest + (1 << 20))
+
+        assert buffer.next_offset() == highest + (1 << 20)
+
+        with pytest.raises(ValueError, match="holding rows up to"):
+            buffer.seed_offsets(1)
+    finally:
+        buffer.close()

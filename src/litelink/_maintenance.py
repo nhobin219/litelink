@@ -654,11 +654,34 @@ class Maintenance:
             limits.append(max((f.hi for f in stale), default=0))
 
         if config.local_rows is not None:
-            # Offsets are contiguous, so the newest `local_rows` of them start
-            # here. AUTOINCREMENT can leave a gap where a transaction rolled
-            # back, which makes this retain slightly more than asked rather
-            # than less — the safe direction for a floor.
-            limits.append(self._buffer.next_offset() - 1 - config.local_rows)
+            # COUNTED, not subtracted from the frontier. `next_offset() - 1 -
+            # local_rows` reads naturally and assumes the offset space is
+            # dense — true of a rollback's occasional gap, and false the moment
+            # anything reserves a range. A restore skips 2**20 offsets to keep
+            # I9 (§3a), so the subtraction would put the boundary 2**20 above
+            # every local file, and the first `maintain()` after a failover
+            # would evict the whole local window, clamped only by I4. The
+            # comment here used to say the arithmetic errs toward retaining
+            # MORE, which is the safe direction for a floor; across a large
+            # hole it errs the other way.
+            #
+            # Iceberg records a row count per file, so counting back from the
+            # newest costs nothing beyond the manifest read `data_files`
+            # already did.
+            kept = 0
+            for data_file in sorted(
+                self._table.data_files(), key=lambda f: f.hi, reverse=True
+            ):
+                if kept >= config.local_rows:
+                    # This file lies entirely outside the window, so everything
+                    # at or below it may go.
+                    limits.append(data_file.hi)
+                    break
+
+                kept += data_file.rows
+            else:
+                # Every local file is inside the window: keep all of them.
+                limits.append(0)
 
         return min(limits) if limits else 0
 
