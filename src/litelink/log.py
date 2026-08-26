@@ -534,12 +534,16 @@ class Log:
         made of in a design that refuses directory listing.
         """
         layout = Layout(Path(root), name)
-        # A buffer with NO catalog beside it is a restore that was interrupted
-        # between the two, not a log. Refusing it would leave the root in a
+        # A buffer with no TABLE for this log is a restore interrupted before
+        # its last write, not a log. Refusing it would leave the root in a
         # state neither this nor `Log.open` accepts, so the only way out would
-        # be deleting it by hand. Resumed instead: everything below is safe to
-        # repeat, and the reserve simply skips another window.
-        resuming = layout.buffer_db.exists() and not layout.catalog_db.exists()
+        # be deleting it by hand. Resumed instead: everything before that write
+        # is repeatable, and the reserve simply skips another window.
+        #
+        # Asked of the table, not of `catalog.db`. That file is shared by every
+        # log under the root (§2), so in a root holding a second log it exists
+        # already and a genuinely interrupted restore would never resume.
+        resuming = layout.buffer_db.exists() and not LogTable.exists_for(layout)
         if layout.buffer_db.exists() and not resuming:
             msg = (
                 f"a log already exists at {layout.root}/{name}; restore refuses to "
@@ -626,72 +630,87 @@ class Log:
         schema = pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
         sort_by = tuple(json.loads(raw_sort))
 
-        # THE RESERVE FIRST, and the table second. `LogTable.create` is the
-        # write that makes this root openable, so with it first an interruption
-        # between the two left a root that `restore` refuses to retry and
-        # `Log.open` cheerfully accepts — reporting `recovery() is None`, with
-        # the sequence still at the replica's frontier, handing out offsets the
-        # dead primary had already served. Measured: a primary served through
-        # 950, the retry refused, and the ordinary open resumed at 901.
+        # EVERY OTHER DURABLE WRITE FIRST; `LogTable.create` LAST.
         #
-        # This order has no such state. Interrupted before the table exists,
-        # the root cannot open at all — and `restore` resumes it, below.
+        # That table is what makes this root openable, so wherever it sits, an
+        # interruption after it leaves a root `restore` refuses to retry — both
+        # databases now exist — and `Log.open` cheerfully accepts, reporting
+        # `recovery() is None`. An earlier version put it second and claimed
+        # "this order has no such state"; it had one, one write later. Measured
+        # from that window: the open group still at the replica's stale
+        # frontier, the first seal writing a file straddling the archive's
+        # extent, 712 archived offsets vanishing from every
+        # `scan(include_archive=True)` with no error anywhere, and `sync`
+        # raising for ever afterwards.
+        #
+        # Nothing before it needs it. Adoption and the reconcile are about the
+        # ARCHIVE and the buffer; neither reads the local table. So it becomes
+        # the commit point: everything ahead of it is repeatable, and a root
+        # without it cannot be opened by anything.
         buffer = Buffer.open(layout.buffer_db, schema)
         try:
             released, resumed = buffer.strip_local_state(RESTORE_RESERVE)
+
+            # ADOPTED, explicitly. `archive.db` was deliberately not restored,
+            # so nothing here has a catalog row for the archive — and an
+            # ordinary `open` will not create one: adoption is a write to that
+            # catalog, and `open_archive` reserves it for a repairing caller.
+            # Without this the log comes back holding only what the buffer
+            # carried, and every `include_archive` read silently leaves the
+            # archive leg out.
+            #
+            # Built standalone rather than reached through a `Log`, because
+            # there is no local table yet — which is the whole point of doing
+            # it here. It reads the archive's location from the restored
+            # `meta`, so it adopts the archive THIS log wrote, not whatever
+            # prefix the caller named for the WAL.
+            remote = Archive(layout, buffer, options, table_schema(schema), sort_by)
+            where = remote.uri
+            if remote.table(repair=True) is None and where is not None:
+                # Not best-effort. A restore that cannot reach the archive has
+                # recovered the unsealed tail and nothing else, and returning
+                # it as a success is the "partial recovery that looks whole"
+                # this refuses elsewhere.
+                msg = (
+                    f"restored the buffer but could not adopt the archive at "
+                    f"{where!r}: it holds nothing this log can read. The rows "
+                    f"below the archive frontier are not recovered"
+                )
+                raise RuntimeError(msg)
+
+            # RECONCILED against the archive, and this is not optional. A
+            # replica is a consistent snapshot from BEFORE the primary's last
+            # sync — ordinary replication lag, not a crash window — so the
+            # archive is routinely ahead of the `extent` rows the buffer
+            # carries. Left alone, `_seed_group` opens the group at the
+            # replica's stale frontier while the bucket already holds past it,
+            # and the first seal here writes a file reaching into the archive's
+            # extent.
+            #
+            # Which wedges the log permanently: `_refuse_straddle` raises on
+            # every push, `archived_prefix` returns 0 for the straddler so
+            # eviction pins at zero, and disk grows without bound. Nothing
+            # re-cuts a local straddler, and this is the operation you run when
+            # the archive is the only surviving copy.
+            #
+            # Releasing what the archive holds and re-seeding is what closes
+            # it. Those rows are genuinely safe: the archive has them, which is
+            # the same authority `_push` releases on.
+            adopted = remote.table()
+            covered = None if adopted is None else adopted.extent()
+            if covered is not None:
+                released -= buffer.release_archived(covered[1])
+                buffer.reseed_group()
         finally:
             buffer.close()
 
         # REBUILT, not restored. Its Parquet is on the machine that died and
         # its Iceberg metadata was never replicated, so there is nothing to
-        # point at — see this method's docstring.
+        # point at — see this method's docstring. Last, so it is the moment
+        # this root becomes a log.
         LogTable.create(layout, table_schema(schema), sort_by)
 
         log = cls.open(layout.root, name, s3=options)
-        # ADOPTED, explicitly. `archive.db` was deliberately not restored, so
-        # nothing here has a catalog row for the archive — and an ordinary
-        # `open` will not create one: adoption is a write to that catalog, and
-        # `open_archive` reserves it for a repairing caller. Without this the
-        # log comes back holding only what the buffer carried, and every
-        # `include_archive` read silently leaves the archive leg out.
-        #
-        # Not best-effort. A restore that cannot reach the archive has
-        # recovered the unsealed tail and nothing else, and returning it as a
-        # success is the "partial recovery that looks whole" this refuses
-        # elsewhere.
-        if log._archive.table(repair=True) is None and log.archive is not None:
-            log.close()
-            msg = (
-                f"restored the buffer but could not adopt the archive at "
-                f"{log.archive!r}: it holds nothing this log can read. The rows "
-                f"below the archive frontier are not recovered"
-            )
-            raise RuntimeError(msg)
-
-        # RECONCILED against the archive, and this is not optional. A replica
-        # is a consistent snapshot from BEFORE the primary's last sync —
-        # ordinary replication lag, not a crash window — so the archive is
-        # routinely ahead of the `extent` rows the buffer carries. Left alone,
-        # `_seed_group` opens the group at the replica's stale frontier while
-        # the bucket already holds past it, and the first seal on this box
-        # writes a file whose range reaches into the archive's extent.
-        #
-        # That wedges the log permanently: `_refuse_straddle` raises on every
-        # push, `archived_prefix` returns 0 for the straddler so eviction pins
-        # at zero, and local disk grows without bound. Measured — three
-        # append/seal/sync cycles, `archived_through` frozen, file count
-        # climbing, the same error each time. Nothing re-cuts a local
-        # straddler, and this is the operation you run when the archive is the
-        # only surviving copy.
-        #
-        # Releasing what the archive holds and re-seeding is what closes it.
-        # Those rows are genuinely safe: the archive has them, which is the
-        # same authority `_push` releases on.
-        remote = log._archive.table()
-        covered = None if remote is None else remote.extent()
-        if covered is not None:
-            log._buffer.release_archived(covered[1])
-            log._buffer.reseed_group()
 
         # REWRITTEN, now that the policy is back. The config above had to be
         # written before `buffer.db` existed — that is the chicken-and-egg this
@@ -702,13 +721,26 @@ class Log:
         # file as the one an operator then runs the sidecar against.
         log.write_replication_config()
 
-        # Recorded after the adoption, so the archive is resolved and its
-        # frontier readable. Both numbers are what an operator needs and
-        # neither is recoverable afterwards.
+        # DERIVED from the highest offset anything still holds, not from
+        # `resumed - RESTORE_RESERVE`. A resumed restore reserves twice, so
+        # subtracting one window named only the last of them — measured, a log
+        # that skipped 1101..2098252 reported 1049677..2098252.
+        #
+        # `recovered` is likewise the count AFTER the reconcile, which the
+        # subtraction above it performs: rows the archive already held were
+        # released two lines later, and counting them as recovered describes a
+        # buffer that no longer exists.
+        local = log.table_extent()
+        buffered = log._buffer.extent()  # noqa: SLF001
+        highest = max(
+            0 if local is None else local[1],
+            log._maintenance.archived_through(),  # noqa: SLF001
+            0 if buffered is None else buffered[1],
+        )
         log._restored_from = _Recovery(  # noqa: SLF001
             recovered=released,
             resumed_at=resumed,
-            skipped=(resumed - RESTORE_RESERVE, resumed - 1),
+            skipped=(highest + 1, resumed - 1),
         )
 
         return log
