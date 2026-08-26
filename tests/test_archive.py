@@ -3067,3 +3067,71 @@ def test_a_failed_restore_never_leaves_an_openable_root(
         # And it is resumable rather than a dead end.
         with Log.restore(root, "s", archive=where, s3=s3) as revived:
             assert revived.scan(include_archive=True).read_all().num_rows > 0
+
+
+def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`restore`'s rollback must never undo a row it did not create.
+
+    `LogTable.create` is two commits, so a failure in the second drops the
+    catalog row to leave the root unopenable — which is right when this call
+    made the row, and destructive when it did not. `create` raises
+    `TableAlreadyExistsError` on a row that pre-exists, and the blanket
+    `except` then dropped a LIVE log's only pointer to its local files.
+
+    Reachable with `buffer.db` gone and the table present, which the guard at
+    the top cannot catch: it keys on the buffer. Removing the buffer is a
+    plausible answer to that guard's own "Remove it, or restore into another
+    root".
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/live-row"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        readable = log.scan(include_archive=True).read_all().num_rows
+        replication = log.write_replication_config()
+
+    # A replica has to exist, or `restore` fails at the download and never
+    # reaches the create this is about.
+    environment = dict(os.environ)
+    resolved = s3.resolved()
+    if resolved.access_key and resolved.secret_key:
+        environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
+        environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
+
+    subprocess.run(  # noqa: S603
+        [str(binary), "replicate", "-config", str(replication), "-exec", "sleep 3"],
+        check=True,
+        env=environment,
+        capture_output=True,
+        timeout=120,
+    )
+
+    # The buffer removed by hand; the table and its files stay. That is a
+    # plausible answer to the guard's own "Remove it, or restore into another
+    # root", and it walks straight past the guard, which keys on the buffer.
+    Layout(tmp_path, "s").buffer_db.unlink()
+
+    with pytest.raises(Exception, match="already exists"):
+        Log.restore(tmp_path, "s", archive=where, s3=s3, binary=str(binary))
+
+    # The row survives, so the local files are still referenced and the log
+    # still reads. Before this, `Log.open` answered "use new() to create one".
+    assert LogTable.exists_for(Layout(tmp_path, "s"))
+    with Log.open(tmp_path, "s", s3=s3, read_only=True) as reopened:
+        assert reopened.scan(include_archive=True).read_all().num_rows == readable
