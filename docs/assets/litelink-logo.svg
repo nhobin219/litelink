@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 180" width="660" height="180" role="img" aria-label="litelink">
+  <title>litelink</title>
+
+  <defs>
+    <!-- upper half of the overlap, used to weave link A back over link B -->
+    <clipPath id="weave">
+      <rect x="126" y="50" width="30" height="40"/>
+    </clipPath>
+  </defs>
+
+  <!-- link A: sealed / archive tier -->
+  <rect x="36" y="58" width="118" height="64" rx="32"
+        fill="none" stroke="#6B7684" stroke-width="14"/>
+
+  <!-- link B: hot / buffer tier, drawn over A -->
+  <rect x="126" y="58" width="118" height="64" rx="32"
+        fill="none" stroke="#2F6FED" stroke-width="14"/>
+
+  <!-- weave: A passes back over B in the upper overlap -->
+  <g clip-path="url(#weave)">
+    <rect x="36" y="58" width="118" height="64" rx="32"
+          fill="none" stroke="#6B7684" stroke-width="14"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="296" y="113"
+        font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace"
+        font-size="64" letter-spacing="-1.5">
+    <tspan fill="#6B7684">lite</tspan><tspan fill="#2F6FED">link</tspan>
+  </text>
+</svg>

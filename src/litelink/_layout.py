@@ -104,8 +104,13 @@ class Layout:
         What a WAL-shipping sidecar has to replicate. All three, not just the
         buffer: the buffer holds rows no Parquet file has yet, `catalog.db`
         holds which files the local table is made of, and `archive.db` holds
-        the same for the archive — so without it the objects in S3 are there
-        and nothing knows what they are.
+        the same for the archive.
+
+        That last one used to be justified as the only thing able to name the
+        objects in S3. It is not, since the archive publishes
+        `version-hint.text`; it is replicated for the SAME-machine case, where
+        it saves a round trip, and a failover deliberately does not restore it
+        because a stale copy wins over the bucket's own pointer.
 
         The rewrite scratch is excluded. It is derived from the archive and
         deleted at the end of the operation that makes it, so replicating it

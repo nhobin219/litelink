@@ -1,11 +1,22 @@
-# litelink
+<p align="center">
+  <img src="docs/assets/litelink-logo.svg" alt="litelink" width="330">
+</p>
 
-Durable append-only capture into Iceberg tables. Local-first, in-process, no service.
+[![CI](https://github.com/nhobin219/litelink/actions/workflows/ci.yml/badge.svg)](https://github.com/nhobin219/litelink/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache%20v2-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![Iceberg](https://img.shields.io/badge/Apache%20Iceberg-v2-4B8BBE)](https://iceberg.apache.org/)
+
+# Durable append-only capture into Iceberg tables
+
+**Local-first, in-process, no service.**
 
 **Status: early.** All three tiers work — append, seal, read, compact, evict, expire, and
 `sync()` into an Iceberg table on S3, with reads spanning buffer, local table and archive.
-Verified against a local S3-compatible store and against AWS. **Schema evolution is not
-implemented**, and remains the one specified feature the code does not have. The design is
+A log survives losing its machine: WAL shipping puts the SQLite state on object storage and
+`Log.restore` rebuilds it on another box. Verified against a local S3-compatible store and
+against AWS. **Schema evolution (§9) and blob fields (§15) are specified and not
+implemented**, and are what the code lacks against its own design. That design is
 [`docs/SPEC.md`](docs/SPEC.md), and in places it is still ahead of the code.
 
 ---
@@ -52,7 +63,7 @@ durability — but "real-time" means fresh, not point-lookup fast.
 Nor is it an unbounded local archive. **Keeping everything on one machine — `archive=None`
 with no `local_retention` — degrades as the table grows.** A seal's cost tracks what the
 table's metadata holds, and while running `maintain()` bounds the largest part of that, a
-residue grows with the file count: compaction merges files *below* half the target size, so one it
+residue grows with the file count: compaction groups adjacent files whose combined uncompressed size fits the target, so one it
 has already produced at that size is never revisited, and only eviction removes it. With no
 retention set nothing evicts. The seal is on the write path, so the cost lands on appends.
 
@@ -74,8 +85,10 @@ in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 - **The seal cut is chosen by the appender**, in the transaction that crosses
   `target_size`, and queued. A sealer that falls behind therefore writes several
   correctly-sized files rather than one oversized one.
-- **Compaction is required and local**, because a time-based seal trigger guarantees
-  undersized files. Local means no egress to read files back.
+- **Compaction is local**, and in normal operation a no-op: the seal cuts on
+  `target_seal_size` alone, so every file already lands at that size. What it is for is
+  converting seals into archive-shaped files when `target_compact_size` is larger. Local
+  means no egress to read files back.
 
 Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
@@ -180,7 +193,18 @@ just demo-tail         # in a third: watch where the rows are
 just bench --quick     # write and read throughput on your hardware
 ```
 
-Local only, no network. To add the archive tier against a local S3-compatible store:
+Local only, no network. To survive losing the machine, ship the SQLite WAL alongside:
+
+```
+just litestream        # once: fetch the pinned, checksum-verified sidecar
+just demo-replicate    # generates litestream.yml from the log, runs it
+```
+
+Then `Log.restore(root, name, archive=...)` rebuilds the log on another box — it writes the
+config from the layout alone, restores `buffer.db`, rebuilds the local table, adopts the
+archive, and reserves an offset window so nothing the dead machine served is reissued.
+
+To add the archive tier against a local S3-compatible store:
 
 ```
 just rustfs            # object storage in one container
@@ -210,7 +234,7 @@ just bootstrap          # uv sync + git hooks + DuckDB extensions
 just check              # lint + format-check + typecheck + tests, same as CI
 ```
 
-`just bootstrap` provisions the `iceberg` and `avro` DuckDB extensions, which are
+`just bootstrap` provisions the `iceberg`, `avro` and `httpfs` DuckDB extensions, which are
 downloaded rather than bundled — see [`docs/SPEC.md`](docs/SPEC.md) §7. `just
 duckdb-extensions --check` verifies a machine can read offline. The buffer is **not**
 read through DuckDB's sqlite scanner: two independently linked SQLite libraries in one
@@ -227,8 +251,8 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org), enfo
 <type>(<scope>): <lowercase description, no trailing period, subject <= 72 chars>
 
 types   feat fix refactor perf test docs build chore
-scopes  the subsystems in docs/SPEC.md — buffer, write, seal, sync, compaction, read,
-        retention, schema, blob, catalog, config, replication — plus spec, ci, deps
+scopes  benchmarks blob buffer catalog ci compaction config deps examples read
+        replication retention schema seal spec sync write
 ```
 
 ## License
