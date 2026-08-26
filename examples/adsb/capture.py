@@ -1,6 +1,6 @@
 """The writer: append, and nothing else.
 
-    uv run python examples/capture.py [--root DIR] [--rate ROWS_PER_SECOND]
+    uv run python examples/adsb/capture.py [--root DIR] [--rate ROWS_PER_SECOND]
 
 One thread appending, and every append durable when `extend()` returns — there
 is no in-memory buffer to flush, which is the failure the README opens with.

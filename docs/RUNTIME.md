@@ -50,9 +50,11 @@ compaction ever delays sealing enough to matter. It costs latency, not file size
 cut was recorded when the rows arrived.
 
 **Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue;
-`maintain()` compacts, evicts and expires — and calls
-`seal_due()` first, because sealing is the first thing done with what the writer leaves
-behind. They are two methods rather than one only because their costs differ by an order
+`maintain()` compacts, evicts and expires — and calls `seal_due()` itself at the end, so a
+caller running only `maintain()` in a loop is still correct. At the end rather than the
+start because the pass ahead of it works on files that are already sealed: a group cut
+during this call becomes a compaction candidate on the next one, which costs a cycle of
+latency and nothing else. They are two methods rather than one only because their costs differ by an order
 of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
 often, while `maintain()` reads table metadata and wants to be run rarely.
 
@@ -587,7 +589,7 @@ the RPO; removing it made replication the only mechanism rather than one of two.
 just demo-replicate      # generates litestream.yml from the log, runs the sidecar
 ```
 
-**Three databases, not one.** `examples/replicate.py` generates the config from
+**Three databases, not one.** `examples/adsb/replicate.py` generates the config from
 `Log.databases` rather than leaving it to be written by hand, because the set is not
 obvious and getting it wrong is silent: `buffer.db` holds rows no Parquet file has yet,
 `catalog.db` says which files the local table is made of, and `archive.db` says the same
@@ -602,13 +604,91 @@ region against real AWS unless the replica names one, so against anything else i
 with "cannot lookup bucket region" while the credentials it needs sit unused in the
 environment.
 
-**Restore is correct by construction.** A restored buffer may hold rows already sealed into
-the table. Nothing reconciles them, because the read boundary comes from the table's
-committed extent (I3), so those rows fall outside the buffer's contribution automatically.
+**The archive says where its own metadata is.** Every archive commit writes
+`version-hint.text` beside the metadata JSONs it names, which is what makes a bucket
+recoverable without the local root and a re-point reversible — `archive.db`'s catalog row
+is otherwise the only pointer to the current metadata, and re-pointing drops it. An engine
+with no catalog at all reads the prefix directly:
+
+```sql
+SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/litelink/positions',
+                                  version_name_format = '%s%s.metadata.json');
+```
+
+That parameter is not optional. DuckDB defaults to the Hadoop `v%s%s.metadata.json` while
+pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the hint carries that stem
+and the format has to stop prepending a `v`.
+
+**A restored buffer holding sealed rows needs no reconciliation.** The read boundary comes
+from the table's committed extent (I3), so those rows fall outside the buffer's
+contribution automatically.
 
 Measured on this machine: a log at 189,140 appended rows, killed with its directory
-discarded, restored from object storage alone — 189,140 rows readable, none of them ever
-sealed.
+discarded, restored from object storage alone — 189,140 rows readable, **none of them ever
+sealed**.
+
+**That last clause is the whole caveat, and this used to read as though it were not.**
+Restoring the databases onto another machine and opening the log FAILS once anything has
+sealed — measured:
+
+```
+FileNotFoundError: .../orig/litelink/s/metadata/00009-....metadata.json
+```
+
+`catalog.db` records absolute paths to the local Iceberg metadata, and a sidecar ships the
+`.db` files and nothing else — not that metadata, not the Parquet. So a restored catalog
+points into the dead machine's filesystem. It is not particular to sealed logs either:
+`Log.new` writes a metadata JSON before the first append, so a never-sealed log fails the
+same way. What the measurement above actually exercised was a restore back onto the SAME
+paths.
+
+Failing over to another box therefore rebuilds the local table rather than restoring it —
+`Log.restore` — and `catalog.db` stays in the replication set because same-machine
+recovery, where those paths still resolve, is exactly where it is the only record of which
+Parquet the table is made of.
+
+### Failing over
+
+```python
+log = Log.restore("/data", "positions", archive="s3://bucket/prefix")
+print(log.recovery())      # what came back, and which offsets were skipped
+```
+
+One call. It refuses a root that already holds this log, or whose
+`litestream.yml` replicates a different one; writes the config from the layout
+alone — which is the chicken-and-egg, since you need the config to name the
+databases you are restoring; restores `buffer.db`; rebuilds the local Iceberg
+table empty; drops what described the dead machine; adopts the archive through
+`version-hint.text`; and reserves an offset gap.
+
+**`archive.db` is not restored, deliberately.** It is replicated and it is
+machine-independent — but it is *time*-dependent, and stale is worse than
+absent here. `open_archive` reads `version-hint.text` only when the catalog has
+no row, so a stale row wins over the bucket's own pointer: measured, one archive
+file reported where the bucket held five, and a union reading 261 rows instead
+of 1061. The next sync then commits onto that lineage and republishes the hint
+over the fork, destroying the pointer the next recovery would need. `restore`
+drops any entry it finds before opening, so a hand restore of all three gets the
+same protection.
+
+**Offsets resume above everything the primary served, with a gap.**
+`sqlite_sequence` comes back from the replica, so it resumes above what the
+replica RECEIVED — not above what was ASSIGNED. Rows appended inside the
+replication lag were returned to callers by `append` and never shipped, so
+resuming at the replica's frontier would hand those integers to different data.
+I9 says offsets are never reused; §6 needs files adjacent in offset order rather
+than free of gaps. So 2²⁰ offsets are skipped, and `recovery()` reports which.
+
+**What is not recovered:** rows appended inside the replication lag. They are
+gone, and no mechanism here returns them — that is the RPO the sidecar's
+`sync-interval` sets. Everything below the seal frontier comes back, including
+the sealed-but-unsynced band, because a seal keeps its rows until the archive
+has them.
+
+**Split-brain is not detected.** If the primary is not actually dead you have
+two writers on one archive, and if both replicate, two litestream instances on
+one replica path — the thing litestream is explicit about. Nothing here checks
+it; §13's archive-identity token is what would.
 
 ## Operating it
 
@@ -619,5 +699,5 @@ just demo-tail         # in another terminal: watch it accumulate
 
 A maintainer is not optional. Nothing seals unless something calls `seal_due()` or
 `maintain()`, so a writer running alone accumulates in SQLite indefinitely — durable and
-readable the whole time, but never reaching Parquet. `examples/maintainer.py` is the
+readable the whole time, but never reaching Parquet. `examples/adsb/maintainer.py` is the
 smallest thing that qualifies: one loop, two calls, two intervals.

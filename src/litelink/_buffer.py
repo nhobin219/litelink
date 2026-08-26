@@ -15,11 +15,11 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from litelink._config import LogConfig
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
-
-    from litelink.log import LogConfig
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import column_type
@@ -688,10 +688,23 @@ class Buffer:
             # commits. Nothing downstream can detect it: the row counts match,
             # the ranges look contiguous, and the payloads are simply attached
             # to the wrong offsets.
-            if self._con.execute("SELECT 1 FROM buffer LIMIT 1").fetchone():
+            # The hazard is DOWNWARD only, and this used to refuse any
+            # non-empty buffer. Raising the sequence past the rows present is
+            # safe — SQLite assigns `max(max(rowid), seq) + 1` either way — and
+            # it is what a restore needs: reserving an offset range (§3a) has
+            # to work on a buffer holding the recovered tail, which is exactly
+            # a buffer with rows in it.
+            #
+            # Narrowed rather than bypassed. A second writer of this sequence
+            # would be a second place to get the direction wrong, and the
+            # direction is the whole of the danger.
+            highest = self._con.execute(
+                'SELECT max("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+            if highest is not None and first - 1 < highest:
                 msg = (
-                    "cannot seed offsets on a buffer that already holds rows: "
-                    "SQLite ignores a sequence lowered past them"
+                    f"cannot seed offsets to {first} on a buffer holding rows up "
+                    f"to {highest}: SQLite ignores a sequence lowered past them"
                 )
                 raise ValueError(msg)
 
@@ -720,9 +733,27 @@ class Buffer:
 
         return 0 if row is None else int(row[0])
 
-    def rows_below(self, end: int) -> pa.Table:
-        """Buffered rows with `offset < end`, as Arrow. The seal's input."""
-        return self._rows("< ?", (end,))
+    def rows_between(self, start: int, end: int) -> pa.Table:
+        """Buffered rows in `[start, end)`, as Arrow. The seal's input.
+
+        **Bounded at BOTH ends, and the lower one is load-bearing.** A seal used
+        to be able to take everything below its cut, because `finish_seal`
+        deleted those rows immediately: the buffer's minimum was always the next
+        group's start. Once the delete is deferred until the archive holds the
+        range (§3a), that stops being true — and an unbounded read then writes
+        every row from the archive frontier upward into the new file.
+
+        Nothing catches that at seal time. The local `register` passes no `lo`,
+        so `_refuse_straddle` returns early; what fails is later and elsewhere.
+        The manifest's own ranges stop being non-overlapping (§4, §6), the local
+        leg of a read is an unfiltered `iceberg_scan` so every overlapped row
+        comes back twice, the next `sync` refuses the straddle for ever, and
+        compaction's row-count verification fails.
+
+        `start` costs nothing to supply: `pending_group` and `pending_seal` both
+        already carry it, and both call sites already unpack it.
+        """
+        return self._rows("BETWEEN ? AND ?", (start, end - 1))
 
     def rows_above(self, boundary: int | None) -> pa.Table:
         """Buffered rows with `offset > boundary`, as Arrow. The read's input.
@@ -913,11 +944,19 @@ class Buffer:
         the one way this library writes an undersized file, and it takes a
         deliberate call to do it.
 
-        With `cutoff`, only if the group's first row landed at or before then.
-        That was `max_age`, which no longer exists; the parameter is kept
-        because the offline archive rewrite needs the same conditional cut.
-
         An empty group is never closed either way; there would be no file.
+        That is asked of the BUFFER, not of `start_offset`, and it used to be
+        asked of neither — a group whose rows had gone set `end_offset` to the
+        max of nothing, reported a rowcount of 1 anyway, and got a second open
+        group inserted behind it. Two open rows is the permanent seal-queue
+        wedge `_seed_group` documents: `close_open_group` closes both at the
+        same end, and `finish_seal` then hits the `rel_path` UNIQUE after the
+        Iceberg commit has already landed.
+
+        Unreachable until `Log.restore` began releasing archived rows out from
+        under a knowingly-stale group (§3a), which is one transaction away from
+        the reseed that fixes it.
+
         Harmless to race — the predicate matches nothing once another caller
         has closed it.
         """
@@ -928,7 +967,9 @@ class Buffer:
         with self._lock:
             if not self._con.execute(
                 "SELECT 1 FROM extent WHERE end_offset IS NULL"
-                " AND rel_path IS NULL AND start_offset IS NOT NULL",
+                " AND rel_path IS NULL AND start_offset IS NOT NULL"
+                " AND EXISTS (SELECT 1 FROM buffer"
+                '             WHERE "litelink_offset" >= extent.start_offset)',
                 (),
             ).fetchone():
                 return False
@@ -938,7 +979,9 @@ class Buffer:
                 "UPDATE extent SET end_offset ="
                 ' (SELECT max("litelink_offset") + 1 FROM buffer)'
                 " WHERE end_offset IS NULL AND rel_path IS NULL"
-                " AND start_offset IS NOT NULL",
+                " AND start_offset IS NOT NULL"
+                " AND EXISTS (SELECT 1 FROM buffer"
+                '             WHERE "litelink_offset" >= extent.start_offset)',
                 (),
             )
             closed = bool(cursor.rowcount)
@@ -971,12 +1014,23 @@ class Buffer:
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
-    def finish_seal(self, end: int, rel_path: str) -> bool:
-        """Delete sealed rows, retire the group, and clear the intent.
+    def finish_seal(self, end: int, rel_path: str, *, discard: bool = True) -> bool:
+        """Retire the group, clear the intent, and drop the sealed rows.
 
         Garbage collection, not correctness: the read boundary in §7 already
         excludes these rows the moment the Iceberg commit lands, so the window
         between that commit and this call is safe in both directions.
+
+        **`discard=False` keeps them, and that is I4 one tier up.** A seal moves
+        rows from SQLite into a Parquet file that no sidecar replicates, so
+        with WAL shipping on, deleting here removes the only off-box copy of a
+        range the archive does not have yet — and the machine dying in that
+        window loses them, silently, from the middle of the offset space
+        (§3a). The caller passes False when replication is on and something is
+        owed to an archive; `release_archived` is what removes them afterwards.
+
+        Only the CALLER can decide that, which is why it is a parameter rather
+        than a check here: this object knows nothing about archives.
 
         Returns whether this caller's claim was the live one. False means it
         was superseded while it worked, and finishing belongs to whoever holds
@@ -999,7 +1053,11 @@ class Buffer:
             if not cursor.rowcount:
                 return False
 
-            self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
+            if discard:
+                self._con.execute(
+                    'DELETE FROM buffer WHERE "litelink_offset" < ?', (end,)
+                )
+
             # NAMED, not deleted. The row is the same fact before and after —
             # this range, these bytes — and sealing only settles where it
             # lives. Deleting it and writing the size to a second table was
@@ -1390,15 +1448,11 @@ class Buffer:
         """
         raw = self.get_meta(CONFIG_KEY)
         if raw is None:
-            from litelink.log import LogConfig
-
             return LogConfig()
 
         cached = self._config_cache
         if cached is not None and cached[0] == raw:
             return cached[1]
-
-        from litelink.log import LogConfig
 
         try:
             parsed = LogConfig.from_json(raw)
@@ -1579,6 +1633,135 @@ class Buffer:
             # The extent goes with the file. It described where those rows
             # live, and they no longer live anywhere by that name.
             self._con.execute("DELETE FROM extent WHERE rel_path = ?", (rel_path,))
+
+    def strip_local_state(self, reserve: int) -> tuple[int, int]:
+        """Drop everything that describes the machine this came FROM (§3a).
+
+        A restored `buffer.db` is a faithful copy of a database that belonged
+        to a box which no longer exists, and some of what it says is about that
+        box rather than about the log. Returns `(released, next_offset)`.
+
+        - **`extent` rows naming LOCAL files** go. They name Parquet on the
+          machine that died, so `file_bytes` — and through it `memory`, which
+          sizes merges — would describe files nothing can open. Rows naming
+          ARCHIVE copies stay: that is the coverage I4 acts on, and it is still
+          true.
+
+          Narrower than it first looks, and worth saying so: compaction decides
+          what to merge from the Iceberg table's `data_files`, not from these
+          rows, and that table is rebuilt empty. So a stale row cannot make a
+          merge reach for a missing file. What it can do is make this database
+          describe a filesystem that does not exist, which is the thing every
+          other path here is arranged to prevent.
+        - **The open group** goes with them, and `_seed_group` reruns. Without
+          this the recovered band is orphaned — its own rows have just been
+          dropped as local, and `_seed_group` returns early whenever an open
+          group exists, which a restored buffer always has because `_cut`
+          inserts one after every cut. The surviving row starts at the dead
+          box's UNSEALED floor, above the band, so the band would fall into no
+          leg of a read and be lost at the first seal after recovery.
+        - **`pending_delete` rows naming local files** go; REMOTE ones stay,
+          and that half is required. `rewrite_archive` is the only thing that
+          queues a remote entry, and this design refuses directory listing, so
+          dropping them leaks archive objects nothing can ever find again.
+        - **`claim` rows** go. They carry the dead box's owners and a future
+          expiry, so keeping them makes this one wait out a TTL for processes
+          that do not exist.
+        - **`sealing` GOES**, and this was wrong in an earlier draft. The
+          reasoning was that `_recover_seal` finds the rebuilt table empty and
+          rewrites the interrupted file, recovering data. It does — and then
+          duplicates it. The closed-but-unsealed `extent` row that seal
+          belonged to is deleted above, so `finish_seal`'s naming UPDATE
+          (keyed `end_offset = ? AND rel_path IS NULL`) matches nothing and
+          returns True anyway, while the fresh open group still spans the
+          range. With `discard=False` the rows are still buffered, so the next
+          cut writes them a second time. Measured: 490 rows read where 440 are
+          distinct, from two overlapping local files, with no error anywhere.
+
+          Recovery is redundant here rather than protective. Every row that
+          seal was writing is still in the buffer, and the open group
+          `_seed_group` builds covers them — so dropping the claim re-seals
+          them exactly once.
+
+        - **`compacting` stays.** It only queues deletions, and its outputs
+          are archive objects this machine never wrote.
+
+        Finally the offset sequence is raised by `reserve`. See `Log.restore`.
+        """
+        with self._transaction():
+            self._con.execute(
+                "DELETE FROM extent WHERE rel_path IS NULL OR rel_path NOT LIKE '%://%'"
+            )
+            self._con.execute(
+                "DELETE FROM pending_delete WHERE rel_path NOT LIKE '%://%'"
+            )
+            self._con.execute("DELETE FROM claim")
+            self._con.execute("DELETE FROM sealing")
+            released = self._con.execute("SELECT count(*) FROM buffer").fetchone()[0]
+            highest = self._con.execute(
+                'SELECT max("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+            seq = self._con.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone()
+            ceiling = max(int(seq[0]) if seq else 0, int(highest or 0)) + reserve
+            self._con.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
+                (ceiling,),
+            )
+            if not self._con.execute(
+                "SELECT 1 FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone():
+                self._con.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
+                    (ceiling,),
+                )
+
+        self._seed_group()
+
+        return int(released), ceiling + 1
+
+    def reseed_group(self) -> None:
+        """Rebuild the open group from what is buffered NOW.
+
+        `_seed_group` returns early whenever an open group exists, which is
+        what keeps it idempotent at open — so re-running it after rows have
+        left the buffer changes nothing. This drops the stale row first.
+
+        For the restore path, where the group was seeded from a replica's view
+        of the archive and the archive has since moved on: see `Log.restore`.
+        """
+        with self._transaction():
+            self._con.execute(
+                "DELETE FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+            )
+
+        self._seed_group()
+
+    def release_archived(self, boundary: int) -> int:
+        """Drop buffer rows the archive now holds. Returns how many.
+
+        The other half of `finish_seal(discard=False)`: those rows stayed
+        because the archive did not have them yet, and this is what notices
+        that it does.
+
+        Bounded by the ARCHIVE's frontier, never by the seal's. That is the
+        whole point — the seal moves rows to a file nothing replicates, and
+        only the archive makes them safe off-box.
+
+        Idempotent, and it has to be. Driven from the archive's own extent at
+        the start of a pass rather than from the tail of a push, because a push
+        has three early returns before its watermark: a crash between the
+        register and this call would otherwise leave the rows held, and the
+        next pass — finding nothing left to push — would return before reaching
+        it. On a log that has gone quiet, for ever.
+        """
+        with self._lock, self._con:
+            cursor = self._con.execute(
+                'DELETE FROM buffer WHERE "litelink_offset" <= ?', (boundary,)
+            )
+
+        return cursor.rowcount
 
     def queued_deletions(self) -> list[str]:
         with self._lock:

@@ -154,7 +154,7 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
         end = extent[1] + 1
         rel_path = log._layout.seal_path(1, end, "tok")
         log._buffer.claim_seal(1, end, rel_path)
-        log._write_and_commit(end, rel_path)
+        log._write_and_commit(1, end, rel_path)
         # deliberately NOT finish_seal: this is the crash window
         assert log._buffer.extent() is not None
         assert len(read_all(log)) == 4
@@ -347,7 +347,7 @@ def test_readonly_will_not_create_a_log(tmp_path: Path) -> None:
 
 
 def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
-    """The shape examples/capture.py uses (§1: one process, threads within it).
+    """The shape examples/adsb/capture.py uses (§1: one process, threads within it).
 
     Python's sqlite3 defaults to check_same_thread=True, so without the
     connection flag and the lock, every background maintain() raises and the

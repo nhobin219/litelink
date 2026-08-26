@@ -10,6 +10,10 @@ three tiers that only means anything when one of them is genuinely remote.
 
 from __future__ import annotations
 
+import os
+import shutil
+import sqlite3
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,12 +22,19 @@ import pyarrow as pa
 import pytest
 
 from litelink import Log, LogConfig
+from litelink._archive import Archive
 from litelink._buffer import Buffer
-from litelink._layout import Layout
+from litelink._layout import NAMESPACE, Layout
 from litelink._maintenance import Maintenance
+from litelink._read import load_extension, secret_sql
 from litelink._s3 import S3Options
-from litelink._table import LogTable, _recorded_location
-from litelink.log import OFFSET, table_schema
+from litelink._table import (
+    VERSION_HINT,
+    LogTable,
+    _recorded_location,
+    forget_archive_entry,
+)
+from litelink.log import OFFSET, RESTORE_RESERVE, table_schema
 from tests.conftest import filesystem
 
 pytestmark = pytest.mark.s3
@@ -1600,17 +1611,115 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
         )
 
 
-def test_re_pointing_leaves_the_old_archive_unreadable(
+def test_the_published_hint_names_the_metadata_the_commit_produced(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The documented cost of a re-point, pinned so it stays documented.
+    """The hint has to name the metadata the table is actually at.
 
-    Rows already evicted into the old archive stay there, and the read path
-    resolves only the archive the log currently names — so they are not
-    readable through this log, silently. And pointing back does not undo it,
-    because re-attaching to an archive that already holds data is not
-    expressible (§13): the repair drops the catalog entry and creates a fresh,
-    empty table over the objects still sitting in the bucket.
+    Asserted against the pointer directly, which is why this sits beside the
+    re-attach test rather than inside it: a round trip through `set_archive`
+    recovers a hint that is one version stale often enough to pass, because the
+    missing snapshot's rows may still be in the local tier.
+
+    It does NOT pin publish-after-reload. That was the intent, and falsifying
+    it showed the ordering is not observable: pyiceberg updates the handle in
+    place when a commit lands, so publishing before `_commit`'s reload writes
+    the same hint. The claim the code makes has been narrowed to match.
+    """
+    where = f"s3://{bucket}/hinted"
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2),
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend(rows(400))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        archive = log._archive.require()  # noqa: SLF001
+        archive.reload()
+        current = str(archive.metadata_location)
+
+    fs = filesystem(s3)
+    published = fs.cat(f"{bucket}/hinted/{NAMESPACE}/s/metadata/{VERSION_HINT}")
+
+    assert current.endswith(f"/{published.decode().strip()}.metadata.json"), (
+        f"hint {published!r} does not name {current!r}"
+    )
+
+
+def test_the_archive_reads_as_a_directory_with_no_catalog_at_all(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """What the hint buys beyond re-attach: an archive nothing local can read.
+
+    litelink resolves the archive through `archive.db` and hands DuckDB a
+    metadata path (§7). This is the other reader — an engine pointed at the
+    prefix, with no catalog, no local root, and nothing but the bucket.
+
+    **`version_name_format` is required, and that is the documented cost.**
+    DuckDB's default is the Hadoop `v%s%s.metadata.json`; pyiceberg names its
+    metadata `00003-<uuid>.metadata.json`, so the hint holds that stem and the
+    format has to stop prepending a `v`. Writing a second copy under the
+    Hadoop name would remove the parameter and add an object per commit that
+    nothing collects — see `VERSION_HINT`.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    where = f"s3://{bucket}/standalone"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        local_rows=200,
+    )
+    with Log.new(
+        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        for _ in range(4):
+            log.extend(rows(400))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        archived = log.archived_through()
+
+    assert archived > 0, "nothing reached the archive to read back"
+
+    connection = duckdb.connect()
+    load_extension(connection, "iceberg", remote=False)
+    load_extension(connection, "httpfs", remote=True)
+    connection.execute(secret_sql(s3))
+    directory = f"{where}/{NAMESPACE}/s"
+    rows_read = connection.execute(
+        f"SELECT count(*) FROM iceberg_scan('{directory}',"
+        " version_name_format = '%s%s.metadata.json')"
+    ).fetchone()
+
+    assert rows_read is not None
+    assert rows_read[0] == archived
+
+
+def test_pointing_back_at_an_archive_restores_everything_it_held(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A re-point costs reach, not data — and pointing back gets it back.
+
+    Both halves matter and they are different claims. While pointed elsewhere,
+    rows evicted into the old archive are out of reach: the read path resolves
+    exactly one archive, so `scan(include_archive=True)` returns fewer rows
+    than were written, silently. That has not changed.
+
+    What has is the way back. This test asserted the opposite until the archive
+    began publishing `version-hint.text` beside its metadata — before that, the
+    local catalog row was the only thing naming the archive's current metadata,
+    and re-pointing drops it, so returning built an EMPTY table over objects
+    still sitting in the bucket. Now the bucket says where its own metadata is,
+    and `open_archive` registers from that instead of creating.
     """
     config = replace(
         LogConfig(),
@@ -1646,15 +1755,19 @@ def test_re_pointing_leaves_the_old_archive_unreadable(
 
         assert moved < written, "expected the evicted history to be out of reach"
 
-        # And pointing BACK does not undo it: re-attaching to an archive that
-        # already holds data is not expressible (§13), so the repair creates an
-        # empty table over the objects still sitting there. The first draft of
-        # this test asserted the opposite, and the docstring said so too.
+        # ALL of them, not merely more than `moved`. Adopting the archive has
+        # to hand back the extent it actually holds; a partial recovery would
+        # mean registering a metadata JSON older than the last commit, which is
+        # the failure mode a remembered-at-open pointer would have had and this
+        # one must not.
         log.set_archive(first)
 
-        assert log.scan(include_archive=True).read_all().num_rows < written, (
-            "re-attaching to a populated archive is documented as unsupported"
-        )
+        assert log.scan(include_archive=True).read_all().num_rows == written
+
+        # And it is genuinely the old table, not a new one that happens to
+        # read: an empty table created over the objects would show no files at
+        # all while the union still answered from the local tier.
+        assert log.archive_files() > 0
 
 
 def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
@@ -2070,3 +2183,955 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
             "superseded archive files are still due against a stamp from "
             f"before the commit that superseded them: {overdue}"
         )
+
+
+def test_replication_holds_sealed_rows_until_the_archive_has_them(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """§3a's middle hole, closed. I4 one tier up.
+
+    A seal moves rows from SQLite into a Parquet file that no sidecar
+    replicates, so with WAL shipping on, dropping them at seal removes the only
+    off-box copy of a range the archive does not hold yet. The machine dying in
+    that window loses them from the MIDDLE of the offset space: below the seal
+    frontier so the buffer no longer has them, above the archive frontier so
+    the bucket does not either.
+
+    So they stay until sync has pushed the range, and only then go.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/held",
+        s3=s3,
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+
+        sealed = log.table_extent()
+
+        assert sealed is not None, "nothing sealed, so the case is not set up"
+        # The buffer's FLOOR is the measure, not its size: `count_above(0)`
+        # counts the unsealed tail too, which is in the buffer either way.
+        buffered = log._buffer.extent()  # noqa: SLF001
+
+        assert buffered is not None
+        assert buffered[0] <= sealed[1], (
+            "the seal dropped rows the archive does not have yet"
+        )
+        # And a read is unaffected, which is what makes holding them affordable:
+        # the buffer leg is bounded by the local table's committed extent.
+        assert log.scan().read_all().num_rows == 1200
+
+        log.maintain()
+        log.sync()
+        archived = log.archived_through()
+
+        assert archived > 0, "nothing reached the archive"
+        # Released only up to the ARCHIVE's frontier, never the seal's.
+        released = log._buffer.extent()  # noqa: SLF001
+
+        assert released is not None
+        assert released[0] > archived, "rows the archive holds were never released"
+        assert log.scan(include_archive=True).read_all().num_rows == 1200
+
+
+def test_without_replication_a_seal_still_drops_its_rows(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """An archive alone is not the trigger.
+
+    Without a sidecar the buffer and the Parquet share a disk and die together,
+    so holding buys nothing and costs SQLite growth on every seal. The gate is
+    `wal_replication`, and this is the half that proves an archive by itself
+    does not flip it.
+    """
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/unheld",
+        s3=s3,
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+
+        sealed = log.table_extent()
+
+        assert sealed is not None
+        buffered = log._buffer.extent()  # noqa: SLF001
+        # Either the buffer is empty, or what is in it is strictly the unsealed
+        # tail — never a row the seal already wrote to Parquet.
+        assert buffered is None or buffered[0] > sealed[1], (
+            "rows were held with no sidecar to replicate them"
+        )
+
+
+def test_a_held_seal_does_not_widen_the_next_file(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The defect deferring the delete introduces, if the seal is not bounded.
+
+    The seal's read used to be unbounded below. It was correct only because the
+    delete made a floor: after `finish_seal`, the buffer's minimum WAS the next
+    group's start. Hold the rows and that stops being true, so an unbounded
+    read sweeps every earlier row into the next file.
+
+    Nothing catches it at seal time — the local `register` passes no `lo`, so
+    `_refuse_straddle` returns early. It surfaces later and elsewhere: manifest
+    ranges stop being non-overlapping, the local leg is an unfiltered
+    `iceberg_scan` so the overlap is returned twice, and the next sync refuses
+    the straddle for ever.
+
+    So this asserts the FILES, not the row count — a total can be right while
+    the ranges overlap.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=1 << 30,  # never merge, so the seal cuts stand
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/widen",
+        s3=s3,
+    ) as log:
+        for _ in range(3):
+            log.extend(rows(600))
+            log.seal_due()
+
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)  # noqa: SLF001
+
+        assert len(files) > 2, "not enough seals to have a second one to widen"
+        # Contiguous and non-overlapping (§4, §6). A widened file starts at the
+        # log's floor instead of its own group's, so every later file overlaps
+        # every earlier one.
+        for earlier, later in zip(files, files[1:], strict=False):
+            assert later.lo == earlier.hi + 1, (
+                f"{later.lo} does not follow {earlier.hi}: ranges overlap"
+            )
+
+        # And the read agrees, which is what the overlap would break.
+        assert log.scan().read_all().num_rows == 1800
+        assert log.scan().read_all().column(OFFSET).to_pylist() == list(range(1, 1801))
+
+
+def test_the_archive_declares_the_same_sort_order_as_the_log(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """§4: the order is declared as table metadata, on BOTH tiers.
+
+    `open_archive` never declared one, so an archive holding clustered data
+    said nothing about it — a table lying about itself to any reader that is
+    not this library, and the reason `sort_by` was unanswerable from the
+    archive alone.
+    """
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/sorted",
+        s3=s3,
+    ) as log:
+        log.extend(scrambled(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        archive = log._archive.require()  # noqa: SLF001
+
+        assert archive.sort_by() == ("event_ts",), (
+            "the archive holds clustered data and declares no order"
+        )
+        # And it still holds the rows, so declaring the order did not disturb
+        # the create/publish sequence around it.
+        assert log.archived_through() > 0
+
+
+def test_attaching_an_archive_that_is_ahead_of_the_log_is_refused(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The obvious failover attempt, which wedges the log silently.
+
+    `Log.new` on a second box then `set_archive` at the old prefix: `sync`
+    computes its floor from the archive's extent, every local file sits below
+    it, so nothing is ever pushed. The watermark is still written, eviction's
+    I4 clamp finds no `extent` rows and pins at zero, and local disk grows
+    without bound while `sync()` returns success having uploaded nothing.
+    """
+    where = f"s3://{bucket}/ahead"
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    # A populated archive: this is the log that legitimately owns it.
+    with Log.new(
+        tmp_path / "first", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as owner:
+        owner.extend(rows(1200))
+        owner.seal_due()
+        owner.maintain()
+        owner.sync()
+
+        assert owner.archived_through() > 0
+
+    # A fresh log elsewhere, appending from offset 1, pointed at that archive.
+    with Log.new(
+        tmp_path / "second", "s", schema=SCHEMA, config=config, s3=s3
+    ) as fresh:
+        fresh.extend(rows(10))
+
+        with pytest.raises(ValueError, match="another log's history"):
+            fresh.set_archive(where)
+
+        assert fresh.archive is None, "the log was re-pointed despite the refusal"
+
+
+def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The guard must not fail closed.
+
+    `_repoint` deliberately tolerates an archive that does not exist yet —
+    configuring one is a statement of intent, not a claim that the bucket is
+    there — and `set_archive` runs on every writer restart. A check that
+    raised on an unreadable prefix would turn a routine restart into a coin
+    toss against object storage.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
+        log.extend(rows(10))
+        log.set_archive(f"s3://{bucket}/never-written-to")
+
+        assert log.archive == f"s3://{bucket}/never-written-to"
+
+
+def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The guard reads the network in TWO steps, and either can fail.
+
+    An unreachable endpoint is already absorbed — `_published_location`
+    swallows and answers None — so this exercises the other half: a hint that
+    IS readable, naming metadata that is not. The guard has to treat that as
+    "cannot tell" rather than "refuse", because `set_archive` runs on every
+    writer restart and configuring an archive is a statement of intent. A real
+    problem there surfaces loudly at the first `sync`, which is where it can
+    be acted on.
+    """
+    prefix = f"s3://{bucket}/corrupt"
+    fs = filesystem(s3)
+    hint = f"{bucket}/corrupt/{NAMESPACE}/s/metadata/{VERSION_HINT}"
+    fs.pipe(hint, b"00042-does-not-exist")
+
+    with Log.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
+        log.extend(rows(10))
+        log.set_archive(prefix)
+
+        assert log.archive == prefix
+
+
+@pytest.mark.slow
+def test_a_log_is_recovered_onto_another_machine(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """§3a failover, end to end, against the real sidecar.
+
+    The procedure this replaces — restore the databases and open — does not
+    work: `catalog.db` records ABSOLUTE paths to local Iceberg metadata that no
+    sidecar ships, so a restored catalog names files on a machine that is gone.
+    That failure is asserted first, so this test says what it fixes.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/failover"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        # More on top, sealed but never synced: the band that used to be lost.
+        log.extend(rows(400))
+        log.seal_due()
+        archived = log.archived_through()
+        replicated = log.end_offset() - 1
+        served = log.scan(include_archive=True).read_all().num_rows
+
+        assert archived < replicated, "nothing left unsynced, so the band is untested"
+
+        replication = log.write_replication_config()
+
+    # Ship it. `-config` names all three databases; only the buffer is restored.
+    environment = dict(os.environ)
+    resolved = s3.resolved()
+    if resolved.access_key and resolved.secret_key:
+        environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
+        environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
+
+    subprocess.run(  # noqa: S603
+        [str(binary), "replicate", "-config", str(replication), "-exec", "sleep 3"],
+        check=True,
+        env=environment,
+        capture_output=True,
+        timeout=120,
+    )
+
+    # AFTER the sidecar stops: rows the primary served and never shipped. This
+    # is hole B, and it is what makes the offset reserve necessary rather than
+    # decorative — without these the replica's frontier equals the primary's
+    # and no reuse is possible to detect.
+    with Log.open(primary, "s", s3=s3) as log:
+        log.extend(rows(50))
+        written = log.end_offset() - 1
+
+    assert written > replicated, "the unreplicated tail did not happen"
+
+    # The machine dies.
+    second = tmp_path / "second"
+
+    with Log.restore(second, "s", archive=where, s3=s3, binary=str(binary)) as revived:
+        report = revived.recovery()
+
+        assert report is not None
+        # Every row is readable again — including the sealed-but-unsynced band,
+        # which survives because a seal keeps its rows until the archive has
+        # them when wal_replication is on.
+        assert revived.scan(include_archive=True).read_all().num_rows == served
+        # The shape came from `meta`, not from the catalog that was not restored.
+        assert revived._sort_by == ("event_ts",)  # noqa: SLF001
+        assert revived.config.target_seal_size == 8 * 1024
+        # And it resumes ABOVE everything the primary ever assigned, so no
+        # offset the dead machine served is handed to different data.
+        resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
+
+        assert resumed > written, f"reissued offset {resumed}, primary served {written}"
+        assert report.skipped[1] - report.skipped[0] + 1 == RESTORE_RESERVE
+
+        # And it goes on working. `maintain` is where a stale local `extent`
+        # row would surface: compaction reads those rows to decide what to
+        # merge, and they name Parquet that is on the machine that died.
+        revived.seal_due()
+        revived.maintain()
+        revived.sync()
+
+        assert revived.scan(include_archive=True).read_all().num_rows == served + 1
+
+        # And this database describes a filesystem that exists. Every local
+        # path it names is a file that is here — the dead machine's are gone.
+        for path in revived._buffer.file_bytes():  # noqa: SLF001
+            if "://" not in path:
+                assert (second / path).exists(), (
+                    f"names a file that is not here: {path}"
+                )
+
+
+def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The measured 261-vs-1061 case, and the one line that fixes it.
+
+    `open_archive` consults `version-hint.text` only when the catalog has NO
+    row for the table. With a stale row present it calls `load_table` on
+    whatever that names — and old metadata JSONs survive in the bucket until
+    expiry, so the load SUCCEEDS and reports the archive as it was several
+    syncs ago. Silent, and in the losing direction.
+
+    Worse than under-reading: the next sync commits onto that lineage and
+    `publish_pointer` republishes the hint over the fork, destroying the
+    pointer a later recovery depends on.
+
+    Both halves are asserted here — the hazard, so it stays documented, and
+    that `forget_archive_entry` removes it. `Log.restore` calls that before
+    opening, so an operator who restored all three databases by hand gets the
+    same protection as one who did not.
+    """
+    where = f"s3://{bucket}/stale"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+    )
+    root = tmp_path / "log"
+    layout = Layout(root, "s")
+    with Log.new(root, "s", schema=SCHEMA, config=config, archive=where, s3=s3) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        early = log.archive_files()
+
+    # A replica of `archive.db` taken here — the state a WAL restore would
+    # bring back — and then the archive grows past it.
+    stale = tmp_path / "stale-archive.db"
+    shutil.copyfile(layout.archive_db, stale)
+
+    with Log.open(root, "s", s3=s3) as log:
+        for _ in range(3):
+            log.extend(rows(600))
+            log.seal_due()
+            log.maintain()
+            log.sync()
+
+        current = log.archive_files()
+
+    assert current > early, "the archive did not grow, so staleness is untestable"
+
+    # The hazard: the old catalog wins over the bucket's own pointer.
+    shutil.copyfile(stale, layout.archive_db)
+    with Log.open(root, "s", s3=s3) as log:
+        assert log.archive_files() == early, (
+            "expected the stale catalog to be believed; the case has changed"
+        )
+
+    # And the fix, which is what `restore` does before it opens anything.
+    assert forget_archive_entry(layout), "there was no entry to drop"
+
+    with Log.open(root, "s", s3=s3) as log:
+        # A reader may not adopt — that is a write to `archive.db` — so it
+        # still sees nothing until a repairing caller runs.
+        assert log.archive_files() == 0
+        log.sync()
+
+        assert log.archive_files() == current, "adoption did not recover the archive"
+
+
+def test_forgetting_an_archive_entry_that_is_not_there_is_a_no_op(
+    tmp_path: Path,
+) -> None:
+    """A fresh restore has no `archive.db` at all, which is the ordinary case.
+
+    Constructing a `SqlCatalog` to drop one row would create that catalog's own
+    tables as a side effect — a write, from a path whose whole purpose is to
+    leave less behind.
+    """
+    layout = Layout(tmp_path, "s")
+
+    assert forget_archive_entry(layout) is False
+    assert not layout.archive_db.exists(), "it created the database it was checking"
+
+
+def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A restore lands on whatever the replica caught, including a live seal.
+
+    `sealing` is populated for the whole duration of every seal — the Parquet
+    write and the Iceberg commit — so on a busy log a replica reflects one for
+    a real fraction of wall time.
+
+    Keeping that claim through a restore looked protective: `_recover_seal`
+    finds the rebuilt table empty and rewrites the interrupted file. It also
+    duplicates it. The closed-but-unsealed `extent` row is dropped as local, so
+    `finish_seal`'s naming UPDATE matches nothing and reports success anyway,
+    while the fresh open group still spans the range — and with the rows held
+    rather than discarded, the next cut writes them again.
+
+    Asserted on DISTINCT offsets, because the totals are what hid it: the row
+    count is simply higher, and every file looks plausible.
+    """
+    where = f"s3://{bucket}/interrupted"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        # A seal claimed and never finished, exactly as a crash leaves one.
+        log.extend(rows(400))
+        group = log._buffer.pending_group()  # noqa: SLF001
+
+        assert group is not None, "nothing queued, so there is no seal to interrupt"
+
+        start, end = group
+        log._buffer.claim_seal(  # noqa: SLF001
+            start, end, log._layout.seal_path(start, end, "tok")
+        )
+        written = log.end_offset() - 1
+
+    # A restore of that database, by hand — the state a replica would carry.
+    second = tmp_path / "second"
+    (second / "s").mkdir(parents=True)
+    source = sqlite3.connect(Layout(primary, "s").buffer_db)
+    copy = sqlite3.connect(Layout(second, "s").buffer_db)
+    source.backup(copy)
+    source.close()
+    copy.close()
+
+    buffer = Buffer.open(Layout(second, "s").buffer_db, SCHEMA)
+    try:
+        buffer.strip_local_state(1 << 20)
+    finally:
+        buffer.close()
+
+    LogTable.create(Layout(second, "s"), table_schema(SCHEMA), ())
+    with Log.open(second, "s", s3=s3) as revived:
+        revived._archive.table(repair=True)  # noqa: SLF001
+        # `seal()`, not `seal_due()`. The recovered group is OPEN — `_seed_group`
+        # builds it, and the appender never cut it — so `seal_due` drains
+        # nothing and the overlap never materialises. Closing it is what the
+        # next real seal on that box would do.
+        revived.seal()
+        revived.maintain()
+
+        offsets = revived.scan(include_archive=True).read_all().column(OFFSET)
+
+        assert len(offsets) == len(set(offsets.to_pylist())), (
+            "the interrupted seal was replayed on top of the recovered group"
+        )
+        assert len(offsets) <= written
+
+
+def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The crash window §3a exists for, on the recovery path rather than the
+    ordinary one.
+
+    `_recover_seal` has two exits. The one that finds the file already
+    committed retired the group with the default `discard=True`, so it deleted
+    rows the archive had not taken — the only off-box copy — while the sibling
+    exit eighteen lines below passed the flag correctly.
+    """
+    where = f"s3://{bucket}/recovered"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(600))
+        group = log._buffer.pending_group()  # noqa: SLF001
+
+        assert group is not None
+
+        start, end = group
+        rel_path = log._layout.seal_path(start, end, "tok")
+        log._buffer.claim_seal(start, end, rel_path)  # noqa: SLF001
+        # Committed, not retired: the crash lands between the two.
+        log._write_and_commit(start, end, rel_path)
+
+        held = log._buffer.count_above(0)  # noqa: SLF001
+
+        assert held > 0
+
+        log.recover()
+
+        assert log._buffer.count_above(0) == held, (  # noqa: SLF001
+            "recovery deleted rows the archive has not been sent"
+        )
+
+
+def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A populated archive this log never pushed to belongs to another log.
+
+    Offsets cannot tell them apart — two logs of the same name both start at 1,
+    so a foreign archive whose ranges sit BELOW this log's next offset passes
+    the "is it ahead of us" check. What tells them apart is that a log which
+    pushed to an archive keeps its `extent` rows naming that prefix across a
+    detach (§4a).
+
+    Refused at the door rather than contained afterwards, and two attempts to
+    contain it are why. `_push` raises the watermark to the archive's extent on
+    every pass, and its backfill writes `extent` rows for the archive's ENTIRE
+    manifest within one sync — so by the time anything downstream looks, the
+    foreign archive's ranges ARE this log's records. Measured: a bound derived
+    from either moved with the contamination.
+
+    Both entry points, because either can be the one that points the log —
+    `Log.new(archive=...)` is exactly what an operator reaches for when failing
+    over by hand.
+    """
+    foreign = f"s3://{bucket}/foreign"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    # Someone else's log, which fills that prefix.
+    with Log.new(
+        tmp_path / "owner", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
+    ) as owner:
+        owner.extend(rows(1200))
+        owner.seal_due()
+        owner.maintain()
+        owner.sync()
+
+        assert owner.archived_through() > 0, "the foreign archive holds nothing"
+
+    # Creating a log against it — the failover-by-hand shape.
+    with pytest.raises(ValueError, match="no record of pushing"):
+        Log.new(
+            tmp_path / "mine", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
+        )
+
+    assert not (tmp_path / "mine" / "s" / "buffer.db").exists(), (
+        "the refusal left a half-built log behind"
+    )
+
+    # And pointing an existing one at it. Created local-only, so without
+    # `wal_replication` — `validate` refuses that pair, and the archive is
+    # what this is about to try to attach.
+    local_only = replace(config, wal_replication=False)
+    with Log.new(
+        tmp_path / "other", "s", schema=SCHEMA, config=local_only, s3=s3
+    ) as other:
+        other.extend(rows(2000))
+        other.seal_due()
+
+        with pytest.raises(ValueError, match="no record of pushing"):
+            other.set_archive(foreign)
+
+        assert other.archive is None, "the log was pointed despite the refusal"
+
+
+def test_a_restore_from_a_replica_the_archive_has_outrun(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A replica is a snapshot from BEFORE the primary's last sync.
+
+    That is ordinary replication lag, not a crash window: the bucket routinely
+    holds ranges the replicated `extent` rows do not mention. Seeded from the
+    replica alone, the open group starts below the archive's frontier, and the
+    first seal here writes a file reaching into the archive's extent.
+
+    Which wedges the log for good — `_refuse_straddle` raises on every push,
+    `archived_prefix` returns 0 for the straddler so eviction pins at zero, and
+    local disk grows without bound. Nothing re-cuts a local straddler, and this
+    is the operation you run when the archive is the only surviving copy.
+
+    Asserted by DOING the work a revived box does — seal, maintain, sync,
+    repeatedly — rather than by inspecting the group, because the group looks
+    entirely reasonable right up until the push.
+    """
+    where = f"s3://{bucket}/outrun"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        # THE SNAPSHOT, taken here — before the sync below. This is the lag.
+        second = tmp_path / "second"
+        (second / "s").mkdir(parents=True)
+        source = sqlite3.connect(Layout(primary, "s").buffer_db)
+        copy = sqlite3.connect(Layout(second, "s").buffer_db)
+        source.backup(copy)
+        source.close()
+        copy.close()
+
+        # The primary carries on: more rows, sealed and PUSHED. The archive is
+        # now ahead of everything the snapshot knows about.
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        ahead = log.archived_through()
+
+    stale = Buffer.peek_meta(Layout(second, "s").buffer_db, "archive_through")
+
+    assert stale is not None and int(stale) < ahead, (
+        "the archive did not outrun the snapshot, so the case is not set up"
+    )
+
+    # Restored from that snapshot, then worked the way a revived box is.
+    with Log.restore(second, "s", archive=where, s3=s3) as revived:
+        # Checked BEFORE any work: the first seal recycles the open group, so
+        # a stale one is invisible a moment later. Releasing the archived rows
+        # empties this buffer — every row in the snapshot is below the frontier
+        # the archive reached — so a group still naming the replica's start
+        # would be one with no rows behind it.
+        group = revived._buffer._con.execute(  # noqa: SLF001
+            "SELECT start_offset FROM extent"
+            " WHERE end_offset IS NULL AND rel_path IS NULL"
+        ).fetchone()
+
+        assert group is not None, "the log came back with no open group at all"
+        assert (group[0] is None) == (revived.buffered_rows() == 0), (
+            f"open group starts at {group[0]} with "
+            f"{revived.buffered_rows()} rows buffered"
+        )
+
+        for _ in range(3):
+            revived.extend(rows(200))
+            revived.seal_due()
+            revived.maintain()
+            revived.sync()
+
+        assert revived.archived_through() > ahead, (
+            "sync never got past the archive's frontier: the log is wedged"
+        )
+        # And eviction is not pinned at zero by a straddling local file.
+        assert revived.scan(include_archive=True).read_all().num_rows > 0
+
+
+def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Log.restore` has two durable writes; the order between them decides.
+
+    `LogTable.create` is what makes a root openable, and the offset reserve is
+    what makes its offsets safe. With the table first, an interruption between
+    them left a root that `restore` refuses to retry and `Log.open` cheerfully
+    accepts — reporting `recovery() is None`, sequence still at the replica's
+    frontier, handing out offsets the dead primary had already served.
+
+    Reversed, no interruption can produce that: before the reserve there is no
+    table, so the root cannot open at all, and `restore` resumes it.
+    """
+    where = f"s3://{bucket}/interrupted-restore"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        log.extend(rows(300))
+        served = log.end_offset() - 1
+
+    second = tmp_path / "second"
+    (second / "s").mkdir(parents=True)
+    source = sqlite3.connect(Layout(primary, "s").buffer_db)
+    copy = sqlite3.connect(Layout(second, "s").buffer_db)
+    source.backup(copy)
+    source.close()
+    copy.close()
+
+    # THE INTERRUPTION, between the two durable writes. A full disk, SIGKILL,
+    # SQLITE_BUSY — anything raising where the reserve happens.
+    def die(self: Buffer, reserve: int) -> tuple[int, int]:
+        msg = "interrupted"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(Buffer, "strip_local_state", die)
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        Log.restore(second, "s", archive=where, s3=s3)
+
+    monkeypatch.undo()
+
+    # The reserve never ran, so the sequence is still the replica's. With the
+    # table created FIRST this root would open, report `recovery() is None`,
+    # and hand out offsets the primary already served.
+    with pytest.raises(FileNotFoundError):
+        Log.open(second, "s", s3=s3)
+
+    # And the half state is resumable rather than a dead end.
+    with Log.restore(second, "s", archive=where, s3=s3) as revived:
+        resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
+
+        assert resumed > served, (
+            f"reissued offset {resumed}; the primary served through {served}"
+        )
+
+
+def test_a_failed_restore_never_leaves_an_openable_root(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`LogTable.create` is the commit point, and must be the LAST write.
+
+    That table is what makes a root openable. Wherever it sits, an interruption
+    AFTER it leaves a root `restore` refuses to retry — both databases exist —
+    and `Log.open` cheerfully accepts, reporting `recovery() is None`. An
+    earlier ordering put it second and claimed no such state existed; it had
+    one, one write later, and the measured consequence was worse than the
+    offset reuse that ordering was fixing: the open group still at the
+    replica's stale frontier, the first seal straddling the archive's extent,
+    and 712 archived offsets vanishing from every `scan(include_archive=True)`
+    with no error anywhere.
+
+    So the property, rather than any one window: if `restore` raises, nothing
+    can open the root. Asserted for each step that can fail — and a bad minute
+    in object storage is enough to fail the adoption, no crash required.
+    """
+    where = f"s3://{bucket}/failed"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+    def die(*args: object, **kwargs: object) -> object:
+        msg = "a bad minute in object storage"
+        raise RuntimeError(msg)
+
+    # Every step that can fail, INCLUDING the sort-order commit inside
+    # `LogTable.create`. That method is two commits — the catalog row makes the
+    # root openable, the declaration follows — so a failure in the second used
+    # to leave a root refusing to retry while `Log.open` accepted it, telling
+    # the operator to delete a log whose data was intact.
+    for attempt, (target, method) in enumerate(
+        [
+            (Buffer, "strip_local_state"),
+            (Archive, "table"),
+            (Buffer, "reseed_group"),
+            (LogTable, "set_sort_order"),
+        ]
+    ):
+        root = tmp_path / f"try{attempt}"
+        (root / "s").mkdir(parents=True)
+        source = sqlite3.connect(Layout(primary, "s").buffer_db)
+        copy = sqlite3.connect(Layout(root, "s").buffer_db)
+        source.backup(copy)
+        source.close()
+        copy.close()
+
+        with monkeypatch.context() as patched:
+            patched.setattr(target, method, die)
+
+            with pytest.raises(RuntimeError, match="bad minute"):
+                Log.restore(root, "s", archive=where, s3=s3)
+
+        # The root is not a log. Whatever failed, nothing here can be opened
+        # and handed offsets, because the table that would make it openable is
+        # written only once everything else has landed.
+        assert not LogTable.exists_for(Layout(root, "s")), (
+            f"{method} failed and still left an openable root"
+        )
+        with pytest.raises(FileNotFoundError):
+            Log.open(root, "s", s3=s3)
+
+        # And it is resumable rather than a dead end.
+        with Log.restore(root, "s", archive=where, s3=s3) as revived:
+            assert revived.scan(include_archive=True).read_all().num_rows > 0
+
+
+def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`restore`'s rollback must never undo a row it did not create.
+
+    `LogTable.create` is two commits, so a failure in the second drops the
+    catalog row to leave the root unopenable — which is right when this call
+    made the row, and destructive when it did not. `create` raises
+    `TableAlreadyExistsError` on a row that pre-exists, and the blanket
+    `except` then dropped a LIVE log's only pointer to its local files.
+
+    Reachable with `buffer.db` gone and the table present, which the guard at
+    the top cannot catch: it keys on the buffer. Removing the buffer is a
+    plausible answer to that guard's own "Remove it, or restore into another
+    root".
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/live-row"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        readable = log.scan(include_archive=True).read_all().num_rows
+        replication = log.write_replication_config()
+
+    # A replica has to exist, or `restore` fails at the download and never
+    # reaches the create this is about.
+    environment = dict(os.environ)
+    resolved = s3.resolved()
+    if resolved.access_key and resolved.secret_key:
+        environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
+        environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
+
+    subprocess.run(  # noqa: S603
+        [str(binary), "replicate", "-config", str(replication), "-exec", "sleep 3"],
+        check=True,
+        env=environment,
+        capture_output=True,
+        timeout=120,
+    )
+
+    # The buffer removed by hand; the table and its files stay. That is a
+    # plausible answer to the guard's own "Remove it, or restore into another
+    # root", and it walks straight past the guard, which keys on the buffer.
+    Layout(tmp_path, "s").buffer_db.unlink()
+
+    with pytest.raises(Exception, match="already exists"):
+        Log.restore(tmp_path, "s", archive=where, s3=s3, binary=str(binary))
+
+    # The row survives, so the local files are still referenced and the log
+    # still reads. Before this, `Log.open` answered "use new() to create one".
+    assert LogTable.exists_for(Layout(tmp_path, "s"))
+    with Log.open(tmp_path, "s", s3=s3, read_only=True) as reopened:
+        assert reopened.scan(include_archive=True).read_all().num_rows == readable

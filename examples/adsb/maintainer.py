@@ -1,6 +1,6 @@
 """One storage role, one process.
 
-    uv run python examples/maintainer.py --role seal|compact|reclaim|sync|all
+    uv run python examples/adsb/maintainer.py --role seal|compact|reclaim|sync|all
 
 The **writer** appends and does nothing else. Everything else is storage work,
 and this runs one piece of it: sealing the buffer into Parquet, converting
@@ -321,6 +321,24 @@ def _stop(signum: int, frame: object) -> None:
     raise SystemExit(128 + signum)
 
 
+def _litestream() -> str:
+    """The binary to run, pinned build first.
+
+    `just litestream` puts a pinned release in `.bin/`, and a checkout should
+    replicate with the version it pinned rather than whatever the machine
+    happens to carry. That is not fastidiousness: litestream v0.5.0 changed the
+    config format, and `Log.replication_config` writes one shape.
+
+    Resolved against the REPO, not the cwd. This is an example run through
+    `just` from the repo root today, but a `cd` into `examples/` would
+    otherwise silently fall through to PATH — the failure being a different
+    litestream, not a missing one, which is the harder one to see.
+    """
+    pinned = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+
+    return str(pinned) if os.access(pinned, os.X_OK) else "litestream"
+
+
 class Sidecar:
     """Runs litestream alongside this process, and restarts it if it dies.
 
@@ -396,7 +414,7 @@ class Sidecar:
 
         try:
             self._process = subprocess.Popen(  # noqa: S603
-                ["litestream", "replicate", "-config", str(self.config)],  # noqa: S607
+                [_litestream(), "replicate", "-config", str(self.config)],
                 # Die with this process, however it dies. Without it a SIGKILL
                 # here leaves litestream running while the kernel frees the
                 # lock — so a supervisor restarting this service acquires the
@@ -407,8 +425,9 @@ class Sidecar:
             )
         except FileNotFoundError:
             raise SystemExit(
-                "wal_replication is on but litestream is not on PATH — "
-                "see https://litestream.io/install"
+                "wal_replication is on but litestream was not found.\n"
+                "Fetch the pinned build:  just litestream\n"
+                "or install it yourself:  https://litestream.io/install"
             ) from None
 
     def stop(self) -> None:
