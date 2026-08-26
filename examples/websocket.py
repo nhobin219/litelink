@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 import pyarrow as pa
+import websockets
 
 from litelink import Log, LogConfig
 
@@ -63,8 +64,6 @@ def row(trade: dict) -> dict:
 
 
 async def main() -> None:
-    import websockets
-
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("litelink-ws"))
     parser.add_argument("--seconds", type=float, default=30.0)

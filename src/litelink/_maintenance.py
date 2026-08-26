@@ -36,9 +36,9 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from litelink._buffer import Buffer
+    from litelink._config import LogConfig
     from litelink._layout import Layout
     from litelink._table import DataFile, LogTable
-    from litelink.log import LogConfig
 
 
 def checkpoint(heartbeat: Callable[[], bool] | None) -> None:

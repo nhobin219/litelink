@@ -15,11 +15,11 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from litelink._config import LogConfig
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
-
-    from litelink.log import LogConfig
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import column_type
@@ -1436,15 +1436,11 @@ class Buffer:
         """
         raw = self.get_meta(CONFIG_KEY)
         if raw is None:
-            from litelink.log import LogConfig
-
             return LogConfig()
 
         cached = self._config_cache
         if cached is not None and cached[0] == raw:
             return cached[1]
-
-        from litelink.log import LogConfig
 
         try:
             parsed = LogConfig.from_json(raw)

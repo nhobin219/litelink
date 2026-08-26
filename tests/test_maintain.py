@@ -12,9 +12,10 @@ import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
 from litelink._claim import EVERYTHING, Claim, new_owner
+from litelink._config import COMPACT_MULTIPLE
 from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
-from litelink.log import COMPACT_MULTIPLE, Log, LogConfig, validate
+from litelink.log import Log, LogConfig, validate
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
 
