@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -2640,3 +2641,125 @@ def test_forgetting_an_archive_entry_that_is_not_there_is_a_no_op(
 
     assert forget_archive_entry(layout) is False
     assert not layout.archive_db.exists(), "it created the database it was checking"
+
+
+def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A restore lands on whatever the replica caught, including a live seal.
+
+    `sealing` is populated for the whole duration of every seal — the Parquet
+    write and the Iceberg commit — so on a busy log a replica reflects one for
+    a real fraction of wall time.
+
+    Keeping that claim through a restore looked protective: `_recover_seal`
+    finds the rebuilt table empty and rewrites the interrupted file. It also
+    duplicates it. The closed-but-unsealed `extent` row is dropped as local, so
+    `finish_seal`'s naming UPDATE matches nothing and reports success anyway,
+    while the fresh open group still spans the range — and with the rows held
+    rather than discarded, the next cut writes them again.
+
+    Asserted on DISTINCT offsets, because the totals are what hid it: the row
+    count is simply higher, and every file looks plausible.
+    """
+    where = f"s3://{bucket}/interrupted"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        # A seal claimed and never finished, exactly as a crash leaves one.
+        log.extend(rows(400))
+        group = log._buffer.pending_group()  # noqa: SLF001
+
+        assert group is not None, "nothing queued, so there is no seal to interrupt"
+
+        start, end = group
+        log._buffer.claim_seal(  # noqa: SLF001
+            start, end, log._layout.seal_path(start, end, "tok")
+        )
+        written = log.end_offset() - 1
+
+    # A restore of that database, by hand — the state a replica would carry.
+    second = tmp_path / "second"
+    (second / "s").mkdir(parents=True)
+    source = sqlite3.connect(Layout(primary, "s").buffer_db)
+    copy = sqlite3.connect(Layout(second, "s").buffer_db)
+    source.backup(copy)
+    source.close()
+    copy.close()
+
+    buffer = Buffer.open(Layout(second, "s").buffer_db, SCHEMA)
+    try:
+        buffer.strip_local_state(1 << 20)
+    finally:
+        buffer.close()
+
+    LogTable.create(Layout(second, "s"), table_schema(SCHEMA), ())
+    with Log.open(second, "s", s3=s3) as revived:
+        revived._archive.table(repair=True)  # noqa: SLF001
+        # `seal()`, not `seal_due()`. The recovered group is OPEN — `_seed_group`
+        # builds it, and the appender never cut it — so `seal_due` drains
+        # nothing and the overlap never materialises. Closing it is what the
+        # next real seal on that box would do.
+        revived.seal()
+        revived.maintain()
+
+        offsets = revived.scan(include_archive=True).read_all().column(OFFSET)
+
+        assert len(offsets) == len(set(offsets.to_pylist())), (
+            "the interrupted seal was replayed on top of the recovered group"
+        )
+        assert len(offsets) <= written
+
+
+def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The crash window §3a exists for, on the recovery path rather than the
+    ordinary one.
+
+    `_recover_seal` has two exits. The one that finds the file already
+    committed retired the group with the default `discard=True`, so it deleted
+    rows the archive had not taken — the only off-box copy — while the sibling
+    exit eighteen lines below passed the flag correctly.
+    """
+    where = f"s3://{bucket}/recovered"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(600))
+        group = log._buffer.pending_group()  # noqa: SLF001
+
+        assert group is not None
+
+        start, end = group
+        rel_path = log._layout.seal_path(start, end, "tok")
+        log._buffer.claim_seal(start, end, rel_path)  # noqa: SLF001
+        # Committed, not retired: the crash lands between the two.
+        log._write_and_commit(start, end, rel_path)
+
+        held = log._buffer.count_above(0)  # noqa: SLF001
+
+        assert held > 0
+
+        log.recover()
+
+        assert log._buffer.count_above(0) == held, (  # noqa: SLF001
+            "recovery deleted rows the archive has not been sent"
+        )

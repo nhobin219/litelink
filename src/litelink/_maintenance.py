@@ -895,11 +895,27 @@ class Maintenance:
         A file whose size was never recorded counts as full, so an archive
         whose local extents were lost is left alone rather than rewritten on a
         guess about what it holds.
+
+        **A file spanning a gap in the offset space is excluded outright**, and
+        so is everything after it. `_recut` re-appends rows through a scratch
+        buffer seeded at the range's start, so it RENUMBERS them densely — over
+        a gap that hands every row above it an offset belonging to different
+        data. `_recut` asserts against that, so before this exclusion a single
+        gapped file made every later `rewrite_archive` raise: after a failover
+        reserves 2**20 offsets (§3a) the first sealed file spans the hole, and
+        being the archive's first file it was in every candidate run for the
+        life of the log. One un-rewritable file is the honest cost of the
+        reserve; an unusable repair tool is not.
         """
         held = self.memory()
         target = self.config.compact_size
         files = archive.data_files()
         for index, data_file in enumerate(files):
+            if data_file.rows != data_file.hi - data_file.lo + 1:
+                # Gapped. Everything from here on would be re-cut across it,
+                # since a run is contiguous, so the candidate list ends here.
+                return []
+
             if held.get(data_file.path, target) < target:
                 return files[index:]
 
@@ -992,8 +1008,24 @@ class Maintenance:
         # Before the swap, not after. The commit is the point of no return:
         # it deletes the range these rows came from, so a rewrite that lost
         # any of them must fail while the originals are still the live files.
+        # Against the RANGE WIDTH, deliberately, and this is one of the few
+        # places that inference is right rather than a bug. `_recut` re-appends
+        # through `seed_offsets(lo)`, so rows are RENUMBERED sequentially from
+        # `lo` — which reproduces their original offsets only if the range is
+        # dense. Comparing against `sum(f.rows)` instead would let a gapped
+        # range pass and commit every row above the gap under an offset
+        # belonging to different data, which is the corruption I9 exists to
+        # prevent and which nothing downstream could detect.
+        #
+        # So this stays a denseness assertion. What changed is that a gapped
+        # range no longer REACHES it: `_badly_sized` excludes such files, so
+        # a reserved hole (§3a) leaves one file un-rewritable rather than
+        # raising on every rewrite the log ever attempts afterwards.
         if expected != hi - lo + 1:
-            msg = f"archive rewrite read {expected} rows for offsets {lo}-{hi}"
+            msg = (
+                f"archive rewrite read {expected} rows for offsets {lo}-{hi}, "
+                f"which is not a dense range"
+            )
             raise RuntimeError(msg)
 
         # Checked between writing and committing, the same as `_write_merge`

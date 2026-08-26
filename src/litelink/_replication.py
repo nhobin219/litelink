@@ -67,13 +67,24 @@ def snapshot_block(retention: timedelta) -> list[str]:
     Seconds, spelled as a Go duration. litestream parses these with
     `time.ParseDuration`, which takes `21600s` as readily as `6h`, and seconds
     are the one encoding that cannot drift the way a hand-rounded `6h30m` can.
+
+    **Rendered as an integer, never `%g`.** `%g` switches to exponent notation
+    at a million, so a 30-day window emitted `2.592e+06s` and litestream
+    refused the whole file: "cannot unmarshal into time.Duration". The
+    threshold is 11 days 13 hours, which is an ordinary WAL retention, and the
+    failure lands at sidecar start — so the maintainer's restart loop just
+    fails forever with replication off. `%g` bit at the other end too, turning
+    a sub-second retention into `5e-07s`.
     """
     seconds = retention.total_seconds()
 
+    # Floored at a second, so a very short retention cannot render `0s` — an
+    # interval of zero is not "snapshot constantly", it is a value litestream
+    # has no sensible reading of.
     return [
         "    snapshot:",
-        f"      interval: {seconds / 2:g}s",
-        f"      retention: {seconds:g}s",
+        f"      interval: {max(1, round(seconds / 2))}s",
+        f"      retention: {max(1, round(seconds))}s",
     ]
 
 
