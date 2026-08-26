@@ -102,7 +102,6 @@ process per storage role:
 just demo-capture      # append continuously — the hot path, and nothing else
 just demo-maintain     # in another terminal: seal, compact, evict, expire
 just demo-tail         # in a third: watch where the rows are
-just bench --quick     # write and read throughput on your hardware
 ```
 
 To add the archive tier against a local S3-compatible store:
@@ -137,6 +136,18 @@ Then `Log.restore(root, name, archive=...)` rebuilds the log on another box — 
 config from the layout alone, restores `buffer.db`, rebuilds the local table, adopts the
 archive, and reserves an offset window so nothing the dead machine served is reissued.
 Verified against a local S3-compatible store and against AWS. See [`examples/`](examples/).
+
+## Benchmarks
+
+```bash
+just bench             # write and read throughput on this machine
+just bench --quick     # a smaller run
+```
+
+Both print what each number means, not just the number. SPEC §3 and §7 carry figures from a
+2 vCPU box and both say to re-measure on target hardware — this is that measurement.
+[`benchmarks/`](benchmarks/) has the rest, including `just bench-floor`: what litelink costs
+on top of the raw SQLite write it is built on.
 
 ## How it works
 
