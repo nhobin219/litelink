@@ -237,24 +237,41 @@ question.
 
 Optional. Three things to be clear about:
 
-**It covers append→seal only.** Once a seal deletes buffer rows, replication faithfully
-carries the delete; sealed-but-unuploaded Parquet is not its concern. So
+**It covers append→sync, and it used to cover only append→seal.** The difference is a
+hole this paragraph once described as a lag. A seal moves rows out of SQLite and into a
+Parquet file no sidecar replicates, so deleting them at seal removed the only off-box copy
+of a range the archive did not hold yet — and the machine dying in that window lost them
+from the MIDDLE of the offset space: below the seal frontier so the buffer no longer had
+them, above the archive frontier so the bucket did not either.
+
+**So a seal keeps its rows when `wal_replication` is on**, and `sync` drops them once the
+archive holds the range. It is I4 one tier up: never delete the only off-box copy. Reads
+are unaffected — the buffer leg is bounded by the local table's committed extent (§7), so
+held rows never reach the engine — and the cost is that `buffer.db` grows with sync lag,
+which a stalled sync makes unbounded, like a stalled eviction (§11).
+
+The gate is `wal_replication`, not "an archive is configured": with no sidecar the buffer
+and the Parquet share a disk and die together, so holding buys nothing. With neither, a
+seal discards as it always did, because nothing would ever release the rows.
 
 ```
-RPO = max(WAL replication lag, Parquet upload lag)
+RPO = WAL replication lag        (with wal_replication)
+RPO = max(WAL replication lag, Parquet upload lag)   (before this; the hole)
 ```
-
-Adding it is only worth it if uploads are also prompt — which they cheaply can be, since
-they are plain PUTs with no compute.
 
 **It cannot break writes.** It is a sidecar reading the WAL, not something in the write path.
 If it dies, SQLite is unaffected: you lose replication, not data. That is why it does not
 violate the no-network-in-the-write-path property.
 
-**Restore is correct by construction.** A restored buffer may contain rows already sealed
-into the table. No reconciliation is needed, because the read boundary (§7) is derived from
-the table's committed max offset, so those rows fall outside the buffer's contribution
-automatically.
+**A restored buffer holding sealed rows needs no reconciliation.** The read boundary (§7)
+comes from the table's committed max offset, so those rows fall outside the buffer's
+contribution automatically. That is what makes holding them affordable above, and it is
+what made an out-of-date replica safe before it.
+
+It is NOT the same claim as "a restore is correct by construction", which this said until
+a measurement disproved it: `catalog.db` records absolute paths to local Iceberg metadata
+that no sidecar replicates, so restoring the databases onto another machine and opening
+the log fails outright. See §3a's failover notes and `Log.restore`.
 
 ## 4. Seal
 

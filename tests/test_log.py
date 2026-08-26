@@ -154,7 +154,7 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
         end = extent[1] + 1
         rel_path = log._layout.seal_path(1, end, "tok")
         log._buffer.claim_seal(1, end, rel_path)
-        log._write_and_commit(end, rel_path)
+        log._write_and_commit(1, end, rel_path)
         # deliberately NOT finish_seal: this is the crash window
         assert log._buffer.extent() is not None
         assert len(read_all(log)) == 4

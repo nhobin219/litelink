@@ -22,10 +22,14 @@ To restore, per database:
 
     litestream restore -config DIR/litestream.yml -o RESTORED/buffer.db DIR/positions/buffer.db
 
-Restoring is correct by construction: a restored buffer may hold rows already
-sealed into the table, and the read boundary (§7) comes from the table's
-committed extent, so those rows fall outside the buffer's contribution
-automatically. No reconciliation, no dedup pass.
+A restored buffer holding rows already sealed into the table needs no
+reconciliation: the read boundary (§7) comes from the table's committed extent,
+so they fall outside the buffer's contribution automatically.
+
+Restoring onto ANOTHER machine is a different operation and this is not it.
+`catalog.db` records absolute paths to local Iceberg metadata that no sidecar
+replicates, so the restore above works back onto the same paths and fails
+elsewhere. Use `Log.restore` for that.
 """
 
 from __future__ import annotations

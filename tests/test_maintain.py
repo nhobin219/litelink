@@ -376,7 +376,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
         log.extend(rows(3, start=16))
         rel_path = log._layout.seal_path(17, 20, "tok")
         log._buffer.claim_seal(17, 20, rel_path)
-        log._write_and_commit(20, rel_path)
+        log._write_and_commit(17, 20, rel_path)
         assert_nothing_untracked(log)
 
 
