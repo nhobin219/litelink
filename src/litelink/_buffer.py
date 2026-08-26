@@ -89,8 +89,8 @@ class Buffer:
 
         `schema` is the application's columns, without `offset`; `columns` is
         their names, passed rather than derived so this assigns and nothing
-        else. `target_size` is here rather than only on the seal because the
-        cut it describes is made on the append path — see `extent`.
+        else. `target_seal_size` is here rather than only on the seal because
+        the cut it describes is made on the append path — see `extent`.
         """
         self._con = writer
         self._reader = reader
@@ -273,7 +273,7 @@ class Buffer:
               rel_path TEXT PRIMARY KEY, superseded_at INTEGER NOT NULL
             )
         """)
-        # The seal queue, and the reason `target_size` means anything.
+        # The seal queue, and the reason `target_seal_size` means anything.
         #
         # A single running byte counter cannot keep that promise. It says a
         # threshold was crossed, never WHERE — so a sealer that polls one cuts
@@ -387,7 +387,7 @@ class Buffer:
     # Approximate on purpose. SQLite stores an integer in 1-8 bytes and
     # `octet_length` reports its TEXT width, so neither side of this is exact.
     # It is a policy trigger, not an accounting record; being within a few
-    # percent of the true size is what `target_size` actually needs.
+    # percent of the true size is what `target_seal_size` actually needs.
 
     def _seed_group(self) -> None:
         """Ensure exactly one open group, seeded from whatever is buffered.
@@ -567,10 +567,11 @@ class Buffer:
         """Close the group at `offset` and open the next. Once per FILE.
 
         The cut lands on the row that crossed, not at the end of the batch:
-        `target_size` is the library's one promise about file size, and cutting
-        on the batch boundary would make that promise depend on how the caller
-        chose to batch — which §1 says carries no meaning of its own. A batch
-        large enough crosses several times and comes through here each time.
+        `target_seal_size` is the library's one promise about file size, and
+        cutting on the batch boundary would make that promise depend on how the
+        caller chose to batch — which §1 says carries no meaning of its own. A
+        batch large enough crosses several times and comes through here each
+        time.
         """
         self._write_group(cursor, group, end_offset=offset + 1)
         cursor.execute("INSERT INTO extent (bytes) VALUES (0)")
@@ -940,9 +941,9 @@ class Buffer:
         """Cut the open group short so a sealer can pick it up.
 
         Only `seal()` calls this, and cutting short is exactly what "seal now"
-        means — the resulting file is under `target_size` by definition. It is
-        the one way this library writes an undersized file, and it takes a
-        deliberate call to do it.
+        means — the resulting file is under `target_seal_size` by definition.
+        It is the one way this library writes an undersized file, and it takes
+        a deliberate call to do it.
 
         An empty group is never closed either way; there would be no file.
         That is asked of the BUFFER, not of `start_offset`, and it used to be
