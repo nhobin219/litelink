@@ -427,6 +427,23 @@ class LogConfig:
         )
 
 
+def _foreign_archive(archive: str) -> ValueError:
+    """This log has no record of pushing to an archive that already holds data.
+
+    Which makes it another log's. Two logs of the same name both start at
+    offset 1, so the ranges cannot tell them apart — what can is that a log
+    which pushed to an archive keeps its `extent` rows naming that prefix, even
+    across a detach (§4a). No rows, data present: not ours.
+    """
+    return ValueError(
+        f"the archive at {archive!r} holds data this log has no record of pushing, "
+        f"so it belongs to another log. Attaching it would let its contents be read "
+        f"as this log's own, push nothing, and pin eviction — silently. To resume "
+        f"that log here use Log.restore; to start a new one, point at an unused "
+        f"prefix"
+    )
+
+
 def _repointed_mid_push() -> RuntimeError:
     """The log was pointed at another archive while a sync was pushing.
 
@@ -592,6 +609,30 @@ class Log:
         if layout.buffer_db.exists():
             msg = f"a log already exists at {layout.root}/{name} — use open()"
             raise FileExistsError(msg)
+
+        # BEFORE anything is created, so a refusal leaves no half-built log —
+        # which would then block the retry, since `new` refuses an existing
+        # buffer and `restore` does too.
+        #
+        # A fresh log holds no `extent` rows at all, so any archive that
+        # already has data belongs to something else. This is the shape an
+        # operator reaches for when failing over by hand: `Log.new` on the
+        # second box, pointed at the old prefix. Silently, that log pushes
+        # nothing — its offsets are below the archive's — eviction pins, and
+        # the archive's contents read back as its own. `set_archive` refuses
+        # the same thing; both entry points need it, because either can be the
+        # one that points the log.
+        if archive is not None:
+            try:
+                covered = archive_extent(layout, archive, s3 or S3Options())
+            except Exception:
+                # Unreachable or unreadable is "cannot tell", which passes:
+                # configuring an archive is a statement of intent, not a claim
+                # that the bucket is already there.
+                covered = None
+
+            if covered is not None:
+                raise _foreign_archive(archive)
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
@@ -1209,6 +1250,27 @@ class Log:
                 f"silently. To resume that log here, use Log.restore"
             )
             raise ValueError(msg)
+
+        # And it must be an archive this log has SEEN. A populated prefix that
+        # this log holds no `extent` row for is somebody else's, whatever its
+        # offsets look like — and offsets are all a comparison has to go on,
+        # since two logs of the same name both start at 1.
+        #
+        # Attaching one cannot be contained downstream, which two attempts
+        # tried: the watermark is raised to the archive's extent by `confirmed`
+        # on every pass, and this log's own `extent` rows are written for the
+        # archive's ENTIRE manifest by `_push`'s backfill within one sync.
+        # Measured — a bound derived from either moved with the contamination.
+        # The backfill is right to trust the manifest; what it needs is for the
+        # archive to be ours, and §13's identity token is what would prove it.
+        # Until then the check belongs at the moment the log is pointed, before
+        # anything has laundered anything.
+        #
+        # Re-attach passes: ranges pushed to an archive go on naming it after a
+        # detach (§4a), so returning to one finds its own records intact. A
+        # fresh prefix passes too — `covered` is None above.
+        if not self._buffer.archive_records(archive, 0):
+            raise _foreign_archive(archive)
 
     def _repoint(self, archive: str | None) -> None:
         """Record the new location, with the maintenance lease held."""
@@ -2089,20 +2151,15 @@ class Log:
         # held indefinitely. Driven from the frontier instead, it is idempotent
         # and every pass retries it for free.
         if not self._discard_on_seal() and floor:
-            # Bounded by what THIS log recorded the archive taking, not by the
-            # archive's raw extent. `_refuse_archive_ahead` deliberately allows
-            # attaching an archive whose ranges sit below this log's — that is
-            # re-attach, and it is supported — so a prefix belonging to another
-            # log can legitimately report an extent above our own frontier.
-            # Releasing on that alone would delete buffered rows no archive
-            # holds, which with replication on is the only off-box copy.
-            #
-            # `archived_through` is our own record, raised only by a push this
-            # log made. The `min` is what makes a foreign extent unable to
-            # authorise a deletion.
-            self._buffer.release_archived(
-                min(floor, self._maintenance.archived_through())
-            )
+            # The archive's own extent, and that is sound only because
+            # `_refuse_archive_ahead` has already established the archive is
+            # OURS. Two narrower bounds were tried here and neither works: the
+            # watermark is raised to `floor` by `confirmed` below on every
+            # pass, and this log's own `extent` rows are written for the
+            # archive's whole manifest by the backfill within one sync. Both
+            # are downstream of a contamination that has to be stopped at the
+            # point the log is pointed.
+            self._buffer.release_archived(floor)
 
         # The watermark reconciled against the archive itself. It is a cache of
         # what the archive holds — kept for the push floor and for display, and
@@ -2319,16 +2376,17 @@ class Log:
         ):
             raise _repointed_mid_push()
 
-        # Again, now that this push has landed. The release at the top of the
-        # pass reads the extent as it was BEFORE this push, so on its own it
-        # frees rows one whole sync late — safe, since holding is the safe
-        # direction, but a busy log would carry a sync's worth of rows it no
+        # Again, now that this push has landed and its `record_file` rows
+        # exist. The release at the top of the pass ran before them, so on its
+        # own it frees rows one whole sync late — safe, since holding is the
+        # safe direction, but a busy log would carry a sync's worth it no
         # longer needs.
         #
         # This one is the promptness; that one is the correctness. A crash
         # between the register above and this line leaves rows held, and the
-        # next pass frees them from the archive's own extent without needing
-        # anything to have been uploaded. Neither placement alone is both.
+        # next pass frees them from the same rows without needing anything to
+        # have been uploaded. Neither placement alone is both.
+        #
         if not self._discard_on_seal():
             self._buffer.release_archived(last.hi)
 

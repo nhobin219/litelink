@@ -2763,3 +2763,69 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         assert log._buffer.count_above(0) == held, (  # noqa: SLF001
             "recovery deleted rows the archive has not been sent"
         )
+
+
+def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A populated archive this log never pushed to belongs to another log.
+
+    Offsets cannot tell them apart — two logs of the same name both start at 1,
+    so a foreign archive whose ranges sit BELOW this log's next offset passes
+    the "is it ahead of us" check. What tells them apart is that a log which
+    pushed to an archive keeps its `extent` rows naming that prefix across a
+    detach (§4a).
+
+    Refused at the door rather than contained afterwards, and two attempts to
+    contain it are why. `_push` raises the watermark to the archive's extent on
+    every pass, and its backfill writes `extent` rows for the archive's ENTIRE
+    manifest within one sync — so by the time anything downstream looks, the
+    foreign archive's ranges ARE this log's records. Measured: a bound derived
+    from either moved with the contamination.
+
+    Both entry points, because either can be the one that points the log —
+    `Log.new(archive=...)` is exactly what an operator reaches for when failing
+    over by hand.
+    """
+    foreign = f"s3://{bucket}/foreign"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    # Someone else's log, which fills that prefix.
+    with Log.new(
+        tmp_path / "owner", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
+    ) as owner:
+        owner.extend(rows(1200))
+        owner.seal_due()
+        owner.maintain()
+        owner.sync()
+
+        assert owner.archived_through() > 0, "the foreign archive holds nothing"
+
+    # Creating a log against it — the failover-by-hand shape.
+    with pytest.raises(ValueError, match="no record of pushing"):
+        Log.new(
+            tmp_path / "mine", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
+        )
+
+    assert not (tmp_path / "mine" / "s" / "buffer.db").exists(), (
+        "the refusal left a half-built log behind"
+    )
+
+    # And pointing an existing one at it. Created local-only, so without
+    # `wal_replication` — `validate` refuses that pair, and the archive is
+    # what this is about to try to attach.
+    local_only = replace(config, wal_replication=False)
+    with Log.new(
+        tmp_path / "other", "s", schema=SCHEMA, config=local_only, s3=s3
+    ) as other:
+        other.extend(rows(2000))
+        other.seal_due()
+
+        with pytest.raises(ValueError, match="no record of pushing"):
+            other.set_archive(foreign)
+
+        assert other.archive is None, "the log was pointed despite the refusal"
