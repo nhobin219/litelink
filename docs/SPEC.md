@@ -28,7 +28,7 @@ later shrinks the window without touching the archive.
 
 **No hot-path read touches the network.** A hot read is the local Iceberg table plus the
 SQLite buffer, both on local disk. This holds once the machine is provisioned — DuckDB's
-`iceberg` and `sqlite` extensions are downloaded rather than bundled, and the first read on
+`iceberg` and `avro` extensions are downloaded rather than bundled, and the first read on
 a fresh machine fetches them. See §7.
 
 **Everything Iceberg provides is used, not reimplemented** — manifests, per-file column
@@ -76,7 +76,8 @@ The writer assigns `litelink_offset`; Iceberg then computes its min/max as ordin
 statistics, which is what §7 reads.
 
 A bare `INTEGER PRIMARY KEY` is a rowid alias assigned as `max(rowid)+1` — and buffer rows
-are **deleted at every seal**. Once the table empties, the next insert reuses offsets
+are **deleted once something off-box holds them** — at the seal, or at the sync with
+`wal_replication` (§3a). Once the table empties, the next insert reuses offsets
 already committed to Iceberg, silently destroying monotonicity and corrupting every
 boundary read.
 
@@ -142,7 +143,8 @@ Everything else is the application's schema, declared at stream creation and tre
 opaque. Iceberg computes statistics for every column, so all of them prune.
 
 ```python
-litelink.Stream(
+litelink.Log.new(
+    root, name,
     schema=pa.schema([...]),          # the application's columns
     sort_by=("event_ts", "key"),      # names from that schema
 )
@@ -155,7 +157,8 @@ application supplies it.
 
 **Why the library stamps nothing else — in particular not an ingest timestamp.** Nothing in
 the design needs one. Retention is the only time-based operation, and file age comes from
-the Iceberg snapshot's commit timestamp rather than any data column. Sorting is configurable.
+the log's own `extent.named_at` — the moment the file was named — falling back to the
+Iceberg snapshot's commit timestamp, and never from a data column. Sorting is configurable.
 Statistics are automatic.
 
 More importantly, "ingest time" is ambiguous in a way a library cannot resolve: the moment a
@@ -264,6 +267,26 @@ RPO = WAL replication lag        (with wal_replication)
 RPO = max(WAL replication lag, Parquet upload lag)   (before this; the hole)
 ```
 
+**Where a row can be, and which of those places is off the machine.** The
+offset space has two holes in it, and they are different problems:
+
+```
+  [0 .......... archived]  safe — in the archive
+                [archived ...... sealed]  hole A — local Parquet only
+                                  [sealed ... replicated]  safe — in buffer.db
+                                            [replicated ... assigned]  hole B
+```
+
+**Hole A is closed.** It was the band a seal moved out of SQLite into a Parquet
+file no sidecar replicates, above what the archive had taken — so it was on the
+dead machine and nowhere else. Holding those rows until `sync` pushes the range
+removes it.
+
+**Hole B is inherent.** Rows appended inside the replication lag were returned
+to callers by `append` and never shipped. Nothing recovers them; what a restore
+must not do is hand their offsets to different data, which is why it reserves a
+window rather than resuming at the replica's frontier (I9).
+
 **It cannot break writes.** It is a sidecar reading the WAL, not something in the write path.
 If it dies, SQLite is unaffected: you lose replication, not data. That is why it does not
 violate the no-network-in-the-write-path property.
@@ -330,11 +353,16 @@ single-key scan clusters within a timestamp.
 The sort costs one in-memory sort of at most `target_size` rows per seal, and does not
 affect the tier boundaries in §7, which use min/max of `litelink_offset` and are order-independent.
 
-**Step 1 fixes the range before the file exists**, making the path deterministic:
-`{stream}/{date}/{start}-{end}.parquet`. A retry recomputes the identical path and
-overwrites rather than orphaning. Chosen after the write instead, a crash between write and
-commit lets new rows arrive, and the retry seals a wider range while the first file is
-stranded.
+**Step 1 fixes the range before the file exists**, making the path NAMEABLE:
+`{name}/data/{start}-{end}-{token}.parquet`. Chosen after the write instead, a crash
+between write and commit lets new rows arrive, and the retry seals a wider range while the
+first file is stranded.
+
+The token is per ATTEMPT, not per range, so the path is deliberately NOT deterministic — an
+earlier draft made it so, on the reasoning that a retry should overwrite in place. A writer
+stalled past its claim is indistinguishable from one that died, and `pq.write_table`
+truncates on open, so a shared name blends two writers into one file. Recovery mints a new
+token and queues the abandoned name for deletion instead.
 
 **Step 3 is garbage collection, not correctness.** Read consistency comes from the offset
 boundary in §7, so the window between steps 2 and 3 is safe in both directions and needs no
@@ -830,7 +858,7 @@ Step 5 removes files from the local table's current snapshot; the archive is unt
 **A file must never be evicted locally before step 2 has registered it** — the one ordering
 in sync that is correctness, not optimisation (I4).
 
-Sync records what it has registered in `meta`, keyed by the local table's snapshot ID.
+Sync records how far it has registered in `meta`, as one offset under `archive_through`.
 
 **Steps 4 and 5 do not belong to sync.** Snapshot expiry and local eviction are local
 storage work; they are listed here because eviction must respect the registration watermark
@@ -903,7 +931,7 @@ library creates has its path written to SQLite *before* it is written to disk:
 
 | table | names | so that |
 |---|---|---|
-| `sealing` | a seal's output | I2 — a retry overwrites in place |
+| `sealing` | a seal's output | I2 — the path is recorded before the file exists |
 | `compacting` | a compaction's output | a crash mid-write is removable by name |
 | `pending_delete` | superseded files | the grace period outlives the commit that ended them |
 
@@ -1052,8 +1080,15 @@ buffer rows   buffer scan   UNION (1h, all columns)   file size at seal
 **The Iceberg side is nearly free; the buffer is the entire variable cost.** Per row, 180k
 buffer rows cost roughly 40x what 1M Parquet rows do — SQLite is row-oriented, so there is
 no storage-level column pruning and no vectorised read. `ATTACH` and `sqlite_scan` measure
-identically (403 vs 408 ms) and going around DuckDB is slower (`sqlite3.fetchall` 496 ms),
-so there is no cheaper path to the buffer.
+identically (403 vs 408 ms) and a naive trip around DuckDB is slower (`sqlite3.fetchall`
+496 ms).
+
+**There IS a cheaper path, and it is the one shipped.** Reading the tail through the
+library's own connection and handing DuckDB Arrow measures 25.6 ms against the attached
+version's 46.0 ms — because it converts incrementally, re-using what the last scan already
+built. It is also the only safe option: attaching the buffer puts it under two
+independently linked SQLite libraries in one process, which corrupted the database on the
+first concurrent scan. See "Two SQLite libraries in one process".
 
 Below ~20k rows the buffer vanishes into noise and the union floor is the Iceberg leg alone.
 Above it the cost goes superlinear: 1.0 us/row at 20k, 1.9 at 60k, 2.3 at 180k.
@@ -1226,7 +1261,8 @@ Raising it is an operation, not a config change: `hydrate(since=…)` fetches ar
 and re-registers them into the local table. Without it, a raised setting applies only to
 data captured afterwards.
 
-Buffer rows are deleted at seal. There is no SQLite retention knob.
+Buffer rows are deleted once something off-box holds them — at seal, or at sync with
+`wal_replication` (§3a). There is no SQLite retention knob.
 
 ---
 
@@ -1313,7 +1349,7 @@ Each needs a test.
 | # | Invariant | Why |
 |---|---|---|
 | **I1** | The Parquet file is written and fsynced before the Iceberg commit. | The reverse publishes a manifest entry for a file that may not exist. |
-| **I2** | The seal range is persisted before the file is written. | Makes the path deterministic, so retries overwrite instead of orphaning. |
+| **I2** | The seal range and its path are persisted before the file is written. | No file can exist that this database cannot name. |
 | **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The archive overlaps the local window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
 | **I4** | A file is never evicted from the local table while a configured archive still lacks it. Vacuous when no archive is configured (§8). | Eviction before registration is data loss. With no archive nothing is owed, and `local_retention` is then a deletion policy the operator asked for — see §8. |
 | **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
@@ -1336,7 +1372,7 @@ Each needs a test.
 | Crash between Iceberg commit and buffer delete | The boundary has already advanced, so reads stay correct; recovery drops the stale rows. |
 | Network unavailable indefinitely | Capture, seal, compaction and hot reads all continue. Unregistered files accumulate; local eviction stalls (I4). Fails only when local disk fills. |
 | Two sync passes race | The Iceberg catalog commit is atomic; the loser refreshes and retries. |
-| Local disk fills | Backpressure — §13.4. |
+| Local disk fills | Backpressure — §13.3. |
 | Machine lost | Exposure is whatever was unregistered. The archive is intact and independently readable. |
 | Compaction crashes mid-write | No snapshot was committed; the orphaned file is unreferenced and swept. |
 | A second process opens a live log | **Currently unsafe.** Opening runs recovery, and recovery does not know which operations belong to the opener — see below. |
@@ -1383,9 +1419,17 @@ target_seal_size       uncompressed bytes per SEAL        (size it for READ late
 local_retention        local table window, by TIME        (> longest hot lookback, with margin; 0 = evict on upload)
 local_rows             local table window, by ROWS        (floor: keep at least this many recent rows)
 snapshot_retention     snapshot expiry floor              (> longest scan)
-compact_min_files      minimum adjacent files to compact  (e.g. 4)
-sort_by                within-file sort order              (capture default: event_ts, key)
+compact_min_files      minimum adjacent files to compact  (default 4; below 2 is refused —
+                                                          every run would look mergeable)
+wal_replication        ship the WAL with a sidecar        (needs an archive; also decides
+                                                          whether a seal keeps its rows)
+wal_retention          how far back a restore may go      (None = litestream's own default)
 ```
+
+`sort_by` is NOT in here. Everything above governs future work only, so `set_config` needs
+no rewrite; the sort order is a read-shape decision that re-clusters every existing file,
+so it is set at `Log.new` and changed by `set_sort_by`. It lives in `meta` beside the
+schema, not in `LogConfig`.
 
 `maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no
 archive. Each is a no-op or a regression without the others: compaction alone increases
@@ -1456,29 +1500,21 @@ The consequence worth planning for is that local disk holds roughly
    defended interleaving by interleaving, not by construction.** The regime the current
    mechanism is actually sound in is a re-point with every other process stopped.
 
-0. **Per-operation claims, replacing the maintenance lease.** Designed in §4a, **not
-   implemented.** Today `compact`, `evict`, `expire` and `sync` all take one `maintain`
-   lease, so they exclude each other for the whole of their work — including the seconds
-   spent reading Parquet and waiting on S3, none of which touches the catalog. §4a works
-   through what each pair actually needs and concludes that most of it is interval
-   arithmetic on immutable offsets, not mutual exclusion.
+0. ~~**Per-operation claims, replacing the maintenance lease.**~~ **Closed: built.**
+   The `claim(id, owner, expires_at, kind, lo, hi, rel_path)` table exists, every
+   range-owning pass claims before it works with the conflict check and the insert in one
+   `BEGIN IMMEDIATE`, and recovery reclaims expired claims rather than a role's. See §4a
+   and `_claim.py`.
 
-   What it would take: one `claims(id, owner, expires_at, kind, lo, hi, rel_path)` table
-   subsuming `sealing` and `compacting`; every range-owning pass claiming before it works,
-   with the conflict check and the insert in one SQLite transaction; recovery reclaiming
-   expired claims rather than a role's; and the role leases dissolving into per-operation
-   liveness.
+   `sealing` and `compacting` were NOT subsumed, which the original sketch expected. They
+   are intent records — the path written down before the file exists (I2) — and a claim
+   answers a different question, so collapsing them would have made one row mean two
+   things.
 
-   What it buys: compaction concurrent with eviction and with other compactions, and sync
-   no longer blocking compaction on network latency. What it risks: it is surgery on the
-   seal path, I2 and recovery — the three most safety-critical things here — so it wants
-   its own change rather than riding along with a feature.
-
-   The one correctness item it also fixes is in §4a: a merge that begins before the archive
-   watermark moves can include files sync has since archived, and pushing that merged file
-   adds a range PARTIALLY overlapping the archive, which `register` admits because it
-   declines only a range entirely covered. Duplicate rows on an archive read. Today the
-   shared lease prevents it; nothing else does.
+   The correctness item it was also going to fix is fixed by a different mechanism: a merge
+   can no longer include files sync has archived, because compaction and `sync` both read
+   the per-segment archive records rather than a watermark, and `archived_prefix` excludes
+   anything an archive holds.
 
 1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
    data naturally clustered by ingest time, so `litelink_offset` and `ingest_ts` statistics are tight
@@ -1584,13 +1620,13 @@ The consequence worth planning for is that local disk holds roughly
    buffer rows. But only step 3 writes the buffer, and it is explicitly garbage collection
    rather than correctness; the expensive step *reads*, which WAL permits alongside a writer.
 
-   **A lease per resource is built**, and the seal is the operation that uses it. `sealing`
+   **A claim per operation is built** (§4a; this paragraph described the role-lease era), and the seal is the operation that uses it. `sealing`
    belongs to whoever holds the `seal` role and `compacting` to whoever holds `maintain`, so
    recovery replays only what it owns — which is the hazard above, resolved.
 
    Nothing configures where the sealer runs, because nothing in the library runs one.
-   `seal_due()` drains the queue; `maintain()` calls it and then
-   compacts, evicts and expires. Both are plain methods on their caller's schedule, and
+   `seal_due()` drains the queue; `maintain()` compacts, evicts and expires and then
+   calls it. Both are plain methods on their caller's schedule, and
    if another owner holds the lease the call is refused and returns rather than
    duplicating the work.
 
@@ -1688,9 +1724,9 @@ The consequence worth planning for is that local disk holds roughly
      improving the maximum.
 
      A library has no business setting a process-wide switch interval, so the lever is the CPU
-     cost itself. §16 removes the deep copy; running the seal in a separate process would too,
+     cost itself. §13.7 removes the deep copy; running the seal in a separate process would too,
      which is one more thing the multi-process question above is worth to this one. **The
-     ordering matters: this option is gated on §16, not independent of it.**
+     ordering matters: this option is gated on §13.7, not independent of it.**
    - **A lease per role**, writer and maintainer, each recovering its own intents. Simple to
      state, but the split is coarser than what is actually exclusive, and it forces sealing
      to sit on whichever side owns the buffer.
@@ -1961,7 +1997,7 @@ Beyond §10:
 
 - **Block all network access; assert writes, seals, compaction and hot reads all succeed.**
   This is I5 and the central claim.
-- Kill between Parquet write and Iceberg commit; assert recovery reuses the same path and
+- Kill between Parquet write and Iceberg commit; assert recovery mints a NEW path, queues the abandoned one, and
   leaves no orphan.
 - Kill between Iceberg commit and buffer delete; assert a read in that window returns each
   row exactly once (I3).
@@ -2036,7 +2072,8 @@ tunable. See §15.5.
 Declared at stream creation, alongside the application schema:
 
 ```python
-litelink.Stream(
+litelink.Log.new(
+    root, name,
     schema=pa.schema([...]),
     sort_by=("event_ts", "key"),
     blob_fields=[litelink.blob_field("payload", hash=True, size=True)],

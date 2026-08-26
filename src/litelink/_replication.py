@@ -11,8 +11,12 @@ one to take the lease would start a second.
 
 What the library owns is what the config has to SAY: which files carry the
 log's state, and where they go. Both are things only the log knows, and both
-are silently wrong when written by hand — a config that omits `archive.db`
-leaves the objects in S3 intact with nothing able to say what they are.
+are silently wrong when written by hand.
+
+`archive.db` is in the set, though the archive can now name its own metadata
+(`version-hint.text`) and a FAILOVER deliberately does not restore it — a
+stale copy wins over the bucket's own pointer. It is replicated for the
+same-machine case, where it saves a round trip. See `Log.restore`.
 
 **One sidecar per ROOT, not per log.** `catalog.db` and `archive.db` live at the
 root and are shared by every log under it, so two logs each running their own

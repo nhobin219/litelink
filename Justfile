@@ -35,8 +35,9 @@ bootstrap:
     @just duckdb-extensions --remote
 
 # Of what the SPEC §7 read path touches, only `parquet` is compiled into the
-# duckdb wheel; `iceberg` and the sqlite scanner are fetched from
-# extensions.duckdb.org on first use. Provisioning them here pulls that
+# duckdb wheel; `iceberg` and `avro` are fetched from extensions.duckdb.org on
+# first use, and `httpfs` too with `--remote`. The sqlite scanner is NOT in the
+# set — the buffer leg is handed to DuckDB as Arrow, never attached. Provisioning them here pulls that
 # download out of the first hot-path read, where it is supposed to be offline.
 #
 #   just duckdb-extensions            provision the read path

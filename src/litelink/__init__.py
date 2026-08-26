@@ -1,7 +1,9 @@
 """Durable append-only capture into Iceberg tables.
 
-See ``docs/SPEC.md``. The local capture loop is implemented; the archive tier
-(``sync``) is not — see the README for what runs today.
+See ``docs/SPEC.md``. All three tiers are implemented — the SQLite buffer, the
+local Iceberg table, and the archive on object storage — and a log survives
+losing its machine (``Log.restore``). Schema evolution (§9) and blob fields
+(§15) are specified and are not.
 """
 
 from importlib.metadata import PackageNotFoundError, version

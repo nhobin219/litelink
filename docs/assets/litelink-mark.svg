@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="litelink mark">
+  <title>litelink</title>
+
+  <defs>
+    <clipPath id="weave-sq">
+      <rect x="112" y="86" width="32" height="42"/>
+    </clipPath>
+  </defs>
+
+  <!-- link A: sealed / archive tier -->
+  <rect x="20" y="96" width="124" height="66" rx="33"
+        fill="none" stroke="#6B7684" stroke-width="15"/>
+
+  <!-- link B: hot / buffer tier -->
+  <rect x="112" y="96" width="124" height="66" rx="33"
+        fill="none" stroke="#2F6FED" stroke-width="15"/>
+
+  <!-- weave -->
+  <g clip-path="url(#weave-sq)">
+    <rect x="20" y="96" width="124" height="66" rx="33"
+          fill="none" stroke="#6B7684" stroke-width="15"/>
+  </g>
+</svg>
