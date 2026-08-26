@@ -2320,3 +2320,117 @@ def test_a_held_seal_does_not_widen_the_next_file(
         # And the read agrees, which is what the overlap would break.
         assert log.scan().read_all().num_rows == 1800
         assert log.scan().read_all().column(OFFSET).to_pylist() == list(range(1, 1801))
+
+
+def test_the_archive_declares_the_same_sort_order_as_the_log(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """§4: the order is declared as table metadata, on BOTH tiers.
+
+    `open_archive` never declared one, so an archive holding clustered data
+    said nothing about it — a table lying about itself to any reader that is
+    not this library, and the reason `sort_by` was unanswerable from the
+    archive alone.
+    """
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/sorted",
+        s3=s3,
+    ) as log:
+        log.extend(scrambled(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        archive = log._archive.require()  # noqa: SLF001
+
+        assert archive.sort_by() == ("event_ts",), (
+            "the archive holds clustered data and declares no order"
+        )
+        # And it still holds the rows, so declaring the order did not disturb
+        # the create/publish sequence around it.
+        assert log.archived_through() > 0
+
+
+def test_attaching_an_archive_that_is_ahead_of_the_log_is_refused(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The obvious failover attempt, which wedges the log silently.
+
+    `Log.new` on a second box then `set_archive` at the old prefix: `sync`
+    computes its floor from the archive's extent, every local file sits below
+    it, so nothing is ever pushed. The watermark is still written, eviction's
+    I4 clamp finds no `extent` rows and pins at zero, and local disk grows
+    without bound while `sync()` returns success having uploaded nothing.
+    """
+    where = f"s3://{bucket}/ahead"
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    # A populated archive: this is the log that legitimately owns it.
+    with Log.new(
+        tmp_path / "first", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as owner:
+        owner.extend(rows(1200))
+        owner.seal_due()
+        owner.maintain()
+        owner.sync()
+
+        assert owner.archived_through() > 0
+
+    # A fresh log elsewhere, appending from offset 1, pointed at that archive.
+    with Log.new(
+        tmp_path / "second", "s", schema=SCHEMA, config=config, s3=s3
+    ) as fresh:
+        fresh.extend(rows(10))
+
+        with pytest.raises(ValueError, match="another log's history"):
+            fresh.set_archive(where)
+
+        assert fresh.archive is None, "the log was re-pointed despite the refusal"
+
+
+def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The guard must not fail closed.
+
+    `_repoint` deliberately tolerates an archive that does not exist yet —
+    configuring one is a statement of intent, not a claim that the bucket is
+    there — and `set_archive` runs on every writer restart. A check that
+    raised on an unreadable prefix would turn a routine restart into a coin
+    toss against object storage.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
+        log.extend(rows(10))
+        log.set_archive(f"s3://{bucket}/never-written-to")
+
+        assert log.archive == f"s3://{bucket}/never-written-to"
+
+
+def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The guard reads the network in TWO steps, and either can fail.
+
+    An unreachable endpoint is already absorbed — `_published_location`
+    swallows and answers None — so this exercises the other half: a hint that
+    IS readable, naming metadata that is not. The guard has to treat that as
+    "cannot tell" rather than "refuse", because `set_archive` runs on every
+    writer restart and configuring an archive is a statement of intent. A real
+    problem there surfaces loudly at the first `sync`, which is where it can
+    be acted on.
+    """
+    prefix = f"s3://{bucket}/corrupt"
+    fs = filesystem(s3)
+    hint = f"{bucket}/corrupt/{NAMESPACE}/s/metadata/{VERSION_HINT}"
+    fs.pipe(hint, b"00042-does-not-exist")
+
+    with Log.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
+        log.extend(rows(10))
+        log.set_archive(prefix)
+
+        assert log.archive == prefix

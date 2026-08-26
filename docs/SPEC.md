@@ -296,6 +296,14 @@ produced worse files. Freshness in the cloud is §3a's job.
 the table's Iceberg `sort_order` *and* actually applied at write time — the metadata records
 intent, it does not sort for you.
 
+**Declared in three places, and each answers a different reader.** The local table's
+`sort_order` and the ARCHIVE's say what the data is clustered by, to anything reading either
+Iceberg table directly; the archive's went undeclared until failover needed it, which made
+an archive holding clustered data silently say nothing about it. `meta` carries it too, and
+that is the copy `open` reads — because the local catalog cannot be restored onto another
+machine, so a failover rebuilds the local table and has to be told what to declare. An empty
+`sort_by` is a value meaning unsorted, and clears all three.
+
 Sorting only improves **row-group** statistics within a file; file-level statistics are
 already tight for `litelink_offset` and `ingest_ts`, because a sealed file covers a contiguous offset
 range and therefore a narrow ingest window. So sorting by `ingest_ts` buys nothing.

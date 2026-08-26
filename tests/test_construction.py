@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pytest
+from pyiceberg.catalog.sql import SqlCatalog
 
 from litelink import Log, LogConfig
 from litelink._archive import Archive
@@ -1060,3 +1061,75 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
         assert second._archive.uri == "s3://bucket/prefix"
         assert second._maintenance.config.local_rows == 4242
         assert second._buffer.config().local_rows == 4242
+
+
+def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
+    tmp_path: Path,
+) -> None:
+    """§4's clustering has to survive a machine, and the catalog does not.
+
+    `sort_by` used to live only in the local Iceberg table, read back at open.
+    `catalog.db` is replicated but records ABSOLUTE paths to local metadata no
+    sidecar ships, so a failover rebuilds the local table rather than restoring
+    it — and has to be told what order to declare. The archive could not answer
+    either: `open_archive` never declared one.
+
+    So `meta` carries it, and this proves `open` reads THAT rather than the
+    table: the declaration is removed from under a closed log and the order
+    still comes back.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        assert log._table.sort_by() == ("event_ts",)  # noqa: SLF001
+
+    catalog = SqlCatalog(
+        "local",
+        uri=Layout(tmp_path, "s").catalog_uri,
+        warehouse=Layout(tmp_path, "s").warehouse_uri,
+    )
+    table = catalog.load_table(Layout(tmp_path, "s").table_id)
+    with table.update_sort_order() as update:
+        update._apply()  # noqa: SLF001
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._sort_by == ("event_ts",), (  # noqa: SLF001
+            "open read the table's declaration rather than meta"
+        )
+
+
+def test_a_log_with_no_stored_sort_order_is_refused(tmp_path: Path) -> None:
+    """Absent means damaged, not "unsorted".
+
+    `new` always writes it, so defaulting to `()` would silently de-cluster
+    every file the next compaction rewrites while the table still declared a
+    key. Same rule as the stored config, one line above it.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)):
+        pass
+
+    buffer = Buffer.open(Layout(tmp_path, "s").buffer_db, SCHEMA)
+    try:
+        buffer._con.execute("DELETE FROM meta WHERE k = 'sort_by'")  # noqa: SLF001
+    finally:
+        buffer.close()
+
+    with pytest.raises(ValueError, match="no stored sort order"):
+        Log.open(tmp_path, "s")
+
+
+def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
+    """An empty order is a value, not a no-op.
+
+    `set_sort_order` used to return early on it, so `set_sort_by((),
+    rewrite=True)` re-clustered every file and left the table declaring the old
+    key. Harmless while `open` read that declaration and reverted; permanent
+    once `meta` is the source of truth, because nothing would reconcile them.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        log.extend([{"event_ts": i, "key": f"k{i}", "payload": "p"} for i in range(20)])
+        log.set_sort_by((), rewrite=True)
+
+        assert log._table.sort_by() == ()  # noqa: SLF001
+        assert log._buffer.get_meta("sort_by") == "[]"  # noqa: SLF001
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._sort_by == ()  # noqa: SLF001

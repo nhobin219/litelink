@@ -35,6 +35,8 @@ from litelink._s3 import S3Options
 from litelink._table import ArchiveAbsent, LogTable
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import pyarrow as pa
 
     from litelink._buffer import Buffer
@@ -76,11 +78,17 @@ class Archive:
         buffer: Buffer,
         s3: S3Options | None = None,
         schema: pa.Schema | None = None,
+        sort_by: Sequence[str] = (),
     ) -> None:
         self._layout = layout
         self._buffer = buffer
         self._s3 = s3 or S3Options()
         self._schema = schema
+        # Declared on the archive table when this creates one, so the archive
+        # states its own clustering the way the local table does (§4). Passed
+        # at construction like the schema, and for the same reason: both are
+        # shape, decided once, and neither is this object's to invent.
+        self._sort_by = tuple(sort_by)
         self._handle: LogTable | None = None
         # What the cached handle was opened FOR. Keying the cache on the
         # durable value is what keeps it from becoming the stale copy this
@@ -139,7 +147,12 @@ class Archive:
             if self._handle is None or self._handle_uri != uri:
                 try:
                     self._handle = LogTable.open_archive(
-                        self._layout, uri, self._s3, self._schema, repair=repair
+                        self._layout,
+                        uri,
+                        self._s3,
+                        self._schema,
+                        self._sort_by,
+                        repair=repair,
                     )
                 except ArchiveAbsent:
                     return None

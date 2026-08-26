@@ -22,6 +22,7 @@ from pyiceberg.exceptions import (
 )
 from pyiceberg.io import load_file_io
 from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.table import StaticTable
 from pyiceberg.transforms import IdentityTransform
 
 from litelink._fs import fsync
@@ -215,6 +216,32 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     return f"{directory}/{version}.metadata.json" if version else None
 
 
+def archive_extent(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[int, int] | None:
+    """`(lo, hi)` of the archive at `prefix`, read from the bucket alone.
+
+    Answers "what does that archive hold" WITHOUT touching `archive.db`, which
+    is what makes it usable as a pre-flight check. The catalog row is keyed by
+    table id, so while a log is pointed at one archive the row names that one —
+    `open_archive` on a different prefix therefore either raises on the boundary
+    check or, with `repair=True`, drops the row as a side effect of a read.
+
+    Two objects instead: the published pointer, then the metadata it names.
+    `None` when the archive has no hint, which covers both "nothing has been
+    pushed there" and "it is not a litelink archive". Errors propagate — the
+    caller decides whether a bad minute in object storage is fatal.
+    """
+    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+
+    return LogTable(None, layout, table, prefix).extent()  # ty: ignore
+
+
 class LogTable:
     """The local Iceberg table for one log.
 
@@ -325,6 +352,7 @@ class LogTable:
         prefix: str,
         options: S3Options,
         schema: pa.Schema,
+        sort_by: Sequence[str] = (),
         *,
         repair: bool = False,
     ) -> LogTable:
@@ -481,12 +509,22 @@ class LogTable:
                     table = catalog.create_table(
                         layout.table_id, schema=schema, properties=METADATA_PROPERTIES
                     )
+                    opened = cls(catalog, layout, table, prefix)
+                    # DECLARED, like the local table's (§4). The archive is the
+                    # same rows later and is clustered the same way, so a table
+                    # that does not say so is lying about itself to every
+                    # reader that is not this library — and `sort_by` was
+                    # therefore unanswerable from the archive alone.
+                    if sort_by:
+                        opened.set_sort_order(sort_by)
+
                     # So a freshly created archive names its own metadata from
                     # the start, rather than only from its first commit. An
                     # archive detached before anything was pushed to it holds
                     # nothing, so creating over it would be harmless — but the
                     # invariant is cheaper to hold than to reason about.
-                    cls(catalog, layout, table, prefix).publish_pointer()
+                    opened.publish_pointer()
+                    table = opened._table  # the declaration's commit reloaded it
                 else:
                     # Deliberately unguarded, like the load below. A hint
                     # naming metadata that cannot be read is a broken archive,
@@ -537,10 +575,14 @@ class LogTable:
         return tuple(names[f.source_id] for f in self._table.sort_order().fields)
 
     def set_sort_order(self, sort_by: Sequence[str]) -> None:
-        """Declare the sort order. Does NOT reorder existing data."""
-        if not sort_by:
-            return
+        """Declare the sort order. Does NOT reorder existing data.
 
+        An EMPTY order is a real value meaning unsorted, not a no-op. It used
+        to return early here, so `set_sort_by((), rewrite=True)` re-clustered
+        every file and left the table still declaring the old key — a table
+        lying about its own clustering, with nothing able to correct it now
+        that `meta` rather than this declaration is what `open` reads.
+        """
         self._commit(lambda: self._apply_sort_order(sort_by))
 
     def _apply_sort_order(self, sort_by: Sequence[str]) -> None:
