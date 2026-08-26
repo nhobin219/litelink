@@ -652,10 +652,12 @@ class Log:
     ) -> Self:
         """Open an existing log, and recover it.
 
-        Takes none of the shape: the columns come from the Iceberg table, their
-        declared Arrow types and the config and archive from the buffer's
-        `meta` table (§2), and the sort order from the table's declared sort
-        order (§4). Restating any of it here would invite a caller to state
+        Takes none of the shape: the columns come from the Iceberg table, and
+        their declared Arrow types, the config, the archive and the sort order
+        all from the buffer's `meta` table (§2, §4). The sort order used to
+        come from the table's own declaration; it moved because `catalog.db`
+        cannot be restored onto another machine, so a failover rebuilds that
+        table and has to be told what to declare. Restating any of it here would invite a caller to state
         something the log does not agree with, and the log is the one that is
         right.
 
@@ -812,14 +814,26 @@ class Log:
         # log per root until a per-root generator exists, and this is that
         # advice enforced.
         config_path = layout.root / "litestream.yml"
-        if config_path.exists() and f"path: {layout.buffer_db}" not in (
-            config_path.read_text()
-        ):
-            msg = (
-                f"{config_path} already replicates another log; restoring here would "
-                f"stop it. Restore into a root of its own"
-            )
-            raise FileExistsError(msg)
+        if config_path.exists():
+            # Every `- path:` the file names, which is the database list. It
+            # must be a subset of THIS log's, and an earlier version only
+            # checked that this log's buffer appeared somewhere in it — so a
+            # hand-written per-root config naming several buffers, which §3a
+            # tells operators to write, passed and was then overwritten with
+            # one naming only the restored log. Every other log under that root
+            # stopped replicating at the sidecar's next restart, silently.
+            named = {
+                line.split("path: ", 1)[1].strip()
+                for line in config_path.read_text().splitlines()
+                if line.startswith("  - path: ")
+            }
+            if not named <= {str(path) for path in layout.databases}:
+                msg = (
+                    f"{config_path} replicates databases outside {layout.root}/{name}; "
+                    f"restoring here would overwrite it and stop them. Restore into a "
+                    f"root of its own"
+                )
+                raise FileExistsError(msg)
 
         options = s3 or S3Options()
         layout.root.mkdir(parents=True, exist_ok=True)
@@ -898,6 +912,15 @@ class Log:
                 f"below the archive frontier are not recovered"
             )
             raise RuntimeError(msg)
+
+        # REWRITTEN, now that the policy is back. The config above had to be
+        # written before `buffer.db` existed — that is the chicken-and-egg this
+        # method is for — so it could not carry `wal_retention`, which lives in
+        # the `meta` that was still in the replica. Left as it was, the box
+        # that just took over would replicate under litestream's defaults
+        # rather than the window the log records, and RUNTIME presents this
+        # file as the one an operator then runs the sidecar against.
+        log.write_replication_config()
 
         # Recorded after the adoption, so the archive is resolved and its
         # frontier readable. Both numbers are what an operator needs and
@@ -1276,13 +1299,25 @@ class Log:
                 raise RuntimeError(msg)
 
             try:
-                # `meta` FIRST, because it is what `open` reads. The table's
-                # declaration is for anything reading the Iceberg table
-                # directly; a crash between the two leaves them disagreeing,
-                # and this order leaves the disagreement in the direction the
-                # next `open` corrects rather than inherits.
-                self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
+                # `meta` LAST of the two durable writes, because it is what
+                # `open` reads and nothing reconciles the pair afterwards.
+                #
+                # An earlier version wrote it first and claimed the next `open`
+                # would correct any disagreement. Nothing does: `open` reads
+                # `meta` and never re-declares, and `LogTable.load` only
+                # repairs metadata PROPERTIES. So a crash between the two left
+                # the tables declaring one key for ever while every later seal
+                # wrote another — a table lying about its own clustering, which
+                # is the failure this whole change exists to prevent. This way
+                # a crash in the gap leaves `meta` unchanged, so the log goes
+                # on using the OLD key that the tables still declare, and the
+                # operation is simply not done.
                 self._table.set_sort_order(requested)
+                # The archive's declaration too. Missing it left an archive
+                # created after a re-sort born declaring the old key, with
+                # every file pushed into it clustered by the new one.
+                self._archive.set_sort_by(requested)
+                self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
                 self._sort_by = requested
                 self._maintenance.set_sort_by(requested)
                 self._maintenance.rewrite_sorted(
@@ -1851,7 +1886,12 @@ class Log:
 
         start, end, rel_path = pending
         if str(self._layout.absolute(rel_path)) in self._table.file_paths():
-            self._buffer.finish_seal(end, rel_path)
+            # `discard` here too, and it was missing. This is the crash window
+            # §3a exists for — committed, not yet retired — so defaulting to a
+            # delete removed the only off-box copy of a range the archive does
+            # not hold, with replication on. Measured: five buffered rows
+            # before the crash, zero after the recovery.
+            self._buffer.finish_seal(end, rel_path, discard=self._discard_on_seal())
 
             return
 
@@ -2049,7 +2089,20 @@ class Log:
         # held indefinitely. Driven from the frontier instead, it is idempotent
         # and every pass retries it for free.
         if not self._discard_on_seal() and floor:
-            self._buffer.release_archived(floor)
+            # Bounded by what THIS log recorded the archive taking, not by the
+            # archive's raw extent. `_refuse_archive_ahead` deliberately allows
+            # attaching an archive whose ranges sit below this log's — that is
+            # re-attach, and it is supported — so a prefix belonging to another
+            # log can legitimately report an extent above our own frontier.
+            # Releasing on that alone would delete buffered rows no archive
+            # holds, which with replication on is the only off-box copy.
+            #
+            # `archived_through` is our own record, raised only by a push this
+            # log made. The `min` is what makes a foreign extent unable to
+            # authorise a deletion.
+            self._buffer.release_archived(
+                min(floor, self._maintenance.archived_through())
+            )
 
         # The watermark reconciled against the archive itself. It is a cache of
         # what the archive holds — kept for the push floor and for display, and

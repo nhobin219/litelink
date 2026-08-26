@@ -225,8 +225,13 @@ which files carry the log's state and therefore have to be replicated.
 
 **All three databases, not just the buffer.** `buffer.db` holds rows no Parquet file has
 yet, `catalog.db` says which files the local table is made of, and `archive.db` says the
-same for the archive. Omit the last and the objects in S3 survive with nothing to say what
-they are.
+same for the archive.
+
+That last justification used to be "omit it and the objects in S3 survive with nothing to
+say what they are". It is no longer true — the archive publishes `version-hint.text` and can
+name its own metadata — and the file is now replicated for the *same-machine* case, where
+it saves a round trip, while a failover deliberately does NOT restore it: a stale copy wins
+over the bucket's own pointer and reads the archive short. See §3a and `Log.restore`.
 
 **One sidecar per root.** Two of those three live at the root and are shared by every log
 under it, so a sidecar per log would run two instances against the same `catalog.db` — what
@@ -302,7 +307,9 @@ Iceberg table directly; the archive's went undeclared until failover needed it, 
 an archive holding clustered data silently say nothing about it. `meta` carries it too, and
 that is the copy `open` reads — because the local catalog cannot be restored onto another
 machine, so a failover rebuilds the local table and has to be told what to declare. An empty
-`sort_by` is a value meaning unsorted, and clears all three.
+`sort_by` is a value meaning unsorted, and clears all three; the archive's declaration is
+best effort, since a re-sort has already rewritten every local file by the time it is
+attempted and an unreachable bucket must not fail it.
 
 Sorting only improves **row-group** statistics within a file; file-level statistics are
 already tight for `litelink_offset` and `ingest_ts`, because a sealed file covers a contiguous offset
@@ -936,9 +943,15 @@ ATTACH ... (TYPE ICEBERG)         fails -- "AUTHORIZATION_TYPE is 'oauth2'"
 ```
 
 **DuckDB's Iceberg `ATTACH` assumes a REST catalog** and asks for OAuth2 credentials; it
-cannot attach a pyiceberg `SqlCatalog`. Path-based scanning also fails, because `SqlCatalog`
-keeps the current metadata pointer in the catalog rather than in a `version-hint.text` file
-the way a filesystem catalog would.
+cannot attach a pyiceberg `SqlCatalog`. Path-based scanning fails for the same reason it
+always did — `SqlCatalog` keeps the current metadata pointer in the catalog rather than in a
+`version-hint.text` file the way a filesystem catalog would.
+
+**The ARCHIVE is the exception, and deliberately so.** Every archive commit writes that hint
+beside its metadata (§5), which is what makes a re-point reversible and lets an engine with
+no catalog read the prefix directly. The local table publishes none: its catalog sits in the
+same directory as its warehouse, so nothing can be in a position to have one without the
+other.
 
 So a read is a two-step handoff:
 

@@ -1659,9 +1659,24 @@ class Buffer:
         - **`claim` rows** go. They carry the dead box's owners and a future
           expiry, so keeping them makes this one wait out a TTL for processes
           that do not exist.
-        - **`sealing` and `compacting` stay.** `_recover_seal` finds the
-          rebuilt table empty and rewrites the interrupted file from the
-          surviving buffer rows, which RECOVERS data rather than losing it.
+        - **`sealing` GOES**, and this was wrong in an earlier draft. The
+          reasoning was that `_recover_seal` finds the rebuilt table empty and
+          rewrites the interrupted file, recovering data. It does — and then
+          duplicates it. The closed-but-unsealed `extent` row that seal
+          belonged to is deleted above, so `finish_seal`'s naming UPDATE
+          (keyed `end_offset = ? AND rel_path IS NULL`) matches nothing and
+          returns True anyway, while the fresh open group still spans the
+          range. With `discard=False` the rows are still buffered, so the next
+          cut writes them a second time. Measured: 490 rows read where 440 are
+          distinct, from two overlapping local files, with no error anywhere.
+
+          Recovery is redundant here rather than protective. Every row that
+          seal was writing is still in the buffer, and the open group
+          `_seed_group` builds covers them — so dropping the claim re-seals
+          them exactly once.
+
+        - **`compacting` stays.** It only queues deletions, and its outputs
+          are archive objects this machine never wrote.
 
         Finally the offset sequence is raised by `reserve`. See `Log.restore`.
         """
@@ -1673,6 +1688,7 @@ class Buffer:
                 "DELETE FROM pending_delete WHERE rel_path NOT LIKE '%://%'"
             )
             self._con.execute("DELETE FROM claim")
+            self._con.execute("DELETE FROM sealing")
             released = self._con.execute("SELECT count(*) FROM buffer").fetchone()[0]
             highest = self._con.execute(
                 'SELECT max("litelink_offset") FROM buffer'

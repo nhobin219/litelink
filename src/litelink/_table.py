@@ -198,20 +198,27 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     layout — `{prefix}/{namespace}/{name}/metadata` — rather than from a table
     handle, because there is no handle yet; that is the situation.
 
-    None covers both "no hint" and "unreadable", deliberately. A caller uses
-    this to decide between adopting and creating, and the only safe reading of
-    a hint it cannot get is that there is nothing to adopt.
+    **None means ABSENT, never "could not tell".** An earlier version swallowed
+    every failure into None, and the caller reads None as "nothing here yet,
+    create one" — so one 503, one expired token, one throttled GET on this
+    single object was indistinguishable from a virgin prefix, and the repair
+    built an empty table over a live archive. Then `publish_pointer`
+    republished the hint onto the empty lineage, destroying the last pointer to
+    the real one; after a re-point has dropped the catalog row, that hint is
+    all there is. The sibling `load_table` branch refuses exactly this, in
+    those words.
+
+    So a read that fails RAISES. Callers that would rather carry on — the
+    `set_archive` guard, which must not fail closed on a bad minute in object
+    storage — catch it themselves and say so.
     """
     namespace, _, name = layout.table_id.rpartition(".")
     directory = f"{prefix.rstrip('/')}/{namespace}/{name}/metadata"
-    try:
-        source = io.new_input(f"{directory}/{VERSION_HINT}")
-        if not source.exists():
-            return None
-
-        version = source.open().read().decode().strip()
-    except Exception:
+    source = io.new_input(f"{directory}/{VERSION_HINT}")
+    if not source.exists():
         return None
+
+    version = source.open().read().decode().strip()
 
     return f"{directory}/{version}.metadata.json" if version else None
 
@@ -264,8 +271,10 @@ def archive_extent(
 
     Two objects instead: the published pointer, then the metadata it names.
     `None` when the archive has no hint, which covers both "nothing has been
-    pushed there" and "it is not a litelink archive". Errors propagate — the
-    caller decides whether a bad minute in object storage is fatal.
+    pushed there" and "it is not a litelink archive". A hint that cannot be
+    READ raises instead, because `_published_location` no longer conflates the
+    two — the caller decides whether a bad minute in object storage is fatal,
+    and `_refuse_archive_ahead` treats it as "cannot tell" and passes.
     """
     io = load_file_io(options.resolved().catalog_properties(), prefix)
     location = _published_location(io, layout, prefix)
@@ -544,22 +553,6 @@ class LogTable:
                     table = catalog.create_table(
                         layout.table_id, schema=schema, properties=METADATA_PROPERTIES
                     )
-                    opened = cls(catalog, layout, table, prefix)
-                    # DECLARED, like the local table's (§4). The archive is the
-                    # same rows later and is clustered the same way, so a table
-                    # that does not say so is lying about itself to every
-                    # reader that is not this library — and `sort_by` was
-                    # therefore unanswerable from the archive alone.
-                    if sort_by:
-                        opened.set_sort_order(sort_by)
-
-                    # So a freshly created archive names its own metadata from
-                    # the start, rather than only from its first commit. An
-                    # archive detached before anything was pushed to it holds
-                    # nothing, so creating over it would be harmless — but the
-                    # invariant is cheaper to hold than to reason about.
-                    opened.publish_pointer()
-                    table = opened._table  # the declaration's commit reloaded it
                 else:
                     # Deliberately unguarded, like the load below. A hint
                     # naming metadata that cannot be read is a broken archive,
@@ -576,6 +569,27 @@ class LogTable:
                     catalog.register_table(layout.table_id, displaced)
 
                 raise
+
+            # AFTER the rollback window, not inside it. These two are commits
+            # against a table that now exists, so a failure here cannot be
+            # repaired by re-registering the displaced entry — the row for this
+            # table id is already taken, and `register_table` would raise
+            # `TableAlreadyExistsError` from inside the handler, masking the
+            # real error and skipping the rollback the comment promises.
+            if published is None:
+                opened = cls(catalog, layout, table, prefix)
+                # DECLARED, like the local table's (§4). The archive is the
+                # same rows later and is clustered the same way, so a table
+                # that does not say so is lying about itself to every reader
+                # that is not this library — and `sort_by` was therefore
+                # unanswerable from the archive alone.
+                if sort_by:
+                    opened.set_sort_order(sort_by)
+
+                # So a freshly created archive names its own metadata from the
+                # start, rather than only from its first commit.
+                opened.publish_pointer()
+                table = opened._table  # the declaration's commit reloaded it
         else:
             # Deliberately unguarded. Catching everything here and rebuilding
             # meant a 503, a timeout or an expired token read as "there is no

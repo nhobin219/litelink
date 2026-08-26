@@ -28,6 +28,7 @@ exists — `configured()` is the question about what is in it.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from typing import TYPE_CHECKING
 
@@ -99,6 +100,28 @@ class Archive:
         # The reader resolves the archive on a query thread while a maintainer
         # syncs on another and `set_archive` re-points it from a third.
         self._lock = threading.RLock()
+
+    def set_sort_by(self, sort_by: Sequence[str]) -> None:
+        """Re-declare the clustering, here and on the archive's own table.
+
+        Reached from `Log.set_sort_by`, which was previously a fan-out to
+        everything EXCEPT this — so the field stayed at whatever the process
+        opened with, and an archive created afterwards was born declaring the
+        old key while every file pushed into it was clustered by the new one.
+
+        Best effort against the remote half. The archive may be unreachable,
+        and a re-sort is a local operation that has already rewritten every
+        local file by the time this runs; failing it here would report a
+        failure that did not happen. The declaration is corrected by the next
+        pass that opens the archive with the current order.
+        """
+        with self._lock:
+            self._sort_by = tuple(sort_by)
+            handle = self._handle
+
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.set_sort_order(sort_by)
 
     def location(self) -> str | None:
         """Where the archive is, according to the log.

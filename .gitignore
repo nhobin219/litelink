@@ -17,6 +17,7 @@ wheels/
 # Local capture roots: a SQLite buffer, a file:// warehouse, and the two
 # catalog databases (docs/SPEC.md §1). Never commit a database.
 litelink-data/
+litelink-ws/
 *.db
 *.db-wal
 *.db-shm

@@ -21,11 +21,16 @@ nothing to overlap with.
 loopback websocket in this same event loop. So it runs offline, and the test
 suite can exercise it without reaching the network.
 
-**`log.append` is a synchronous SQLite write inside an async loop, and it
-blocks it.** At feed rates that is invisible — an append is ~10 us — and it is
-the first thing to fix if this shape is ever pushed hard. The fix is a bounded
-`asyncio.Queue` drained by `asyncio.to_thread`, NOT a second process: the point
-of this file is that one process is enough until it is not.
+**This blocks the event loop, and it is the SEAL that does it — not the
+append.** Measured on this file's own config: `append` runs at a 405 us median,
+while a `seal_due` that actually writes a file takes 43 ms, two orders of
+magnitude more. So a frame arriving during a seal waits for it, and at real
+rates that is where the backpressure shows up. Moving `append` to a thread —
+the obvious fix, and the wrong one — leaves the stall exactly where it is.
+
+What fixes it is running the seal elsewhere, which is what `maintainer.py`
+does and why it exists. Until then this shape holds as long as the gap between
+seals is comfortably longer than a seal takes.
 """
 
 from __future__ import annotations
@@ -104,13 +109,25 @@ async def main() -> None:
     server = None if args.url else await serve("127.0.0.1", args.port)
     url = args.url or f"ws://127.0.0.1:{args.port}"
 
-    with Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config) as log:
+    # Open-or-new, the same shape `capture.py` uses and for the same reason:
+    # `Log.new` alone raises on the second run, which is a poor first
+    # impression for the example that is meant to be the easy one.
+    try:
+        log = Log.open(args.root, NAME)
+    except FileNotFoundError:
+        log = Log.new(args.root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config)
+
+    with log:
         print(f"capturing {url} into {args.root}/{NAME} for {args.seconds:g}s")
         appended, sealed = await capture(url, log, args.seconds)
 
-        # Sealed here rather than left queued, so the run ends with everything
-        # in Parquet and the query below reads the shape a reader would see.
-        while log.seal_due() is not None:
+        # `seal()`, not `seal_due()`. The loop above drains groups the appender
+        # has already CUT; the open group is not one of them, so ending on
+        # `seal_due` left the tail in SQLite — measured, 320 of 3,599 rows —
+        # while this print claimed everything was in Parquet. `seal` closes the
+        # open group first, which is exactly what an orderly shutdown wants and
+        # what nothing on the hot path should do.
+        while log.seal() is not None:
             sealed += 1
 
         print(f"  appended {appended:,} rows, sealed {sealed} file(s)")
