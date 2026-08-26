@@ -23,7 +23,7 @@ once they reach a target size, and sync from there into an Iceberg table on S3:
 
 ```
 SQLite buffer          durable on commit. unsealed rows only.
-      │  seal at target_size
+      │  seal at target_seal_size
       ▼
 local Iceberg table    a rolling window. reads land here.
       │  sync: upload data files, register into the archive

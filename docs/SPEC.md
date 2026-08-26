@@ -9,7 +9,7 @@
 ```
 SQLite buffer          durable on commit. unsealed rows only.
       │                WAL, synchronous=FULL, one db per stream
-      │  seal at target_size
+      │  seal at target_seal_size
       ▼
 local Iceberg table    a rolling WINDOW of recent data.
       │                SqlCatalog on SQLite, file:// warehouse
@@ -218,15 +218,15 @@ per-commit cost is a larger fraction.
 ## 3a. Optional: WAL replication for RPO
 
 Without it, unsealed rows exist only on local disk, and nothing bounds how long they stay
-there: the seal fires on `target_size` alone, so a stream that goes quiet holds its last
-partial file's worth of rows indefinitely. **With the `max_age` timer removed, replication
-is the only thing that bounds RPO at all** — it is no longer a way to avoid a trade, it is
-the mechanism.
+there: the seal fires on `target_seal_size` alone, so a stream that goes quiet holds its last
+partial file's worth of rows indefinitely. **With the `max_age` timer removed, replication is
+the only thing that bounds RPO at all** — it is no longer a way to avoid a trade, it is the
+mechanism.
 
 That removal is what makes it clean. A timer bounded RPO by sealing early, which meant the
-same knob set the file size and the loss window, and shrinking one wrecked the other.
-Shipping the WAL separates them completely: files are sized by `target_size` and RPO falls
-to the replication lag, which is a property of a sidecar rather than of the layout.
+same knob set the file size and the loss window, and shrinking one wrecked the other. Shipping
+the WAL separates them completely: files are sized by `target_seal_size` and RPO falls to the
+replication lag, which is a property of a sidecar rather than of the layout.
 
 **Litestream (or equivalent WAL shipping) is the sidecar.** It continuously replicates
 SQLite WAL frames to object storage. It is not configured in `LogConfig`: whether a sidecar
@@ -314,7 +314,7 @@ the log fails outright. See §3a's failover notes and `Log.restore`.
 Triggered on `min(target_seal_size, target_seal_rows)`, evaluated by the writer at commit
 time.
 Entirely local. Both are ceilings on one file — bytes bound memory, rows bound the read
-latency §7 sizes for — so the cut lands on whichever is reached first, and `target_rows`
+latency §7 sizes for — so the cut lands on whichever is reached first, and `target_seal_rows`
 defaults to no limit because only the caller knows how wide a row is.
 
 There is no timer. A `max_age` branch was specified here and removed: it emitted a small
@@ -358,8 +358,9 @@ Default for capture workloads: **`(event_ts, key)`** — `event_ts` primary beca
 dominant access pattern is cross-sectional (every key at a timestamp), `key` secondary so a
 single-key scan clusters within a timestamp.
 
-The sort costs one in-memory sort of at most `target_size` rows per seal, and does not
-affect the tier boundaries in §7, which use min/max of `litelink_offset` and are order-independent.
+The sort costs one in-memory sort per seal, over at most the `target_seal_size` bytes of rows
+that seal holds, and does not affect the tier boundaries in §7, which use min/max of
+`litelink_offset` and are order-independent.
 
 **Step 1 fixes the range before the file exists**, making the path NAMEABLE:
 `{name}/data/{start}-{end}-{token}.parquet`. Chosen after the write instead, a crash
@@ -895,23 +896,23 @@ the conversion is turned off.
 Hand-written, because `rewrite_data_files` is a Spark procedure with no pyiceberg
 equivalent.
 
-The table is unpartitioned (§13), so the compaction unit is a **contiguous offset range**.
-That works because sealed files already cover contiguous, non-overlapping ranges: pick
-adjacent files that together hold less than `target_size`, and their combined range is
-itself contiguous.
+The table is unpartitioned (§13), so the compaction unit is a **contiguous offset range**. That
+works because sealed files already cover contiguous, non-overlapping ranges: pick adjacent
+files that together hold less than `target_compact_size`, and their combined range is itself
+contiguous.
 
-**Sizing is in uncompressed bytes, never in file size on disk.** `target_size` bounds what
-a file HOLDS — the appender's own byte count for the rows that went into it — and that
-number is carried per file from the seal that measured it, added up across a merge, and
-dropped when the file is unlinked. It cannot be recovered from the file afterwards: on
-data compressing 8:1 a file holding a full target is an eighth of it on disk, so a rule
-reading sizes off disk merges eight already-full files into one holding eight times the
-memory the target allows — and, since `sync` refuses anything compaction may still
-rewrite, archives nothing at all in the meantime. A file whose size was never recorded
-counts as full, so an unmeasured file is never rewritten on a guess.
+**Sizing is in uncompressed bytes, never in file size on disk.** `target_compact_size` bounds
+what a file HOLDS — the appender's own byte count for the rows that went into it — and that
+number is carried per file from the seal that measured it, added up across a merge, and dropped
+when the file is unlinked. It cannot be recovered from the file afterwards: on data compressing
+8:1 a file holding a full target is an eighth of it on disk, so a rule reading sizes off disk
+merges eight already-full files into one holding eight times the memory the target allows —
+and, since `sync` refuses anything compaction may still rewrite, archives nothing at all in the
+meantime. A file whose size was never recorded counts as full, so an unmeasured file is never
+rewritten on a guess.
 
 ```
-1. Select adjacent files holding < target_size in total, spanning [lo, hi];
+1. Select adjacent files holding < target_compact_size in total, spanning [lo, hi];
    require compact_min_files.
 2. Scan them into one Arrow table; re-sort by `sort_by`.
 3. Verify row count and per-column min/max against the sources.
@@ -1116,10 +1117,10 @@ it separates cleanly from compaction:
 
 | knob | controls |
 |---|---|
-| seal threshold (`target_size` / `target_rows`) | how many rows sit in the buffer, hence hot-read latency |
+| seal threshold (`target_seal_size` / `target_seal_rows`) | how many rows sit in the buffer, hence hot-read latency |
 | compaction | how large the files end up, hence scan cost |
 
-So **seal small and often, then compact** — rather than sealing at a large `target_size` to
+So **seal small and often, then compact** — rather than sealing at a large `target_seal_size` to
 get large files directly. Both operations are local and cheap, and this is what makes a
 small seal threshold affordable. Size the threshold so the buffer stays under ~20k rows: at
 50 rows/s that is a ~5 minute seal, holding the buffer near 15k rows and its contribution
@@ -1562,13 +1563,12 @@ The consequence worth planning for is that local disk holds roughly
 
    **The file is staged, not sealed.** It is raw input to the same local
    normalise-then-upload path as a seal's output, so an oversized one is split before it is
-   ever registered — the mirror of a quiet stream's undersized file being merged before
-   upload. §6 is merge-only, selecting files that together hold *under* `target_size`, so
-   the split is an
-   addition: the same `overwrite` on the same offset-range filter, emitting N files instead
-   of one, with step 3's row-count-and-min/max verification unchanged. Bulk ingest is what
-   creates the requirement — a seal cannot emit an oversized file, since `target_size`
-   already bounds it.
+   ever registered — the mirror of a quiet stream's undersized file being merged before upload.
+   §6 is merge-only, selecting files that together hold *under* `target_compact_size`, so the
+   split is an addition: the same `overwrite` on the same offset-range filter, emitting N files
+   instead of one, with step 3's row-count-and-min/max verification unchanged. Bulk ingest is
+   what creates the requirement — a seal cannot emit an oversized file, since
+   `target_seal_size` already bounds it.
 
    **A reservation is a hole in the offset space.** A seal spanning it writes a file whose
    `litelink_offset` statistics cover `[lo, hi]` while containing none of it; when the staged file
@@ -1916,15 +1916,14 @@ The consequence worth planning for is that local disk holds roughly
 
    **A file-count component remains**, and it is the honest residual: 43.2 ms to 86.3 ms as
    files went 40 to 240 with snapshots pinned at one. §6 selects files holding *under*
-   `target_size`,
-   so a file compaction has already produced at or above that size is never revisited —
-   compaction bounds how many *small* files exist and cannot reduce the total. Eviction is the
-   only mechanism that removes a large file, and §8 makes `local_retention = None` the default,
-   so a local-only capture that keeps its history still degrades. Less steeply than this entry
-   first claimed, and for a reason now named.
+   `target_compact_size`, so a file compaction has already produced at or above that size is
+   never revisited — compaction bounds how many *small* files exist and cannot reduce the
+   total. Eviction is the only mechanism that removes a large file, and §8 makes
+   `local_retention = None` the default, so a local-only capture that keeps its history still
+   degrades. Less steeply than this entry first claimed, and for a reason now named.
 
    Worth measuring before choosing a fix, since the options differ in shape: raising
-   `target_size` over time so yesterday's output is tomorrow's input, tiered compaction, or
+   `target_compact_size` over time so yesterday's output is tomorrow's input, tiered compaction, or
    the honest possibility that unbounded local retention is not a supported configuration.
 
    ### Registering files without pyiceberg's commit path
@@ -2228,7 +2227,7 @@ pyiceberg maps Iceberg `binary` on the way in rather than assuming.
 **Set `compression=NONE` on blob columns.** Sensor payloads and media are already compressed;
 the codec will spend CPU proving it.
 
-**Raise `target_size`.** The §12 default is a handful of rows once blobs are inline. Size it
+**Raise `target_seal_size`.** The §12 default is a handful of rows once blobs are inline. Size it
 so a file still holds a useful number of rows. Note this pulls against §7's finding that the
 seal threshold bounds hot-read latency — with blobs, the buffer holds fewer, larger rows, so
 the row-count guidance there still governs.
@@ -2392,7 +2391,8 @@ storage that Iceberg does not know about.
 Compaction (§6) needs no change in principle, since re-sorting an offset range carries the
 bytes along. It does change in cost: compaction now reads blob bytes rather than only Parquet
 metadata and small columns. Streams with blob fields should therefore get a separate, lower
-`target_size`, or the pass will move far more data than the file-count problem justifies.
+`target_compact_size`, or the pass will move far more data than the file-count problem
+justifies.
 
 ---
 
@@ -2406,7 +2406,7 @@ metadata and small columns. Streams with blob fields should therefore get a sepa
 | §6 Compaction | Unchanged in logic; needs a separate size bound for blob streams. |
 | §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `litelink_offset` must be quoted. |
 | §8 Retention | Unchanged. Blobs inherit it. |
-| §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_size`; `target_size` raised. |
+| §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_size`; `target_seal_size` raised. |
 
 ---
 
