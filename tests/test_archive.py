@@ -2829,3 +2829,160 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
             other.set_archive(foreign)
 
         assert other.archive is None, "the log was pointed despite the refusal"
+
+
+def test_a_restore_from_a_replica_the_archive_has_outrun(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A replica is a snapshot from BEFORE the primary's last sync.
+
+    That is ordinary replication lag, not a crash window: the bucket routinely
+    holds ranges the replicated `extent` rows do not mention. Seeded from the
+    replica alone, the open group starts below the archive's frontier, and the
+    first seal here writes a file reaching into the archive's extent.
+
+    Which wedges the log for good — `_refuse_straddle` raises on every push,
+    `archived_prefix` returns 0 for the straddler so eviction pins at zero, and
+    local disk grows without bound. Nothing re-cuts a local straddler, and this
+    is the operation you run when the archive is the only surviving copy.
+
+    Asserted by DOING the work a revived box does — seal, maintain, sync,
+    repeatedly — rather than by inspecting the group, because the group looks
+    entirely reasonable right up until the push.
+    """
+    where = f"s3://{bucket}/outrun"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        # THE SNAPSHOT, taken here — before the sync below. This is the lag.
+        second = tmp_path / "second"
+        (second / "s").mkdir(parents=True)
+        source = sqlite3.connect(Layout(primary, "s").buffer_db)
+        copy = sqlite3.connect(Layout(second, "s").buffer_db)
+        source.backup(copy)
+        source.close()
+        copy.close()
+
+        # The primary carries on: more rows, sealed and PUSHED. The archive is
+        # now ahead of everything the snapshot knows about.
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        ahead = log.archived_through()
+
+    stale = Buffer.peek_meta(Layout(second, "s").buffer_db, "archive_through")
+
+    assert stale is not None and int(stale) < ahead, (
+        "the archive did not outrun the snapshot, so the case is not set up"
+    )
+
+    # Restored from that snapshot, then worked the way a revived box is.
+    with Log.restore(second, "s", archive=where, s3=s3) as revived:
+        # Checked BEFORE any work: the first seal recycles the open group, so
+        # a stale one is invisible a moment later. Releasing the archived rows
+        # empties this buffer — every row in the snapshot is below the frontier
+        # the archive reached — so a group still naming the replica's start
+        # would be one with no rows behind it.
+        group = revived._buffer._con.execute(  # noqa: SLF001
+            "SELECT start_offset FROM extent"
+            " WHERE end_offset IS NULL AND rel_path IS NULL"
+        ).fetchone()
+
+        assert group is not None, "the log came back with no open group at all"
+        assert (group[0] is None) == (revived.buffered_rows() == 0), (
+            f"open group starts at {group[0]} with "
+            f"{revived.buffered_rows()} rows buffered"
+        )
+
+        for _ in range(3):
+            revived.extend(rows(200))
+            revived.seal_due()
+            revived.maintain()
+            revived.sync()
+
+        assert revived.archived_through() > ahead, (
+            "sync never got past the archive's frontier: the log is wedged"
+        )
+        # And eviction is not pinned at zero by a straddling local file.
+        assert revived.scan(include_archive=True).read_all().num_rows > 0
+
+
+def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Log.restore` has two durable writes; the order between them decides.
+
+    `LogTable.create` is what makes a root openable, and the offset reserve is
+    what makes its offsets safe. With the table first, an interruption between
+    them left a root that `restore` refuses to retry and `Log.open` cheerfully
+    accepts — reporting `recovery() is None`, sequence still at the replica's
+    frontier, handing out offsets the dead primary had already served.
+
+    Reversed, no interruption can produce that: before the reserve there is no
+    table, so the root cannot open at all, and `restore` resumes it.
+    """
+    where = f"s3://{bucket}/interrupted-restore"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        log.extend(rows(300))
+        served = log.end_offset() - 1
+
+    second = tmp_path / "second"
+    (second / "s").mkdir(parents=True)
+    source = sqlite3.connect(Layout(primary, "s").buffer_db)
+    copy = sqlite3.connect(Layout(second, "s").buffer_db)
+    source.backup(copy)
+    source.close()
+    copy.close()
+
+    # THE INTERRUPTION, between the two durable writes. A full disk, SIGKILL,
+    # SQLITE_BUSY — anything raising where the reserve happens.
+    def die(self: Buffer, reserve: int) -> tuple[int, int]:
+        msg = "interrupted"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(Buffer, "strip_local_state", die)
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        Log.restore(second, "s", archive=where, s3=s3)
+
+    monkeypatch.undo()
+
+    # The reserve never ran, so the sequence is still the replica's. With the
+    # table created FIRST this root would open, report `recovery() is None`,
+    # and hand out offsets the primary already served.
+    with pytest.raises(FileNotFoundError):
+        Log.open(second, "s", s3=s3)
+
+    # And the half state is resumable rather than a dead end.
+    with Log.restore(second, "s", archive=where, s3=s3) as revived:
+        resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
+
+        assert resumed > served, (
+            f"reissued offset {resumed}; the primary served through {served}"
+        )

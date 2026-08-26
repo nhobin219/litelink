@@ -160,6 +160,17 @@ against a 4 MiB target give 3 MiB files for ever.
 ## Try it
 
 ```
+just demo-websocket    # capture a live public feed, one process, ~30 seconds
+```
+
+No producer, no credentials, no maintainer: Bitstamp publishes BTC/USD trades over an
+unauthenticated websocket, and the loop is `log.append(...)` then `log.seal_due()`. It
+prints a query over what it captured.
+
+The other end of the range — a synthetic feed you can drive as hard as you like, with one
+process per storage role:
+
+```
 just demo-capture      # append continuously — the hot path, and nothing else
 just demo-maintain     # in another terminal: seal, compact, evict, expire
 just demo-tail         # in a third: watch where the rows are

@@ -1,6 +1,41 @@
 # examples
 
-Scripts against a real log. None need an archive, a service, or a network.
+Two demos, at opposite ends of the range.
+
+## Start here
+
+```
+just demo-websocket
+```
+
+The whole library in one process against a **live public feed** — Bitstamp
+publishes BTC/USD trades over an unauthenticated websocket, so there is no
+producer to start and no credentials to set. `websocket.py` subscribes, appends
+each trade, seals when there is enough to seal, and prints a query over what it
+captured. Thirty seconds end to end.
+
+The loop is two calls:
+
+```python
+log.append(row(trade))
+log.seal_due()
+```
+
+`seal_due` is an indexed read of one row when there is nothing to do, so calling
+it per message costs almost nothing; when a group is queued it writes that one
+file and returns. Nothing else seals, so leaving it out means rows accumulate in
+SQLite for ever — durable and readable the whole time, but never reaching
+Parquet.
+
+**It blocks the event loop, and it is the seal that does it**, not the append.
+Measured: an append runs at a 405 us median, a `seal_due` that actually writes a
+file at 43 ms. At this feed's rate that is invisible. At real rates it is the
+first thing to fix, and the fix is `adsb/` below.
+
+## `adsb/` — the shape a deployment wants
+
+A synthetic ADS-B position feed, driven as hard as you like, with one process
+per storage role. None of it needs an archive, a service, or a network.
 
 ```
 just demo-capture      # terminal 1: append, and nothing else
@@ -8,34 +43,24 @@ just demo-maintain     # terminal 2: one process per storage role
 just demo-tail         # terminal 3: watch where the rows are
 ```
 
-**Or the whole thing in one process**, which is the other end of the range:
+`demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `sync` —
+and one command stops them all. They are separate processes rather than one,
+because a seal is CPU-bound pure Python and so is compaction, only more of it:
+run together, sealing waits on compaction through the interpreter and the buffer
+grows for as long as it waits. That is the same argument that makes the writer
+its own process, one level down. Each prints only when it does something, so
+silence is the healthy state.
 
-```
-just demo-websocket    # capture a feed in-line: append, seal_due, query
-```
+`maintainer.py --role all` is the single-process shape, and is right when the
+costs do not justify four. It is also quieter: four processes committing to one
+Iceberg table race on pyiceberg's post-commit metadata cleanup and log a
+`Failed to delete metadata file` now and then. Measured to be noise — 817,760
+rows read back contiguous across a run that logged it — but a single process
+produces none.
 
-`websocket.py` is the smallest thing that is still a durable, queryable log —
-no maintainer, no threads, no second process. The loop is `log.append(...)`
-then `log.seal_due()`, and `seal_due` is an indexed read of one row when there
-is nothing to do, so calling it per message costs almost nothing. With no
-`--url` it serves its own feed over loopback, so it runs offline.
-
-Read it beside `maintainer.py` and the difference is the argument for splitting:
-a seal is CPU-bound pure Python, so at real rates it blocks the event loop that
-is trying to receive. The file says where that line is and what to do about it.
-
-`demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `sync` — and one
-command stops them all. They are separate processes rather than one, because a seal is
-CPU-bound pure Python and so is compaction, only more of it: run together, sealing waits on
-compaction through the interpreter and the buffer grows for as long as it waits. That is
-the same argument that makes the writer its own process, one level down. Each prints only
-when it does something, so silence is the healthy state.
-
-`maintainer.py --role all` is the single-process shape, and is right when the costs do not
-justify four. It is also quieter: four processes committing to one Iceberg table race on
-pyiceberg's post-commit metadata cleanup and log a `Failed to delete metadata file` now and
-then. Measured to be noise — 817,760 rows read back contiguous across a run that logged
-it — but a single process produces none.
+The feed is synthetic on purpose. A demo you can turn up to a hundred thousand
+rows a second is the one that shows what the tiers are for; a real feed arrives
+at whatever rate it arrives at.
 
 ## Adding the archive tier
 
@@ -73,13 +98,13 @@ Add `--replicate` to `demo-archive` and the maintainer runs litestream alongside
 shipping the SQLite WAL to `_wal` beside the archived data. Needs the binary on PATH
 ([install](https://litestream.io/install)) and an archive to ship to.
 
-That supervision lives in `maintainer.py`, not in the library: replication is a separate
+That supervision lives in `adsb/maintainer.py`, not in the library: replication is a separate
 process reading the WAL, which is exactly why it keeps the network out of the write path,
 and litestream is explicit that two instances must never replicate one database. To run it
 independently instead, generate the same config and use it directly:
 
 ```
-uv run python examples/replicate.py --root litelink-data
+uv run python examples/adsb/replicate.py --root litelink-data
 litestream replicate -config litelink-data/litestream.yml
 ```
 
@@ -98,7 +123,7 @@ Nothing coordinates that but the `lease` table. The writer holds no lease and ne
 tries; the maintainer takes both when it starts, and if it dies they lapse and the next
 one takes over.
 
-`maintainer.py` is one loop calling two plain methods at two cadences — `seal_due()`
+`adsb/maintainer.py` is one loop calling two plain methods at two cadences — `seal_due()`
 often, `maintain()` rarely. The library owns neither the thread nor the interval, so
 there is no `seal_mode` to set and nothing starts behind your back.
 
@@ -114,7 +139,7 @@ race on `write.metadata.delete-after-commit` and the loser complains about a fil
 winner already removed. Data files are never affected either way — those go through
 `pending_delete`, transactionally.
 
-The demo keeps its data on purpose — `tail.py` reads it after the writer stops, and it is
+The demo keeps its data on purpose — `adsb/tail.py` reads it after the writer stops, and it is
 there to poke at — so nothing removes it automatically, and `local_retention` is left unset
 so the window grows without bound. Roughly 25 MB per 30 seconds at the default rate. A real
 deployment sets a retention and lets `maintain()` hold the size; the benchmarks, which have
@@ -124,11 +149,11 @@ The stream is an ADS-B position feed over a websocket, parsed into columns rathe
 stored as raw frames — which is the point of declaring a schema, since every field then
 prunes from Iceberg statistics.
 
-`capture.py` appends and nothing else. Every append is durable when `extend()` returns,
+`adsb/capture.py` appends and nothing else. Every append is durable when `extend()` returns,
 with no buffer to flush, and the only other thing it does is record where the next file
 should be cut — see [`docs/RUNTIME.md`](../docs/RUNTIME.md).
 
-`maintainer.py` does everything else, in one process.
+`adsb/maintainer.py` does everything else, in one process.
 
 **Why a process and not the writer's thread.** A seal is CPU-bound pure Python — most of
 its commit is pyiceberg copying table metadata — so a sealing thread starves the
@@ -153,7 +178,7 @@ than an object in Python, and WAL serialises the processes. Reading is safe for 
 reason — but note that DuckDB must never open the buffer database itself, which
 [`docs/RUNTIME.md`](../docs/RUNTIME.md) explains at some cost.
 
-`tail.py` opens the same log `readonly` while the writer runs, and prints where the rows
+`adsb/tail.py` opens the same log `readonly` while the writer runs, and prints where the rows
 are. The column worth watching is the split: rows move from the buffer into the Iceberg
 table at each seal, and the total never double-counts across that boundary because both
 legs derive from one committed extent (§7, I3). It counts in DuckDB rather than

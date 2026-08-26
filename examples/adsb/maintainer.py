@@ -1,6 +1,6 @@
 """One storage role, one process.
 
-    uv run python examples/maintainer.py --role seal|compact|reclaim|sync|all
+    uv run python examples/adsb/maintainer.py --role seal|compact|reclaim|sync|all
 
 The **writer** appends and does nothing else. Everything else is storage work,
 and this runs one piece of it: sealing the buffer into Parquet, converting

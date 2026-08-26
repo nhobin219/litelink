@@ -312,7 +312,7 @@ class LogConfig:
     # process reading the WAL, which is exactly why replication does not put
     # the network in the write path, and litestream is explicit that two
     # instances must never replicate one database. Supervising it belongs in
-    # deployment code, where it is visible: see `examples/maintainer.py`.
+    # deployment code, where it is visible: see `examples/adsb/maintainer.py`.
     wal_replication: bool = False
     # §3a. How far BACK a restore can go, which is not how much is kept safe.
     #
@@ -333,7 +333,7 @@ class LogConfig:
     #
     # That window is append -> seal -> compact -> sync, which no library can
     # know in advance: it depends on the arrival rate and on how often a
-    # maintainer runs. `examples/tail.py` reports the lag it actually is. Set
+    # maintainer runs. `examples/adsb/tail.py` reports the lag it actually is. Set
     # this from that, with margin.
     #
     # None leaves litestream on its own defaults (24h/24h as of v0.5.16).
@@ -841,7 +841,13 @@ class Log:
         made of in a design that refuses directory listing.
         """
         layout = Layout(Path(root), name)
-        if layout.buffer_db.exists():
+        # A buffer with NO catalog beside it is a restore that was interrupted
+        # between the two, not a log. Refusing it would leave the root in a
+        # state neither this nor `Log.open` accepts, so the only way out would
+        # be deleting it by hand. Resumed instead: everything below is safe to
+        # repeat, and the reserve simply skips another window.
+        resuming = layout.buffer_db.exists() and not layout.catalog_db.exists()
+        if layout.buffer_db.exists() and not resuming:
             msg = (
                 f"a log already exists at {layout.root}/{name}; restore refuses to "
                 f"overwrite it. Remove it, or restore into another root"
@@ -885,7 +891,12 @@ class Log:
         # ONLY the buffer, and with no `-if-replica-exists`: that flag exits 0
         # when there is no backup, which would make the check below unable to
         # tell a restored database from an absent one.
-        restore_buffer(config_path, layout.buffer_db, options, binary)
+        #
+        # Skipped when resuming — the buffer is already here, and litestream
+        # would refuse to write over it anyway.
+        if not resuming:
+            restore_buffer(config_path, layout.buffer_db, options, binary)
+
         if not layout.buffer_db.exists():
             msg = (
                 f"no replica of {layout.buffer_db.name} under {archive} — there is "
@@ -922,16 +933,26 @@ class Log:
         schema = pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
         sort_by = tuple(json.loads(raw_sort))
 
-        # REBUILT, not restored. Its Parquet is on the machine that died and
-        # its Iceberg metadata was never replicated, so there is nothing to
-        # point at — see this method's docstring.
-        LogTable.create(layout, table_schema(schema), sort_by)
-
+        # THE RESERVE FIRST, and the table second. `LogTable.create` is the
+        # write that makes this root openable, so with it first an interruption
+        # between the two left a root that `restore` refuses to retry and
+        # `Log.open` cheerfully accepts — reporting `recovery() is None`, with
+        # the sequence still at the replica's frontier, handing out offsets the
+        # dead primary had already served. Measured: a primary served through
+        # 950, the retry refused, and the ordinary open resumed at 901.
+        #
+        # This order has no such state. Interrupted before the table exists,
+        # the root cannot open at all — and `restore` resumes it, below.
         buffer = Buffer.open(layout.buffer_db, schema)
         try:
             released, resumed = buffer.strip_local_state(RESTORE_RESERVE)
         finally:
             buffer.close()
+
+        # REBUILT, not restored. Its Parquet is on the machine that died and
+        # its Iceberg metadata was never replicated, so there is nothing to
+        # point at — see this method's docstring.
+        LogTable.create(layout, table_schema(schema), sort_by)
 
         log = cls.open(layout.root, name, s3=options)
         # ADOPTED, explicitly. `archive.db` was deliberately not restored, so
@@ -953,6 +974,31 @@ class Log:
                 f"below the archive frontier are not recovered"
             )
             raise RuntimeError(msg)
+
+        # RECONCILED against the archive, and this is not optional. A replica
+        # is a consistent snapshot from BEFORE the primary's last sync —
+        # ordinary replication lag, not a crash window — so the archive is
+        # routinely ahead of the `extent` rows the buffer carries. Left alone,
+        # `_seed_group` opens the group at the replica's stale frontier while
+        # the bucket already holds past it, and the first seal on this box
+        # writes a file whose range reaches into the archive's extent.
+        #
+        # That wedges the log permanently: `_refuse_straddle` raises on every
+        # push, `archived_prefix` returns 0 for the straddler so eviction pins
+        # at zero, and local disk grows without bound. Measured — three
+        # append/seal/sync cycles, `archived_through` frozen, file count
+        # climbing, the same error each time. Nothing re-cuts a local
+        # straddler, and this is the operation you run when the archive is the
+        # only surviving copy.
+        #
+        # Releasing what the archive holds and re-seeding is what closes it.
+        # Those rows are genuinely safe: the archive has them, which is the
+        # same authority `_push` releases on.
+        remote = log._archive.table()
+        covered = None if remote is None else remote.extent()
+        if covered is not None:
+            log._buffer.release_archived(covered[1])
+            log._buffer.reseed_group()
 
         # REWRITTEN, now that the policy is back. The config above had to be
         # written before `buffer.db` existed — that is the chicken-and-egg this
@@ -2433,10 +2479,15 @@ class Log:
         # Each pass claims what it works on; see `_pass`.
         self._maintenance.run(heartbeat=None)
 
-        # Sealing IS maintenance — it is the first thing done with what the
-        # writer leaves behind. Called here so that a caller running only this
-        # in a loop is correct; `seal_due` is exposed separately only because
-        # it is cheap enough to run far more often than the rest of this.
+        # Sealing IS maintenance, so a caller running only this in a loop has
+        # to get it; `seal_due` is exposed separately only because it is cheap
+        # enough to run far more often than the rest of this.
+        #
+        # AFTER the pass, not before, and the comment here used to say the
+        # opposite of the line it sat on. The pass works on files that are
+        # already sealed, so a group cut during this call becomes a candidate
+        # on the next one — a cycle of latency, against a pass that would
+        # otherwise compact a file it had just written.
         self.seal_due()
 
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:

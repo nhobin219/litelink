@@ -50,9 +50,11 @@ compaction ever delays sealing enough to matter. It costs latency, not file size
 cut was recorded when the rows arrived.
 
 **Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue;
-`maintain()` compacts, evicts and expires — and calls
-`seal_due()` first, because sealing is the first thing done with what the writer leaves
-behind. They are two methods rather than one only because their costs differ by an order
+`maintain()` compacts, evicts and expires — and calls `seal_due()` itself at the end, so a
+caller running only `maintain()` in a loop is still correct. At the end rather than the
+start because the pass ahead of it works on files that are already sealed: a group cut
+during this call becomes a compaction candidate on the next one, which costs a cycle of
+latency and nothing else. They are two methods rather than one only because their costs differ by an order
 of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
 often, while `maintain()` reads table metadata and wants to be run rarely.
 
@@ -587,7 +589,7 @@ the RPO; removing it made replication the only mechanism rather than one of two.
 just demo-replicate      # generates litestream.yml from the log, runs the sidecar
 ```
 
-**Three databases, not one.** `examples/replicate.py` generates the config from
+**Three databases, not one.** `examples/adsb/replicate.py` generates the config from
 `Log.databases` rather than leaving it to be written by hand, because the set is not
 obvious and getting it wrong is silent: `buffer.db` holds rows no Parquet file has yet,
 `catalog.db` says which files the local table is made of, and `archive.db` says the same
@@ -697,5 +699,5 @@ just demo-tail         # in another terminal: watch it accumulate
 
 A maintainer is not optional. Nothing seals unless something calls `seal_due()` or
 `maintain()`, so a writer running alone accumulates in SQLite indefinitely — durable and
-readable the whole time, but never reaching Parquet. `examples/maintainer.py` is the
+readable the whole time, but never reaching Parquet. `examples/adsb/maintainer.py` is the
 smallest thing that qualifies: one loop, two calls, two intervals.
