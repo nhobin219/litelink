@@ -2281,10 +2281,10 @@ def test_a_held_seal_does_not_widen_the_next_file(
 ) -> None:
     """The defect deferring the delete introduces, if the seal is not bounded.
 
-    `rows_below(end)` has no floor. It was correct only because the delete made
-    one: after `finish_seal`, the buffer's minimum WAS the next group's start.
-    Hold the rows and that stops being true, so an unbounded read sweeps every
-    earlier row into the next file.
+    The seal's read used to be unbounded below. It was correct only because the
+    delete made a floor: after `finish_seal`, the buffer's minimum WAS the next
+    group's start. Hold the rows and that stops being true, so an unbounded
+    read sweeps every earlier row into the next file.
 
     Nothing catches it at seal time — the local `register` passes no `lo`, so
     `_refuse_straddle` returns early. It surfaces later and elsewhere: manifest

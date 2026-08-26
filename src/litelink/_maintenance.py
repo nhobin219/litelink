@@ -1063,7 +1063,11 @@ class Maintenance:
             scratch.claim_seal(start, end, rel_path)
             self._buffer.claim_output(start, end - 1, archive.uri(rel_path))
 
-            rows = scratch.rows_below(end)
+            # Bounded at BOTH ends, though this loop's own `finish_seal`
+            # would leave the floor correct anyway. That is the point: relying
+            # on it is how the log's seal was wrong, and one rule is cheaper to
+            # hold than a rule plus a reason it happens not to matter here.
+            rows = scratch.rows_between(start, end)
             if self._sort_by:
                 rows = rows.sort_by([(c, "ascending") for c in self._sort_by])
 

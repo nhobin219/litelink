@@ -733,16 +733,6 @@ class Buffer:
 
         return 0 if row is None else int(row[0])
 
-    def rows_below(self, end: int) -> pa.Table:
-        """Buffered rows with `offset < end`, as Arrow.
-
-        Unbounded below, so it is only safe where the buffer's floor is known
-        to be the caller's floor. The archive rewrite's scratch buffer holds
-        exactly one re-cut range and qualifies; the LOG's seal does not, and
-        uses `rows_between`. See there for what that cost.
-        """
-        return self._rows("< ?", (end,))
-
     def rows_between(self, start: int, end: int) -> pa.Table:
         """Buffered rows in `[start, end)`, as Arrow. The seal's input.
 
