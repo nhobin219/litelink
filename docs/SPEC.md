@@ -264,6 +264,26 @@ RPO = WAL replication lag        (with wal_replication)
 RPO = max(WAL replication lag, Parquet upload lag)   (before this; the hole)
 ```
 
+**Where a row can be, and which of those places is off the machine.** The
+offset space has two holes in it, and they are different problems:
+
+```
+  [0 .......... archived]  safe — in the archive
+                [archived ...... sealed]  hole A — local Parquet only
+                                  [sealed ... replicated]  safe — in buffer.db
+                                            [replicated ... assigned]  hole B
+```
+
+**Hole A is closed.** It was the band a seal moved out of SQLite into a Parquet
+file no sidecar replicates, above what the archive had taken — so it was on the
+dead machine and nowhere else. Holding those rows until `sync` pushes the range
+removes it.
+
+**Hole B is inherent.** Rows appended inside the replication lag were returned
+to callers by `append` and never shipped. Nothing recovers them; what a restore
+must not do is hand their offsets to different data, which is why it reserves a
+window rather than resuming at the replica's frontier (I9).
+
 **It cannot break writes.** It is a sidecar reading the WAL, not something in the write path.
 If it dies, SQLite is unaffected: you lose replication, not data. That is why it does not
 violate the no-network-in-the-write-path property.
