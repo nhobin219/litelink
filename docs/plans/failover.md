@@ -151,12 +151,9 @@ metadata set. Properties would be a second durable home for a fact `buffer.db`
 already carries — §4a's "one copy of a fact", which nine review rounds were
 spent enforcing.
 
-**Migration, and it must not be silent.** Every existing log's `meta` has no
-`sort_by` row, and `()` is indistinguishable from "old log". Defaulting to `()`
-would make the first compaction after upgrade rewrite files UNSORTED
-(`_maintenance.py:547`) while the Iceberg table still declares the order — a
-table lying about its own clustering. So `Log.open` falls back to
-`table.sort_by()` and **writes it back**, once.
+**No migration.** Pre-release: there are no existing logs, so `meta` carries
+`sort_by` from `Log.new` onward and `Log.open` reads it with no fallback. A
+missing row is corruption, handled the way a missing `config` row already is.
 
 **Unset must be expressible.** `set_sort_order` early-returns on an empty order
 (`_table.py:539`), so `set_sort_by((), rewrite=True)` re-clusters the data and
@@ -164,18 +161,11 @@ never clears the declaration. Today `Log.open` reads the declaration and
 silently reverts; after this move the two records disagree for ever. Fix
 `set_sort_order` to clear the order on empty.
 
-**The restore path cannot use that fallback**, because there is no local table
-to read — step 7 creates one FROM `sort_by`. So a log created before this change
-and never reopened on the primary (or whose backfill never reached the replica)
-restores with `sort_by = ()`, and the first compaction rewrites files unsorted.
-`Log.restore` therefore refuses when `meta` carries no `sort_by` row, rather
-than recovering into a log that will silently de-cluster itself.
-
 **Also declare the sort order on the archive table.** `open_archive` should call
 `set_sort_order` on its create path: the archive is the same table's data later,
 and an Iceberg table that does not declare its clustering is lying about itself.
-A correctness fix in its own right — not the recovery mechanism, since it helps
-only archives created after it lands.
+A correctness fix in its own right, and pre-release there are no archives it
+arrives too late for.
 
 ### 3. `Log.restore(root, name, *, archive, s3=None)`
 
@@ -340,9 +330,8 @@ Each falsified — break the code, prove the test bites.
 2. With `wal_replication`, buffer rows survive a seal and go at sync. Without
    it, they go at seal.
 3. A restore recovers the sealed-but-unsynced band (hole A closed).
-4. `sort_by` survives a restore; an existing log with no `meta` row backfills
-   from the table rather than defaulting to `()`; `set_sort_by(())` clears both
-   records.
+4. `sort_by` survives a restore, and `set_sort_by(())` clears both records —
+   `meta` and the table's declaration — rather than leaving them disagreeing.
 5. Restoring with a stale `archive.db` present does not truncate the archive —
    the measured 261-vs-1061 case.
 6. Archived `extent` rows and remote `pending_delete` rows survive; local ones
