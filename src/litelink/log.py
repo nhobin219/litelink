@@ -44,7 +44,7 @@ from litelink._maintenance import (
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config
 from litelink._s3 import S3Options
-from litelink._table import LogTable
+from litelink._table import LogTable, archive_extent
 from litelink._types import validate_schema
 
 if TYPE_CHECKING:
@@ -84,6 +84,15 @@ _CONFIG_KEY = CONFIG_KEY
 # One home, in `_archive`, because `evict` reads it too.
 _ARCHIVE_KEY = ARCHIVE_KEY
 _SCHEMA_KEY = "arrow_schema"
+# §4's declared clustering, kept here as well as on the table.
+#
+# Not a duplicate of the Iceberg sort order — a fact the local CATALOG carries
+# and nothing else does. `catalog.db` is replicated but cannot be restored onto
+# another machine (it records absolute paths to local metadata no sidecar
+# ships), so a failover rebuilds the local table rather than restoring it, and
+# has to be told what order to declare. `open_archive` never declared one
+# either, so the archive could not answer it.
+_SORT_KEY = "sort_by"
 
 
 # How much larger a compacted file is than a sealed one, when nothing says.
@@ -574,13 +583,14 @@ class Log:
         buffer.set_meta_all(
             {
                 _CONFIG_KEY: settings.to_json(),
+                _SORT_KEY: json.dumps(list(order)),
                 **({_ARCHIVE_KEY: archive} if archive is not None else {}),
             }
         )
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, buffer, s3, table_schema(schema))
+        remote = Archive(layout, buffer, s3, table_schema(schema), order)
 
         return cls(
             layout=layout,
@@ -651,8 +661,17 @@ class Log:
             schema,
             readonly=read_only,
         )
-        sort_by = table.sort_by()
-        remote = Archive(layout, buffer, s3, table_schema(schema))
+        # From `meta`, not from the table. Required like the config and for
+        # the same reason: `new` always writes it, so its absence is a damaged
+        # log, and defaulting to no order would silently de-cluster every file
+        # the next compaction rewrites while the table still declared one.
+        declared = buffer.get_meta(_SORT_KEY)
+        if declared is None:
+            msg = f"log at {layout.root}/{name} has no stored sort order; it is corrupt"
+            raise ValueError(msg)
+
+        sort_by = tuple(json.loads(declared))
+        remote = Archive(layout, buffer, s3, table_schema(schema), sort_by)
         log = cls(
             layout=layout,
             table=table,
@@ -844,12 +863,19 @@ class Log:
         which `set_archive` is; a plain `include_archive` read still leaves the
         leg out until one has run.
 
-        **One writer per archive is assumed, not checked.** The hint records
-        where the metadata was at the last commit THIS log made. Another writer
-        touching that archive while it was detached would leave the hint behind
-        its true state, and adopting it would strand the commits made in
-        between. That is §13's archive-identity seam; the contract is one
-        writer per log, and nothing here enforces it.
+        **An archive AHEAD of this log is refused.** One whose extent reaches
+        at or above the next offset to be assigned is another log's history,
+        and attaching it wedges this one silently — nothing is ever pushed,
+        eviction pins, and local disk grows without bound. `Log.restore` is
+        the operation for resuming that log here. Re-attaching to an archive
+        this log has moved past is unaffected, and supported.
+
+        **One writer per archive is otherwise assumed, not checked.** The hint
+        records where the metadata was at the last commit THIS log made.
+        Another writer touching that archive while it was detached would leave
+        the hint behind its true state, and adopting it would strand the
+        commits made in between. That is §13's archive-identity seam; the
+        contract is one writer per log, and nothing here enforces it.
 
         What re-pointing no longer does is disturb what the log already knows.
         There is no watermark to carry across: each pushed file records the
@@ -876,11 +902,67 @@ class Log:
                 # two serialise. It is the rule §4a already states for data,
                 # applied to the configuration that governs it.
                 validate(self._schema, self._sort_by, self.config, archive)
+                self._refuse_archive_ahead(archive)
                 # The other half of the same rule; see `set_config`.
                 checkpoint(lease.renew)
                 self._repoint(archive)
             finally:
                 lease.release()
+
+    def _refuse_archive_ahead(self, archive: str | None) -> None:
+        """Refuse an archive whose extent is above this log's next offset.
+
+        That archive belongs to a different log's history, and attaching it
+        wedges this one SILENTLY. Traced: `sync` computes `floor` from the
+        archive's extent, every local file sits below it, so `pending` is empty
+        and nothing is ever pushed. The watermark is still written, eviction's
+        I4 clamp finds no `extent` rows and pins at zero, and local disk grows
+        without bound while `sync()` returns success having uploaded nothing.
+        No error surfaces at any step.
+
+        It is reachable by the obvious failover attempt — `Log.new` on a second
+        box, then `set_archive` at the old prefix — which is exactly what
+        `Log.restore` exists to do properly.
+
+        **`>= next_offset`, not "overlaps".** Re-attaching to an archive that
+        holds offsets this log has moved PAST is supported and tested; the
+        archive's ranges simply sit below the local ones. Only an archive
+        reaching at or above the next offset to be assigned is describing a
+        stream this log is not.
+
+        **Read through `version-hint.text`, never `open_archive`.** At this
+        point `meta` still names the OLD archive, so `Archive.table()` opens
+        that one. Going to `open_archive` for the new prefix fails both ways:
+        with `repair=False` the catalog row names the old archive and the
+        boundary check raises on every ordinary re-point; with `repair=True` it
+        drops that row as a side effect of what is meant to be a read.
+
+        Absent, unreachable, or unreadable all PASS. `_repoint` deliberately
+        tolerates an archive that does not exist yet — "configuring one is a
+        statement of intent, not a claim that the bucket exists" — and this is
+        called on every writer restart, so it must not fail closed on a bad
+        minute in object storage.
+        """
+        if archive is None:
+            return
+
+        try:
+            covered = archive_extent(self._layout, archive, self._archive.s3)
+        except Exception:
+            return
+
+        if covered is None:
+            return
+
+        nxt = self._buffer.next_offset()
+        if covered[1] >= nxt:
+            msg = (
+                f"the archive at {archive!r} holds offsets up to {covered[1]}, at or "
+                f"above this log's next offset ({nxt}) — it is another log's "
+                f"history. Attaching it would push nothing and pin eviction, "
+                f"silently. To resume that log here, use Log.restore"
+            )
+            raise ValueError(msg)
 
     def _repoint(self, archive: str | None) -> None:
         """Record the new location, with the maintenance lease held."""
@@ -971,6 +1053,12 @@ class Log:
                 raise RuntimeError(msg)
 
             try:
+                # `meta` FIRST, because it is what `open` reads. The table's
+                # declaration is for anything reading the Iceberg table
+                # directly; a crash between the two leaves them disagreeing,
+                # and this order leaves the disagreement in the direction the
+                # next `open` corrects rather than inherits.
+                self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
                 self._table.set_sort_order(requested)
                 self._sort_by = requested
                 self._maintenance.set_sort_by(requested)
