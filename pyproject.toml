@@ -1,6 +1,6 @@
 [project]
 name = "litelink"
-version = "0.0.0"
+version = "0.1.0"
 description = "Durable append-only capture into Iceberg tables. Local-first, in-process, no service."
 readme = "README.md"
 authors = [
@@ -13,14 +13,13 @@ license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11,<3.14"
 keywords = ["iceberg", "capture", "sqlite", "parquet", "append-only"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Database :: Database Engines/Servers",
     "Typing :: Typed",
 ]
-# The floors docs/SPEC.md measured against. Nothing is implemented yet, so these
-# are the spec's declared substrate rather than an observed import graph — the
-# first module to import one of them is what will start holding them honest.
+# The floors docs/SPEC.md measured against, and every one of them is now on a
+# real import path rather than a declared intention.
 #   sql-sqlite: SqlCatalog on SQLite (§1). pyarrow: the seal path (§15.4).
 dependencies = [
     "duckdb>=1.5.5",

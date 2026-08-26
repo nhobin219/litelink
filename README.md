@@ -223,6 +223,8 @@ for embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 - [`docs/SPEC.md`](docs/SPEC.md) — the design, and in places still ahead of the code
 - [`docs/RUNTIME.md`](docs/RUNTIME.md) — writer and maintainer, threads, processes, what crosses between them
 - [`examples/`](examples/) — the websocket capture, and the synthetic feed with one process per role
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, the gates, and what a good PR here looks like
+- [`SECURITY.md`](SECURITY.md) — what to report privately, and what is a known limit instead
 
 ## Development
 
