@@ -721,8 +721,36 @@ class Buffer:
         return 0 if row is None else int(row[0])
 
     def rows_below(self, end: int) -> pa.Table:
-        """Buffered rows with `offset < end`, as Arrow. The seal's input."""
+        """Buffered rows with `offset < end`, as Arrow.
+
+        Unbounded below, so it is only safe where the buffer's floor is known
+        to be the caller's floor. The archive rewrite's scratch buffer holds
+        exactly one re-cut range and qualifies; the LOG's seal does not, and
+        uses `rows_between`. See there for what that cost.
+        """
         return self._rows("< ?", (end,))
+
+    def rows_between(self, start: int, end: int) -> pa.Table:
+        """Buffered rows in `[start, end)`, as Arrow. The seal's input.
+
+        **Bounded at BOTH ends, and the lower one is load-bearing.** A seal used
+        to be able to take everything below its cut, because `finish_seal`
+        deleted those rows immediately: the buffer's minimum was always the next
+        group's start. Once the delete is deferred until the archive holds the
+        range (§3a), that stops being true — and an unbounded read then writes
+        every row from the archive frontier upward into the new file.
+
+        Nothing catches that at seal time. The local `register` passes no `lo`,
+        so `_refuse_straddle` returns early; what fails is later and elsewhere.
+        The manifest's own ranges stop being non-overlapping (§4, §6), the local
+        leg of a read is an unfiltered `iceberg_scan` so every overlapped row
+        comes back twice, the next `sync` refuses the straddle for ever, and
+        compaction's row-count verification fails.
+
+        `start` costs nothing to supply: `pending_group` and `pending_seal` both
+        already carry it, and both call sites already unpack it.
+        """
+        return self._rows("BETWEEN ? AND ?", (start, end - 1))
 
     def rows_above(self, boundary: int | None) -> pa.Table:
         """Buffered rows with `offset > boundary`, as Arrow. The read's input.
@@ -971,12 +999,23 @@ class Buffer:
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
-    def finish_seal(self, end: int, rel_path: str) -> bool:
-        """Delete sealed rows, retire the group, and clear the intent.
+    def finish_seal(self, end: int, rel_path: str, *, discard: bool = True) -> bool:
+        """Retire the group, clear the intent, and drop the sealed rows.
 
         Garbage collection, not correctness: the read boundary in §7 already
         excludes these rows the moment the Iceberg commit lands, so the window
         between that commit and this call is safe in both directions.
+
+        **`discard=False` keeps them, and that is I4 one tier up.** A seal moves
+        rows from SQLite into a Parquet file that no sidecar replicates, so
+        with WAL shipping on, deleting here removes the only off-box copy of a
+        range the archive does not have yet — and the machine dying in that
+        window loses them, silently, from the middle of the offset space
+        (§3a). The caller passes False when replication is on and something is
+        owed to an archive; `release_archived` is what removes them afterwards.
+
+        Only the CALLER can decide that, which is why it is a parameter rather
+        than a check here: this object knows nothing about archives.
 
         Returns whether this caller's claim was the live one. False means it
         was superseded while it worked, and finishing belongs to whoever holds
@@ -999,7 +1038,11 @@ class Buffer:
             if not cursor.rowcount:
                 return False
 
-            self._con.execute('DELETE FROM buffer WHERE "litelink_offset" < ?', (end,))
+            if discard:
+                self._con.execute(
+                    'DELETE FROM buffer WHERE "litelink_offset" < ?', (end,)
+                )
+
             # NAMED, not deleted. The row is the same fact before and after —
             # this range, these bytes — and sealing only settles where it
             # lives. Deleting it and writing the size to a second table was
@@ -1579,6 +1622,31 @@ class Buffer:
             # The extent goes with the file. It described where those rows
             # live, and they no longer live anywhere by that name.
             self._con.execute("DELETE FROM extent WHERE rel_path = ?", (rel_path,))
+
+    def release_archived(self, boundary: int) -> int:
+        """Drop buffer rows the archive now holds. Returns how many.
+
+        The other half of `finish_seal(discard=False)`: those rows stayed
+        because the archive did not have them yet, and this is what notices
+        that it does.
+
+        Bounded by the ARCHIVE's frontier, never by the seal's. That is the
+        whole point — the seal moves rows to a file nothing replicates, and
+        only the archive makes them safe off-box.
+
+        Idempotent, and it has to be. Driven from the archive's own extent at
+        the start of a pass rather than from the tail of a push, because a push
+        has three early returns before its watermark: a crash between the
+        register and this call would otherwise leave the rows held, and the
+        next pass — finding nothing left to push — would return before reaching
+        it. On a log that has gone quiet, for ever.
+        """
+        with self._lock, self._con:
+            cursor = self._con.execute(
+                'DELETE FROM buffer WHERE "litelink_offset" <= ?', (boundary,)
+            )
+
+        return cursor.rowcount
 
     def queued_deletions(self) -> list[str]:
         with self._lock:

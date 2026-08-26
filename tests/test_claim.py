@@ -342,7 +342,7 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
         start, end = group
         path = log._layout.seal_path(start, end, "tok")
         log._buffer.claim_seal(start, end, path)
-        log._write_and_commit(end, path)
+        log._write_and_commit(start, end, path)
 
         assert log.seal_due() == end, "the replay did not finish the seal"
 
@@ -423,7 +423,7 @@ def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
         assert stolen.acquire(), "could not simulate the takeover"
 
         with pytest.raises(RuntimeError, match="lost the claim on this seal range"):
-            log._write_and_commit(end, path, lapsed)
+            log._write_and_commit(start, end, path, lapsed)
 
         assert log.table_files() == 0, "a lapsed writer committed anyway"
         assert path in log._buffer.queued_deletions(), (

@@ -1333,8 +1333,8 @@ class Log:
                 msg = "lost the claim on this seal range before writing"
                 raise RuntimeError(msg)
 
-            self._write_and_commit(end, rel_path, lease)
-            self._buffer.finish_seal(end, rel_path)
+            self._write_and_commit(start, end, rel_path, lease)
+            self._buffer.finish_seal(end, rel_path, discard=self._discard_on_seal())
         finally:
             lease.release()
 
@@ -1373,15 +1373,47 @@ class Log:
 
             time.sleep(_AWAIT_POLL)
 
+    def _discard_on_seal(self) -> bool:
+        """Whether a seal may drop the rows it just wrote to Parquet (§3a).
+
+        The rule is I4 one tier up: never delete the only off-box copy. What
+        counts as another copy is a property of the deployment, so this is the
+        one question, asked in one place.
+
+        - **No archive** — nothing is off-box either way, and holding would
+          hold for ever, because nothing would ever release it. Discard.
+        - **Archive, no `wal_replication`** — the buffer and the Parquet share
+          a disk and die together, so holding buys nothing and costs SQLite
+          growth. Discard.
+        - **Archive and `wal_replication`** — the buffer IS the off-box copy
+          until the archive has the range. Hold, and let `release_archived`
+          drop them once sync has pushed it.
+
+        `validate` refuses `wal_replication` without an archive, so the last
+        case is just the flag — but both halves are read, because the flag
+        alone would be a claim about the archive that this does not check.
+
+        Read durably on every seal rather than cached: `set_config` and
+        `set_archive` both change the answer from another process, and §4a's
+        rule is that a decision reads the log rather than its own memory.
+        """
+        return not (self.config.wal_replication and self._archive.configured())
+
     def _write_and_commit(
-        self, end: int, rel_path: str, lease: Claim | None = None
+        self, start: int, end: int, rel_path: str, lease: Claim | None = None
     ) -> None:
         """Write the Parquet file, fsync it, then commit it to the table.
 
         I1 in this order: committing first would publish a manifest entry for a
         file that may not survive the crash.
+
+        `start` as well as `end`, because the buffer's floor is no longer the
+        group's floor: with WAL replication on, sealed rows stay until the
+        archive has them (§3a), so a read bounded only above would sweep every
+        earlier row into this file. `Buffer.rows_between` records what that
+        costs.
         """
-        rows = self._buffer.rows_below(end)
+        rows = self._buffer.rows_between(start, end)
         if self._sort_by:
             # §4: the sort order is declared as table metadata AND applied here.
             # Metadata records intent; it does not sort for you.
@@ -1525,8 +1557,8 @@ class Log:
         self._buffer.enqueue_deletions([rel_path], int(datetime.now(UTC).timestamp()))
         retry = self._layout.seal_path(start, end, uuid.uuid4().hex[:8])
         self._buffer.claim_seal(start, end, retry)
-        self._write_and_commit(end, retry, lease)
-        self._buffer.finish_seal(end, retry)
+        self._write_and_commit(start, end, retry, lease)
+        self._buffer.finish_seal(end, retry, discard=self._discard_on_seal())
 
     def _recover_compaction(self) -> None:
         """Resolve a compaction interrupted before its commit (§11).
@@ -1692,6 +1724,22 @@ class Log:
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
+
+        # RELEASED HERE, at the top of the pass, from the archive's own extent.
+        # These are rows a seal held because nothing off-box had them yet
+        # (`_discard_on_seal`); the archive now does, so they can go.
+        #
+        # Not at the tail of this method, and that placement is the whole of
+        # its crash-safety. `_push` returns early in three places before its
+        # watermark — nothing to upload, a declined register, a re-point — so a
+        # crash between `register` and a trailing release leaves the rows held,
+        # and the NEXT pass finds nothing above `floor` to push and returns
+        # before reaching the release. On a log that has gone quiet, they are
+        # held indefinitely. Driven from the frontier instead, it is idempotent
+        # and every pass retries it for free.
+        if not self._discard_on_seal() and floor:
+            self._buffer.release_archived(floor)
+
         # The watermark reconciled against the archive itself. It is a cache of
         # what the archive holds — kept for the push floor and for display, and
         # no longer for anything that authorises a deletion — so a commit that
@@ -1906,6 +1954,19 @@ class Log:
             _ARCHIVE_KEY, pinned, {Maintenance.ARCHIVED_KEY: str(last.hi)}
         ):
             raise _repointed_mid_push()
+
+        # Again, now that this push has landed. The release at the top of the
+        # pass reads the extent as it was BEFORE this push, so on its own it
+        # frees rows one whole sync late — safe, since holding is the safe
+        # direction, but a busy log would carry a sync's worth of rows it no
+        # longer needs.
+        #
+        # This one is the promptness; that one is the correctness. A crash
+        # between the register above and this line leaves rows held, and the
+        # next pass frees them from the archive's own extent without needing
+        # anything to have been uploaded. Neither placement alone is both.
+        if not self._discard_on_seal():
+            self._buffer.release_archived(last.hi)
 
     def maintain(self) -> None:
         """Reclaim local storage: compact, evict, expire (§6, §8, §12).

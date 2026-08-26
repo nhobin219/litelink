@@ -234,7 +234,7 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
         start, end = group
         path = log._layout.seal_path(start, end, "tok")
         log._buffer.claim_seal(start, end, path)
-        log._write_and_commit(end, path)
+        log._write_and_commit(start, end, path)
 
         assert log.table_rows() == 100, "the commit did not land"
         assert log._buffer.pending_group() == group, "the group was retired early"

@@ -617,13 +617,33 @@ That parameter is not optional. DuckDB defaults to the Hadoop `v%s%s.metadata.js
 pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the hint carries that stem
 and the format has to stop prepending a `v`.
 
-**Restore is correct by construction.** A restored buffer may hold rows already sealed into
-the table. Nothing reconciles them, because the read boundary comes from the table's
-committed extent (I3), so those rows fall outside the buffer's contribution automatically.
+**A restored buffer holding sealed rows needs no reconciliation.** The read boundary comes
+from the table's committed extent (I3), so those rows fall outside the buffer's
+contribution automatically.
 
 Measured on this machine: a log at 189,140 appended rows, killed with its directory
-discarded, restored from object storage alone — 189,140 rows readable, none of them ever
-sealed.
+discarded, restored from object storage alone — 189,140 rows readable, **none of them ever
+sealed**.
+
+**That last clause is the whole caveat, and this used to read as though it were not.**
+Restoring the databases onto another machine and opening the log FAILS once anything has
+sealed — measured:
+
+```
+FileNotFoundError: .../orig/litelink/s/metadata/00009-....metadata.json
+```
+
+`catalog.db` records absolute paths to the local Iceberg metadata, and a sidecar ships the
+`.db` files and nothing else — not that metadata, not the Parquet. So a restored catalog
+points into the dead machine's filesystem. It is not particular to sealed logs either:
+`Log.new` writes a metadata JSON before the first append, so a never-sealed log fails the
+same way. What the measurement above actually exercised was a restore back onto the SAME
+paths.
+
+Failing over to another box therefore rebuilds the local table rather than restoring it —
+`Log.restore` — and `catalog.db` stays in the replication set because same-machine
+recovery, where those paths still resolve, is exactly where it is the only record of which
+Parquet the table is made of.
 
 ## Operating it
 

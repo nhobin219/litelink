@@ -2173,3 +2173,150 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
             "superseded archive files are still due against a stamp from "
             f"before the commit that superseded them: {overdue}"
         )
+
+
+def test_replication_holds_sealed_rows_until_the_archive_has_them(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """§3a's middle hole, closed. I4 one tier up.
+
+    A seal moves rows from SQLite into a Parquet file that no sidecar
+    replicates, so with WAL shipping on, dropping them at seal removes the only
+    off-box copy of a range the archive does not hold yet. The machine dying in
+    that window loses them from the MIDDLE of the offset space: below the seal
+    frontier so the buffer no longer has them, above the archive frontier so
+    the bucket does not either.
+
+    So they stay until sync has pushed the range, and only then go.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/held",
+        s3=s3,
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+
+        sealed = log.table_extent()
+
+        assert sealed is not None, "nothing sealed, so the case is not set up"
+        # The buffer's FLOOR is the measure, not its size: `count_above(0)`
+        # counts the unsealed tail too, which is in the buffer either way.
+        buffered = log._buffer.extent()  # noqa: SLF001
+
+        assert buffered is not None
+        assert buffered[0] <= sealed[1], (
+            "the seal dropped rows the archive does not have yet"
+        )
+        # And a read is unaffected, which is what makes holding them affordable:
+        # the buffer leg is bounded by the local table's committed extent.
+        assert log.scan().read_all().num_rows == 1200
+
+        log.maintain()
+        log.sync()
+        archived = log.archived_through()
+
+        assert archived > 0, "nothing reached the archive"
+        # Released only up to the ARCHIVE's frontier, never the seal's.
+        released = log._buffer.extent()  # noqa: SLF001
+
+        assert released is not None
+        assert released[0] > archived, "rows the archive holds were never released"
+        assert log.scan(include_archive=True).read_all().num_rows == 1200
+
+
+def test_without_replication_a_seal_still_drops_its_rows(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """An archive alone is not the trigger.
+
+    Without a sidecar the buffer and the Parquet share a disk and die together,
+    so holding buys nothing and costs SQLite growth on every seal. The gate is
+    `wal_replication`, and this is the half that proves an archive by itself
+    does not flip it.
+    """
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/unheld",
+        s3=s3,
+    ) as log:
+        log.extend(rows(1200))
+        log.seal_due()
+
+        sealed = log.table_extent()
+
+        assert sealed is not None
+        buffered = log._buffer.extent()  # noqa: SLF001
+        # Either the buffer is empty, or what is in it is strictly the unsealed
+        # tail — never a row the seal already wrote to Parquet.
+        assert buffered is None or buffered[0] > sealed[1], (
+            "rows were held with no sidecar to replicate them"
+        )
+
+
+def test_a_held_seal_does_not_widen_the_next_file(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The defect deferring the delete introduces, if the seal is not bounded.
+
+    `rows_below(end)` has no floor. It was correct only because the delete made
+    one: after `finish_seal`, the buffer's minimum WAS the next group's start.
+    Hold the rows and that stops being true, so an unbounded read sweeps every
+    earlier row into the next file.
+
+    Nothing catches it at seal time — the local `register` passes no `lo`, so
+    `_refuse_straddle` returns early. It surfaces later and elsewhere: manifest
+    ranges stop being non-overlapping, the local leg is an unfiltered
+    `iceberg_scan` so the overlap is returned twice, and the next sync refuses
+    the straddle for ever.
+
+    So this asserts the FILES, not the row count — a total can be right while
+    the ranges overlap.
+    """
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=1 << 30,  # never merge, so the seal cuts stand
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/widen",
+        s3=s3,
+    ) as log:
+        for _ in range(3):
+            log.extend(rows(600))
+            log.seal_due()
+
+        files = sorted(log._table.data_files(), key=lambda f: f.lo)  # noqa: SLF001
+
+        assert len(files) > 2, "not enough seals to have a second one to widen"
+        # Contiguous and non-overlapping (§4, §6). A widened file starts at the
+        # log's floor instead of its own group's, so every later file overlaps
+        # every earlier one.
+        for earlier, later in zip(files, files[1:], strict=False):
+            assert later.lo == earlier.hi + 1, (
+                f"{later.lo} does not follow {earlier.hi}: ranges overlap"
+            )
+
+        # And the read agrees, which is what the overlap would break.
+        assert log.scan().read_all().num_rows == 1800
+        assert log.scan().read_all().column(OFFSET).to_pylist() == list(range(1, 1801))
