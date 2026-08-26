@@ -944,10 +944,6 @@ class Buffer:
         the one way this library writes an undersized file, and it takes a
         deliberate call to do it.
 
-        With `cutoff`, only if the group's first row landed at or before then.
-        That was `max_age`, which no longer exists; the parameter is kept
-        because the offline archive rewrite needs the same conditional cut.
-
         An empty group is never closed either way; there would be no file.
         That is asked of the BUFFER, not of `start_offset`, and it used to be
         asked of neither — a group whose rows had gone set `end_offset` to the

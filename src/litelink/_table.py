@@ -363,9 +363,16 @@ class LogTable:
     ) -> LogTable:
         """Create the table and declare its sort order.
 
+        TWO commits, not one: the catalog row lands first and the sort order
+        after it. Nothing in this library reads that declaration back — `open`
+        takes `sort_by` from `meta` (§4) — so it is there for anything reading
+        the Iceberg table directly. `Log.restore` cares about the split, since
+        the first commit is what makes a root openable; see there.
+
         §4 wants the order declared as table metadata AND applied at write
-        time. The declaration is what makes `sort_by` recoverable by `open`,
-        rather than something the caller has to restate identically forever.
+        time. The declaration used to be what made `sort_by` recoverable by
+        `open`; `meta` carries it now, because a failover rebuilds this table
+        and has to be told what to declare.
         """
         catalog = cls._catalog_for(layout)
         catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
@@ -607,6 +614,17 @@ class LogTable:
         return cls(catalog, layout, table, prefix)
 
     @staticmethod
+    def forget(layout: Layout) -> None:
+        """Drop this log's local catalog row, leaving the root unopenable.
+
+        `create` is two commits and only the first makes a root openable, so a
+        failure in the second needs undoing — see `Log.restore`. The objects it
+        may have written stay: a metadata JSON nothing references is inert, and
+        the alternative is deleting files on a path already handling a failure.
+        """
+        LogTable._catalog_for(layout).drop_table(layout.table_id)
+
+    @staticmethod
     def exists_for(layout: Layout) -> bool:
         """Whether the LOCAL catalog holds a table for this log.
 
@@ -616,9 +634,15 @@ class LogTable:
         Read straight out of the catalog's own SQLite, like
         `_recorded_location` and for the same reason — the question has to be
         answerable without loading the table, whose metadata may not exist yet.
-        A catalog too old or too new to have that shape answers False, which
-        sends the caller down the create path where pyiceberg decides for
-        itself.
+        **Raises `LookupError` when it cannot tell**, which is the same refusal
+        `_recorded_location` makes and for a sharper reason. `catalog.db` runs
+        in `journal_mode=delete` with no busy timeout on this connection, so a
+        read landing in another process's commit window returns `SQLITE_BUSY`.
+        Answering False there tells `Log.restore` it is resuming an interrupted
+        restore when it is looking at a LIVE log — and the resume path then
+        reserves 2**20 offsets on it, deletes every `extent` row including
+        queued cuts, wipes `sealing` and `claim`, drops the archive catalog
+        row, and deletes buffered rows below the frontier.
         """
         if not layout.catalog_db.exists():
             return False
@@ -631,8 +655,9 @@ class LogTable:
                 " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
                 (LOCAL_CATALOG, namespace, name),
             ).fetchone()
-        except sqlite3.Error:
-            return False
+        except sqlite3.Error as exc:
+            msg = f"cannot read the local catalog's own table: {exc}"
+            raise LookupError(msg) from exc
         finally:
             connection.close()
 
