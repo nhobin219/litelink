@@ -341,14 +341,18 @@ rustfs:
 rustfs-stop:
     @docker rm -f litelink-rustfs >/dev/null 2>&1 && echo "rustfs stopped" || echo "not running"
 
-# Delete a demo's captured data.
-demo-clean root="litelink-data":
+# Two roots because the demos do not share one: `examples/websocket.py` writes
+# to `litelink-ws` and the adsb scripts to `litelink-data`, and cleaning only
+# the root that happened to be passed left the other on disk. Each is handled
+# independently, so a missing one does not stop the other being removed.
+
+# Delete every demo's captured data — the adsb root and the websocket one.
+demo-clean root="litelink-data" ws_root="litelink-ws":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -e "{{root}}" ]; then
         echo "nothing at {{root}}"
-        exit 0
-    fi
+    else
     # The archive first, while the log can still say where it is. Reading it
     # from the log rather than from the environment means this removes what
     # THIS demo wrote, even if `.env` has changed since.
@@ -397,11 +401,21 @@ demo-clean root="litelink-data":
     " || echo "  skipped the archive (no credentials, or nothing to remove)"
     echo "removing {{root}} ($(du -sh "{{root}}" | cut -f1))"
     rm -rf "{{root}}"
+    fi
+    # No archive pass for the websocket root: that demo is local-only — it
+    # never takes an `archive=`, so there is nothing off-box to consult or
+    # remove, and opening the log to ask would only be a way to fail.
+    if [ ! -e "{{ws_root}}" ]; then
+        echo "nothing at {{ws_root}}"
+    else
+        echo "removing {{ws_root}} ($(du -sh "{{ws_root}}" | cut -f1))"
+        rm -rf "{{ws_root}}"
+    fi
 
 # Write and read throughput on this machine. --quick for a smaller run.
 bench *args:
-    uv run python benchmarks/throughput.py {{args}}
+    uv run --quiet python benchmarks/throughput.py {{args}}
 
 # What litelink costs on top of the raw SQLite write it is built on.
 bench-floor *args:
-    uv run python benchmarks/vs_sqlite.py {{args}}
+    uv run --quiet python benchmarks/vs_sqlite.py {{args}}

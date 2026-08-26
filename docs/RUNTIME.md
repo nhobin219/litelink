@@ -79,8 +79,8 @@ range claimed skips it and finds the work still there next pass.
      └─ with _lock:  ONE transaction
           INSERT INTO buffer ................. per row
           running total += row bytes ......... in the same txn
-          crossed target_size?  ──► freeze the cut HERE, at this row,
-                                    and open the next group
+          crossed target_seal_size?  ──► freeze the cut HERE, at this row,
+                                         and open the next group
           UPDATE extent  ..................... once per batch
      ◄─ returns offsets; rows are ALREADY DURABLE (synchronous=FULL)
                               │
@@ -151,8 +151,9 @@ directory walk. That matters most where a walk is a paginated, billable LIST.
 
 ## Why the cut is decided by the appender
 
-`target_size` is the library's one promise about file size, and it is kept on the append
-path — in the transaction that crosses the threshold, at the exact row that crosses it.
+`target_seal_size` is the library's one promise about file size, and it is kept on the
+append path — in the transaction that crosses the threshold, at the exact row that crosses
+it.
 
 A running byte counter cannot keep that promise. A counter tells a sealer that a
 threshold was crossed; it never says **where**. A sealer that polls one cuts wherever the
@@ -251,7 +252,7 @@ workload with the reader in a separate process ran clean, which is the tell: cro
 is the case WAL is designed for; two libraries inside one process is not.
 
 **What that cache costs.** It mirrors the *unsealed* tail and nothing else, so it is
-bounded by whatever bounds the buffer — `target_size` plus however far behind the
+bounded by whatever bounds the buffer — `target_seal_size` plus however far behind the
 maintainer is — and it releases: measured over 24 append/seal/read cycles, the cached
 tail returns to zero rows and Arrow's allocation to zero after each seal. Run a writer
 with no maintainer and it grows, at roughly 1.1x the payload, for the same reason the
@@ -268,7 +269,7 @@ query.
 
 ## File sizing, and where undersized files are allowed to be
 
-`target_size` is the size a file should be, and the seal cut is exact — the appending
+`target_seal_size` is the size a file should be, and the seal cut is exact — the appending
 transaction closes a group at the row that crosses it. Nothing else produces a file, so in
 normal operation **every file in the system is the size it was asked to be**, and the
 things that exist to repair sizing have nothing to repair.
@@ -303,8 +304,8 @@ after — and it coupled RPO to file size, so shrinking the window to lose less 
 crash produced worse files. §3a names that trade; WAL replication is what breaks it, and
 freshness in the cloud is its job rather than the seal's.
 
-**One undersized file may exist, and only at the frontier.** The buffer's trailing rows
-have not reached `target_size` yet; they stay in SQLite, readable, until they do. Anything
+**One undersized file may exist, and only at the frontier.** The buffer's trailing rows have
+not reached `target_seal_size` yet; they stay in SQLite, readable, until they do. Anything
 already written as a file is full.
 
 **Where compaction still earns its place.** An explicit `seal()` cuts short by definition,
@@ -349,7 +350,7 @@ Holding it blocked the archive permanently: everything after it is newer, so the
 never advanced, and I4 pinned local disk with it.
 
 So the archive can gain one small file per explicit seal. `rewrite_archive` is the tool
-for that, ad-hoc, and the same one that recompacts after a `target_size` change.
+for that, ad-hoc, and the same one that recompacts after a `target_compact_size` change.
 
 **What would change this.** Compaction rewriting everything downstream of an undersized
 file would keep the archive perfect — merging `[0.1][8][8]` and splitting at the cap moves
@@ -505,12 +506,12 @@ sealers came to write the same file. The read-only connection needs no such lock
 that is the proof the rule is about transactions rather than about threads — nothing ever
 opens one on it.
 
-**The seal has two ceilings, and the tighter one binds.** `target_size` bounds the bytes a
-file holds, `target_rows` the number of rows, and the cut lands on whichever is reached
-first. They are not interchangeable: buffer cost is per ROW, so a stream of narrow rows
-reaches a byte target only after far more rows than the read-latency ceiling was sized for,
-while every byte-based check reports the buffer is fine. Compaction respects both, or it
-would merge exactly the files a row cap just created straight back past it.
+**The seal has two ceilings, and the tighter one binds.** `target_seal_size` bounds the
+bytes a file holds, `target_seal_rows` the number of rows, and the cut lands on whichever is
+reached first. They are not interchangeable: buffer cost is per ROW, so a stream of narrow
+rows reaches a byte target only after far more rows than the read-latency ceiling was sized
+for, while every byte-based check reports the buffer is fine. Compaction respects both, or
+it would merge exactly the files a row cap just created straight back past it.
 
 Note the direction, which is the opposite of retention's. These are ceilings on one file
 and the tighter wins; `local_retention` and `local_rows` are floors on what stays readable
@@ -578,8 +579,8 @@ Sealed data is in the archive once `sync` has pushed it. Everything else — row
 not sealed yet, and the catalogs that say what the sealed files are — is SQLite on local
 disk, and a WAL-shipping sidecar is what gets it off the machine.
 
-**Nothing bounds the loss window without one.** The seal fires on `target_size` alone, so a
-stream that goes quiet holds its last partial file's worth of rows indefinitely. The
+**Nothing bounds the loss window without one.** The seal fires on `target_seal_size` alone,
+so a stream that goes quiet holds its last partial file's worth of rows indefinitely. The
 `max_age` timer used to bound it, at the cost of making one knob set both the file size and
 the RPO; removing it made replication the only mechanism rather than one of two.
 

@@ -133,6 +133,10 @@ there is no `seal_mode` to set and nothing starts behind your back.
 just demo-clean        # delete the captured data when you are done
 ```
 
+That removes both demo roots — `litelink-data` here and `litelink-ws` from the websocket
+capture — plus whatever this log pushed to the archive, so one command covers every demo
+in this directory.
+
 Benchmarks live in [`benchmarks/`](../benchmarks/).
 
 The four maintainer processes all commit to the Iceberg table, and they race on

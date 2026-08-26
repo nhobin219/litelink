@@ -422,9 +422,9 @@ class Log:
         schema = _declared_schema(layout, application_schema(table.arrow_schema()))
 
         # Read through a throwaway connection, like the schema above it,
-        # because the buffer needs `target_size` before it can size the groups
-        # it cuts and the value lives in the buffer's own database. A wart:
-        # policy is stored inside the thing that consumes it.
+        # because the buffer needs `target_seal_size` before it can size the
+        # groups it cuts and the value lives in the buffer's own database. A
+        # wart: policy is stored inside the thing that consumes it.
         #
         # Required, not defaulted, for the same reason as the schema: new()
         # always writes it, so its absence is a damaged log rather than an
@@ -1494,12 +1494,12 @@ class Log:
         # One mechanism for both cases: owners are unique per attempt, so the
         # row that refuses a sealer in another process refuses one in another
         # thread on the same terms — and it lapses if this attempt dies
-        # mid-seal, so another may finish what `sealing` records.
-        # The range comes from the queue, not from whatever the buffer happens
-        # to hold now. That is the difference between a file of `target_size`
-        # and a file of however much arrived while the sealer was getting here
-        # — and it costs one indexed row read instead of the SCAN that asking
-        # the buffer for its extent used to.
+        # mid-seal, so another may finish what `sealing` records. The range
+        # comes from the queue, not from whatever the buffer happens to hold
+        # now. That is the difference between a file of `target_seal_size` and
+        # a file of however much arrived while the sealer was getting here —
+        # and it costs one indexed row read instead of the SCAN that asking the
+        # buffer for its extent used to.
         #
         # Read BEFORE the claim, because the claim is over this range and the
         # queue is what names it. Nothing is decided by the read: a second
@@ -1563,8 +1563,8 @@ class Log:
             #
             # The write itself cannot be checkpointed — it is one blocking call
             # — so it gets a full TTL and no more. A single group is one
-            # `target_size` file; a write that outlasts 30 s means the machine
-            # is in trouble, and stopping is the right answer then too.
+            # `target_seal_size` file; a write that outlasts 30 s means the
+            # machine is in trouble, and stopping is the right answer then too.
             if not lease.renew():
                 msg = "lost the claim on this seal range before writing"
                 raise RuntimeError(msg)
@@ -1710,11 +1710,11 @@ class Log:
         can be run often; `maintain` reads table metadata and wants to be run
         rarely. That difference is the only reason they are two methods.
 
-        "Due" means cut. `target_size` is the only trigger and it needs nothing
-        here: the cut was recorded by the append that crossed it, and this
-        writes the file. There is no age branch, so a quiet stream is simply
-        one whose rows stay in the buffer — durable, readable, and replicated
-        by §3a — until enough of them arrive to fill a file.
+        "Due" means cut. `target_seal_size` is the only trigger and it needs
+        nothing here: the cut was recorded by the append that crossed it, and
+        this writes the file. There is no age branch, so a quiet stream is
+        simply one whose rows stay in the buffer — durable, readable, and
+        replicated by §3a — until enough of them arrive to fill a file.
 
         A group whose lease is held elsewhere is left alone, not waited for.
         """
@@ -2323,8 +2323,8 @@ class Log:
         operation does not need it: `sync` pushes only files compaction has
         finished with, so the archive is well-sized by construction. It exists
         for the two things that break that on purpose — an explicit `seal()`
-        stranding a small file, and a change to `target_size`, which applies to
-        the future while the archive is immutable history.
+        stranding a small file, and a change to `target_compact_size`, which
+        applies to the future while the archive is immutable history.
 
         Run it when nothing else is maintaining the log: it takes the same
         lease as `maintain` and `sync`, and it rewrites the same files they

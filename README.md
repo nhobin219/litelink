@@ -23,7 +23,7 @@ once they reach a target size, and sync from there into an Iceberg table on S3:
 
 ```
 SQLite buffer          durable on commit. unsealed rows only.
-      │  seal at target_size
+      │  seal at target_seal_size
       ▼
 local Iceberg table    a rolling window. reads land here.
       │  sync: upload data files, register into the archive
@@ -77,6 +77,11 @@ log = Log.new("data", "trades", schema=schema, sort_by=("event_ts",))
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076, "side": 0})  # durable on return
 
+# When rows arrive in groups, extend() commits the whole group in ONE
+# transaction — one fsync for the batch, not one per row. That call size is the
+# write throughput lever, and a call-site choice: no LogConfig setting tunes it.
+log.extend(group_of_rows)                          # append(row) is extend([row])
+
 # open() takes none of it — schema, sort order, config and archive all come
 # from the log itself.
 log = Log.open("data", "trades")
@@ -97,7 +102,6 @@ process per storage role:
 just demo-capture      # append continuously — the hot path, and nothing else
 just demo-maintain     # in another terminal: seal, compact, evict, expire
 just demo-tail         # in a third: watch where the rows are
-just bench --quick     # write and read throughput on your hardware
 ```
 
 To add the archive tier against a local S3-compatible store:
@@ -133,6 +137,18 @@ config from the layout alone, restores `buffer.db`, rebuilds the local table, ad
 archive, and reserves an offset window so nothing the dead machine served is reissued.
 Verified against a local S3-compatible store and against AWS. See [`examples/`](examples/).
 
+## Benchmarks
+
+```bash
+just bench             # write and read throughput on this machine
+just bench --quick     # a smaller run
+```
+
+Both print what each number means, not just the number. SPEC §3 and §7 carry figures from a
+2 vCPU box and both say to re-measure on target hardware — this is that measurement.
+[`benchmarks/`](benchmarks/) has the rest, including `just bench-floor`: what litelink costs
+on top of the raw SQLite write it is built on.
+
 ## How it works
 
 - **Iceberg is used, not reimplemented.** Manifests, per-file column statistics, schema with
@@ -144,13 +160,9 @@ Verified against a local S3-compatible store and against AWS. See [`examples/`](
   write amplification and buys nothing, because the local WAL already made the row durable.
 - **Read boundaries are derived from committed table state**, never from a stored flag — so
   no seal window can double-count or drop.
-- **The seal cut is chosen by the appender**, in the transaction that crosses `target_size`,
-  and queued. A sealer that falls behind therefore writes several correctly-sized files rather
-  than one oversized one.
-- **Compaction is local**, and in normal operation a no-op: the seal cuts on
-  `target_seal_size` alone, so every file already lands at that size. What it is for is
-  converting seals into archive-shaped files when `target_compact_size` is larger. Local means
-  no egress to read files back.
+- **The seal cut is chosen by the appender**, in the transaction that crosses
+  `target_seal_size`, and queued. A sealer that falls behind therefore writes several
+  correctly-sized files rather than one oversized one.
 
 Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
 
@@ -168,8 +180,9 @@ both:
 | `target_compact_size` | a file on disk | large | per-file overhead dominates both scans and uploads |
 
 Compaction is what bridges them, and that is its whole job: converting sealed chunks into
-archive-shaped ones. It defaults to **8× the seal size**, so the conversion is on even without
-an archive — file count is a measured cost here, not a reputation. Reading the offset boundary
+archive-shaped ones, reading and rewriting them on local disk so nothing is pulled back out
+of object storage to be merged. It defaults to **8× the seal size**, so the conversion is on
+even without an archive — file count is a measured cost here, not a reputation. Reading the offset boundary
 from manifest statistics measured **1.0 ms over one file and 44 ms over 64**, and uploading a
 9 kB file to S3 took **648 ms**, nearly all of it round trip rather than bytes.
 

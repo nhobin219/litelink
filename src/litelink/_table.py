@@ -1118,9 +1118,9 @@ class LogTable:
         with, so there is no second client to configure and no way to read from
         somewhere the table does not point.
 
-        Whole-file, not streamed. These are `target_size` files, the same
-        amount a seal holds in memory to write one, and the caller is an
-        explicit operation rather than anything on a read path.
+        Whole-file, not streamed. These are `target_compact_size` files, the
+        same amount compaction holds in memory to write one, and the caller is
+        an explicit operation rather than anything on a read path.
         """
         payload = self._table.io.new_input(path).open().read()
         destination.parent.mkdir(parents=True, exist_ok=True)

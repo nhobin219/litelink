@@ -76,17 +76,17 @@ class LogConfig:
     # That equivalence is what does NOT generalise. §7's buffer cost is per ROW
     # (SQLite is row-oriented: 1.0 us/row at 20k, 2.3 us/row at 180k), so a
     # stream of 40-byte rows reaches 8 MiB at 200k rows and a read-latency
-    # ceiling meant to hold at 20k is breached tenfold. Bytes bound memory; rows
-    # bound read latency; they are different failure modes. A narrow-row stream
-    # may eventually need `min(target_size, target_rows)` —
+    # ceiling meant to hold at 20k is breached tenfold. Bytes bound memory;
+    # rows bound read latency; they are different failure modes. A narrow-row
+    # stream may eventually need `min(target_seal_size, target_seal_rows)` —
     # deliberately not added now, on one knob until a real workload demands the
     # second.
     target_seal_size: int = 8 * 1024 * 1024
-    # The second half of §7's argument, and the one `target_size` cannot make.
-    # Buffer cost is per ROW — SQLite is row-oriented, 1.0 us/row at 20k and
-    # 2.3 us/row at 180k — so a stream of 40-byte rows reaches 8 MiB at 200k
-    # rows and breaches a read-latency ceiling meant to hold at 20k, tenfold,
-    # while every byte-based check reports the buffer is fine.
+    # The second half of §7's argument, and the one `target_seal_size` cannot
+    # make. Buffer cost is per ROW — SQLite is row-oriented, 1.0 us/row at 20k
+    # and 2.3 us/row at 180k — so a stream of 40-byte rows reaches 8 MiB at
+    # 200k rows and breaches a read-latency ceiling meant to hold at 20k,
+    # tenfold, while every byte-based check reports the buffer is fine.
     #
     # Bytes bound memory; rows bound read latency. Both are CEILINGS on one
     # file, so the seal cuts at whichever is reached FIRST — the mirror of
@@ -172,13 +172,13 @@ class LogConfig:
     # stay readable without touching the network, so the binding one is the one
     # that keeps more.
     #
-    # The mirror image of the seal's `min(target_size, target_rows)` in §12,
-    # deliberately: there the two are ceilings and the tighter wins, here they
-    # are floors and the looser does.
+    # The mirror image of the seal's `min(target_seal_size, target_seal_rows)`
+    # in §12, deliberately: there the two are ceilings and the tighter wins,
+    # here they are floors and the looser does.
     #
     # Rows, not files, because it is a statement about the data — "the last
-    # million entries stay local" survives a change to `target_size`, and "the
-    # last ten files" does not.
+    # million entries stay local" survives a change to either size target, and
+    # "the last ten files" does not.
     #
     # FOLLOW-UP: no third floor in BYTES, and deliberately. These two answer
     # "what can I query without touching the network", which is how queries are

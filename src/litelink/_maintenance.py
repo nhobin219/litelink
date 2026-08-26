@@ -70,11 +70,11 @@ def runs(
     have been rewritten underneath it.
 
     Sizes come from `memory` — what each file holds uncompressed, as the
-    appender counted it — and the budget is `target_size`, which is stated in
-    those same units. That correspondence is the point. Sizing this by the
-    files' size on disk is what the code here used to do, and on data that
-    compresses 8:1 it merged eight files that were each already full, into one
-    holding eight times the memory the target allows.
+    appender counted it — and the budget is `target_compact_size`, which is
+    stated in those same units. That correspondence is the point. Sizing this
+    by the files' size on disk is what the code here used to do, and on data
+    that compresses 8:1 it merged eight files that were each already full, into
+    one holding eight times the memory the target allows.
 
     A file whose size was never recorded counts as full. Unknown is not zero:
     treating it as small is what would pull an already-correct file into a
@@ -88,11 +88,11 @@ def runs(
     file would take it past the budget, and the pass emits several correctly
     sized files instead of one enormous one.
 
-    `rows` is `target_rows`, and it has to be here for the same reason. A seal
-    that cut on the row limit produced a file holding fewer bytes than
-    `target_size`, which by bytes alone looks starved — so compaction would
-    merge exactly the files the row cap just created, straight back past it.
-    Whichever ceiling the seal respected, this respects too.
+    `rows` is `target_compact_rows`, and it has to be here for the same reason.
+    A seal that cut on the row limit produced a file holding fewer bytes than
+    `target_compact_size`, which by bytes alone looks starved — so compaction
+    would merge exactly the files the row cap just created, straight back past
+    it. Whichever ceiling the seal respected, this respects too.
     """
     limit = rows or _NO_ROW_LIMIT
     grouped: list[list[DataFile]] = []
@@ -373,11 +373,14 @@ class Maintenance:
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Merge runs of undersized adjacent files (§6).
 
-        A no-op in normal operation. The cut is exact and there is no timer to
-        cut early, so every file a seal writes already holds what it should.
-        This is for the deliberate exceptions: an explicit `seal()`, which cuts
-        short by definition, and a change to `target_size`, which leaves
-        existing files sized for the old value.
+        Real work on the happy path. Not repair — the cut is exact and there is
+        no timer to cut early, so every file a seal writes already holds what
+        it should — but conversion: `target_compact_size` defaults to eight
+        times `target_seal_size`, so eight sealed files become one, archive or
+        no archive. It also picks up the deliberate exceptions: an explicit
+        `seal()`, which cuts short by definition, and a change to
+        `target_compact_size`, which leaves existing files sized for the old
+        value. A no-op only where the two targets are set equal.
 
         The table is unpartitioned, so the compaction unit is a contiguous
         offset range — safe precisely because sealed files already cover
@@ -849,7 +852,7 @@ class Maintenance:
         heartbeat: Callable[[], bool] | None = None,
         owner: str | None = None,
     ) -> None:
-        """Re-cut undersized archived files to `target_size` (§6, ad-hoc).
+        """Re-cut undersized archived files to `target_compact_size` (§6, ad-hoc).
 
         Not part of `maintain`, and not expected to be needed. The archive is
         well-sized by construction: `sync` pushes only what compaction has
@@ -857,8 +860,8 @@ class Maintenance:
         Two deliberate acts break that. An explicit `seal()` can strand a small
         file between larger ones, where compaction can never merge it and
         `sync` pushes it rather than blocking the watermark for ever. And
-        changing `target_size` leaves history sized for the old value, since
-        the archive is immutable and a size change applies to the future.
+        changing `target_compact_size` leaves history sized for the old value,
+        since the archive is immutable and a size change applies to the future.
 
         **It re-ingests rather than merging.** The rows from the first
         badly-sized file onwards are appended to a scratch `Buffer` and sealed
@@ -909,7 +912,7 @@ class Maintenance:
         self._recut(archive, stale, heartbeat, owner)
 
     def _badly_sized(self, archive: LogTable) -> list[DataFile]:
-        """The archived files from the first one under `target_size` on.
+        """The archived files from the first one under `target_compact_size` on.
 
         Everything before it already holds a full target and re-cutting it
         would rewrite bytes to reproduce them. Everything after has to move
