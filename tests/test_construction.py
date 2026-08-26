@@ -1162,3 +1162,38 @@ def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
             buffer.seed_offsets(1)
     finally:
         buffer.close()
+
+
+def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
+    tmp_path: Path,
+) -> None:
+    """ "Cannot tell" and "no table" have opposite safe answers here.
+
+    `Log.restore` reads this to decide whether it is resuming an interrupted
+    restore. Answering False when the catalog merely could not be READ tells it
+    to resume over a LIVE log — and the resume path reserves 2**20 offsets on
+    it, deletes every `extent` row including queued cuts, wipes `sealing` and
+    `claim`, drops the archive catalog row, and deletes buffered rows below the
+    frontier.
+
+    It is reachable without corruption: `catalog.db` runs in
+    `journal_mode=delete` with no busy timeout on this connection, so a read
+    landing in another process's commit window returns SQLITE_BUSY.
+    `_recorded_location` refuses the same conflation, in the same words.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA):
+        pass
+
+    layout = Layout(tmp_path, "s")
+
+    assert LogTable.exists_for(layout) is True
+
+    # Not a SQLite database at all, standing in for a read that cannot answer.
+    layout.catalog_db.write_bytes(b"not a database, and not an absent one")
+
+    with pytest.raises(LookupError):
+        LogTable.exists_for(layout)
+
+    # And the caller that matters treats it as "exists" rather than proceeding.
+    with pytest.raises((LookupError, FileExistsError, ValueError, RuntimeError)):
+        Log.restore(tmp_path, "s", archive="s3://bucket/prefix")

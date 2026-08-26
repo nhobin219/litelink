@@ -400,8 +400,19 @@ class Log:
         disturb the single writer §1 assumes.
         """
         layout = Layout(Path(root), name)
-        if not layout.catalog_db.exists():
-            msg = f"no litelink log at {layout.root} — use new() to create one"
+        # Asked of THIS log's table, not of `catalog.db`. That file is shared
+        # by every log under the root (§2), so a root holding one log answered
+        # the question for every other name in it — and the caller got
+        # pyiceberg's `NoSuchTableError` out of the load below instead of the
+        # message here. "Cannot tell" falls through and lets the load answer,
+        # which is slower and correct.
+        try:
+            present = LogTable.exists_for(layout)
+        except LookupError:
+            present = True
+
+        if not present:
+            msg = f"no litelink log at {layout.root}/{name} — use new() to create one"
             raise FileNotFoundError(msg)
 
         table = LogTable.load(layout, readonly=read_only)
@@ -543,7 +554,18 @@ class Log:
         # Asked of the table, not of `catalog.db`. That file is shared by every
         # log under the root (§2), so in a root holding a second log it exists
         # already and a genuinely interrupted restore would never resume.
-        resuming = layout.buffer_db.exists() and not LogTable.exists_for(layout)
+        #
+        # A catalog it cannot READ counts as a log that exists. The resume path
+        # reserves offsets, deletes every `extent` row and wipes the claim
+        # tables — safe on an interrupted restore, catastrophic on a live log —
+        # so "cannot tell" has exactly one safe reading, and it is not the one
+        # that proceeds.
+        try:
+            has_table = LogTable.exists_for(layout)
+        except LookupError:
+            has_table = True
+
+        resuming = layout.buffer_db.exists() and not has_table
         if layout.buffer_db.exists() and not resuming:
             msg = (
                 f"a log already exists at {layout.root}/{name}; restore refuses to "
@@ -698,6 +720,7 @@ class Log:
             # the same authority `_push` releases on.
             adopted = remote.table()
             covered = None if adopted is None else adopted.extent()
+            frontier = 0 if covered is None else covered[1]
             if covered is not None:
                 released -= buffer.release_archived(covered[1])
                 buffer.reseed_group()
@@ -708,7 +731,21 @@ class Log:
         # its Iceberg metadata was never replicated, so there is nothing to
         # point at — see this method's docstring. Last, so it is the moment
         # this root becomes a log.
-        LogTable.create(layout, table_schema(schema), sort_by)
+        #
+        # ALL OR NOTHING, because `create` is two commits: the catalog row that
+        # makes the root openable, then the sort order. A failure between them
+        # left a root `restore` refuses to retry — telling the operator to
+        # delete a log whose data is in fact intact — declaring no sort order,
+        # with no replication config and no recovery report. Undoing the row
+        # puts the root back to unopenable, which is the state the whole
+        # ordering above exists to guarantee.
+        try:
+            LogTable.create(layout, table_schema(schema), sort_by)
+        except Exception:
+            with contextlib.suppress(Exception):
+                LogTable.forget(layout)
+
+            raise
 
         log = cls.open(layout.root, name, s3=options)
 
@@ -732,9 +769,17 @@ class Log:
         # buffer that no longer exists.
         local = log.table_extent()
         buffered = log._buffer.extent()  # noqa: SLF001
+        # The ARCHIVE's own frontier, read above, not `archived_through` — that
+        # reads the replica's `meta`, which is the exact staleness the reconcile
+        # ten lines up exists to correct. It bites whenever the release empties
+        # the buffer, which is the ordinary "died shortly after a sync" shape:
+        # measured, 16,100 offsets reported skipped that were present and
+        # readable. Nothing is lost by it, but the documented response to a
+        # skipped range is to re-fetch from upstream, and doing that would
+        # duplicate them.
         highest = max(
             0 if local is None else local[1],
-            log._maintenance.archived_through(),  # noqa: SLF001
+            frontier,
             0 if buffered is None else buffered[1],
         )
         log._restored_from = _Recovery(  # noqa: SLF001

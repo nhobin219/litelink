@@ -3028,8 +3028,18 @@ def test_a_failed_restore_never_leaves_an_openable_root(
         msg = "a bad minute in object storage"
         raise RuntimeError(msg)
 
+    # Every step that can fail, INCLUDING the sort-order commit inside
+    # `LogTable.create`. That method is two commits — the catalog row makes the
+    # root openable, the declaration follows — so a failure in the second used
+    # to leave a root refusing to retry while `Log.open` accepted it, telling
+    # the operator to delete a log whose data was intact.
     for attempt, (target, method) in enumerate(
-        [(Buffer, "strip_local_state"), (Archive, "table"), (Buffer, "reseed_group")]
+        [
+            (Buffer, "strip_local_state"),
+            (Archive, "table"),
+            (Buffer, "reseed_group"),
+            (LogTable, "set_sort_order"),
+        ]
     ):
         root = tmp_path / f"try{attempt}"
         (root / "s").mkdir(parents=True)
