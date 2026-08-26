@@ -225,8 +225,13 @@ which files carry the log's state and therefore have to be replicated.
 
 **All three databases, not just the buffer.** `buffer.db` holds rows no Parquet file has
 yet, `catalog.db` says which files the local table is made of, and `archive.db` says the
-same for the archive. Omit the last and the objects in S3 survive with nothing to say what
-they are.
+same for the archive.
+
+That last justification used to be "omit it and the objects in S3 survive with nothing to
+say what they are". It is no longer true — the archive publishes `version-hint.text` and can
+name its own metadata — and the file is now replicated for the *same-machine* case, where
+it saves a round trip, while a failover deliberately does NOT restore it: a stale copy wins
+over the bucket's own pointer and reads the archive short. See §3a and `Log.restore`.
 
 **One sidecar per root.** Two of those three live at the root and are shared by every log
 under it, so a sidecar per log would run two instances against the same `catalog.db` — what
@@ -237,24 +242,41 @@ question.
 
 Optional. Three things to be clear about:
 
-**It covers append→seal only.** Once a seal deletes buffer rows, replication faithfully
-carries the delete; sealed-but-unuploaded Parquet is not its concern. So
+**It covers append→sync, and it used to cover only append→seal.** The difference is a
+hole this paragraph once described as a lag. A seal moves rows out of SQLite and into a
+Parquet file no sidecar replicates, so deleting them at seal removed the only off-box copy
+of a range the archive did not hold yet — and the machine dying in that window lost them
+from the MIDDLE of the offset space: below the seal frontier so the buffer no longer had
+them, above the archive frontier so the bucket did not either.
+
+**So a seal keeps its rows when `wal_replication` is on**, and `sync` drops them once the
+archive holds the range. It is I4 one tier up: never delete the only off-box copy. Reads
+are unaffected — the buffer leg is bounded by the local table's committed extent (§7), so
+held rows never reach the engine — and the cost is that `buffer.db` grows with sync lag,
+which a stalled sync makes unbounded, like a stalled eviction (§11).
+
+The gate is `wal_replication`, not "an archive is configured": with no sidecar the buffer
+and the Parquet share a disk and die together, so holding buys nothing. With neither, a
+seal discards as it always did, because nothing would ever release the rows.
 
 ```
-RPO = max(WAL replication lag, Parquet upload lag)
+RPO = WAL replication lag        (with wal_replication)
+RPO = max(WAL replication lag, Parquet upload lag)   (before this; the hole)
 ```
-
-Adding it is only worth it if uploads are also prompt — which they cheaply can be, since
-they are plain PUTs with no compute.
 
 **It cannot break writes.** It is a sidecar reading the WAL, not something in the write path.
 If it dies, SQLite is unaffected: you lose replication, not data. That is why it does not
 violate the no-network-in-the-write-path property.
 
-**Restore is correct by construction.** A restored buffer may contain rows already sealed
-into the table. No reconciliation is needed, because the read boundary (§7) is derived from
-the table's committed max offset, so those rows fall outside the buffer's contribution
-automatically.
+**A restored buffer holding sealed rows needs no reconciliation.** The read boundary (§7)
+comes from the table's committed max offset, so those rows fall outside the buffer's
+contribution automatically. That is what makes holding them affordable above, and it is
+what made an out-of-date replica safe before it.
+
+It is NOT the same claim as "a restore is correct by construction", which this said until
+a measurement disproved it: `catalog.db` records absolute paths to local Iceberg metadata
+that no sidecar replicates, so restoring the databases onto another machine and opening
+the log fails outright. See §3a's failover notes and `Log.restore`.
 
 ## 4. Seal
 
@@ -278,6 +300,16 @@ produced worse files. Freshness in the cloud is §3a's job.
 **Rows are sorted before writing**, by the configured `sort_by` (§12). This is declared as
 the table's Iceberg `sort_order` *and* actually applied at write time — the metadata records
 intent, it does not sort for you.
+
+**Declared in three places, and each answers a different reader.** The local table's
+`sort_order` and the ARCHIVE's say what the data is clustered by, to anything reading either
+Iceberg table directly; the archive's went undeclared until failover needed it, which made
+an archive holding clustered data silently say nothing about it. `meta` carries it too, and
+that is the copy `open` reads — because the local catalog cannot be restored onto another
+machine, so a failover rebuilds the local table and has to be told what to declare. An empty
+`sort_by` is a value meaning unsorted, and clears all three; the archive's declaration is
+best effort, since a re-sort has already rewritten every local file by the time it is
+attempted and an unreachable bucket must not fail it.
 
 Sorting only improves **row-group** statistics within a file; file-level statistics are
 already tight for `litelink_offset` and `ingest_ts`, because a sealed file covers a contiguous offset
@@ -649,8 +681,11 @@ An equality check on a recorded value, and the consequences fall out:
   wrote down, not an inference from a prefix, a catalog row keyed by table id, or a
   process's memory of its own configuration.
 - **Several archives coexist.** Old ranges name the old bucket and new ranges the new one,
-  which is what makes re-attaching to an archive that already holds data expressible — today
-  it is not.
+  which is half of what makes re-attaching to an archive that already holds data
+  expressible. The other half is the archive naming its own current metadata: `SqlCatalog`
+  keeps that pointer in the catalog, so the local `archive.db` row was the only thing that
+  had it, and a re-point drops that row. Each commit now writes `version-hint.text` beside
+  the metadata, and `open_archive` registers from it instead of creating an empty table.
 - **The compaction frontier goes.** `archive_pending` exists to stop a merge straddling a
   range the archive may hold; per segment, compaction skips a file that records an archive
   copy and needs no frontier, no crash window between writing it and using it, and no
@@ -908,9 +943,15 @@ ATTACH ... (TYPE ICEBERG)         fails -- "AUTHORIZATION_TYPE is 'oauth2'"
 ```
 
 **DuckDB's Iceberg `ATTACH` assumes a REST catalog** and asks for OAuth2 credentials; it
-cannot attach a pyiceberg `SqlCatalog`. Path-based scanning also fails, because `SqlCatalog`
-keeps the current metadata pointer in the catalog rather than in a `version-hint.text` file
-the way a filesystem catalog would.
+cannot attach a pyiceberg `SqlCatalog`. Path-based scanning fails for the same reason it
+always did — `SqlCatalog` keeps the current metadata pointer in the catalog rather than in a
+`version-hint.text` file the way a filesystem catalog would.
+
+**The ARCHIVE is the exception, and deliberately so.** Every archive commit writes that hint
+beside its metadata (§5), which is what makes a re-point reversible and lets an engine with
+no catalog read the prefix directly. The local table publishes none: its catalog sits in the
+same directory as its warehouse, so nothing can be in a position to have one without the
+other.
 
 So a read is a two-step handoff:
 
@@ -1381,10 +1422,14 @@ The consequence worth planning for is that local disk holds roughly
    What would replace them: give the archive an IDENTITY the entry carries — a token
    written into the archive's own table properties at creation and recorded beside the
    URI locally, so "is this mine?" is an equality check on a value rather than an
-   inference from a path. Prefix comparison then stops being load-bearing, re-attaching
-   to an archive that already holds data becomes expressible (today it is not — see
-   `open_archive`), and a re-point becomes one durable fact to change rather than three
-   that can disagree.
+   inference from a path. Prefix comparison then stops being load-bearing and a re-point
+   becomes one durable fact to change rather than three that can disagree.
+
+   Re-attaching to an archive that already holds data no longer waits on that: the
+   archive publishes `version-hint.text` at every commit and `open_archive` registers
+   from it. What the token would add is a CHECK. The hint says where this log left the
+   metadata, and adopting it trusts that nothing else wrote the archive in between —
+   true under the one-writer-per-log contract, and unverifiable without an identity.
 
    **The deferral has a measured cost, and this paragraph used to understate it.** It
    claimed the guards above were sufficient for the operations the library supports —

@@ -26,11 +26,14 @@ put each log in its own root, or write that config by hand.
 
 from __future__ import annotations
 
+import os
+import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
+    from datetime import timedelta
 
     from litelink._s3 import S3Options
 
@@ -51,8 +54,46 @@ def destination(archive: str) -> str:
     return f"{archive.rstrip('/')}/{WAL_PREFIX}"
 
 
+def snapshot_block(retention: timedelta) -> list[str]:
+    """The per-database `snapshot:` lines for a retention window.
+
+    **`interval` is derived, and it has to be shorter than `retention`.**
+    litestream keeps snapshots and the LTX files belonging to them for
+    `retention`, and a restore needs a snapshot at or before the point it is
+    restoring to. An interval longer than the retention leaves windows with no
+    snapshot in them at all, which deletes the chain a restore needs. Half is
+    the simplest value that always leaves one inside.
+
+    Seconds, spelled as a Go duration. litestream parses these with
+    `time.ParseDuration`, which takes `21600s` as readily as `6h`, and seconds
+    are the one encoding that cannot drift the way a hand-rounded `6h30m` can.
+
+    **Rendered as an integer, never `%g`.** `%g` switches to exponent notation
+    at a million, so a 30-day window emitted `2.592e+06s` and litestream
+    refused the whole file: "cannot unmarshal into time.Duration". The
+    threshold is 11 days 13 hours, which is an ordinary WAL retention, and the
+    failure lands at sidecar start — so the maintainer's restart loop just
+    fails forever with replication off. `%g` bit at the other end too, turning
+    a sub-second retention into `5e-07s`.
+    """
+    seconds = retention.total_seconds()
+
+    # Floored at a second, so a very short retention cannot render `0s` — an
+    # interval of zero is not "snapshot constantly", it is a value litestream
+    # has no sensible reading of.
+    return [
+        "    snapshot:",
+        f"      interval: {max(1, round(seconds / 2))}s",
+        f"      retention: {max(1, round(seconds))}s",
+    ]
+
+
 def litestream_config(
-    databases: Sequence[Path], root: Path, archive: str, s3: S3Options
+    databases: Sequence[Path],
+    root: Path,
+    archive: str,
+    s3: S3Options,
+    retention: timedelta | None = None,
 ) -> str:
     """A litestream config replicating every database the log needs.
 
@@ -83,22 +124,98 @@ def litestream_config(
         # is explicit about, and a restore that hands back the other log's WAL.
         name = database.relative_to(root).as_posix()
         key = f"{prefix}/{name}" if prefix else name
+        # `replica`, singular. litestream v0.5.0 made it one replica per
+        # database and carries the `replicas` list as deprecated
+        # (cmd/litestream/main.go: `Replicas []*ReplicaConfig // Deprecated`).
+        # This never emitted more than one element, so the list bought nothing
+        # and dated the file.
+        lines.append(f"  - path: {database}")
+        if retention is not None:
+            # Per database rather than in the global `snapshot:` block, so a
+            # root holding several logs can carry one config with a window each
+            # — the global one would make the shortest of them everyone's.
+            lines += snapshot_block(retention)
+
         lines += [
-            f"  - path: {database}",
-            "    replicas:",
-            "      - type: s3",
-            f"        bucket: {bucket}",
-            f"        path: {key}",
+            "    replica:",
+            "      type: s3",
+            f"      bucket: {bucket}",
+            f"      path: {key}",
         ]
         if resolved.region:
-            lines.append(f"        region: {resolved.region}")
+            lines.append(f"      region: {resolved.region}")
 
         if resolved.endpoint:
             # Anything that is not AWS also needs path-style addressing:
             # `bucket.host` is a DNS name only AWS actually serves.
             lines += [
-                f"        endpoint: {resolved.endpoint}",
-                "        force-path-style: true",
+                f"      endpoint: {resolved.endpoint}",
+                "      force-path-style: true",
             ]
 
     return "\n".join(lines) + "\n"
+
+
+def litestream_binary(override: str | None = None) -> str:
+    """The sidecar binary to run, pinned build first.
+
+    `just litestream` puts a checksum-verified release in `.bin/`, and a
+    checkout should restore with the version it pinned rather than whatever
+    the machine carries: v0.5.0 changed the config format, and this module
+    writes one shape.
+
+    Resolved against the REPO rather than the cwd, so running from a
+    subdirectory finds it. Falls through to PATH, which is what an installed
+    package uses.
+    """
+    if override is not None:
+        return override
+
+    pinned = Path(__file__).resolve().parents[2] / ".bin" / "litestream"
+
+    return str(pinned) if os.access(pinned, os.X_OK) else "litestream"
+
+
+def restore_buffer(
+    config: Path, destination: Path, options: S3Options, binary: str | None = None
+) -> None:
+    """Restore one database from its replica, into `destination`.
+
+    **No `-if-replica-exists`.** That flag exits 0 when no backup is found, so
+    a missing replica would be indistinguishable from a restored one — and the
+    caller's whole decision is whether there was anything to restore. Absence
+    has to be visible, so this lets the command fail and the caller checks for
+    the file.
+
+    Credentials go to the child through the ENVIRONMENT, never into the config
+    file, which is why that file is safe to commit and hand around. litestream
+    reads its own names first and falls back to the AWS ones.
+    """
+    environment = dict(os.environ)
+    resolved = options.resolved()
+    if resolved.access_key and resolved.secret_key:
+        environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
+        environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        litestream_binary(binary),
+        "restore",
+        "-config",
+        str(config),
+        "-o",
+        str(destination),
+        str(destination),
+    ]
+    try:
+        subprocess.run(command, check=True, env=environment, capture_output=True)  # noqa: S603
+    except FileNotFoundError:
+        msg = (
+            "litestream was not found. Fetch the pinned build with "
+            "`just litestream`, or install it: https://litestream.io/install"
+        )
+        raise RuntimeError(msg) from None
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace").strip()
+        msg = f"litestream restore failed: {detail or exc}"
+        raise RuntimeError(msg) from exc

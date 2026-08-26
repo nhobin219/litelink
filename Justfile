@@ -14,6 +14,12 @@ RUSTFS_KEY := "litelink"
 RUSTFS_SECRET := "litelink-secret"
 RUSTFS_BUCKET := "litelink-demo"
 
+# The WAL-shipping sidecar (§3a). PINNED, not "latest": v0.5.0 changed the
+# config format — one `replica` where there was a `replicas` list — so a demo
+# that fetched whatever is current would make the next such change somebody
+# else's silent breakage, with nothing in a diff to point at.
+LITESTREAM_VERSION := "0.5.16"
+
 # Default recipe: list available commands
 default:
     @just --list
@@ -22,7 +28,11 @@ default:
 bootstrap:
     uv sync
     uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
-    @just duckdb-extensions
+    # `--remote` here, though httpfs is opt-in for the LIBRARY. Anyone working
+    # in this repo runs `just demo-archive` sooner or later, and an explicit
+    # LOAD does not autoinstall — so leaving it out buys nothing and costs a
+    # cryptic DuckDB error on the first archive read.
+    @just duckdb-extensions --remote
 
 # Of what the SPEC §7 read path touches, only `parquet` is compiled into the
 # duckdb wheel; `iceberg` and the sqlite scanner are fetched from
@@ -36,6 +46,48 @@ bootstrap:
 # Provision the DuckDB extensions the read path needs
 duckdb-extensions *args:
     uv run python scripts/install_duckdb_extensions.py {{args}}
+
+# litestream is a single Go binary, not a project dependency: it is a sidecar,
+# and a library that pulled it in would be claiming to run it. This fetches the
+# pinned build into `.bin/`, which `demo-replicate` and the maintainer both
+# prefer over whatever is on PATH — the config format is version-dependent, so
+# "whichever one is installed" is not a detail.
+#
+#   just litestream     fetch it; idempotent, and a no-op if the pin is there
+
+# Fetch the pinned litestream binary into .bin/
+litestream:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -x .bin/litestream ] \
+        && .bin/litestream version 2>/dev/null | grep -q "{{LITESTREAM_VERSION}}"; then
+        echo "litestream {{LITESTREAM_VERSION}} already in .bin/"
+        exit 0
+    fi
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    arch=$(uname -m)
+    case "$arch" in
+        aarch64|arm64) arch=arm64 ;;
+        x86_64|amd64)  arch=x86_64 ;;
+        *) echo "no litestream build published for $arch" >&2; exit 1 ;;
+    esac
+    asset="litestream-{{LITESTREAM_VERSION}}-${os}-${arch}.tar.gz"
+    base="https://github.com/benbjohnson/litestream/releases/download/v{{LITESTREAM_VERSION}}"
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    echo "fetching $asset"
+    curl -fsSL "$base/$asset" -o "$tmp/$asset"
+    curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt"
+    # Verified, not trusted. This binary is fetched over the network and then
+    # pointed at the demo's databases with write access to the replica; a
+    # checksum is the cheapest thing that makes "what the release published"
+    # and "what arrived here" the same question. sha256sum on Linux, shasum on
+    # macOS — the same check, two spellings.
+    if command -v sha256sum >/dev/null; then verify="sha256sum -c -"; else verify="shasum -a 256 -c -"; fi
+    ( cd "$tmp" && grep " ${asset}$" checksums.txt | $verify )
+    mkdir -p .bin
+    tar -xzf "$tmp/$asset" -C .bin litestream
+    echo "installed .bin/litestream ($(.bin/litestream version))"
 
 # Repo-wide, matching the pre-commit hook's `pass_filenames: false`: a recipe
 # scoped to src/ lets tests/ and scripts/ drift out of compliance while CI
@@ -77,7 +129,7 @@ build:
 
 # Appends only — nothing seals here. Rows stay buffered until demo-maintain runs.
 demo-capture *args:
-    uv run python examples/capture.py {{args}}
+    uv run python examples/adsb/capture.py {{args}}
 
 # Seal, compact, evict and expire — the second role. Run with demo-capture.
 demo-maintain *args:
@@ -119,14 +171,32 @@ demo-maintain *args:
         # argparse takes the last, and `just demo-maintain --role all` would
         # otherwise start four processes all in role `all` — four sidecars
         # against one database.
-        uv run python examples/maintainer.py {{args}} --role "$role" &
+        uv run python examples/adsb/maintainer.py {{args}} --role "$role" &
         pids="$pids $!"
     done
     wait || true
 
+# START HERE. The whole library against a live public feed, in one process:
+# no producer to start, no credentials, no maintainer, no threads. Bitstamp
+# publishes BTC/USD trades over an unauthenticated websocket.
+#
+# `just demo-capture` and friends are the other end of the range — four
+# processes, one per storage role, against a synthetic feed under `adsb/` that
+# can be driven as hard as you like.
+
+# Capture a live public websocket feed, in one process.
+demo-websocket *args:
+    uv run --group dev python examples/websocket.py {{args}}
+
+# The `read` column is flat by construction — it answers from statistics — and
+# `scan` beside it reads every row, so its cost grows with the log. That
+# contrast is what the display is for.
+#
+#   just demo-tail --scan-every 0    metadata only; no full scans
+
 # Watch a running capture accumulate. Run alongside `just demo-capture`.
 demo-tail *args:
-    uv run python examples/tail.py {{args}}
+    uv run python examples/adsb/tail.py {{args}}
 
 # Needs `just rustfs` first, and a maintainer alongside — the writer seals,
 # archives and evicts nothing on its own.
@@ -145,20 +215,20 @@ demo-archive *args:
     # difference between the local demo and a production deployment.
     if [ -n "${LITELINK_DEMO_ARCHIVE:-}" ]; then
         echo "archiving to $LITELINK_DEMO_ARCHIVE (credentials from the environment)"
-        uv run python examples/capture.py --archive "$LITELINK_DEMO_ARCHIVE" {{args}}
+        uv run python examples/adsb/capture.py --archive "$LITELINK_DEMO_ARCHIVE" {{args}}
     else
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
         export AWS_REGION=us-east-1
-        uv run python examples/capture.py \
+        uv run python examples/adsb/capture.py \
             --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
     fi
 
-# Needs `just rustfs`, a capture running, and the litestream binary on PATH
-# (https://litestream.io/install — a single Go binary, not a project dependency:
-# it is a sidecar, and a library that pulled it in would be claiming to run it).
+# Needs `just rustfs`, a capture running, and the litestream binary — either
+# from `just litestream` (the pinned build, into `.bin/`) or on PATH.
 #
+#   just litestream       # once
 #   just demo-archive     # terminal 1
 #   just demo-replicate   # terminal 2: ship the WAL continuously
 #
@@ -171,10 +241,19 @@ demo-archive *args:
 demo-replicate root="litelink-data":
     #!/usr/bin/env bash
     set -euo pipefail
-    command -v litestream >/dev/null || {
-        echo "litestream not on PATH — see https://litestream.io/install" >&2
+    # The pinned build first, PATH second. A checkout should replicate with
+    # the version it pinned rather than whatever the machine happens to carry,
+    # because the config this generates is version-dependent.
+    if [ -x .bin/litestream ]; then
+        litestream="$PWD/.bin/litestream"
+    elif command -v litestream >/dev/null; then
+        litestream=litestream
+    else
+        echo "litestream not found. Fetch the pinned build:" >&2
+        echo "    just litestream" >&2
+        echo "or install it yourself: https://litestream.io/install" >&2
         exit 1
-    }
+    fi
     # rustfs unless `.env` names a real bucket, as everywhere else.
     if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
@@ -187,8 +266,8 @@ demo-replicate root="litelink-data":
     export LITESTREAM_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
     export LITESTREAM_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
     # Destination and file set both come from the log — see `replicate.py`.
-    uv run python examples/replicate.py --root {{root}}
-    litestream replicate -config {{root}}/litestream.yml
+    uv run python examples/adsb/replicate.py --root {{root}}
+    "$litestream" replicate -config {{root}}/litestream.yml
 
 # Create the demo bucket. Idempotent, and through the same s3fs the library
 # uses rather than an AWS CLI nobody is required to have installed.
@@ -281,7 +360,7 @@ demo-clean root="litelink-data":
     uv run --extra s3 python -c "
     import sys
     from pathlib import Path
-    sys.path.insert(0, 'examples')
+    sys.path.insert(0, 'examples/adsb')
     from _stream import NAME
     from litelink import Log
     try:

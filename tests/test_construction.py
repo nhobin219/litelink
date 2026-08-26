@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pytest
+from pyiceberg.catalog.sql import SqlCatalog
 
 from litelink import Log, LogConfig
 from litelink._archive import Archive
@@ -548,6 +549,118 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
         assert "secret" not in rendered.lower(), "credentials must stay in the env"
 
 
+def test_the_config_uses_litestreams_current_single_replica_key(
+    tmp_path: Path,
+) -> None:
+    """`replica`, not the deprecated `replicas` list.
+
+    litestream v0.5.0 made it one replica per database and kept the list only
+    for compatibility — `Replicas []*ReplicaConfig // Deprecated` in
+    cmd/litestream/main.go as of v0.5.16, which is what `just litestream`
+    pins. This never emitted more than one element, so the list bought nothing
+    and dated the file.
+
+    Checked as a shape, not a substring: `"replica:" in rendered` is also true
+    of `replicas:`, so the assertion has to be that the plural is ABSENT, and
+    that the fields sit under the singular at the indentation a mapping needs
+    rather than the one a list item needs.
+    """
+    # An endpoint and a region, so every optional field is rendered — the
+    # ones most likely to be left behind at the old indentation are exactly
+    # the ones a bare `S3Options()` omits.
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True),
+        archive="s3://bucket/prefix",
+        s3=S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1"),
+    ) as log:
+        rendered = log.replication_config()
+
+    assert "replicas:" not in rendered
+    assert "- type: s3" not in rendered, "a list item where a mapping belongs"
+    assert "    replica:\n      type: s3\n" in rendered
+
+    # Every replica field moved with it. Left at the list indentation they
+    # parse as siblings of `replica` — which litestream ignores, so the
+    # failure is a config that loads and replicates to the wrong place.
+    for field in (
+        "bucket:",
+        "path: prefix/",
+        "region:",
+        "endpoint:",
+        "force-path-style:",
+    ):
+        assert f"\n      {field}" in rendered, field
+
+
+def test_wal_retention_writes_a_snapshot_window_the_sidecar_can_act_on(
+    tmp_path: Path,
+) -> None:
+    """§3a. The un-archived window, stated as the only thing litestream takes.
+
+    "Retain WAL above the archived offset" is the way to say what this is for
+    and it is not expressible: litestream v0.5.16's knobs are all durations —
+    `snapshot.interval`, `snapshot.retention`, `l0-retention` — and its CLI has
+    no `snapshot` verb to force one after a sync and make a duration behave
+    like an offset.
+
+    **`interval` must come out SHORTER than `retention`.** litestream keeps
+    snapshots and their LTX files for `retention`, and a restore needs one at
+    or before the point it restores to; a longer interval leaves windows
+    holding no snapshot and deletes the chain the restore needs.
+
+    Verified against the real binary, which is the part a substring assertion
+    cannot do: `litestream databases -config` accepts this file, and rejects it
+    with "cannot unmarshal into time.Duration" when the retention is replaced
+    with a non-duration — so the field is genuinely parsed, not ignored.
+    """
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=LogConfig(wal_replication=True, wal_retention=timedelta(hours=6)),
+        archive="s3://bucket/prefix",
+    ) as log:
+        rendered = log.replication_config()
+        databases = len(log.databases)
+
+    assert (
+        "    snapshot:\n      interval: 10800s\n      retention: 21600s\n" in rendered
+    )
+    # One block per database, not one for the file. A root holding several logs
+    # gets a window each; the global `snapshot:` block would make the shortest
+    # of them everyone's.
+    assert rendered.count("    snapshot:") == databases
+
+
+def test_wal_retention_is_refused_without_a_sidecar_to_read_it(tmp_path: Path) -> None:
+    """It is a window written into the sidecar's config. With nothing shipping
+    the WAL it is a setting nothing reads, which is the failure that looks
+    exactly like a working one."""
+    with pytest.raises(ValueError, match="wal_retention needs wal_replication"):
+        validate(SCHEMA, (), LogConfig(wal_retention=timedelta(hours=6)), None)
+
+
+def test_a_zero_wal_retention_is_refused(tmp_path: Path) -> None:
+    """Zero is not "keep nothing", it is "expire every snapshot as you take
+    it" — a replica that cannot restore to any point at all, reported by
+    nothing. None is how you ask for litestream's own default."""
+    config = LogConfig(wal_replication=True, wal_retention=timedelta(0))
+
+    with pytest.raises(ValueError, match="wal_retention must be positive"):
+        validate(SCHEMA, (), config, "s3://bucket/prefix")
+
+
+def test_wal_retention_survives_the_round_trip_through_meta(tmp_path: Path) -> None:
+    """Durations go to `meta` as seconds, like every other one."""
+    config = LogConfig(wal_replication=True, wal_retention=timedelta(hours=6))
+
+    assert LogConfig.from_json(config.to_json()).wal_retention == timedelta(hours=6)
+    assert LogConfig.from_json(LogConfig().to_json()).wal_retention is None
+
+
 def test_replication_needs_somewhere_to_ship_to(tmp_path: Path) -> None:
     """WAL segments go beside the archived data, so a local-only log has
     nowhere to put them — refused at construction rather than at the first
@@ -623,11 +736,16 @@ def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> N
         Log.new(tmp_path, "one", schema=SCHEMA, archive=shared) as first,
         Log.new(tmp_path, "two", schema=SCHEMA, archive=shared) as second,
     ):
+        # The REPLICA path, not the database path — both spell themselves
+        # `path:`. Told apart by indentation: the database's sits at the list
+        # item (`  - path:`) and the replica's inside the `replica` mapping
+        # under it. Tracks `_replication.litestream_config`, which is why the
+        # prefix is written out rather than stripped.
         keys = {
             line.split("path: ", 1)[1]
             for rendered in (first.replication_config(), second.replication_config())
             for line in rendered.splitlines()
-            if "        path: " in line
+            if line.startswith("      path: ")
         }
         buffers = {key for key in keys if key.endswith("buffer.db")}
 
@@ -943,3 +1061,139 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
         assert second._archive.uri == "s3://bucket/prefix"
         assert second._maintenance.config.local_rows == 4242
         assert second._buffer.config().local_rows == 4242
+
+
+def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
+    tmp_path: Path,
+) -> None:
+    """§4's clustering has to survive a machine, and the catalog does not.
+
+    `sort_by` used to live only in the local Iceberg table, read back at open.
+    `catalog.db` is replicated but records ABSOLUTE paths to local metadata no
+    sidecar ships, so a failover rebuilds the local table rather than restoring
+    it — and has to be told what order to declare. The archive could not answer
+    either: `open_archive` never declared one.
+
+    So `meta` carries it, and this proves `open` reads THAT rather than the
+    table: the declaration is removed from under a closed log and the order
+    still comes back.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        assert log._table.sort_by() == ("event_ts",)  # noqa: SLF001
+
+    catalog = SqlCatalog(
+        "local",
+        uri=Layout(tmp_path, "s").catalog_uri,
+        warehouse=Layout(tmp_path, "s").warehouse_uri,
+    )
+    table = catalog.load_table(Layout(tmp_path, "s").table_id)
+    with table.update_sort_order() as update:
+        update._apply()  # noqa: SLF001
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._sort_by == ("event_ts",), (  # noqa: SLF001
+            "open read the table's declaration rather than meta"
+        )
+
+
+def test_a_log_with_no_stored_sort_order_is_refused(tmp_path: Path) -> None:
+    """Absent means damaged, not "unsorted".
+
+    `new` always writes it, so defaulting to `()` would silently de-cluster
+    every file the next compaction rewrites while the table still declared a
+    key. Same rule as the stored config, one line above it.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)):
+        pass
+
+    buffer = Buffer.open(Layout(tmp_path, "s").buffer_db, SCHEMA)
+    try:
+        buffer._con.execute("DELETE FROM meta WHERE k = 'sort_by'")  # noqa: SLF001
+    finally:
+        buffer.close()
+
+    with pytest.raises(ValueError, match="no stored sort order"):
+        Log.open(tmp_path, "s")
+
+
+def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
+    """An empty order is a value, not a no-op.
+
+    `set_sort_order` used to return early on it, so `set_sort_by((),
+    rewrite=True)` re-clustered every file and left the table declaring the old
+    key. Harmless while `open` read that declaration and reverted; permanent
+    once `meta` is the source of truth, because nothing would reconcile them.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        log.extend([{"event_ts": i, "key": f"k{i}", "payload": "p"} for i in range(20)])
+        log.set_sort_by((), rewrite=True)
+
+        assert log._table.sort_by() == ()  # noqa: SLF001
+        assert log._buffer.get_meta("sort_by") == "[]"  # noqa: SLF001
+
+    with Log.open(tmp_path, "s") as reopened:
+        assert reopened._sort_by == ()  # noqa: SLF001
+
+
+def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
+    tmp_path: Path,
+) -> None:
+    """The guard is about DIRECTION, not about the buffer being empty.
+
+    It used to refuse any non-empty buffer, which blocked the one caller that
+    needs it: a restore reserves an offset range (§3a) on a buffer holding the
+    recovered tail — exactly a buffer with rows in it. Raising past those rows
+    is safe, because SQLite assigns `max(max(rowid), seq) + 1` either way.
+
+    Lowering is the unrecoverable one, and stays refused: the sequence is
+    ignored, every following row lands on an offset belonging to different
+    data, and nothing downstream can detect it.
+    """
+    buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
+    try:
+        buffer.append([{"event_ts": i, "key": "k", "payload": "p"} for i in range(2)])
+        highest = buffer.next_offset() - 1
+
+        buffer.seed_offsets(highest + (1 << 20))
+
+        assert buffer.next_offset() == highest + (1 << 20)
+
+        with pytest.raises(ValueError, match="holding rows up to"):
+            buffer.seed_offsets(1)
+    finally:
+        buffer.close()
+
+
+def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
+    tmp_path: Path,
+) -> None:
+    """ "Cannot tell" and "no table" have opposite safe answers here.
+
+    `Log.restore` reads this to decide whether it is resuming an interrupted
+    restore. Answering False when the catalog merely could not be READ tells it
+    to resume over a LIVE log — and the resume path reserves 2**20 offsets on
+    it, deletes every `extent` row including queued cuts, wipes `sealing` and
+    `claim`, drops the archive catalog row, and deletes buffered rows below the
+    frontier.
+
+    It is reachable without corruption: `catalog.db` runs in
+    `journal_mode=delete` with no busy timeout on this connection, so a read
+    landing in another process's commit window returns SQLITE_BUSY.
+    `_recorded_location` refuses the same conflation, in the same words.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA):
+        pass
+
+    layout = Layout(tmp_path, "s")
+
+    assert LogTable.exists_for(layout) is True
+
+    # Not a SQLite database at all, standing in for a read that cannot answer.
+    layout.catalog_db.write_bytes(b"not a database, and not an absent one")
+
+    with pytest.raises(LookupError):
+        LogTable.exists_for(layout)
+
+    # And the caller that matters treats it as "exists" rather than proceeding.
+    with pytest.raises((LookupError, FileExistsError, ValueError, RuntimeError)):
+        Log.restore(tmp_path, "s", archive="s3://bucket/prefix")

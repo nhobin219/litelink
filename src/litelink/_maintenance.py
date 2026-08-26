@@ -36,9 +36,9 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from litelink._buffer import Buffer
+    from litelink._config import LogConfig
     from litelink._layout import Layout
     from litelink._table import DataFile, LogTable
-    from litelink.log import LogConfig
 
 
 def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
@@ -229,6 +229,26 @@ def is_remote(path: str) -> bool:
     identical either side of the network.
     """
     return "://" in path
+
+
+def _undersized_from(
+    run: Sequence[DataFile], held: Mapping[str, int], target: int
+) -> list[DataFile]:
+    """The tail of `run` from its first under-target file, or nothing.
+
+    §6's rule inside one dense segment: everything before the first short file
+    already holds a full target and re-cutting it would rewrite bytes to
+    reproduce them; everything after has to move regardless of its own size,
+    because the shortfall ahead of it shifts every boundary behind it.
+
+    A file whose size was never recorded counts as full, so an archive whose
+    local extents were lost is left alone rather than rewritten on a guess.
+    """
+    for index, data_file in enumerate(run):
+        if held.get(data_file.path, target) < target:
+            return list(run[index:])
+
+    return []
 
 
 class Maintenance:
@@ -654,11 +674,34 @@ class Maintenance:
             limits.append(max((f.hi for f in stale), default=0))
 
         if config.local_rows is not None:
-            # Offsets are contiguous, so the newest `local_rows` of them start
-            # here. AUTOINCREMENT can leave a gap where a transaction rolled
-            # back, which makes this retain slightly more than asked rather
-            # than less — the safe direction for a floor.
-            limits.append(self._buffer.next_offset() - 1 - config.local_rows)
+            # COUNTED, not subtracted from the frontier. `next_offset() - 1 -
+            # local_rows` reads naturally and assumes the offset space is
+            # dense — true of a rollback's occasional gap, and false the moment
+            # anything reserves a range. A restore skips 2**20 offsets to keep
+            # I9 (§3a), so the subtraction would put the boundary 2**20 above
+            # every local file, and the first `maintain()` after a failover
+            # would evict the whole local window, clamped only by I4. The
+            # comment here used to say the arithmetic errs toward retaining
+            # MORE, which is the safe direction for a floor; across a large
+            # hole it errs the other way.
+            #
+            # Iceberg records a row count per file, so counting back from the
+            # newest costs nothing beyond the manifest read `data_files`
+            # already did.
+            kept = 0
+            for data_file in sorted(
+                self._table.data_files(), key=lambda f: f.hi, reverse=True
+            ):
+                if kept >= config.local_rows:
+                    # This file lies entirely outside the window, so everything
+                    # at or below it may go.
+                    limits.append(data_file.hi)
+                    break
+
+                kept += data_file.rows
+            else:
+                # Every local file is inside the window: keep all of them.
+                limits.append(0)
 
         return min(limits) if limits else 0
 
@@ -872,15 +915,58 @@ class Maintenance:
         A file whose size was never recorded counts as full, so an archive
         whose local extents were lost is left alone rather than rewritten on a
         guess about what it holds.
+
+        **A file spanning a gap in the offset space is excluded outright**, and
+        so is everything after it. `_recut` re-appends rows through a scratch
+        buffer seeded at the range's start, so it RENUMBERS them densely — over
+        a gap that hands every row above it an offset belonging to different
+        data. `_recut` asserts against that, so before this exclusion a single
+        gapped file made every later `rewrite_archive` raise: after a failover
+        reserves 2**20 offsets (§3a) the first sealed file spans the hole, and
+        being the archive's first file it was in every candidate run for the
+        life of the log. One un-rewritable file is the honest cost of the
+        reserve; an unusable repair tool is not.
         """
         held = self.memory()
         target = self.config.compact_size
-        files = archive.data_files()
-        for index, data_file in enumerate(files):
-            if held.get(data_file.path, target) < target:
-                return files[index:]
 
-        return []
+        # By dense SEGMENT, and an earlier version got this wrong in the
+        # ordering that actually occurs. It tested density before size per
+        # file and returned `files[index:]` from the first undersized one —
+        # which still CONTAINS any gapped file after it. That is the normal
+        # shape: the archive's tail file before a failover is undersized, and
+        # the reserve's gapped file lands after it. Measured, `rewrite_archive`
+        # went on raising for the life of every restored log.
+        #
+        # A gap bounds a segment at both ends: a file with one inside it, and a
+        # file that does not continue the previous file's range.
+        #
+        # A segment yielding a SINGLE file is skipped rather than returned.
+        # `rewrite_archive` declines a run of one — merging one file is a
+        # no-op rewrite — so returning it stopped the walk and left every later
+        # segment unreachable. That made the tool a permanent no-op on exactly
+        # the shape it was fixed for: an undersized archive tail, then the
+        # reserve's gapped file, then everything a failed-over log goes on to
+        # write. The tail alone was the candidate, and nothing above the gap
+        # was ever re-cut however much accumulated there.
+        segment: list[DataFile] = []
+        for data_file in archive.data_files():
+            dense = data_file.rows == data_file.hi - data_file.lo + 1
+            if dense and (not segment or data_file.lo == segment[-1].hi + 1):
+                segment.append(data_file)
+                continue
+
+            candidate = _undersized_from(segment, held, target)
+            if len(candidate) > 1:
+                return candidate
+
+            # A gapped file cannot start a segment either — nothing may re-cut
+            # across it — so only a dense one carries over.
+            segment = [data_file] if dense else []
+
+        candidate = _undersized_from(segment, held, target)
+
+        return candidate if len(candidate) > 1 else []
 
     def _recut(
         self,
@@ -969,8 +1055,24 @@ class Maintenance:
         # Before the swap, not after. The commit is the point of no return:
         # it deletes the range these rows came from, so a rewrite that lost
         # any of them must fail while the originals are still the live files.
+        # Against the RANGE WIDTH, deliberately, and this is one of the few
+        # places that inference is right rather than a bug. `_recut` re-appends
+        # through `seed_offsets(lo)`, so rows are RENUMBERED sequentially from
+        # `lo` — which reproduces their original offsets only if the range is
+        # dense. Comparing against `sum(f.rows)` instead would let a gapped
+        # range pass and commit every row above the gap under an offset
+        # belonging to different data, which is the corruption I9 exists to
+        # prevent and which nothing downstream could detect.
+        #
+        # So this stays a denseness assertion. What changed is that a gapped
+        # range no longer REACHES it: `_badly_sized` excludes such files, so
+        # a reserved hole (§3a) leaves one file un-rewritable rather than
+        # raising on every rewrite the log ever attempts afterwards.
         if expected != hi - lo + 1:
-            msg = f"archive rewrite read {expected} rows for offsets {lo}-{hi}"
+            msg = (
+                f"archive rewrite read {expected} rows for offsets {lo}-{hi}, "
+                f"which is not a dense range"
+            )
             raise RuntimeError(msg)
 
         # Checked between writing and committing, the same as `_write_merge`
@@ -1040,7 +1142,11 @@ class Maintenance:
             scratch.claim_seal(start, end, rel_path)
             self._buffer.claim_output(start, end - 1, archive.uri(rel_path))
 
-            rows = scratch.rows_below(end)
+            # Bounded at BOTH ends, though this loop's own `finish_seal`
+            # would leave the floor correct anyway. That is the point: relying
+            # on it is how the log's seal was wrong, and one rule is cheaper to
+            # hold than a rule plus a reason it happens not to matter here.
+            rows = scratch.rows_between(start, end)
             if self._sort_by:
                 rows = rows.sort_by([(c, "ascending") for c in self._sort_by])
 
