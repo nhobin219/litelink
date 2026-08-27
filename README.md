@@ -9,7 +9,7 @@
 
 # Durable append-only capture into Iceberg tables
 
-**Local-first, in-process, no service.**
+**Embedded and local-first.**
 
 ## Introduction
 
@@ -17,9 +17,6 @@ litelink is a Python library for the thing every capture pipeline hand-rolls bad
 stream of observations onto disk durably, into well-sized Parquet, and eventually into object
 storage — without a daemon, a broker, or a catalog service. `append()` returns once the row is
 durable, and a query a moment later sees it.
-
-Rows land in a SQLite buffer under an ordinary transaction, seal into a local Iceberg table
-once they reach a target size, and sync from there into an Iceberg table on S3:
 
 ```
 SQLite buffer          durable on commit. unsealed rows only.
@@ -33,18 +30,15 @@ remote Iceberg table   full history, on S3.
 
 Reads span all three tiers, and the catalog is a SQLite file rather than a service, so **no
 read on the hot path touches the network.** Every other machine reads the archive instead,
-with any Iceberg engine and nothing from litelink — see
-[reading it from another machine](#reading-it-from-another-machine).
+with any Iceberg engine and nothing from litelink.
 
-It exists because doing this by hand goes wrong the same way every time: one production capture
-system had accumulated 125,884 objects with 62.5% of them under 16 KiB, Parquet files at 2 rows
-each, a compaction routine nothing ever scheduled, and an in-memory write buffer that a
-`SIGKILL` emptied. Durable capture, file sizing and tiering are each easy alone and nobody's
-job together.
+It exists because doing this by hand goes wrong the same way every time: one production
+capture system had 125,884 objects, 62.5% of them under 16 KiB, Parquet files at 2 rows each,
+a compaction routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
+Durable capture, file sizing and tiering are each easy alone and nobody's job together.
 
 **Status: early.** All three tiers work, and a log survives losing its machine. Read
-[what it is not](#what-it-is-not) and [not implemented yet](#not-implemented-yet) before you
-commit to it.
+[what it is not](#what-it-is-not) and [not implemented yet](#not-implemented-yet) first.
 
 ## Quick start
 
@@ -54,12 +48,9 @@ just bootstrap         # uv sync + git hooks + DuckDB extensions
 just demo-websocket    # capture a live public feed, one process, ~30 seconds
 ```
 
-You need [`uv`](https://docs.astral.sh/uv/) and [`just`](https://github.com/casey/just).
-Nothing else: no producer, no credentials, no maintainer, no container. Bitstamp publishes
-BTC/USD trades over an unauthenticated websocket, the loop is `log.append(...)` then
-`log.seal_due()`, and it prints a query over what it captured.
-
-That demo is [`examples/websocket.py`](examples/websocket.py), and this is its shape:
+You need [`uv`](https://docs.astral.sh/uv/) and [`just`](https://github.com/casey/just), and
+nothing else: no producer, no credentials, no maintainer, no container. That demo is
+[`examples/websocket.py`](examples/websocket.py), and this is its shape:
 
 ```python
 import pyarrow as pa
@@ -74,18 +65,17 @@ schema = pa.schema([
     pa.field("side", pa.int64()),        # 0 buy, 1 sell
 ])
 
-# new() takes the shape; it is fixed at creation.
+# new() takes the shape, fixed at creation. open() takes none of it — schema,
+# sort order, config and archive all come from the log itself.
 log = Log.new("data", "trades", schema=schema, sort_by=("event_ts",))
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076, "side": 0})  # durable on return
 
-# When rows arrive in groups, extend() commits the whole group in ONE
-# transaction — one fsync for the batch, not one per row. That call size is the
-# write throughput lever, and a call-site choice: no LogConfig setting tunes it.
+# extend() commits the whole group in ONE transaction — one fsync for the batch,
+# not one per row. That call size is the write throughput lever, and a call-site
+# choice: no LogConfig setting tunes it.
 log.extend(group_of_rows)                          # append(row) is extend([row])
 
-# open() takes none of it — schema, sort order, config and archive all come
-# from the log itself.
 log = Log.open("data", "trades")
 log = Log.open("data", "trades", read_only=True)   # alongside a live writer
 
@@ -93,12 +83,13 @@ recent = log.scan(where="event_ts > 1787772776000000").read_all()
 log.maintain()                                     # compact, evict, expire
 ```
 
-That is the whole API surface for local capture. Everything below is optional.
+That is the whole API surface for local capture. Everything below is optional, and every
+public call is in [`docs/API.md`](docs/API.md) — one page, thirty-nine of them, and most
+deployments use six.
 
 ## More demos
 
-The other end of the range — a synthetic feed you can drive as hard as you like, with one
-process per storage role:
+A synthetic feed you can drive as hard as you like, with one process per storage role:
 
 ```bash
 just demo-capture      # append continuously — the hot path, and nothing else
@@ -106,26 +97,19 @@ just demo-maintain     # in another terminal: seal, compact, evict, expire
 just demo-tail         # in a third: watch where the rows are
 ```
 
-To add the archive tier against a local S3-compatible store:
+To add the archive tier, against a local S3-compatible store or a real bucket:
 
 ```bash
 just rustfs            # object storage in one container
 just demo-archive      # capture, with an archive configured
 just demo-maintain     # also pushes to it, and evicts what it has pushed
+
+cp .env.example .env   # or: set LITELINK_DEMO_ARCHIVE=s3://your-bucket/prefix
 ```
 
-**Against a real AWS bucket**, nothing changes but the environment:
-
-```bash
-cp .env.example .env    # set LITELINK_DEMO_ARCHIVE=s3://your-bucket/prefix
-just demo-archive
-just demo-maintain
-```
-
-Credentials are not in that file unless you put them there. The library reads them from the
-environment at the point of use through the ordinary AWS chain, so a profile, instance
-metadata or SSO all work untouched — and a log directory, which gets copied and attached
-elsewhere, never carries a key with it.
+Credentials are not in that file unless you put them there — the library reads them from the
+environment through the ordinary AWS chain, so a profile, instance metadata or SSO all work
+untouched, and a log directory never carries a key with it.
 
 To survive losing the machine, ship the SQLite WAL alongside:
 
@@ -134,70 +118,27 @@ just litestream        # once: fetch the pinned, checksum-verified sidecar
 just demo-replicate    # generates litestream.yml from the log, runs it
 ```
 
-Then `Log.restore(root, name, archive=...)` rebuilds the log on another box — it writes the
-config from the layout alone, restores `buffer.db`, rebuilds the local table, adopts the
-archive, and reserves an offset window so nothing the dead machine served is reissued.
-Verified against a local S3-compatible store and against AWS. See [`examples/`](examples/).
+`Log.restore(root, name, archive=...)` then rebuilds the log on another box, reserving an
+offset window so nothing the dead machine served is reissued. Verified against a local
+S3-compatible store and against AWS. See [`examples/`](examples/).
 
 ## Reading it from another machine
 
-Everything above is the *writer's* read: local disk, all three tiers, no network. Every other
-machine reads the archive instead, and needs nothing from litelink to do it. The archive is an
-ordinary Iceberg table that publishes `version-hint.text` at every commit, so an engine pointed
-at the prefix resolves the current metadata itself — no catalog service, no `archive.db`, no
-local root, no litelink install.
+The demos above are the *writer's* read. Everywhere else reads the archive, which is an
+ordinary Iceberg table publishing `version-hint.text` at every commit — so an engine pointed
+at the prefix resolves the current metadata itself, with no catalog service, no `archive.db`,
+no local root and no litelink install:
 
 ```sql
-INSTALL iceberg; LOAD iceberg;
-INSTALL httpfs; LOAD httpfs;
-CREATE SECRET (TYPE s3, PROVIDER credential_chain);
-
 SELECT count(*), max(litelink_offset)
 FROM iceberg_scan('s3://bucket/prefix/litelink/trades',
                   version_name_format = '%s%s.metadata.json');
 ```
 
-The table sits at `<archive prefix>/litelink/<log name>`. **`version_name_format` is not
-optional**: DuckDB defaults to the Hadoop `v%s%s.metadata.json` while pyiceberg names its
-metadata `00003-<uuid>.metadata.json`, so the hint carries that stem and the format has to stop
-prepending the `v`. `credential_chain` is the ordinary AWS resolution — profile, instance
-metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
-`URL_STYLE 'path'` instead, which is what the library's own reader emits.
-
-**Reading it as it grows.** `sync` is lazy, restartable and arbitrarily far behind, and no read
-depends on it, so a reader sees a committed snapshot that lags the writer — never a partial
-one. `litelink_offset` is what makes that safe to poll: it is monotonic and never reused, so a
-reader keeps the highest one it has seen and asks for what came after.
-
-```sql
--- first pass: whatever is there, and where it ended
-SELECT max(litelink_offset) FROM iceberg_scan(...);          -- 1536
-
--- every pass after: only what the syncs since have published
-SELECT * FROM iceberg_scan(...) WHERE litelink_offset > 1536;
-```
-
-Resolve the table on each pass rather than caching a metadata path — the hint moves with every
-commit, and a pinned pointer serves one stale snapshot for ever. What a reader cannot see is
-anything newer than the last `sync()`: rows still in the buffer or the local table are on the
-writing box alone, so the freshness lever is the sync interval rather than anything at the
-reader.
-
-`tests/test_archive.py::test_the_archive_reads_as_a_directory_with_no_catalog_at_all` is that
-claim as a test — it captures through a live archive and asserts the DuckDB row count equals
-the writer's `archived_through()`.
-
-## Benchmarks
-
-```bash
-just bench             # write and read throughput on this machine
-just bench --quick     # a smaller run
-```
-
-Both print what each number means, not just the number. SPEC §3 and §7 carry figures from a
-2 vCPU box and both say to re-measure on target hardware — this is that measurement.
-[`benchmarks/`](benchmarks/) has the rest, including `just bench-floor`: what litelink costs
-on top of the raw SQLite write it is built on.
+`litelink_offset` is monotonic and never reused, so a reader keeps the highest one it has seen
+and asks for what came after — which is how you follow an archive that `sync` is publishing
+into. The extensions, the credential shapes, why `version_name_format` is not optional, and
+the polling pattern in full are in [`docs/API.md`](docs/API.md).
 
 ## How it works
 
@@ -213,37 +154,13 @@ on top of the raw SQLite write it is built on.
 - **The seal cut is chosen by the appender**, in the transaction that crosses
   `target_seal_size`, and queued. A sealer that falls behind therefore writes several
   correctly-sized files rather than one oversized one.
+- **Sizing is two targets, not one.** A seal wants to be small, because the buffer is what a
+  hot read scans; a file wants to be large, because per-file overhead dominates scans and
+  uploads. Compaction bridges them, on local disk, at 8× the seal size by default.
 
-Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead.
-
-How the pieces run — writer and maintainer, what crosses between them, and what is safe to
-call from which thread or process — is [`docs/RUNTIME.md`](docs/RUNTIME.md).
-
-### Sizing: two targets, not one
-
-A seal wants to be **small** and a file wants to be **large**, and one number cannot serve
-both:
-
-| | bounded by | wants to be | because |
-|---|---|---|---|
-| `target_seal_size` | the buffer | small | the buffer is what a hot read scans, so its size is read latency (§7) |
-| `target_compact_size` | a file on disk | large | per-file overhead dominates both scans and uploads |
-
-Compaction is what bridges them, and that is its whole job: converting sealed chunks into
-archive-shaped ones, reading and rewriting them on local disk so nothing is pulled back out
-of object storage to be merged. It defaults to **8× the seal size**, so the conversion is on
-even without an archive — file count is a measured cost here, not a reputation. Reading the offset boundary
-from manifest statistics measured **1.0 ms over one file and 44 ms over 64**, and uploading a
-9 kB file to S3 took **648 ms**, nearly all of it round trip rather than bytes.
-
-The price is bounded write amplification: each row is written twice locally, once at seal and
-once at conversion, and never again — a converted file is already at the target, so it is not
-a candidate a second time. Set `target_compact_size` equal to the seal size to turn the
-conversion off.
-
-Keep it a **multiple** of the seal size. Sealed files are uniform, so merging whole files
-lands exactly on the target when it divides and short when it does not — three 1 MiB files
-against a 4 MiB target give 3 MiB files for ever.
+Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead. The numbers
+behind all of this are [`docs/SPEC.md`](docs/SPEC.md) §7 and §12; how the pieces run is
+[`docs/RUNTIME.md`](docs/RUNTIME.md); `just bench` is the same measurement on your hardware.
 
 ## What it is not
 
@@ -254,38 +171,28 @@ but "real-time" means fresh, not point-lookup fast.
 
 Nor is it an unbounded local archive. **Keeping everything on one machine — `archive=None`
 with no `local_retention` — degrades as the table grows.** A seal's cost tracks what the
-table's metadata holds, and while running `maintain()` bounds the largest part of that, a
-residue grows with the file count: compaction groups adjacent files whose combined
-uncompressed size fits the target, so one it has already produced at that size is never
-revisited, and only eviction removes it. With no retention set nothing evicts. The seal is on
-the write path, so the cost lands on appends.
-
-Configure a retention, or an archive to evict into, for anything long-running. Both bound the
-file count, which is what bounds the cost. Details and the options for fixing it properly are
-in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
+table's metadata holds, and a residue grows with the file count: compaction never revisits a
+file already at the target size, and only eviction removes one. With no retention set nothing
+evicts, and the seal is on the write path, so the cost lands on appends. Configure a
+retention, or an archive to evict into — [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet
 
 **Schema evolution** ([`docs/SPEC.md`](docs/SPEC.md) §9) and **blob fields** (§15) are
-specified and unbuilt, and are what the code lacks against its own design.
-
-Blob fields are for payloads too large for the buffer (sensor frames, point clouds, raw
-response bodies). Bytes stage beside SQLite while hot and are inlined into Iceberg at seal, so
-the archive stays ordinary Iceberg with a `binary` column: no pointers in the published
-schema, and blob lifetime inherits snapshot expiry and compaction rather than becoming a
-hand-maintained refcount. Until it lands, `binary` columns are refused outright — see
-`_types`. (They were once refused because DuckDB's sqlite scanner decoded blob bytes as UTF-8
-and failed; that scanner is gone, so the remaining reason is §15 itself, which has payloads
-bypass the buffer rather than travel through it.)
+specified and unbuilt, and are what the code lacks against its own design. `add_column`,
+`rename_column` and `drop_column` exist and raise; `binary` columns are refused outright,
+because §15 has large payloads bypass the buffer rather than travel through it.
 
 Still open: payload encoding, local-disk backpressure, bulk ingest, and extension provisioning
 for embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 
 ## Documentation
 
+- [`docs/API.md`](docs/API.md) — every public call, on one page
 - [`docs/SPEC.md`](docs/SPEC.md) — the design, and in places still ahead of the code
 - [`docs/RUNTIME.md`](docs/RUNTIME.md) — writer and maintainer, threads, processes, what crosses between them
 - [`examples/`](examples/) — the websocket capture, and the synthetic feed with one process per role
+- [`benchmarks/`](benchmarks/) — the harness, including what litelink costs over raw SQLite
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, the gates, and what a good PR here looks like
 - [`SECURITY.md`](SECURITY.md) — what to report privately, and what is a known limit instead
 
@@ -294,28 +201,14 @@ for embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 ```bash
 just bootstrap          # uv sync + git hooks + DuckDB extensions
 just check              # lint + format-check + typecheck + tests, same as CI
+just --list             # the rest
 ```
 
 `just bootstrap` provisions the `iceberg`, `avro` and `httpfs` DuckDB extensions, which are
-downloaded rather than bundled — see [`docs/SPEC.md`](docs/SPEC.md) §7. `just
-duckdb-extensions --check` verifies a machine can read offline. The buffer is **not** read
-through DuckDB's sqlite scanner: two independently linked SQLite libraries in one process
-corrupt the database, which [`docs/RUNTIME.md`](docs/RUNTIME.md) records.
-
-`just --list` has the rest. Tooling is uv + ruff + [ty](https://github.com/astral-sh/ty) +
-pytest; the style gate in `scripts/check_blank_lines.py` requires a blank line after every
-compound-statement block.
-
-Commits follow [Conventional Commits](https://www.conventionalcommits.org), enforced by a
-`commit-msg` hook (`scripts/check_commit_msg.py`):
-
-```
-<type>(<scope>): <lowercase description, no trailing period, subject <= 72 chars>
-
-types   feat fix refactor perf test docs build chore
-scopes  benchmarks blob buffer catalog ci compaction config deps examples read
-        replication retention schema seal spec sync write
-```
+downloaded rather than bundled — see [`docs/SPEC.md`](docs/SPEC.md) §7. Tooling is uv + ruff +
+[ty](https://github.com/astral-sh/ty) + pytest. Commits follow
+[Conventional Commits](https://www.conventionalcommits.org), enforced by a `commit-msg` hook;
+[`CONTRIBUTING.md`](CONTRIBUTING.md) has the types, scopes and style gates.
 
 ## License
 
