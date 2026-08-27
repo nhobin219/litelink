@@ -206,6 +206,15 @@ durability story.
 So the batch size is a property of the call site, not a setting: nothing in `LogConfig`
 tunes it, and no throughput figure here means anything without it stated.
 
+**`append()` and `extend()` validate per row, and that is the right trade for them.** A
+mapping carries no schema of its own, so I17 is enforced one row at a time — names in
+Python, types and ranges by the buffer's CHECK constraints. It costs about 400 ns/row,
+which is nothing against a per-transaction fsync: these calls exist for true streams and
+small batches, where a row costs microseconds to hundreds of microseconds and the check is
+under 3% of it. A caller batching thousands of rows per call pays a visible ~10% and wants
+the columnar entry point instead, where the schema is checked once for the whole batch —
+see §13's *Bulk ingest*.
+
 Reference throughput on network-backed storage at a 2 KB row: 21,850 rows/s at
 `synchronous=FULL` (46 µs/row), against a raw `append+fdatasync` floor of 30,464 rows/s.
 The batch size behind that pair predates the benchmark harness and was not recorded, which
@@ -1644,6 +1653,20 @@ The consequence worth planning for is that local disk holds roughly
    into reader output, and not `sealing` itself, which holds one row and would block seals
    for the length of a rewrite. The sweep rule then mirrors §15.3: a staged file with no
    row is an orphan by definition.
+
+   **It amortises I17, which is per-row today and cannot be otherwise.** A row arriving as a
+   mapping carries no schema, so every row is checked on its own: its key set against the
+   declared columns in Python, its values against the buffer's CHECK constraints in SQLite.
+   An Arrow batch carries its schema, so one comparison against the declared one proves the
+   names and types of every row in the batch **by construction** — the per-row work is not
+   optimised away, it stops being necessary. That is a second argument for this path
+   independent of avoiding the row-by-row rewrite, and it is the larger one for a backfill.
+
+   Measured on the write path: validation costs about 400 ns/row of CPU. At `1` and `200`
+   rows per `extend()` that is invisible, because each transaction is fsync-bound at ~800 µs
+   and ~16 µs per row respectively; at 5,000 rows per batch, where the fsync is amortised
+   and a row costs ~4 µs, it is about 10%. So the cost lands exactly on the caller who is
+   already batching hard enough to want this endpoint instead.
 
    Reserving needs no new counter. Bumping `sqlite_sequence` by N inside the write
    transaction reserves `[old+1, old+N]`, preserves I9, and lands above everything ever
