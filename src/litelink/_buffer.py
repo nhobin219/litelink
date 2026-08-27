@@ -988,13 +988,22 @@ class Buffer:
 
         for i, limit in shape.exact_ints:
             value = values[i]
-            if type(value) is int and not -limit <= value <= limit:
+            # `isinstance`, not `type(...) is`: an `IntEnum` member is an int
+            # and reaches the same CHECK, and missing it here means the caller
+            # gets a bare `CHECK constraint failed` instead of this message.
+            # `bool` needs no exclusion — True and False are always in range.
+            if isinstance(value, int) and not -limit <= value <= limit:
                 name = shape.columns[i]
+                # The bound is the range in which EVERY integer is exact, not
+                # a claim about this one: 2**60 converts exactly and is still
+                # refused, because a SQL CHECK cannot ask "is this particular
+                # integer representable". So the message does not say the
+                # conversion would be lossy — it says how to ask for it.
                 msg = (
                     f"column {name!r} cannot hold the integer {value!r}: it is "
-                    f"declared {shape.schema.field(name).type}, which represents "
-                    f"integers exactly only up to {limit}. Pass a float if an "
-                    "approximate value is what you mean"
+                    f"declared {shape.schema.field(name).type}, which holds every "
+                    f"integer exactly only up to {limit}. Pass it as a float to "
+                    "store it as one"
                 )
                 raise ValueError(msg)
 
