@@ -1267,7 +1267,23 @@ policy over the only copy. Data past the window is gone for good.
 That is the right shape for a bounded local capture window, and it is worth stating plainly
 because I4's rationale is literally *"eviction before registration is data loss."* Here the
 loss is the operator's instruction rather than a bug, and the two are distinguishable only
-by whether an archive was configured. `local_retention = None` is the setting that keeps
+by whether an archive was configured.
+
+**Which makes DETACHING the operation that converts one into the other**, and that was
+invisible. I4's clamp is gated on an archive being configured, so `set_archive(None)`
+retires it — for every process at once, since the gate reads `meta` — and the next
+maintenance pass treats the files still queued for upload as ordinary retention candidates.
+A log that HAD an archive never asked for the contract above; it inherited it as a side
+effect of a call that reads as "stop using the archive". Measured at 4,025 acknowledged
+offsets of 8,000, deleted by a maintainer in another process that the operator never
+invoked.
+
+So a detach is refused while `local_retention` or `local_rows` is set. Clearing them first
+is how an operator says the loss is intended, which puts the instruction back where this
+section says it belongs. The refusal is blunt — it declines cases that are provably safe —
+because the precise question is "is there an unarchived file retention would reach", and
+answering it properly means keeping the clamp alive across a detach rather than asking
+better questions at the setter. `local_retention = None` is the setting that keeps
 everything, at unbounded local growth.
 
 `local_retention = 0` presupposes an archive: with none, it would delete each file as it

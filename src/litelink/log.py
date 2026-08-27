@@ -299,6 +299,12 @@ class Log:
         # downstream has to distinguish "unset" from "explicitly unsorted".
         order = tuple(sort_by or ())
         settings = config or LogConfig()
+        # Same normalisation as `set_archive`, and for the same reason: an
+        # empty string is not None to `validate`, so every rule that
+        # presupposes an archive was skipped while `configured()` came back
+        # False — `Log.new(archive="", config=LogConfig(local_retention=0))`
+        # was accepted, which is exactly the pair `validate` exists to refuse.
+        archive = (archive or "").rstrip("/") or None
         validate(schema, order, settings, archive)
 
         layout = Layout(Path(root), name)
@@ -998,6 +1004,15 @@ class Log:
         naming it, eviction keeps asking about the archive that is configured
         now, and compaction keeps refusing to merge across any of them.
         """
+        # NORMALISED here, not in `_repoint`. Every guard below tests
+        # `archive is None`, and `_repoint` used to be the only place that
+        # turned an empty string into None — so `set_archive("")` was non-None
+        # to `validate`, to `_refuse_archive_ahead` and to
+        # `_refuse_lossy_detach`, and None to the write. It detached with none
+        # of the three applying. Measured: 7,828 acknowledged rows lost, the
+        # same magnitude as the case those guards exist for.
+        archive = (archive or "").rstrip("/") or None
+
         with self._lock:
             self._writable()
             lease = self._claim_settings()
@@ -1018,11 +1033,59 @@ class Log:
                 # applied to the configuration that governs it.
                 validate(self._schema, self._sort_by, self.config, archive)
                 self._refuse_archive_ahead(archive)
+                self._refuse_lossy_detach(archive)
                 # The other half of the same rule; see `set_config`.
                 checkpoint(lease.renew)
                 self._repoint(archive)
             finally:
                 lease.release()
+
+    def _refuse_lossy_detach(self, archive: str | None) -> None:
+        """Refuse a detach that could expose unarchived files to eviction.
+
+        I4 — never delete a local file the archive lacks — is enforced by a
+        clamp in `evict` that runs only while an archive is CONFIGURED. So
+        detaching does not merely stop using the archive: it retires the clamp,
+        for every process at once, and the next maintenance pass treats the
+        files still waiting to be pushed as ordinary retention candidates. A
+        maintainer already looping elsewhere does it without the operator
+        calling anything.
+
+        Measured: sync 4,550 rows behind, one detach, one pass, 4,025
+        acknowledged offsets unreadable. Nothing recovers them — `hydrate`
+        restores only what the archive holds, and `sync` cannot push files that
+        have left the table.
+
+        §8's "with no archive, `local_retention` is a deletion policy over the
+        only copy" is the contract a local-only log asked for. A log that HAD
+        an archive did not ask for it, and was getting it as a side effect.
+
+        **A blunt refusal, deliberately.** The precise question is "is there an
+        unarchived file that retention would reach", and answering it is not
+        the hard part — keeping the clamp alive across a detach is, since the
+        per-file `extent` rows outlive `_repoint` and could carry it. That is a
+        change to eviction, and it is tracked separately. Until then this
+        refuses the whole shape rather than pretending to a precision it does
+        not have: with no floors set, eviction does nothing and a detach is
+        safe; with one set, it may not be, and the library says so instead of
+        guessing.
+        """
+        if archive is not None or not self._archive.configured():
+            return
+
+        config = self.config
+        if config.local_retention is None and config.local_rows is None:
+            return
+
+        msg = (
+            "refusing to detach: this log has a retention floor set, and "
+            "detaching retires the I4 clamp that keeps eviction off files the "
+            "archive has not taken yet — so the next maintenance pass, in this "
+            "process or any other, could delete them. Nothing recovers them.\n"
+            "Clear local_retention and local_rows with set_config to say you "
+            "accept that, then detach."
+        )
+        raise ValueError(msg)
 
     def _refuse_archive_ahead(self, archive: str | None) -> None:
         """Refuse an archive whose extent is above this log's next offset.
@@ -1102,7 +1165,9 @@ class Log:
 
     def _repoint(self, archive: str | None) -> None:
         """Record the new location, with the maintenance lease held."""
-        # Normalised before anything compares it. Every path builder strips
+        # Already normalised by `set_archive`, which is the only caller and
+        # does it before its guards rather than after. Repeated here so this
+        # method is correct on its own terms: every path builder strips
         # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same archive
         # everywhere except here — where the difference would read as a move
         # and reset the watermarks of an archive that genuinely holds data.
@@ -2240,6 +2305,12 @@ class Log:
         retention policy and data past it is gone for good. That is the contract
         a local-only log with a retention asks for; `None` keeps everything and
         grows without bound.
+
+        **And DETACHING is the operation that makes a log local-only**, which
+        is the part nothing used to say. A log that had an archive never asked
+        for that contract, so `set_archive(None)` now refuses while a retention
+        floor is set rather than silently converting files awaiting upload into
+        ordinary retention candidates. See `_refuse_lossy_detach` and issue #21.
 
         Whether a stalled or partial pass should be reported rather than silent
         is open — §11 treats stalled eviction as an operational condition, and
