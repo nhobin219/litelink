@@ -41,6 +41,55 @@ class ColumnType(NamedTuple):
     """The DuckDB type the buffer leg is cast to. SQLite's per-value typing
     comes through the scanner loosely, so the union needs this explicit (§7)."""
 
+    carriers: frozenset[type]
+    """The EXACT Python types that may carry a value into this column.
+
+    `NoneType` is in every set: a NULL is a question about nullability, which
+    `Shape.required` answers with its own message, not about the carrier.
+
+    Exact types rather than an isinstance relation, because the check that uses
+    this is `type(v) in carriers` — one C-level set lookup per value, on the
+    write path. `bool` is deliberately absent from the integer sets: `True` is
+    an `int` to `isinstance` and would otherwise be stored as `1` in an int64
+    column with nothing said. `accepts` is what forgives a subclass."""
+
+    accepts: Callable[[object], bool]
+    """The definitive check, consulted only when `carriers` misses.
+
+    A `str` subclass — a `StrEnum` member is the common one — is a legitimate
+    value that `type(v) in carriers` rejects. This is the second opinion that
+    lets it through, and it costs nothing in the ordinary case because a
+    correct value never reaches it."""
+
+    bounds: tuple[float, float] | None
+    """The range a value must fall in, or None if the type cannot overflow.
+
+    Only `int32` and `float32` have one, which is what keeps this affordable:
+    a schema of int64s, float64s and strings has no bounded column at all and
+    the check is one truthiness test per row.
+
+    The two failure modes differ and both are silent at append. An int32 given
+    2**40 is stored by SQLite unchanged and then wedges EVERY scan
+    (`Integer value ... not in range`). A float32 given 1e300 is worse — it
+    reads back as `inf`, with no error anywhere.
+
+    `int64` is deliberately absent. SQLite refuses an out-of-range integer
+    itself, at the insert, inside the transaction and with no offset consumed;
+    adding bounds for it would make every ordinary schema pay the loop."""
+
+    exact_int: int | None
+    """The largest integer this float type represents EXACTLY, or None.
+
+    Only floats have one. An integer is a legal value for a float column —
+    `{"price": 5}` is too natural to refuse — but only while the conversion is
+    lossless, which is the same rule that refuses `1.5` into an int64.
+
+    It is not merely about precision. The buffer stores values with no
+    conversion, so an out-of-range integer stays an INTEGER in SQLite and
+    `pa.array(..., type=float64)` then refuses to build the column at all:
+    every scan and every seal raises for ever, while appends keep succeeding
+    and the buffer never drains. 2**53 for float64, 2**24 for float32."""
+
     variable_length: bool
     """Whether a value's size depends on the value.
 
@@ -50,35 +99,75 @@ class ColumnType(NamedTuple):
     is not a second opinion about types held somewhere else."""
 
 
+def _is_int(value: object) -> bool:
+    # `bool` excluded: it is an `int` subclass, so `True` would otherwise be a
+    # legal int64 and read back as `1`.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_float(value: object) -> bool:
+    # An `int` is a lossless float for every value that matters here, and
+    # `{"price": 5}` is too natural to refuse.
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_str(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _is_bool(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+_NONE = type(None)
+_INT = frozenset({int, _NONE})
+_FLOAT = frozenset({float, int, _NONE})
+_STR = frozenset({str, _NONE})
+_BOOL = frozenset({bool, _NONE})
+
+_INT32 = (-(2**31), 2**31 - 1)
+# The largest finite float32. A float64 above it becomes `inf` on the way in.
+_FLOAT32 = (-3.4028235e38, 3.4028235e38)
+
 # Matched in order, because Arrow's predicates overlap.
 _SUPPORTED: tuple[tuple[Callable[[pa.DataType], bool], ColumnType], ...] = (
     (
         pa.types.is_boolean,
-        ColumnType("INTEGER", "BOOLEAN", variable_length=False),
+        ColumnType(
+            "INTEGER", "BOOLEAN", _BOOL, _is_bool, None, None, variable_length=False
+        ),
     ),
     (
         pa.types.is_int32,
-        ColumnType("INTEGER", "INTEGER", variable_length=False),
+        ColumnType(
+            "INTEGER", "INTEGER", _INT, _is_int, _INT32, None, variable_length=False
+        ),
     ),
     (
         pa.types.is_int64,
-        ColumnType("INTEGER", "BIGINT", variable_length=False),
+        ColumnType(
+            "INTEGER", "BIGINT", _INT, _is_int, None, None, variable_length=False
+        ),
     ),
     (
         pa.types.is_float32,
-        ColumnType("REAL", "FLOAT", variable_length=False),
+        ColumnType(
+            "REAL", "FLOAT", _FLOAT, _is_float, _FLOAT32, 2**24, variable_length=False
+        ),
     ),
     (
         pa.types.is_float64,
-        ColumnType("REAL", "DOUBLE", variable_length=False),
+        ColumnType(
+            "REAL", "DOUBLE", _FLOAT, _is_float, None, 2**53, variable_length=False
+        ),
     ),
     (
         pa.types.is_string,
-        ColumnType("TEXT", "VARCHAR", variable_length=True),
+        ColumnType("TEXT", "VARCHAR", _STR, _is_str, None, None, variable_length=True),
     ),
     (
         pa.types.is_large_string,
-        ColumnType("TEXT", "VARCHAR", variable_length=True),
+        ColumnType("TEXT", "VARCHAR", _STR, _is_str, None, None, variable_length=True),
     ),
 )
 

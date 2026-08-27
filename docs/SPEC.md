@@ -206,6 +206,15 @@ durability story.
 So the batch size is a property of the call site, not a setting: nothing in `LogConfig`
 tunes it, and no throughput figure here means anything without it stated.
 
+**`append()` and `extend()` validate per row, and that is the right trade for them.** A
+mapping carries no schema of its own, so I17 is enforced one row at a time — names in
+Python, types and ranges by the buffer's CHECK constraints. It costs about 400 ns/row,
+which is nothing against a per-transaction fsync: these calls exist for true streams and
+small batches, where a row costs microseconds to hundreds of microseconds and the check is
+under 3% of it. A caller batching thousands of rows per call pays a visible ~10% and wants
+the columnar entry point instead, where the schema is checked once for the whole batch —
+see §13's *Bulk ingest*.
+
 Reference throughput on network-backed storage at a 2 KB row: 21,850 rows/s at
 `synchronous=FULL` (46 µs/row), against a raw `append+fdatasync` floor of 30,464 rows/s.
 The batch size behind that pair predates the benchmark harness and was not recorded, which
@@ -1349,6 +1358,29 @@ Use §4's shape, not a best-effort ordering: record the intended schema in SQLit
 anything changes, commit to Iceberg, then write the schema and clear the intent. Recovery
 replays it, and the table's columns say which half already landed.
 
+**Probe, never stamp.** The intent records WHAT the change is, never which of its steps have
+run. Recording a step does not make it atomic with the commit it describes — it only moves
+the unreconciled gap from before that commit to after it — and a stamp can be *false*:
+`Log.restore` rebuilds the local table from the declared schema, so a replica captured
+mid-change arrives carrying a record of a step that never landed on that machine. Every step
+is settled by asking the thing itself: the archive's columns, the local table's, `PRAGMA
+table_info(buffer)`, the `meta` row. This requires the Iceberg step to be replayable against
+a table where it already landed, which is why it uses `union_by_name` — idempotent — rather
+than `add_column`, which raises `name already exists`.
+
+**Recovery defers; it never fails the open.** If the archive cannot be widened, the intent is
+left standing and the log opens anyway. It appends, seals and reads; the change simply has
+not finished, and it is safe to leave because the declaration is unchanged — so no value of
+the new column can be stored, the insert column list being derived from it. Failing the open
+instead would mean a change interrupted by an outage makes the log unopenable for writing
+until the bucket returns, breaking §11's promise that a log works with no network.
+
+**One change at a time.** A second change while one is outstanding is refused, and the
+refusal names the pending column. This is not tidiness: the second change would write
+`declared + its own column`, dropping the pending one from the declaration while the Iceberg
+tables keep it, and then clear the intent — after which the declared schema and the table
+disagree with nothing to explain it, and no process can open the log at all.
+
 This is the same completion boundary every other multi-step operation here uses — a seal
 completes at its final SQLite transaction, a compaction when its claim is cleared, a deletion
 when its queue row is forgotten. **Iceberg holds the data; SQLite holds the record of what the
@@ -1404,6 +1436,7 @@ Each needs a test.
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
 | **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
 | **I11** | `litelink_offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
+| **I17** | An append names only columns the log declares, supplies a value for every non-nullable one, and gives each a value of its declared type, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. The type clause closes the same two outcomes reached through a value rather than a name: SQLite has affinities, not types, so it stores whatever it is given and the declared schema is not consulted again until the read. A value Arrow cannot parse (`"x"` into an int64) wedges every scan; one it can parse but not preserve (`1.5` into an int64, `12345` into a string, `True` into an int64) is silently rewritten, so what is read back is not what was appended and nothing raises at all. Magnitude is checked with it: `2**40` IS an int and `1e300` IS a float, and they fail the same two ways — the int32 wedges every scan, the float32 reads back as `inf`. **Enforced by the buffer's DDL, not by Python.** Every column is declared `ANY` with a `typeof` CHECK, and that is the whole design: a STRICT column of a declared type does not refuse a wrong value, it CONVERTS one. An INTEGER column given `'77'` stores 77 and `'007'` stores 7; a REAL column given `'1e999'` stores `inf`; a TEXT column given `12345` stores `'12345'`. The conversion happens before any CHECK could see it, so a constraint on a typed column would be asked about a value that had already been changed. `ANY` stores the value exactly as given, which is what lets `typeof` tell the truth about it; STRICT is still declared, because it is what makes `ANY` mean "no conversion". `NOT NULL` carries the nullability half — absent and explicitly-None reach SQLite identically — and the range tests ride in the same CHECK. An integer is a legal value for a FLOAT column — `{"price": 5}` is too natural to refuse — but only within the range where every integer converts exactly (2**53 for float64, 2**24 for float32). Past it the value stays an integer in the buffer, since `ANY` performs no conversion, and Arrow then cannot build the column at all: one such value makes every scan and every seal raise for ever while appends keep succeeding. The bound is a range rather than a per-value test because a SQL CHECK cannot ask whether one particular integer is representable, so some that would convert exactly are refused too. A column added later by `add_column` gets the identical DDL through `ALTER TABLE`, which accepts a CHECK; building it from the affinity alone left every added column unvalidated for the life of the log. Python is left with the one question SQLite cannot be asked, an unknown column: the insert names the schema's columns, so a key the log does not have is dropped before any SQL exists. One leniency is deliberate — `True` into an integer column stores 1, because the driver converts it before SQLite sees it, and it is lossless. |
 | **I9** | `litelink_offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
 | **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
@@ -1620,6 +1653,20 @@ The consequence worth planning for is that local disk holds roughly
    into reader output, and not `sealing` itself, which holds one row and would block seals
    for the length of a rewrite. The sweep rule then mirrors §15.3: a staged file with no
    row is an orphan by definition.
+
+   **It amortises I17, which is per-row today and cannot be otherwise.** A row arriving as a
+   mapping carries no schema, so every row is checked on its own: its key set against the
+   declared columns in Python, its values against the buffer's CHECK constraints in SQLite.
+   An Arrow batch carries its schema, so one comparison against the declared one proves the
+   names and types of every row in the batch **by construction** — the per-row work is not
+   optimised away, it stops being necessary. That is a second argument for this path
+   independent of avoiding the row-by-row rewrite, and it is the larger one for a backfill.
+
+   Measured on the write path: validation costs about 400 ns/row of CPU. At `1` and `200`
+   rows per `extend()` that is invisible, because each transaction is fsync-bound at ~800 µs
+   and ~16 µs per row respectively; at 5,000 rows per batch, where the fsync is amortised
+   and a row costs ~4 µs, it is about 10%. So the cost lands exactly on the caller who is
+   already batching hard enough to want this endpoint instead.
 
    Reserving needs no new counter. Bumping `sqlite_sequence` by N inside the write
    transaction reserves `[old+1, old+N]`, preserves I9, and lands above everything ever
@@ -2070,6 +2117,30 @@ Beyond §10:
 - Create a stream whose schema has no timestamp column at all; assert seal, compaction, the
   three-way read and retention all work — proving nothing depends on an ingest column.
 - Assert a caller-supplied `litelink_offset` is rejected (I11).
+- Assert a row naming an undeclared column is rejected, and that the batch it was in is
+  rejected whole with no offset consumed (I17). Include the row that misspells a declared
+  column: it has the same width as a correct one, so a length check passes it.
+- Assert a value of the wrong type is rejected at APPEND, for both outcomes: one Arrow
+  cannot parse (which would wedge every scan) and one it would silently rewrite (`1.5` into
+  an int64, `True` into an int64 — the case an `isinstance` check passes, `bool` being an
+  `int` subclass). Assert a `str` subclass and an `int` in a float column are still accepted:
+  the exact-type gate is a fast path, not the definition of legality.
+- Assert a value of the right type but the wrong MAGNITUDE is rejected — `2**40` into an
+  int32, `1e300` into a float32 — and that the exact bounds are accepted along with an
+  explicit infinity, which a float32 represents exactly and which is a statement rather than
+  an overflow.
+- Assert a row omitting a non-nullable column is rejected, and so is one supplying it as
+  `None` (I17) — while an absent NULLABLE column is still accepted, which is what stops the
+  check from being a blanket "every key must be present". Falsify by allowing it and
+  scanning: the failure is not scoped to the bad row, so assert the rows written BEFORE it
+  become unreadable too.
+- Add a column to a log with sealed files; assert old rows read null, new rows carry values,
+  and not one file was rewritten. Assert a SEALER that never appends does not drop the new
+  column — the process that would never revalidate if the schema were cached per append.
+- Interrupt a schema change before its final SQLite write; assert the next open completes it,
+  and that a reader opened during the window reads rather than raising. Assert an
+  `add_column` whose archive is unreachable leaves the log openable, appendable and readable,
+  and that the change completes on a later open (§11).
 - Commit twice, then assert a reader that cached `metadata_location` from the first commit
   is detectably stale -- the reason §7 requires resolving it per query.
 - Run with `local_retention = 0`; assert seal, upload, archive reads and compaction all work

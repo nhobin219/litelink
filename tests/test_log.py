@@ -64,9 +64,7 @@ def test_caller_supplied_offset_is_rejected(tmp_path: Path) -> None:
     """I11: the library owns `offset` and never accepts one."""
     with open_log(tmp_path) as log:
         with pytest.raises(ValueError, match="I11"):
-            log.append(
-                {"litelink_offset": 7, "event_ts": 1, "key": "k", "payload": b""}
-            )
+            log.append({"litelink_offset": 7, "event_ts": 1, "key": "k", "payload": ""})
 
 
 def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
@@ -119,7 +117,7 @@ def test_sealed_file_is_sorted_by_sort_by(tmp_path: Path) -> None:
     """§4: the sort order is applied at write time, not merely declared."""
     with open_log(tmp_path) as log:
         log.extend(
-            [{"event_ts": ts, "key": "k", "payload": b""} for ts in (300, 100, 200)]
+            [{"event_ts": ts, "key": "k", "payload": ""} for ts in (300, 100, 200)]
         )
         log.seal()
 
@@ -512,3 +510,508 @@ def test_a_sort_key_correlated_with_the_offset_keeps_files_prunable(
         assert all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1)), (
             "correlated keys leave each file a disjoint slice, so files prune"
         )
+
+
+def test_append_refuses_a_column_this_log_does_not_have(tmp_path: Path) -> None:
+    """Nothing below catches this, and the checks that exist fire too late.
+
+    `_insert` builds each row as `tuple(row.get(c) for c in columns)` — it
+    enumerates the SCHEMA's columns, never the row's keys — so an unknown key
+    is dropped before any SQL exists. Neither SQLite nor pyarrow ever sees it,
+    and `append` returns an offset for a row it silently truncated.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="does not have: \\['region'\\]"):
+            log.append({"event_ts": 1, "key": "a", "payload": "p", "region": "eu"})
+
+        # And the message names the declared set, because "unknown column" on
+        # its own does not tell you whether you misspelled or misremembered.
+        with pytest.raises(ValueError, match="Declared:"):
+            log.append({"event_ts": 1, "key": "a", "payload": "p", "region": "eu"})
+
+        assert log.end_offset() == 1, "a refused row must not consume an offset"
+
+
+def test_append_refuses_a_typo_that_shadows_a_declared_column(
+    tmp_path: Path,
+) -> None:
+    """The row a length check cannot catch, and the reason there is not one.
+
+    A first design guarded the subset test with `len(row) != width`, on the
+    reasoning that a matching width means every declared column is present.
+    It does not: it means as many keys are missing as are unknown. One typo —
+    `ky` for `key` — has the right width, skips the test, stores NULL in the
+    column it shadowed, and if that column is non-nullable every scan and every
+    seal then fails for ever while appends keep succeeding.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="does not have: \\['ky'\\]"):
+            log.append({"event_ts": 1, "ky": "a", "payload": "p"})
+
+        assert log.end_offset() == 1
+
+
+def test_the_unknown_column_fast_path_cannot_be_fooled(tmp_path: Path) -> None:
+    """The width test is skipped only when the row proves it is complete.
+
+    `_insert` avoids the set test when every declared column came back
+    non-None AND the row has exactly that many keys — which together mean the
+    row holds the declared columns and nothing else. Each case below attacks
+    one half of that pairing:
+
+    - a full-width row with a real value in every column PLUS an extra key has
+      the wrong width, so the fast path does not apply;
+    - a row of exactly the right width that hides an unknown key behind an
+      absent one (`ky` for `key`) has a None among its values, which is what
+      sends it to the full test. This is the shape that broke the original
+      `len(row) != width and not declared(row)` predicate.
+
+    Falsify by dropping the `None in values` half: the second row is accepted
+    and `key` is silently NULL.
+    """
+    with open_log(tmp_path) as log:
+        # Every column supplied and non-None, plus one extra: width differs.
+        with pytest.raises(ValueError, match="does not have: \\['region'\\]"):
+            log.append({"event_ts": 1, "key": "a", "payload": "p", "region": "eu"})
+
+        # Exactly the declared width, but one key is a typo for another.
+        with pytest.raises(ValueError, match="does not have: \\['ky'\\]"):
+            log.append({"event_ts": 1, "ky": "a", "payload": "p"})
+
+        # And the fast path itself still accepts the row it exists for.
+        log.append({"event_ts": 1, "key": "a", "payload": "p"})
+
+        assert log.scan().read_all().num_rows == 1
+
+
+def test_append_still_accepts_a_row_missing_a_nullable_column(
+    tmp_path: Path,
+) -> None:
+    """The refusal is about UNKNOWN columns, not absent ones.
+
+    A missing nullable column is a legal row and stores NULL — the shape a
+    subset test permits and a width test would not.
+    """
+    with open_log(tmp_path) as log:
+        log.append({"event_ts": 1, "key": "a"})
+
+        rows = log.scan().read_all().to_pylist()
+
+        assert rows[0]["payload"] is None
+
+
+def test_append_refuses_a_row_omitting_a_non_nullable_column(
+    tmp_path: Path,
+) -> None:
+    """The unknown-column wedge from the other side (I17).
+
+    Naming a column the log lacks and failing to supply one it requires both
+    end as a NULL nothing below catches. `row.get` yields None for an absent
+    key, SQLite stores it, and the scan cast is where it finally raises — long
+    after `append` handed back an offset.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="non-nullable columns NULL"):
+            log.append({"key": "a", "payload": "p"})
+
+        # Named, and named as absent rather than as None: the two have the same
+        # consequence but not the same fix.
+        with pytest.raises(ValueError, match="Absent from the row: \\['event_ts'\\]"):
+            log.append({"key": "a", "payload": "p"})
+
+        assert log.end_offset() == 1, "a refused row must not consume an offset"
+
+
+def test_append_refuses_a_non_nullable_column_supplied_as_none(
+    tmp_path: Path,
+) -> None:
+    """Explicitly None is the same NULL as absent, so it is the same refusal.
+
+    Worth its own test because the obvious implementation — checking the row's
+    KEYS against the required set — passes this row: `event_ts` is present. It
+    is the VALUE that wedges the log, so the check has to read values.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="Supplied as None: \\['event_ts'\\]"):
+            log.append({"event_ts": None, "key": "a", "payload": "p"})
+
+        assert log.end_offset() == 1
+
+
+def test_the_refusal_protects_rows_written_before_the_bad_one(
+    tmp_path: Path,
+) -> None:
+    """Why this is data loss and not just a bad row.
+
+    The failing cast is a property of the FILE, not of the row, so one NULL in
+    a non-nullable column takes every row in the log down with it — including
+    the ones acknowledged long before. Meanwhile `append` keeps succeeding, so
+    a writer sees a healthy log while every reader sees nothing.
+
+    Falsify by removing the `_required` scan from `_insert`: this scan then
+    raises `Casting field 'event_ts' with null values to non-nullable` and the
+    100 good rows above become unreadable.
+    """
+    with open_log(tmp_path) as log:
+        log.extend(rows(100))
+
+        with pytest.raises(ValueError, match="non-nullable columns NULL"):
+            log.append({"key": "late", "payload": "p"})
+
+        assert log.scan().read_all().num_rows == 100, (
+            "the rows acknowledged before the bad one must still read"
+        )
+
+
+def test_a_typo_on_a_non_nullable_column_names_the_unknown_key(
+    tmp_path: Path,
+) -> None:
+    """One typo trips both halves of I17, and the useful half wins.
+
+    `event_tz` is undeclared AND leaves the non-nullable `event_ts` absent.
+    The caller mistyped one key, so naming that key is what shortens the
+    search; "event_ts is missing" describes the consequence, not the cause.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="does not have: \\['event_tz'\\]"):
+            log.append({"event_tz": 1, "key": "a", "payload": "p"})
+
+        assert log.end_offset() == 1
+
+
+TYPED = pa.schema(
+    [
+        pa.field("event_ts", pa.int64(), nullable=False),
+        pa.field("key", pa.string()),
+        pa.field("price", pa.float64()),
+        pa.field("flag", pa.bool_()),
+    ]
+)
+
+
+def test_append_refuses_a_value_that_would_wedge_every_scan(
+    tmp_path: Path,
+) -> None:
+    """SQLite has affinities, not types, so it stores whatever it is given.
+
+    The declared schema is not consulted again until the value is read back —
+    by which point `append` has returned an offset. A value Arrow cannot parse
+    then makes EVERY scan raise, including scans of rows written before it,
+    while appends keep succeeding.
+
+    Falsify by removing the type gate from `_insert`: the append succeeds and
+    the assert on the surviving rows fails with `ArrowInvalid`.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        log.extend([{"event_ts": i, "key": "k"} for i in range(50)])
+
+        for row in (
+            {"event_ts": "not-a-number", "key": "k"},
+            {"event_ts": 1, "price": "expensive"},
+            {"event_ts": 1, "key": b"\xff\xfe"},
+        ):
+            with pytest.raises(ValueError, match="wrong type"):
+                log.append(row)
+
+        assert log.scan().read_all().num_rows == 50, (
+            "the rows acknowledged before the bad one must still read"
+        )
+
+
+def test_append_refuses_a_value_that_would_be_silently_rewritten(
+    tmp_path: Path,
+) -> None:
+    """The quiet half, and the worse one.
+
+    These parse. They just do not survive: `1.5` into an int64 reads back as
+    `1` and `12345` into a string as `'12345'`. No error is raised anywhere,
+    so what comes out is not what went in.
+
+    Caught by the DDL now rather than by Python — `STRICT` refuses the REAL,
+    and a string column is declared `ANY` so a `typeof` CHECK can see that
+    `12345` is an integer before SQLite would have stringified it.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        for row in (
+            {"event_ts": 1.5, "key": "k"},
+            {"event_ts": 1, "key": 12345},
+            {"event_ts": 1, "flag": 7},
+        ):
+            with pytest.raises(ValueError, match="wrong type"):
+                log.append(row)
+
+        assert log.end_offset() == 1, "a refused row must not consume an offset"
+
+        # `True` into an int64 is the one leniency, and it is deliberate.
+        # Python's sqlite3 driver converts a bool to 1 before SQLite sees the
+        # value, so no constraint can distinguish it from a plain int — and
+        # re-adding a Python check for this alone would cost the whole per-row
+        # gate the DDL just replaced. It is lossless: `True == 1` in Python,
+        # and Arrow would store 1 either way.
+        log.append({"event_ts": True, "key": "k"})
+
+        assert log.scan().read_all().column("event_ts").to_pylist() == [1]
+
+
+def test_append_refuses_a_string_that_sqlite_would_convert(
+    tmp_path: Path,
+) -> None:
+    """The reason every column is declared ANY.
+
+    A STRICT column of a declared type does not refuse a wrong value, it
+    CONVERTS one — an INTEGER column given `'77'` stores 77 and `'007'` stores
+    7, a REAL column given `'1e999'` stores `inf`. The conversion happens
+    before any CHECK could see it, so a constraint on a typed column would be
+    asked about a value that had already been changed.
+
+    `'007'` is the one that shows why "lossless" is not the test: it survives
+    as 7, and no round trip gets the original back.
+
+    Falsify by declaring the columns with their affinities instead of ANY:
+    every row below is accepted and silently rewritten.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        for row in (
+            {"event_ts": "77"},
+            {"event_ts": "007"},
+            {"event_ts": " 77 "},
+            {"event_ts": 1, "price": "1e999"},
+            {"event_ts": 1, "flag": "0"},
+        ):
+            with pytest.raises(ValueError, match="wrong type"):
+                log.append(row)
+
+        assert log.end_offset() == 1
+
+
+def test_a_column_added_later_is_validated_like_any_other(
+    tmp_path: Path,
+) -> None:
+    """`ALTER TABLE ADD COLUMN` must carry the same DDL as `CREATE TABLE`.
+
+    It did not, and `_create` is `CREATE TABLE IF NOT EXISTS`, so the gap
+    survived every reopen: a column added by `add_column` was unvalidated for
+    the life of the log. An int32 given 2**40 was stored, `append` returned an
+    offset, and then every scan AND every seal raised for ever while appends
+    kept succeeding — the buffer could never drain.
+
+    Falsify by building the ALTER from the affinity alone: all three rows
+    below are accepted, and the seal at the end raises `ArrowInvalid`.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        log.extend([{"event_ts": i} for i in range(5)])
+        log.add_column("late", pa.int32())
+
+        for row in (
+            {"event_ts": 9, "late": 2**40},
+            {"event_ts": 9, "late": "5"},
+            {"event_ts": 9, "late": 1.5},
+        ):
+            with pytest.raises(ValueError, match="wrong type|cannot hold"):
+                log.append(row)
+
+        log.append({"event_ts": 9, "late": 7})
+        log.seal()
+
+        assert log.scan().read_all().num_rows == 6
+
+
+def test_append_refuses_an_integer_a_float_column_cannot_hold(
+    tmp_path: Path,
+) -> None:
+    """An int is a legal float only while the conversion is lossless.
+
+    The buffer stores values with no conversion, so an out-of-range integer
+    stays an INTEGER in SQLite and `pa.array(..., type=float64)` then refuses
+    to build the column AT ALL. One such value made every scan and every seal
+    raise for ever — including for rows written before it — while `append`
+    kept returning offsets, so the buffer could never drain.
+
+    The bound is what the type represents exactly: 2**53 for float64, 2**24
+    for float32. `-(2**63)` is here because testing the integer with `abs`
+    raised SQLite's `OperationalError` out of the CHECK — there is no positive
+    counterpart for the most-negative int64 — instead of a refusal.
+
+    Falsify by allowing `typeof IN ('integer','real')` without the bound: all
+    four rows are accepted and the scan at the end raises `ArrowInvalid`.
+    """
+    log = Log.new(tmp_path, "s", schema=RANGED_FLOAT)
+    with log:
+        log.extend([{"k": i, "f64": 1.5} for i in range(5)])
+
+        for row in (
+            {"k": 9, "f64": 2**53 + 1},
+            {"k": 9, "f32": 2**24 + 1},
+            {"k": 9, "f32": -(2**63)},
+            {"k": 9, "f64": -(2**63)},
+        ):
+            with pytest.raises(ValueError, match="cannot hold the integer"):
+                log.append(row)
+
+        assert log.scan().read_all().num_rows == 5
+
+
+def test_a_float_column_still_takes_an_integer_it_can_hold(
+    tmp_path: Path,
+) -> None:
+    """`{"price": 5}` is too natural to refuse, and the exact bounds are legal."""
+    log = Log.new(tmp_path, "s", schema=RANGED_FLOAT)
+    with log:
+        log.append({"k": 1, "f64": 5})
+        log.append({"k": 2, "f64": 2**53})
+        log.append({"k": 3, "f64": -(2**53)})
+        log.append({"k": 4, "f32": 2**24})
+        log.seal()
+
+        got = log.scan().read_all().column("f64").to_pylist()
+
+        assert got[:3] == [5.0, float(2**53), float(-(2**53))]
+
+
+def test_the_type_refusal_names_the_column_the_value_and_the_declared_type(
+    tmp_path: Path,
+) -> None:
+    """ "Wrong type" alone does not say which of six columns, or what it wanted."""
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with (
+        log,
+        pytest.raises(ValueError, match=r"event_ts=1\.5 \(float, declared int64\)"),
+    ):
+        log.append({"event_ts": 1.5, "key": "k"})
+
+
+def test_append_accepts_values_the_exact_check_alone_would_refuse(
+    tmp_path: Path,
+) -> None:
+    """The fast gate is `type(v) in carriers`; legality is a broader question.
+
+    A `StrEnum` member IS a string and must be stored as one. An `int` in a
+    float column is lossless and too natural to refuse. Both miss the exact
+    check and are then allowed by `accepts` — which is why a miss is not a
+    refusal.
+    """
+    import enum
+
+    class Region(enum.StrEnum):
+        EU = "eu-west-1"
+
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        log.append({"event_ts": 1, "key": Region.EU, "price": 5})
+
+        table = log.scan().read_all()
+
+        assert table.column("key").to_pylist() == ["eu-west-1"]
+        assert table.column("price").to_pylist() == [5.0]
+
+
+RANGED_FLOAT = pa.schema(
+    [
+        pa.field("k", pa.int64(), nullable=False),
+        pa.field("f64", pa.float64()),
+        pa.field("f32", pa.float32()),
+    ]
+)
+
+RANGED = pa.schema(
+    [
+        pa.field("event_ts", pa.int64(), nullable=False),
+        pa.field("n32", pa.int32()),
+        pa.field("f32", pa.float32()),
+    ]
+)
+
+
+def test_append_refuses_a_value_the_column_cannot_hold(tmp_path: Path) -> None:
+    """Right type, wrong magnitude — which the type gate cannot see.
+
+    `2**40` IS an int and `1e300` IS a float, so both pass an exact-type check
+    and then fail differently: the int32 is stored unchanged and makes every
+    scan raise `Integer value ... not in range`, while the float32 reads back
+    as `inf` with no error raised anywhere.
+    """
+    log = Log.new(tmp_path, "s", schema=RANGED)
+    with log:
+        log.extend([{"event_ts": i} for i in range(20)])
+
+        for row in (
+            {"event_ts": 1, "n32": 2**40},
+            {"event_ts": 1, "n32": -(2**40)},
+            {"event_ts": 1, "f32": 1e300},
+        ):
+            with pytest.raises(ValueError, match="cannot hold"):
+                log.append(row)
+
+        assert log.scan().read_all().num_rows == 20
+
+
+def test_append_accepts_the_exact_bounds_and_an_explicit_infinity(
+    tmp_path: Path,
+) -> None:
+    """The check is a range, not a smaller one, and `inf` is a real float32.
+
+    A float32 represents infinity exactly, so passing one is a statement rather
+    than an overflow. What is refused is a FINITE value that would silently
+    become infinite. Falsify by dropping the `_INFINITE` clause: the explicit
+    infinities below are then refused.
+    """
+    log = Log.new(tmp_path, "s", schema=RANGED)
+    with log:
+        log.append({"event_ts": 1, "n32": 2**31 - 1})
+        log.append({"event_ts": 2, "n32": -(2**31)})
+        log.append({"event_ts": 3, "f32": float("inf")})
+        log.append({"event_ts": 4, "f32": float("-inf")})
+        # A column that CAN overflow but was not supplied is not a range fault.
+        log.append({"event_ts": 5})
+
+        table = log.scan().read_all()
+
+        assert table.column("n32").to_pylist()[:2] == [2**31 - 1, -(2**31)]
+        assert table.column("f32").to_pylist()[2:4] == [float("inf"), float("-inf")]
+
+
+def test_extend_refuses_the_batch_without_writing_any_of_it(
+    tmp_path: Path,
+) -> None:
+    """One bad row rejects the batch, and the batch is one transaction.
+
+    `_insert` runs inside `BEGIN IMMEDIATE`, so raising part way rolls the
+    whole thing back. That matters more than it looks: a partial batch would
+    hand back offsets for rows the caller never learns were stored.
+    """
+    with open_log(tmp_path) as log:
+        good = [{"event_ts": i, "key": f"k{i}", "payload": "p"} for i in range(50)]
+        bad = [*good, {"event_ts": 50, "key": "k50", "payload": "p", "region": "eu"}]
+
+        with pytest.raises(ValueError, match="does not have"):
+            log.extend(bad)
+
+        assert log.end_offset() == 1, "the batch was partly written"
+        assert log.scan().read_all().num_rows == 0
+
+
+def test_a_row_that_is_wrong_twice_names_the_forbidden_column_first(
+    tmp_path: Path,
+) -> None:
+    """I11 before I17, when a row breaks both.
+
+    `litelink_offset` is in the declared set, so the subset test passes it
+    through either way and the ORDER of the two checks is what decides which
+    error the caller reads. Supplying an offset is the specifically forbidden
+    thing; "unknown column" would send them looking at the wrong key.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="I11"):
+            log.append(
+                {
+                    "event_ts": 1,
+                    "key": "a",
+                    "payload": "p",
+                    "litelink_offset": 9,
+                    "region": "eu",
+                }
+            )

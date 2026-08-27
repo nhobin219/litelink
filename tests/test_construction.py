@@ -82,16 +82,13 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     # Log are handed the same one. It stores no location — it reads the log's,
     # so `set_archive` reaches all three by writing one row.
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
+    archive = Archive(layout, buffer, S3Options())
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(
-            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
-        ),
+        reader=Reader(layout, table, buffer, duckdb_connection, archive),
         maintenance=Maintenance(table, buffer, layout, archive),
-        schema=SCHEMA,
         config=config,
         archive=archive,
     )
@@ -119,17 +116,14 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     buffer = StubBuffer.open(layout.buffer_db, SCHEMA)
     config = LogConfig()
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
+    archive = Archive(layout, buffer, S3Options())
 
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(
-            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
-        ),
+        reader=Reader(layout, table, buffer, duckdb_connection, archive),
         maintenance=Maintenance(table, buffer, layout, archive),
-        schema=SCHEMA,
         config=config,
         archive=archive,
     )
@@ -362,9 +356,18 @@ def test_the_reserved_column_is_refused_at_schema_change_time(tmp_path: Path) ->
         with pytest.raises(ValueError, match="litelink_offset"):
             log.drop_column("litelink_offset", breaking_ok=True)
 
-        # An ordinary column still reaches the unimplemented body.
+        # An ordinary column reaches the body — `add_column` is implemented,
+        # so the refusal above is I11 and not the stub. The other two are
+        # still unimplemented: both are BREAKING for consumers (I10).
+        log.add_column("extra", pa.int64())
+
+        assert "extra" in log._buffer.shape().columns
+
         with pytest.raises(NotImplementedError):
-            log.add_column("extra", pa.int64())
+            log.rename_column("key", "renamed", breaking_ok=True)
+
+        with pytest.raises(NotImplementedError):
+            log.drop_column("key", breaking_ok=True)
 
 
 def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
@@ -847,7 +850,7 @@ def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> N
         config=LogConfig(local_retention=timedelta(0), local_rows=1_000_000),
     )
     with log:
-        log.extend([{"event_ts": i, "key": "k", "payload": "p"} for i in range(8)])
+        log.extend([{"event_ts": i, "key": "k"} for i in range(8)])
         log.seal()
         log.maintain()
 
@@ -1126,7 +1129,7 @@ def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
     once `meta` is the source of truth, because nothing would reconcile them.
     """
     with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.extend([{"event_ts": i, "key": f"k{i}", "payload": "p"} for i in range(20)])
+        log.extend([{"event_ts": i, "key": f"k{i}"} for i in range(20)])
         log.set_sort_by((), rewrite=True)
 
         assert log._table.sort_by() == ()  # noqa: SLF001
@@ -1156,12 +1159,7 @@ def test_a_rewrite_finishes_a_re_sort_that_died_after_the_meta_write(
     with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         # `key` descending as `event_ts` ascends, so the two clusterings are
         # distinguishable and neither is the insertion order by accident.
-        log.extend(
-            [
-                {"event_ts": i, "key": f"k{20 - i:02d}", "payload": "p"}
-                for i in range(20)
-            ]
-        )
+        log.extend([{"event_ts": i, "key": f"k{20 - i:02d}"} for i in range(20)])
         while log.seal() is not None:
             pass
 
@@ -1200,7 +1198,7 @@ def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
     """
     buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
     try:
-        buffer.append([{"event_ts": i, "key": "k", "payload": "p"} for i in range(2)])
+        buffer.append([{"event_ts": i, "key": "k"} for i in range(2)])
         highest = buffer.next_offset() - 1
 
         buffer.seed_offsets(highest + (1 << 20))
