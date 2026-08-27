@@ -729,6 +729,7 @@ class Buffer:
             # before any SQL exists — no constraint can see what is not in the
             # statement. Everything else I17 promises is in the DDL now.
             declared = shape.known.issuperset
+            width = len(columns)
             for row in rows:
                 # I11 FIRST, so a row that is wrong twice gets the message
                 # about the thing that is specifically forbidden rather than
@@ -736,10 +737,28 @@ class Buffer:
                 # subset test passes it through to here either way; the order
                 # is what decides which error the caller reads.
                 self._reject_offset(row)
-                if not declared(row):
-                    self._reject_unknown(row)
 
                 values = tuple(row.get(c) for c in columns)
+                # The unknown-column test, skipped when the row proves it
+                # cannot have one. If every declared column came back
+                # non-None then every declared column is PRESENT, so a row
+                # of exactly `width` keys holds those columns and nothing
+                # else — there is no room for an extra.
+                #
+                # Both halves are needed and neither alone is sound. A row
+                # that omits a nullable column has the wrong width and is
+                # perfectly legal, so width alone cannot refuse. And a row of
+                # the right width can still hide an unknown key behind an
+                # absent one — `ky` for `key` — which is why a single None
+                # sends it to the full test. That pairing is the bug an
+                # earlier draft shipped as `len(row) != width and not
+                # declared(row)`: it short-circuited the wrong way round.
+                #
+                # `None in values` is one C-level pass, against a set test
+                # that hashes every key in the row.
+                if (len(row) != width or None in values) and not declared(row):
+                    self._reject_unknown(row)
+
                 try:
                     cursor.execute(sql, values)
                 except sqlite3.IntegrityError as exc:

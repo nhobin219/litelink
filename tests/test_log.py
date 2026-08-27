@@ -551,6 +551,39 @@ def test_append_refuses_a_typo_that_shadows_a_declared_column(
         assert log.end_offset() == 1
 
 
+def test_the_unknown_column_fast_path_cannot_be_fooled(tmp_path: Path) -> None:
+    """The width test is skipped only when the row proves it is complete.
+
+    `_insert` avoids the set test when every declared column came back
+    non-None AND the row has exactly that many keys — which together mean the
+    row holds the declared columns and nothing else. Each case below attacks
+    one half of that pairing:
+
+    - a full-width row with a real value in every column PLUS an extra key has
+      the wrong width, so the fast path does not apply;
+    - a row of exactly the right width that hides an unknown key behind an
+      absent one (`ky` for `key`) has a None among its values, which is what
+      sends it to the full test. This is the shape that broke the original
+      `len(row) != width and not declared(row)` predicate.
+
+    Falsify by dropping the `None in values` half: the second row is accepted
+    and `key` is silently NULL.
+    """
+    with open_log(tmp_path) as log:
+        # Every column supplied and non-None, plus one extra: width differs.
+        with pytest.raises(ValueError, match="does not have: \\['region'\\]"):
+            log.append({"event_ts": 1, "key": "a", "payload": "p", "region": "eu"})
+
+        # Exactly the declared width, but one key is a typo for another.
+        with pytest.raises(ValueError, match="does not have: \\['ky'\\]"):
+            log.append({"event_ts": 1, "ky": "a", "payload": "p"})
+
+        # And the fast path itself still accepts the row it exists for.
+        log.append({"event_ts": 1, "key": "a", "payload": "p"})
+
+        assert log.scan().read_all().num_rows == 1
+
+
 def test_append_still_accepts_a_row_missing_a_nullable_column(
     tmp_path: Path,
 ) -> None:
