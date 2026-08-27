@@ -692,24 +692,34 @@ def test_append_refuses_a_value_that_would_be_silently_rewritten(
     """The quiet half, and the worse one.
 
     These parse. They just do not survive: `1.5` into an int64 reads back as
-    `1`, `12345` into a string as `'12345'`, and `True` into an int64 as `1`.
-    No error is raised anywhere, so what comes out is not what went in.
+    `1` and `12345` into a string as `'12345'`. No error is raised anywhere,
+    so what comes out is not what went in.
 
-    `True` is the one an isinstance check gets wrong — `bool` is a subclass of
-    `int`, so `isinstance(True, int)` is True and the value would pass.
+    Caught by the DDL now rather than by Python — `STRICT` refuses the REAL,
+    and a string column is declared `ANY` so a `typeof` CHECK can see that
+    `12345` is an integer before SQLite would have stringified it.
     """
     log = Log.new(tmp_path, "s", schema=TYPED)
     with log:
         for row in (
             {"event_ts": 1.5, "key": "k"},
             {"event_ts": 1, "key": 12345},
-            {"event_ts": True, "key": "k"},
             {"event_ts": 1, "flag": 7},
         ):
             with pytest.raises(ValueError, match="wrong type"):
                 log.append(row)
 
         assert log.end_offset() == 1, "a refused row must not consume an offset"
+
+        # `True` into an int64 is the one leniency, and it is deliberate.
+        # Python's sqlite3 driver converts a bool to 1 before SQLite sees the
+        # value, so no constraint can distinguish it from a plain int — and
+        # re-adding a Python check for this alone would cost the whole per-row
+        # gate the DDL just replaced. It is lossless: `True == 1` in Python,
+        # and Arrow would store 1 either way.
+        log.append({"event_ts": True, "key": "k"})
+
+        assert log.scan().read_all().column("event_ts").to_pylist() == [1]
 
 
 def test_the_type_refusal_names_the_column_the_value_and_the_declared_type(

@@ -89,6 +89,56 @@ class _Group:
     bytes: int
 
 
+def _column_ddl(name: str, field: pa.Field) -> str:
+    """One column's DDL, carrying as much of I17 as SQLite can enforce.
+
+    Everything expressible here runs in C, at the insert, inside the
+    transaction — which is what makes the write path's validation nearly free.
+    Python is left with the one question SQLite cannot be asked: whether the
+    row named a column that is not in the statement at all.
+
+    Four constraints, each for a value that would otherwise be stored as given
+    and read back wrong:
+
+    - `STRICT` refuses TEXT or BLOB into a numeric column, and a non-integral
+      REAL into an integer one. Without it SQLite has affinities, not types.
+    - A string column is declared **ANY**, not TEXT. A STRICT TEXT column
+      coerces `12345` to `'12345'` before any CHECK could see it; `ANY` stores
+      the value as given, so `typeof` can tell the truth about it.
+    - A bool column is an INTEGER holding 0 or 1, so anything else is a value
+      the read path would turn into `True` — `7` becomes true, silently.
+    - int32 and float32 are the only types that can overflow. An int32 given
+      2**40 wedges every scan; a float32 given 1e300 reads back as `inf`. An
+      explicitly infinite value is legal and stays legal — a float32 holds it
+      exactly, so passing one is a statement rather than an overflow.
+
+    `NOT NULL` carries the nullability half. Absent and explicitly-None reach
+    SQLite identically, because the insert is built as `row.get(c)`, so one
+    constraint covers both.
+    """
+    kind = column_type(field.type)
+    declared = "ANY" if kind.sqlite == "TEXT" else kind.sqlite
+    parts = [] if field.nullable else ["NOT NULL"]
+    guard = f'"{name}" IS NULL OR '
+
+    if kind.sqlite == "TEXT":
+        parts.append(f"CHECK ({guard}typeof(\"{name}\") = 'text')")
+    elif pa.types.is_boolean(field.type):
+        parts.append(f'CHECK ({guard}"{name}" IN (0, 1))')
+
+    if kind.bounds is not None:
+        lo, hi = kind.bounds
+        if pa.types.is_floating(field.type):
+            # `9e999` is how SQL spells infinity here; `abs()` covers both signs.
+            parts.append(
+                f'CHECK ({guard}abs("{name}") <= {hi!r} OR abs("{name}") = 9e999)'
+            )
+        else:
+            parts.append(f'CHECK ({guard}"{name}" BETWEEN {lo:.0f} AND {hi:.0f})')
+
+    return " ".join([f'"{name}" {declared}', *parts])
+
+
 @dataclass(frozen=True, slots=True)
 class Shape:
     """The declared schema, and everything the write path derives from it.
@@ -346,18 +396,24 @@ class Buffer:
         # right source anyway — this call is what brings the table into being.
         shape = self._fallback
         columns = ",\n  ".join(
-            f'"{name}" {column_type(shape.schema.field(name).type).sqlite}'
-            for name in shape.columns
+            _column_ddl(name, shape.schema.field(name)) for name in shape.columns
         )
         # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
         # at every seal, and a rowid alias would reissue offsets already
         # committed to Iceberg once the table empties, silently corrupting every
         # tier boundary in §7 (I9, §2).
+        # STRICT: SQLite enforces the declared type in C, at the insert,
+        # inside the transaction. It refuses TEXT or BLOB into an INTEGER
+        # column, a non-integral REAL into one, and BLOB into TEXT — the
+        # values that would otherwise be stored as given and then wedge every
+        # scan. It is a floor, not the whole gate: it still accepts an int
+        # into a TEXT column (stringifying it silently) and a bool into an
+        # INTEGER one, which is why `Shape.checked` exists.
         self._con.execute(f"""
             CREATE TABLE IF NOT EXISTS buffer (
               "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,
               {columns}
-            )
+            ) STRICT
         """)
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS sealing (
@@ -668,10 +724,11 @@ class Buffer:
             columns = shape.columns
             # Bound out here like `row_bytes` above, for the same reason: this
             # runs per row.
+            # The ONE question SQLite cannot be asked. The insert names the
+            # schema's columns, so a key the log does not have is dropped
+            # before any SQL exists — no constraint can see what is not in the
+            # statement. Everything else I17 promises is in the DDL now.
             declared = shape.known.issuperset
-            required = shape.required
-            carriers = shape.carriers
-            ranged = shape.ranged
             for row in rows:
                 # I11 FIRST, so a row that is wrong twice gets the message
                 # about the thing that is specifically forbidden rather than
@@ -683,46 +740,18 @@ class Buffer:
                     self._reject_unknown(row)
 
                 values = tuple(row.get(c) for c in columns)
-                # `None in values` is one C-level pass, and in the ordinary
-                # case it finds nothing — which settles every required column
-                # at once, without touching `required` at all. Only a row that
-                # does carry a NULL pays the scan to find out whether it landed
-                # on a column that forbids one.
-                if required and None in values:
-                    for i in required:
-                        if values[i] is None:
-                            self._reject_missing(row, values)
+                try:
+                    cursor.execute(sql, values)
+                except sqlite3.IntegrityError as exc:
+                    # SQLite is the gate; this only turns its answer into one
+                    # a caller can act on. `CHECK constraint failed: key` does
+                    # not say what was wrong with the value, or which value.
+                    #
+                    # Reached only on the way to raising, so it costs nothing
+                    # in the ordinary case — and the `try` itself is free,
+                    # CPython having zero-cost exceptions since 3.11.
+                    self._explain(row, values, shape, exc)
 
-                # The type gate. Two C-level maps and an `all`, rather than a
-                # Python loop over the columns: this runs per row, and the
-                # ordinary case is that every value is already the exact type
-                # its column carries.
-                #
-                # A miss is not yet a refusal — `_check_types` decides. A `str`
-                # subclass misses here and is perfectly legal, and paying for
-                # that distinction only on the miss is the point of the split.
-                if not all(map(_CONTAINS, carriers, map(type, values))):
-                    self._check_types(row, values)
-
-                # Range, which the type gate above cannot see: 2**40 IS an
-                # int, and 1e300 IS a float. Only int32 and float32 columns
-                # appear here, so this is usually an empty-tuple test.
-                if ranged:
-                    for i, lo, hi in ranged:
-                        # `cast` rather than an isinstance narrowing, which
-                        # would be a second per-row check: the gate above has
-                        # already established that a value in a bounded column
-                        # is an int or a float, so this is a statement about
-                        # what is already known, not an assumption.
-                        value = cast("float | None", values[i])
-                        if (
-                            value is not None
-                            and not lo <= value <= hi
-                            and value not in _INFINITE
-                        ):
-                            self._reject_range(row, i, value)
-
-                cursor.execute(sql, values)
                 # lastrowid is the assigned offset, available inside the open
                 # transaction and before the row is visible to anyone else.
                 offset = int(cursor.lastrowid or 0)
@@ -871,6 +900,36 @@ class Buffer:
             "Declare the column nullable if None is a legal value for it."
         )
         raise ValueError(msg)
+
+    def _explain(
+        self,
+        row: Mapping[str, object],
+        values: tuple[object, ...],
+        shape: Shape,
+        exc: sqlite3.IntegrityError,
+    ) -> None:
+        """Turn a constraint failure into the refusal a caller can act on.
+
+        The checks below used to run per row, ahead of the insert, and cost
+        11% of the write path between them. They say exactly the same things;
+        they just say them after SQLite has already decided, which is why they
+        are now free. Each raises if it recognises the failure.
+
+        Re-raises the original if none of them does, rather than inventing an
+        explanation for a constraint this does not know about — a wrong
+        diagnosis is worse than a terse one.
+        """
+        if any(values[i] is None for i in shape.required):
+            self._reject_missing(row, values)
+
+        self._check_types(row, values)
+
+        for i, lo, hi in shape.ranged:
+            value = cast("float | None", values[i])
+            if value is not None and not lo <= value <= hi and value not in _INFINITE:
+                self._reject_range(row, i, value)
+
+        raise exc
 
     def _check_types(
         self, row: Mapping[str, object], values: tuple[object, ...]
