@@ -820,6 +820,58 @@ def test_a_column_added_later_is_validated_like_any_other(
         assert log.scan().read_all().num_rows == 6
 
 
+def test_append_refuses_an_integer_a_float_column_cannot_hold(
+    tmp_path: Path,
+) -> None:
+    """An int is a legal float only while the conversion is lossless.
+
+    The buffer stores values with no conversion, so an out-of-range integer
+    stays an INTEGER in SQLite and `pa.array(..., type=float64)` then refuses
+    to build the column AT ALL. One such value made every scan and every seal
+    raise for ever — including for rows written before it — while `append`
+    kept returning offsets, so the buffer could never drain.
+
+    The bound is what the type represents exactly: 2**53 for float64, 2**24
+    for float32. `-(2**63)` is here because testing the integer with `abs`
+    raised SQLite's `OperationalError` out of the CHECK — there is no positive
+    counterpart for the most-negative int64 — instead of a refusal.
+
+    Falsify by allowing `typeof IN ('integer','real')` without the bound: all
+    four rows are accepted and the scan at the end raises `ArrowInvalid`.
+    """
+    log = Log.new(tmp_path, "s", schema=RANGED_FLOAT)
+    with log:
+        log.extend([{"k": i, "f64": 1.5} for i in range(5)])
+
+        for row in (
+            {"k": 9, "f64": 2**53 + 1},
+            {"k": 9, "f32": 2**24 + 1},
+            {"k": 9, "f32": -(2**63)},
+            {"k": 9, "f64": -(2**63)},
+        ):
+            with pytest.raises(ValueError, match="cannot hold the integer"):
+                log.append(row)
+
+        assert log.scan().read_all().num_rows == 5
+
+
+def test_a_float_column_still_takes_an_integer_it_can_hold(
+    tmp_path: Path,
+) -> None:
+    """`{"price": 5}` is too natural to refuse, and the exact bounds are legal."""
+    log = Log.new(tmp_path, "s", schema=RANGED_FLOAT)
+    with log:
+        log.append({"k": 1, "f64": 5})
+        log.append({"k": 2, "f64": 2**53})
+        log.append({"k": 3, "f64": -(2**53)})
+        log.append({"k": 4, "f32": 2**24})
+        log.seal()
+
+        got = log.scan().read_all().column("f64").to_pylist()
+
+        assert got[:3] == [5.0, float(2**53), float(-(2**53))]
+
+
 def test_the_type_refusal_names_the_column_the_value_and_the_declared_type(
     tmp_path: Path,
 ) -> None:
@@ -856,6 +908,14 @@ def test_append_accepts_values_the_exact_check_alone_would_refuse(
         assert table.column("key").to_pylist() == ["eu-west-1"]
         assert table.column("price").to_pylist() == [5.0]
 
+
+RANGED_FLOAT = pa.schema(
+    [
+        pa.field("k", pa.int64(), nullable=False),
+        pa.field("f64", pa.float64()),
+        pa.field("f32", pa.float32()),
+    ]
+)
 
 RANGED = pa.schema(
     [

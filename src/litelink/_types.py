@@ -77,6 +77,19 @@ class ColumnType(NamedTuple):
     itself, at the insert, inside the transaction and with no offset consumed;
     adding bounds for it would make every ordinary schema pay the loop."""
 
+    exact_int: int | None
+    """The largest integer this float type represents EXACTLY, or None.
+
+    Only floats have one. An integer is a legal value for a float column —
+    `{"price": 5}` is too natural to refuse — but only while the conversion is
+    lossless, which is the same rule that refuses `1.5` into an int64.
+
+    It is not merely about precision. The buffer stores values with no
+    conversion, so an out-of-range integer stays an INTEGER in SQLite and
+    `pa.array(..., type=float64)` then refuses to build the column at all:
+    every scan and every seal raises for ever, while appends keep succeeding
+    and the buffer never drains. 2**53 for float64, 2**24 for float32."""
+
     variable_length: bool
     """Whether a value's size depends on the value.
 
@@ -120,31 +133,41 @@ _FLOAT32 = (-3.4028235e38, 3.4028235e38)
 _SUPPORTED: tuple[tuple[Callable[[pa.DataType], bool], ColumnType], ...] = (
     (
         pa.types.is_boolean,
-        ColumnType("INTEGER", "BOOLEAN", _BOOL, _is_bool, None, variable_length=False),
+        ColumnType(
+            "INTEGER", "BOOLEAN", _BOOL, _is_bool, None, None, variable_length=False
+        ),
     ),
     (
         pa.types.is_int32,
-        ColumnType("INTEGER", "INTEGER", _INT, _is_int, _INT32, variable_length=False),
+        ColumnType(
+            "INTEGER", "INTEGER", _INT, _is_int, _INT32, None, variable_length=False
+        ),
     ),
     (
         pa.types.is_int64,
-        ColumnType("INTEGER", "BIGINT", _INT, _is_int, None, variable_length=False),
+        ColumnType(
+            "INTEGER", "BIGINT", _INT, _is_int, None, None, variable_length=False
+        ),
     ),
     (
         pa.types.is_float32,
-        ColumnType("REAL", "FLOAT", _FLOAT, _is_float, _FLOAT32, variable_length=False),
+        ColumnType(
+            "REAL", "FLOAT", _FLOAT, _is_float, _FLOAT32, 2**24, variable_length=False
+        ),
     ),
     (
         pa.types.is_float64,
-        ColumnType("REAL", "DOUBLE", _FLOAT, _is_float, None, variable_length=False),
+        ColumnType(
+            "REAL", "DOUBLE", _FLOAT, _is_float, None, 2**53, variable_length=False
+        ),
     ),
     (
         pa.types.is_string,
-        ColumnType("TEXT", "VARCHAR", _STR, _is_str, None, variable_length=True),
+        ColumnType("TEXT", "VARCHAR", _STR, _is_str, None, None, variable_length=True),
     ),
     (
         pa.types.is_large_string,
-        ColumnType("TEXT", "VARCHAR", _STR, _is_str, None, variable_length=True),
+        ColumnType("TEXT", "VARCHAR", _STR, _is_str, None, None, variable_length=True),
     ),
 )
 

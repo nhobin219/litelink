@@ -119,14 +119,37 @@ def _column_ddl(name: str, field: pa.Field) -> str:
         # the read path would turn into `True` — `7` becomes true, silently.
         test = f"typeof({q}) = 'integer' AND {q} IN (0, 1)"
     elif pa.types.is_floating(field.type):
+        # Two storage classes, tested separately, because what makes each of
+        # them wrong is different.
+        #
         # An integer is a legal float — `{"price": 5}` is too natural to
-        # refuse — and SQLite reports it as `'integer'`, so both are allowed.
-        test = f"typeof({q}) IN ('integer', 'real')"
+        # refuse — but only while the conversion is lossless, and `ANY` means
+        # it stays an INTEGER in SQLite rather than being converted on the way
+        # in. Past 2**53 (2**24 for float32) `pa.array(..., type=float64)`
+        # then refuses to build the column AT ALL, so one such value makes
+        # every scan and every seal raise for ever while appends keep
+        # succeeding. Bounding it here is what keeps that unreachable.
+        #
+        # Testing the integer with BETWEEN rather than `abs` is deliberate:
+        # `abs(-(2**63))` overflows in SQLite, which has no positive
+        # counterpart for the most-negative int64, and raised
+        # `OperationalError` out of the CHECK instead of a refusal.
+        exact = kind.exact_int
+        real = f"typeof({q}) = 'real'"
         if kind.bounds is not None:
-            # `9e999` is how SQL spells infinity; `abs` covers both signs. An
-            # explicitly infinite value is legal and stays legal — a float32
-            # holds it exactly, so passing one is a statement, not an overflow.
-            test += f" AND (abs({q}) <= {kind.bounds[1]!r} OR abs({q}) = 9e999)"
+            # `9e999` is how SQL spells infinity. An explicitly infinite value
+            # is legal and stays legal — a float32 holds it exactly, so
+            # passing one is a statement, not an overflow.
+            real += f" AND (abs({q}) <= {kind.bounds[1]!r} OR abs({q}) = 9e999)"
+
+        test = (
+            real
+            if exact is None
+            else (
+                f"(typeof({q}) = 'integer' AND {q} BETWEEN {-exact:d} AND {exact:d})"
+                f" OR ({real})"
+            )
+        )
     else:
         test = (
             f"typeof({q}) = 'integer'"
@@ -166,6 +189,7 @@ class Shape:
     carriers: tuple[frozenset[type], ...]
     accepts: tuple[Callable[[object], bool], ...]
     ranged: tuple[tuple[int, float, float], ...]
+    exact_ints: tuple[tuple[int, int], ...]
 
     @property
     def table(self) -> pa.Schema:
@@ -210,6 +234,13 @@ class Shape:
             # Only the columns that CAN overflow, so a schema of int64s,
             # float64s and strings leaves this empty and pays one truthiness
             # test per row rather than a loop.
+            # Float columns only, and used solely by the explainer — the
+            # DDL is what enforces it.
+            exact_ints=tuple(
+                (i, exact)
+                for i in range(len(columns))
+                if (exact := column_type(schema.field(i).type).exact_int) is not None
+            ),
             ranged=tuple(
                 (i, *bounds)
                 for i in range(len(columns))
@@ -411,13 +442,11 @@ class Buffer:
         # at every seal, and a rowid alias would reissue offsets already
         # committed to Iceberg once the table empties, silently corrupting every
         # tier boundary in §7 (I9, §2).
-        # STRICT: SQLite enforces the declared type in C, at the insert,
-        # inside the transaction. It refuses TEXT or BLOB into an INTEGER
-        # column, a non-integral REAL into one, and BLOB into TEXT — the
-        # values that would otherwise be stored as given and then wedge every
-        # scan. It is a floor, not the whole gate: it still accepts an int
-        # into a TEXT column (stringifying it silently) and a bool into an
-        # INTEGER one, which is why `Shape.checked` exists.
+        # STRICT is what makes `ANY` mean "store this value exactly as
+        # given" rather than "no declared affinity". It is not itself the
+        # gate — a STRICT column of a declared type CONVERTS a wrong value
+        # rather than refusing it — so every column is `ANY` and carries its
+        # own CHECK. See `_column_ddl`, which is where I17 actually lives.
         self._con.execute(f"""
             CREATE TABLE IF NOT EXISTS buffer (
               "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -956,6 +985,18 @@ class Buffer:
             self._reject_missing(row, values)
 
         self._check_types(row, values)
+
+        for i, limit in shape.exact_ints:
+            value = values[i]
+            if type(value) is int and not -limit <= value <= limit:
+                name = shape.columns[i]
+                msg = (
+                    f"column {name!r} cannot hold the integer {value!r}: it is "
+                    f"declared {shape.schema.field(name).type}, which represents "
+                    f"integers exactly only up to {limit}. Pass a float if an "
+                    "approximate value is what you mean"
+                )
+                raise ValueError(msg)
 
         for i, lo, hi in shape.ranged:
             value = cast("float | None", values[i])
