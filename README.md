@@ -32,7 +32,9 @@ remote Iceberg table   full history, on S3.
 ```
 
 Reads span all three tiers, and the catalog is a SQLite file rather than a service, so **no
-read on the hot path touches the network.**
+read on the hot path touches the network.** Every other machine reads the archive instead,
+with any Iceberg engine and nothing from litelink — see
+[reading it from another machine](#reading-it-from-another-machine).
 
 It exists because doing this by hand goes wrong the same way every time: one production capture
 system had accumulated 125,884 objects with 62.5% of them under 16 KiB, Parquet files at 2 rows
@@ -136,6 +138,54 @@ Then `Log.restore(root, name, archive=...)` rebuilds the log on another box — 
 config from the layout alone, restores `buffer.db`, rebuilds the local table, adopts the
 archive, and reserves an offset window so nothing the dead machine served is reissued.
 Verified against a local S3-compatible store and against AWS. See [`examples/`](examples/).
+
+## Reading it from another machine
+
+Everything above is the *writer's* read: local disk, all three tiers, no network. Every other
+machine reads the archive instead, and needs nothing from litelink to do it. The archive is an
+ordinary Iceberg table that publishes `version-hint.text` at every commit, so an engine pointed
+at the prefix resolves the current metadata itself — no catalog service, no `archive.db`, no
+local root, no litelink install.
+
+```sql
+INSTALL iceberg; LOAD iceberg;
+INSTALL httpfs; LOAD httpfs;
+CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+
+SELECT count(*), max(litelink_offset)
+FROM iceberg_scan('s3://bucket/prefix/litelink/trades',
+                  version_name_format = '%s%s.metadata.json');
+```
+
+The table sits at `<archive prefix>/litelink/<log name>`. **`version_name_format` is not
+optional**: DuckDB defaults to the Hadoop `v%s%s.metadata.json` while pyiceberg names its
+metadata `00003-<uuid>.metadata.json`, so the hint carries that stem and the format has to stop
+prepending the `v`. `credential_chain` is the ordinary AWS resolution — profile, instance
+metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
+`URL_STYLE 'path'` instead, which is what the library's own reader emits.
+
+**Reading it as it grows.** `sync` is lazy, restartable and arbitrarily far behind, and no read
+depends on it, so a reader sees a committed snapshot that lags the writer — never a partial
+one. `litelink_offset` is what makes that safe to poll: it is monotonic and never reused, so a
+reader keeps the highest one it has seen and asks for what came after.
+
+```sql
+-- first pass: whatever is there, and where it ended
+SELECT max(litelink_offset) FROM iceberg_scan(...);          -- 1536
+
+-- every pass after: only what the syncs since have published
+SELECT * FROM iceberg_scan(...) WHERE litelink_offset > 1536;
+```
+
+Resolve the table on each pass rather than caching a metadata path — the hint moves with every
+commit, and a pinned pointer serves one stale snapshot for ever. What a reader cannot see is
+anything newer than the last `sync()`: rows still in the buffer or the local table are on the
+writing box alone, so the freshness lever is the sync interval rather than anything at the
+reader.
+
+`tests/test_archive.py::test_the_archive_reads_as_a_directory_with_no_catalog_at_all` is that
+claim as a test — it captures through a live archive and asserts the DuckDB row count equals
+the writer's `archived_through()`.
 
 ## Benchmarks
 
