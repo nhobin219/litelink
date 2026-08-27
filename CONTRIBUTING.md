@@ -3,6 +3,8 @@
 The gates in this repo are strict and mostly automated, so the fastest way to a merged PR is
 to know what they check before you write anything.
 
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Setup
 
 ```bash
@@ -102,3 +104,19 @@ required check.
 
 Say what you changed and why in the description. If you found something on the way that you
 did not fix, write it down rather than leaving it for the next person to rediscover.
+
+## Releases
+
+Cutting a tag is the whole release process — `.github/workflows/release.yml` does the rest:
+it refuses the tag if `pyproject.toml` disagrees with it, builds, installs the resulting
+wheel into a clean environment and captures a row through it, publishes to PyPI through
+trusted publishing, and opens a GitHub release with notes generated from the commits since
+the last tag.
+
+```bash
+# with the version already bumped in pyproject.toml and merged
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The version check is there because a PyPI release is immutable: a `v0.2.0` tag that ships
+0.1.0 burns the version number rather than being correctable.
