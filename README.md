@@ -84,7 +84,7 @@ log.maintain()                                     # compact, evict, expire
 ```
 
 That is the whole API surface for local capture. Everything below is optional, and every
-public call is in [`docs/API.md`](docs/API.md) — one page, thirty-nine of them, and most
+public call is in [`docs/API.md`](docs/API.md) — one page, forty-one of them, and most
 deployments use six.
 
 ## More demos

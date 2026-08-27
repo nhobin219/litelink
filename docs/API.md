@@ -4,19 +4,20 @@ Everything public, on one page. [`SPEC.md`](SPEC.md) says what the system is and
 [`RUNTIME.md`](RUNTIME.md) says how it runs; this says what you can call.
 
 ```python
-from litelink import Log, LogConfig, __version__
+from litelink import Log, LogConfig, S3Options, __version__
 ```
 
 Those are the exports. `Log` is the whole object model — there is no session, no client, no
 catalog handle to hold. A log is a directory under a root, named at `Log.new` and opened by
 that name for ever after.
 
-**`S3Options` is a gap.** It appears in four public signatures and is not exported: reaching
-it means `from litelink.log import S3Options`, which is an import that happens to work rather
-than an interface. It is a frozen dataclass of `endpoint`, `access_key`, `secret_key`,
-`region`, and every field is optional — omit the argument entirely and credentials resolve
-through the ordinary AWS chain, which is the intended path on AWS. Pass one only for a
-non-AWS endpoint or an explicit key.
+**`S3Options` is exported because four public signatures name it** — `new`, `open`, `restore`
+and `replication_config_for`. A frozen dataclass of `endpoint`, `access_key`, `secret_key`
+and `region`, every field optional: omit the argument entirely and credentials resolve
+through the ordinary AWS chain, which is the intended path on AWS. Construct one only for a
+non-AWS endpoint or an explicit key. It is deliberately not part of `LogConfig`, because
+`LogConfig` is persisted into the log directory and a secret must not travel with something
+that gets copied and attached elsewhere.
 
 ## The whole surface
 
@@ -29,7 +30,7 @@ non-AWS endpoint or an explicit key.
 | **maintain** | `maintain` · `compact` · `evict` · `expire` |
 | **archive** | `sync` · `hydrate` · `rewrite_archive` |
 | **observe** | `end_offset` · `buffered_rows` · `table_rows` · `table_files` · `table_extent` · `archived_through` · `archive_files` |
-| **configure** | `config` · `set_config` · `archive` · `set_archive` · `set_sort_by` |
+| **configure** | `config` · `set_config` · `archive` · `set_archive` · `schema` · `sort_by` · `set_sort_by` |
 | **replicate** | `databases` · `replication_config` · `write_replication_config` · `replication_config_for` |
 | **schema** | `add_column` · `rename_column` · `drop_column` — all three raise `NotImplementedError` |
 
@@ -260,8 +261,15 @@ log.config -> LogConfig
 log.set_config(config) -> None
 log.archive -> str | None
 log.set_archive(archive) -> None              # None detaches
+log.schema -> pa.Schema                       # your columns, as declared at new()
+log.sort_by -> tuple[str, ...]
 log.set_sort_by(sort_by, *, rewrite) -> None
 ```
+
+**Everything `new` took, the log gives back**, which is what lets `open` take none of it.
+`schema` strips `litelink_offset`, so it is the schema you wrote and the one `append` accepts;
+`sort_by` is the one §7 tells you to bound every scan on a leading column of, which is advice
+no caller can follow without being able to ask.
 
 **There is exactly one copy of the policy, and it is a row in SQLite.** Every decision reads
 it from there rather than from memory, so `set_config` in one process is seen by the writer's

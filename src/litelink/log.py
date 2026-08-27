@@ -1215,6 +1215,29 @@ class Log:
             with contextlib.suppress(Exception):
                 self._archive.table(repair=True)
 
+    @property
+    def schema(self) -> pa.Schema:
+        """The caller's columns, as declared at `new`.
+
+        `open` takes no schema, so this is the only way to ask a log what shape
+        it is. `litelink_offset` is stripped: this is the schema the caller
+        wrote and the one `append` accepts, while the TABLE's schema carries
+        the library's column in front of it (I11).
+        """
+        return self._schema
+
+    @property
+    def sort_by(self) -> tuple[str, ...]:
+        """The within-file sort order, from `new` or `set_sort_by` (§7).
+
+        §7 tells a reader to bound every scan on a LEADING column of this —
+        measured at 13 ms against 119 ms for the same predicate without one —
+        which is advice no caller can follow without being able to ask. Like
+        `archive` and `config`, it is recovered from `meta` on `open`, so a
+        caller holding its own copy is a caller that can disagree with the log.
+        """
+        return self._sort_by
+
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, rewriting every existing file.
 
