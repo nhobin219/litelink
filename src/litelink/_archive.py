@@ -84,7 +84,14 @@ class Archive:
         self._layout = layout
         self._buffer = buffer
         self._s3 = s3 or S3Options()
-        self._schema = schema
+        # Kept only to say WHETHER this archive may create a table; the shape
+        # it would create with is read from the buffer at use. Holding the
+        # schema itself is the one stale copy that cannot be repaired later —
+        # `open_archive` hands it to `create_table`, so an archive attached
+        # after a schema change would be born with the OLD columns, and
+        # nothing in `src/` re-declares an existing table. Every later push
+        # then fails, I4 pins eviction, and local disk grows without bound.
+        self._may_create = schema is not None
         # Declared on the archive table when this creates one, so the archive
         # states its own clustering the way the local table does (§4). Passed
         # at construction like the schema, and for the same reason: both are
@@ -173,7 +180,7 @@ class Archive:
                         self._layout,
                         uri,
                         self._s3,
-                        self._schema,
+                        self._buffer.shape().table if self._may_create else None,
                         self._sort_by,
                         repair=repair,
                     )

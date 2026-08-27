@@ -11,14 +11,14 @@ import contextlib
 import sqlite3
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pyarrow as pa
 
 from litelink._config import LogConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping
     from pathlib import Path
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
@@ -31,6 +31,17 @@ CONFIG_KEY = "config"
 # The library-owned column (§2).
 OFFSET = "litelink_offset"
 
+# Where the log records its declared schema. Beside `CONFIG_KEY` and for the
+# same reason: this object owns `meta`, and `meta` is the one place the schema
+# exists. It used to live in `log.py`, which meant the module that OWNS the row
+# could not read it without importing the module that names it.
+SCHEMA_KEY = "arrow_schema"
+
+# Where a schema change records what it set out to do, before it does any of
+# it (I16). Cleared only when the change is complete — §9: a schema change is
+# finished when SQLite says so, not when Iceberg does.
+INTENT_KEY = "schema_intent"
+
 # Stands in for "no row limit" so the per-row check stays one comparison. Far
 # above any row count a buffer sized for read latency could reach.
 _NO_ROW_LIMIT = 1 << 62
@@ -38,6 +49,15 @@ _NO_ROW_LIMIT = 1 << 62
 # How many appended-since-last-query slices the tail may accumulate before it
 # is compacted back into one.
 _MAX_TAIL_CHUNKS = 32
+
+# Bound once here rather than looked up per row: `frozenset.__contains__` is
+# the unbound method, so `map(_CONTAINS, carriers, types)` drives the whole
+# per-column scan in C.
+_CONTAINS = frozenset.__contains__
+
+# An explicitly infinite value is a legal float32 — what the range check exists
+# to catch is a FINITE value that would silently become one.
+_INFINITE = (float("inf"), float("-inf"))
 
 # IMMEDIATE, never a bare BEGIN. Every transaction here writes, and several read
 # first — an append reads the open `extent` row before inserting anything.
@@ -69,6 +89,76 @@ class _Group:
     bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class Shape:
+    """The declared schema, and everything the write path derives from it.
+
+    One object because they are one fact, and separating them is a silent
+    loss. A fresh `known` accepts a column a stale `columns` then drops in
+    `tuple(row.get(c) for c in columns)` — the row is acknowledged with an
+    offset and the value is gone. Deriving them together, in one read, is what
+    makes that unrepresentable rather than merely avoided.
+    """
+
+    schema: pa.Schema
+    columns: tuple[str, ...]
+    known: frozenset[str]
+    required: tuple[int, ...]
+    carriers: tuple[frozenset[type], ...]
+    accepts: tuple[Callable[[object], bool], ...]
+    ranged: tuple[tuple[int, float, float], ...]
+
+    @property
+    def table(self) -> pa.Schema:
+        """The caller's columns with `offset` in front — the TABLE's schema.
+
+        Here rather than in `log.py` so the archive can ask the buffer for it
+        without importing the module that owns the log. It is the shape
+        `create_table` is handed, and an archive born from a stale copy of it
+        is the one holder that cannot be repaired afterwards: nothing in
+        `src/` ever re-declares an existing table.
+        """
+        return pa.schema([pa.field(OFFSET, pa.int64(), nullable=False), *self.schema])
+
+    @classmethod
+    def of(cls, schema: pa.Schema) -> Shape:
+        columns = tuple(schema.names)
+
+        return cls(
+            schema=schema,
+            columns=columns,
+            # `litelink_offset` is in the set so `_reject_offset` stays the
+            # thing that refuses it, with its own message.
+            known=frozenset((OFFSET, *columns)),
+            # Positions, not names: the check reads the values tuple, which is
+            # built from `columns` in this order, so a name-keyed set would
+            # mean a second lookup per row on the write path.
+            # `field(i)`, not `field(name)`: the index is what the check uses
+            # to reach into the values tuple, so deriving it positionally makes
+            # the two impossible to disagree. Name lookup was equivalent for
+            # every schema that can exist — `_create` refuses a duplicate name
+            # before a log gets built — but it read as if it might not be.
+            required=tuple(
+                i for i in range(len(columns)) if not schema.field(i).nullable
+            ),
+            # Aligned with `columns`, like `required`, and for the same reason.
+            carriers=tuple(
+                column_type(schema.field(i).type).carriers for i in range(len(columns))
+            ),
+            accepts=tuple(
+                column_type(schema.field(i).type).accepts for i in range(len(columns))
+            ),
+            # Only the columns that CAN overflow, so a schema of int64s,
+            # float64s and strings leaves this empty and pays one truthiness
+            # test per row rather than a loop.
+            ranged=tuple(
+                (i, *bounds)
+                for i in range(len(columns))
+                if (bounds := column_type(schema.field(i).type).bounds) is not None
+            ),
+        )
+
+
 class Buffer:
     """The unsealed tail of a log."""
 
@@ -77,7 +167,6 @@ class Buffer:
         writer: sqlite3.Connection,
         reader: sqlite3.Connection,
         schema: pa.Schema,
-        columns: tuple[str, ...],
     ) -> None:
         """Take built collaborators. `open` is what builds and validates them.
 
@@ -87,38 +176,27 @@ class Buffer:
         it would serialise against the appends a seal exists to stay out of the
         way of. WAL allows it: one writer, any number of readers.
 
-        `schema` is the application's columns, without `offset`; `columns` is
-        their names, passed rather than derived so this assigns and nothing
-        else. `target_seal_size` is here rather than only on the seal because
-        the cut it describes is made on the append path — see `extent`.
+        `schema` is the application's columns, without `offset`. Its names
+        used to be passed alongside it; they are derived in `Shape.of` now, so
+        the two cannot be handed in disagreeing — the positions in
+        `Shape.required` index the values tuple, and a caller that passed a
+        different order would have aimed them at the wrong columns.
+        `target_seal_size` is here rather than only on the seal because the cut
+        it describes is made on the append path — see `extent`.
         """
         self._con = writer
         self._reader = reader
-        self._schema = schema
-        self._columns = columns
-        # Derived from `_columns`, and it must MOVE with it. Both answer one
-        # question — what columns does this log have — and refreshing them at
-        # different moments is a silent loss: a fresh `_known` accepts a column
-        # a stale `_columns` then drops in `tuple(row.get(c) for c in
-        # columns)`. `litelink_offset` is in the set so `_reject_offset` stays
-        # the thing that refuses it, with its own message.
-        self._known = frozenset((OFFSET, *columns))
-        # The THIRD derivation of that same fact, and it moves with the other
-        # two for the same reason. Positions, not names, because the check
-        # reads the values tuple — which is built from `_columns` in this
-        # order — and a name-keyed set would mean a second lookup per row on
-        # the write path.
+        # What `shape()` falls back to when `meta` has no schema row yet. Two
+        # callers need that and both would otherwise fail at construction:
+        # `_create` runs inside `Buffer.open` BEFORE `Log.new` writes the row,
+        # and the scratch buffer an archive rewrite cuts through is handed a
+        # schema directly and only ever has `CONFIG_KEY` written into it.
         #
-        # Non-nullable columns only. A nullable column may be absent or
-        # explicitly None and both are legal; for a non-nullable one both are
-        # the same wedge. `row.get` yields None either way, SQLite stores it
-        # happily, and then every scan raises `Casting field ... with null
-        # values to non-nullable` — including scans of the rows written BEFORE
-        # the bad one — while `append` keeps handing back offsets. Writer sees
-        # a healthy log, readers see nothing.
-        self._required = tuple(
-            i for i, name in enumerate(columns) if not schema.field(name).nullable
-        )
+        # A fallback, not the value. Everything reads `shape()`, so a schema
+        # change reaches every holder without anyone remembering to refresh —
+        # which is the failure this replaces.
+        self._fallback = Shape.of(schema)
+        self._shape_cache: tuple[str, Shape] | None = None
         self._config_cache: tuple[str, LogConfig] | None = None
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
@@ -145,6 +223,16 @@ class Buffer:
         # look at a table the write cannot invalidate.
         self._tail_lock = threading.Lock()
         self._tail: pa.Table | None = None
+        # Which `Shape` the cached tail was built under, compared by IDENTITY:
+        # `shape()` hands back the same object until the raw `meta` value
+        # changes, so `is not` is exactly "the schema moved".
+        #
+        # Checked where the tail is used rather than pushed from `shape()`.
+        # Pushing deadlocks: the refresh path holds `_tail_lock` and calls
+        # `_rows`, which calls `shape()` — and `_tail_lock` is not reentrant,
+        # so invalidating from inside `shape()` hangs the reader on itself.
+        # Found by stack-dumping a suite that had sat idle for 29 minutes.
+        self._tail_shape: Shape | None = None
         self._tail_lo = 0
         self._tail_hi = 0
 
@@ -203,7 +291,6 @@ class Buffer:
         depends on. Never for a log's own buffer: there, the fsync IS the
         product (§3).
         """
-        columns = tuple(schema.names)
         if readonly:
             con = cls._connect_readonly(path)
 
@@ -211,7 +298,6 @@ class Buffer:
                 con,
                 con,
                 schema,
-                columns,
             )
 
         # check_same_thread=False because scheduling maintenance on a background
@@ -233,7 +319,6 @@ class Buffer:
             writer,
             cls._connect_readonly(path),
             schema,
-            columns,
         )
         buffer._create()
         buffer._seed_group()
@@ -256,9 +341,13 @@ class Buffer:
         handed to anyone, so there is no second thread to exclude. Every method
         reachable afterwards takes the lock.
         """
+        # `_fallback`, not `shape()`: this runs before the `meta` table it
+        # would read exists, and the schema handed to the constructor is the
+        # right source anyway — this call is what brings the table into being.
+        shape = self._fallback
         columns = ",\n  ".join(
-            f'"{name}" {column_type(self._schema.field(name).type).sqlite}'
-            for name in self._columns
+            f'"{name}" {column_type(shape.schema.field(name).type).sqlite}'
+            for name in shape.columns
         )
         # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
         # at every seal, and a rowid alias would reissue offsets already
@@ -412,6 +501,34 @@ class Buffer:
     # It is a policy trigger, not an accounting record; being within a few
     # percent of the true size is what `target_seal_size` actually needs.
 
+    def table_columns(self) -> tuple[str, ...]:
+        """The buffer table's ACTUAL columns, asked of SQLite.
+
+        The probe recovery settles step 6 with. `_create` is
+        `CREATE TABLE IF NOT EXISTS`, so a reopened buffer keeps whatever
+        columns it already had — the declared schema saying otherwise proves
+        nothing about this table.
+        """
+        with self._lock:
+            rows = self._con.execute("PRAGMA table_info(buffer)").fetchall()
+
+        return tuple(str(r[1]) for r in rows)
+
+    def add_table_column(self, name: str, type_: pa.DataType) -> None:
+        """Widen the buffer table. Idempotent, like every step of a change.
+
+        SQLite cannot add a NOT NULL column without a default, which is not a
+        limitation here but the same rule Iceberg enforces: rows that predate
+        the column have no value for it, so it must be nullable. `add_column`
+        refuses a non-nullable field before reaching this.
+        """
+        if name in self.table_columns():
+            return
+
+        sqlite_type = column_type(type_).sqlite
+        with self._lock:
+            self._con.execute(f'ALTER TABLE buffer ADD COLUMN "{name}" {sqlite_type}')
+
     def _seed_group(self) -> None:
         """Ensure exactly one open group, seeded from whatever is buffered.
 
@@ -453,11 +570,12 @@ class Buffer:
             )
 
     def _measure_from(self, floor: int) -> int:
+        shape = self.shape()
         terms = ["8"]  # offset
-        for name in self._columns:
+        for name in shape.columns:
             terms.append(
                 f'coalesce(octet_length("{name}"), 0)'
-                if column_type(self._schema.field(name).type).variable_length
+                if column_type(shape.schema.field(name).type).variable_length
                 else "8"
             )
 
@@ -469,8 +587,13 @@ class Buffer:
 
         return int(row[0])
 
-    def _row_bytes(self, row: Mapping[str, object]) -> int:
+    def _row_bytes(self, row: Mapping[str, object], columns: tuple[str, ...]) -> int:
         """Approximate bytes for one row, and refuse what SQLite cannot store.
+
+        `columns` is passed rather than read, because this runs once per row.
+        Reading it here would mean a keyed `meta` read and a lock acquisition
+        for every appended row — which is exactly what happened when this took
+        it from a property, and it made the test suite eight times slower.
 
         The NaN check lives here because this loop already visits every value,
         so it costs a comparison rather than a pass. SQLite has no NaN — it
@@ -480,7 +603,7 @@ class Buffer:
         declines what it cannot carry faithfully rather than changing it.
         """
         total = 8
-        for name in self._columns:
+        for name in columns:
             value = row.get(name)
             if isinstance(value, bytes | bytearray | memoryview):
                 total += len(value)
@@ -509,14 +632,23 @@ class Buffer:
         One transaction means one fsync amortised across the batch, which is
         the whole of §3's throughput story.
         """
-        placeholders = ", ".join("?" * len(self._columns))
-        names = ", ".join(f'"{c}"' for c in self._columns)
-        sql = f"INSERT INTO buffer ({names}) VALUES ({placeholders})"
-
         with self._lock:
-            return self._insert(rows, sql)
+            # ONE read, inside the lock, and handed down. Read here and again
+            # in `_insert` and the two can disagree: a schema change landing
+            # between them builds the statement from one column list and the
+            # value tuples from another, so the bindings do not match the
+            # placeholders. Taking it under the lock is also what makes the
+            # statement and the rows it carries describe the same schema.
+            shape = self.shape()
+            placeholders = ", ".join("?" * len(shape.columns))
+            names = ", ".join(f'"{c}"' for c in shape.columns)
+            sql = f"INSERT INTO buffer ({names}) VALUES ({placeholders})"
 
-    def _insert(self, rows: Iterable[Mapping[str, object]], sql: str) -> list[int]:
+            return self._insert(rows, sql, shape)
+
+    def _insert(
+        self, rows: Iterable[Mapping[str, object]], sql: str, shape: Shape
+    ) -> list[int]:
         """The append's transaction, with the lock already held."""
         offsets: list[int] = []
         cursor = self._con.cursor()
@@ -533,11 +665,13 @@ class Buffer:
             # inner test a comparison rather than a branch on None.
             target_rows = config.target_seal_rows or _NO_ROW_LIMIT
             row_bytes = self._row_bytes
-            columns = self._columns
+            columns = shape.columns
             # Bound out here like `row_bytes` above, for the same reason: this
             # runs per row.
-            declared = self._known.issuperset
-            required = self._required
+            declared = shape.known.issuperset
+            required = shape.required
+            carriers = shape.carriers
+            ranged = shape.ranged
             for row in rows:
                 # I11 FIRST, so a row that is wrong twice gets the message
                 # about the thing that is specifically forbidden rather than
@@ -559,6 +693,35 @@ class Buffer:
                         if values[i] is None:
                             self._reject_missing(row, values)
 
+                # The type gate. Two C-level maps and an `all`, rather than a
+                # Python loop over the columns: this runs per row, and the
+                # ordinary case is that every value is already the exact type
+                # its column carries.
+                #
+                # A miss is not yet a refusal — `_check_types` decides. A `str`
+                # subclass misses here and is perfectly legal, and paying for
+                # that distinction only on the miss is the point of the split.
+                if not all(map(_CONTAINS, carriers, map(type, values))):
+                    self._check_types(row, values)
+
+                # Range, which the type gate above cannot see: 2**40 IS an
+                # int, and 1e300 IS a float. Only int32 and float32 columns
+                # appear here, so this is usually an empty-tuple test.
+                if ranged:
+                    for i, lo, hi in ranged:
+                        # `cast` rather than an isinstance narrowing, which
+                        # would be a second per-row check: the gate above has
+                        # already established that a value in a bounded column
+                        # is an int or a float, so this is a statement about
+                        # what is already known, not an assumption.
+                        value = cast("float | None", values[i])
+                        if (
+                            value is not None
+                            and not lo <= value <= hi
+                            and value not in _INFINITE
+                        ):
+                            self._reject_range(row, i, value)
+
                 cursor.execute(sql, values)
                 # lastrowid is the assigned offset, available inside the open
                 # transaction and before the row is visible to anyone else.
@@ -568,7 +731,7 @@ class Buffer:
                 if group.start_offset is None:
                     group.start_offset = offset
 
-                group.bytes += row_bytes(row)
+                group.bytes += row_bytes(row, columns)
                 # Whichever is reached FIRST. Both are ceilings on one file —
                 # bytes bound memory, rows bound the read latency §7 sizes for
                 # — so the tighter one wins, which is the opposite of how
@@ -661,10 +824,11 @@ class Buffer:
         raises on it for ever while appends keep working — measured. Refusing
         here is what keeps a rejectable row from wedging the log.
         """
-        unknown = sorted(set(row) - self._known)
+        shape = self.shape()
+        unknown = sorted(set(row) - shape.known)
         msg = (
             f"row names columns this log does not have: {unknown}. "
-            f"Declared: {sorted(self._columns)}"
+            f"Declared: {sorted(shape.columns)}"
         )
         raise ValueError(msg)
 
@@ -690,8 +854,9 @@ class Buffer:
         key is usually a caller that forgot, an explicit None is usually a
         caller that meant it and needs the column declared nullable instead.
         """
-        columns = self._columns
-        offending = sorted(columns[i] for i in self._required if values[i] is None)
+        shape = self.shape()
+        columns = shape.columns
+        offending = sorted(columns[i] for i in shape.required if values[i] is None)
         absent = [c for c in offending if c not in row]
         supplied = [c for c in offending if c in row]
         detail = ""
@@ -704,6 +869,70 @@ class Buffer:
         msg = (
             f"row leaves non-nullable columns NULL: {offending}.{detail} "
             "Declare the column nullable if None is a legal value for it."
+        )
+        raise ValueError(msg)
+
+    def _check_types(
+        self, row: Mapping[str, object], values: tuple[object, ...]
+    ) -> None:
+        """Decide a row the fast type gate could not pass (I17).
+
+        Reached only when some value is not the exact type its column carries,
+        which a correct row never is. So this can afford to ask the definitive
+        question per column and to name every column that fails.
+
+        **Nothing below catches these, and what does catches them too late.**
+        SQLite has no column types, only affinities, so it stores whatever it
+        is given. The declared schema is not consulted again until the value is
+        read back — and by then `append` has returned an offset. Two outcomes,
+        both measured: a value Arrow cannot parse (`"x"` into an int64) makes
+        EVERY scan raise, including scans of rows written before it, while
+        appends keep succeeding; and a value it can parse but not preserve
+        (`1.5` into an int64, `12345` into a string) is silently rewritten, so
+        what is read back is not what was appended and no error is raised
+        anywhere.
+        """
+        shape = self.shape()
+        columns, accepts = shape.columns, shape.accepts
+        bad = [
+            (columns[i], value)
+            for i, value in enumerate(values)
+            if value is not None and not accepts[i](value)
+        ]
+        if not bad:
+            return
+
+        detail = ", ".join(
+            f"{name}={value!r} ({type(value).__name__}, declared "
+            f"{shape.schema.field(name).type})"
+            for name, value in bad
+        )
+        msg = (
+            f"row has values of the wrong type: {detail}. SQLite would store "
+            "them as given and the mismatch would not surface until a read"
+        )
+        raise ValueError(msg)
+
+    def _reject_range(
+        self, row: Mapping[str, object], index: int, value: object
+    ) -> None:
+        """A value of the right type whose MAGNITUDE the column cannot hold.
+
+        Off the hot path, like the other refusals. The two cases it covers fail
+        differently and neither says anything at append: an int32 given 2**40
+        is stored by SQLite unchanged and then makes every scan raise, while a
+        float32 given 1e300 reads back as `inf` with no error at all.
+
+        An explicit infinity is allowed through — a float32 represents `inf`
+        exactly, so passing one is a statement rather than an overflow. What is
+        refused is a FINITE value that would silently become infinite.
+        """
+        shape = self.shape()
+        name = shape.columns[index]
+        msg = (
+            f"column {name!r} cannot hold {value!r}: it is declared "
+            f"{shape.schema.field(name).type}, whose range is "
+            f"{shape.ranged[[i for i, *_ in shape.ranged].index(index)][1:]}"
         )
         raise ValueError(msg)
 
@@ -772,7 +1001,7 @@ class Buffer:
         """The declared Arrow schema, for building a second buffer like this
         one — an archive rewrite re-ingests through a scratch buffer and must
         cast the rows exactly as this one would."""
-        return self._schema
+        return self.shape().schema
 
     def seed_offsets(self, first: int) -> None:
         """Make the next appended row take offset `first`.
@@ -894,6 +1123,17 @@ class Buffer:
         """
         floor = 0 if boundary is None else boundary
         with self._tail_lock:
+            # The tail is an Arrow table under the schema in force when it was
+            # built, so a schema change has to discard it. Loud rather than
+            # silent if it does not — `ArrowInvalid: Schema at index 1 was
+            # different` out of the `concat_tables` below — but it would turn
+            # every read in this process into that error.
+            shape = self.shape()
+            if self._tail_shape is not shape:
+                self._tail = None
+                self._tail_lo = self._tail_hi = 0
+                self._tail_shape = shape
+
             cached = self._reusable(floor)
             if cached is None:
                 table = self._rows("> ?", (floor,))
@@ -960,17 +1200,18 @@ class Buffer:
         rows the caller will discard. That is what keeps a deferred cleanup
         costing disk rather than query latency (§7).
         """
-        names = ", ".join(f'"{c}"' for c in ("litelink_offset", *self._columns))
+        shape = self.shape()
+        names = ", ".join(f'"{c}"' for c in (OFFSET, *shape.columns))
         cursor = self._reader.execute(
             f'SELECT {names} FROM buffer WHERE "litelink_offset" {predicate}'
             ' ORDER BY "litelink_offset"',
             params,
         )
         columns = list(zip(*cursor.fetchall(), strict=True)) or [
-            () for _ in range(len(self._columns) + 1)
+            () for _ in range(len(shape.columns) + 1)
         ]
         schema = pa.schema(
-            [pa.field("litelink_offset", pa.int64(), nullable=False), *self._schema]
+            [pa.field(OFFSET, pa.int64(), nullable=False), *shape.schema]
         )
 
         return pa.table(
@@ -1541,6 +1782,41 @@ class Buffer:
             )
             return True
 
+    def shape(self) -> Shape:
+        """The declared schema and its derivations, read from the log.
+
+        The same shape as `config()`, for the same reason and against the same
+        failure. There is exactly one copy of the schema and it is the `meta`
+        row; everything that decides from it reads here, so nothing can hold a
+        stale one.
+
+        That matters more than it does for the policy, because the stale-copy
+        failure here is SILENT. A sealer never calls `append`, so a design that
+        revalidated per append would leave it building its projection from the
+        columns it was constructed with — dropping a column a writer had
+        already been given an offset for, null-filled by `add_files` and then
+        deleted from the buffer by `finish_seal`. §4a's lesson: a design whose
+        correctness needs N refresh calls is always one short, because nothing
+        tells you what N is.
+
+        The DECODE is cached, keyed on the raw value — reading the row costs
+        about 1.8 us and `read_schema` costs far more. Keying on the durable
+        value is what stops the cache being the stale copy it exists to
+        prevent: when the row changes, the key changes.
+        """
+        raw = self.get_meta(SCHEMA_KEY)
+        if raw is None:
+            return self._fallback
+
+        cached = self._shape_cache
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+
+        shape = Shape.of(pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw))))
+        self._shape_cache = (raw, shape)
+
+        return shape
+
     def config(self) -> LogConfig:
         """The policy in force, read from the log rather than remembered.
 
@@ -1885,14 +2161,16 @@ class Buffer:
 
     # -- lifecycle --------------------------------------------------------
 
-    def close(self) -> None:
-        # The cache goes too. It is bounded by the unsealed tail and falls to
-        # nothing once that is sealed, but a closed buffer holds no tail at
-        # all, and a caller keeping the object alive should not keep the rows.
+    def _drop_tail(self) -> None:
         with self._tail_lock:
             self._tail = None
             self._tail_lo = self._tail_hi = 0
 
+    def close(self) -> None:
+        # The cache goes too. It is bounded by the unsealed tail and falls to
+        # nothing once that is sealed, but a closed buffer holds no tail at
+        # all, and a caller keeping the object alive should not keep the rows.
+        self._drop_tail()
         self._con.close()
         if self._reader is not self._con:
             self._reader.close()

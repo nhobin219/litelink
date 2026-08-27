@@ -150,14 +150,12 @@ class Reader:
         layout: Layout,
         table: LogTable,
         buffer: Buffer,
-        schema: pa.Schema,
         connect: Callable[[], duckdb.DuckDBPyConnection],
         archive: Archive,
     ) -> None:
         self._layout = layout
         self._table = table
         self._buffer = buffer
-        self._schema = schema
         self._connect_to = connect
         # The shared archive object, not a table handle: it opens the table on
         # first use, so a reader that never passes `include_archive` never
@@ -173,6 +171,16 @@ class Reader:
         # `register` below is connection-global, so two concurrent scans on one
         # connection would swap each other's buffer leg.
         self._lock = threading.Lock()
+
+    @property
+    def _schema(self) -> pa.Schema:
+        """Read, never remembered — a reader opened before a schema change
+        must not serve the old columns for the rest of its life.
+
+        `.table`, not `.schema`: this is the shape the DuckDB view is built
+        in, and every projection here names `litelink_offset` first.
+        """
+        return self._buffer.shape().table
 
     def _prepare_remote(
         self, cursor: duckdb.DuckDBPyConnection
@@ -297,14 +305,18 @@ class Reader:
         `location` is passed rather than re-read, so the snapshot scanned and
         the boundary cutting the buffer are the same one.
         """
-        columns = tuple(self._schema.names)
+        # Bound once. `_schema` reads through the buffer now, so touching it
+        # inside the comprehension below would be a keyed `meta` read per
+        # COLUMN rather than per query.
+        schema = self._schema
+        columns = tuple(schema.names)
         # Cast the buffer side explicitly rather than letting UNION ALL
         # reconcile: SQLite's per-value typing comes through loosely, and a
         # column that holds integers in every row can still surprise the union
         # (§7). Aliased back to the bare name, or the buffer-only leg exposes
         # columns called `CAST(b."x" AS BIGINT)`.
         casts = ", ".join(
-            f'b."{c}"::{column_type(self._schema.field(c).type).duckdb} AS "{c}"'
+            f'b."{c}"::{column_type(schema.field(c).type).duckdb} AS "{c}"'
             for c in columns
         )
 

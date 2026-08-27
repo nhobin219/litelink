@@ -64,9 +64,7 @@ def test_caller_supplied_offset_is_rejected(tmp_path: Path) -> None:
     """I11: the library owns `offset` and never accepts one."""
     with open_log(tmp_path) as log:
         with pytest.raises(ValueError, match="I11"):
-            log.append(
-                {"litelink_offset": 7, "event_ts": 1, "key": "k", "payload": b""}
-            )
+            log.append({"litelink_offset": 7, "event_ts": 1, "key": "k", "payload": ""})
 
 
 def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
@@ -119,7 +117,7 @@ def test_sealed_file_is_sorted_by_sort_by(tmp_path: Path) -> None:
     """§4: the sort order is applied at write time, not merely declared."""
     with open_log(tmp_path) as log:
         log.extend(
-            [{"event_ts": ts, "key": "k", "payload": b""} for ts in (300, 100, 200)]
+            [{"event_ts": ts, "key": "k", "payload": ""} for ts in (300, 100, 200)]
         )
         log.seal()
 
@@ -646,6 +644,166 @@ def test_a_typo_on_a_non_nullable_column_names_the_unknown_key(
             log.append({"event_tz": 1, "key": "a", "payload": "p"})
 
         assert log.end_offset() == 1
+
+
+TYPED = pa.schema(
+    [
+        pa.field("event_ts", pa.int64(), nullable=False),
+        pa.field("key", pa.string()),
+        pa.field("price", pa.float64()),
+        pa.field("flag", pa.bool_()),
+    ]
+)
+
+
+def test_append_refuses_a_value_that_would_wedge_every_scan(
+    tmp_path: Path,
+) -> None:
+    """SQLite has affinities, not types, so it stores whatever it is given.
+
+    The declared schema is not consulted again until the value is read back —
+    by which point `append` has returned an offset. A value Arrow cannot parse
+    then makes EVERY scan raise, including scans of rows written before it,
+    while appends keep succeeding.
+
+    Falsify by removing the type gate from `_insert`: the append succeeds and
+    the assert on the surviving rows fails with `ArrowInvalid`.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        log.extend([{"event_ts": i, "key": "k"} for i in range(50)])
+
+        for row in (
+            {"event_ts": "not-a-number", "key": "k"},
+            {"event_ts": 1, "price": "expensive"},
+            {"event_ts": 1, "key": b"\xff\xfe"},
+        ):
+            with pytest.raises(ValueError, match="wrong type"):
+                log.append(row)
+
+        assert log.scan().read_all().num_rows == 50, (
+            "the rows acknowledged before the bad one must still read"
+        )
+
+
+def test_append_refuses_a_value_that_would_be_silently_rewritten(
+    tmp_path: Path,
+) -> None:
+    """The quiet half, and the worse one.
+
+    These parse. They just do not survive: `1.5` into an int64 reads back as
+    `1`, `12345` into a string as `'12345'`, and `True` into an int64 as `1`.
+    No error is raised anywhere, so what comes out is not what went in.
+
+    `True` is the one an isinstance check gets wrong — `bool` is a subclass of
+    `int`, so `isinstance(True, int)` is True and the value would pass.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        for row in (
+            {"event_ts": 1.5, "key": "k"},
+            {"event_ts": 1, "key": 12345},
+            {"event_ts": True, "key": "k"},
+            {"event_ts": 1, "flag": 7},
+        ):
+            with pytest.raises(ValueError, match="wrong type"):
+                log.append(row)
+
+        assert log.end_offset() == 1, "a refused row must not consume an offset"
+
+
+def test_the_type_refusal_names_the_column_the_value_and_the_declared_type(
+    tmp_path: Path,
+) -> None:
+    """ "Wrong type" alone does not say which of six columns, or what it wanted."""
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with (
+        log,
+        pytest.raises(ValueError, match=r"event_ts=1\.5 \(float, declared int64\)"),
+    ):
+        log.append({"event_ts": 1.5, "key": "k"})
+
+
+def test_append_accepts_values_the_exact_check_alone_would_refuse(
+    tmp_path: Path,
+) -> None:
+    """The fast gate is `type(v) in carriers`; legality is a broader question.
+
+    A `StrEnum` member IS a string and must be stored as one. An `int` in a
+    float column is lossless and too natural to refuse. Both miss the exact
+    check and are then allowed by `accepts` — which is why a miss is not a
+    refusal.
+    """
+    import enum
+
+    class Region(enum.StrEnum):
+        EU = "eu-west-1"
+
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        log.append({"event_ts": 1, "key": Region.EU, "price": 5})
+
+        table = log.scan().read_all()
+
+        assert table.column("key").to_pylist() == ["eu-west-1"]
+        assert table.column("price").to_pylist() == [5.0]
+
+
+RANGED = pa.schema(
+    [
+        pa.field("event_ts", pa.int64(), nullable=False),
+        pa.field("n32", pa.int32()),
+        pa.field("f32", pa.float32()),
+    ]
+)
+
+
+def test_append_refuses_a_value_the_column_cannot_hold(tmp_path: Path) -> None:
+    """Right type, wrong magnitude — which the type gate cannot see.
+
+    `2**40` IS an int and `1e300` IS a float, so both pass an exact-type check
+    and then fail differently: the int32 is stored unchanged and makes every
+    scan raise `Integer value ... not in range`, while the float32 reads back
+    as `inf` with no error raised anywhere.
+    """
+    log = Log.new(tmp_path, "s", schema=RANGED)
+    with log:
+        log.extend([{"event_ts": i} for i in range(20)])
+
+        for row in (
+            {"event_ts": 1, "n32": 2**40},
+            {"event_ts": 1, "n32": -(2**40)},
+            {"event_ts": 1, "f32": 1e300},
+        ):
+            with pytest.raises(ValueError, match="cannot hold"):
+                log.append(row)
+
+        assert log.scan().read_all().num_rows == 20
+
+
+def test_append_accepts_the_exact_bounds_and_an_explicit_infinity(
+    tmp_path: Path,
+) -> None:
+    """The check is a range, not a smaller one, and `inf` is a real float32.
+
+    A float32 represents infinity exactly, so passing one is a statement rather
+    than an overflow. What is refused is a FINITE value that would silently
+    become infinite. Falsify by dropping the `_INFINITE` clause: the explicit
+    infinities below are then refused.
+    """
+    log = Log.new(tmp_path, "s", schema=RANGED)
+    with log:
+        log.append({"event_ts": 1, "n32": 2**31 - 1})
+        log.append({"event_ts": 2, "n32": -(2**31)})
+        log.append({"event_ts": 3, "f32": float("inf")})
+        log.append({"event_ts": 4, "f32": float("-inf")})
+        # A column that CAN overflow but was not supplied is not a range fault.
+        log.append({"event_ts": 5})
+
+        table = log.scan().read_all()
+
+        assert table.column("n32").to_pylist()[:2] == [2**31 - 1, -(2**31)]
+        assert table.column("f32").to_pylist()[2:4] == [float("inf"), float("-inf")]
 
 
 def test_extend_refuses_the_batch_without_writing_any_of_it(

@@ -85,11 +85,8 @@ def test_init_does_no_io(tmp_path: Path) -> None:
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(
-            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
-        ),
+        reader=Reader(layout, table, buffer, duckdb_connection, archive),
         maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
-        schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
         archive=archive,
@@ -123,11 +120,8 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(
-            layout, table, buffer, table_schema(SCHEMA), duckdb_connection, archive
-        ),
+        reader=Reader(layout, table, buffer, duckdb_connection, archive),
         maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
-        schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
         archive=archive,
@@ -361,9 +355,18 @@ def test_the_reserved_column_is_refused_at_schema_change_time(tmp_path: Path) ->
         with pytest.raises(ValueError, match="litelink_offset"):
             log.drop_column("litelink_offset", breaking_ok=True)
 
-        # An ordinary column still reaches the unimplemented body.
+        # An ordinary column reaches the body — `add_column` is implemented,
+        # so the refusal above is I11 and not the stub. The other two are
+        # still unimplemented: both are BREAKING for consumers (I10).
+        log.add_column("extra", pa.int64())
+
+        assert "extra" in log._buffer.shape().columns
+
         with pytest.raises(NotImplementedError):
-            log.add_column("extra", pa.int64())
+            log.rename_column("key", "renamed", breaking_ok=True)
+
+        with pytest.raises(NotImplementedError):
+            log.drop_column("key", breaking_ok=True)
 
 
 def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:

@@ -1333,6 +1333,29 @@ Use §4's shape, not a best-effort ordering: record the intended schema in SQLit
 anything changes, commit to Iceberg, then write the schema and clear the intent. Recovery
 replays it, and the table's columns say which half already landed.
 
+**Probe, never stamp.** The intent records WHAT the change is, never which of its steps have
+run. Recording a step does not make it atomic with the commit it describes — it only moves
+the unreconciled gap from before that commit to after it — and a stamp can be *false*:
+`Log.restore` rebuilds the local table from the declared schema, so a replica captured
+mid-change arrives carrying a record of a step that never landed on that machine. Every step
+is settled by asking the thing itself: the archive's columns, the local table's, `PRAGMA
+table_info(buffer)`, the `meta` row. This requires the Iceberg step to be replayable against
+a table where it already landed, which is why it uses `union_by_name` — idempotent — rather
+than `add_column`, which raises `name already exists`.
+
+**Recovery defers; it never fails the open.** If the archive cannot be widened, the intent is
+left standing and the log opens anyway. It appends, seals and reads; the change simply has
+not finished, and it is safe to leave because the declaration is unchanged — so no value of
+the new column can be stored, the insert column list being derived from it. Failing the open
+instead would mean a change interrupted by an outage makes the log unopenable for writing
+until the bucket returns, breaking §11's promise that a log works with no network.
+
+**One change at a time.** A second change while one is outstanding is refused, and the
+refusal names the pending column. This is not tidiness: the second change would write
+`declared + its own column`, dropping the pending one from the declaration while the Iceberg
+tables keep it, and then clear the intent — after which the declared schema and the table
+disagree with nothing to explain it, and no process can open the log at all.
+
 This is the same completion boundary every other multi-step operation here uses — a seal
 completes at its final SQLite transaction, a compaction when its claim is cleared, a deletion
 when its queue row is forgotten. **Iceberg holds the data; SQLite holds the record of what the
@@ -1388,7 +1411,7 @@ Each needs a test.
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
 | **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
 | **I11** | `litelink_offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
-| **I17** | An append names only columns the log declares, and supplies a value for every non-nullable one, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. |
+| **I17** | An append names only columns the log declares, supplies a value for every non-nullable one, and gives each a value of its declared type, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. The type clause closes the same two outcomes reached through a value rather than a name: SQLite has affinities, not types, so it stores whatever it is given and the declared schema is not consulted again until the read. A value Arrow cannot parse (`"x"` into an int64) wedges every scan; one it can parse but not preserve (`1.5` into an int64, `12345` into a string, `True` into an int64) is silently rewritten, so what is read back is not what was appended and nothing raises at all. Magnitude is checked with it, because the type gate cannot see it: `2**40` IS an int and `1e300` IS a float, and they fail the same two ways — the int32 wedges every scan, the float32 reads back as `inf`. Only int32 and float32 can overflow, so a schema without them pays nothing; int64 is left to SQLite, which refuses it at the insert. |
 | **I9** | `litelink_offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
 | **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
@@ -2058,11 +2081,27 @@ Beyond §10:
 - Assert a row naming an undeclared column is rejected, and that the batch it was in is
   rejected whole with no offset consumed (I17). Include the row that misspells a declared
   column: it has the same width as a correct one, so a length check passes it.
+- Assert a value of the wrong type is rejected at APPEND, for both outcomes: one Arrow
+  cannot parse (which would wedge every scan) and one it would silently rewrite (`1.5` into
+  an int64, `True` into an int64 — the case an `isinstance` check passes, `bool` being an
+  `int` subclass). Assert a `str` subclass and an `int` in a float column are still accepted:
+  the exact-type gate is a fast path, not the definition of legality.
+- Assert a value of the right type but the wrong MAGNITUDE is rejected — `2**40` into an
+  int32, `1e300` into a float32 — and that the exact bounds are accepted along with an
+  explicit infinity, which a float32 represents exactly and which is a statement rather than
+  an overflow.
 - Assert a row omitting a non-nullable column is rejected, and so is one supplying it as
   `None` (I17) — while an absent NULLABLE column is still accepted, which is what stops the
   check from being a blanket "every key must be present". Falsify by allowing it and
   scanning: the failure is not scoped to the bad row, so assert the rows written BEFORE it
   become unreadable too.
+- Add a column to a log with sealed files; assert old rows read null, new rows carry values,
+  and not one file was rewritten. Assert a SEALER that never appends does not drop the new
+  column — the process that would never revalidate if the schema were cached per append.
+- Interrupt a schema change before its final SQLite write; assert the next open completes it,
+  and that a reader opened during the window reads rather than raising. Assert an
+  `add_column` whose archive is unreachable leaves the log openable, appendable and readable,
+  and that the change completes on a later open (§11).
 - Commit twice, then assert a reader that cached `metadata_location` from the first commit
   is detectably stale -- the reason §7 requires resolving it per query.
 - Run with `local_retention = 0`; assert seal, upload, archive reads and compaction all work

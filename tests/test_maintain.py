@@ -89,7 +89,7 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
         for ts in (500, 100, 400, 200):
-            log.append({"event_ts": ts, "key": "k", "payload": b""})
+            log.append({"event_ts": ts, "key": "k", "payload": ""})
             log.seal()
 
         log.maintain()
