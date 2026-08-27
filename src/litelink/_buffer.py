@@ -90,53 +90,62 @@ class _Group:
 
 
 def _column_ddl(name: str, field: pa.Field) -> str:
-    """One column's DDL, carrying as much of I17 as SQLite can enforce.
+    """One column's DDL, carrying every part of I17 that SQLite can enforce.
 
-    Everything expressible here runs in C, at the insert, inside the
-    transaction — which is what makes the write path's validation nearly free.
-    Python is left with the one question SQLite cannot be asked: whether the
-    row named a column that is not in the statement at all.
+    **Every column is `ANY`, and that is the whole design.** A STRICT column
+    of a declared type does not refuse a wrong value, it CONVERTS one: an
+    INTEGER column given `'77'` stores 77, `'007'` stores 7, and a REAL column
+    given `'1e999'` stores `inf`. A TEXT column given `12345` stores
+    `'12345'`. The conversion happens before any CHECK could see it, so the
+    constraint would be asked about a value that had already been changed.
 
-    Four constraints, each for a value that would otherwise be stored as given
-    and read back wrong:
+    `ANY` stores the value exactly as given, which is what lets `typeof` tell
+    the truth about it. STRICT is still declared — it is what makes `ANY` mean
+    "no conversion" rather than "no declared affinity".
 
-    - `STRICT` refuses TEXT or BLOB into a numeric column, and a non-integral
-      REAL into an integer one. Without it SQLite has affinities, not types.
-    - A string column is declared **ANY**, not TEXT. A STRICT TEXT column
-      coerces `12345` to `'12345'` before any CHECK could see it; `ANY` stores
-      the value as given, so `typeof` can tell the truth about it.
-    - A bool column is an INTEGER holding 0 or 1, so anything else is a value
-      the read path would turn into `True` — `7` becomes true, silently.
-    - int32 and float32 are the only types that can overflow. An int32 given
-      2**40 wedges every scan; a float32 given 1e300 reads back as `inf`. An
-      explicitly infinite value is legal and stays legal — a float32 holds it
-      exactly, so passing one is a statement rather than an overflow.
+    One CHECK per column rather than several: the type test and the range test
+    are one question about one value, and SQLite evaluates a single expression
+    more cheaply than two.
 
-    `NOT NULL` carries the nullability half. Absent and explicitly-None reach
-    SQLite identically, because the insert is built as `row.get(c)`, so one
-    constraint covers both.
+    The remaining leniency is `True` into an integer column, which stores 1.
+    Python's driver converts a bool before SQLite sees the value, so no
+    constraint can distinguish it from a plain int. It is lossless.
     """
     kind = column_type(field.type)
-    declared = "ANY" if kind.sqlite == "TEXT" else kind.sqlite
-    parts = [] if field.nullable else ["NOT NULL"]
-    guard = f'"{name}" IS NULL OR '
+    q = f'"{name}"'
 
-    if kind.sqlite == "TEXT":
-        parts.append(f"CHECK ({guard}typeof(\"{name}\") = 'text')")
-    elif pa.types.is_boolean(field.type):
-        parts.append(f'CHECK ({guard}"{name}" IN (0, 1))')
+    if pa.types.is_boolean(field.type):
+        # A bool column is an integer holding 0 or 1; anything else is a value
+        # the read path would turn into `True` — `7` becomes true, silently.
+        test = f"typeof({q}) = 'integer' AND {q} IN (0, 1)"
+    elif pa.types.is_floating(field.type):
+        # An integer is a legal float — `{"price": 5}` is too natural to
+        # refuse — and SQLite reports it as `'integer'`, so both are allowed.
+        test = f"typeof({q}) IN ('integer', 'real')"
+        if kind.bounds is not None:
+            # `9e999` is how SQL spells infinity; `abs` covers both signs. An
+            # explicitly infinite value is legal and stays legal — a float32
+            # holds it exactly, so passing one is a statement, not an overflow.
+            test += f" AND (abs({q}) <= {kind.bounds[1]!r} OR abs({q}) = 9e999)"
+    else:
+        test = (
+            f"typeof({q}) = 'integer'"
+            if kind.sqlite == "INTEGER"
+            else (f"typeof({q}) = 'text'")
+        )
+        if kind.bounds is not None:
+            lo, hi = kind.bounds
+            test += f" AND {q} BETWEEN {lo:.0f} AND {hi:.0f}"
 
-    if kind.bounds is not None:
-        lo, hi = kind.bounds
-        if pa.types.is_floating(field.type):
-            # `9e999` is how SQL spells infinity here; `abs()` covers both signs.
-            parts.append(
-                f'CHECK ({guard}abs("{name}") <= {hi!r} OR abs("{name}") = 9e999)'
-            )
-        else:
-            parts.append(f'CHECK ({guard}"{name}" BETWEEN {lo:.0f} AND {hi:.0f})')
+    parts = [f"{q} ANY"]
+    if not field.nullable:
+        # Absent and explicitly-None reach SQLite identically — the insert is
+        # built as `row.get(c)` — so one constraint covers both.
+        parts.append("NOT NULL")
 
-    return " ".join([f'"{name}" {declared}', *parts])
+    parts.append(f"CHECK ({q} IS NULL OR ({test}))")
+
+    return " ".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,9 +590,14 @@ class Buffer:
         if name in self.table_columns():
             return
 
-        sqlite_type = column_type(type_).sqlite
+        # The SAME DDL a column created with the table gets. Building this
+        # from the affinity alone left every column added by `add_column`
+        # with no constraints at all — unvalidated for the life of the log,
+        # since `_create` is `CREATE TABLE IF NOT EXISTS` and never revisits
+        # it. `ALTER TABLE ADD COLUMN` accepts a CHECK, and it fires.
+        ddl = _column_ddl(name, pa.field(name, type_))
         with self._lock:
-            self._con.execute(f'ALTER TABLE buffer ADD COLUMN "{name}" {sqlite_type}')
+            self._con.execute(f"ALTER TABLE buffer ADD COLUMN {ddl}")
 
     def _seed_group(self) -> None:
         """Ensure exactly one open group, seeded from whatever is buffered.

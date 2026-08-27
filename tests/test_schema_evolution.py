@@ -6,6 +6,7 @@ consumers (I10) and want a versioning conversation this does not have.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pyarrow as pa
@@ -368,3 +369,38 @@ def test_recovery_defers_when_the_archive_commit_itself_fails(
     with Log.open(tmp_path, "s", s3=s3) as healed:
         assert "region" in healed._buffer.shape().columns
         assert not healed._buffer.get_meta("schema_intent")
+
+
+def test_reattaching_an_archive_behind_the_schema_is_refused(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Detach, add a column, re-attach — the door that skips step 4.
+
+    Attaching does no schema work: `open_archive` declares a schema only when
+    it CREATES a table, and nothing re-declares an existing one. So the
+    archive stays narrow and every later push fails permanently with
+    `PyArrow table contains more columns`, `sync` never advances, and I4 pins
+    eviction on the files it could not push — local disk grows without bound.
+
+    Falsify by removing `_refuse_archive_behind`: the attach succeeds and
+    `sync()` then raises on every call, with the watermark frozen.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(20))
+        log.seal()
+        log.sync()
+
+        uri = log.archive
+
+        # Detaching needs the retention floors clear; see `_refuse_lossy_detach`.
+        log.set_config(replace(log.config, local_retention=None, local_rows=None))
+        log.set_archive(None)
+        log.add_column("region", pa.string())
+
+        with pytest.raises(ValueError, match="missing \\['region'\\]"):
+            log.set_archive(uri)
+
+        # And the log is still usable, having refused rather than half-attached.
+        log.extend(rows(3, start=20, region="eu"))
+
+        assert log.scan().read_all().num_rows == 23

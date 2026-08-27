@@ -291,6 +291,30 @@ def archive_extent(
     return LogTable(None, layout, table, prefix).extent()  # ty: ignore
 
 
+def archive_columns(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[str, ...] | None:
+    """The column names of the archive at `prefix`, read from the bucket alone.
+
+    The sibling of `archive_extent` and for the same reason: a pre-flight
+    check has to ask about an archive this log is not pointed at yet, and
+    `open_archive` on a different prefix either raises on the boundary check
+    or drops a catalog row as a side effect.
+
+    `None` when the archive has no published hint, which covers both "nothing
+    has been pushed there" and "not a litelink archive" — neither of which the
+    caller can conclude anything from.
+    """
+    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+
+    return tuple(field.name for field in table.schema().fields)
+
+
 class LogTable:
     """The local Iceberg table for one log.
 

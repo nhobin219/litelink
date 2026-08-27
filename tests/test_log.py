@@ -755,6 +755,71 @@ def test_append_refuses_a_value_that_would_be_silently_rewritten(
         assert log.scan().read_all().column("event_ts").to_pylist() == [1]
 
 
+def test_append_refuses_a_string_that_sqlite_would_convert(
+    tmp_path: Path,
+) -> None:
+    """The reason every column is declared ANY.
+
+    A STRICT column of a declared type does not refuse a wrong value, it
+    CONVERTS one — an INTEGER column given `'77'` stores 77 and `'007'` stores
+    7, a REAL column given `'1e999'` stores `inf`. The conversion happens
+    before any CHECK could see it, so a constraint on a typed column would be
+    asked about a value that had already been changed.
+
+    `'007'` is the one that shows why "lossless" is not the test: it survives
+    as 7, and no round trip gets the original back.
+
+    Falsify by declaring the columns with their affinities instead of ANY:
+    every row below is accepted and silently rewritten.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        for row in (
+            {"event_ts": "77"},
+            {"event_ts": "007"},
+            {"event_ts": " 77 "},
+            {"event_ts": 1, "price": "1e999"},
+            {"event_ts": 1, "flag": "0"},
+        ):
+            with pytest.raises(ValueError, match="wrong type"):
+                log.append(row)
+
+        assert log.end_offset() == 1
+
+
+def test_a_column_added_later_is_validated_like_any_other(
+    tmp_path: Path,
+) -> None:
+    """`ALTER TABLE ADD COLUMN` must carry the same DDL as `CREATE TABLE`.
+
+    It did not, and `_create` is `CREATE TABLE IF NOT EXISTS`, so the gap
+    survived every reopen: a column added by `add_column` was unvalidated for
+    the life of the log. An int32 given 2**40 was stored, `append` returned an
+    offset, and then every scan AND every seal raised for ever while appends
+    kept succeeding — the buffer could never drain.
+
+    Falsify by building the ALTER from the affinity alone: all three rows
+    below are accepted, and the seal at the end raises `ArrowInvalid`.
+    """
+    log = Log.new(tmp_path, "s", schema=TYPED)
+    with log:
+        log.extend([{"event_ts": i} for i in range(5)])
+        log.add_column("late", pa.int32())
+
+        for row in (
+            {"event_ts": 9, "late": 2**40},
+            {"event_ts": 9, "late": "5"},
+            {"event_ts": 9, "late": 1.5},
+        ):
+            with pytest.raises(ValueError, match="wrong type|cannot hold"):
+                log.append(row)
+
+        log.append({"event_ts": 9, "late": 7})
+        log.seal()
+
+        assert log.scan().read_all().num_rows == 6
+
+
 def test_the_type_refusal_names_the_column_the_value_and_the_declared_type(
     tmp_path: Path,
 ) -> None:

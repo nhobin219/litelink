@@ -46,7 +46,12 @@ from litelink._maintenance import (
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config, restore_buffer
 from litelink._s3 import S3Options
-from litelink._table import LogTable, archive_extent, forget_archive_entry
+from litelink._table import (
+    LogTable,
+    archive_columns,
+    archive_extent,
+    forget_archive_entry,
+)
 from litelink._types import column_type, validate_schema
 
 if TYPE_CHECKING:
@@ -1040,6 +1045,7 @@ class Log:
                 # applied to the configuration that governs it.
                 validate(self._schema, self._sort_by, self.config, archive)
                 self._refuse_archive_ahead(archive)
+                self._refuse_archive_behind(archive)
                 self._refuse_lossy_detach(archive)
                 # The other half of the same rule; see `set_config`.
                 checkpoint(lease.renew)
@@ -1093,6 +1099,55 @@ class Log:
             "accept that, then detach."
         )
         raise ValueError(msg)
+
+    def _refuse_archive_behind(self, archive: str | None) -> None:
+        """Refuse an archive missing a column this log has since added.
+
+        Attaching does no schema work — `open_archive` only DECLARES a schema
+        when it creates a table, and nothing in `src/` re-declares an existing
+        one. So an archive detached before an `add_column` and re-attached
+        after it stays narrow, and every later push fails permanently:
+
+            ValueError: PyArrow table contains more columns: region.
+
+        `sync` then never advances, eviction's I4 clamp pins on the unpushed
+        files, and local disk grows without bound — the exact consequence
+        `_apply_add_column` orders its steps to prevent, arrived at through a
+        door that skips step 4 entirely.
+
+        Refused rather than repaired. Widening an existing archive is
+        `union_by_name` against a table this log did not create, which belongs
+        with `rewrite_archive` and wants its own design; doing it quietly from
+        a setter would mean `set_archive` mutating a shared archive as a side
+        effect. Tracked as an issue.
+        """
+        if archive is None:
+            return
+
+        # Read from the bucket, not through `self._archive`: that object
+        # takes its URI from `meta`, which still names the OLD archive — or
+        # None, on the detach-then-attach path this exists to catch.
+        try:
+            columns = archive_columns(self._layout, archive, self._archive.s3)
+        except Exception:
+            # A bad minute in object storage is not a schema disagreement.
+            # `_refuse_archive_ahead` treats it the same way: cannot tell, so
+            # pass rather than refuse an archive that may be fine.
+            return
+
+        if columns is None:
+            return
+
+        declared = set(self._buffer.shape().schema.names)
+        missing = sorted(declared - set(columns))
+        if missing:
+            msg = (
+                f"archive at {archive} is missing {missing}, which this log has "
+                "added since. Attaching it would make every later sync fail "
+                "permanently and pin eviction, so the log would grow without "
+                "bound. Widen the archive first"
+            )
+            raise ValueError(msg)
 
     def _refuse_archive_ahead(self, archive: str | None) -> None:
         """Refuse an archive whose extent is above this log's next offset.
@@ -1890,7 +1945,19 @@ class Log:
             .type
         )
 
-        lease = self._claim_settings()
+        try:
+            # Inside the try, because taking the claim can itself fail. Unlike
+            # the other two halves of `recover()`, which use a non-blocking
+            # `acquire()`, this one waits and then RAISES if a maintainer is
+            # holding the whole-log range — and `recover()` is unguarded in
+            # `open`, so that would fail the open for every writer while
+            # `read_only=True` kept working. That is the failure this method
+            # exists to avoid; leaving the acquisition outside meant it could
+            # still happen, just for a different reason.
+            lease = self._claim_settings()
+        except Exception:
+            return
+
         try:
             # Re-read under the claim: another process may have finished it
             # between the check above and here.
