@@ -1,6 +1,6 @@
 # Capture storage
 
-**v1.0** — durable append-only capture into Iceberg tables. Local-first, no service.
+**v1.0** — durable append-only capture into Iceberg tables. Embedded and local-first.
 
 ---
 

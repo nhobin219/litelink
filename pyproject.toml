@@ -1,7 +1,7 @@
 [project]
 name = "litelink"
 version = "0.1.0"
-description = "Durable append-only capture into Iceberg tables. Local-first, in-process, no service."
+description = "Durable append-only capture into Iceberg tables. Embedded and local-first."
 readme = "README.md"
 authors = [
     { name = "Nico Bautista Hobin", email = "nico@penca.io" }
