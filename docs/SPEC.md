@@ -1673,6 +1673,49 @@ The consequence worth planning for is that local disk holds roughly
    assigned. §2's note that an explicit `meta` counter *"only earns its extra moving part
    if offset ranges must later be pre-allocated across producers"* is the clause this
    trips; the `sqlite_sequence` bump is the cheaper way to satisfy it.
+
+   **Reserving DOWNWARD is what makes a cutover cheap, and it is the same mechanism.** A log
+   created with a non-zero starting offset — `Log.new(..., start_offset=N)` — leaves
+   `[1, N-1]` permanently unassigned. Live capture begins immediately at `N`, and the
+   historical corpus is bulk-ingested into the reserve afterwards, at whatever pace the
+   rewrite takes. The two never contend: the backfill writes strictly below every offset
+   live capture will ever hold.
+
+   That turns a cutover from one coordinated operation into two independent ones. Without
+   it, adopting litelink for a stream that already has history means either starting at
+   offset 1 and blocking live capture until the backfill lands, or accepting that history
+   sorts *above* everything captured since. With it, you point the live feed at litelink
+   today and backfill next week.
+
+   **It rests on gaps already being legal**, which they are twice over: the reservation
+   paragraph above requires it, and rolled-back batches already produce them (§15.3). §6
+   needs files non-overlapping and adjacent in offset order, not free of integer gaps.
+
+   **I11 holds the way `Buffer.seed_offsets` already makes it hold.** The caller chooses a
+   RANGE; the library still assigns every value inside it. That is the distinction I11 is
+   drawing — not "the library picks the number" but "no caller-supplied number can collide
+   with, or reuse, one the library has issued". A `start_offset` at creation cannot: nothing
+   has been issued yet. `Log.restore` already reserves a gap this way (`RESTORE_RESERVE`),
+   for the same reason in a different direction.
+
+   **The API takes `offsets` or `start_offset`, not both.** A backfill that is one contiguous
+   run wants the latter; one assembled from several files, or carrying its own ordering,
+   wants the former. Either way the library validates before writing anything: every offset
+   must fall inside the reserve, and the row count must not exceed it. **A backfill of more
+   than `N-1` rows is refused** — there is nowhere to put the overflow that does not collide
+   with live capture, and silently placing it above would interleave history with current
+   data.
+
+   **The sizing decision is one-way, and that is the sharp edge.** Once live capture has
+   taken offsets above `N`, the reserve cannot grow: the space below is bounded by a number
+   chosen before the first row. Underestimate and the remaining history has no home.
+   Overestimating costs nothing — gaps are free, and §7's tier boundaries are extents rather
+   than counts — so the guidance is to pick `N` well above the known row count.
+
+   Two smaller consequences worth stating. A backfill smaller than its reserve leaves a
+   permanent gap, which is fine and needs no repair. And where `sort_by` is a time column,
+   the backfilled files cluster entirely below the live ones, so §7's pruning improves rather
+   than degrades — the opposite of what appending history after the fact would do.
 5. **Extension provisioning for embedders.** §7 makes the extension download a provisioning
    obligation. A repo can discharge it in its bootstrap and its CI; an application that
    `pip install`s the library runs neither. It gets the read path and no extensions, so its
