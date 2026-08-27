@@ -522,10 +522,15 @@ class Buffer:
             # runs per row.
             declared = self._known.issuperset
             for row in rows:
+                # I11 FIRST, so a row that is wrong twice gets the message
+                # about the thing that is specifically forbidden rather than
+                # the generic one. `litelink_offset` is in `_known`, so the
+                # subset test passes it through to here either way; the order
+                # is what decides which error the caller reads.
+                self._reject_offset(row)
                 if not declared(row):
                     self._reject_unknown(row)
 
-                self._reject_offset(row)
                 cursor.execute(sql, tuple(row.get(c) for c in columns))
                 # lastrowid is the assigned offset, available inside the open
                 # transaction and before the row is visible to anyone else.
@@ -611,7 +616,7 @@ class Buffer:
         )
 
     def _reject_unknown(self, row: Mapping[str, object]) -> None:
-        """A row naming a column this log does not have.
+        """A row naming a column this log does not have (I17).
 
         Off the hot path: `_insert` calls this only once the subset test has
         already failed, so building the sorted difference costs nothing in the

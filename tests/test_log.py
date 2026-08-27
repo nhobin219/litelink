@@ -587,3 +587,26 @@ def test_extend_refuses_the_batch_without_writing_any_of_it(
 
         assert log.end_offset() == 1, "the batch was partly written"
         assert log.scan().read_all().num_rows == 0
+
+
+def test_a_row_that_is_wrong_twice_names_the_forbidden_column_first(
+    tmp_path: Path,
+) -> None:
+    """I11 before I17, when a row breaks both.
+
+    `litelink_offset` is in the declared set, so the subset test passes it
+    through either way and the ORDER of the two checks is what decides which
+    error the caller reads. Supplying an offset is the specifically forbidden
+    thing; "unknown column" would send them looking at the wrong key.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="I11"):
+            log.append(
+                {
+                    "event_ts": 1,
+                    "key": "a",
+                    "payload": "p",
+                    "litelink_offset": 9,
+                    "region": "eu",
+                }
+            )
