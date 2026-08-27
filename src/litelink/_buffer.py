@@ -96,6 +96,13 @@ class Buffer:
         self._reader = reader
         self._schema = schema
         self._columns = columns
+        # Derived from `_columns`, and it must MOVE with it. Both answer one
+        # question — what columns does this log have — and refreshing them at
+        # different moments is a silent loss: a fresh `_known` accepts a column
+        # a stale `_columns` then drops in `tuple(row.get(c) for c in
+        # columns)`. `litelink_offset` is in the set so `_reject_offset` stays
+        # the thing that refuses it, with its own message.
+        self._known = frozenset((OFFSET, *columns))
         self._config_cache: tuple[str, LogConfig] | None = None
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
@@ -511,7 +518,13 @@ class Buffer:
             target_rows = config.target_seal_rows or _NO_ROW_LIMIT
             row_bytes = self._row_bytes
             columns = self._columns
+            # Bound out here like `row_bytes` above, for the same reason: this
+            # runs per row.
+            declared = self._known.issuperset
             for row in rows:
+                if not declared(row):
+                    self._reject_unknown(row)
+
                 self._reject_offset(row)
                 cursor.execute(sql, tuple(row.get(c) for c in columns))
                 # lastrowid is the assigned offset, available inside the open
@@ -596,6 +609,31 @@ class Buffer:
                 group.group_id,
             ),
         )
+
+    def _reject_unknown(self, row: Mapping[str, object]) -> None:
+        """A row naming a column this log does not have.
+
+        Off the hot path: `_insert` calls this only once the subset test has
+        already failed, so building the sorted difference costs nothing in the
+        ordinary case.
+
+        **Nothing below catches this.** The insert is built as
+        `tuple(row.get(c) for c in columns)` — it enumerates the SCHEMA's
+        columns, never the row's keys — so an unknown key is dropped before any
+        SQL exists and neither SQLite nor pyarrow ever sees it. `append`
+        returned an offset for a row it had silently truncated.
+
+        The checks that DO exist fire at the wrong time. A value pyarrow cannot
+        cast is stored, `append` succeeds, and then every scan and every seal
+        raises on it for ever while appends keep working — measured. Refusing
+        here is what keeps a rejectable row from wedging the log.
+        """
+        unknown = sorted(set(row) - self._known)
+        msg = (
+            f"row names columns this log does not have: {unknown}. "
+            f"Declared: {sorted(self._columns)}"
+        )
+        raise ValueError(msg)
 
     @staticmethod
     def _reject_offset(row: Mapping[str, object]) -> None:

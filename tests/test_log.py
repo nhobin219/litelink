@@ -512,3 +512,78 @@ def test_a_sort_key_correlated_with_the_offset_keeps_files_prunable(
         assert all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1)), (
             "correlated keys leave each file a disjoint slice, so files prune"
         )
+
+
+def test_append_refuses_a_column_this_log_does_not_have(tmp_path: Path) -> None:
+    """Nothing below catches this, and the checks that exist fire too late.
+
+    `_insert` builds each row as `tuple(row.get(c) for c in columns)` — it
+    enumerates the SCHEMA's columns, never the row's keys — so an unknown key
+    is dropped before any SQL exists. Neither SQLite nor pyarrow ever sees it,
+    and `append` returns an offset for a row it silently truncated.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="does not have: \\['region'\\]"):
+            log.append({"event_ts": 1, "key": "a", "payload": "p", "region": "eu"})
+
+        # And the message names the declared set, because "unknown column" on
+        # its own does not tell you whether you misspelled or misremembered.
+        with pytest.raises(ValueError, match="Declared:"):
+            log.append({"event_ts": 1, "key": "a", "payload": "p", "region": "eu"})
+
+        assert log.end_offset() == 1, "a refused row must not consume an offset"
+
+
+def test_append_refuses_a_typo_that_shadows_a_declared_column(
+    tmp_path: Path,
+) -> None:
+    """The row a length check cannot catch, and the reason there is not one.
+
+    A first design guarded the subset test with `len(row) != width`, on the
+    reasoning that a matching width means every declared column is present.
+    It does not: it means as many keys are missing as are unknown. One typo —
+    `ky` for `key` — has the right width, skips the test, stores NULL in the
+    column it shadowed, and if that column is non-nullable every scan and every
+    seal then fails for ever while appends keep succeeding.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="does not have: \\['ky'\\]"):
+            log.append({"event_ts": 1, "ky": "a", "payload": "p"})
+
+        assert log.end_offset() == 1
+
+
+def test_append_still_accepts_a_row_missing_a_nullable_column(
+    tmp_path: Path,
+) -> None:
+    """The refusal is about UNKNOWN columns, not absent ones.
+
+    A missing nullable column is a legal row and stores NULL — the shape a
+    subset test permits and a width test would not.
+    """
+    with open_log(tmp_path) as log:
+        log.append({"event_ts": 1, "key": "a"})
+
+        rows = log.scan().read_all().to_pylist()
+
+        assert rows[0]["payload"] is None
+
+
+def test_extend_refuses_the_batch_without_writing_any_of_it(
+    tmp_path: Path,
+) -> None:
+    """One bad row rejects the batch, and the batch is one transaction.
+
+    `_insert` runs inside `BEGIN IMMEDIATE`, so raising part way rolls the
+    whole thing back. That matters more than it looks: a partial batch would
+    hand back offsets for rows the caller never learns were stored.
+    """
+    with open_log(tmp_path) as log:
+        good = [{"event_ts": i, "key": f"k{i}", "payload": "p"} for i in range(50)]
+        bad = [*good, {"event_ts": 50, "key": "k50", "payload": "p", "region": "eu"}]
+
+        with pytest.raises(ValueError, match="does not have"):
+            log.extend(bad)
+
+        assert log.end_offset() == 1, "the batch was partly written"
+        assert log.scan().read_all().num_rows == 0

@@ -846,7 +846,7 @@ def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> N
         config=LogConfig(local_retention=timedelta(0), local_rows=1_000_000),
     )
     with log:
-        log.extend([{"event_ts": i, "key": "k", "payload": "p"} for i in range(8)])
+        log.extend([{"event_ts": i, "key": "k"} for i in range(8)])
         log.seal()
         log.maintain()
 
@@ -1125,7 +1125,7 @@ def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
     once `meta` is the source of truth, because nothing would reconcile them.
     """
     with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.extend([{"event_ts": i, "key": f"k{i}", "payload": "p"} for i in range(20)])
+        log.extend([{"event_ts": i, "key": f"k{i}"} for i in range(20)])
         log.set_sort_by((), rewrite=True)
 
         assert log._table.sort_by() == ()  # noqa: SLF001
@@ -1151,7 +1151,7 @@ def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
     """
     buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
     try:
-        buffer.append([{"event_ts": i, "key": "k", "payload": "p"} for i in range(2)])
+        buffer.append([{"event_ts": i, "key": "k"} for i in range(2)])
         highest = buffer.next_offset() - 1
 
         buffer.seed_offsets(highest + (1 << 20))

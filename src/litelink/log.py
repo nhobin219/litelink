@@ -1340,7 +1340,10 @@ class Log:
         (§3). There is no in-memory write buffer to flush, and that absence is
         the point: it is the failure the README opens with.
 
-        A caller-supplied `offset` is rejected (I11).
+        A caller-supplied `offset` is rejected (I11), and so is a column this
+        log does not have: the insert is built from the SCHEMA's columns, so an
+        unknown key would otherwise be dropped before any SQL exists and this
+        would return an offset for a row it had silently truncated.
         """
         return self.extend([row])[0]
 
@@ -1350,6 +1353,12 @@ class Log:
         The batch is the durability unit: one fsync amortised across the batch,
         which is the whole of §3's throughput story. It carries no meaning
         beyond that — see §1 on why there is no transaction id column.
+
+        **One bad row rejects the whole batch**, because the batch is one
+        transaction: a row naming a column this log does not have raises before
+        anything commits, and no offset is consumed. Partial acceptance would
+        be worse than refusal — it would hand back offsets for some rows while
+        the caller learns nothing about the rest.
         """
         self._writable()
 
