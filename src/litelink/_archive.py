@@ -110,19 +110,28 @@ class Archive:
         An argument is not the second home this class shed. The field was: it
         stayed at whatever the process opened with, so an archive created after
         a re-sort was born declaring the old key. `table` reads `meta` when it
-        opens a handle, so creation is now correct by construction and this
-        covers only the handle already open.
+        opens a handle, so creation is correct by construction and this covers
+        the table that already exists.
+
+        OPENS one rather than settling for a handle this process happens to
+        hold. An earlier version read `self._handle`, and `set_sort_by` never
+        opens the archive itself — `validate` reads only the URI — so a re-sort
+        from a process that had not touched the archive left its declaration
+        stale for ever, successfully and silently. Review caught the gap and
+        the docstring that admitted it.
+
+        `repair=False` never creates: an archive that does not exist yet is
+        left alone, and the one created later is created from `meta`, which by
+        then holds the new order.
 
         Best effort against the remote half. The archive may be unreachable,
         and a re-sort is a local operation that has already rewritten every
         local file by the time this runs; failing it here would report a
         failure that did not happen.
         """
-        with self._lock:
-            handle = self._handle
-
-        if handle is not None:
-            with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception):
+            handle = self.table()
+            if handle is not None:
                 handle.set_sort_order(sort_by)
 
     def location(self) -> str | None:

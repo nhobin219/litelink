@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
@@ -1133,6 +1134,54 @@ def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
 
     with Log.open(tmp_path, "s") as reopened:
         assert reopened.sort_by == ()  # noqa: SLF001
+
+
+def test_a_rewrite_finishes_a_re_sort_that_died_after_the_meta_write(
+    tmp_path: Path,
+) -> None:
+    """The one crash gap in `set_sort_by` that nothing used to heal.
+
+    `set_sort_by` writes `meta` LAST, so a crash before it leaves the log
+    deciding by the old key and a retry completes the operation. A crash AFTER
+    it does not: the declarations say the new key, every existing file is still
+    in the old one, and the natural retry used to find the orders equal and
+    return without doing anything. Silent, permanent, and a §7 lie — a
+    predicate on the declared leading column pruning nothing, on exactly the
+    files the rewrite never reached.
+
+    Reproduced by a review pass, so this asserts the ROWS rather than the
+    declarations: both of those already said the right thing in the broken
+    state, which is what made it silent.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        # `key` descending as `event_ts` ascends, so the two clusterings are
+        # distinguishable and neither is the insertion order by accident.
+        log.extend(
+            [
+                {"event_ts": i, "key": f"k{20 - i:02d}", "payload": "p"}
+                for i in range(20)
+            ]
+        )
+        while log.seal() is not None:
+            pass
+
+        # The state a crash after the `meta` write leaves: both declarations
+        # carry the new key, the file carries the old clustering.
+        log._table.set_sort_order(("key",))  # noqa: SLF001
+        log._buffer.set_meta("sort_by", json.dumps(["key"]))  # noqa: SLF001
+
+        written = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
+        keys = written.column("key").to_pylist()
+        assert keys != sorted(keys), "the file was already re-clustered"
+        assert log.sort_by == ("key",), "the declaration did not survive"
+
+        # The retry. Same order the log already declares, which is precisely
+        # the call that used to do nothing.
+        log.set_sort_by(("key",), rewrite=True)
+
+        rewritten = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
+        assert rewritten.column("key").to_pylist() == sorted(keys)
+        assert rewritten.num_rows == 20, "the rewrite dropped or duplicated rows"
 
 
 def test_seeding_the_sequence_forward_is_allowed_backward_is_not(

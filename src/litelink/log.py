@@ -1269,7 +1269,19 @@ class Log:
             self._writable()
             requested = tuple(sort_by)
             validate(self._schema, requested, self.config, self._archive.uri)
-            if requested == self._buffer.sort_by():
+            if requested == self._buffer.sort_by() and not rewrite:
+                # Restating the order the log already declares, without asking
+                # for the data. Nothing to declare, nothing accepted, so this
+                # is the no-op it looks like.
+                #
+                # It used to return here whatever `rewrite` said, and that left
+                # the one crash gap nothing healed: a crash after `meta` and
+                # before the rewrite finished leaves the declarations NEW and
+                # the files OLD, and the natural retry found the orders equal
+                # and returned without doing anything. Reproduced by review.
+                # `rewrite=True` on an unchanged order is now the way to finish
+                # it — the whole table re-clustered, which is what that flag
+                # already means and what an interrupted rewrite needs.
                 return
 
             if not rewrite:
@@ -1291,19 +1303,25 @@ class Log:
                 raise RuntimeError(msg)
 
             try:
-                # `meta` LAST of the two durable writes, because it is what
-                # `open` reads and nothing reconciles the pair afterwards.
+                # `meta` LAST of the durable writes, because it is what
+                # every decision reads: a crash before it leaves the log
+                # deciding by the OLD key, which is the order every existing
+                # file is already in, so the operation is simply not done.
                 #
-                # An earlier version wrote it first and claimed the next `open`
-                # would correct any disagreement. Nothing does: `open` reads
-                # `meta` and never re-declares, and `LogTable.load` only
-                # repairs metadata PROPERTIES. So a crash between the two left
-                # the tables declaring one key for ever while every later seal
-                # wrote another — a table lying about its own clustering, which
-                # is the failure this whole change exists to prevent. This way
-                # a crash in the gap leaves `meta` unchanged, so the log goes
-                # on using the OLD key that the tables still declare, and the
-                # operation is simply not done.
+                # What it does NOT leave is the declarations untouched, and
+                # this comment used to say otherwise — "the log goes on using
+                # the OLD key that the tables still declare", which a review
+                # reproduced as false. After the declaration writes and before
+                # `meta`, the table declares NEW while `meta` still says OLD.
+                # That mismatch is declaration-only, and the natural retry
+                # heals it: the check above compares against `meta`, which is
+                # unchanged, so a repeated call proceeds and completes all of
+                # them.
+                #
+                # Writing `meta` FIRST is what does not heal. `meta` would say
+                # NEW while every file stayed OLD, and the retry would find the
+                # orders equal and return — which is the gap the `rewrite=True`
+                # branch above now fills.
                 self._table.set_sort_order(requested)
                 # The archive's declaration too, and BEFORE `meta` like the
                 # local one: `open_archive` declares an order only on a table
