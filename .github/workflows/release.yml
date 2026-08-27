@@ -1,0 +1,122 @@
+name: Release
+
+# Cutting a tag is the whole trigger. CI already runs on `v*` pushes too, so the
+# suite and this workflow start together — but publishing is gated on the checks
+# below rather than on that run, because a job that publishes must not depend on
+# a green light it cannot see.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and check the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # The tag and the version in pyproject.toml are two statements of the same
+      # fact, and PyPI will not let the second one be corrected later: a release
+      # is immutable, so a `v0.2.0` tag that ships 0.1.0 burns the version
+      # number. Fail before anything is built.
+      - name: Tag matches the packaged version
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          packaged=$(uv version --short)
+          if [ "$tagged" != "$packaged" ]; then
+            echo "tag $GITHUB_REF_NAME declares $tagged, pyproject.toml says $packaged" >&2
+            exit 1
+          fi
+          echo "both say $packaged"
+
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  smoke:
+    name: Install the wheel and capture a row
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # Against the built WHEEL in a clean environment, not the source tree.
+      # This is the one check that covers what a user actually installs: a
+      # missing package directory, an unshipped py.typed, a dependency declared
+      # in the dev group by accident. None of those fail in a repo checkout.
+      - name: Round-trip a row through the installed package
+        run: |
+          uv venv
+          uv pip install dist/*.whl
+          uv run --no-project python scripts/install_duckdb_extensions.py
+          uv run --no-project python - <<'PY'
+          import tempfile
+          import pyarrow as pa
+          import litelink
+          from litelink import Log
+
+          print(f"litelink {litelink.__version__}")
+          schema = pa.schema([pa.field("event_ts", pa.int64())])
+          with tempfile.TemporaryDirectory() as root:
+              with Log.new(root, "smoke", schema=schema) as log:
+                  log.append({"event_ts": 1})
+                  assert log.scan().read_all().num_rows == 1
+
+          print("append and read back: ok")
+          PY
+
+  publish:
+    name: Publish to PyPI
+    needs: smoke
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI verifies this workflow's OIDC identity, so there
+    # is no API token in the repository to leak or rotate. It requires a
+    # publisher configured on the PyPI project side — owner, repo, workflow
+    # filename, and this environment name must all match what is registered
+    # there, or the upload is rejected.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/litelink
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      # Notes generated from the commits since the last tag. The history is
+      # written to be read — Conventional Commits with a body explaining the
+      # why — so generated notes are worth more here than a hand-written
+      # summary that says less.
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
