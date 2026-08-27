@@ -1388,7 +1388,7 @@ Each needs a test.
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
 | **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
 | **I11** | `litelink_offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
-| **I17** | An append names only columns the log declares, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. A row misspelling a declared column also shadows it with NULL, and if that column is non-nullable every later scan and seal fails while appends keep succeeding. |
+| **I17** | An append names only columns the log declares, and supplies a value for every non-nullable one, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. |
 | **I9** | `litelink_offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
 | **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
@@ -2058,6 +2058,11 @@ Beyond §10:
 - Assert a row naming an undeclared column is rejected, and that the batch it was in is
   rejected whole with no offset consumed (I17). Include the row that misspells a declared
   column: it has the same width as a correct one, so a length check passes it.
+- Assert a row omitting a non-nullable column is rejected, and so is one supplying it as
+  `None` (I17) — while an absent NULLABLE column is still accepted, which is what stops the
+  check from being a blanket "every key must be present". Falsify by allowing it and
+  scanning: the failure is not scoped to the bad row, so assert the rows written BEFORE it
+  become unreadable too.
 - Commit twice, then assert a reader that cached `metadata_location` from the first commit
   is detectably stale -- the reason §7 requires resolving it per query.
 - Run with `local_retention = 0`; assert seal, upload, archive reads and compaction all work

@@ -103,6 +103,22 @@ class Buffer:
         # columns)`. `litelink_offset` is in the set so `_reject_offset` stays
         # the thing that refuses it, with its own message.
         self._known = frozenset((OFFSET, *columns))
+        # The THIRD derivation of that same fact, and it moves with the other
+        # two for the same reason. Positions, not names, because the check
+        # reads the values tuple — which is built from `_columns` in this
+        # order — and a name-keyed set would mean a second lookup per row on
+        # the write path.
+        #
+        # Non-nullable columns only. A nullable column may be absent or
+        # explicitly None and both are legal; for a non-nullable one both are
+        # the same wedge. `row.get` yields None either way, SQLite stores it
+        # happily, and then every scan raises `Casting field ... with null
+        # values to non-nullable` — including scans of the rows written BEFORE
+        # the bad one — while `append` keeps handing back offsets. Writer sees
+        # a healthy log, readers see nothing.
+        self._required = tuple(
+            i for i, name in enumerate(columns) if not schema.field(name).nullable
+        )
         self._config_cache: tuple[str, LogConfig] | None = None
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
@@ -521,6 +537,7 @@ class Buffer:
             # Bound out here like `row_bytes` above, for the same reason: this
             # runs per row.
             declared = self._known.issuperset
+            required = self._required
             for row in rows:
                 # I11 FIRST, so a row that is wrong twice gets the message
                 # about the thing that is specifically forbidden rather than
@@ -531,7 +548,18 @@ class Buffer:
                 if not declared(row):
                     self._reject_unknown(row)
 
-                cursor.execute(sql, tuple(row.get(c) for c in columns))
+                values = tuple(row.get(c) for c in columns)
+                # `None in values` is one C-level pass, and in the ordinary
+                # case it finds nothing — which settles every required column
+                # at once, without touching `required` at all. Only a row that
+                # does carry a NULL pays the scan to find out whether it landed
+                # on a column that forbids one.
+                if required and None in values:
+                    for i in required:
+                        if values[i] is None:
+                            self._reject_missing(row, values)
+
+                cursor.execute(sql, values)
                 # lastrowid is the assigned offset, available inside the open
                 # transaction and before the row is visible to anyone else.
                 offset = int(cursor.lastrowid or 0)
@@ -637,6 +665,45 @@ class Buffer:
         msg = (
             f"row names columns this log does not have: {unknown}. "
             f"Declared: {sorted(self._columns)}"
+        )
+        raise ValueError(msg)
+
+    def _reject_missing(
+        self, row: Mapping[str, object], values: tuple[object, ...]
+    ) -> None:
+        """A row leaving a non-nullable column NULL (I17).
+
+        Off the hot path, like `_reject_unknown`: reached only on the way to
+        raising, so it can afford to name every offending column instead of
+        the first one found.
+
+        The sibling of the unknown-name case, and the same wedge from the
+        other side. That one is a key the log does not have; this one is a key
+        the log requires and did not get. Both end as a NULL nothing below
+        catches — `add_files` null-fills an optional field missing from a
+        file, and the scan cast is where it finally raises, long after the
+        offset was handed out.
+
+        Absent and explicitly-None are one refusal because they are one bug:
+        `row.get` cannot tell them apart and neither can the scan that fails
+        later. The message separates them because the fix differs — a missing
+        key is usually a caller that forgot, an explicit None is usually a
+        caller that meant it and needs the column declared nullable instead.
+        """
+        columns = self._columns
+        offending = sorted(columns[i] for i in self._required if values[i] is None)
+        absent = [c for c in offending if c not in row]
+        supplied = [c for c in offending if c in row]
+        detail = ""
+        if absent:
+            detail += f" Absent from the row: {absent}."
+
+        if supplied:
+            detail += f" Supplied as None: {supplied}."
+
+        msg = (
+            f"row leaves non-nullable columns NULL: {offending}.{detail} "
+            "Declare the column nullable if None is a legal value for it."
         )
         raise ValueError(msg)
 

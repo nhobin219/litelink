@@ -569,6 +569,85 @@ def test_append_still_accepts_a_row_missing_a_nullable_column(
         assert rows[0]["payload"] is None
 
 
+def test_append_refuses_a_row_omitting_a_non_nullable_column(
+    tmp_path: Path,
+) -> None:
+    """The unknown-column wedge from the other side (I17).
+
+    Naming a column the log lacks and failing to supply one it requires both
+    end as a NULL nothing below catches. `row.get` yields None for an absent
+    key, SQLite stores it, and the scan cast is where it finally raises — long
+    after `append` handed back an offset.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="non-nullable columns NULL"):
+            log.append({"key": "a", "payload": "p"})
+
+        # Named, and named as absent rather than as None: the two have the same
+        # consequence but not the same fix.
+        with pytest.raises(ValueError, match="Absent from the row: \\['event_ts'\\]"):
+            log.append({"key": "a", "payload": "p"})
+
+        assert log.end_offset() == 1, "a refused row must not consume an offset"
+
+
+def test_append_refuses_a_non_nullable_column_supplied_as_none(
+    tmp_path: Path,
+) -> None:
+    """Explicitly None is the same NULL as absent, so it is the same refusal.
+
+    Worth its own test because the obvious implementation — checking the row's
+    KEYS against the required set — passes this row: `event_ts` is present. It
+    is the VALUE that wedges the log, so the check has to read values.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="Supplied as None: \\['event_ts'\\]"):
+            log.append({"event_ts": None, "key": "a", "payload": "p"})
+
+        assert log.end_offset() == 1
+
+
+def test_the_refusal_protects_rows_written_before_the_bad_one(
+    tmp_path: Path,
+) -> None:
+    """Why this is data loss and not just a bad row.
+
+    The failing cast is a property of the FILE, not of the row, so one NULL in
+    a non-nullable column takes every row in the log down with it — including
+    the ones acknowledged long before. Meanwhile `append` keeps succeeding, so
+    a writer sees a healthy log while every reader sees nothing.
+
+    Falsify by removing the `_required` scan from `_insert`: this scan then
+    raises `Casting field 'event_ts' with null values to non-nullable` and the
+    100 good rows above become unreadable.
+    """
+    with open_log(tmp_path) as log:
+        log.extend(rows(100))
+
+        with pytest.raises(ValueError, match="non-nullable columns NULL"):
+            log.append({"key": "late", "payload": "p"})
+
+        assert log.scan().read_all().num_rows == 100, (
+            "the rows acknowledged before the bad one must still read"
+        )
+
+
+def test_a_typo_on_a_non_nullable_column_names_the_unknown_key(
+    tmp_path: Path,
+) -> None:
+    """One typo trips both halves of I17, and the useful half wins.
+
+    `event_tz` is undeclared AND leaves the non-nullable `event_ts` absent.
+    The caller mistyped one key, so naming that key is what shortens the
+    search; "event_ts is missing" describes the consequence, not the cause.
+    """
+    with open_log(tmp_path) as log:
+        with pytest.raises(ValueError, match="does not have: \\['event_tz'\\]"):
+            log.append({"event_tz": 1, "key": "a", "payload": "p"})
+
+        assert log.end_offset() == 1
+
+
 def test_extend_refuses_the_batch_without_writing_any_of_it(
     tmp_path: Path,
 ) -> None:
