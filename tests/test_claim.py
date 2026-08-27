@@ -373,15 +373,20 @@ def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
 
         assert held.acquire(), "could not simulate another maintainer"
 
-        with pytest.raises(RuntimeError, match="claim over this range"):
+        # Bounded WAIT, not a single attempt: a rewrite is administrative and
+        # the maintainer it collides with never stops, so refusing outright
+        # made the documented way to finish an interrupted re-sort lose a race
+        # it should have waited out. It still reports rather than hanging.
+        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]  # noqa: SLF001
+        with pytest.raises(RuntimeError, match="has held a claim"):
             log.set_sort_by(("key", "event_ts"), rewrite=True)
 
-        assert log._sort_by == ("event_ts",), "the sort order changed anyway"
+        assert log.sort_by == ("event_ts",), "the sort order changed anyway"
 
         held.release()
         log.set_sort_by(("key", "event_ts"), rewrite=True)
 
-        assert log._sort_by == ("key", "event_ts")
+        assert log.sort_by == ("key", "event_ts")
 
 
 def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(

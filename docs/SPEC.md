@@ -1,6 +1,6 @@
 # Capture storage
 
-**v1.0** — durable append-only capture into Iceberg tables. Local-first, no service.
+**v1.0** — durable append-only capture into Iceberg tables. Embedded and local-first.
 
 ---
 
@@ -229,10 +229,26 @@ the WAL separates them completely: files are sized by `target_seal_size` and RPO
 replication lag, which is a property of a sidecar rather than of the layout.
 
 **Litestream (or equivalent WAL shipping) is the sidecar.** It continuously replicates
-SQLite WAL frames to object storage. It is not configured in `LogConfig`: whether a sidecar
-is running is a deployment fact the library cannot know or enforce, and a boolean claiming
-otherwise would be a setting nothing reads. What the library does own is `Log.databases` —
-which files carry the log's state and therefore have to be replicated.
+SQLite WAL frames to object storage, and litelink never starts it — that is a separate
+process reading the WAL, which is exactly why replication does not put the network in the
+write path. What the library owns is `Log.databases`: which files carry the log's state and
+therefore have to be replicated.
+
+**`wal_replication` is a declaration, not a supervisor.** This paragraph used to say the
+opposite — that replication is not configured in `LogConfig`, because a boolean claiming a
+sidecar was running would be a setting nothing reads. The flag exists now, and it is read:
+`_discard_on_seal` consults it on every seal to decide whether the rows stay in SQLite until
+the archive has them, and `validate` refuses it without an archive to ship to and refuses
+`wal_retention` without it. What it still does not do is assert that a sidecar is running,
+which the library cannot know. So it states an intent the deployment has to honour, and
+stating it falsely costs the growth without buying the durability that growth was traded
+for: seals hold their rows, nothing ships them, and only `sync` reaching the range releases
+them.
+
+`wal_retention` is the other half, and the sidecar enforces it rather than litelink.
+`replication_config` emits it as a per-database `snapshot:` block, deriving `interval` as
+half the retention so a window can never hold zero snapshots — a restore needs a snapshot at
+or before the point it is restoring to.
 
 **All three databases, not just the buffer.** `buffer.db` holds rows no Parquet file has
 yet, `catalog.db` says which files the local table is made of, and `archive.db` says the
@@ -1483,8 +1499,8 @@ wal_retention          how far back a restore may go      (None = litestream's o
 ```
 
 `sort_by` is NOT in here. Everything above governs future work only, so `set_config` needs
-no rewrite; the sort order is a read-shape decision that re-clusters every existing file,
-so it is set at `Log.new` and changed by `set_sort_by`. It lives in `meta` beside the
+no rewrite; the sort order is a read-shape decision that re-clusters every file the local
+table owns, so it is set at `Log.new` and changed by `set_sort_by`. It lives in `meta` beside the
 schema, not in `LogConfig`.
 
 `maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no

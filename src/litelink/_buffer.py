@@ -8,6 +8,7 @@ loss a SIGKILL could expose.
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ from litelink._types import column_type
 # Where the log records its settings. It lives here because this object owns
 # `meta`, and `meta` is the one place the policy exists.
 CONFIG_KEY = "config"
+
+# §4's declared clustering. Here for the same reason `CONFIG_KEY` is: `meta` is
+# the one place it exists, so this object owns the read.
+SORT_KEY = "sort_by"
 
 # The library-owned column (§2).
 OFFSET = "litelink_offset"
@@ -288,6 +293,7 @@ class Buffer:
         self._fallback = Shape.of(schema)
         self._shape_cache: tuple[str, Shape] | None = None
         self._config_cache: tuple[str, LogConfig] | None = None
+        self._sort_cache: tuple[str, tuple[str, ...]] | None = None
         # The buffer serialises its own writes rather than leaving callers to
         # agree on a lock. One write connection is reached by several threads —
         # an append, a seal claiming and clearing its range, a maintenance pass
@@ -1991,6 +1997,40 @@ class Buffer:
             return LogConfig() if cached is None else cached[1]
 
         self._config_cache = (raw, parsed)
+
+        return parsed
+
+    def sort_by(self) -> tuple[str, ...]:
+        """The declared clustering, read from the log rather than remembered.
+
+        The rule `config` follows, for the reason `config` follows it (§4a).
+        This used to live in four places — `meta`, `Log`, `Maintenance` and
+        `Archive` — kept in step by `set_sort_by` writing each. That is a
+        fan-out, and a fan-out is only correct in the process that ran it: a
+        maintainer already open elsewhere went on sorting by the key IT opened
+        with while both tables declared the new one, and compaction, the pass
+        that would have re-clustered them, read the same stale field.
+
+        The PARSE is cached on the raw value, as `config`'s is. Keying it on
+        the durable value is what keeps the cache from becoming the fifth home:
+        when the row changes the key changes.
+
+        A MISSING row is corruption, not "no order". `new` always writes it,
+        and defaulting to unsorted here would silently de-cluster every file
+        the next seal or compaction wrote while the tables went on declaring a
+        key — which is the state `open` already refuses to start on.
+        """
+        raw = self.get_meta(SORT_KEY)
+        if raw is None:
+            msg = "the log has no stored sort order; it is corrupt"
+            raise ValueError(msg)
+
+        cached = self._sort_cache
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+
+        parsed = tuple(json.loads(raw))
+        self._sort_cache = (raw, parsed)
 
         return parsed
 

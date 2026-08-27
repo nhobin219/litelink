@@ -259,13 +259,11 @@ class Maintenance:
         table: LogTable,
         buffer: Buffer,
         layout: Layout,
-        sort_by: tuple[str, ...],
         archive: Archive,
     ) -> None:
         self._table = table
         self._buffer = buffer
         self._layout = layout
-        self._sort_by = sort_by
         self._archive = archive
         # Read once per eviction pass rather than once per file. Cleared at the
         # top of `evict`, so a pass never decides from what a previous one saw.
@@ -282,8 +280,17 @@ class Maintenance:
         """
         return self._buffer.config()
 
-    def set_sort_by(self, sort_by: tuple[str, ...]) -> None:
-        self._sort_by = sort_by
+    @property
+    def sort_by(self) -> tuple[str, ...]:
+        """The declared clustering, read from the log on every access.
+
+        No copy is kept here, for the reason `config` keeps none: this pass
+        rewrites files, and a rewrite that clusters by a key the table no
+        longer declares is a table lying about itself. `set_sort_by` used to
+        push the new value in here; a maintainer in another process never got
+        that call.
+        """
+        return self._buffer.sort_by()
 
     def run(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """The local passes, with a checkpoint between them.
@@ -567,11 +574,12 @@ class Maintenance:
     ) -> None:
         lo, hi = run[0].lo, run[-1].hi
         merged = table.scan_range(lo, hi)
-        if self._sort_by:
+        order = self.sort_by
+        if order:
             # Re-sorted, not merely concatenated: concatenation would leave the
             # row groups carrying each source file's range, which is the
             # statistic the sort exists to tighten.
-            merged = merged.sort_by([(c, "ascending") for c in self._sort_by])
+            merged = merged.sort_by([(c, "ascending") for c in order])
 
         _verify(merged, run, lo, hi)
 
@@ -1154,8 +1162,9 @@ class Maintenance:
             # on it is how the log's seal was wrong, and one rule is cheaper to
             # hold than a rule plus a reason it happens not to matter here.
             rows = scratch.rows_between(start, end)
-            if self._sort_by:
-                rows = rows.sort_by([(c, "ascending") for c in self._sort_by])
+            order = self.sort_by
+            if order:
+                rows = rows.sort_by([(c, "ascending") for c in order])
 
             dest = self._layout.absolute(rel_path)
             dest.parent.mkdir(parents=True, exist_ok=True)

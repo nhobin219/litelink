@@ -201,9 +201,9 @@ class LogConfig:
     # that the seal has no timer: a stream that goes quiet holds its last
     # partial file's worth of rows indefinitely.
     #
-    # A declaration rather than a supervisor. It is read — `write_replication_
-    # config` needs it, and validation refuses it without an archive to
-    # replicate to — but litelink never starts the sidecar. That is a separate
+    # A declaration rather than a supervisor. It is read — `_discard_on_seal`
+    # consults it on every seal, and validation refuses it without an archive
+    # to replicate to — but litelink never starts the sidecar. That is a separate
     # process reading the WAL, which is exactly why replication does not put
     # the network in the write path, and litestream is explicit that two
     # instances must never replicate one database. Supervising it belongs in

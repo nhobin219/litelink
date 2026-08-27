@@ -15,12 +15,13 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
 from litelink import Log, LogConfig
 from litelink._archive import Archive
-from litelink._buffer import Buffer
+from litelink._buffer import SORT_KEY, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
@@ -80,14 +81,14 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     # Local-only, and still a real object: the reader, the maintainer and the
     # Log are handed the same one. It stores no location — it reads the log's,
     # so `set_archive` reaches all three by writing one row.
+    buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
     archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
     log = Log(
         layout=layout,
         table=table,
         buffer=buffer,
         reader=Reader(layout, table, buffer, duckdb_connection, archive),
-        maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
-        sort_by=("event_ts",),
+        maintenance=Maintenance(table, buffer, layout, archive),
         config=config,
         archive=archive,
     )
@@ -114,6 +115,7 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
     buffer = StubBuffer.open(layout.buffer_db, SCHEMA)
     config = LogConfig()
+    buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
     archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
 
     log = Log(
@@ -121,8 +123,7 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
         table=table,
         buffer=buffer,
         reader=Reader(layout, table, buffer, duckdb_connection, archive),
-        maintenance=Maintenance(table, buffer, layout, ("event_ts",), archive),
-        sort_by=("event_ts",),
+        maintenance=Maintenance(table, buffer, layout, archive),
         config=config,
         archive=archive,
     )
@@ -231,7 +232,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
         created.append({"event_ts": 1, "key": "a"})
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened._sort_by == ("key", "event_ts")
+        assert reopened.sort_by == ("key", "event_ts")
         assert reopened._archive.uri == "s3://bucket/prefix"
         assert reopened.config == config
         # Logically the same schema, not byte-identical: Iceberg has one string
@@ -297,7 +298,7 @@ def test_changing_sort_by_requires_an_explicit_rewrite(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="rewrite=True"):
             log.set_sort_by(("key",), rewrite=False)
 
-        assert log._sort_by == ("event_ts",), "refused change must not apply"
+        assert log.sort_by == ("event_ts",), "refused change must not apply"
 
 
 def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
@@ -325,7 +326,7 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
 
         log.set_sort_by(("key",), rewrite=True)
 
-        assert log._sort_by == ("key",)
+        assert log.sort_by == ("key",)
         assert log._table.sort_by() == ("key",)
         merged = next(tmp_path.rglob("*compacted*/*.parquet"))
         assert pq.read_table(merged)["key"].to_pylist() == ["a", "b", "c"]
@@ -335,7 +336,7 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
         assert rows.num_rows == 3
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened._sort_by == ("key",), "the new order must survive a reopen"
+        assert reopened.sort_by == ("key",), "the new order must survive a reopen"
 
 
 def test_the_reserved_column_is_refused_at_schema_change_time(tmp_path: Path) -> None:
@@ -1094,7 +1095,7 @@ def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
         update._apply()  # noqa: SLF001
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened._sort_by == ("event_ts",), (  # noqa: SLF001
+        assert reopened.sort_by == ("event_ts",), (  # noqa: SLF001
             "open read the table's declaration rather than meta"
         )
 
@@ -1135,7 +1136,50 @@ def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
         assert log._buffer.get_meta("sort_by") == "[]"  # noqa: SLF001
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened._sort_by == ()  # noqa: SLF001
+        assert reopened.sort_by == ()  # noqa: SLF001
+
+
+def test_a_rewrite_finishes_a_re_sort_that_died_after_the_meta_write(
+    tmp_path: Path,
+) -> None:
+    """The one crash gap in `set_sort_by` that nothing used to heal.
+
+    `set_sort_by` writes `meta` LAST, so a crash before it leaves the log
+    deciding by the old key and a retry completes the operation. A crash AFTER
+    it does not: the declarations say the new key, every existing file is still
+    in the old one, and the natural retry used to find the orders equal and
+    return without doing anything. Silent, permanent, and a §7 lie — a
+    predicate on the declared leading column pruning nothing, on exactly the
+    files the rewrite never reached.
+
+    Reproduced by a review pass, so this asserts the ROWS rather than the
+    declarations: both of those already said the right thing in the broken
+    state, which is what made it silent.
+    """
+    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        # `key` descending as `event_ts` ascends, so the two clusterings are
+        # distinguishable and neither is the insertion order by accident.
+        log.extend([{"event_ts": i, "key": f"k{20 - i:02d}"} for i in range(20)])
+        while log.seal() is not None:
+            pass
+
+        # The state a crash after the `meta` write leaves: both declarations
+        # carry the new key, the file carries the old clustering.
+        log._table.set_sort_order(("key",))  # noqa: SLF001
+        log._buffer.set_meta("sort_by", json.dumps(["key"]))  # noqa: SLF001
+
+        written = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
+        keys = written.column("key").to_pylist()
+        assert keys != sorted(keys), "the file was already re-clustered"
+        assert log.sort_by == ("key",), "the declaration did not survive"
+
+        # The retry. Same order the log already declares, which is precisely
+        # the call that used to do nothing.
+        log.set_sort_by(("key",), rewrite=True)
+
+        rewritten = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
+        assert rewritten.column("key").to_pylist() == sorted(keys)
+        assert rewritten.num_rows == 20, "the rewrite dropped or duplicated rows"
 
 
 def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
