@@ -4,15 +4,18 @@ Everything public, on one page. [`SPEC.md`](SPEC.md) says what the system is and
 [`RUNTIME.md`](RUNTIME.md) says how it runs; this says what you can call.
 
 ```python
-from litelink import Log, LogConfig, S3Options, __version__
+from litelink import Log, LogConfig, Row, S3Options, __version__
 ```
 
 Those are the exports. `Log` is the whole object model — there is no session, no client, no
 catalog handle to hold. A log is a directory under a root, named at `Log.new` and opened by
 that name for ever after.
 
-**`S3Options` is exported because four public signatures name it** — `new`, `open`, `restore`
-and `replication_config_for`. A frozen dataclass of `endpoint`, `access_key`, `secret_key`
+**`Row` and `S3Options` are exported because public signatures name them**, and a type a
+caller has to name has to be importable. `Row` is `Mapping[str, object]`, what `append` and
+`extend` take.
+
+`S3Options` is named by `new`, `open`, `restore` and `replication_config_for`. A frozen dataclass of `endpoint`, `access_key`, `secret_key`
 and `region`, every field optional: omit the argument entirely and credentials resolve
 through the ordinary AWS chain, which is the intended path on AWS. Construct one only for a
 non-AWS endpoint or an explicit key. It is deliberately not part of `LogConfig`, because
@@ -86,8 +89,8 @@ owns no thread. `Log` is a context manager, and `with` is the same thing.
 ## Writing
 
 ```python
-log.append(row) -> int                    # Row = Mapping[str, object]
-log.extend(rows) -> list[int]
+log.append(row: Row) -> int               # Row = Mapping[str, object]
+log.extend(rows: Iterable[Row]) -> list[int]
 ```
 
 Both return the assigned offsets, and **the rows are durable when the call returns** — one
@@ -270,6 +273,11 @@ log.set_sort_by(sort_by, *, rewrite) -> None
 `schema` strips `litelink_offset`, so it is the schema you wrote and the one `append` accepts;
 `sort_by` is the one §7 tells you to bound every scan on a leading column of, which is advice
 no caller can follow without being able to ask.
+
+`sort_by` reads `meta` on every access, like `config` and `archive`. That is not a detail of
+the getter: the seal, compaction and the archive's own declaration all read the same one
+place, so `set_sort_by` in one process cannot leave a maintainer in another clustering files
+by the key it happened to open with.
 
 **There is exactly one copy of the policy, and it is a row in SQLite.** Every decision reads
 it from there rather than from memory, so `set_config` in one process is seen by the writer's

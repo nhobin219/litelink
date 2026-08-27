@@ -75,40 +75,69 @@ def test_the_websocket_example_builds_a_readable_log(tmp_path: Path) -> None:
 def test_every_type_a_caller_must_name_is_exported() -> None:
     """A type in a public parameter has to be importable from the package root.
 
-    `S3Options` was not. It appears in the signatures of `new`, `open`,
-    `restore` and `replication_config_for`, and reaching it meant
-    `from litelink.log import S3Options` — an import that happens to work
-    because `log.py` imports it, rather than an interface. A caller pointing at
-    a non-AWS endpoint has to construct one, and a caller annotating against
-    those signatures has to spell it.
+    Two names failed this. `S3Options` appears in the signatures of `new`,
+    `open`, `restore` and `replication_config_for`, and reaching it meant
+    `from litelink.log import S3Options` — an import that works because
+    `log.py` happens to import the name, rather than an interface. `Row` was
+    worse: an alias under `if TYPE_CHECKING`, named by `append` and `extend`
+    and importable from nowhere at all, because it existed to a type checker
+    and to nothing else.
 
-    Written against the whole surface rather than that one name, because the
+    Written against the whole surface rather than those two names, because the
     defect is structural: anything `Log` asks a caller to pass can grow the
-    same hole. Parameters only — a returned object is used, not named, and
-    `recovery()` deliberately hands back a private record.
+    same hole.
 
-    Annotations are compared as SOURCE TEXT. `log.py` uses
-    `from __future__ import annotations` with its typing imports under
-    `TYPE_CHECKING`, so resolving them at runtime fails on names that were
-    never imported — and a test that has to import a module's private
-    machinery to check its public surface is testing the wrong thing.
+    Collected from the SOURCE, which is what an earlier version of this test
+    got wrong. It read runtime namespaces, and `inspect.isclass` over an
+    imported module cannot see a `TYPE_CHECKING` alias at all — so the check
+    passed over `Row` while claiming to cover exactly it. Parsing also lets the
+    annotations stay source text, which they have to: `log.py` keeps its typing
+    imports under `TYPE_CHECKING`, so resolving them at runtime fails on names
+    that were never imported.
+
+    Parameters only. A returned object is used rather than named, and
+    `recovery()` deliberately hands back a private record.
     """
+    import ast
     import inspect
     import pkgutil
     import re
 
-    public_classes = set()
-    for info in pkgutil.iter_modules(litelink.__path__):
-        module = importlib.import_module(f"litelink.{info.name}")
-        for name, member in vars(module).items():
-            if (
-                inspect.isclass(member)
-                and not name.startswith("_")
-                and getattr(member, "__module__", "").startswith("litelink")
-            ):
-                public_classes.add(name)
+    def declared(body: list[ast.stmt]) -> set[str]:
+        """Public names a block binds that could appear in an annotation.
 
-    assert "S3Options" in public_classes, "the fixture below would prove nothing"
+        Descends into `if`, so a `TYPE_CHECKING` block counts. Not into
+        functions or classes: a name bound in there is not importable from the
+        module, so it cannot be what a caller is told to name.
+        """
+        names: set[str] = set()
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                names.add(node.name)
+            elif isinstance(node, ast.If):
+                names |= declared(node.body) | declared(node.orelse)
+            elif isinstance(node, ast.Assign | ast.AnnAssign):
+                # An alias is a subscript or a dotted name. A constant is
+                # neither, which is what keeps `CONFIG_KEY = "config"` out.
+                if not isinstance(node.value, ast.Subscript | ast.Attribute):
+                    continue
+
+                targets = (
+                    [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+                )
+                names |= {t.id for t in targets if isinstance(t, ast.Name)}
+
+        return {name for name in names if not name.startswith("_")}
+
+    package = Path(litelink.__file__).parent
+    nameable: set[str] = set()
+    for info in pkgutil.iter_modules([str(package)]):
+        source = (package / f"{info.name}.py").read_text()
+        nameable |= declared(ast.parse(source).body)
+
+    # Fixture rot: if the collector stops seeing the two names this test was
+    # written for, everything below passes and proves nothing.
+    assert {"S3Options", "Row"} <= nameable, f"collector missed a fixture: {nameable}"
 
     leaked: dict[str, set[str]] = {}
     for name in dir(Log):
@@ -125,7 +154,7 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
                 continue
 
             named = set(re.findall(r"\w+", str(parameter.annotation)))
-            unreachable = named & public_classes - set(litelink.__all__)
+            unreachable = named & nameable - set(litelink.__all__)
             if unreachable:
                 leaked.setdefault(name, set()).update(unreachable)
 

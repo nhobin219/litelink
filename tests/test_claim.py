@@ -376,12 +376,12 @@ def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="claim over this range"):
             log.set_sort_by(("key", "event_ts"), rewrite=True)
 
-        assert log._sort_by == ("event_ts",), "the sort order changed anyway"
+        assert log.sort_by == ("event_ts",), "the sort order changed anyway"
 
         held.release()
         log.set_sort_by(("key", "event_ts"), rewrite=True)
 
-        assert log._sort_by == ("key", "event_ts")
+        assert log.sort_by == ("key", "event_ts")
 
 
 def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
