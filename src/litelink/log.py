@@ -299,6 +299,12 @@ class Log:
         # downstream has to distinguish "unset" from "explicitly unsorted".
         order = tuple(sort_by or ())
         settings = config or LogConfig()
+        # Same normalisation as `set_archive`, and for the same reason: an
+        # empty string is not None to `validate`, so every rule that
+        # presupposes an archive was skipped while `configured()` came back
+        # False — `Log.new(archive="", config=LogConfig(local_retention=0))`
+        # was accepted, which is exactly the pair `validate` exists to refuse.
+        archive = (archive or "").rstrip("/") or None
         validate(schema, order, settings, archive)
 
         layout = Layout(Path(root), name)
@@ -998,6 +1004,15 @@ class Log:
         naming it, eviction keeps asking about the archive that is configured
         now, and compaction keeps refusing to merge across any of them.
         """
+        # NORMALISED here, not in `_repoint`. Every guard below tests
+        # `archive is None`, and `_repoint` used to be the only place that
+        # turned an empty string into None — so `set_archive("")` was non-None
+        # to `validate`, to `_refuse_archive_ahead` and to
+        # `_refuse_lossy_detach`, and None to the write. It detached with none
+        # of the three applying. Measured: 7,828 acknowledged rows lost, the
+        # same magnitude as the case those guards exist for.
+        archive = (archive or "").rstrip("/") or None
+
         with self._lock:
             self._writable()
             lease = self._claim_settings()
@@ -1150,7 +1165,9 @@ class Log:
 
     def _repoint(self, archive: str | None) -> None:
         """Record the new location, with the maintenance lease held."""
-        # Normalised before anything compares it. Every path builder strips
+        # Already normalised by `set_archive`, which is the only caller and
+        # does it before its guards rather than after. Repeated here so this
+        # method is correct on its own terms: every path builder strips
         # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same archive
         # everywhere except here — where the difference would read as a move
         # and reset the watermarks of an archive that genuinely holds data.

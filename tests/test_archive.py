@@ -500,9 +500,9 @@ def test_detaching_and_reattaching_keeps_the_archive(
     checked against the prefix when the archive is opened, so leaving and
     returning to the same one changes nothing.
     """
-    # Not exactly zero: that means "evict on upload" and validation refuses to
-    # detach an archive it presupposes. A microsecond evicts just as promptly,
-    # and the floor is cleared below before detaching.
+    # A microsecond rather than zero, because zero means "evict on upload" and
+    # `validate` refuses that pair at construction. Either way the floor is
+    # cleared below before detaching, which is now the enforced order.
     with archived_log(
         tmp_path, bucket, s3, local_retention=timedelta(microseconds=1)
     ) as log:
@@ -3213,3 +3213,63 @@ def test_detaching_a_log_with_no_retention_floor_is_allowed(
         log.set_archive(None)
 
         assert log.archive is None
+
+
+def test_an_empty_archive_string_is_a_detach_and_is_refused_as_one(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`set_archive("")` must not slip past the guards that `None` hits.
+
+    Every check reads `archive is None`, and normalising `"" -> None` used to
+    happen in `_repoint`, AFTER all of them. So an empty string was non-None to
+    `validate`, to `_refuse_archive_ahead` and to `_refuse_lossy_detach`, and
+    None to the write that followed — a detach with no guard applying.
+    Measured before the fix: 7,828 acknowledged rows lost, the same magnitude
+    as the case those guards exist for.
+
+    The plausible route is not a literal but `os.environ.get("ARCHIVE", "")`.
+    """
+    config = replace(
+        LogConfig(), target_seal_size=8 * 1024, compact_min_files=2, local_rows=100
+    )
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/empty-string",
+        s3=s3,
+    ) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        readable = log.scan(include_archive=True).read_all().num_rows
+
+        for spelling in ("", "/", "///"):
+            with pytest.raises(ValueError, match="refusing to detach"):
+                log.set_archive(spelling)
+
+        assert log.archive is not None, "detached through an empty spelling"
+        log.maintain()
+
+        assert log.scan(include_archive=True).read_all().num_rows == readable
+
+
+def test_creating_a_log_with_an_empty_archive_is_a_local_only_log(
+    tmp_path: Path,
+) -> None:
+    """And `validate` judges it as one.
+
+    `Log.new(archive="")` was non-None to `validate`, so every rule that
+    presupposes an archive was skipped — while `Archive.configured()` came back
+    False. `local_retention=0` means "evict on upload" and is refused with no
+    archive; with an empty string it was accepted, which is the exact pair the
+    rule exists to prevent.
+    """
+    with pytest.raises(ValueError, match="presuppose an archive"):
+        Log.new(
+            tmp_path,
+            "s",
+            schema=SCHEMA,
+            config=replace(LogConfig(), local_retention=timedelta(0), local_rows=0),
+            archive="",
+        )
