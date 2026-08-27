@@ -1301,7 +1301,8 @@ class Log:
 
             if not rewrite:
                 msg = (
-                    "changing sort_by re-clusters every existing file; "
+                    "changing sort_by re-clusters every file the local table "
+                    "owns, and leaves the archived prefix as it is; "
                     "pass rewrite=True to accept that cost"
                 )
                 raise ValueError(msg)
