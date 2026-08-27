@@ -1253,7 +1253,7 @@ class Log:
         return self._buffer.sort_by()
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
-        """Change the sort order, rewriting every existing file.
+        """Change the sort order, re-clustering every file the local table owns.
 
         §7 calls `sort_by` a read-shape decision rather than a tuning knob:
         it declares which predicates prune, and the clustering that makes them
@@ -1263,7 +1263,22 @@ class Log:
         data and slow on older data, with nothing to indicate why.
 
         `rewrite` must be passed explicitly. It is the honest name for the
-        cost: every data file is read, re-sorted and replaced.
+        cost: every file this rewrites is read, re-sorted and replaced.
+
+        **The archived prefix is not re-clustered, and cannot be.** `_rewrite_run`
+        skips any run reaching at or below the archive watermark, because a
+        local rewrite there would commit a file straddling the archive's extent
+        and nothing re-cuts a local straddler. So on a synced log this changes
+        three declarations and rewrites only what sync has not yet taken — and
+        `rewrite_archive` is not the other half either: it re-ingests from the
+        first badly-SIZED file onwards, so a well-sized archived prefix is
+        never a candidate and keeps its original clustering for ever.
+
+        That is §6's "sealed once and never rewritten" applied to history, not
+        an oversight — but this docstring used to say "every existing file",
+        which on an archived log was a claim the code did not honour and did
+        not report. A re-sort is a decision for a log's local window; the
+        archive keeps the clustering it was written with.
         """
         with self._lock:
             self._writable()
@@ -1297,10 +1312,14 @@ class Log:
             # in another process: two writers to one `compaction_path`, and a
             # single-row `compacting` intent each would clear from under the
             # other, leaving a half-written file nothing could name.
-            lease = self._lease(MAINTAIN_ROLE)
-            if not lease.acquire():
-                msg = "another owner holds a claim over this range"
-                raise RuntimeError(msg)
+            #
+            # Taken with the bounded WAIT the other administrative operations
+            # use, not a single attempt. A single attempt loses to any pass
+            # already running, which made the documented way to finish an
+            # interrupted re-sort — the `rewrite=True` retry above — fail
+            # spuriously beside a maintainer that never stops. `set_config`
+            # measured one startup in six lost to exactly this.
+            lease = self._claim_settings()
 
             try:
                 # `meta` LAST of the durable writes, because it is what

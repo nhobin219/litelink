@@ -54,7 +54,8 @@ archive it is pointed at holds data this log has no record of pushing — that a
 to another log.
 
 `sort_by` is set here and only here; it is a read-shape decision rather than a knob (§7), and
-changing it later rewrites every file. `schema` is your columns — the library prepends
+changing it later rewrites the local table's files — see `set_sort_by` for what that does not
+reach. `schema` is your columns — the library prepends
 `litelink_offset` itself, and refuses a schema that declares it (I11).
 
 **`open` recovers before it returns**, finishing whatever a crash interrupted. It raises
@@ -291,9 +292,20 @@ elsewhere.
 **`set_archive(None)` is refused while a retention floor is set.** Detaching retires the I4
 clamp for every process at once, and eviction would then delete files still queued for upload.
 
-`set_sort_by` re-clusters every existing file, so `rewrite` must be passed explicitly and
-`rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under the
-maintenance claim, because a rewrite *is* a compaction.
+`set_sort_by` re-clusters what the local table owns, so `rewrite` must be passed explicitly
+and `rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under
+the maintenance claim, because a rewrite *is* a compaction.
+
+**It does not re-cluster the archived prefix.** A local rewrite there would commit a file
+straddling the archive's extent, and nothing re-cuts a local straddler — so on a synced log a
+re-sort changes the declarations and rewrites only what `sync` has not yet taken. Archived
+data keeps the clustering it was written with, which is §6's "sealed once and never
+rewritten" applied to history. `rewrite_archive` is not the other half: it re-ingests from
+the first badly-*sized* file onwards, so a well-sized archive is never a candidate.
+
+Passing the order the log already has, with `rewrite=True`, is not a no-op — it is how a
+re-sort that died after the `meta` write is finished, since that crash leaves the
+declarations correct and the files not.
 
 ### LogConfig
 
