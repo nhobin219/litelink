@@ -82,7 +82,7 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     # Log are handed the same one. It stores no location — it reads the log's,
     # so `set_archive` reaches all three by writing one row.
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
+    archive = Archive(layout, buffer, S3Options())
     log = Log(
         layout=layout,
         table=table,
@@ -116,7 +116,7 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     buffer = StubBuffer.open(layout.buffer_db, SCHEMA)
     config = LogConfig()
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    archive = Archive(layout, buffer, S3Options(), table_schema(SCHEMA))
+    archive = Archive(layout, buffer, S3Options())
 
     log = Log(
         layout=layout,

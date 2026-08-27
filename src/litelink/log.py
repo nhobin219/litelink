@@ -376,7 +376,7 @@ class Log:
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, buffer, s3, table_schema(schema))
+        remote = Archive(layout, buffer, s3)
 
         return cls(
             layout=layout,
@@ -471,7 +471,7 @@ class Log:
             msg = f"log at {layout.root}/{name} has no stored sort order; it is corrupt"
             raise ValueError(msg) from exc
 
-        remote = Archive(layout, buffer, s3, table_schema(schema))
+        remote = Archive(layout, buffer, s3)
         log = cls(
             layout=layout,
             table=table,
@@ -706,7 +706,7 @@ class Log:
             # it here. It reads the archive's location from the restored
             # `meta`, so it adopts the archive THIS log wrote, not whatever
             # prefix the caller named for the WAL.
-            remote = Archive(layout, buffer, options, table_schema(schema))
+            remote = Archive(layout, buffer, options)
             where = remote.uri
             if remote.table(repair=True) is None and where is not None:
                 # Not best-effort. A restore that cannot reach the archive has

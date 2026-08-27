@@ -38,8 +38,6 @@ from litelink._table import ArchiveAbsent, LogTable
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    import pyarrow as pa
-
     from litelink._buffer import Buffer
     from litelink._layout import Layout
 
@@ -78,22 +76,18 @@ class Archive:
         layout: Layout,
         buffer: Buffer,
         s3: S3Options | None = None,
-        schema: pa.Schema | None = None,
     ) -> None:
         self._layout = layout
         self._buffer = buffer
         self._s3 = s3 or S3Options()
-        # Kept only to say WHETHER this archive may create a table; the shape
-        # it would create with is read from the buffer at use. Holding the
-        # schema itself is the one stale copy that cannot be repaired later —
-        # `open_archive` hands it to `create_table`, so an archive attached
-        # after a schema change would be born with the OLD columns, and
-        # nothing in `src/` re-declares an existing table. Every later push
-        # then fails, I4 pins eviction, and local disk grows without bound.
-        #
-        # The clustering it would declare is read from the buffer for the same
-        # reason, which `main` arrived at independently for `sort_by`.
-        self._may_create = schema is not None
+        # The shape this would create a table with is NOT held here. It is
+        # read from the buffer at use, because it is the one stale copy that
+        # cannot be repaired afterwards: `open_archive` hands it to
+        # `create_table`, so an archive attached after a schema change would
+        # be born with the OLD columns, and nothing in `src/` re-declares an
+        # existing table. Every later push then fails, I4 pins eviction, and
+        # local disk grows without bound. The clustering goes the same way,
+        # which `main` arrived at independently for `sort_by`.
         self._handle: LogTable | None = None
         # What the cached handle was opened FOR. Keying the cache on the
         # durable value is what keeps it from becoming the stale copy this
@@ -194,7 +188,7 @@ class Archive:
                         self._layout,
                         uri,
                         self._s3,
-                        self._buffer.shape().table if self._may_create else None,
+                        self._buffer.shape().table,
                         self._buffer.sort_by(),
                         repair=repair,
                     )
