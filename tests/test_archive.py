@@ -501,8 +501,8 @@ def test_detaching_and_reattaching_keeps_the_archive(
     returning to the same one changes nothing.
     """
     # Not exactly zero: that means "evict on upload" and validation refuses to
-    # detach an archive it presupposes. A microsecond evicts just as promptly
-    # and leaves detaching legal, which is what this is about.
+    # detach an archive it presupposes. A microsecond evicts just as promptly,
+    # and the floor is cleared below before detaching.
     with archived_log(
         tmp_path, bucket, s3, local_retention=timedelta(microseconds=1)
     ) as log:
@@ -514,6 +514,12 @@ def test_detaching_and_reattaching_keeps_the_archive(
         assert log.scan().read_all().num_rows < ROWS, "rows must be archive-only"
         watermark = log.archived_through()
 
+        # The floor comes off BEFORE the detach, which is the documented order
+        # and now the enforced one: detaching retires I4's clamp, so a log with
+        # a retention floor could evict files the archive never took. Retention
+        # has already done its work above; this is about coming back to the
+        # same archive.
+        log.set_config(replace(log.config, local_retention=None, local_rows=None))
         log.set_archive(None)
         log.set_archive(where)
         log.sync()
@@ -3135,3 +3141,75 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     assert LogTable.exists_for(Layout(tmp_path, "s"))
     with Log.open(tmp_path, "s", s3=s3, read_only=True) as reopened:
         assert reopened.scan(include_archive=True).read_all().num_rows == readable
+
+
+def test_detaching_with_a_retention_floor_is_refused(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Detaching retires I4's clamp, for every process at once.
+
+    `evict`'s "never delete what the archive lacks" runs only while an archive
+    is configured, so `set_archive(None)` does not merely stop using the
+    archive — it makes the files still waiting to be pushed ordinary retention
+    candidates, and the next maintenance pass deletes them. A maintainer
+    looping in another process does it without the operator calling anything.
+
+    Measured before this refusal: sync 4,550 rows behind, one detach, one pass,
+    4,025 acknowledged offsets unreadable. `hydrate` restores only what the
+    archive holds and `sync` cannot push files that have left the table, so
+    nothing gets them back.
+
+    Blunt on purpose. Keeping the clamp alive across a detach is the real fix
+    and is tracked separately; until then the library refuses the shape rather
+    than guessing at the cases.
+    """
+    where = f"s3://{bucket}/lossy-detach"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        local_rows=100,
+    )
+    with Log.new(
+        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        readable = log.scan(include_archive=True).read_all().num_rows
+
+        with pytest.raises(ValueError, match="refusing to detach"):
+            log.set_archive(None)
+
+        assert log.archive == where, "detached despite the refusal"
+
+        # Clearing the floors is how you say you accept it — and then the
+        # detach goes through.
+        log.set_config(replace(config, local_rows=None, local_retention=None))
+        log.set_archive(None)
+
+        assert log.archive is None
+        assert log.scan().read_all().num_rows == readable
+
+
+def test_detaching_a_log_with_no_retention_floor_is_allowed(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """With no floor, eviction does nothing and a detach costs nothing.
+
+    The refusal has to leave this alone: `local_retention` and `local_rows` are
+    both None by default, so refusing here would refuse the ordinary case.
+    """
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    with Log.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        config=config,
+        archive=f"s3://{bucket}/plain-detach",
+        s3=s3,
+    ) as log:
+        log.extend(rows(600))
+        log.seal_due()
+        log.set_archive(None)
+
+        assert log.archive is None
