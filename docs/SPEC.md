@@ -1475,8 +1475,8 @@ wal_retention          how far back a restore may go      (None = litestream's o
 ```
 
 `sort_by` is NOT in here. Everything above governs future work only, so `set_config` needs
-no rewrite; the sort order is a read-shape decision that re-clusters every existing file,
-so it is set at `Log.new` and changed by `set_sort_by`. It lives in `meta` beside the
+no rewrite; the sort order is a read-shape decision that re-clusters every file the local
+table owns, so it is set at `Log.new` and changed by `set_sort_by`. It lives in `meta` beside the
 schema, not in `LogConfig`.
 
 `maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no

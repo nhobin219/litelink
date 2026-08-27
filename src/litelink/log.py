@@ -22,6 +22,7 @@ import random
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,7 +33,7 @@ import pyarrow.parquet as pq
 from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._archive import ARCHIVE_KEY, Archive
-from litelink._buffer import Buffer
+from litelink._buffer import SORT_KEY, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
 from litelink._fs import fsync
@@ -50,14 +51,20 @@ from litelink._table import LogTable, archive_extent, forget_archive_entry
 from litelink._types import validate_schema
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from os import PathLike
     from types import TracebackType
     from typing import Self
 
     from litelink._table import DataFile
 
-    Row = Mapping[str, object]
+# What `append` and `extend` take, and the one alias in a public signature.
+#
+# Defined at RUNTIME rather than under `TYPE_CHECKING`, so it can be exported:
+# a caller annotating against those signatures has to name it, and a name that
+# exists only to a type checker cannot be imported. `Mapping` comes from
+# `collections.abc`, so the runtime import costs a stdlib module already loaded.
+Row = Mapping[str, object]
 
 # Keys in the buffer's `meta` table (§2). These hold what the Iceberg table
 # cannot: deployment policy rather than data shape.
@@ -94,7 +101,10 @@ _SCHEMA_KEY = "arrow_schema"
 # ships), so a failover rebuilds the local table rather than restoring it, and
 # has to be told what order to declare. `open_archive` never declared one
 # either, so the archive could not answer it.
-_SORT_KEY = "sort_by"
+#
+# One home, in `_buffer`, because the seal, compaction and the archive all read
+# it too — see `Buffer.sort_by`.
+_SORT_KEY = SORT_KEY
 
 # How many offsets a restore skips before resuming (§3a).
 #
@@ -179,7 +189,6 @@ class Log:
         reader: Reader,
         maintenance: Maintenance,
         schema: pa.Schema,
-        sort_by: tuple[str, ...],
         config: LogConfig,
         archive: Archive,
         readonly: bool = False,
@@ -192,7 +201,6 @@ class Log:
         self._table = table
         self._buffer = buffer
         self._schema = schema
-        self._sort_by = sort_by
         # The same object the reader and the maintainer were handed. See
         # `_archive.Archive`: it owns the credentials and the lazily opened
         # handle, and reads the URI from `meta` on every access rather than
@@ -363,7 +371,7 @@ class Log:
 
         # Built here and handed to all three, so each is given its archive at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, buffer, s3, table_schema(schema), order)
+        remote = Archive(layout, buffer, s3, table_schema(schema))
 
         return cls(
             layout=layout,
@@ -377,9 +385,8 @@ class Log:
                 duckdb_connection,
                 archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, order, remote),
+            maintenance=Maintenance(table, buffer, layout, remote),
             schema=schema,
-            sort_by=order,
             config=settings,
             archive=remote,
         )
@@ -451,13 +458,17 @@ class Log:
         # the same reason: `new` always writes it, so its absence is a damaged
         # log, and defaulting to no order would silently de-cluster every file
         # the next compaction rewrites while the table still declared one.
-        declared = buffer.get_meta(_SORT_KEY)
-        if declared is None:
+        #
+        # Read here only to fail fast with a message naming the log — and to
+        # cover an unparseable value, which the bare presence check did not.
+        # Every decision that needs the order reads `Buffer.sort_by` itself.
+        try:
+            buffer.sort_by()
+        except ValueError as exc:
             msg = f"log at {layout.root}/{name} has no stored sort order; it is corrupt"
-            raise ValueError(msg)
+            raise ValueError(msg) from exc
 
-        sort_by = tuple(json.loads(declared))
-        remote = Archive(layout, buffer, s3, table_schema(schema), sort_by)
+        remote = Archive(layout, buffer, s3, table_schema(schema))
         log = cls(
             layout=layout,
             table=table,
@@ -470,9 +481,8 @@ class Log:
                 duckdb_connection,
                 archive=remote,
             ),
-            maintenance=Maintenance(table, buffer, layout, sort_by, remote),
+            maintenance=Maintenance(table, buffer, layout, remote),
             schema=schema,
-            sort_by=sort_by,
             config=config,
             archive=remote,
             readonly=read_only,
@@ -695,7 +705,7 @@ class Log:
             # it here. It reads the archive's location from the restored
             # `meta`, so it adopts the archive THIS log wrote, not whatever
             # prefix the caller named for the WAL.
-            remote = Archive(layout, buffer, options, table_schema(schema), sort_by)
+            remote = Archive(layout, buffer, options, table_schema(schema))
             where = remote.uri
             if remote.table(repair=True) is None and where is not None:
                 # Not best-effort. A restore that cannot reach the archive has
@@ -845,7 +855,7 @@ class Log:
             try:
                 validate(
                     self._schema,
-                    self._sort_by,
+                    self._buffer.sort_by(),
                     config,
                     self._buffer.get_meta(_ARCHIVE_KEY) or None,
                 )
@@ -1031,7 +1041,7 @@ class Log:
                 # `set_config` takes this same claim, which is what makes the
                 # two serialise. It is the rule §4a already states for data,
                 # applied to the configuration that governs it.
-                validate(self._schema, self._sort_by, self.config, archive)
+                validate(self._schema, self._buffer.sort_by(), self.config, archive)
                 self._refuse_archive_ahead(archive)
                 self._refuse_lossy_detach(archive)
                 # The other half of the same rule; see `set_config`.
@@ -1215,8 +1225,35 @@ class Log:
             with contextlib.suppress(Exception):
                 self._archive.table(repair=True)
 
+    @property
+    def schema(self) -> pa.Schema:
+        """The caller's columns, as declared at `new`.
+
+        `open` takes no schema, so this is the only way to ask a log what shape
+        it is. `litelink_offset` is stripped: this is the schema the caller
+        wrote and the one `append` accepts, while the TABLE's schema carries
+        the library's column in front of it (I11).
+        """
+        return self._schema
+
+    @property
+    def sort_by(self) -> tuple[str, ...]:
+        """The within-file sort order, read from the log on every access (§7).
+
+        §7 tells a reader to bound every scan on a LEADING column of this —
+        measured at 13 ms against 119 ms for the same predicate without one —
+        which is advice no caller can follow without being able to ask.
+
+        Read through to `meta` like `config` and `archive`, and for the reason
+        they are: `set_sort_by` in one process must not leave another holding
+        the key it opened with. An earlier draft of this property returned a
+        field and claimed parity with those two in its own docstring while
+        being the copy they exist to avoid.
+        """
+        return self._buffer.sort_by()
+
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
-        """Change the sort order, rewriting every existing file.
+        """Change the sort order, re-clustering every file the local table owns.
 
         §7 calls `sort_by` a read-shape decision rather than a tuning knob:
         it declares which predicates prune, and the clustering that makes them
@@ -1226,18 +1263,46 @@ class Log:
         data and slow on older data, with nothing to indicate why.
 
         `rewrite` must be passed explicitly. It is the honest name for the
-        cost: every data file is read, re-sorted and replaced.
+        cost: every file this rewrites is read, re-sorted and replaced.
+
+        **The archived prefix is not re-clustered, and cannot be.** `_rewrite_run`
+        skips any run reaching at or below the archive watermark, because a
+        local rewrite there would commit a file straddling the archive's extent
+        and nothing re-cuts a local straddler. So on a synced log this changes
+        three declarations and rewrites only what sync has not yet taken — and
+        `rewrite_archive` is not the other half either: it re-ingests from the
+        first badly-SIZED file onwards, so a well-sized archived prefix is
+        never a candidate and keeps its original clustering for ever.
+
+        That is §6's "sealed once and never rewritten" applied to history, not
+        an oversight — but this docstring used to say "every existing file",
+        which on an archived log was a claim the code did not honour and did
+        not report. A re-sort is a decision for a log's local window; the
+        archive keeps the clustering it was written with.
         """
         with self._lock:
             self._writable()
             requested = tuple(sort_by)
             validate(self._schema, requested, self.config, self._archive.uri)
-            if requested == self._sort_by:
+            if requested == self._buffer.sort_by() and not rewrite:
+                # Restating the order the log already declares, without asking
+                # for the data. Nothing to declare, nothing accepted, so this
+                # is the no-op it looks like.
+                #
+                # It used to return here whatever `rewrite` said, and that left
+                # the one crash gap nothing healed: a crash after `meta` and
+                # before the rewrite finished leaves the declarations NEW and
+                # the files OLD, and the natural retry found the orders equal
+                # and returned without doing anything. Reproduced by review.
+                # `rewrite=True` on an unchanged order is now the way to finish
+                # it — the whole table re-clustered, which is what that flag
+                # already means and what an interrupted rewrite needs.
                 return
 
             if not rewrite:
                 msg = (
-                    "changing sort_by re-clusters every existing file; "
+                    "changing sort_by re-clusters every file the local table "
+                    "owns, and leaves the archived prefix as it is; "
                     "pass rewrite=True to accept that cost"
                 )
                 raise ValueError(msg)
@@ -1248,33 +1313,44 @@ class Log:
             # in another process: two writers to one `compaction_path`, and a
             # single-row `compacting` intent each would clear from under the
             # other, leaving a half-written file nothing could name.
-            lease = self._lease(MAINTAIN_ROLE)
-            if not lease.acquire():
-                msg = "another owner holds a claim over this range"
-                raise RuntimeError(msg)
+            #
+            # Taken with the bounded WAIT the other administrative operations
+            # use, not a single attempt. A single attempt loses to any pass
+            # already running, which made the documented way to finish an
+            # interrupted re-sort — the `rewrite=True` retry above — fail
+            # spuriously beside a maintainer that never stops. `set_config`
+            # measured one startup in six lost to exactly this.
+            lease = self._claim_settings()
 
             try:
-                # `meta` LAST of the two durable writes, because it is what
-                # `open` reads and nothing reconciles the pair afterwards.
+                # `meta` LAST of the durable writes, because it is what
+                # every decision reads: a crash before it leaves the log
+                # deciding by the OLD key, which is the order every existing
+                # file is already in, so the operation is simply not done.
                 #
-                # An earlier version wrote it first and claimed the next `open`
-                # would correct any disagreement. Nothing does: `open` reads
-                # `meta` and never re-declares, and `LogTable.load` only
-                # repairs metadata PROPERTIES. So a crash between the two left
-                # the tables declaring one key for ever while every later seal
-                # wrote another — a table lying about its own clustering, which
-                # is the failure this whole change exists to prevent. This way
-                # a crash in the gap leaves `meta` unchanged, so the log goes
-                # on using the OLD key that the tables still declare, and the
-                # operation is simply not done.
+                # What it does NOT leave is the declarations untouched, and
+                # this comment used to say otherwise — "the log goes on using
+                # the OLD key that the tables still declare", which a review
+                # reproduced as false. After the declaration writes and before
+                # `meta`, the table declares NEW while `meta` still says OLD.
+                # That mismatch is declaration-only, and the natural retry
+                # heals it: the check above compares against `meta`, which is
+                # unchanged, so a repeated call proceeds and completes all of
+                # them.
+                #
+                # Writing `meta` FIRST is what does not heal. `meta` would say
+                # NEW while every file stayed OLD, and the retry would find the
+                # orders equal and return — which is the gap the `rewrite=True`
+                # branch above now fills.
                 self._table.set_sort_order(requested)
-                # The archive's declaration too. Missing it left an archive
-                # created after a re-sort born declaring the old key, with
-                # every file pushed into it clustered by the new one.
-                self._archive.set_sort_by(requested)
+                # The archive's declaration too, and BEFORE `meta` like the
+                # local one: `open_archive` declares an order only on a table
+                # it creates, so an archive that already exists is re-declared
+                # here or never. Missing it entirely left an archive created
+                # after a re-sort born declaring the old key, with every file
+                # pushed into it clustered by the new one.
+                self._archive.redeclare_sort_order(requested)
                 self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
-                self._sort_by = requested
-                self._maintenance.set_sort_by(requested)
                 self._maintenance.rewrite_sorted(
                     heartbeat=lease.renew, owner=lease.owner
                 )
@@ -1715,10 +1791,11 @@ class Log:
         costs.
         """
         rows = self._buffer.rows_between(start, end)
-        if self._sort_by:
+        order = self._buffer.sort_by()
+        if order:
             # §4: the sort order is declared as table metadata AND applied here.
             # Metadata records intent; it does not sort for you.
-            rows = rows.sort_by([(c, "ascending") for c in self._sort_by])
+            rows = rows.sort_by([(c, "ascending") for c in order])
 
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)

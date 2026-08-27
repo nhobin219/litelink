@@ -467,7 +467,7 @@ def test_a_log_needs_no_sort_by(tmp_path: Path) -> None:
         log.extend(rows(50))
         log.seal()
 
-        assert log._sort_by == ()
+        assert log.sort_by == ()
         assert log.table_files() == 1
 
         stored = log.scan().read_all()
@@ -485,7 +485,7 @@ def test_an_unsorted_log_reopens_unsorted(tmp_path: Path) -> None:
         log.extend(rows(4))
 
     with Log.open(tmp_path, "s") as reopened:
-        assert reopened._sort_by == ()
+        assert reopened.sort_by == ()
 
 
 def test_a_sort_key_correlated_with_the_offset_keeps_files_prunable(

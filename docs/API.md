@@ -4,19 +4,23 @@ Everything public, on one page. [`SPEC.md`](SPEC.md) says what the system is and
 [`RUNTIME.md`](RUNTIME.md) says how it runs; this says what you can call.
 
 ```python
-from litelink import Log, LogConfig, __version__
+from litelink import Log, LogConfig, Row, S3Options, __version__
 ```
 
 Those are the exports. `Log` is the whole object model — there is no session, no client, no
 catalog handle to hold. A log is a directory under a root, named at `Log.new` and opened by
 that name for ever after.
 
-**`S3Options` is a gap.** It appears in four public signatures and is not exported: reaching
-it means `from litelink.log import S3Options`, which is an import that happens to work rather
-than an interface. It is a frozen dataclass of `endpoint`, `access_key`, `secret_key`,
-`region`, and every field is optional — omit the argument entirely and credentials resolve
-through the ordinary AWS chain, which is the intended path on AWS. Pass one only for a
-non-AWS endpoint or an explicit key.
+**`Row` and `S3Options` are exported because public signatures name them**, and a type a
+caller has to name has to be importable. `Row` is `Mapping[str, object]`, what `append` and
+`extend` take.
+
+`S3Options` is named by `new`, `open`, `restore` and `replication_config_for`. A frozen dataclass of `endpoint`, `access_key`, `secret_key`
+and `region`, every field optional: omit the argument entirely and credentials resolve
+through the ordinary AWS chain, which is the intended path on AWS. Construct one only for a
+non-AWS endpoint or an explicit key. It is deliberately not part of `LogConfig`, because
+`LogConfig` is persisted into the log directory and a secret must not travel with something
+that gets copied and attached elsewhere.
 
 ## The whole surface
 
@@ -29,7 +33,7 @@ non-AWS endpoint or an explicit key.
 | **maintain** | `maintain` · `compact` · `evict` · `expire` |
 | **archive** | `sync` · `hydrate` · `rewrite_archive` |
 | **observe** | `end_offset` · `buffered_rows` · `table_rows` · `table_files` · `table_extent` · `archived_through` · `archive_files` |
-| **configure** | `config` · `set_config` · `archive` · `set_archive` · `set_sort_by` |
+| **configure** | `config` · `set_config` · `archive` · `set_archive` · `schema` · `sort_by` · `set_sort_by` |
 | **replicate** | `databases` · `replication_config` · `write_replication_config` · `replication_config_for` |
 | **schema** | `add_column` · `rename_column` · `drop_column` — all three raise `NotImplementedError` |
 
@@ -50,7 +54,8 @@ archive it is pointed at holds data this log has no record of pushing — that a
 to another log.
 
 `sort_by` is set here and only here; it is a read-shape decision rather than a knob (§7), and
-changing it later rewrites every file. `schema` is your columns — the library prepends
+changing it later rewrites the local table's files — see `set_sort_by` for what that does not
+reach. `schema` is your columns — the library prepends
 `litelink_offset` itself, and refuses a schema that declares it (I11).
 
 **`open` recovers before it returns**, finishing whatever a crash interrupted. It raises
@@ -85,8 +90,8 @@ owns no thread. `Log` is a context manager, and `with` is the same thing.
 ## Writing
 
 ```python
-log.append(row) -> int                    # Row = Mapping[str, object]
-log.extend(rows) -> list[int]
+log.append(row: Row) -> int               # Row = Mapping[str, object]
+log.extend(rows: Iterable[Row]) -> list[int]
 ```
 
 Both return the assigned offsets, and **the rows are durable when the call returns** — one
@@ -260,8 +265,20 @@ log.config -> LogConfig
 log.set_config(config) -> None
 log.archive -> str | None
 log.set_archive(archive) -> None              # None detaches
+log.schema -> pa.Schema                       # your columns, as declared at new()
+log.sort_by -> tuple[str, ...]
 log.set_sort_by(sort_by, *, rewrite) -> None
 ```
+
+**Everything `new` took, the log gives back**, which is what lets `open` take none of it.
+`schema` strips `litelink_offset`, so it is the schema you wrote and the one `append` accepts;
+`sort_by` is the one §7 tells you to bound every scan on a leading column of, which is advice
+no caller can follow without being able to ask.
+
+`sort_by` reads `meta` on every access, like `config` and `archive`. That is not a detail of
+the getter: the seal, compaction and the archive's own declaration all read the same one
+place, so `set_sort_by` in one process cannot leave a maintainer in another clustering files
+by the key it happened to open with.
 
 **There is exactly one copy of the policy, and it is a row in SQLite.** Every decision reads
 it from there rather than from memory, so `set_config` in one process is seen by the writer's
@@ -275,9 +292,20 @@ elsewhere.
 **`set_archive(None)` is refused while a retention floor is set.** Detaching retires the I4
 clamp for every process at once, and eviction would then delete files still queued for upload.
 
-`set_sort_by` re-clusters every existing file, so `rewrite` must be passed explicitly and
-`rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under the
-maintenance claim, because a rewrite *is* a compaction.
+`set_sort_by` re-clusters what the local table owns, so `rewrite` must be passed explicitly
+and `rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under
+the maintenance claim, because a rewrite *is* a compaction.
+
+**It does not re-cluster the archived prefix.** A local rewrite there would commit a file
+straddling the archive's extent, and nothing re-cuts a local straddler — so on a synced log a
+re-sort changes the declarations and rewrites only what `sync` has not yet taken. Archived
+data keeps the clustering it was written with, which is §6's "sealed once and never
+rewritten" applied to history. `rewrite_archive` is not the other half: it re-ingests from
+the first badly-*sized* file onwards, so a well-sized archive is never a candidate.
+
+Passing the order the log already has, with `rewrite=True`, is not a no-op — it is how a
+re-sort that died after the `meta` write is finished, since that crash leaves the
+declarations correct and the files not.
 
 ### LogConfig
 

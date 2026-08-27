@@ -2537,7 +2537,7 @@ def test_a_log_is_recovered_onto_another_machine(
         # them when wal_replication is on.
         assert revived.scan(include_archive=True).read_all().num_rows == served
         # The shape came from `meta`, not from the catalog that was not restored.
-        assert revived._sort_by == ("event_ts",)  # noqa: SLF001
+        assert revived.sort_by == ("event_ts",)  # noqa: SLF001
         assert revived.config.target_seal_size == 8 * 1024
         # And it resumes ABOVE everything the primary ever assigned, so no
         # offset the dead machine served is handed to different data.

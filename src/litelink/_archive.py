@@ -79,17 +79,11 @@ class Archive:
         buffer: Buffer,
         s3: S3Options | None = None,
         schema: pa.Schema | None = None,
-        sort_by: Sequence[str] = (),
     ) -> None:
         self._layout = layout
         self._buffer = buffer
         self._s3 = s3 or S3Options()
         self._schema = schema
-        # Declared on the archive table when this creates one, so the archive
-        # states its own clustering the way the local table does (§4). Passed
-        # at construction like the schema, and for the same reason: both are
-        # shape, decided once, and neither is this object's to invent.
-        self._sort_by = tuple(sort_by)
         self._handle: LogTable | None = None
         # What the cached handle was opened FOR. Keying the cache on the
         # durable value is what keeps it from becoming the stale copy this
@@ -101,26 +95,43 @@ class Archive:
         # syncs on another and `set_archive` re-points it from a third.
         self._lock = threading.RLock()
 
-    def set_sort_by(self, sort_by: Sequence[str]) -> None:
-        """Re-declare the clustering, here and on the archive's own table.
+    def redeclare_sort_order(self, sort_by: Sequence[str]) -> None:
+        """Push a clustering onto an already-open handle.
 
-        Reached from `Log.set_sort_by`, which was previously a fan-out to
-        everything EXCEPT this — so the field stayed at whatever the process
-        opened with, and an archive created afterwards was born declaring the
-        old key while every file pushed into it was clustered by the new one.
+        TAKES the order rather than reading it, and that is what lets
+        `set_sort_by` call this BEFORE it writes `meta` — the ordering the
+        local half already depends on. Reading it here would force the call
+        after the row, and `open_archive` declares an order only on the table
+        it CREATES, so a crash in that gap would leave an existing archive
+        declaring the old key for ever while every file pushed into it was
+        clustered by the new one. Nothing re-declares an archive that already
+        exists.
+
+        An argument is not the second home this class shed. The field was: it
+        stayed at whatever the process opened with, so an archive created after
+        a re-sort was born declaring the old key. `table` reads `meta` when it
+        opens a handle, so creation is correct by construction and this covers
+        the table that already exists.
+
+        OPENS one rather than settling for a handle this process happens to
+        hold. An earlier version read `self._handle`, and `set_sort_by` never
+        opens the archive itself — `validate` reads only the URI — so a re-sort
+        from a process that had not touched the archive left its declaration
+        stale for ever, successfully and silently. Review caught the gap and
+        the docstring that admitted it.
+
+        `repair=False` never creates: an archive that does not exist yet is
+        left alone, and the one created later is created from `meta`, which by
+        then holds the new order.
 
         Best effort against the remote half. The archive may be unreachable,
         and a re-sort is a local operation that has already rewritten every
         local file by the time this runs; failing it here would report a
-        failure that did not happen. The declaration is corrected by the next
-        pass that opens the archive with the current order.
+        failure that did not happen.
         """
-        with self._lock:
-            self._sort_by = tuple(sort_by)
-            handle = self._handle
-
-        if handle is not None:
-            with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception):
+            handle = self.table()
+            if handle is not None:
                 handle.set_sort_order(sort_by)
 
     def location(self) -> str | None:
@@ -174,7 +185,7 @@ class Archive:
                         uri,
                         self._s3,
                         self._schema,
-                        self._sort_by,
+                        self._buffer.sort_by(),
                         repair=repair,
                     )
                 except ArchiveAbsent:
