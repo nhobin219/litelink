@@ -348,8 +348,11 @@ class Log:
         # was accepted, which is exactly the pair `validate` exists to refuse.
         archive = (archive or "").rstrip("/") or None
         validate(schema, order, settings, archive)
-        if start_offset < 1:
-            msg = f"start_offset must be at least 1, not {start_offset}"
+        # The type as well as the range, because this one is written to `meta`
+        # and read back by anything that needs the reserve: `2.5` seeds 2 and
+        # records "2.5", so the durable record would disagree with the log.
+        if not isinstance(start_offset, int) or start_offset < 1:
+            msg = f"start_offset must be an integer of at least 1, not {start_offset!r}"
             raise ValueError(msg)
 
         layout = Layout(Path(root), name)

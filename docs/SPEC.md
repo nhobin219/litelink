@@ -1737,8 +1737,9 @@ The consequence worth planning for is that local disk holds roughly
    written. History appended AFTER live data prunes just as well — measured, 3 of 6 files
    read either way, and it does not depend on `sort_by` at all. What the reserve buys is
    that a scan with no time predicate returns history first, and that §7's tier boundaries
-   put the oldest data in the coldest tier. Appending after costs about two files that
-   straddle an era boundary once compaction has run, and nothing else.
+   put the oldest data in the coldest tier. Once compaction has run a single file straddles
+   the era boundary and stops pruning, and it costs the same in both orders — measured, three
+   files read either way — so that is not a reason to prefer one.
 5. **Extension provisioning for embedders.** §7 makes the extension download a provisioning
    obligation. A repo can discharge it in its bootstrap and its CI; an application that
    `pip install`s the library runs neither. It gets the read path and no extensions, so its
