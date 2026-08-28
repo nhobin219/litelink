@@ -1670,8 +1670,8 @@ The consequence worth planning for is that local disk holds roughly
 
    **`start_offset` is recorded durably in `meta`, and that is not bookkeeping.** A backfill
    has to tell this reserve from a `Log.restore` fence, and after the fact nothing else can:
-   both are empty ranges below the log's offsets, and §3a's reserve *"leaves no trace once
-   the sequence has moved"*. Position does not separate them either — a restore whose replica
+   both are empty ranges below the log's offsets, and `Log` says of the failover reserve that
+   it *"leaves no trace once the sequence has moved"*. Position does not separate them either — a restore whose replica
    was empty leaves the log high with nothing beneath it, which is a reserve's own shape. So
    the recorded value is the only thing a backfill may bound itself by, and its ABSENCE must
    read as "no reserve" rather than "a reserve of nothing": a log created at offset 1 and

@@ -42,7 +42,8 @@ Most deployments use six: `new`/`open`, `extend`, `scan`, `seal_due`, `maintain`
 ## Lifecycle
 
 ```python
-Log.new(root, name, *, schema, sort_by=None, config=None, archive=None, s3=None) -> Log
+Log.new(root, name, *, schema, sort_by=None, config=None, archive=None, s3=None,
+        start_offset=1) -> Log
 Log.open(root, name, *, read_only=False, s3=None) -> Log
 Log.restore(root, name, *, archive, s3=None, binary=None) -> Log
 ```
@@ -52,6 +53,12 @@ live in the log and come back from it, so nothing at the call site can disagree 
 on disk. `new` raises `FileExistsError` if a log is already there, and `ValueError` if the
 archive it is pointed at holds data this log has no record of pushing — that archive belongs
 to another log.
+
+`start_offset` is set here and only here too, and leaves `[1, start_offset - 1]` unassigned
+for ever. It aligns a log's offsets with a sequence something else owns, and reserves room a
+later backfill can fill (§13). There is deliberately no way to re-seed a log afterwards: the
+guard that would refuse it reads the offsets currently BUFFERED, which a seal empties, so it
+cannot tell an unused offset from an issued one.
 
 `sort_by` is set here and only here; it is a read-shape decision rather than a knob (§7), and
 changing it later rewrites the local table's files — see `set_sort_by` for what that does not

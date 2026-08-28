@@ -1354,8 +1354,8 @@ class Buffer:
         """The cached tail with everything through `floor` dropped, or None.
 
         The slice index is arithmetic — cached offsets are contiguous from
-        `_tail_lo + 1`, so dropping through `floor` drops exactly
-        `floor - _tail_lo` rows — and then checked, because that contiguity is
+        `_tail_lo + 1`, so dropping through the clamped `base` drops exactly
+        `base - _tail_lo` rows — and then checked, because that contiguity is
         a property of AUTOINCREMENT and prefix-only deletion rather than
         something enforced here. A failed check costs a rebuild, which is what
         the code did unconditionally before.
