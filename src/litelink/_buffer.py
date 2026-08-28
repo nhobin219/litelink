@@ -47,6 +47,17 @@ SCHEMA_KEY = "arrow_schema"
 # finished when SQLite says so, not when Iceberg does.
 INTENT_KEY = "schema_intent"
 
+# Where a log records the offset it was created to start at, or nothing if it
+# started at 1. Durable because a future backfill needs to tell the RESERVE
+# below it — deliberate, empty, safe to fill — from a `Log.restore` fence,
+# which is empty for the opposite reason and must never be filled.
+#
+# Nothing distinguishes them after the fact: `Log` says "the skipped range
+# leaves no trace once the sequence has moved", and a restore whose replica was
+# empty leaves the log high with nothing below it, positionally identical to a
+# reserve. The recorded value is the only thing that separates the two.
+START_OFFSET_KEY = "start_offset"
+
 # Stands in for "no row limit" so the per-row check stays one comparison. Far
 # above any row count a buffer sized for read latency could reach.
 _NO_ROW_LIMIT = 1 << 62
@@ -331,6 +342,20 @@ class Buffer:
         self._tail_shape: Shape | None = None
         self._tail_lo = 0
         self._tail_hi = 0
+        # The lowest boundary this cache is COMPLETE for — the floor it was
+        # fetched above, not the offset it happens to start at.
+        #
+        # `_tail_lo` is `first_offset - 1`, which on a log whose offsets start
+        # high is far above any boundary a reader asks for before the first
+        # seal: `Reader.query` passes 0 while the local table has no extent, so
+        # gating on `_tail_lo <= floor` missed on EVERY read and re-converted
+        # the whole buffer per query. Measured at the default 8 MiB first-seal
+        # window: 4.2 ms/read against 42.
+        #
+        # Two distinct facts, and conflating them is what cost that. Where the
+        # cache STARTS bounds the slice arithmetic; what it is complete FOR
+        # decides whether it can answer at all.
+        self._tail_from = 0
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -1279,12 +1304,13 @@ class Buffer:
             shape = self.shape()
             if self._tail_shape is not shape:
                 self._tail = None
-                self._tail_lo = self._tail_hi = 0
+                self._tail_lo = self._tail_hi = self._tail_from = 0
                 self._tail_shape = shape
 
             cached = self._reusable(floor)
             if cached is None:
                 table = self._rows("> ?", (floor,))
+                self._tail_from = floor
             else:
                 fresh = self._rows("> ?", (self._tail_hi,))
                 table = (
@@ -1294,6 +1320,18 @@ class Buffer:
                     # One chunk per query otherwise, forever. Combining is a
                     # copy, so it is amortised rather than paid every time.
                     table = table.combine_chunks()
+
+                # A hit implies `_tail_from <= floor`, so this only ever
+                # raises — the guard above is what makes that true, and a
+                # `max()` here would be dead.
+                #
+                # Conservative in one direction and never wrong in the other:
+                # when `floor` is below where the cache STARTS the slice prunes
+                # nothing, so the cache is still complete from where it was,
+                # and raising loses a later hit rather than serving short. That
+                # costs nothing in practice because the boundary is the local
+                # table's extent, which only rises.
+                self._tail_from = floor
 
             self._tail = table
             # Taken from the DATA, never from `floor`. They are not the same
@@ -1328,12 +1366,18 @@ class Buffer:
         returned as an answer. `_tail_hi > floor` says the last cached row
         qualifies, so an empty result contradicts the cache itself.
         """
-        if self._tail is None or not (self._tail_lo <= floor <= self._tail_hi):
+        if self._tail is None or not (self._tail_from <= floor <= self._tail_hi):
             return None
 
-        kept = self._tail.slice(floor - self._tail_lo)
+        # Clamped, because a floor BELOW where the cache starts drops nothing
+        # rather than a negative number of rows. That is the ordinary case on a
+        # log whose offsets start high — every buffered row is already above
+        # the boundary — and the unclamped subtraction is why the guard could
+        # not simply be widened.
+        base = max(floor, self._tail_lo)
+        kept = self._tail.slice(base - self._tail_lo)
         if kept.num_rows:
-            if int(kept.column(OFFSET)[0].as_py()) != floor + 1:
+            if int(kept.column(OFFSET)[0].as_py()) != base + 1:
                 return None
         elif self._tail_hi > floor:
             return None
@@ -2346,7 +2390,7 @@ class Buffer:
     def _drop_tail(self) -> None:
         with self._tail_lock:
             self._tail = None
-            self._tail_lo = self._tail_hi = 0
+            self._tail_lo = self._tail_hi = self._tail_from = 0
 
     def close(self) -> None:
         # The cache goes too. It is bounded by the unsealed tail and falls to
