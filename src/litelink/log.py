@@ -33,7 +33,13 @@ import pyarrow.parquet as pq
 from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._archive import ARCHIVE_KEY, Archive
-from litelink._buffer import INTENT_KEY, SCHEMA_KEY, SORT_KEY, Buffer
+from litelink._buffer import (
+    INTENT_KEY,
+    SCHEMA_KEY,
+    SORT_KEY,
+    START_OFFSET_KEY,
+    Buffer,
+)
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
 from litelink._fs import fsync
@@ -100,6 +106,8 @@ _ARCHIVE_KEY = ARCHIVE_KEY
 # One home, in `_buffer`, because the buffer is what reads it per call — it
 # owns `meta`, and `shape()` is where every holder of the schema now gets it.
 _SCHEMA_KEY = SCHEMA_KEY
+# One home, in `_buffer`, beside the other durable facts about a log's shape.
+_START_OFFSET_KEY = START_OFFSET_KEY
 # §4's declared clustering, kept here as well as on the table.
 #
 # Not a duplicate of the Iceberg sort order — a fact the local CATALOG carries
@@ -262,11 +270,32 @@ class Log:
         config: LogConfig | None = None,
         archive: str | None = None,
         s3: S3Options | None = None,
+        start_offset: int = 1,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
 
         This is the only call that takes the log's shape, because the shape is
         fixed at creation and recovered by `open` thereafter.
+
+        **`start_offset` leaves `[1, start_offset - 1]` unassigned for ever**,
+        and is the one way to do so. It exists to align a log's offsets with a
+        sequence something else already owns, and to reserve room a later
+        backfill can fill — see §13's *Bulk ingest*.
+
+        It is creation-only, and there is deliberately no way to re-seed a log
+        afterwards. `Buffer.seed_offsets`' guard reads the offsets currently
+        BUFFERED, which is empty once a seal has deleted them, so it would not
+        refuse a re-seed onto already-issued offsets: the next appends would
+        reuse committed offsets, `_union` would hide them behind the table's
+        extent and the seal's `register` would decline the file and queue it
+        for deletion — rows acknowledged and silently gone. A fresh buffer is
+        the only state in which seeding is safe, and `new` is the only call
+        that has one.
+
+        The value is recorded in `meta` when it is greater than 1, because a
+        backfill has to tell that reserve from a `Log.restore` fence. Both are
+        empty ranges below the log's offsets and nothing else distinguishes
+        them — see `START_OFFSET_KEY`.
 
         `schema` is the application's columns. The library adds `offset` and
         owns nothing else — no ingest timestamp, no transaction id (§2).
@@ -319,6 +348,12 @@ class Log:
         # was accepted, which is exactly the pair `validate` exists to refuse.
         archive = (archive or "").rstrip("/") or None
         validate(schema, order, settings, archive)
+        # The type as well as the range, because this one is written to `meta`
+        # and read back by anything that needs the reserve: `2.5` seeds 2 and
+        # records "2.5", so the durable record would disagree with the log.
+        if not isinstance(start_offset, int) or start_offset < 1:
+            msg = f"start_offset must be an integer of at least 1, not {start_offset!r}"
+            raise ValueError(msg)
 
         layout = Layout(Path(root), name)
         if layout.buffer_db.exists():
@@ -360,6 +395,15 @@ class Log:
         # cast to. It is kept here because Iceberg cannot represent it: one
         # string type and one binary type, so `large_binary` would come back
         # `binary` and the declaration would be quietly overruled.
+        # BEFORE either `meta` write, and that ordering is the whole of its
+        # crash safety. `Log.open` refuses a log with no stored schema or
+        # config, so every window between here and `set_meta_all` fails closed.
+        # Seeding AFTER them leaves one whose crash yields a log that reopens
+        # silently at offset 1 — and `Log.new` then refuses to retry, because
+        # the buffer exists. The reserve would be lost with no error anywhere.
+        if start_offset > 1:
+            buffer.seed_offsets(start_offset)
+
         buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
         # The pair in ONE transaction. `validate` has just accepted these two
         # together, and written separately a crash between them records the
@@ -371,6 +415,12 @@ class Log:
                 _CONFIG_KEY: settings.to_json(),
                 _SORT_KEY: json.dumps(list(order)),
                 **({_ARCHIVE_KEY: archive} if archive is not None else {}),
+                # Recorded only when there IS a reserve. Absent means
+                # "started at 1", which a backfill must read as "no reserve"
+                # rather than "a reserve of nothing" — a log created at 1 and
+                # later restored has a gap below its offsets too, and that gap
+                # is a fence.
+                **({_START_OFFSET_KEY: str(start_offset)} if start_offset > 1 else {}),
             }
         )
 

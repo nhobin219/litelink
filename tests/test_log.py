@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from litelink._buffer import Buffer
 from litelink.log import OFFSET, Log, LogConfig
 
 SCHEMA = pa.schema(
@@ -1015,3 +1016,136 @@ def test_a_row_that_is_wrong_twice_names_the_forbidden_column_first(
                     "region": "eu",
                 }
             )
+
+
+def test_start_offset_reserves_the_range_below_it(tmp_path: Path) -> None:
+    """`[1, N-1]` is left unassigned for ever (§13.4).
+
+    The reserve exists so a cutover can point live capture at litelink today
+    and backfill the history later, into offsets live capture will never take.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, start_offset=1000)
+    with log:
+        assert log.append({"event_ts": 1, "key": "a", "payload": "p"}) == 1000
+        assert log.extend(rows(3)) == [1001, 1002, 1003]
+        log.seal()
+
+        assert log._table.extent() == (1000, 1003)
+        assert log.scan().read_all().num_rows == 4
+
+
+def test_start_offset_is_recorded_durably(tmp_path: Path) -> None:
+    """And only when there IS a reserve.
+
+    A backfill has to tell this reserve from a `Log.restore` fence, and nothing
+    else can: both are empty ranges below the log's offsets, and `Log` says
+    "the skipped range leaves no trace once the sequence has moved". Absent
+    must therefore mean "no reserve" rather than "a reserve of nothing" — a log
+    created at 1 and later restored has a gap below its offsets too, and that
+    gap is a fence that must never be filled.
+    """
+    log = Log.new(tmp_path / "seeded", "s", schema=SCHEMA, start_offset=1000)
+    with log:
+        assert log._buffer.get_meta("start_offset") == "1000"
+
+    with Log.open(tmp_path / "seeded", "s") as reopened:
+        assert reopened._buffer.get_meta("start_offset") == "1000"
+        assert reopened.end_offset() == 1000
+
+    plain = Log.new(tmp_path / "plain", "s", schema=SCHEMA)
+    with plain:
+        assert plain._buffer.get_meta("start_offset") is None
+        assert plain.append({"event_ts": 1}) == 1
+
+
+def test_start_offset_below_one_is_refused(tmp_path: Path) -> None:
+    """`1` is the current behaviour, not an error; below it is meaningless."""
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="at least 1"):
+            Log.new(tmp_path / str(bad), "s", schema=SCHEMA, start_offset=bad)
+
+    with Log.new(tmp_path / "one", "s", schema=SCHEMA, start_offset=1) as log:
+        assert log.append({"event_ts": 1}) == 1
+
+
+def test_the_tail_cache_serves_a_seeded_log_before_its_first_seal(
+    tmp_path: Path,
+) -> None:
+    """Assert HITS, not rows — the rows are right either way.
+
+    `_tail_lo` is `first_offset - 1`, which on a seeded log is far above the
+    boundary `Reader.query` passes while the local table has no extent (0). A
+    guard gating on `_tail_lo <= floor` therefore missed on every read and
+    re-converted the whole buffer per query — 4.2 ms/read against 42 at the
+    default 8 MiB first-seal window.
+
+    Three broken variants all return correct rows and all pass the rest of this
+    suite: the unguarded original (0 hits of 20), one that pins `_tail_from` at
+    the buffer's floor instead of only raising it (about half), and one that
+    drops the lower bound entirely. So this asserts the mechanism.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, start_offset=1_000_000)
+    with log:
+        log.extend(rows(500))
+
+        hits = 0
+        original = Buffer._reusable
+
+        def counting(self: Buffer, floor: int) -> pa.Table | None:
+            nonlocal hits
+            got = original(self, floor)
+            hits += got is not None
+
+            return got
+
+        Buffer._reusable = counting  # type: ignore[method-assign]
+        try:
+            for _ in range(5):
+                log.scan().read_all()
+        finally:
+            Buffer._reusable = original  # type: ignore[method-assign]
+
+        # The first read builds it; every later one must reuse it.
+        assert hits == 4, f"tail cache missed on a seeded log: {hits} of 4"
+
+
+def test_the_tail_cache_prunes_what_the_boundary_excludes(tmp_path: Path) -> None:
+    """The slice must still drop rows at or below `floor`.
+
+    Asked of `rows_above` directly, because going through `scan()` cannot see
+    it: a seal deletes the rows it covered, so the buffer holds nothing below
+    the boundary and the slice has nothing to prune. The bug this guards
+    against — returning the whole cache regardless of `floor` — is invisible
+    there and returns duplicate rows here.
+
+    Falsify by slicing at `self._tail_lo` instead of `max(floor, _tail_lo)`:
+    the second call returns 40 rows instead of 20.
+    """
+    with open_log(tmp_path) as log:
+        log.extend(rows(40))
+        buffer = log._buffer
+
+        assert buffer.rows_above(0).num_rows == 40
+        assert buffer.rows_above(20).num_rows == 20
+        assert buffer.rows_above(39).num_rows == 1
+        assert buffer.rows_above(40).num_rows == 0
+
+
+def test_the_tail_cache_refuses_a_boundary_below_what_it_holds(
+    tmp_path: Path,
+) -> None:
+    """The lower bound is a correctness guard, not an optimisation.
+
+    A cache built for a high boundary is missing every row below it. Serving it
+    to a lower boundary returns fewer rows than exist — silently, since the
+    result looks like a perfectly ordinary answer.
+
+    Falsify by dropping the lower bound (`floor <= _tail_hi` alone): the second
+    call returns the 10 cached rows instead of all 40.
+    """
+    with open_log(tmp_path) as log:
+        log.extend(rows(40))
+        buffer = log._buffer
+
+        assert buffer.rows_above(30).num_rows == 10
+        assert buffer.rows_above(0).num_rows == 40

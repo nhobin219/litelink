@@ -1668,6 +1668,21 @@ The consequence worth planning for is that local disk holds roughly
    and a row costs ~4 µs, it is about 10%. So the cost lands exactly on the caller who is
    already batching hard enough to want this endpoint instead.
 
+   **`start_offset` is recorded durably in `meta`, and that is not bookkeeping.** A backfill
+   has to tell this reserve from a `Log.restore` fence, and after the fact nothing else can:
+   both are empty ranges below the log's offsets, and `Log` says of the failover reserve that
+   it *"leaves no trace once the sequence has moved"*. Position does not separate them either — a restore whose replica
+   was empty leaves the log high with nothing beneath it, which is a reserve's own shape. So
+   the recorded value is the only thing a backfill may bound itself by, and its ABSENCE must
+   read as "no reserve" rather than "a reserve of nothing": a log created at offset 1 and
+   later restored has a gap below its offsets too, and filling that gap would reissue the
+   offsets the fence exists to abandon.
+
+   It is creation-only. `Buffer.seed_offsets`' guard reads the offsets currently BUFFERED,
+   which a seal empties — so it cannot refuse a re-seed onto already-issued offsets, and the
+   appends that followed would be hidden by the read boundary and their file declined at
+   registration. A fresh buffer is the only safe state, and `new` is the only call with one.
+
    Reserving needs no new counter. Bumping `sqlite_sequence` by N inside the write
    transaction reserves `[old+1, old+N]`, preserves I9, and lands above everything ever
    assigned. §2's note that an explicit `meta` counter *"only earns its extra moving part
@@ -1713,9 +1728,18 @@ The consequence worth planning for is that local disk holds roughly
    than counts — so the guidance is to pick `N` well above the known row count.
 
    Two smaller consequences worth stating. A backfill smaller than its reserve leaves a
-   permanent gap, which is fine and needs no repair. And where `sort_by` is a time column,
-   the backfilled files cluster entirely below the live ones, so §7's pruning improves rather
-   than degrades — the opposite of what appending history after the fact would do.
+   permanent gap, which is fine and needs no repair. And the backfilled files cluster
+   entirely below the live ones, which keeps offset order and time order correlated.
+
+   **Pruning is not what that buys, and an earlier version of this section said it was.**
+   Pruning is per-file; every file covers a contiguous offset range, and each era occupies a
+   contiguous offset range, so a file's statistics land inside one era however the log was
+   written. History appended AFTER live data prunes just as well — measured, 3 of 6 files
+   read either way, and it does not depend on `sort_by` at all. What the reserve buys is
+   that a scan with no time predicate returns history first, and that §7's tier boundaries
+   put the oldest data in the coldest tier. Once compaction has run a single file straddles
+   the era boundary and stops pruning, and it costs the same in both orders — measured, three
+   files read either way — so that is not a reason to prefer one.
 5. **Extension provisioning for embedders.** §7 makes the extension download a provisioning
    obligation. A repo can discharge it in its bootstrap and its CI; an application that
    `pip install`s the library runs neither. It gets the read path and no extensions, so its
@@ -2160,6 +2184,14 @@ Beyond §10:
 - Create a stream whose schema has no timestamp column at all; assert seal, compaction, the
   three-way read and retention all work — proving nothing depends on an ingest column.
 - Assert a caller-supplied `litelink_offset` is rejected (I11).
+- Create a log with `start_offset=N`; assert the first append lands at N, that `[1, N-1]` is
+  never assigned, and that the value survives a reopen. Assert it is ABSENT on a log created
+  without one — a backfill must read absence as "no reserve", not as "a reserve of nothing".
+- Assert the tail cache serves a seeded log before its first seal, by counting HITS rather
+  than rows. Three broken variants return correct rows and pass every other test here: the
+  guard keyed on the cache's first offset, one that pins the completeness floor instead of
+  only raising it, and one that drops the lower bound. Assert the slice still prunes what the
+  boundary excludes, and that a cache built for a high boundary refuses a lower one.
 - Assert a row naming an undeclared column is rejected, and that the batch it was in is
   rejected whole with no offset consumed (I17). Include the row that misspells a declared
   column: it has the same width as a correct one, so a length check passes it.
