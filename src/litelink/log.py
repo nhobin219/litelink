@@ -1054,7 +1054,6 @@ class Log:
         archive: str,
         s3: S3Options | None = None,
         binary: str | None = None,
-        root: PathLike[str] | str | None = None,
         scratch_dir: PathLike[str] | str | None = None,
     ) -> Follower:
         """A read-only view of a log running somewhere else (§3b).
@@ -1072,11 +1071,23 @@ class Log:
 
         **A snapshot, not a subscription.** litestream restores to a point in
         time, so refreshing means assembling another one — exit the block and
-        reopen. That is why `root` defaults to a temporary directory this owns
-        and removes on `close`: a follower's root is scaffolding for one read
-        session, not a durable artefact. Pass `root` to keep it (for inspection
-        after a surprise), or `scratch_dir` to choose where the temporary one
-        lives without giving up the cleanup — the restored buffer holds the
+        reopen. So the root is always a temporary directory this owns and
+        removes on `close`: it is scaffolding for one read session, not a
+        durable artefact.
+
+        **There is no `root` parameter**, and taking one cost two latent bugs
+        for a use case nobody had. Pointing a follow at a caller's directory
+        meant it could land on a root that already held a live log — where
+        `catalog.db` and `archive.db` are shared by every log under it, so the
+        follower's writes went into the primary's files and its sidecar
+        shipped them — and it meant a stale `archive.db` could survive to win
+        over the bucket's own hint and pin the follower to an old snapshot.
+        Both were guarded or nearly so; neither is now reachable, which is
+        cheaper than being right about them. Bring it back when something
+        actually needs to inspect a follower's root after the fact.
+
+        `scratch_dir` still chooses WHERE the temporary one lives, which is
+        the part with a real motivation: the restored buffer holds the
         unsealed tail *plus* the band the archive lacks, which on a log whose
         sync is behind is not small, and `/tmp` is often memory-backed.
 
@@ -1088,23 +1099,18 @@ class Log:
         which is the one failure this must not have.
         """
         options = s3 or S3Options()
-        owned: tempfile.TemporaryDirectory[str] | None = None
-        if root is None:
-            owned = tempfile.TemporaryDirectory(
-                prefix="litelink-follow-",
-                dir=None if scratch_dir is None else Path(scratch_dir),
-            )
-            root = owned.name
-
+        owned = tempfile.TemporaryDirectory(
+            prefix="litelink-follow-",
+            dir=None if scratch_dir is None else Path(scratch_dir),
+        )
         try:
-            layout = Layout(Path(root), name)
+            layout = Layout(Path(owned.name), name)
             cls._restore_replica(layout, archive, options, binary)
             schema, sort_by, prefix = cls._followed_shape(layout)
             cls._assemble_follower(layout, schema, sort_by, prefix, options)
             follower = cls._followed_reader(layout, schema, options, owned)
         except BaseException:
-            if owned is not None:
-                owned.cleanup()
+            owned.cleanup()
 
             raise
 
@@ -1154,7 +1160,7 @@ class Log:
         options: S3Options,
         binary: str | None,
     ) -> None:
-        """Pull `buffer.db` down, with the sidecar's config kept out of `root`.
+        """Pull `buffer.db` down, with the sidecar's config kept out of the root.
 
         `restore` writes that config into the root at its START, because
         `restore_buffer` needs `-config` to run. A follower must not leave one
@@ -1167,28 +1173,13 @@ class Log:
 
         So it goes in a temporary directory of its own and is deleted with it,
         on the exception path too. Nothing needs it once the restore returns.
+
+        This used to begin by refusing a root that already held a log, because
+        `follow` took a `root` argument and a caller could aim it anywhere.
+        The argument is gone and the root is always freshly made, so the check
+        could no longer fire; it was removed rather than left as a guard that
+        reads like protection and provides none.
         """
-        try:
-            occupied = layout.buffer_db.exists() or LogTable.exists_for(layout)
-        except LookupError:
-            occupied = True
-
-        if occupied:
-            # The table as well as the buffer, which is stricter than `restore`
-            # and can afford to be: `restore` must admit a root holding a table
-            # with no buffer, because that is its resuming case. `follow` has
-            # none. Keying on the buffer alone would let a follow assemble on
-            # top of a damaged log's catalog row — leaving a root whose local
-            # table names one log's files while its buffer and archive URI
-            # belong to another, which `Log.open` will happily open and `sync`
-            # would push into the wrong archive.
-            msg = (
-                f"a log already exists at {layout.root}/{layout.name}; follow refuses "
-                f"to overwrite it. Follow into an empty root, or omit `root` and let "
-                f"one be made"
-            )
-            raise FileExistsError(msg)
-
         layout.root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="litelink-follow-cfg-") as cfg:
             config_path = Path(cfg) / "litestream.yml"

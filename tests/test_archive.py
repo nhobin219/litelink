@@ -3887,74 +3887,6 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
             fs.invalidate_cache()
 
 
-@pytest.mark.slow
-def test_a_follow_refuses_a_root_that_holds_a_table(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Keyed on the table as well as the buffer, unlike `restore`.
-
-    `restore` must admit a root holding a table with no buffer — that is its
-    resuming case. `follow` has none, so it can be stricter, and needs to be:
-    assembling on top of a damaged log's catalog row leaves a root whose local
-    table names one log's Parquet while its buffer and archive URI belong to
-    another. `Log.open` opens that happily, and a `sync` from it would push the
-    first log's files into the second's archive.
-
-    Falsify by keying the guard on `buffer.db` alone: the follow proceeds,
-    restores the primary's buffer over the victim's root, adopts the archive
-    into the victim's `archive.db`, and only then fails on the pre-existing
-    table — too late, the mixture already exists.
-
-    The `-wal` and `-shm` files go with the buffer deliberately. Leaving them
-    makes SQLite replay the victim's stale WAL over the freshly restored
-    replica, so the falsification fails for the wrong reason — a missing
-    `archive` key rather than the mixture this guard exists to prevent.
-    """
-    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
-    if not os.access(binary, os.X_OK):
-        pytest.skip("litestream is not provisioned — run `just litestream`")
-
-    where = f"s3://{bucket}/follow-occupied"
-    config = replace(
-        LogConfig(),
-        target_seal_size=16 * 1024,
-        target_compact_size=16 * 1024,
-        compact_min_files=2,
-        wal_replication=True,
-    )
-    with Log.new(
-        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
-    ) as primary:
-        primary.extend(rows(2000))
-        while primary.seal() is not None:
-            pass
-
-        primary.maintain()
-        primary.sync()
-        replication = primary.write_replication_config()
-
-    _replicate(binary, replication, s3)
-
-    # A different log at the target root, with its buffer removed by hand.
-    victim = tmp_path / "victim"
-    with Log.new(victim, "s", schema=SCHEMA) as other:
-        other.extend(rows(200))
-        other.seal()
-
-    buffer_db = Layout(victim, "s").buffer_db
-    buffer_db.unlink()
-    for sidecar in (".-wal", ".-shm"):
-        stale = buffer_db.with_name(buffer_db.name + sidecar[1:])
-        stale.unlink(missing_ok=True)
-
-    before = LogTable.load(Layout(victim, "s"), readonly=True).metadata_location
-
-    with pytest.raises(FileExistsError, match="already exists"):
-        Log.follow("s", archive=where, s3=s3, binary=str(binary), root=victim)
-
-    assert LogTable.load(Layout(victim, "s"), readonly=True).metadata_location == before
-
-
 def test_a_follower_delegates_the_whole_read_signature() -> None:
     """The cost of not inheriting, pinned.
 
@@ -3970,6 +3902,15 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
     by construction, so reading without the archive would return the buffer
     alone. Unrepresentable rather than refused.
     """
+    taken = set(inspect.signature(Log.follow).parameters) - {"cls"}
+    assert taken == {"name", "archive", "s3", "binary", "scratch_dir"}
+    assert "root" not in taken, (
+        "a caller-supplied root can land on a directory that already holds a "
+        "live log, whose catalog.db and archive.db are shared by every log "
+        "under it — and can leave a stale archive.db that wins over the "
+        "bucket's own hint. Both were unreachable once the parameter went"
+    )
+
     followed = set(inspect.signature(Follower.scan).parameters) - {"self"}
     logged = set(inspect.signature(Log.scan).parameters) - {"self"}
 

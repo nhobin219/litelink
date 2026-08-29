@@ -348,9 +348,12 @@ there is nothing to fence and it reserves none. It opens read-only, which is als
 `recover()` from finishing a seal the primary owns.
 
 **A snapshot, not a subscription.** litestream restores to a point in time, so refreshing
-means assembling another one. That is why the root defaults to a temporary directory the
+means assembling another one. That is why the root is always a temporary directory the
 follower owns and removes on close: it is scaffolding for one read session, not a durable
-artefact. The archive metadata is pinned at assembly for the same reason — and because
+artefact. There is deliberately no `root` parameter — a caller-supplied one could land on a
+directory that already held a live log, whose `catalog.db` and `archive.db` are shared by
+every log under it, and could leave a stale `archive.db` to win over the bucket's own hint.
+Both were reachable only through that argument, so removing it was cheaper than guarding it. The archive metadata is pinned at assembly for the same reason — and because
 `previous-versions-max: 10` keeps ten previous versions beside the current one, so the
 **eleventh further archive commit** deletes the metadata object a follower is holding, **with
 no time component at all**. Archive commits are the ones that count — `sync`, `rewrite_archive`

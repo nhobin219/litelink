@@ -194,7 +194,7 @@ last `sync()`. `Log.follow` restores the writer's `buffer.db` from its replica, 
 archive beside it, and merges the two — so freshness falls to the replication lag.
 
 ```python
-Log.follow(name, *, archive, s3=None, binary=None, root=None, scratch_dir=None) -> Follower
+Log.follow(name, *, archive, s3=None, binary=None, scratch_dir=None) -> Follower
 ```
 
 ```python
@@ -217,10 +217,13 @@ rather than raising: the writer machinery is not built at all. `scan` and `sql` 
 reading without the archive would return the replicated buffer alone.
 
 **A snapshot, not a subscription.** litestream restores to a point in time, so refreshing means
-assembling another follower — exit the block and reopen. `root` defaults to a temporary
-directory the follower owns and deletes on close; pass `root` to keep it, or `scratch_dir` to
-place the temporary one somewhere other than `/tmp`, which is often memory-backed and which the
-restored buffer can outgrow.
+assembling another follower — exit the block and reopen. The root is always a temporary
+directory the follower owns and deletes on close; there is no `root` parameter, because
+aiming a follow at a caller's directory could land it on a root that already held a live log
+— `catalog.db` and `archive.db` are shared by every log under a root — and could leave a
+stale `archive.db` that wins over the bucket's own hint. `scratch_dir` places the temporary
+one somewhere other than `/tmp`, which is often memory-backed and which the restored buffer
+can outgrow.
 
 Reads refuse rather than lie once the primary has committed past the pinned snapshot. The
 archive keeps `previous-versions-max: 10` — ten previous versions beside the current one — so
