@@ -1025,7 +1025,7 @@ class Log:
         root: PathLike[str] | str | None = None,
         scratch_dir: PathLike[str] | str | None = None,
     ) -> Follower:
-        """A read-only view of a log running somewhere else (§3a).
+        """A read-only view of a log running somewhere else (§3b).
 
         The archive merged with a replicated copy of the writer's buffer, so a
         reader sees data fresher than the archive alone — down to the
@@ -3381,7 +3381,7 @@ class Coverage:
 
 
 class Follower:
-    """A read-only view of a log running somewhere else, from `Log.follow`.
+    """A read-only view of a log running somewhere else (§3b), from `Log.follow`.
 
     Wraps a `Log` rather than extending one. A follower does three things —
     read, report what it covers, and go away — and inheriting `Log` gave it a

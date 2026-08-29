@@ -140,6 +140,22 @@ and asks for what came after — which is how you follow an archive that `sync` 
 into. The extensions, the credential shapes, why `version_name_format` is not optional, and
 the polling pattern in full are in [`docs/API.md`](docs/API.md).
 
+That read is only as fresh as the last `sync`. When you have a WAL sidecar running
+(`wal_replication`), `Log.follow` does better: it restores the writer's buffer alongside the
+archive and merges them, so the reader sees down to the replication lag instead.
+
+```python
+with Log.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
+    reader.coverage()   # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, ...)
+    reader.scan(where="side = 0", columns=["event_ts", "price"])
+```
+
+It never writes anything the primary shares and cannot append — a `Follower` has no write
+surface at all, rather than one that raises. It is a **snapshot, not a subscription**:
+refreshing means assembling another one, and the root it builds is a temporary directory
+removed on close. `coverage()` is how it stays honest about what it can and cannot serve.
+See [§3b](docs/SPEC.md) for why a gap in that report is not necessarily loss.
+
 ## How it works
 
 - **Iceberg is used, not reimplemented.** Manifests, per-file column statistics, schema with

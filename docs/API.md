@@ -29,6 +29,7 @@ that gets copied and attached elsewhere.
 | **lifecycle** | `new` · `open` · `restore` · `recover` · `recovery` · `close` |
 | **write** | `append` · `extend` |
 | **read** | `scan` · `sql` |
+| **follow** | `Log.follow` → `Follower`: `scan` · `sql` · `coverage` · `end_offset` · `close` |
 | **seal** | `seal_due` · `seal` · `await_seal` |
 | **maintain** | `maintain` · `compact` · `evict` · `expire` |
 | **archive** | `sync` · `hydrate` · `rewrite_archive` |
@@ -175,14 +176,65 @@ SELECT * FROM iceberg_scan(...) WHERE litelink_offset > 1536;
 ```
 
 Resolve the table on each pass rather than caching a metadata path — the hint moves with every
-commit, and a pinned pointer serves one stale snapshot for ever. What a reader cannot see is
+commit, and a pinned pointer serves one stale snapshot for ever. What this reader cannot see is
 anything newer than the last `sync()`: rows still in the buffer or the local table are on the
-writing box alone, so the freshness lever is the sync interval rather than anything at the
-reader.
+writing box alone, so its freshness lever is the sync interval.
+
+That last sentence used to say "rather than anything at the reader", which `Log.follow` below
+makes false — with a WAL sidecar there *is* a lever at the reader.
 
 `tests/test_archive.py::test_the_archive_reads_as_a_directory_with_no_catalog_at_all` is that
 claim as a test — it captures through a live archive and asserts the DuckDB row count equals
 the writer's `archived_through()`.
+
+### Fresher than the archive: `Log.follow`
+
+When the writer runs a WAL sidecar (`wal_replication`, §3a), a reader can do better than the
+last `sync()`. `Log.follow` restores the writer's `buffer.db` from its replica, adopts the
+archive beside it, and merges the two — so freshness falls to the replication lag.
+
+```python
+Log.follow(name, *, archive, s3=None, binary=None, root=None, scratch_dir=None) -> Follower
+```
+
+```python
+with Log.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
+    reader.coverage()        # what it can serve, and where it cannot
+    reader.end_offset()      # compare against the primary's to measure staleness
+    reader.scan(where="side = 0")
+    reader.sql("SELECT side, count(*) FROM log GROUP BY side")
+```
+
+`archive` is where the *WAL replica* lives; the archive prefix itself comes from the replica's
+own `meta`. It requires a published archive — a log before its first successful sync cannot be
+followed, because serving the buffer alone would silently omit every archived row.
+
+**A `Follower` is not a `Log`.** It wraps one and exposes the read surface only, so `append`,
+`seal`, `sync`, `compact`, `evict` and `write_replication_config` are *absent* rather than
+raising. `scan` and `sql` take no `include_archive`: a follower's local table is empty by
+construction, so reading without the archive would return the replicated buffer alone.
+
+**A snapshot, not a subscription.** litestream restores to a point in time, so refreshing means
+assembling another follower — exit the block and reopen. `root` defaults to a temporary
+directory the follower owns and deletes on close; pass `root` to keep it, or `scratch_dir` to
+place the temporary one somewhere other than `/tmp`, which is often memory-backed and which the
+restored buffer can outgrow.
+
+Reads refuse rather than lie once the primary has committed past the pinned snapshot. The
+archive keeps `previous-versions-max: 10`, so **ten further primary commits are enough — there
+is no time component**, and a busy primary can sweep a follower in seconds. The error says to
+reassemble.
+
+```python
+Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=True)
+```
+
+`coverage()` reports; it does not adjudicate. A follower cannot ask the primary anything, so the
+failure it avoids is silence. **A gap is not necessarily loss**: a range in neither tier is
+either rows the buffer discarded at seal with replication off, or a reserve that was never
+issued — `Log.restore` burns 2**20 of them and `start_offset` creates one deliberately — and
+nothing local tells the two apart. A caller who knows whether their log has failed over can
+read a gap that this cannot.
 
 ## Sealing
 
