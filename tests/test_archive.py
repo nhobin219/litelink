@@ -3387,6 +3387,79 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
 
 
 @pytest.mark.slow
+def test_buffered_rows_sees_another_process_seal(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The §7 boundary has to be re-read, or the two tiers double-count.
+
+    A seal LEAVES its rows in the buffer when `wal_replication` is on — the
+    buffer is the off-box copy until the archive has the range (§3a) — so
+    `buffered_rows` cannot ask the buffer how many rows it holds. It counts
+    above the local table's frontier instead.
+
+    That frontier moves when ANOTHER process seals, and `LogTable.extent`
+    resolves nothing: it compares against this handle's in-memory
+    `metadata_location`. Read directly, it pins the boundary to whatever
+    snapshot was last loaded, and every row the other process has sealed still
+    counts as unsealed — so `table_rows() + buffered_rows()` counts that band
+    twice, against I3's guarantee that each row crosses the boundary exactly
+    once.
+
+    This is the documented two-role topology: RUNTIME.md has the writer append
+    while the maintainer seals.
+
+    Falsify by reading `self._table.extent()` instead of `self.table_extent()`
+    in `buffered_rows`: the reader reports 20 buffered and 20 in the table for
+    a log holding 20.
+    """
+    where = f"s3://{bucket}/prefix"
+    config = replace(
+        LogConfig(),
+        target_seal_size=1,
+        wal_replication=True,
+        snapshot_retention=timedelta(seconds=0),
+    )
+    with litelink.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=where,
+        s3=s3,
+    ) as writer:
+        writer.extend(rows(20))
+
+        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+            # Warm the reader's view BEFORE the seal, so its cached pointer is
+            # the stale one.
+            assert reader.buffered_rows() == 20
+            assert reader.table_rows() == 0
+
+            writer.seal_due()
+
+            # `buffered_rows` FIRST, before anything else reloads. That order
+            # is the whole test: `table_rows()` resolves the catalog, so
+            # calling it first repairs the stale pointer and hides this.
+            # `examples/adsb/tail.py` only reads the right number because it
+            # happens to evaluate `table_rows()` earlier in the same tuple.
+            buffered = reader.buffered_rows()
+            assert buffered == 0, (
+                f"the reader counted {buffered} rows as unsealed after another "
+                f"process sealed them"
+            )
+
+            assert reader.table_rows() == 20, "the fixture must seal"
+            assert reader.table_rows() + reader.buffered_rows() == 20, (
+                "the tiers must not double-count across the §7 boundary"
+            )
+
+        # And the writer sees the maintainer's seal too, in the order that
+        # hides the bug: `buffered_rows` alone, with nothing reloading first.
+        assert writer.buffered_rows() == 0
+
+
+@pytest.mark.slow
 def test_an_evicted_log_still_serves_every_row(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:

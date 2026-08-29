@@ -144,7 +144,7 @@ Everything else is the application's schema, declared at stream creation and tre
 opaque. Iceberg computes statistics for every column, so all of them prune.
 
 ```python
-litelink.litelink.new(
+litelink.new(
     root, name,
     schema=pa.schema([...]),          # the application's columns
     sort_by=("event_ts", "key"),      # names from that schema
@@ -361,7 +361,8 @@ and archive expiry — not a local `maintain()`, which moves nothing in the buck
 syncing steadily can still sweep a follower in seconds. Every read therefore re-reads that pointer and refuses with "reassemble" rather
 than serving from a snapshot that is gone.
 
-**Following returns a `LogHandle`, the same type a local `reader()` returns.** The
+**Following returns a `RemoteReadHandle`, a sibling of the `LocalReadHandle` that
+`open(read_only=True)` returns.** The
 decomposition is `WriteHandle = LocalReadHandle + writes`, so `follow` builds the buffer, the local
 table, the archive handle and the `Reader` directly and hands them over. What makes it a
 follower is state: an empty local table beside an archive that holds rows, which is the same
@@ -2349,7 +2350,7 @@ tunable. See §15.5.
 Declared at stream creation, alongside the application schema:
 
 ```python
-litelink.litelink.new(
+litelink.new(
     root, name,
     schema=pa.schema([...]),
     sort_by=("event_ts", "key"),

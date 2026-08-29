@@ -26,7 +26,7 @@ that gets copied and attached elsewhere.
 ## Handles, not logs
 
 The log is the directory and the objects in the bucket. These classes are **handles** to it —
-which is why none of them is called `WriteHandle`. A class named after the data invites the question
+which is why none of them is called `Log`. A class named after the data invites the question
 of why a read-only one is a lesser version of it, and `sqlite3` has no `Database` class
 either; it has `Connection`.
 
@@ -309,10 +309,14 @@ construction and its archive holds rows, so the archive is load-bearing: reads i
 automatically, and `include_archive=False` is **refused** rather than answered short. A local
 reader in the same state — a fully evicted log — gets the same treatment, correctly.
 
-`replication_config`, `write_replication_config` and `databases` are the exception: they exist
-on `LogHandle` because generating a sidecar config is exactly what you do beside a live
-writer, but a *followed* log refuses them. `litestream_config` keys each replica on the path
-relative to the root, so a follower would emit the **primary's** key and a sidecar run there
+`replication_config`, `write_replication_config` and `databases` live on
+**`LocalReadHandle`**, not on the base: generating a sidecar config is exactly what you do
+beside a live writer, and a local handle shares the primary's root and name so the key it
+emits is the primary's own correct one. A followed log does not have them at all — it raises
+`AttributeError`, because `RemoteReadHandle` is a sibling rather than a child.
+
+That split is the point. `litestream_config` keys each replica on the path relative to the
+root, so a follower emitting one would name the **primary's** key, and a sidecar run there
 would ship its scratch copy over the primary's only off-box record of its unsealed rows.
 
 **A snapshot, not a subscription.** litestream restores to a point in time, so refreshing means
@@ -424,12 +428,16 @@ log.archived_through() -> int                # highest offset the archive holds,
 log.archive_files() -> int
 ```
 
-All local and none of them opens a data file, with one exception: on a log whose local table
-holds **nothing** while its archive holds rows — a fully evicted log, or a followed one —
-`end_offset()` and `coverage()` read the archive's metadata, because the buffer's sequence is
-not authoritative there. `sqlite_sequence` never lowers, so it keeps counting rows a seal
-discarded, and taking it at face value made a followed log claim 1,501 while serving 864.
-Everything else stays local, and so does `end_offset()` on any log with local files.
+All local and none of them opens a data file, with one exception: on a **read** handle whose
+local table holds nothing while its archive holds rows — a followed log, or a local one
+evicted dry — `end_offset()` and `coverage()` read the archive's metadata, because the
+buffer's sequence is not authoritative there. `sqlite_sequence` never lowers, so it keeps
+counting rows a seal discarded, and taking it at face value made a followed log claim 1,501
+while serving 864.
+
+**A `WriteHandle` never does this.** It overrides `end_offset()` to read `sqlite_sequence`
+alone, because a writer is asked where its next row will land rather than what it can serve —
+so the number an operator alarms on cannot fail during an object-storage outage.
 
 `archived_through()` against `end_offset()` is
 the sync lag, which is the number to alarm on: eviction may never precede registration (I4),

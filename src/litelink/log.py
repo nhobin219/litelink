@@ -449,8 +449,29 @@ class LogHandle:
         )
 
     def buffered_rows(self) -> int:
-        """Rows durable in the buffer but not yet sealed."""
-        extent = self._table.extent()
+        """Rows durable in the buffer but not yet sealed.
+
+        Counted against the local table's boundary rather than by asking the
+        buffer how many rows it holds, because a seal LEAVES its rows there
+        when `wal_replication` is on (§3a) — the buffer is the off-box copy
+        until the archive has the range, so its row count is not the unsealed
+        tail.
+
+        **Through `table_extent`, which reloads.** `LogTable.extent` compares
+        against this handle's in-memory `metadata_location` and resolves
+        nothing, so reading it directly pins the boundary to whatever snapshot
+        was last loaded and every row another process has since sealed still
+        counts as unsealed. Measured against a maintainer that had just sealed
+        20 rows: a reader reported `buffered=20, table=20` for a log holding
+        20, double-counting the whole band across the §7 boundary that I3 says
+        each row crosses exactly once.
+
+        A refactor inlined this method's body minus the reload, and it hid
+        because every other observation here reloads — `examples/adsb/tail.py`
+        only reads the right number because it happens to call `table_rows()`
+        first in the same tuple.
+        """
+        extent = self.table_extent()
 
         return self._buffer.count_above(0 if extent is None else extent[1])
 
@@ -565,8 +586,12 @@ class LogHandle:
         """Release the reader's connection and the buffer's. Nothing else.
 
         `RemoteReadHandle` extends this to remove the scratch root it owns —
-        extends rather than replaces, which is the only override in this
-        hierarchy and adds a step rather than changing one.
+        extends rather than replaces, adding a step rather than changing one.
+
+        It is one of two overrides in the hierarchy. The other is
+        `WriteHandle.end_offset`, which answers a genuinely different question
+        than this class's: where the next append lands, rather than past the
+        last row this handle can serve.
         """
         self._reader.close()
         self._buffer.close()
@@ -723,13 +748,17 @@ class LocalReadHandle(LogHandle):
         commit, because this surface was on `WriteHandle` alone and the example had to
         reach for a writer to get at it.
 
-        Refused on a FOLLOWED log, which is the reason it was kept off readers
-        in the first place: `litestream_config` keys each replica on the path
-        relative to the root, so a follower with the same log name emits a key
-        identical to the primary's, and a sidecar run there ships the
-        follower's stripped scratch copy over the primary's only off-box record
-        of its unsealed rows. A local reader shares the primary's root and
-        name, so the key it emits IS the primary's own correct one.
+        **Absent on a followed log**, which is why `RemoteReadHandle` is a
+        sibling of this class rather than a child: `litestream_config` keys
+        each replica on the path relative to the root, so a follower with the
+        same log name emits a key identical to the primary's, and a sidecar
+        run there ships the follower's stripped scratch copy over the
+        primary's only off-box record of its unsealed rows. A local handle
+        shares the primary's root and name, so the key it emits IS the
+        primary's own correct one.
+
+        This used to be a runtime refusal on one shared class. Moving it here
+        made the guard unnecessary — there is nothing to call.
         """
         archive = self.archive
         if archive is None:
