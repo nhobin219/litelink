@@ -3592,7 +3592,17 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
                 live.maintain()
                 live.sync()
 
-        for call in (follower.coverage, lambda: follower.scan().read_all()):
+        # Every documented member that touches the archive, not just the two
+        # that were easy to reach. `end_offset` only came under this guard
+        # when it started taking the archive frontier, and `sql` reaches the
+        # engine by a different route than `scan` — both passed unproven
+        # until review pointed out the test never asked.
+        for call in (
+            follower.coverage,
+            follower.end_offset,
+            lambda: follower.scan().read_all(),
+            lambda: follower.sql("SELECT count(*) FROM log").read_all(),
+        ):
             with pytest.raises(RuntimeError, match="reassemble"):
                 call()
 
