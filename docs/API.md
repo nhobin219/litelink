@@ -249,25 +249,25 @@ commit, and a pinned pointer serves one stale snapshot for ever. What this reade
 anything newer than the last `sync()`: rows still in the buffer or the local table are on the
 writing box alone, so its freshness lever is the sync interval.
 
-That last sentence used to say "rather than anything at the reader", which `Log.follow` below
+That last sentence used to say "rather than anything at the reader", which `litelink.follow` below
 makes false — with a WAL sidecar there *is* a lever at the reader.
 
 `tests/test_archive.py::test_the_archive_reads_as_a_directory_with_no_catalog_at_all` is that
 claim as a test — it captures through a live archive and asserts the DuckDB row count equals
 the writer's `archived_through()`.
 
-### Fresher than the archive: `Log.follow`
+### Fresher than the archive: `litelink.follow`
 
 When the writer runs a WAL sidecar (`wal_replication`, §3a), a reader can do better than the
-last `sync()`. `Log.follow` restores the writer's `buffer.db` from its replica, adopts the
+last `sync()`. `litelink.follow` restores the writer's `buffer.db` from its replica, adopts the
 archive beside it, and merges the two — so freshness falls to the replication lag.
 
 ```python
-Log.follow(name, *, archive, s3=None, binary=None, scratch_dir=None) -> Follower
+litelink.follow(name, *, archive, s3=None, binary=None, scratch_dir=None) -> LogReader
 ```
 
 ```python
-with Log.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
+with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
     reader.coverage()        # what it can serve, and where it cannot
     reader.end_offset()      # compare against the primary's to measure staleness
     reader.scan(where="side = 0")
@@ -278,12 +278,21 @@ with Log.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
 own `meta`. It requires a published archive — a log before its first successful sync cannot be
 followed, because serving the buffer alone would silently omit every archived row.
 
-**A `Follower` is not a `Log` and does not hold one.** It holds the same read collaborators a
-`Log` holds — the replicated buffer, the archive handle, and the reader over both — so
-`append`, `seal`, `sync`, `compact`, `evict` and `write_replication_config` are *absent*
-rather than raising: the writer machinery is not built at all. `scan` and `sql` take no
-`include_archive` either, because a follower's local table is empty by construction and
-reading without the archive would return the replicated buffer alone.
+**This returns a `LogReader`, the same type `reader()` does.** It holds the read
+collaborators — the replicated buffer, the local table, the archive handle, and the reader
+over them — so `append`, `seal`, `sync`, `compact` and `evict` are *absent* rather than
+raising: the writer machinery is not built at all.
+
+What makes it behave as a follower is state, not type. Its local table is empty by
+construction and its archive holds rows, so the archive is load-bearing: reads include it
+automatically, and `include_archive=False` is **refused** rather than answered short. A local
+reader in the same state — a fully evicted log — gets the same treatment, correctly.
+
+`replication_config`, `write_replication_config` and `databases` are the exception: they exist
+on `LogReader` because generating a sidecar config is exactly what you do beside a live
+writer, but a *followed* log refuses them. `litestream_config` keys each replica on the path
+relative to the root, so a follower would emit the **primary's** key and a sidecar run there
+would ship its scratch copy over the primary's only off-box record of its unsealed rows.
 
 **A snapshot, not a subscription.** litestream restores to a point in time, so refreshing means
 assembling another follower — exit the block and reopen. The root is always a temporary

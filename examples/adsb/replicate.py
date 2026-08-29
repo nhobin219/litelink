@@ -52,7 +52,7 @@ def main() -> None:
     # generator that took the write lock would be a strange thing to run
     # alongside a live writer, which is exactly when you want it.
     try:
-        log = litelink.open(args.root, NAME, s3=S3Options())
+        log = litelink.reader(args.root, NAME, s3=S3Options())
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 

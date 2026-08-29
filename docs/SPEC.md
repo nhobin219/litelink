@@ -336,7 +336,7 @@ the log fails outright. See §3a's failover notes and `Log.restore`.
 
 ## 3b. Reading a log from another machine
 
-`Log.follow` assembles a **read-only view of a log running somewhere else**: the archive
+`litelink.follow` assembles a **read-only view of a log running somewhere else**: the archive
 merged with a restored copy of the writer's `buffer.db`, so a reader sees data fresher than
 the archive alone — down to the replication lag rather than to the seal cadence. It is what
 §3a's replication buys on the read side, and it exists because the alternative readers had
@@ -361,10 +361,11 @@ and archive expiry — not a local `maintain()`, which moves nothing in the buck
 syncing steadily can still sweep a follower in seconds. Every read therefore re-reads that pointer and refuses with "reassemble" rather
 than serving from a snapshot that is gone.
 
-**A `Follower` holds the same read collaborators a `Log` holds — it does not hold a `Log`.**
-The decomposition is `Log = writer state + Reader` and `Follower = Reader + the pin check`,
-so `Log.follow` builds the buffer, the archive handle and the `Reader` directly and hands
-them over. Two earlier shapes were wrong in the same direction: subclassing `Log` published
+**Following returns a `LogReader`, the same type a local `reader()` returns.** The
+decomposition is `Log = writer state + LogReader`, so `follow` builds the buffer, the local
+table, the archive handle and the `Reader` directly and hands them over. What makes it a
+follower is state: an empty local table beside an archive that holds rows, which is the same
+condition a fully evicted local log meets and gets the same treatment for. Two earlier shapes were wrong in the same direction: subclassing `Log` published
 a write surface that only raised, and wrapping a whole `Log` hid that surface while still
 constructing the writer machinery and then reaching past it. Both bugs review found on this
 class came from that seam — a read that lost its error translation to the wrapped object's

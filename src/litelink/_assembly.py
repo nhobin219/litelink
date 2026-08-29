@@ -22,11 +22,11 @@ import pyarrow as pa
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import CONFIG_KEY, SCHEMA_KEY, SORT_KEY, Buffer
 from litelink._layout import Layout
+from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config, restore_buffer
 from litelink._table import LogTable, archive_extent
 from litelink.log import (
-    FOLLOWED_KEY,
     Log,
     LogConfig,
     LogReader,
@@ -107,10 +107,11 @@ def follow(
 
     **The result is an ordinary `LogReader`**, the same type `reader` returns.
     What makes it behave as a follower is its state, not its type: the local
-    Iceberg table is empty by construction, so `LogReader` derives that the
-    archive is load-bearing and both includes it and refuses to serve without
-    it. A local reader whose table has been fully evicted gets the same
-    treatment, correctly, and used to not.
+    Iceberg table is empty by construction and the archive is known to hold
+    rows, so `LogReader` derives that the archive is load-bearing and both
+    includes it and refuses to serve without it. A local reader whose table has
+    been fully evicted meets the same two conditions and gets the same
+    treatment, correctly — it used to serve 476 of 1,500 rows instead.
 
     **A snapshot, not a subscription.** litestream restores to a point in
     time, so refreshing means assembling another one — exit the block and call
@@ -344,12 +345,17 @@ def _assemble_follower(
         if extent is not None:
             buffer.release_archived(extent[1])
             buffer.reseed_group()
-
-        # The one fact a reader cannot work out for itself: this table is empty
-        # and nothing here will ever fill it, so the archive is the only source
-        # of the archived rows. A local log with an empty table is a different
-        # situation — see `LogReader._archive_required`.
-        buffer.set_meta_all({FOLLOWED_KEY: "1"})
+            # The replica's own watermark is whatever the primary had recorded
+            # when litestream last shipped, which can be 0 — a buffer captured
+            # before the first sync. The BUCKET is authoritative and was just
+            # read, so record what the archive actually holds.
+            #
+            # Not bookkeeping: `LogReader._archive_required` derives "the
+            # archive is the only source of the archived rows" from this
+            # watermark and an empty local table, and a stale 0 makes a
+            # follower decide it needs no archive — then serve nothing at all,
+            # because `release_archived` above just emptied its buffer.
+            buffer.set_meta_all({Maintenance.ARCHIVED_KEY: str(extent[1])})
     finally:
         buffer.close()
 

@@ -122,10 +122,6 @@ _START_OFFSET_KEY = START_OFFSET_KEY
 # it too — see `Buffer.sort_by`.
 _SORT_KEY = SORT_KEY
 
-# Written once by `follow`, read by `LogReader` to know that its local table is
-# empty and will stay that way — the one thing about a followed log that cannot
-# be derived from its state. See `LogReader._archive_required`.
-FOLLOWED_KEY = "followed"
 
 # How many offsets a restore skips before resuming (§3a).
 #
@@ -987,18 +983,8 @@ class Log:
 
     @property
     def databases(self) -> tuple[Path, ...]:
-        """The SQLite files a restore needs (§3a).
-
-        For a WAL-shipping sidecar to replicate. Public because deciding to run
-        one is a deployment choice, but knowing WHICH files carry the log's
-        state is not — it is this library's, and a sidecar configured by hand
-        against a guess is one that silently omits a file.
-
-        litelink does not run the sidecar. It is a separate process reading the
-        WAL, which is exactly why it does not put the network in the write path
-        (§3a); a library that supervised it would.
-        """
-        return self._layout.databases
+        """The SQLite files a restore needs (§3a). See `LogReader.databases`."""
+        return self._view.databases
 
     def archive_files(self) -> int:
         """How many data files the archive holds, or 0 with no archive."""
@@ -1009,40 +995,12 @@ class Log:
         return self._view.coverage()
 
     def replication_config(self) -> str:
-        """A litestream config for this log (§3a).
-
-        Derived, not configured: the file set is `databases`, the destination
-        is `_wal` beside the archived data, and the endpoint comes from the
-        credentials this log was opened with. Everything a hand-written config
-        would have to restate, and each of those a way to get it silently
-        wrong.
-        """
-        # One read, checked and used. Read twice, a detach landing between them
-        # hands `litestream_config` a None it has no branch for.
-        archive = self._archive.uri
-        if archive is None:
-            msg = "replication needs an archive; this log is local-only"
-            raise ValueError(msg)
-
-        return litestream_config(
-            self.databases,
-            self._layout.root,
-            archive,
-            self._archive.s3,
-            self.config.wal_retention,
-        )
+        """A litestream config for this log (§3a). See `LogReader`."""
+        return self._view.replication_config()
 
     def write_replication_config(self) -> Path:
-        """Write that config next to the log, and return where.
-
-        Beside the data rather than at a configured path, for the same reason
-        every other path is derived: a setting for it would be one more thing
-        to keep in step with the log it describes.
-        """
-        destination = self._layout.root / "litestream.yml"
-        destination.write_text(self.replication_config())
-
-        return destination
+        """Write that config next to the log, and return where."""
+        return self._view.write_replication_config()
 
     def recovery(self) -> _Recovery | None:
         """What `restore` recovered, or None on a log opened normally.
@@ -3118,14 +3076,14 @@ class LogReader:
     and a separate `Follower` — had to keep two answers to every question.
 
     **What the follower used to encode as a type is derived here.** The
-    archive is load-bearing exactly when the local table holds nothing and an
-    archive is configured: then it is the only place the archived rows can
-    come from, so reads must include it and a missing archive must refuse
-    rather than quietly serve the buffer alone. That is true of a followed log
-    (its table is empty by construction) and equally true of a local log that
-    has evicted everything, which is a case the old split got wrong — measured
-    on a local log after `evict`, `scan()` returned 476 of 1,500 rows with no
-    error.
+    archive is load-bearing exactly when the local table holds nothing and the
+    archive is known to hold something: then it is the only place the archived
+    rows can come from, so reads must include it and a missing archive must
+    refuse rather than quietly serve the buffer alone. That is true of a
+    followed log, whose table is empty by construction, and equally true of a
+    local log that has evicted everything — a case the old split got wrong,
+    measured at 476 of 1,500 rows returned with no error. See
+    `_archive_required` for why the watermark is part of the test.
 
     **One thing is NOT derived, and it is a real cost of unifying.**
     `include_archive=False` was absent from `Follower` and is merely refused
@@ -3181,11 +3139,80 @@ class LogReader:
         """Where the archive is, or None for a local-only log.
 
         Read from `meta` on every access, so a caller cannot disagree with the
-        log about it. The `replication_config` family stays on `Log`: it keys
-        each replica on the path relative to the root, so a followed log would
-        emit the PRIMARY's replica key.
+        log about it.
         """
         return self._archive.uri
+
+    @property
+    def databases(self) -> tuple[Path, ...]:
+        """The SQLite files a restore needs (§3a), for a sidecar to replicate."""
+        self._refuse_if_followed("databases")
+
+        return self._layout.databases
+
+    def replication_config(self) -> str:
+        """A litestream config for this log (§3a).
+
+        **A read, which is why it belongs here.** Generating it is exactly what
+        you do alongside a live writer, and doing that through a writer takes
+        both whole-log claims and the SQLite write lock on a log another
+        process owns — and runs `recover()`, which can finish and replace that
+        process's in-flight seal. `examples/adsb/replicate.py` did that for one
+        commit, because this surface was on `Log` alone and the example had to
+        reach for a writer to get at it.
+
+        Refused on a FOLLOWED log, which is the reason it was kept off readers
+        in the first place: `litestream_config` keys each replica on the path
+        relative to the root, so a follower with the same log name emits a key
+        identical to the primary's, and a sidecar run there ships the
+        follower's stripped scratch copy over the primary's only off-box record
+        of its unsealed rows. A local reader shares the primary's root and
+        name, so the key it emits IS the primary's own correct one.
+        """
+        self._refuse_if_followed("replication_config")
+        archive = self.archive
+        if archive is None:
+            msg = (
+                f"{self.root}/{self.name} has no archive, so there is nowhere to "
+                f"ship its WAL — replication needs one"
+            )
+            raise ValueError(msg)
+
+        return litestream_config(
+            self._layout.databases,
+            self._layout.root,
+            archive,
+            self._archive.s3,
+            self.config.wal_retention,
+        )
+
+    def write_replication_config(self) -> Path:
+        """Write that config next to the log, and return where.
+
+        Beside the data rather than at a configured path, for the same reason
+        every other path is derived: a setting for it would be one more thing
+        to keep in step with the log it describes.
+        """
+        destination = self._layout.root / "litestream.yml"
+        destination.write_text(self.replication_config())
+
+        return destination
+
+    def _refuse_if_followed(self, what: str) -> None:
+        """A followed log must not describe replication. See `replication_config`.
+
+        Keyed on owning the root, which only `follow` does — it assembles into
+        a scratch directory it removes on close. A reader on an existing log
+        never owns one.
+        """
+        if self._owned_root is not None:
+            msg = (
+                f"this is a followed log, assembled into {self.root}. Its "
+                f"{what} would name the PRIMARY's replica key, and a sidecar run "
+                f"here would ship this scratch copy over the primary's only "
+                f"off-box record of its unsealed rows"
+            )
+            raise ValueError(msg)
 
     # -- read --------------------------------------------------------------
 
@@ -3400,7 +3427,22 @@ class LogReader:
         buffered = self._buffer.extent()
         gap: tuple[int, int] | None = None
         if archive is not None:
-            above = self._buffer.next_offset() if buffered is None else buffered[0]
+            self._table.reload()
+            # ALL THREE TIERS. This arrived for a followed log, whose local
+            # table is empty by construction, so "archive frontier to the
+            # buffer's first offset" described everything it could serve. A
+            # local log has a third tier in between, and leaving it out
+            # reported every offset sealed-but-not-yet-synced as unservable —
+            # measured, a healthy log with `archive=(1, 432)` and a local table
+            # of `(1, 10000)` reported `gap=(433, 10000)` while serving all
+            # 9,568 of those rows. Sync lagging the table is the design rather
+            # than an error, so that was wrong on nearly every archived log.
+            starts = [
+                extent[0]
+                for extent in (self._table.extent(), buffered)
+                if extent is not None
+            ]
+            above = min(starts) if starts else self._buffer.next_offset()
             if above > archive[1] + 1:
                 gap = (archive[1] + 1, above - 1)
 
@@ -3434,28 +3476,46 @@ class LogReader:
     def _archive_required(self) -> bool:
         """Whether the archive is the only source of this log's archived rows.
 
-        **This is the one thing that could not be derived, and claiming it
-        could was wrong.** The intuition was that an empty local table means
-        the archive is the only source — true of a followed log, whose table
-        is created empty and never filled. But a LOCAL log can have an empty
-        table too, in two ways that must not be treated alike:
+        Three conditions, all answerable from local disk and none of them a
+        flag: an archive is configured, it is known to HOLD something, and the
+        local table holds nothing. `configured()` opens nothing,
+        `archived_through` is a keyed `meta` read, and the extent comes from
+        manifest statistics — so deciding whether a read needs the network
+        costs no network.
 
-        - Created with an archive and not yet synced. Demanding the archive
-          would refuse a first read that should simply serve the buffer.
-        - Fully evicted. Here the rows really are archive-only, and a default
-          local read does under-serve — measured, `scan()` returned 476 of
-          1,500 rows after `evict`. But its table refills on the next seal,
-          and flipping `scan`'s default to reach the network would rewrite
-          I5 ("a hot read is local disk only") as a side effect of this
-          refactor. That case is left alone deliberately and tracked
-          separately; it is a question about `Log`, not about readers.
+        **The watermark is what stops this over-firing.** Without it, a log
+        created with an archive but never synced looks identical to a followed
+        one: empty table, archive configured. It would demand an archive that
+        has published nothing, and a first read would refuse instead of simply
+        serving the buffer. `archived_through` is 0 until a sync lands.
 
-        So `follow` records the fact at assembly instead: this directory's
-        table is empty and nothing will ever fill it. One durable `meta` row,
-        written once by the code that knows, read here — not a mode anything
-        can toggle later.
+        **Two earlier versions got this wrong in both directions, and the
+        shape of the second mistake is worth keeping.** The first derived from
+        the empty table alone and broke fresh logs. The second added the
+        watermark and was right — but it failed five eviction tests, and I read
+        those as encoding a behaviour I must preserve, replaced the whole thing
+        with a durable marker `follow` wrote, and recorded the eviction case as
+        future work. The tests were failing because this FIXES a local defect:
+        a fully evicted log holds its rows only in the archive, and a default
+        read that skipped it returned 476 of 1,500 rows with no error. The
+        marker made a real bug look like a design boundary.
+
+        I5 still holds where it means anything. "A hot read is local disk only"
+        protects a read that HAS local disk to serve; a log whose table is
+        empty has none, and the choice there is a metadata GET or silently
+        wrong results.
+
+        The table is reloaded first because this decides whether a read
+        consults the archive at all, and the dangerous direction is a stale
+        "the table has files" on one that has just been emptied — that would
+        drop the archive leg and serve short with no error.
         """
-        return self._buffer.get_meta(FOLLOWED_KEY) is not None
+        if not self._archive.configured() or self.archived_through() == 0:
+            return False
+
+        self._table.reload()
+
+        return self._table.extent() is None
 
     def _archive_extent(self) -> tuple[int, int] | None:
         """The archive's extent, forcing a real re-read, or None if unreachable.

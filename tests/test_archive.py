@@ -139,8 +139,17 @@ def test_a_read_spans_archive_local_and_buffer(
         log.maintain()
 
         assert log.table_files() < before, "eviction must have removed local files"
-        local = log.scan().read_all()
-        assert local.num_rows < ROWS, "the local tier must no longer hold everything"
+        assert log.table_extent() is None, "the fixture must evict the local tier dry"
+
+        # `scan()` reaches the archive of its own accord now. This used to
+        # assert a SHORT read here — that the local tier "no longer holds
+        # everything" — which is the defect rather than the design: a log whose
+        # table is empty has no local rows to serve, so a read that skips the
+        # archive returns a fraction with no error. Measured before the fix,
+        # 476 of 1,500. There is no correct local-only read of this state, so
+        # asking for one is refused rather than answered short.
+        with pytest.raises(ValueError, match="holds no local files"):
+            log.scan(include_archive=False)
 
         merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
         offsets = merged.column(OFFSET).to_pylist()
@@ -228,8 +237,10 @@ def test_hydrate_brings_evicted_files_back_to_local_disk(
         log.sync()
         log.maintain()
 
-        evicted = log.scan().read_all().num_rows
-        assert evicted < ROWS, "the fixture must evict something to test this"
+        assert log.table_extent() is None, "the fixture must evict something"
+        assert log.scan().read_all().num_rows == ROWS, (
+            "an emptied local tier must still serve every row, via the archive"
+        )
 
         log.hydrate(since=timedelta(hours=1))
 
@@ -307,7 +318,7 @@ def test_rewrite_archive_merges_files_left_undersized(
         # and the assertions below pass without reading a rewritten file at
         # all — which is exactly what they did before this line.
         log.maintain()
-        assert log.scan().read_all().num_rows < ROWS, "the read must need S3"
+        assert log.table_extent() is None, "the read must need S3"
 
         remote = log._archive.require()
         before = len(remote.data_files())
@@ -417,7 +428,7 @@ def test_an_interrupted_hydrate_can_be_finished(
         log.seal_due()
         log.sync()
         log.maintain()
-        assert log.scan().read_all().num_rows < ROWS
+        assert log.table_extent() is None, "the fixture must evict the local tier"
 
         archive = log._archive.require()
         real_fetch = archive.fetch
@@ -514,7 +525,7 @@ def test_detaching_and_reattaching_keeps_the_archive(
         log.seal_due()
         log.sync()
         log.maintain()
-        assert log.scan().read_all().num_rows < ROWS, "rows must be archive-only"
+        assert log.table_extent() is None, "rows must be archive-only"
         watermark = log.archived_through()
 
         # The floor comes off BEFORE the detach, which is the documented order
@@ -3296,6 +3307,108 @@ def _replicate(binary: Path, config: Path, s3: S3Options) -> None:
 
 
 @pytest.mark.slow
+def test_an_evicted_log_still_serves_every_row(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A default read must not go short because eviction emptied the table.
+
+    Eviction moves files out of the local table once the archive holds them
+    (I4). A log evicted dry therefore has its rows in exactly one place, and a
+    read that skips the archive returns the unsealed buffer alone — measured
+    before this fix, 476 of 1,500 rows, with no error at all.
+
+    `include_archive` defaults to whether the archive is load-bearing rather
+    than to False, and it is load-bearing exactly when the local table holds
+    nothing and the archive is known to hold something. I5 still holds where it
+    means anything: "a hot read is local disk only" protects a read that HAS
+    local disk to serve, and this one has none.
+
+    Falsify by returning False unconditionally from `_archive_required`: the
+    row count drops to the buffer's share.
+    """
+    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        log.maintain()
+
+        assert log.table_extent() is None, "the fixture must evict the tier dry"
+        assert log.archived_through() > 0
+
+        served = log.scan().read_all().column(OFFSET).to_pylist()
+        assert sorted(served) == list(range(1, ROWS + 1)), (
+            f"an evicted log served {len(served)} of {ROWS} rows"
+        )
+
+        # And a reader on the same root agrees, because it is the same object.
+        with litelink.reader(tmp_path, "s", s3=s3) as view:
+            assert view.scan().read_all().num_rows == ROWS
+
+        # Asking for local-only is refused rather than answered short: there
+        # is no correct local-only read of a log with no local files.
+        with pytest.raises(ValueError, match="holds no local files"):
+            log.scan(include_archive=False)
+
+
+@pytest.mark.slow
+def test_coverage_counts_the_local_tier_between_archive_and_buffer(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`gap` means "cannot serve", and the local table is a tier too.
+
+    `coverage()` arrived for a followed log, whose local table is empty by
+    construction — so "archive frontier up to the buffer's first offset"
+    described everything it could serve. A local log has a third tier in
+    between, and leaving it out reported every offset sealed-but-not-yet-synced
+    as unservable.
+
+    That is not an error state, it is the design: `sync` pushes only
+    well-sized files and eviction closes the distance afterwards, so a healthy
+    archived log is almost always in it. Measured before this fix, a log with
+    `archive=(1, 432)` and a local table of `(1, 10000)` reported
+    `gap=(433, 10000)` while serving all 9,568 of those rows — and a consumer
+    that trusts `gap` and skips it skips rows that exist.
+
+    Falsify by taking `above` from the buffer alone: the gap reappears and
+    covers rows the very next assertion reads back.
+    """
+    with archived_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+
+        # Sealed locally, deliberately NOT synced: the band that used to be
+        # reported as a gap.
+        log.extend(rows(ROWS))
+        log.seal_due()
+
+        archived = log.archived_through()
+        table = log.table_extent()
+        assert archived > 0, "the fixture must publish an archive to compare against"
+        assert table is not None and table[1] > archived, (
+            "the fixture must leave the local table ahead of the archive"
+        )
+
+        coverage = log.coverage()
+        assert coverage.archive is not None
+        assert coverage.gap is None, (
+            f"reported {coverage.gap} unservable while the local table holds "
+            f"{table} — sync lagging the table is the design, not a hole"
+        )
+
+        # The claim under test: it serves every offset it declines to call a
+        # gap, contiguously, including the whole band the old arithmetic
+        # reported as unservable.
+        served = log.scan(include_archive=True).read_all().column(OFFSET).to_pylist()
+        assert sorted(served) == list(range(1, max(served) + 1))
+        assert max(served) >= table[1]
+        assert set(range(archived + 1, table[1] + 1)) <= set(served), (
+            "the band between the archive frontier and the local table's top "
+            "is exactly what used to be reported as a gap"
+        )
+
+
+@pytest.mark.slow
 def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
@@ -3470,11 +3583,20 @@ def test_a_follower_writes_nothing_the_primary_shares(
 
         assert not (root / "litestream.yml").exists()
 
-        # Neither exists on a follower. Gating them was the subclass's job;
-        # wrapping removes them, so there is nothing to call and nothing to
-        # forget to gate.
-        assert not hasattr(follower, "write_replication_config")
-        assert not hasattr(follower, "replication_config")
+        # A followed log refuses these rather than lacking them. They belong
+        # on a reader — generating a config is exactly what you do alongside a
+        # live writer, and reaching for a writer to do it takes both whole-log
+        # claims and can recover another process's in-flight seal. What must
+        # not happen is a FOLLOWER emitting one: `litestream_config` keys each
+        # replica on the path relative to the root, so it would name the
+        # primary's key and ship this scratch copy over the primary's only
+        # off-box record of its unsealed rows.
+        for call in (follower.write_replication_config, follower.replication_config):
+            with pytest.raises(ValueError, match="followed log"):
+                call()
+
+        with pytest.raises(ValueError, match="followed log"):
+            _ = follower.databases
 
         # And the whole write surface is gone with them.
         for absent in ("append", "extend", "seal", "sync", "compact", "evict"):
@@ -3948,6 +4070,10 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         "sort_by",
         "schema",
         "archive",
+        # replicate — refused on a followed log, not absent
+        "databases",
+        "replication_config",
+        "write_replication_config",
         # lifecycle
         "close",
     }
