@@ -1,6 +1,6 @@
 """Building logs and readers.
 
-`log.py` owns what a `WriteHandle` and a `LogReader` *do*; this module owns how they
+`log.py` owns what the handles *do*; this module owns how they
 come to exist. The split is why `litelink.follow` could return something that was
 not a `WriteHandle` and read as though it should — a classmethod names its receiver as
 the thing being built, and four of these build three different types.
@@ -156,10 +156,11 @@ def follow(
     follower appends nothing, so there is nothing to fence and it reserves
     none.
 
-    **The result is an ordinary `LogReader`**, the same type `reader` returns.
+    **The result is a `RemoteReadHandle`**, a sibling of the `LocalReadHandle`
+    that `open(read_only=True)` returns.
     What makes it behave as a follower is its state, not its type: the local
     Iceberg table is empty by construction and the archive is known to hold
-    rows, so `LogReader` derives that the archive is load-bearing and both
+    rows, so `LogHandle` derives that the archive is load-bearing and both
     includes it and refuses to serve without it. A local reader whose table has
     been fully evicted meets the same two conditions and gets the same
     treatment, correctly — it used to serve 476 of 1,500 rows instead.
@@ -363,7 +364,7 @@ def _assemble_follower(
     hint is exactly what it proved.
 
     The local table is created EMPTY and stays that way, which is what makes
-    `LogReader` treat the archive as load-bearing without being told to.
+    `LogHandle` treat the archive as load-bearing without being told to.
     """
     import contextlib
 
@@ -401,7 +402,7 @@ def _assemble_follower(
             # before the first sync. The BUCKET is authoritative and was just
             # read, so record what the archive actually holds.
             #
-            # Not bookkeeping: `LogReader._archive_required` derives "the
+            # Not bookkeeping: `LogHandle._archive_required` derives "the
             # archive is the only source of the archived rows" from this
             # watermark and an empty local table, and a stale 0 makes a
             # follower decide it needs no archive — then serve nothing at all,

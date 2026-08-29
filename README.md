@@ -77,7 +77,7 @@ log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
 log.extend(group_of_rows)                          # append(row) is extend([row])
 
 log = litelink.open("data", "trades")
-reader = litelink.reader("data", "trades")         # alongside a live writer, no write surface
+reader = litelink.open("data", "trades", read_only=True)         # alongside a live writer, no write surface
 
 recent = log.scan(where="event_ts > 1787772776000000").read_all()
 log.maintain()                                     # compact, evict, expire
@@ -150,7 +150,7 @@ with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
     reader.scan(where="side = 0", columns=["event_ts", "price"])
 ```
 
-It never writes anything the primary shares and cannot append — a `LogReader` has no write
+It never writes anything the primary shares and cannot append — a `LogHandle` has no write
 surface at all, rather than one that raises. It is a **snapshot, not a subscription**:
 refreshing means assembling another one, and the root it builds is a temporary directory
 removed on close. `coverage()` is how it stays honest about what it can and cannot serve.

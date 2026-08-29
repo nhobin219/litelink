@@ -3315,6 +3315,78 @@ def _replicate(binary: Path, config: Path, s3: S3Options) -> None:
 
 
 @pytest.mark.slow
+def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A writer's `end_offset` is the sequence; a reader's is the tiers.
+
+    `LogHandle.end_offset` answers "past the last row I can SERVE", which is
+    what a follower needs and what a handle assembled from two tiers can
+    honestly claim. A writer is asked where its next row will land, and only
+    `sqlite_sequence` knows that — it is the thing that assigns it.
+
+    The two coincide on a healthy log and diverge exactly where the local
+    table is empty while the archive holds rows. `restore` is that state by
+    construction: the fence burns `RESTORE_RESERVE` offsets, so the sequence
+    sits 2**20 above the archive's frontier while the rebuilt table is empty.
+
+    Inheriting the reader's answer reported the ARCHIVE's frontier there. A
+    caller reading `end_offset()` as "what comes next" — which is what its
+    docstring and §4's half-open seal ranges promise — would land inside the
+    fence that I9 exists to hold.
+
+    Falsify by deleting `WriteHandle.end_offset`: the writer inherits the
+    reader's version and this fails by about `RESTORE_RESERVE`.
+    """
+    where = f"s3://{bucket}/prefix"
+    second = tmp_path / "second"
+    with archived_log(tmp_path / "first", bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+        # Stand the second box up from a copy of the buffer, the way the
+        # failover tests beside this one do — `restore` needs a replica and
+        # this test is about the arithmetic, not about litestream.
+        (second / "s").mkdir(parents=True)
+        source = sqlite3.connect(Layout(tmp_path / "first", "s").buffer_db)
+        copy = sqlite3.connect(Layout(second, "s").buffer_db)
+        source.backup(copy)
+        source.close()
+        copy.close()
+
+    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
+        assert revived.table_extent() is None, (
+            "a restore rebuilds the local table empty — that is the state where "
+            "the two questions diverge"
+        )
+
+        sequence = revived._buffer.next_offset()  # noqa: SLF001
+        assert sequence > ROWS + RESTORE_RESERVE - 1, "the fence must be in place"
+
+        assert revived.end_offset() == sequence, (
+            f"a writer reported {revived.end_offset()} while its next append "
+            f"lands at {sequence} — inside the fence"
+        )
+
+        # A READER on the same log answers the other question, correctly —
+        # checked BEFORE the append below, which would close the gap by
+        # putting a row at the sequence.
+        with litelink.open(second, "s", read_only=True, s3=s3) as view:
+            served = view.scan().read_all().column(OFFSET).to_pylist()
+            assert view.end_offset() == max(served) + 1
+            assert view.end_offset() < revived.end_offset(), (
+                "the reader reports what it can serve; the writer, where it "
+                "will write — and across a fence they must differ"
+            )
+            assert revived.end_offset() - view.end_offset() >= RESTORE_RESERVE
+
+        # The promise the writer makes, checked directly.
+        assert revived.append(rows(1)[0]) == revived.end_offset() - 1
+
+
+@pytest.mark.slow
 def test_an_evicted_log_still_serves_every_row(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
@@ -4104,14 +4176,30 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
     # gap it could not see is exactly where `scan` lost its swept-snapshot
     # translation — a wrapper intercepts the call it makes, not the dispatch
     # inside it.
-    for shared in ("scan", "sql", "coverage", "end_offset", "close"):
+    for shared in ("scan", "sql", "coverage"):
         assert getattr(WriteHandle, shared) is getattr(LogHandle, shared), (
             f"{shared} is reimplemented rather than inherited"
         )
-        assert (
-            getattr(litelink.RemoteReadHandle, shared) is getattr(LogHandle, shared)
-            or shared == "close"
+        assert getattr(litelink.RemoteReadHandle, shared) is getattr(
+            LogHandle, shared
         ), f"{shared} is reimplemented on the remote handle"
+
+    # Two members are deliberately NOT shared, and both overrides ADD rather
+    # than refuse:
+    #
+    #   `WriteHandle.end_offset` answers a different question — where the next
+    #   append lands, from `sqlite_sequence`, which only a writer can know.
+    #   Inheriting the reader's "past the last row I can serve" made a restored
+    #   log report the archive's frontier while its next append took an offset
+    #   RESTORE_RESERVE higher, inside the fence I9 exists to hold.
+    #
+    #   `RemoteReadHandle.close` extends the base to remove the scratch root it
+    #   owns, and calls `super().close()` to do it.
+    assert WriteHandle.end_offset is not LogHandle.end_offset
+    assert litelink.RemoteReadHandle.close is not LogHandle.close
+    assert litelink.LocalReadHandle.end_offset is LogHandle.end_offset, (
+        "a local reader answers the reader's question"
+    )
 
     # Every subclass ADDS; none refuses. That is the property the earlier
     # shapes kept failing, and it is what makes the hierarchy safe.

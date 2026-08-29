@@ -730,7 +730,7 @@ class LogTable:
         has ALREADY landed. `union_by_name` is a no-op there; `add_column`
         raises `Cannot add column, name already exists` and, because
         `recover()` is unguarded in `open`, would leave the log unopenable by
-        every writer while `litelink.reader` kept working.
+        every writer while a read-only handle kept working.
 
         It stays strict where it matters: a column whose type genuinely
         conflicts is refused with `ValidationError: Cannot change column

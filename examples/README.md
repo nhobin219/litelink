@@ -113,7 +113,7 @@ uv run python examples/adsb/replicate.py --root litelink-data
 Two roles, because there are two kinds of work: **the hot path, and everything else.**
 The writer appends; the maintainer does the rest. Sealing is maintenance, not a third
 role — it is the first thing done with what the writer leaves behind. (A reader is not a
-role: any number may open the log with `litelink.reader`, holding and mutating nothing.)
+role: any number may open the log with `litelink.open(..., read_only=True)`, holding and mutating nothing.)
 
 `demo-capture` seals nothing at all, and that is the point of running it alone first:
 `demo-tail` shows every row in the buffer and none in the table. They are durable and
@@ -185,7 +185,7 @@ than an object in Python, and WAL serialises the processes. Reading is safe for 
 reason — but note that DuckDB must never open the buffer database itself, which
 [`docs/RUNTIME.md`](../docs/RUNTIME.md) explains at some cost.
 
-`adsb/tail.py` opens the same log with `litelink.reader` while the writer runs, and prints where the rows
+`adsb/tail.py` opens the same log with `litelink.open(..., read_only=True)` while the writer runs, and prints where the rows
 are. The column worth watching is the split: rows move from the buffer into the Iceberg
 table at each seal, and the total never double-counts across that boundary because both
 legs derive from one committed extent (§7, I3). It counts in DuckDB rather than

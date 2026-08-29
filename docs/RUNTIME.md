@@ -25,8 +25,8 @@ with what the writer leaves behind: turn the buffer into Parquet. Compaction, ev
 and expiry are what it then does with the files that produces.
 
 A reader is not a role in this sense. Any number of processes may open the log
-with `litelink.reader`; they hold nothing, mutate nothing, and coordinate with
-nobody, and a `LogReader` has no write surface to hold back.
+with `litelink.open(..., read_only=True)`; they hold nothing, mutate nothing, and coordinate with
+nobody, and a `LogHandle` has no write surface to hold back.
 
 **Why the maintainer is a separate process.** A seal is CPU-bound pure Python — most of
 its commit is pyiceberg copying table metadata — so doing it on a *thread* inside the
@@ -135,7 +135,7 @@ Two different things get called "eviction". They happen in different roles:
   Without `wal_replication` they go at step 3 of a seal, once the Iceberg commit has
   landed. With it, the seal keeps them and `sync` drops them once the archive holds the
   range — a seal moves rows into a Parquet file no sidecar replicates, so deleting them
-  earlier removes the only off-box copy (§3a). `Log._discard_on_seal` is the one place
+  earlier removes the only off-box copy (§3a). `WriteHandle._discard_on_seal` is the one place
   that decides. The appending call never does either. The delete takes the write lock
   briefly, so a concurrent append waits for it — but it is a delete by primary key, not
   work proportional to the seal.
@@ -209,11 +209,11 @@ Nothing about correctness depends on it.
 **Concurrency, by axis.** Any number of *processes* may read at once, each with its own
 SQLite and DuckDB connections, sharing only files — which is what WAL is for, and what
 the corruption fix restored by keeping DuckDB out of the buffer database entirely (327
-concurrent scans from a second process, clean). Within one process, each `Log` has its
+concurrent scans from a second process, clean). Within one process, each handle has its
 own `Reader`, so two handles read in parallel; only concurrent `scan()` calls on the
 *same* handle serialise, on that reader's lock.
 
-Making those parallel too — a thread-local DuckDB connection per `Log` — was measured and
+Making those parallel too — a thread-local DuckDB connection per `WriteHandle` — was measured and
 rejected. On a 2-core box DuckDB already uses both cores for a single query, so 1, 2 and
 4 concurrent readers gave 35, 28 and 7 scans/s: more readers, less throughput. It is the
 right lever on many-core hardware and the wrong one here. The SQLite side does not have
@@ -231,7 +231,7 @@ performing. `sealing` belongs to whoever holds the `seal` role and `compacting` 
 whoever holds `maintain`, so each recovers only its own. A holder that exits cleanly
 releases; one that is killed leaves a lease that lapses, after which someone else may
 finish what it started. Owners are UUIDs minted per acquisition, so two threads sharing a
-`Log` are two owners and the row that refuses another process refuses another thread on
+`WriteHandle` are two owners and the row that refuses another process refuses another thread on
 identical terms.
 
 ---
@@ -374,13 +374,13 @@ listed is not one.
 | | |
 |---|---|
 | one writer process per log | §1. Two processes appending to one log is unsupported and unchecked |
-| any number of reader processes | `litelink.reader(root, name)`. They claim nothing and mutate nothing |
+| any number of reader processes | `litelink.open(root, name, read_only=True)`. They claim nothing and mutate nothing |
 | maintainers on disjoint offsets | claims exclude by RANGE, so two passes that cannot touch each other's files run at once; one that finds its range claimed skips it |
 | open the log *after* forking | a SQLite handle does not survive `fork`, and neither does a DuckDB one |
 
 **Between threads, within a process**
 
-Safe to call on one `Log` from any thread, including different threads on different
+Safe to call on one `WriteHandle` from any thread, including different threads on different
 calls:
 
 - `append` / `extend`
@@ -394,7 +394,7 @@ calls:
 - `close`
 
 The first three mutate a SQLite row and a Python object together, and they are the only
-place `Log._lock` still exists. Reconfiguring a log from two threads at once is not a
+place `WriteHandle._lock` still exists. Reconfiguring a log from two threads at once is not a
 scenario worth designing for; corrupting one is not a failure worth allowing.
 
 `close` is different, and deliberately unguarded. It closes the connections, and a lock
@@ -473,7 +473,7 @@ returned **zero** once another query ran. Not perturbed, destroyed. A cursor is 
 independent connection over the same database, with its own registrations and views, and
 costs 0.0055 ms.
 
-**Lock order**, for anyone adding one: `Log._lock` → `Reader._lock` →
+**Lock order**, for anyone adding one: `WriteHandle._lock` → `Reader._lock` →
 {`Archive._lock`, `LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
 acquiring one another, and nothing below reaches back up, so there is no cycle to
 deadlock on. A read takes `Reader._lock` then briefly `LogTable._lock` and
@@ -614,7 +614,7 @@ the un-archived window — which `adsb/tail.py` shows as the gap between `stream
 zero snapshots. Leave it `None` for litestream's own defaults.
 
 **Three databases, not one.** `examples/adsb/replicate.py` generates the config from
-`Log.databases` rather than leaving it to be written by hand, because the set is not
+`LocalReadHandle.databases` rather than leaving it to be written by hand, because the set is not
 obvious and getting it wrong is silent: `buffer.db` holds rows no Parquet file has yet,
 `catalog.db` says which files the local table is made of, and `archive.db` says the same
 for the archive.
@@ -667,19 +667,19 @@ FileNotFoundError: .../orig/litelink/s/metadata/00009-....metadata.json
 `catalog.db` records absolute paths to the local Iceberg metadata, and a sidecar ships the
 `.db` files and nothing else — not that metadata, not the Parquet. So a restored catalog
 points into the dead machine's filesystem. It is not particular to sealed logs either:
-`Log.new` writes a metadata JSON before the first append, so a never-sealed log fails the
+`litelink.new` writes a metadata JSON before the first append, so a never-sealed log fails the
 same way. What the measurement above actually exercised was a restore back onto the SAME
 paths.
 
 Failing over to another box therefore rebuilds the local table rather than restoring it —
-`Log.restore` — and `catalog.db` stays in the replication set because same-machine
+`litelink.restore` — and `catalog.db` stays in the replication set because same-machine
 recovery, where those paths still resolve, is exactly where it is the only record of which
 Parquet the table is made of.
 
 ### Failing over
 
 ```python
-log = Log.restore("/data", "positions", archive="s3://bucket/prefix")
+log = litelink.restore("/data", "positions", archive="s3://bucket/prefix")
 print(log.recovery())      # what came back, and which offsets were skipped
 ```
 

@@ -226,7 +226,7 @@ class Coverage:
 
     Reported rather than enforced. `gap` is a range the reader cannot serve;
     whether that is lost data or a never-issued reserve is a question only the
-    caller can answer — see `LogReader.coverage`. `archive` is None when the
+    caller can answer — see `LogHandle.coverage`. `archive` is None when the
     log has no archive configured.
     """
 
@@ -298,8 +298,17 @@ class LogHandle:
         """The declared clustering (§7), read through like `config`."""
         return self._buffer.sort_by()
 
+    @property
     def schema(self) -> pa.Schema:
-        """The caller's columns, without `litelink_offset` (I11)."""
+        """The caller's columns, as declared at `new`, without the offset (I11).
+
+        `open` takes no schema, so this is the only way to ask a log what shape
+        it is. A property, like `config` and `sort_by` beside it — the refactor
+        that built this class dropped the decorator, and because attribute
+        access still SUCCEEDED it failed silently: callers got a bound method,
+        `if handle.schema:` stayed true, and the break surfaced only where the
+        value was used as a schema.
+        """
         return self._buffer.schema
 
     @property
@@ -344,7 +353,7 @@ class LogHandle:
         """
         return self.sql(
             scan_query(
-                self.schema().names,
+                self.schema.names,
                 columns=columns,
                 where=where,
                 start_offset=start_offset,
@@ -817,7 +826,7 @@ class WriteHandle(LocalReadHandle):
     writes the buffer database, so it is a writer, and two of those is the case
     §1 excludes.
 
-    Construct through `litelink.new`, `open` or `restore`; `litelink.reader`
+    Construct through `litelink.new`, `open` or `restore`; `litelink.open(..., read_only=True)`
     gives a second view alongside a live writer. The initialiser takes already
     built collaborators and does no I/O, so a test can substitute any of them.
     """
@@ -1081,7 +1090,7 @@ class WriteHandle(LocalReadHandle):
         right.
 
         Always recovers, because this always returns a writer. For a second
-        view of a log another process is writing, use `litelink.reader`, which
+        view of a log another process is writing, use `litelink.open(..., read_only=True)`, which
         runs no recovery and has no mutation to refuse — so it cannot disturb
         the single writer §1 assumes.
         """
@@ -1999,6 +2008,40 @@ class WriteHandle(LocalReadHandle):
         """
         return self._buffer.claim(role, lo, hi, new_owner())
 
+    # -- write ---------------------------------------------------------------
+
+    def end_offset(self) -> int:
+        """The offset the next append will receive — an EXCLUSIVE upper bound.
+
+        Half-open, matching the `[start, end)` seal ranges in §4, so this on a
+        fresh log is the first offset it will ever assign and never a sentinel.
+
+        **A writer answers a different question than a reader, and inheriting
+        the reader's answer was wrong twice.** `LogHandle.end_offset` reports
+        the offset after the last row THAT HANDLE CAN SERVE, which is what a
+        follower needs and what a reader assembled from two tiers can honestly
+        claim. A writer is asked where its next row will land, and only
+        `sqlite_sequence` knows that — it is the thing that assigns it.
+
+        The two coincide on a healthy log and diverge exactly where the local
+        table is empty while the archive holds rows:
+
+        - **After `restore`.** The fence reserves `RESTORE_RESERVE` offsets, so
+          the sequence is 1,048,576 above the archive's frontier and the
+          rebuilt local table is empty. The inherited version reported 801
+          where the next append took 1,049,377 — a caller reading it as "what
+          comes next" would collide with the fence I9 exists to hold.
+        - **After `evict` empties the table.** The inherited version reads
+          archive metadata, so a writer's cheapest observation became a
+          network call that RAISES when the bucket is unreachable. It returned
+          3,001 locally before, and could not fail. `docs/API.md` calls
+          `archived_through()` against `end_offset()` the number to alarm on,
+          which made the monitoring call the one that dies in an outage.
+
+        So this reads SQLite and nothing else. It cannot fail and cannot lag.
+        """
+        return self._buffer.next_offset()
+
     def append(self, row: Row) -> int:
         """Append one row. Returns the assigned offset.
 
@@ -2035,7 +2078,7 @@ class WriteHandle(LocalReadHandle):
         # files to compact.
         return self._buffer.append(rows)
 
-    # -- read --------------------------------------------------------------
+    # -- seal ---------------------------------------------------------------
 
     def seal(self) -> int | None:
         """Cut everything buffered into files. Returns the exclusive end offset.
@@ -2237,7 +2280,7 @@ class WriteHandle(LocalReadHandle):
         watching would hang until the timeout, or forever without one, over
         work no survivor was going to do.
 
-        This is a `WriteHandle` method and not a `LogReader` one for that reason: a
+        This is a `WriteHandle` method and not a `LogHandle` one for that reason: a
         reader could only watch, and a watcher that cannot help is the case
         this exists to avoid. It used to branch on `readonly` to decide, which
         is the flag that no longer exists.
@@ -2462,7 +2505,7 @@ class WriteHandle(LocalReadHandle):
             # `acquire()`, this one waits and then RAISES if a maintainer is
             # holding the whole-log range — and `recover()` is unguarded in
             # `open`, so that would fail the open for every writer while
-            # `litelink.reader` kept working. That is the failure this method
+            # `litelink.open(..., read_only=True)` kept working. That is the failure this method
             # exists to avoid; leaving the acquisition outside meant it could
             # still happen, just for a different reason.
             lease = self._claim_settings()
@@ -3409,8 +3452,6 @@ class WriteHandle(LocalReadHandle):
         """
         reject_reserved(name)
         raise NotImplementedError
-
-    # -- lifecycle ---------------------------------------------------------
 
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:

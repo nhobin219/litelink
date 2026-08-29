@@ -4,11 +4,12 @@ Everything public, on one page. [`SPEC.md`](SPEC.md) says what the system is and
 [`RUNTIME.md`](RUNTIME.md) says how it runs; this says what you can call.
 
 ```python
-from litelink import Log, LogConfig, Row, S3Options, __version__
+import litelink
+from litelink import LogConfig, LogHandle, Row, S3Options, WriteHandle, __version__
 ```
 
-Those are the exports. `Log` is the whole object model — there is no session, no client, no
-catalog handle to hold. A log is a directory under a root, named at `Log.new` and opened by
+Those are the exports. The handles are the whole object model — there is no session, no client, no
+catalog handle to hold. A log is a directory under a root, named at `litelink.new` and opened by
 that name for ever after.
 
 **`Row` and `S3Options` are exported because public signatures name them**, and a type a
@@ -25,7 +26,7 @@ that gets copied and attached elsewhere.
 ## Handles, not logs
 
 The log is the directory and the objects in the bucket. These classes are **handles** to it —
-which is why none of them is called `Log`. A class named after the data invites the question
+which is why none of them is called `WriteHandle`. A class named after the data invites the question
 of why a read-only one is a lesser version of it, and `sqlite3` has no `Database` class
 either; it has `Connection`.
 
@@ -132,10 +133,10 @@ Most deployments use six: `new`/`open`, `extend`, `scan`, `seal_due`, `maintain`
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None, s3=None,
-             start_offset=1) -> Log
-litelink.open(root, name, *, s3=None) -> Log
-litelink.reader(root, name, *, s3=None) -> LogReader
-litelink.restore(root, name, *, archive, s3=None, binary=None) -> Log
+             start_offset=1) -> WriteHandle
+litelink.open(root, name, *, s3=None) -> WriteHandle
+litelink.open(root, name, *, read_only=True, s3=None) -> LocalReadHandle
+litelink.restore(root, name, *, archive, s3=None, binary=None) -> WriteHandle
 ```
 
 **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and archive
@@ -182,7 +183,7 @@ log.close() -> None
 `None` on a log opened normally. Those numbers are available nowhere else afterwards.
 
 `close` releases handles. **It does not seal**, and has nothing to stop, because the library
-owns no thread. `Log` is a context manager, and `with` is the same thing.
+owns no thread. `WriteHandle` is a context manager, and `with` is the same thing.
 
 ## Writing
 
@@ -283,7 +284,7 @@ last `sync()`. `litelink.follow` restores the writer's `buffer.db` from its repl
 archive beside it, and merges the two — so freshness falls to the replication lag.
 
 ```python
-litelink.follow(name, *, archive, s3=None, binary=None, scratch_dir=None) -> LogReader
+litelink.follow(name, *, archive, s3=None, binary=None, scratch_dir=None) -> RemoteReadHandle
 ```
 
 ```python
@@ -298,7 +299,7 @@ with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
 own `meta`. It requires a published archive — a log before its first successful sync cannot be
 followed, because serving the buffer alone would silently omit every archived row.
 
-**This returns a `LogReader`, the same type `reader()` does.** It holds the read
+**This returns a `LogHandle`, the same type `reader()` does.** It holds the read
 collaborators — the replicated buffer, the local table, the archive handle, and the reader
 over them — so `append`, `seal`, `sync`, `compact` and `evict` are *absent* rather than
 raising: the writer machinery is not built at all.
@@ -309,7 +310,7 @@ automatically, and `include_archive=False` is **refused** rather than answered s
 reader in the same state — a fully evicted log — gets the same treatment, correctly.
 
 `replication_config`, `write_replication_config` and `databases` are the exception: they exist
-on `LogReader` because generating a sidecar config is exactly what you do beside a live
+on `LogHandle` because generating a sidecar config is exactly what you do beside a live
 writer, but a *followed* log refuses them. `litestream_config` keys each replica on the path
 relative to the root, so a follower would emit the **primary's** key and a sidecar run there
 would ship its scratch copy over the primary's only off-box record of its unsealed rows.
@@ -339,7 +340,7 @@ failure it avoids is silence. The gap it reports sits above the archive's fronti
 the next thing the replica knows of — the buffer's first offset when it holds rows, the
 sequence's end when it does not, so an empty replica still reports the band it cannot serve.
 **A gap there is not necessarily loss**:
-it is either rows the buffer discarded at seal with replication off, or a `Log.restore` fence,
+it is either rows the buffer discarded at seal with replication off, or a `litelink.restore` fence,
 which burns 2**20 offsets in exactly that position — and nothing local tells the two apart. A
 caller who knows whether their log has failed over can read a gap that this cannot.
 
@@ -512,7 +513,7 @@ without `wal_replication`, and `wal_replication` without an archive are each ref
 log.databases -> tuple[Path, ...]
 log.replication_config() -> str
 log.write_replication_config() -> Path
-Log.replication_config_for(root, name, archive, s3=None, retention=None) -> str
+WriteHandle.replication_config_for(root, name, archive, s3=None, retention=None) -> str
 ```
 
 litelink does not run the sidecar — it says what the config has to name. `databases` is the
@@ -546,12 +547,14 @@ the second way a caller could reach it.
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
 `append`, `seal`, `seal_due`, `maintain`, `compact`, `evict`, `expire`, `sync`, `hydrate`,
-`rewrite_archive`, `set_config`, `set_archive` and `set_sort_by` are absent from `LogReader`.
+`rewrite_archive`, `set_config`, `set_archive` and `set_sort_by` are absent from `LogHandle`.
 Everything observational and both read paths are there.
 
-This replaced `Log.open(read_only=True)`, which returned a `Log` whose thirteen write methods
-existed and raised `RuntimeError("this Log was opened readonly")` — the shape Python's own
-`open()` has, where a read-mode file carries a `.write` that raises `UnsupportedOperation`.
+This is the difference from the older `Log.open(read_only=True)`, which returned ONE class
+whose thirteen write methods existed and raised `RuntimeError("this Log was opened
+readonly")`. That is the shape Python's own `open()` has at runtime, where a read-mode file
+carries a `.write` that raises `UnsupportedOperation` — but typeshed types the *constructor*
+with overloads, and so does this, so the misuse is caught before it runs.
 
 **One writer per log.** SQLite's write lock is per file and one process per stream is the
 intended topology; multiple machines write separate logs and readers union.

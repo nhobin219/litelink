@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -1177,3 +1178,67 @@ def test_the_tail_cache_refuses_a_boundary_below_what_it_holds(
 
         assert buffer.rows_above(30).num_rows == 10
         assert buffer.rows_above(0).num_rows == 40
+
+
+def test_the_identity_surface_is_properties_not_methods(tmp_path: Path) -> None:
+    """`schema` lost its `@property` in a refactor and nothing noticed.
+
+    That is the failure mode of a mechanical rewrite, and it is silent: the
+    attribute still resolves, so there is no `AttributeError` at the call site.
+    A caller gets a bound method, `if handle.schema:` stays true, and the break
+    surfaces somewhere else entirely — `pa.Table.from_pylist(rows,
+    schema=handle.schema)` raising `TypeError: Schema must be an instance of
+    pyarrow.Schema`.
+
+    `docs/API.md` distinguishes the two by convention: methods are written with
+    parens, properties without. This asserts the code matches.
+
+    Falsify by removing any of these decorators: the value becomes a bound
+    method and the isinstance check fails.
+    """
+    for name in ("root", "name", "config", "sort_by", "schema", "archive"):
+        for cls in (litelink.LogHandle, WriteHandle):
+            attr = inspect.getattr_static(cls, name)
+            assert isinstance(attr, property), (
+                f"{cls.__name__}.{name} is not a property"
+            )
+
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        assert isinstance(log.schema, pa.Schema)
+        assert isinstance(log.sort_by, tuple)
+        assert isinstance(log.root, Path)
+
+        # The use that failed: it must be usable AS a schema.
+        pa.Table.from_pylist([{"event_ts": 1, "key": "k", "payload": "p"}], log.schema)
+
+
+def test_a_writer_reports_where_its_next_append_lands(tmp_path: Path) -> None:
+    """A writer's `end_offset` is the sequence, never the tiers it can serve.
+
+    `LogHandle.end_offset` answers "past the last row I can SERVE", which is
+    what a follower needs. A writer is asked where its next row will land, and
+    only `sqlite_sequence` knows — it is what assigns it. The two coincide on a
+    healthy log and diverge where the local table is empty while the archive
+    holds rows.
+
+    `restore` is that state by construction: the fence reserves
+    `RESTORE_RESERVE` offsets, so the sequence sits far above the archive's
+    frontier while the rebuilt local table is empty. Inheriting the reader's
+    answer reported 801 where the next append took 1,049,377 — a caller
+    reading it as "what comes next" would collide with the fence I9 exists to
+    hold.
+
+    Falsify by deleting `WriteHandle.end_offset`: the writer inherits the
+    reader's version and this fails by exactly `RESTORE_RESERVE`.
+    """
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        log.extend(rows(5))
+
+        assert log.end_offset() == 6
+        assert log.append({"event_ts": 9, "key": "k", "payload": "p"}) == 6
+        assert log.end_offset() == 7, "it must move with the sequence, not with a tier"
+
+        # And it is a local read: no archive is configured, so nothing here
+        # can reach for one.
+        assert log.archive is None
+        assert log.end_offset() == 7
