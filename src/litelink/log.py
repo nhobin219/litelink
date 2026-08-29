@@ -1069,16 +1069,14 @@ class Log:
             cls._restore_replica(layout, archive, options, binary)
             schema, sort_by, prefix = cls._followed_shape(layout)
             cls._assemble_follower(layout, schema, sort_by, prefix, options)
-            follower = Follower.open(layout.root, name, read_only=True, s3=options)
+            inner = cls.open(layout.root, name, read_only=True, s3=options)
         except BaseException:
             if owned is not None:
                 owned.cleanup()
 
             raise
 
-        follower._owned_root = owned
-
-        return follower
+        return Follower(inner, owned)
 
     @staticmethod
     def _restore_replica(
@@ -3382,15 +3380,59 @@ class Coverage:
     wal_replication: bool
 
 
-class Follower(Log):
-    """A read-only view of someone else's log, assembled by `Log.follow`.
+class Follower:
+    """A read-only view of a log running somewhere else, from `Log.follow`.
 
-    A `Log` subclass rather than a wrapper, so the whole read path is reused.
-    What it changes is the three places where a follower is not an ordinary
-    read-only log.
+    Wraps a `Log` rather than extending one. A follower does three things —
+    read, report what it covers, and go away — and inheriting `Log` gave it a
+    surface carrying `append`, `seal`, `sync`, `compact` and `evict`, every one
+    of them raising. The interface described the base class rather than the
+    thing.
+
+    **Composition also makes two guarantees unrepresentable rather than
+    guarded.** There is no `include_archive` parameter, because a follower's
+    local table is empty by construction and reading without the archive would
+    return the replicated buffer alone — 308 of 800 rows, silently. And there
+    is no `write_replication_config`, because `litestream_config` keys replicas
+    on the path relative to the root, so a follower's config would name the
+    PRIMARY's replica key. Neither needs a refusal now: there is nothing to
+    call.
+
+    The cost is that `scan` and `sql` are hand-written delegations that could
+    drift from `Log`'s, which a test pins.
     """
 
-    _owned_root: tempfile.TemporaryDirectory[str] | None = None
+    def __init__(
+        self, log: Log, owned: tempfile.TemporaryDirectory[str] | None
+    ) -> None:
+        self._log = log
+        self._owned_root = owned
+
+    @property
+    def root(self) -> Path:
+        """Where this follower was assembled. Scratch unless `root` was given."""
+        return self._log.root
+
+    @property
+    def name(self) -> str:
+        return self._log.name
+
+    @property
+    def config(self) -> LogConfig:
+        """The followed log's policy, as its replica recorded it."""
+        return self._log.config
+
+    @property
+    def sort_by(self) -> tuple[str, ...]:
+        return self._log.sort_by
+
+    def end_offset(self) -> int:
+        """The offset after the last row this follower can see.
+
+        The affordance for measuring staleness: compare it against the
+        primary's. This makes no promise about the distance — it cannot ask.
+        """
+        return self._log.end_offset()
 
     def scan(
         self,
@@ -3399,26 +3441,15 @@ class Follower(Log):
         where: str | None = None,
         start_offset: int | None = None,
         end_offset: int | None = None,
-        include_archive: bool = True,
     ) -> pa.RecordBatchReader:
-        """As `Log.scan`, but the archive is not optional here.
+        """Read the merged view: the archive plus the replicated tail.
 
-        `Log` defaults `include_archive=False` because an ordinary log's local
-        Iceberg table holds the sealed history. **A follower's local table is
-        empty by construction** — `LogTable.create` makes it and nothing ever
-        registers a file into it — so that default would return the buffer leg
-        alone. Measured on an assembled follower: 308 of 800 rows, silently.
-
-        Refused rather than honoured when False, because on a follower it can
-        only mean "serve the tail and hide the rest". A caller who wants the
-        unsealed tail alone is asking for something else.
+        `Log.scan`'s `include_archive` is absent deliberately — see the class
+        docstring. Everything else passes through.
         """
-        # No `_followed_extent` here: `Log.scan` delegates to `self.sql`, which
-        # is this class's override, so the check and the translation happen
-        # once rather than paying two metadata reads per scan.
-        self._refuse_partial(include_archive=include_archive)
+        self._checked_extent()
 
-        return super().scan(
+        return self._log.scan(
             columns=columns,
             where=where,
             start_offset=start_offset,
@@ -3426,68 +3457,55 @@ class Follower(Log):
             include_archive=True,
         )
 
-    def sql(self, query: str, *, include_archive: bool = True) -> pa.RecordBatchReader:
-        """As `Log.sql`, with the same default and the same refusal as `scan`.
-
-        Both, not just `scan`: `sql` is public and carries the same
-        `include_archive=False` default, so overriding one would leave the
-        other serving the buffer alone.
-        """
-        self._refuse_partial(include_archive=include_archive)
-        self._followed_extent()
+    def sql(self, query: str) -> pa.RecordBatchReader:
+        """Arbitrary DuckDB SQL against the merged view, exposed as `log`."""
+        self._checked_extent()
 
         try:
-            return super().sql(query, include_archive=True)
+            return self._log.sql(query, include_archive=True)
         except FileNotFoundError as exc:
-            # Narrow, and narrower than an earlier version of this comment
-            # claimed. It covers the race where the primary sweeps the
-            # metadata JSON between `_followed_extent`'s reload and
-            # `_prepare_remote`'s own read — pyiceberg raises
-            # `FileNotFoundError` there.
+            # Narrow: the race where the primary sweeps the metadata JSON
+            # between `_checked_extent`'s reload and `_prepare_remote`'s read.
+            # pyiceberg raises `FileNotFoundError` there.
             #
             # It does NOT cover the archive's data files or manifests. Within
             # this call those are DuckDB's to read — pyiceberg reads manifests
             # too, but only when `metadata_location` changes, and a follower's
-            # is pinned, so `_prepare_remote` always finds that cache warm.
-            # A missing data file surfaces
-            # as `HTTPException`, and a missing manifest aborts the process
-            # outright — DuckDB's iceberg extension calls `std::terminate`,
-            # which is pre-existing and reaches a plain `Log` reading its own
-            # archive too. Neither is catchable here, and both happen before
-            # any row is served, so nothing is short — but do not read this
-            # handler as covering them.
+            # is pinned, so `_prepare_remote` always finds that cache warm. A
+            # missing data file surfaces as `HTTPException` raised inside
+            # `execute`, and a missing manifest aborts the process outright:
+            # DuckDB's iceberg extension calls `std::terminate`, which is
+            # pre-existing and reaches a plain `Log` reading its own archive
+            # too. Neither is catchable here, and both happen before any row is
+            # served — but do not read this handler as covering them.
             #
-            # Two earlier versions of this comment claimed otherwise, and a
-            # third put the data-file failure at `read_all()`. It is raised
-            # inside `execute`, and `scan` appends an ORDER BY that forces
-            # materialisation there regardless.
+            # Three earlier versions of this comment claimed otherwise.
             #
             # The cold missing-manifest case IS caught, earlier, by the handler
             # around `adopted.extent()`.
             raise self._swept(exc) from exc
 
     def coverage(self) -> Coverage:
-        """What this follower can actually serve, and where it cannot.
+        """What this follower can serve, and where it cannot.
 
-        A follower is assembled from two tiers and can only report what they
-        hold — it cannot ask the primary. So it reports rather than adjudicates,
-        because the failure to avoid is SILENCE, not incompleteness.
+        A follower is assembled from two tiers and cannot ask the primary, so
+        it reports rather than adjudicates — the failure to avoid is SILENCE,
+        not incompleteness.
 
-        **A gap here is not necessarily loss.** An offset range in neither tier
-        is either a band the buffer lost — rows sealed while `wal_replication`
-        was off are discarded at seal and gone for ever — or a reserve that was
-        never issued, which `Log.restore` creates 2**20 of and `start_offset`
-        creates on purpose. Nothing distinguishes them from a replica: the
-        reserve "leaves no trace once the sequence has moved". A caller who
-        knows whether their log has ever failed over can read a gap that this
-        cannot.
+        **A gap is not necessarily loss.** An offset range in neither tier is
+        either a band the buffer lost — rows sealed while `wal_replication` was
+        off are discarded at seal and gone — or a reserve that was never
+        issued, which `Log.restore` creates 2**20 of and `start_offset` creates
+        on purpose. Nothing distinguishes them from a replica: the reserve
+        "leaves no trace once the sequence has moved". A caller who knows
+        whether their log has failed over can read a gap that this cannot.
 
-        That is also why an earlier design refusing to open on a gap was wrong:
-        it refused every followed log that had failed over, on a million
-        offsets that never existed.
+        That is why an earlier design refusing to open on a gap was wrong: it
+        refused every followed log that had failed over, on a million offsets
+        that never existed.
         """
-        archive = self._followed_extent()
-        buffered = self._buffer.extent()
+        archive = self._checked_extent()
+        buffered = self._log._buffer.extent()  # noqa: SLF001
         gap: tuple[int, int] | None = None
         if buffered is not None and buffered[0] > archive[1] + 1:
             gap = (archive[1] + 1, buffered[0] - 1)
@@ -3496,42 +3514,50 @@ class Follower(Log):
             archive=archive,
             buffered=buffered,
             gap=gap,
-            wal_replication=self.config.wal_replication,
+            wal_replication=self._log.config.wal_replication,
         )
 
-    def _followed_extent(self) -> tuple[int, int]:
+    def close(self) -> None:
+        """Close, and remove the scratch root if this made one."""
+        try:
+            self._log.close()
+        finally:
+            owned, self._owned_root = self._owned_root, None
+            if owned is not None:
+                owned.cleanup()
+
+    def __enter__(self) -> Follower:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _checked_extent(self) -> tuple[int, int]:
         """The adopted archive's extent, or a refusal saying to reassemble.
 
         **Two failures, and neither may be silent.** `Archive.table()` returns
-        None when the catalog row is gone, and `_union` would then quietly fall
+        None when the catalog row is gone, and the read would then quietly fall
         to the buffer leg — on a follower, whose local table is empty, that is
         every archived row missing with no error.
 
-        And the adopted metadata is PINNED at assembly: `reload()` re-reads this
-        follower's own `archive.db` row, which nothing updates. The archive's
-        `previous-versions-max` is 10, so ten further primary commits delete the
-        object this names — with no time component, which on a busy log is
-        minutes. `coverage()` would otherwise keep reporting a healthy,
-        gap-free follower against a snapshot it can no longer read, while every
-        scan raised. The honesty guarantee lying is the worst failure available
-        to this design, so both paths fail the same way.
+        And the adopted metadata is PINNED at assembly, so this must force a
+        re-read. Without `reload()` it is an in-memory replay: `Archive.table`
+        short-circuits on a cached handle and `LogTable.extent` on an unchanged
+        `metadata_location`, so neither touches the network and the guard below
+        is unreachable on any follower that has read once. `coverage()` would
+        go on reporting a healthy, gap-free follower against a snapshot the
+        primary has already swept — the honesty guarantee lying, which is this
+        design's worst failure.
+
+        The archive carries `previous-versions-max: 10`, so ten further primary
+        commits delete the object this names, with no time component at all.
+        One metadata GET, and it cannot change what reads serve: it re-reads
+        this follower's own `archive.db` row, which nothing updates.
         """
+        archive = self._log._archive  # noqa: SLF001
         try:
-            adopted = self._archive.table(repair=False)
+            adopted = archive.table(repair=False)
             if adopted is not None:
-                # **The re-read is the detector.** Without it this method is an
-                # in-memory replay: `Archive.table` short-circuits on a cached
-                # handle and `LogTable.extent` on an unchanged
-                # `metadata_location`, so neither touches the network and the
-                # `FileNotFoundError` below is unreachable on any follower that
-                # has read once. `coverage()` would then keep reporting a
-                # healthy, gap-free follower against a snapshot the primary has
-                # already swept — which is this design's worst failure, the
-                # honesty guarantee lying.
-                #
-                # One metadata GET, and it cannot change what reads serve: it
-                # re-reads this follower's own `archive.db` row, which nothing
-                # updates after adoption.
                 adopted.reload()
         except FileNotFoundError as exc:
             raise self._swept(exc) from exc
@@ -3551,8 +3577,8 @@ class Follower(Log):
 
         if extent is None:
             msg = (
-                f"the archive at {self._archive.uri!r} reports no extent; there is "
-                f"nothing for this follower to merge"
+                f"the archive at {archive.uri!r} reports no extent; there is nothing "
+                f"for this follower to merge"
             )
             raise RuntimeError(msg)
 
@@ -3564,60 +3590,6 @@ class Follower(Log):
             f"committed past it ({exc}). A follower is a snapshot, not a "
             f"subscription: reassemble with `Log.follow`"
         )
-
-    @staticmethod
-    def _refuse_partial(*, include_archive: bool) -> None:
-        if not include_archive:
-            msg = (
-                "a follower cannot read without the archive: its local table is "
-                "empty by construction, so this would return the replicated "
-                "buffer alone and silently omit every archived row"
-            )
-            raise ValueError(msg)
-
-    def replication_config(self) -> str:
-        """Refused too: this is what `write_replication_config` withholds.
-
-        Gating only the writer leaves the door half closed. This method
-        produces the payload — a config naming the PRIMARY's replica key, for
-        this follower's stripped scratch buffer — and it is public and
-        documented, so a caller can obtain the string and write it themselves.
-        """
-        raise self._refuse_config()
-
-    def write_replication_config(self) -> Path:
-        """Refused on a follower, and only on a follower.
-
-        `litestream_config` keys each replica on the path RELATIVE to the root,
-        so a follower with the same log name writes a config naming the
-        PRIMARY's replica key. Running a sidecar against it would ship this
-        stripped scratch copy over the primary's only off-box record of its
-        unsealed rows.
-
-        Gated here rather than on `readonly`, which would be the obvious place
-        and is wrong: `examples/adsb/replicate.py` deliberately opens a log
-        read-only to generate its config, precisely so a config generator does
-        not take the write lock alongside a live writer.
-        """
-        raise self._refuse_config()
-
-    def _refuse_config(self) -> ValueError:
-        return ValueError(
-            f"{self.root}/{self.name} is a follower, and its replication config "
-            f"would name the primary's replica path — pointing a sidecar at it "
-            f"would ship this scratch copy over the primary's only off-box "
-            f"record of its unsealed rows. Generate it from the log being "
-            f"replicated instead"
-        )
-
-    def close(self) -> None:
-        """Close, and remove the scratch root if this made one."""
-        try:
-            super().close()
-        finally:
-            owned, self._owned_root = self._owned_root, None
-            if owned is not None:
-                owned.cleanup()
 
 
 def _intent(name: str, type_: pa.DataType) -> str:

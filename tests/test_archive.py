@@ -10,6 +10,7 @@ three tiers that only means anything when one of them is genuinely remote.
 
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 import sqlite3
@@ -34,7 +35,7 @@ from litelink._table import (
     _recorded_location,
     forget_archive_entry,
 )
-from litelink.log import OFFSET, RESTORE_RESERVE, table_schema
+from litelink.log import OFFSET, RESTORE_RESERVE, Follower, table_schema
 from tests.conftest import filesystem
 
 pytestmark = pytest.mark.s3
@@ -3399,14 +3400,15 @@ def test_a_follower_refuses_to_read_without_the_archive(
     _replicate(binary, replication, s3)
 
     with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        # Unrepresentable rather than refused: a `Follower` wraps a `Log`, it
+        # does not extend one, so the parameter simply is not there.
         for call in (
-            lambda: follower.scan(include_archive=False),
-            lambda: follower.sql("SELECT 1 FROM log", include_archive=False),
+            lambda: follower.scan(include_archive=False),  # ty: ignore[unknown-argument]
+            lambda: follower.sql("SELECT 1 FROM log", include_archive=False),  # ty: ignore[unknown-argument]
         ):
-            with pytest.raises(ValueError, match="cannot read without the archive"):
+            with pytest.raises(TypeError, match="include_archive"):
                 call()
 
-        # And the default really does include it.
         assert follower.scan().read_all().num_rows > 0
 
 
@@ -3463,13 +3465,15 @@ def test_a_follower_writes_nothing_the_primary_shares(
 
         assert not (root / "litestream.yml").exists()
 
-        # Both, not just the writer: `replication_config` produces the payload
-        # the writer withholds, and it is public and documented.
-        with pytest.raises(ValueError, match="is a follower"):
-            follower.write_replication_config()
+        # Neither exists on a follower. Gating them was the subclass's job;
+        # wrapping removes them, so there is nothing to call and nothing to
+        # forget to gate.
+        assert not hasattr(follower, "write_replication_config")
+        assert not hasattr(follower, "replication_config")
 
-        with pytest.raises(ValueError, match="is a follower"):
-            follower.replication_config()
+        # And the whole write surface is gone with them.
+        for absent in ("append", "extend", "seal", "sync", "compact", "evict"):
+            assert not hasattr(follower, absent), f"a follower exposes {absent}"
 
     assert sorted(fs.find(f"{bucket}/follow-readonly")) == before
     assert not root.exists(), "the scratch root outlived the follower"
@@ -3658,3 +3662,30 @@ def test_a_follow_refuses_a_root_that_holds_a_table(
         Log.follow("s", archive=where, s3=s3, binary=str(binary), root=victim)
 
     assert LogTable.load(Layout(victim, "s"), readonly=True).metadata_location == before
+
+
+def test_a_follower_delegates_the_whole_read_signature() -> None:
+    """Composition's one real cost, pinned.
+
+    `Follower.scan` is hand-written delegation, so it can drift from
+    `Log.scan` — a parameter added there would silently not reach a follower,
+    and the caller would get a `TypeError` naming an argument the docs say
+    exists. Inheriting would have kept them in step for free; this is what is
+    paid instead, and it is cheaper than the interface inheritance imposed.
+
+    `include_archive` is deliberately absent: a follower's local table is empty
+    by construction, so reading without the archive would return the buffer
+    alone. Unrepresentable rather than refused.
+    """
+    followed = set(inspect.signature(Follower.scan).parameters) - {"self"}
+    logged = set(inspect.signature(Log.scan).parameters) - {"self"}
+
+    assert followed == logged - {"include_archive"}, (
+        "Follower.scan has drifted from Log.scan"
+    )
+
+    assert set(inspect.signature(Follower.sql).parameters) - {"self"} == {"query"}
+
+    # The write surface is not merely refused, it is absent.
+    for absent in ("append", "extend", "seal", "sync", "maintain", "set_config"):
+        assert not hasattr(Follower, absent), f"Follower exposes {absent}"

@@ -334,6 +334,63 @@ a measurement disproved it: `catalog.db` records absolute paths to local Iceberg
 that no sidecar replicates, so restoring the databases onto another machine and opening
 the log fails outright. See §3a's failover notes and `Log.restore`.
 
+## 3b. Reading a log from another machine
+
+`Log.follow` assembles a **read-only view of a log running somewhere else**: the archive
+merged with a restored copy of the writer's `buffer.db`, so a reader sees data fresher than
+the archive alone — down to the replication lag rather than to the seal cadence. It is what
+§3a's replication buys on the read side, and it exists because the alternative readers had
+was the archive, which is `sync`-fresh at best.
+
+**It is `restore`'s assembly without the takeover.** `restore` burns `RESTORE_RESERVE`
+offsets to fence a machine that may still be writing (I9); a follower appends nothing, so
+there is nothing to fence and it reserves none. It opens read-only, which is also what keeps
+`recover()` from finishing a seal the primary owns.
+
+**A snapshot, not a subscription.** litestream restores to a point in time, so refreshing
+means assembling another one. That is why the root defaults to a temporary directory the
+follower owns and removes on close: it is scaffolding for one read session, not a durable
+artefact. The archive metadata is pinned at assembly for the same reason — and because
+`previous-versions-max: 10` means ten further primary commits delete the metadata object a
+follower is holding, **with no time component at all**. A busy primary can sweep a follower
+in seconds. Every read therefore re-reads that pointer and refuses with "reassemble" rather
+than serving from a snapshot that is gone.
+
+**Two things are unrepresentable rather than refused**, which is why `Follower` wraps a
+`Log` instead of extending one:
+
+- **There is no `include_archive=False`.** A follower's local Iceberg table is empty by
+  construction — `_assemble_follower` creates it that way — so reading without the archive
+  returns the replicated buffer alone: a fraction of the log, silently. As a subclass this
+  was a parameter that had to raise; wrapping deletes it.
+- **There is no `write_replication_config`.** `litestream_config` keys each replica on the
+  path *relative to the root*, so a follower with the same log name produces a key identical
+  to the primary's. A sidecar run in a follower's root — which this project's own convention
+  says to do — would ship the follower's stripped scratch copy over the primary's only
+  off-box record of its unsealed rows. `_restore_replica` keeps the config it needs in a
+  temporary directory of its own for the same reason.
+
+**`coverage()` reports, it does not adjudicate.** A follower is assembled from two tiers and
+cannot ask the primary anything, so the failure to avoid is silence, not incompleteness. It
+returns the archive extent, the buffered extent, the gap between them if any, and whether
+the followed log declared `wal_replication`.
+
+**A gap is not necessarily loss**, and nothing local can tell the two apart. An offset range
+in neither tier is either a band the buffer lost — rows sealed while `wal_replication` was
+off are discarded at seal and gone — or a reserve that was never issued, which `Log.restore`
+creates 2**20 of and `start_offset` creates on purpose. From a replica they are
+indistinguishable: the reserve "leaves no trace once the sequence has moved" (§13.4). A
+caller who knows whether their log has failed over can read a gap that this cannot, so it
+reports the gap and lets them.
+
+An earlier design refused to open on a gap. It was wrong for exactly this reason: it refused
+every followed log that had ever failed over, on a million offsets that never existed.
+
+**It requires a published archive.** `archive_extent` returns None both for "nothing pushed"
+and for "a hint over an empty table", so a log before its first successful sync cannot be
+followed. Serving the buffer alone instead would be a reader silently missing every archived
+row — the one failure this must not have.
+
 ## 4. Seal
 
 Triggered on `min(target_seal_size, target_seal_rows)`, evaluated by the writer at commit
