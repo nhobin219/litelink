@@ -23,6 +23,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
+import litelink
 from litelink import Log, LogConfig
 from litelink._archive import Archive
 from litelink._buffer import Buffer
@@ -36,7 +37,7 @@ from litelink._table import (
     _recorded_location,
     forget_archive_entry,
 )
-from litelink.log import OFFSET, RESTORE_RESERVE, Follower, table_schema
+from litelink.log import OFFSET, RESTORE_RESERVE, LogReader, table_schema
 from tests.conftest import filesystem
 
 pytestmark = pytest.mark.s3
@@ -672,7 +673,7 @@ def test_a_read_never_repairs_the_archive_catalog(
     with Log.open(tmp_path, "s", s3=s3) as writer:
         writer._buffer.set_meta("archive", second)
 
-    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+    with litelink.reader(tmp_path, "s", s3=s3) as reader:
         with pytest.raises(ValueError, match="not under"):
             reader._archive.table()
 
@@ -717,7 +718,7 @@ def test_a_repoint_leaves_reads_working(
 
         log.set_archive(f"s3://{bucket}/moved")
 
-    with Log.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+    with litelink.reader(tmp_path, "s", s3=s3) as reader:
         merged = reader.sql("SELECT * FROM log", include_archive=True).read_all()
 
         assert merged.num_rows == ROWS, "a re-pointed log must still be readable"
@@ -3141,7 +3142,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     # The row survives, so the local files are still referenced and the log
     # still reads. Before this, `Log.open` answered "use new() to create one".
     assert LogTable.exists_for(Layout(tmp_path, "s"))
-    with Log.open(tmp_path, "s", s3=s3, read_only=True) as reopened:
+    with litelink.reader(tmp_path, "s", s3=s3) as reopened:
         assert reopened.scan(include_archive=True).read_all().num_rows == readable
 
 
@@ -3340,7 +3341,7 @@ def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
 
     _replicate(binary, replication, s3)
 
-    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         got = follower.scan().read_all()
         offsets = got.column(OFFSET).to_pylist()
 
@@ -3400,14 +3401,17 @@ def test_a_follower_refuses_to_read_without_the_archive(
 
     _replicate(binary, replication, s3)
 
-    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
-        # Unrepresentable rather than refused: a `Follower` holds the read
-        # collaborators, not a `Log`, so the parameter simply is not there.
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        # Refused, not absent. Unifying the two read-only shapes into one
+        # `LogReader` means the parameter has to exist for the local case,
+        # where a hot read is local disk only (I5). This is the cost, and it
+        # is named in `LogReader`'s docstring: a followed log's table is empty
+        # by construction, so asking to skip the archive raises.
         for call in (
-            lambda: follower.scan(include_archive=False),  # ty: ignore[unknown-argument]
-            lambda: follower.sql("SELECT 1 FROM log", include_archive=False),  # ty: ignore[unknown-argument]
+            lambda: follower.scan(include_archive=False),
+            lambda: follower.sql("SELECT 1 FROM log", include_archive=False),
         ):
-            with pytest.raises(TypeError, match="include_archive"):
+            with pytest.raises(ValueError, match="holds no local files"):
                 call()
 
         assert follower.scan().read_all().num_rows > 0
@@ -3460,7 +3464,7 @@ def test_a_follower_writes_nothing_the_primary_shares(
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-readonly"))
 
-    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         follower.scan().read_all()
         root = follower.root
 
@@ -3521,7 +3525,7 @@ def test_a_follower_refuses_an_archive_that_has_published_nothing(
     before = sorted(fs.find(f"{bucket}/follow-unpublished"))
 
     with pytest.raises(ValueError, match="published nothing yet"):
-        Log.follow("s", archive=where, s3=s3, binary=str(binary))
+        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
 
     assert sorted(fs.find(f"{bucket}/follow-unpublished")) == before, (
         "a reader wrote into the archive"
@@ -3577,7 +3581,7 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
 
     _replicate(binary, replication, s3)
 
-    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Warm both caches, which is what makes the naive detector unreachable.
         assert follower.scan().read_all().num_rows > 0
         assert follower.coverage().gap is None
@@ -3671,7 +3675,7 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
         log.maintain()
         log.sync()
 
-    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         served = follower.scan().read_all().column(OFFSET).to_pylist()
         assert served, "the fixture must serve rows for this to mean anything"
 
@@ -3763,7 +3767,7 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
 
     # The control first, so a failure here means the fixture is wrong rather
     # than the code: a non-empty buffer always reported this band correctly.
-    with Log.follow(
+    with litelink.follow(
         "s", archive=build("ctl", unsealed=40), s3=s3, binary=str(binary)
     ) as control:
         served = control.scan().read_all().column(OFFSET).to_pylist()
@@ -3771,7 +3775,7 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
         assert control.coverage().gap is not None
         assert control.end_offset() == max(served) + 1
 
-    with Log.follow(
+    with litelink.follow(
         "s", archive=build("empty", unsealed=0), s3=s3, binary=str(binary)
     ) as follower:
         served = follower.scan().read_all().column(OFFSET).to_pylist()
@@ -3818,7 +3822,7 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
     §3b promises refuses with "reassemble". A caller looping
     `except RuntimeError: reassemble` crashed rather than recovering.
 
-    Falsify by narrowing `Follower._guarded` back to `sql` alone: `sql` still
+    Falsify by narrowing `LogReader._guarded` back to `sql` alone: `sql` still
     refuses and `scan` raises `FileNotFoundError`.
     """
     binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
@@ -3863,7 +3867,7 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
 
     monkeypatch.setattr(Reader, "_prepare_remote", sweeping)
 
-    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Warm every cache first, so the guard alone cannot be what fires.
         assert follower.scan().read_all().num_rows > 0
 
@@ -3888,21 +3892,19 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
 
 
 def test_a_follower_delegates_the_whole_read_signature() -> None:
-    """The cost of not inheriting, pinned.
+    """`Log` delegates its reads; the signatures must not drift.
 
-    `Log` and `Follower` reach the same reader by different routes — `Log.scan`
-    through `Log.sql`, `Follower.scan` through `Reader` directly — and both
-    build their query with `scan_query`. Nothing keeps their signatures in
-    step, so a parameter added to one would silently not reach the other and a
-    caller would get a `TypeError` naming an argument the docs say exists.
-    Inheriting kept them aligned for free; this assertion is what is paid
-    instead, and it is cheaper than the interface inheritance imposed.
+    `Log` holds a `LogReader` and passes every read through to it, so the two
+    signatures have to match exactly — a parameter added to one and not the
+    other would be a caller getting a `TypeError` naming an argument the docs
+    say exists. Delegation is hand-written, so nothing enforces it but this.
 
-    `include_archive` is deliberately absent: a follower's local table is empty
-    by construction, so reading without the archive would return the buffer
-    alone. Unrepresentable rather than refused.
+    `include_archive` is present on both now. Unifying the two read-only
+    shapes means the parameter has to exist for the local case; a followed log
+    refuses it rather than not having it, which is the cost recorded in
+    `LogReader`'s docstring.
     """
-    taken = set(inspect.signature(Log.follow).parameters) - {"cls"}
+    taken = set(inspect.signature(litelink.follow).parameters)
     assert taken == {"name", "archive", "s3", "binary", "scratch_dir"}
     assert "root" not in taken, (
         "a caller-supplied root can land on a directory that already holds a "
@@ -3911,38 +3913,70 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         "bucket's own hint. Both were unreachable once the parameter went"
     )
 
-    followed = set(inspect.signature(Follower.scan).parameters) - {"self"}
+    followed = set(inspect.signature(LogReader.scan).parameters) - {"self"}
     logged = set(inspect.signature(Log.scan).parameters) - {"self"}
 
-    assert followed == logged - {"include_archive"}, (
-        "Follower.scan has drifted from Log.scan"
-    )
-
-    assert set(inspect.signature(Follower.sql).parameters) - {"self"} == {"query"}
+    assert followed == logged, "LogReader.scan has drifted from Log.scan"
+    assert set(inspect.signature(LogReader.sql).parameters) - {"self"} == set(
+        inspect.signature(Log.sql).parameters
+    ) - {"self"}
 
     # The write surface is not merely refused, it is absent.
     for absent in ("append", "extend", "seal", "sync", "maintain", "set_config"):
-        assert not hasattr(Follower, absent), f"Follower exposes {absent}"
+        assert not hasattr(LogReader, absent), f"LogReader exposes {absent}"
 
     # And the surface is exactly this, because `docs/API.md` prints it as
     # "the whole of it". A member added here without updating that table
     # makes the documented surface a lie, which this catches.
-    assert {n for n in vars(Follower) if not n.startswith("_")} == {
+    assert {n for n in vars(LogReader) if not n.startswith("_")} == {
+        # read
         "scan",
         "sql",
+        # observe
         "coverage",
         "end_offset",
+        "buffered_rows",
+        "table_rows",
+        "table_files",
+        "table_extent",
+        "archived_through",
+        "archive_files",
+        # identity
         "root",
         "name",
         "config",
         "sort_by",
+        "schema",
+        "archive",
+        # lifecycle
         "close",
     }
+
+    # Every one of those is on `Log` too, because `Log` delegates to it. A
+    # reader that could answer something a log could not would mean the
+    # decomposition had leaked.
+    for member in vars(LogReader):
+        # `root` and `name` are instance attributes on `Log`, set in its
+        # `__init__`, so they are not visible on the class.
+        if not member.startswith("_") and member not in {"root", "name"}:
+            assert hasattr(Log, member), f"Log cannot answer {member}"
+
+    # And the write surface is on `Log` alone — the flag that used to gate it
+    # is gone, so there is nothing to open readonly and nothing to raise.
+    for absent in ("append", "extend", "seal", "sync", "maintain", "set_config"):
+        assert not hasattr(LogReader, absent), f"LogReader exposes {absent}"
+
+    assert not hasattr(Log, "readonly"), "the read_only flag survived"
+    assert "read_only" not in inspect.signature(Log.open).parameters
 
     # And it builds from the read collaborators alone. Passing a `Log` in was
     # the previous shape, and the one that produced both of this class's bugs:
     # a follower that holds a `Log` inevitably asks it questions it answers for
     # a writer, and routes reads through dispatch it cannot intercept.
-    taken = set(inspect.signature(Follower.__init__).parameters) - {"self"}
-    assert taken == {"layout", "buffer", "archive", "reader", "owned"}
-    assert "log" not in taken
+    taken = set(inspect.signature(LogReader.__init__).parameters) - {"self"}
+    assert taken == {"layout", "table", "buffer", "archive", "reader", "owned"}
+    assert "log" not in taken, (
+        "a reader that holds a Log asks it questions it answers for a writer, "
+        "and routes reads through dispatch it cannot intercept — both bugs "
+        "this class shipped came from exactly that"
+    )

@@ -22,31 +22,100 @@ non-AWS endpoint or an explicit key. It is deliberately not part of `LogConfig`,
 `LogConfig` is persisted into the log directory and a secret must not travel with something
 that gets copied and attached elsewhere.
 
+## Two objects, four constructors
+
+`Log` writes. `LogReader` is everything you can ask a log **without** writing to it. Which
+one you get is decided by the constructor you call — there is no mode argument, and
+`Log.open(read_only=True)` is gone along with the flag. It used to return a `Log` whose
+thirteen write methods existed and raised `"this Log was opened readonly"`; a `LogReader`
+has no write surface to raise from.
+
+```python
+litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
+             s3=None, start_offset=1)            -> Log         # create
+litelink.open(root, name, *, s3=None)            -> Log         # write to an existing log
+litelink.reader(root, name, *, s3=None)          -> LogReader   # read one on THIS machine
+litelink.follow(name, *, archive, s3=None,
+                binary=None, scratch_dir=None)   -> LogReader   # read one on ANOTHER machine
+```
+
+They live in `litelink._assembly` and are exported from the package. `Log.new`/`Log.open`/
+`Log.restore` still exist and do the same thing; the module-level names are preferred because
+a classmethod names its receiver as the thing being built, and `Log.follow` returning a
+`LogReader` read as though it should return a `Log`.
+
+### The local/remote boundary is the constructor, not an argument
+
+This is the distinction worth internalising, because everything else follows from it:
+
+| | `reader(root, name)` | `follow(name, archive=…)` |
+|---|---|---|
+| **what you pass** | a root **on this machine** | an **archive URI**, and no root |
+| **where the data is** | the log's own directory | object storage + a restored replica |
+| **the buffer** | the writer's live `buffer.db` | a litestream restore of it |
+| **the local Iceberg table** | the writer's, filling as it seals | created **empty**, never filled |
+| **freshness** | live — sees commits as they land | a **snapshot**, as of the restore |
+| **refreshing** | nothing to do | assemble another one |
+| **archive** | optional; a hot read is local disk (I5) | **load-bearing** — see below |
+| **root lifetime** | yours | a scratch dir, removed on `close` |
+
+```python
+# On the writer's box: a live second view. No archive argument — the log
+# already records where its archive is, and reads come off local disk.
+with litelink.reader("data", "trades") as r:
+    r.scan(where="side = 0")          # local: buffer + local Iceberg table
+    r.end_offset()                    # cheap; sqlite_sequence is authoritative here
+
+# On any other box: no root, an archive URI, and a WAL sidecar on the writer.
+with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as r:
+    r.coverage()                      # Coverage(archive=(1, 1928), buffered=(1929, 2100), …)
+    r.scan(where="side = 0")          # archive + replicated tail, merged
+```
+
+Both return the *same type*. What differs is state, not kind — and one fact that is recorded
+rather than derived: `follow` writes a durable `meta` row saying "this table is empty and
+nothing here will fill it", which is what makes the reader treat the archive as load-bearing.
+It includes the archive automatically and refuses to serve without it, because doing so would
+return the replicated buffer alone and silently omit every archived row. A `reader()` on a
+log whose table has rows never does either.
+
+> A local log that has been **fully evicted** also has an empty table and its rows really are
+> archive-only, so a default `scan()` there under-serves — measured at 476 of 1,500 rows. That
+> is a question about `Log`'s default and I5 rather than about readers, and is tracked
+> separately rather than changed as a side effect here.
+
 ## The whole surface
 
-| | |
-|---|---|
-| **lifecycle** | `new` · `open` · `restore` · `recover` · `recovery` · `close` |
-| **write** | `append` · `extend` |
-| **read** | `scan` · `sql` |
-| **follow** | `Log.follow` → `Follower` — the whole of it: `scan` · `sql` · `coverage` · `end_offset` · `root` · `name` · `config` · `sort_by` · `close` |
-| **seal** | `seal_due` · `seal` · `await_seal` |
-| **maintain** | `maintain` · `compact` · `evict` · `expire` |
-| **archive** | `sync` · `hydrate` · `rewrite_archive` |
-| **observe** | `end_offset` · `buffered_rows` · `table_rows` · `table_files` · `table_extent` · `archived_through` · `archive_files` |
-| **configure** | `config` · `set_config` · `archive` · `set_archive` · `schema` · `sort_by` · `set_sort_by` |
-| **replicate** | `databases` · `replication_config` · `write_replication_config` · `replication_config_for` |
-| **schema** | `add_column` · `rename_column` · `drop_column` — all three raise `NotImplementedError` |
+| | `Log` | `LogReader` |
+|---|---|---|
+| **build** | `litelink.new` · `litelink.open` · `Log.restore` | `litelink.reader` · `litelink.follow` |
+| **write** | `append` · `extend` | — |
+| **read** | `scan` · `sql` | `scan` · `sql` |
+| **observe** | `end_offset` · `buffered_rows` · `table_rows` · `table_files` · `table_extent` · `archived_through` · `archive_files` · `coverage` | same |
+| **identity** | `config` · `schema` · `sort_by` · `root` · `name` | same |
+| **seal** | `seal_due` · `seal` · `await_seal` | — |
+| **maintain** | `maintain` · `compact` · `evict` · `expire` | — |
+| **archive** | `sync` · `hydrate` · `rewrite_archive` | — |
+| **configure** | `set_config` · `archive` · `set_archive` · `set_sort_by` | — |
+| **replicate** | `databases` · `replication_config` · `write_replication_config` · `replication_config_for` | — |
+| **recover** | `recover` · `recovery` | — |
+| **schema** | `add_column`; `rename_column`/`drop_column` raise `NotImplementedError` | — |
+| **lifecycle** | `close` · context manager | same |
+
+`LogReader`'s column is the whole of it — a test asserts the exact set, because "the whole of
+it" is a claim that rots. `await_seal` is deliberately a `Log` method: it *helps* drain the
+queue each round rather than only watching, and a reader could only watch.
 
 Most deployments use six: `new`/`open`, `extend`, `scan`, `seal_due`, `maintain`, `sync`.
 
 ## Lifecycle
 
 ```python
-Log.new(root, name, *, schema, sort_by=None, config=None, archive=None, s3=None,
-        start_offset=1) -> Log
-Log.open(root, name, *, read_only=False, s3=None) -> Log
-Log.restore(root, name, *, archive, s3=None, binary=None) -> Log
+litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None, s3=None,
+             start_offset=1) -> Log
+litelink.open(root, name, *, s3=None) -> Log
+litelink.reader(root, name, *, s3=None) -> LogReader
+litelink.restore(root, name, *, archive, s3=None, binary=None) -> Log
 ```
 
 **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and archive
@@ -70,10 +139,10 @@ reach. `schema` is your columns — the library prepends
 `FileNotFoundError` for a log that is not there, and `ValueError` for one whose stored config
 or sort order is missing — a log that exists but is corrupt.
 
-**`read_only=True` opens a second view alongside a live writer.** Any number of processes may
-hold one. They take no lease, mutate nothing, and coordinate with nobody. Reading in the
-*same* process as the writer is the case to avoid — see RUNTIME.md on two SQLite libraries in
-one process.
+**`reader()` opens a second view alongside a live writer.** Any number of processes may hold
+one. They take no lease, mutate nothing, and coordinate with nobody. Reading in the *same*
+process as the writer is the case to avoid — see RUNTIME.md on two SQLite libraries in one
+process.
 
 **`restore` is failover, not a read replica** (§3a). It rebuilds a log on a machine that is
 not the one that wrote it: restores `buffer.db` from the WAL replica, rebuilds the local
@@ -439,10 +508,14 @@ the second way a caller could reach it.
 
 ## Rules that cut across
 
-**`read_only=True` refuses anything that writes** with `RuntimeError`: `extend`, `append`,
-`seal`, `seal_due`, `maintain`, `compact`, `evict`, `expire`, `sync`, `hydrate`,
-`rewrite_archive`, `set_config`, `set_archive`, `set_sort_by`. Everything observational and
-both read paths stay available.
+**A reader has nothing that writes**, rather than write methods that refuse. `extend`,
+`append`, `seal`, `seal_due`, `maintain`, `compact`, `evict`, `expire`, `sync`, `hydrate`,
+`rewrite_archive`, `set_config`, `set_archive` and `set_sort_by` are absent from `LogReader`.
+Everything observational and both read paths are there.
+
+This replaced `Log.open(read_only=True)`, which returned a `Log` whose thirteen write methods
+existed and raised `RuntimeError("this Log was opened readonly")` — the shape Python's own
+`open()` has, where a read-mode file carries a `.write` that raises `UnsupportedOperation`.
 
 **One writer per log.** SQLite's write lock is per file and one process per stream is the
 intended topology; multiple machines write separate logs and readers union.

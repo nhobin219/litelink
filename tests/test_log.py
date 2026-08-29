@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import litelink
 from litelink._buffer import Buffer
 from litelink.log import OFFSET, Log, LogConfig
 
@@ -39,8 +40,8 @@ def _today() -> date:
     return datetime.now(UTC).date()
 
 
-def open_log_readonly(root: Path) -> Log:
-    return Log.open(root, "s", read_only=True)
+def open_log_readonly(root: Path) -> litelink.LogReader:
+    return litelink.reader(root, "s")
 
 
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
@@ -50,7 +51,7 @@ def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
     ]
 
 
-def read_all(log: Log) -> list[tuple[object, ...]]:
+def read_all(log: Log | litelink.LogReader) -> list[tuple[object, ...]]:
     return [tuple(r.values()) for r in log.scan().read_all().to_pylist()]
 
 
@@ -324,25 +325,50 @@ def test_readonly_sees_a_writer_s_committed_rows(tmp_path: Path) -> None:
             assert len(read_all(reader)) == 5, "still exactly once across the seal"
 
 
-def test_readonly_refuses_every_mutation(tmp_path: Path) -> None:
+def test_a_reader_has_no_mutation_to_refuse(tmp_path: Path) -> None:
+    """Absent, not raising — which is the whole point of dropping the flag.
+
+    `Log.open(read_only=True)` returned a `Log` whose thirteen write methods
+    existed and raised "this Log was opened readonly". The interface described
+    the writer rather than the thing. `reader()` returns a `LogReader`, which
+    has no write surface at all, so there is nothing to gate and no
+    `_writable()` call anyone can forget to add.
+
+    Falsify by giving `LogReader` any one of these as a delegation.
+    """
     with open_log(tmp_path) as writer:
         writer.extend(rows(2))
 
     with open_log_readonly(tmp_path) as reader:
-        for mutate in (
-            lambda: reader.append(rows(1)[0]),
-            lambda: reader.extend(rows(1)),
-            reader.seal,
-            reader.maintain,
+        for absent in (
+            "append",
+            "extend",
+            "seal",
+            "await_seal",
+            "maintain",
+            "compact",
+            "evict",
+            "expire",
+            "sync",
+            "hydrate",
+            "rewrite_archive",
+            "set_config",
+            "set_sort_by",
+            "set_archive",
+            "add_column",
+            "recover",
         ):
-            with pytest.raises(RuntimeError, match="readonly"):
-                mutate()
+            assert not hasattr(reader, absent), f"a reader exposes {absent}"
+
+        # And it still answers everything a reader should.
+        assert reader.end_offset() == 3
+        assert len(read_all(reader)) == 2
 
 
 def test_readonly_will_not_create_a_log(tmp_path: Path) -> None:
     """Opening a log that does not exist must fail rather than quietly make one."""
     with pytest.raises(FileNotFoundError, match="no litelink log at"):
-        Log.open(tmp_path / "nothing-here", "s", read_only=True)
+        litelink.reader(tmp_path / "nothing-here", "s")
 
 
 def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:

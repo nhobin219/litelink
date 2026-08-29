@@ -53,8 +53,8 @@ nothing else: no producer, no credentials, no maintainer, no container. That dem
 [`examples/websocket.py`](examples/websocket.py), and this is its shape:
 
 ```python
+import litelink
 import pyarrow as pa
-from litelink import Log
 
 # A trade feed: durable the moment it arrives, queryable a moment later.
 schema = pa.schema([
@@ -67,7 +67,7 @@ schema = pa.schema([
 
 # new() takes the shape, fixed at creation. open() takes none of it — schema,
 # sort order, config and archive all come from the log itself.
-log = Log.new("data", "trades", schema=schema, sort_by=("event_ts",))
+log = litelink.new("data", "trades", schema=schema, sort_by=("event_ts",))
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076, "side": 0})  # durable on return
 
@@ -76,8 +76,8 @@ log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
 # choice: no LogConfig setting tunes it.
 log.extend(group_of_rows)                          # append(row) is extend([row])
 
-log = Log.open("data", "trades")
-log = Log.open("data", "trades", read_only=True)   # alongside a live writer
+log = litelink.open("data", "trades")
+reader = litelink.reader("data", "trades")         # alongside a live writer, no write surface
 
 recent = log.scan(where="event_ts > 1787772776000000").read_all()
 log.maintain()                                     # compact, evict, expire
@@ -118,7 +118,7 @@ just litestream        # once: fetch the pinned, checksum-verified sidecar
 just demo-replicate    # generates litestream.yml from the log, runs it
 ```
 
-`Log.restore(root, name, archive=...)` then rebuilds the log on another box, reserving an
+`litelink.restore(root, name, archive=...)` then rebuilds the log on another box, reserving an
 offset window so nothing the dead machine served is reissued. Verified against a local
 S3-compatible store and against AWS. See [`examples/`](examples/).
 
@@ -141,11 +141,11 @@ into. The extensions, the credential shapes, why `version_name_format` is not op
 the polling pattern in full are in [`docs/API.md`](docs/API.md).
 
 That read is only as fresh as the last `sync`. When you have a WAL sidecar running
-(`wal_replication`), `Log.follow` does better: it restores the writer's buffer alongside the
+(`wal_replication`), `litelink.follow` does better: it restores the writer's buffer alongside the
 archive and merges them, so the reader sees down to the replication lag instead.
 
 ```python
-with Log.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
+with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
     reader.coverage()   # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, ...)
     reader.scan(where="side = 0", columns=["event_ts", "price"])
 ```

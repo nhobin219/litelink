@@ -239,7 +239,7 @@ def test_a_change_interrupted_before_step_seven_completes_on_reopen(
     landed is a no-op — `union_by_name` is idempotent where
     `update_schema().add_column` raises `name already exists`. Falsify by
     swapping it: recovery then raises inside `open`, which is unguarded, so
-    every writer fails to open while `read_only=True` still works.
+    every writer fails to open while `reader()` still works.
     """
     with archived_log(tmp_path, bucket, s3) as log:
         log.extend(rows(20))
@@ -284,7 +284,7 @@ def test_add_column_with_the_archive_unreachable_leaves_the_log_writable(
     log opens, appends, seals and reads; the change simply has not finished.
 
     Falsify by letting `_ArchiveDeferred` escape `_recover_schema_change`:
-    every writer then fails to open while `read_only=True` still works.
+    every writer then fails to open while `reader()` still works.
     """
     with archived_log(tmp_path, bucket, s3) as log:
         log.extend(rows(10))
@@ -337,7 +337,7 @@ def test_recovery_defers_when_the_archive_commit_itself_fails(
     Recovery must still defer rather than fail the open. Falsify by narrowing
     the catch in `_recover_schema_change` to `_ArchiveDeferred`: this open then
     raises, and because `recover()` is unguarded in `open`, every writer is
-    locked out while `read_only=True` keeps working.
+    locked out while `reader()` keeps working.
     """
     from litelink.log import _intent
 

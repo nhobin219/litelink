@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
+import litelink
 from litelink import Log, LogConfig
 from litelink._archive import Archive
 from litelink._buffer import SORT_KEY, Buffer
@@ -149,7 +150,7 @@ def test_layout_paths_are_derived_not_discovered(tmp_path: Path) -> None:
 
 def test_open_readonly_refuses_a_missing_log(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="no litelink log at"):
-        Log.open(tmp_path / "nothing", "s", read_only=True)
+        litelink.reader(tmp_path / "nothing", "s")
 
 
 def test_the_extent_cache_follows_the_metadata_pointer(tmp_path: Path) -> None:

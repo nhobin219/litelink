@@ -122,6 +122,11 @@ _START_OFFSET_KEY = START_OFFSET_KEY
 # it too — see `Buffer.sort_by`.
 _SORT_KEY = SORT_KEY
 
+# Written once by `follow`, read by `LogReader` to know that its local table is
+# empty and will stay that way — the one thing about a followed log that cannot
+# be derived from its state. See `LogReader._archive_required`.
+FOLLOWED_KEY = "followed"
+
 # How many offsets a restore skips before resuming (§3a).
 #
 # `sqlite_sequence` comes back from the replica, so it resumes above everything
@@ -223,7 +228,7 @@ class Log:
     writes the buffer database, so it is a writer, and two of those is the case
     §1 excludes.
 
-    Construct through `new`, `open`, or `restore`; `open(read_only=True)`
+    Construct through `litelink.new`, `open` or `restore`; `litelink.reader`
     gives a second view alongside a live writer. The initialiser takes already
     built collaborators and does no I/O, so a test can substitute any of them.
     """
@@ -238,11 +243,9 @@ class Log:
         maintenance: Maintenance,
         config: LogConfig,
         archive: Archive,
-        readonly: bool = False,
     ) -> None:
         self.name = layout.name
         self.root = layout.root
-        self.readonly = readonly
 
         self._layout = layout
         self._table = table
@@ -262,6 +265,16 @@ class Log:
         # indistinguishable from ordinary buffered rows a second later.
         self._restored_from: _Recovery | None = None
         self._reader = reader
+        # `Log = writer state + LogReader`. The reader is built from the same
+        # collaborators, not given a second set, so there is one answer to
+        # every read question rather than two that can drift.
+        self._view = LogReader(
+            layout=layout,
+            table=table,
+            buffer=buffer,
+            archive=archive,
+            reader=reader,
+        )
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
         # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
@@ -483,7 +496,6 @@ class Log:
         root: PathLike[str] | str,
         name: str,
         *,
-        read_only: bool = False,
         s3: S3Options | None = None,
     ) -> Self:
         """Open an existing log, and recover it.
@@ -517,7 +529,7 @@ class Log:
             msg = f"no litelink log at {layout.root}/{name} — use new() to create one"
             raise FileNotFoundError(msg)
 
-        table = LogTable.load(layout, readonly=read_only)
+        table = LogTable.load(layout, readonly=False)
         schema = _declared_schema(layout, application_schema(table.arrow_schema()))
 
         # Read through a throwaway connection, like the schema above it,
@@ -535,11 +547,7 @@ class Log:
             raise ValueError(msg)
 
         config = LogConfig.from_json(encoded)
-        buffer = Buffer.open(
-            layout.buffer_db,
-            schema,
-            readonly=read_only,
-        )
+        buffer = Buffer.open(layout.buffer_db, schema)
         # From `meta`, not from the table. Required like the config and for
         # the same reason: `new` always writes it, so its absence is a damaged
         # log, and defaulting to no order would silently de-cluster every file
@@ -569,10 +577,8 @@ class Log:
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
             archive=remote,
-            readonly=read_only,
         )
-        if not read_only:
-            log.recover()
+        log.recover()
 
         return log
 
@@ -934,7 +940,6 @@ class Log:
         schema are not in here precisely because they do.
         """
         with self._lock:
-            self._writable()
             # The same claim `set_archive` takes, and for the same reason.
             # `validate` refuses a PAIR — an evict-on-upload policy with no
             # archive to evict into — so the two halves have to be decided
@@ -995,20 +1000,12 @@ class Log:
         return self._layout.databases
 
     def archive_files(self) -> int:
-        """How many data files the archive holds, or 0 with no archive.
+        """How many data files the archive holds, or 0 with no archive."""
+        return self._view.archive_files()
 
-        A network round trip, unlike `table_files()`: it reloads the remote
-        table to answer. Paired with `table_files()` it is the two halves of
-        where the data is — local disk and object storage — which is otherwise
-        only visible as a watermark in offsets.
-        """
-        archive = self._archive.table()
-        if archive is None:
-            return 0
-
-        archive.reload()
-
-        return len(archive.data_files())
+    def coverage(self) -> Coverage:
+        """What this log can serve, and where it cannot. See `LogReader.coverage`."""
+        return self._view.coverage()
 
     def replication_config(self) -> str:
         """A litestream config for this log (§3a).
@@ -1046,260 +1043,6 @@ class Log:
 
         return destination
 
-    @classmethod
-    def follow(
-        cls,
-        name: str,
-        *,
-        archive: str,
-        s3: S3Options | None = None,
-        binary: str | None = None,
-        scratch_dir: PathLike[str] | str | None = None,
-    ) -> Follower:
-        """A read-only view of a log running somewhere else (§3b).
-
-        The archive merged with a replicated copy of the writer's buffer, so a
-        reader sees data fresher than the archive alone — down to the
-        replication lag rather than to the seal cadence. It never takes over as
-        writer and never writes anything the primary shares.
-
-        **This is `restore`'s assembly without the takeover.** `restore` burns
-        `RESTORE_RESERVE` offsets to fence a machine that may still be writing;
-        a follower appends nothing, so there is nothing to fence and it
-        reserves none. It opens read-only, which is also what keeps `recover()`
-        from finishing a seal the primary owns.
-
-        **A snapshot, not a subscription.** litestream restores to a point in
-        time, so refreshing means assembling another one — exit the block and
-        reopen. So the root is always a temporary directory this owns and
-        removes on `close`: it is scaffolding for one read session, not a
-        durable artefact.
-
-        **There is no `root` parameter**, and taking one cost two latent bugs
-        for a use case nobody had. Pointing a follow at a caller's directory
-        meant it could land on a root that already held a live log — where
-        `catalog.db` and `archive.db` are shared by every log under it, so the
-        follower's writes went into the primary's files and its sidecar
-        shipped them — and it meant a stale `archive.db` could survive to win
-        over the bucket's own hint and pin the follower to an old snapshot.
-        Both were guarded or nearly so; neither is now reachable, which is
-        cheaper than being right about them. Bring it back when something
-        actually needs to inspect a follower's root after the fact.
-
-        `scratch_dir` still chooses WHERE the temporary one lives, which is
-        the part with a real motivation: the restored buffer holds the
-        unsealed tail *plus* the band the archive lacks, which on a log whose
-        sync is behind is not small, and `/tmp` is often memory-backed.
-
-        Raises if the archive has never been published. `archive_extent`
-        returns None both for "nothing pushed" and for "a hint over an empty
-        table", and `set_archive` creates the second on re-point — so a log
-        before its first successful sync cannot be followed. Serving the buffer
-        alone instead would be a reader silently missing every archived row,
-        which is the one failure this must not have.
-        """
-        options = s3 or S3Options()
-        owned = tempfile.TemporaryDirectory(
-            prefix="litelink-follow-",
-            dir=None if scratch_dir is None else Path(scratch_dir),
-        )
-        try:
-            layout = Layout(Path(owned.name), name)
-            cls._restore_replica(layout, archive, options, binary)
-            schema, sort_by, prefix = cls._followed_shape(layout)
-            cls._assemble_follower(layout, schema, sort_by, prefix, options)
-            follower = cls._followed_reader(layout, schema, options, owned)
-        except BaseException:
-            owned.cleanup()
-
-            raise
-
-        return follower
-
-    @staticmethod
-    def _followed_reader(
-        layout: Layout,
-        schema: pa.Schema,
-        options: S3Options,
-        owned: tempfile.TemporaryDirectory[str] | None,
-    ) -> Follower:
-        """Build the read collaborators, which is all a follower is.
-
-        This used to be `cls.open(..., read_only=True)`, and the `Follower` held
-        the whole `Log` that produced. The writer half of it was never usable —
-        the point of `read_only` — but it was still constructed, still open, and
-        still the thing a follower reached past to answer its own questions.
-
-        So the same four objects `Log.open` hands its reader are built here and
-        handed to the follower directly. No `Maintenance`, because nothing
-        maintains a follower; no `recover()`, because finishing a seal is the
-        primary's to do and read-only is what stopped it; no `LogTable` on the
-        follower itself, because `Reader` owns it and a follower's is empty.
-        """
-        table = LogTable.load(layout, readonly=True)
-        buffer = Buffer.open(layout.buffer_db, schema, readonly=True)
-        try:
-            remote = Archive(layout, buffer, options)
-
-            return Follower(
-                layout=layout,
-                buffer=buffer,
-                archive=remote,
-                reader=Reader(layout, table, buffer, duckdb_connection, archive=remote),
-                owned=owned,
-            )
-        except BaseException:
-            buffer.close()
-
-            raise
-
-    @staticmethod
-    def _restore_replica(
-        layout: Layout,
-        archive: str,
-        options: S3Options,
-        binary: str | None,
-    ) -> None:
-        """Pull `buffer.db` down, with the sidecar's config kept out of the root.
-
-        `restore` writes that config into the root at its START, because
-        `restore_buffer` needs `-config` to run. A follower must not leave one
-        there: `litestream_config` keys each replica on the path RELATIVE to
-        the root, so a follower with the same log name produces a key identical
-        to the primary's. Running a sidecar in that directory — which this
-        project's own convention says to do — would ship the follower's
-        stripped scratch copy over the primary's only off-box record of its
-        unsealed rows.
-
-        So it goes in a temporary directory of its own and is deleted with it,
-        on the exception path too. Nothing needs it once the restore returns.
-
-        This used to begin by refusing a root that already held a log, because
-        `follow` took a `root` argument and a caller could aim it anywhere.
-        The argument is gone and the root is always freshly made, so the check
-        could no longer fire; it was removed rather than left as a guard that
-        reads like protection and provides none.
-        """
-        layout.root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="litelink-follow-cfg-") as cfg:
-            config_path = Path(cfg) / "litestream.yml"
-            config_path.write_text(
-                litestream_config(layout.databases, layout.root, archive, options)
-            )
-            restore_buffer(config_path, layout.buffer_db, options, binary)
-
-        if not layout.buffer_db.exists():
-            msg = (
-                f"no replica of {layout.buffer_db.name} under {archive} — there is "
-                f"nothing to follow. A log with wal_replication off has no off-box "
-                f"copy of its unsealed rows"
-            )
-            raise FileNotFoundError(msg)
-
-    @staticmethod
-    def _followed_shape(layout: Layout) -> tuple[pa.Schema, tuple[str, ...], str]:
-        """The log's shape, and where its archive is, from the replica's `meta`.
-
-        The prefix comes from here rather than from `follow`'s `archive=`,
-        which only says where the WAL replica lives. That is also why the
-        archive pre-flight cannot come first: there is no prefix to check until
-        `buffer.db` is on disk.
-        """
-        encoded = Buffer.peek_meta(layout.buffer_db, _CONFIG_KEY)
-        raw_schema = Buffer.peek_meta(layout.buffer_db, _SCHEMA_KEY)
-        raw_sort = Buffer.peek_meta(layout.buffer_db, _SORT_KEY)
-        if encoded is None or raw_schema is None or raw_sort is None:
-            msg = (
-                f"the replica of {layout.root}/{layout.name} carries no stored shape; "
-                f"it is corrupt or was captured mid-creation"
-            )
-            raise ValueError(msg)
-
-        prefix = Buffer.peek_meta(layout.buffer_db, _ARCHIVE_KEY)
-        if not prefix:
-            msg = (
-                f"{layout.root}/{layout.name} records no archive, so there is nothing "
-                f"to merge the replicated buffer with. A local-only log cannot be "
-                f"followed — its sealed files exist only on the machine that wrote them"
-            )
-            raise ValueError(msg)
-
-        return (
-            pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema))),
-            tuple(json.loads(raw_sort)),
-            prefix,
-        )
-
-    @staticmethod
-    def _assemble_follower(
-        layout: Layout,
-        schema: pa.Schema,
-        sort_by: tuple[str, ...],
-        prefix: str,
-        options: S3Options,
-    ) -> None:
-        """Adopt the archive and build the empty local table `open` expects.
-
-        **Neither `repair` value adopts safely on its own, which is why the
-        bucket is asked first.** `repair=False` never creates — and never
-        adopts either: it reads the local `archive.db` row, which a follower
-        has none of, and `Archive.table` swallows the resulting `ArchiveAbsent`
-        into `None`. The follower would then serve the buffer alone, silently
-        missing every archived row. `repair=True` adopts, but with no published
-        hint it takes the CREATE branch and writes a `metadata.json` and a
-        `version-hint.text` into the bucket — a reader publishing a lineage the
-        primary then commits onto.
-
-        `archive_extent` reads the hint from the bucket alone, with no
-        `archive.db` and no catalog, and separates "no hint" from "cannot
-        read". Once it has answered, `repair=True` cannot reach the create
-        branch, because a published hint is exactly what it proved.
-        """
-        covered = archive_extent(layout, prefix, options)
-        if covered is None:
-            msg = (
-                f"the archive at {prefix!r} has published nothing yet, so following "
-                f"it would serve only the replicated buffer and silently omit every "
-                f"archived row. Sync the primary at least once first"
-            )
-            raise ValueError(msg)
-
-        buffer = Buffer.open(layout.buffer_db, schema)
-        try:
-            # Reserves nothing: a follower never appends, so there is no
-            # offset to fence. `strip_local_state` still runs — the `extent`
-            # rows naming the primary's Parquet describe files this machine
-            # cannot open, and the copy is scratch, so dropping them is free.
-            buffer.strip_local_state(0)
-            remote = Archive(layout, buffer, options)
-            if remote.table(repair=True) is None:
-                msg = (
-                    f"restored the buffer but could not adopt the archive at "
-                    f"{prefix!r}: it holds nothing this log can read"
-                )
-                raise RuntimeError(msg)
-
-            adopted = remote.table()
-            extent = None if adopted is None else adopted.extent()
-            if extent is not None:
-                buffer.release_archived(extent[1])
-                buffer.reseed_group()
-        finally:
-            buffer.close()
-
-        try:
-            LogTable.create(layout, table_schema(schema), sort_by)
-        except TableAlreadyExistsError:
-            # Never forgotten, exactly as `restore` refuses to: a row that
-            # pre-exists belongs to a log whose local Parquet this is the only
-            # pointer to, and the blanket handler below would drop it.
-            raise
-        except Exception:
-            with contextlib.suppress(Exception):
-                LogTable.forget(layout)
-
-            raise
-
     def recovery(self) -> _Recovery | None:
         """What `restore` recovered, or None on a log opened normally.
 
@@ -1313,11 +1056,9 @@ class Log:
     def archive(self) -> str | None:
         """Where the archive is, or None for a local-only log.
 
-        The question a maintenance loop has to answer before calling `sync`,
-        and one only the log can: the archive is recovered from `meta` on
-        `open`, so a caller that restated it could disagree with the log.
+        The question a maintenance loop has to answer before calling `sync`.
         """
-        return self._archive.uri
+        return self._view.archive
 
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5).
@@ -1373,7 +1114,6 @@ class Log:
         archive = (archive or "").rstrip("/") or None
 
         with self._lock:
-            self._writable()
             lease = self._claim_settings()
 
             # Every write inside, so a failure — a full disk, a busy database —
@@ -1680,7 +1420,6 @@ class Log:
         archive keeps the clustering it was written with.
         """
         with self._lock:
-            self._writable()
             requested = tuple(sort_by)
             validate(self._schema, requested, self.config, self._archive.uri)
             if requested == self._buffer.sort_by() and not rewrite:
@@ -1801,13 +1540,6 @@ class Log:
         """
         return self._buffer.claim(role, lo, hi, new_owner())
 
-    def _writable(self) -> None:
-        if self.readonly:
-            msg = "this Log was opened readonly"
-            raise RuntimeError(msg)
-
-    # -- write -------------------------------------------------------------
-
     def append(self, row: Row) -> int:
         """Append one row. Returns the assigned offset.
 
@@ -1835,7 +1567,6 @@ class Log:
         be worse than refusal — it would hand back offsets for some rows while
         the caller learns nothing about the rest.
         """
-        self._writable()
 
         # No lock. `Buffer` serialises its own connection, which is the only
         # thing two appending threads share — and the append decides nothing
@@ -1854,48 +1585,22 @@ class Log:
         where: str | None = None,
         start_offset: int | None = None,
         end_offset: int | None = None,
-        include_archive: bool = False,
+        include_archive: bool | None = None,
     ) -> pa.RecordBatchReader:
-        """Read the log as one relation, newest data included.
-
-        Unions the tiers and bounds each by its neighbour's committed offset
-        extent, resolved from manifest statistics at query time (§7, I3). The
-        tiers overlap by design, so the bounds are what make each row appear
-        exactly once.
-
-        `include_archive=False` by default: a hot read is local disk only and
-        must stay that way (I5). Opting in is opting into network I/O.
-
-        Always bound on a LEADING column of `sort_by`. §7 measures a non-leading
-        predicate at 119 ms against 13 ms for the same predicate with a leading
-        bound — the column is in the sort key and still does not prune on its
-        own.
-
-        Returns a streaming reader rather than a table: a full-window read with
-        a 400-byte payload column is 611 ms and proportional to the data, so
-        materialising it is the caller's choice to make.
-        """
-        return self.sql(
-            scan_query(
-                self._schema.names,
-                columns=columns,
-                where=where,
-                start_offset=start_offset,
-                end_offset=end_offset,
-            ),
+        """Read the log as one relation, newest data included. See `LogReader.scan`."""
+        return self._view.scan(
+            columns=columns,
+            where=where,
+            start_offset=start_offset,
+            end_offset=end_offset,
             include_archive=include_archive,
         )
 
-    def sql(self, query: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
-        """Run arbitrary DuckDB SQL against the log, exposed as `log`.
-
-        The escape hatch for what `scan` cannot express. Quote `"litelink_offset"` — it
-        is a DuckDB reserved word.
-        """
-        # No lock here. `Reader` guards its own connection and `LogTable` its
-        # own cache, both briefly — whereas this used to be the SAME lock a
-        # whole maintenance pass held, so a read waited out a compaction.
-        return self._reader.query(query, include_archive=include_archive)
+    def sql(
+        self, query: str, *, include_archive: bool | None = None
+    ) -> pa.RecordBatchReader:
+        """Arbitrary DuckDB SQL against the log, exposed as `log`."""
+        return self._view.sql(query, include_archive=include_archive)
 
     def end_offset(self) -> int:
         """The offset the next append will receive — an EXCLUSIVE upper bound.
@@ -1912,49 +1617,20 @@ class Log:
         return self._buffer.next_offset()
 
     def buffered_rows(self) -> int:
-        """Rows durable in the buffer but not yet sealed.
-
-        The unsealed tail, which is what §7 measures as the variable cost of a
-        read — so it is the number to watch when tuning the seal threshold.
-
-        Counted in SQLite against the tier boundary rather than through the
-        union: a `count(*)` over the log would make DuckDB evaluate the same
-        predicate against the Iceberg leg too, reading the offset column out of
-        every Parquet file to establish that none of them qualify.
-        """
-        extent = self.table_extent()
-
-        # Deliberately unlocked, and therefore approximate: a seal landing
-        # between the two reads shifts the boundary under the count. This is a
-        # number to watch, not one to derive anything from, and locking it
-        # would put a metric on the path of every append.
-        return self._buffer.count_above(0 if extent is None else extent[1])
+        """Rows durable in the buffer but not yet sealed."""
+        return self._view.buffered_rows()
 
     def table_rows(self) -> int:
-        """Rows in the local Iceberg table.
-
-        From the manifests, which track a count per file, so this costs nothing
-        beyond the snapshot read the boundary already needs.
-        """
-        self._table.reload()
-
-        return self._table.record_count()
+        """Rows in the local Iceberg table, from the manifests."""
+        return self._view.table_rows()
 
     def table_files(self) -> int:
         """Data files in the local table — what compaction is bringing down."""
-        self._table.reload()
-
-        return self._table.file_count()
+        return self._view.table_files()
 
     def table_extent(self) -> tuple[int, int] | None:
-        """`(lo, hi)` offset extent of the local table, from statistics.
-
-        §7's tier boundary. Read from manifest column statistics — no data file
-        is opened, which is what makes it ~0.6 ms rather than a scan.
-        """
-        self._table.reload()
-
-        return self._table.extent()
+        """`(lo, hi)` offset extent of the local table, from statistics (§7)."""
+        return self._view.table_extent()
 
     # -- seal --------------------------------------------------------------
 
@@ -1985,7 +1661,6 @@ class Log:
         One seal at a time. A second would claim a range overlapping the first,
         and `sealing` holds one row by design (§2).
         """
-        self._writable()
         # Cut unconditionally, and that is the whole contract. Cutting only
         # when the queue happened to be empty made this method's effect depend
         # on how far behind a sealer was: the rows the caller had just appended
@@ -2028,7 +1703,6 @@ class Log:
         Split from `seal` so that draining the queue can never cut a group
         short: everything this writes was sized when its rows arrived.
         """
-        self._writable()
         # Outside `_lock`, because the lease excludes other OWNERS and the lock
         # sequences this process's own buffer writes — different jobs. Taking
         # it inside put two more fsyncs under the lock an append needs, and at
@@ -2158,8 +1832,12 @@ class Log:
         queue itself, which does nothing while another owner holds the lease —
         and everything once that owner dies and its lease lapses. Purely
         watching would hang until the timeout, or forever without one, over
-        work no survivor was going to do. A readonly log has no such option and
-        can only wait.
+        work no survivor was going to do.
+
+        This is a `Log` method and not a `LogReader` one for that reason: a
+        reader could only watch, and a watcher that cannot help is the case
+        this exists to avoid. It used to branch on `readonly` to decide, which
+        is the flag that no longer exists.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -2168,8 +1846,7 @@ class Log:
             ):
                 return True
 
-            if not self.readonly:
-                self._seal_queued()
+            self._seal_queued()
 
             if deadline is not None and time.monotonic() >= deadline:
                 return False
@@ -2301,7 +1978,6 @@ class Log:
 
         A group whose lease is held elsewhere is left alone, not waited for.
         """
-        self._writable()
 
         end = None
         # Peeked before `_seal_queued` takes the lock, because almost every
@@ -2546,7 +2222,6 @@ class Log:
         skipped. Sync's remaining obligation to eviction is the registration
         watermark it records in `meta`, which is what lets `maintain` enforce I4.
         """
-        self._writable()
         if not self._archive.configured():
             msg = "sync() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -2912,7 +2587,6 @@ class Log:
         is open — §11 treats stalled eviction as an operational condition, and
         returning None says nothing about it.
         """
-        self._writable()
 
         # The lease is the exclusion, and it is the only one this needs. There
         # is no lock around the pass any more: a compaction reads every file it
@@ -2975,7 +2649,6 @@ class Log:
         is not a way around it: a second owner is refused whichever entry point
         it came through.
         """
-        self._writable()
         # No claim here. Each pass claims the range it actually works on —
         # compaction a run, eviction the prefix it removes — so two maintainers
         # exclude each other only where their work overlaps, which is what §4a
@@ -2997,7 +2670,6 @@ class Log:
         lease as `maintain` and `sync`, and it rewrites the same files they
         would.
         """
-        self._writable()
         if not self._archive.configured():
             msg = "rewrite_archive() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -3041,7 +2713,6 @@ class Log:
         archive it just came from. Eviction still applies to it, which is the
         point: this is temporary unless `local_retention` is raised too.
         """
-        self._writable()
         if not self._archive.configured():
             msg = "hydrate() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -3188,7 +2859,6 @@ class Log:
         # make every existing file invalid, and Iceberg refuses it too.
 
         with self._lock:
-            self._writable()
             # The claim `set_config` and `set_archive` share. Claims exclude by
             # RANGE, not by kind, and this one is `[0, EVERYTHING]` — so seal,
             # compact, sync, evict, `rewrite_archive`, `hydrate` and
@@ -3421,71 +3091,70 @@ class _ArchiveDeferred(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Coverage:
-    """What a follower holds, and any offsets in neither tier.
+    """What a reader holds, and any offsets in neither tier.
 
-    Reported rather than enforced. `gap` is a range this follower cannot serve;
+    Reported rather than enforced. `gap` is a range the reader cannot serve;
     whether that is lost data or a never-issued reserve is a question only the
-    caller can answer — see `Follower.coverage`.
+    caller can answer — see `LogReader.coverage`. `archive` is None when the
+    log has no archive configured.
     """
 
-    archive: tuple[int, int]
+    archive: tuple[int, int] | None
     buffered: tuple[int, int] | None
     gap: tuple[int, int] | None
     wal_replication: bool
 
 
-class Follower:
-    """A read-only view of a log running somewhere else (§3b), from `Log.follow`.
+class LogReader:
+    """Everything you can ask a log without writing to it.
 
-    **It holds the same read collaborators a `Log` holds, not a `Log`.** Two
-    earlier shapes were wrong in the same direction. Subclassing gave a
-    read-only follower a public surface of 42 members carrying `append`,
-    `seal`, `sync`, `compact` and `evict`, every one of them raising. Wrapping
-    a whole `Log` hid that surface but kept the object: a follower still
-    constructed the writer machinery it must never use, and then reached PAST
-    it into `_buffer` and `_archive` to answer questions `Log` answers for a
-    writer.
+    One type for both read-only cases, because they differ in STATE and not in
+    kind. A reader on the writer's box shares the log's directory and sees its
+    local Iceberg table fill; a reader assembled by `follow` has a restored
+    replica of the buffer and a local table that is empty and stays empty.
+    Nothing else about them differs, and an earlier design that made them two
+    classes — a `Log` with a `readonly` flag guarding thirteen write methods,
+    and a separate `Follower` — had to keep two answers to every question.
 
-    Both bugs review found on this class came from that seam:
+    **What the follower used to encode as a type is derived here.** The
+    archive is load-bearing exactly when the local table holds nothing and an
+    archive is configured: then it is the only place the archived rows can
+    come from, so reads must include it and a missing archive must refuse
+    rather than quietly serve the buffer alone. That is true of a followed log
+    (its table is empty by construction) and equally true of a local log that
+    has evicted everything, which is a case the old split got wrong — measured
+    on a local log after `evict`, `scan()` returned 476 of 1,500 rows with no
+    error.
 
-    - `scan` lost its swept-snapshot translation, because delegating to
-      `Log.scan` sent the read out through `Log.sql` — a wrapper intercepts the
-      call it makes, not the dispatch inside it. It now builds its query with
-      `scan_query` and calls `Reader` directly, so there is no inner dispatch.
-    - `end_offset` under-reported, because `Log.end_offset` answers a WRITER's
-      question — what the next append will receive, from `sqlite_sequence` — and
-      a follower needs the highest offset it can serve. It now computes that
-      from the two extents.
-
-    So the decomposition is `Log = writer state + Reader` and
-    `Follower = Reader + the pin check`. `config` and `sort_by` read through to
-    the buffer exactly as `Log`'s do, because that is where they live; neither
-    needs a `Maintenance` and neither is a copy.
-
-    The write surface is not refused here, it is absent — there is nothing to
-    call and nothing to forget to guard. `scan` and `sql` take no
-    `include_archive`: a follower's local table is empty by construction, so
-    reading without the archive would return the replicated buffer alone.
+    **One thing is NOT derived, and it is a real cost of unifying.**
+    `include_archive=False` was absent from `Follower` and is merely refused
+    here, because the parameter has to exist for the local case. Asking for it
+    where the archive is load-bearing raises instead of being unrepresentable.
     """
 
     def __init__(
         self,
         *,
         layout: Layout,
+        table: LogTable,
         buffer: Buffer,
         archive: Archive,
         reader: Reader,
         owned: tempfile.TemporaryDirectory[str] | None = None,
     ) -> None:
         self._layout = layout
+        self._table = table
         self._buffer = buffer
         self._archive = archive
         self._reader = reader
+        # Set only by `follow`, which assembles into a scratch directory it
+        # must remove. A reader on an existing log owns none of its root.
         self._owned_root = owned
+
+    # -- identity ----------------------------------------------------------
 
     @property
     def root(self) -> Path:
-        """Where this follower was assembled. Scratch unless `root` was given."""
         return self._layout.root
 
     @property
@@ -3494,68 +3163,30 @@ class Follower:
 
     @property
     def config(self) -> LogConfig:
-        """The followed log's policy, as its replica recorded it.
-
-        Read through to the buffer on every access, like `Log.config` — same
-        durable row, no second copy.
-        """
+        """The policy in force, read through to the log on every access."""
         return self._buffer.config()
 
     @property
     def sort_by(self) -> tuple[str, ...]:
-        """The clustering the primary declared (§7), read through like `config`."""
+        """The declared clustering (§7), read through like `config`."""
         return self._buffer.sort_by()
 
-    def end_offset(self) -> int:
-        """The offset after the last row this follower can see.
+    def schema(self) -> pa.Schema:
+        """The caller's columns, without `litelink_offset` (I11)."""
+        return self._buffer.schema
 
-        The affordance for measuring staleness: compare it against the
-        primary's. This makes no promise about the distance — it cannot ask.
+    @property
+    def archive(self) -> str | None:
+        """Where the archive is, or None for a local-only log.
 
-        **Both tiers, because they are captured at different times.** The
-        buffer alone is `sqlite_sequence.seq + 1` of the REPLICA, which
-        litestream shipped at some earlier point than `_assemble_follower`
-        adopted the archive. When the primary sealed and synced rows the
-        sidecar had not yet shipped, the archive frontier is higher and
-        `release_archived` empties the buffer outright — so the replica's
-        sequence describes a tier that no longer contributes anything, while
-        the archive leg serves hundreds of rows above it.
-
-        `Log.restore` corrects the identical arithmetic on the identical two
-        tiers, and records what it cost to find: *"16,100 offsets reported
-        skipped that were present and readable"*. `follow` reuses `restore`'s
-        assembly, so it inherits the same skew and needs the same `max`.
-
-        Measured: a follower serving 2,288 rows reported 2,001.
-
-        **The buffer's contribution is its EXTENT, not `next_offset()`**, and a
-        first version of this fix got that wrong in the opposite direction.
-        `next_offset` reads `sqlite_sequence`, which its own docstring calls
-        "the highest value ever assigned and never lowers" — so it keeps
-        counting rows the replica no longer carries. A seal taken while
-        `_discard_on_seal()` was true, which is any log with `wal_replication`
-        off, deletes its rows from the buffer and they reach the archive only
-        at the next `sync`. Between those two moments the offsets are in
-        neither tier while the sequence still counts them.
-
-        That is the state an operator passes through to ADOPT following: an
-        archived log with replication off, turned on, sidecar started, followed
-        before the next sync. Measured there: a follower serving 864 rows
-        reported 1,501, and a caller using this as a resume cursor skipped 636
-        rows permanently once the primary synced. Over-reporting loses data;
-        under-reporting only re-delivers. This is the dangerous direction.
-
-        `Log.restore` takes `buffered[1]` for exactly this reason. So does
-        this now.
-
-        Taking the archive frontier also brings this under the swept-snapshot
-        refusal, which it escaped while it read SQLite alone.
+        Read from `meta` on every access, so a caller cannot disagree with the
+        log about it. The `replication_config` family stays on `Log`: it keys
+        each replica on the path relative to the root, so a followed log would
+        emit the PRIMARY's replica key.
         """
-        buffered = self._buffer.extent()
+        return self._archive.uri
 
-        return (
-            max(self._checked_extent()[1], 0 if buffered is None else buffered[1]) + 1
-        )
+    # -- read --------------------------------------------------------------
 
     def scan(
         self,
@@ -3564,75 +3195,213 @@ class Follower:
         where: str | None = None,
         start_offset: int | None = None,
         end_offset: int | None = None,
+        include_archive: bool | None = None,
     ) -> pa.RecordBatchReader:
-        """Read the merged view: the archive plus the replicated tail.
+        """Read the log as one relation, newest data included.
 
-        Builds its own query rather than routing through a `Log`, so the guard
-        and the translation below apply to the read this actually performs.
+        Unions the tiers and bounds each by its neighbour's committed offset
+        extent, resolved from manifest statistics at query time (§7, I3). The
+        tiers overlap by design, so the bounds are what make each row appear
+        exactly once.
+
+        `include_archive` defaults to whether the archive is load-bearing —
+        False for an ordinary local read, which keeps a hot read on local disk
+        (I5), and True when the local table holds nothing and the archive is
+        the only source of the archived rows.
+
+        Always bound on a LEADING column of `sort_by`. §7 measures a
+        non-leading predicate at 119 ms against 13 ms for the same predicate
+        with a leading bound.
+
+        Returns a streaming reader rather than a table: a full-window read with
+        a 400-byte payload column is 611 ms and proportional to the data, so
+        materialising it is the caller's choice to make.
         """
-        return self._read(
+        return self.sql(
             scan_query(
-                self._schema().names,
+                self.schema().names,
                 columns=columns,
                 where=where,
                 start_offset=start_offset,
                 end_offset=end_offset,
-            )
+            ),
+            include_archive=include_archive,
         )
 
-    def sql(self, query: str) -> pa.RecordBatchReader:
-        """Arbitrary DuckDB SQL against the merged view, exposed as `log`."""
-        return self._read(query)
+    def sql(
+        self, query: str, *, include_archive: bool | None = None
+    ) -> pa.RecordBatchReader:
+        """Run arbitrary DuckDB SQL against the log, exposed as `log`.
+
+        The escape hatch for what `scan` cannot express. Quote
+        `"litelink_offset"` — it is a DuckDB reserved word.
+        """
+        required = self._archive_required()
+        if include_archive is None:
+            include_archive = required
+        elif not include_archive and required:
+            msg = (
+                f"{self.root}/{self.name} holds no local files, so the archive is "
+                f"the only source of its archived rows — reading without it would "
+                f"return the buffer alone and silently omit them"
+            )
+            raise ValueError(msg)
+
+        if required:
+            # Refuses rather than serving short. Not called otherwise: a log
+            # with local files does not need the archive to be correct, and a
+            # read must not start costing a metadata GET because one exists.
+            self._checked_extent()
+
+        try:
+            # No lock. `Reader` guards its own connection and `LogTable` its
+            # own cache, both briefly.
+            return self._reader.query(query, include_archive=include_archive)
+        except FileNotFoundError as exc:
+            # Narrow: the race where a primary sweeps the metadata JSON between
+            # `_checked_extent`'s reload and `_prepare_remote`'s own — two
+            # separate GETs. pyiceberg raises `FileNotFoundError` there.
+            #
+            # Narrow in the other direction too, which was tested rather than
+            # assumed: an endpoint cut out from under a live reader raises
+            # `OSError` (NETWORK_CONNECTION) and bad credentials raise `OSError`
+            # (ACCESS_DENIED). Neither is mislabelled "reassemble".
+            #
+            # It does NOT cover the archive's data files or manifests. A
+            # missing data file surfaces as `HTTPException` inside `execute`,
+            # and a missing manifest can abort the process outright — DuckDB's
+            # iceberg extension calls `std::terminate` — which is pre-existing
+            # and reaches an ordinary local read of an archive too. Neither is
+            # catchable here.
+            #
+            # "Can", not "does": that abort was observed on a COLD read. A
+            # reader that has already scanned serves from DuckDB's cache and
+            # neither aborts nor raises.
+            #
+            # Three earlier versions of this comment claimed otherwise.
+            raise self._swept(exc) from exc
+
+    # -- observe -----------------------------------------------------------
+
+    def end_offset(self) -> int:
+        """The offset after the last row this reader can see.
+
+        **Which tier answers depends on whether the archive is load-bearing.**
+        With local files, `sqlite_sequence` is authoritative: it is the offset
+        the next append receives, and nothing below it is missing, because the
+        local table holds whatever the buffer has sealed. That keeps this a
+        cheap SQLite read on the writer's own log.
+
+        With an empty local table it is not authoritative, and this is where a
+        followed log bit. `next_offset` reads a sequence its own docstring
+        calls "the highest value ever assigned and never lowers", so it keeps
+        counting rows the replica no longer carries: a seal taken while
+        `_discard_on_seal()` was true deletes its rows and they reach the
+        archive only at the next `sync`. In between they are in neither tier.
+
+        Measured on a followed log in that window: it served 864 rows and
+        reported 1,501, and a caller using this as a resume cursor skipped 636
+        rows permanently once the primary synced. Over-reporting loses data;
+        under-reporting only re-delivers. So the answer is taken from the
+        tiers that actually hold rows, which is `Log.restore`'s formula.
+        """
+        if not self._archive_required():
+            return self._buffer.next_offset()
+
+        buffered = self._buffer.extent()
+
+        return (
+            max(self._checked_extent()[1], 0 if buffered is None else buffered[1]) + 1
+        )
+
+    def buffered_rows(self) -> int:
+        """Rows durable in the buffer but not yet sealed."""
+        extent = self._table.extent()
+
+        return self._buffer.count_above(0 if extent is None else extent[1])
+
+    def table_rows(self) -> int:
+        """Rows in the local Iceberg table, from the manifests."""
+        self._table.reload()
+
+        return self._table.record_count()
+
+    def table_files(self) -> int:
+        """Data files in the local table — what compaction is bringing down."""
+        self._table.reload()
+
+        return self._table.file_count()
+
+    def table_extent(self) -> tuple[int, int] | None:
+        """`(lo, hi)` offset extent of the local table, from statistics (§7)."""
+        self._table.reload()
+
+        return self._table.extent()
+
+    def archived_through(self) -> int:
+        """Highest offset the archive is known to hold, 0 if none (§5, I4).
+
+        The log's own cached watermark, not a network read — the same `meta`
+        row eviction consults so it can ask a keyed read instead of a round
+        trip. On a followed log that row came from the replica, so it describes
+        what the PRIMARY had pushed as of the snapshot; `coverage()` is the one
+        that asks the bucket.
+        """
+        recorded = self._buffer.get_meta(Maintenance.ARCHIVED_KEY)
+
+        return 0 if recorded is None else int(recorded)
+
+    def archive_files(self) -> int:
+        """How many data files the archive holds, or 0 with no archive.
+
+        A network round trip, unlike `table_files()`.
+        """
+        archive = self._archive.table()
+        if archive is None:
+            return 0
+
+        archive.reload()
+
+        return len(archive.data_files())
 
     def coverage(self) -> Coverage:
-        """What this follower can serve, and where it cannot.
+        """What this reader can serve, and where it cannot.
 
-        A follower is assembled from two tiers and cannot ask the primary, so
+        A reader assembled from a replica cannot ask the primary anything, so
         it reports rather than adjudicates — the failure to avoid is SILENCE,
         not incompleteness.
 
-        **A gap is not necessarily loss.** The gap reported here sits strictly
-        BETWEEN the tiers — above the archive's frontier, below the buffer's
-        first offset — because that is the only comparison made below. A range
-        there is either a band the buffer lost, since rows sealed while
+        **A gap is not necessarily loss.** The gap sits above the archive's
+        frontier and below the next thing this knows of: the buffer's first
+        offset when it holds rows, and the sequence's end when it does not. A
+        range there is either a band the buffer lost, since rows sealed while
         `wal_replication` was off are discarded at seal and gone, or a
         `Log.restore` fence, which burns 2**20 offsets in exactly that
-        position. Nothing distinguishes them from a replica: the fence "leaves
-        no trace once the sequence has moved". A caller who knows whether their
+        position. Nothing distinguishes them locally: the fence "leaves no
+        trace once the sequence has moved". A caller who knows whether their
         log has failed over can read a gap that this cannot.
 
-        A `start_offset` reserve is NOT among them, though an earlier version
-        of this docstring said it was. That reserve lies BELOW the archive's
-        low end, which nothing here compares against, so it can never surface
-        as a gap.
-
-        That is also why an earlier design refusing to open on a gap was wrong:
-        it refused every followed log that had failed over, on a million
-        offsets that never existed.
+        A `start_offset` reserve is NOT among them. It lies BELOW the archive's
+        low end, which nothing here compares against, so it never surfaces.
 
         **An EMPTY buffer is the case that must not report `gap=None`**, and an
-        earlier version did. The comparison was `buffered[0]` against the
-        archive's frontier, so with no buffered rows there was no lower bound
-        and the whole band above the archive went unexamined — a follower
-        serving 864 rows of 1,500 reporting itself gap-free, which is precisely
-        the silence this method exists to prevent.
-
-        The sequence is what closes it. `next_offset` counts every offset ever
-        assigned on the replica, including rows a seal discarded, so when the
-        buffer holds nothing it still says how far the log had got. The bound
-        above the archive is therefore the buffer's first offset when it has
-        one and the sequence's end when it does not.
+        earlier version did: the comparison was against `buffered[0]`, so with
+        no buffered rows there was no lower bound and the whole band above the
+        archive went unexamined — a reader serving 864 rows of 1,500 reporting
+        itself gap-free. The sequence closes it, because it counts every offset
+        ever assigned and never lowers.
 
         What this does NOT model is a second, disjoint band above the buffer's
         own top: `gap` is one range, and it reports the one adjoining the
         archive.
         """
-        archive = self._checked_extent()
+        archive = self._archive_extent()
         buffered = self._buffer.extent()
-        above = self._buffer.next_offset() if buffered is None else buffered[0]
         gap: tuple[int, int] | None = None
-        if above > archive[1] + 1:
-            gap = (archive[1] + 1, above - 1)
+        if archive is not None:
+            above = self._buffer.next_offset() if buffered is None else buffered[0]
+            if above > archive[1] + 1:
+                gap = (archive[1] + 1, above - 1)
 
         return Coverage(
             archive=archive,
@@ -3641,12 +3410,10 @@ class Follower:
             wal_replication=self.config.wal_replication,
         )
 
-    def close(self) -> None:
-        """Release handles, then remove the scratch root if this made one.
+    # -- lifecycle ---------------------------------------------------------
 
-        The same two closes `Log.close` performs, for the same two objects —
-        there is no third thing a follower opened.
-        """
+    def close(self) -> None:
+        """Release handles, then remove the scratch root if this made one."""
         try:
             self._reader.close()
             self._buffer.close()
@@ -3655,120 +3422,85 @@ class Follower:
             if owned is not None:
                 owned.cleanup()
 
-    def __enter__(self) -> Follower:
+    def __enter__(self) -> LogReader:
         return self
 
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _schema(self) -> pa.Schema:
-        """The declared columns, read from the replica rather than remembered."""
-        return self._buffer.schema
+    # -- internals ---------------------------------------------------------
 
-    def _read(self, query: str) -> pa.RecordBatchReader:
-        """Every read's two obligations, in one place because `scan` lost one.
+    def _archive_required(self) -> bool:
+        """Whether the archive is the only source of this log's archived rows.
 
-        **This exists because inheritance was hiding a dependency.** As a
-        subclass, only `sql` carried the translation below and `scan` carried a
-        comment explaining why it needed none: `Log.scan` ends in `self.sql`,
-        which bound to the OVERRIDE, so a scan picked up both halves through
-        dispatch. Delegation to a wrapped `Log` broke that silently — the call
-        reached `Log.sql` and the handler never ran. The guard survived because
-        it was explicit; the translation did not because it was inherited.
+        **This is the one thing that could not be derived, and claiming it
+        could was wrong.** The intuition was that an empty local table means
+        the archive is the only source — true of a followed log, whose table
+        is created empty and never filled. But a LOCAL log can have an empty
+        table too, in two ways that must not be treated alike:
 
-        Building the query here and calling `Reader` directly removes the inner
-        dispatch that made the loss possible, and routing both reads through
-        this makes the pair inseparable.
+        - Created with an archive and not yet synced. Demanding the archive
+          would refuse a first read that should simply serve the buffer.
+        - Fully evicted. Here the rows really are archive-only, and a default
+          local read does under-serve — measured, `scan()` returned 476 of
+          1,500 rows after `evict`. But its table refills on the next seal,
+          and flipping `scan`'s default to reach the network would rewrite
+          I5 ("a hot read is local disk only") as a side effect of this
+          refactor. That case is left alone deliberately and tracked
+          separately; it is a question about `Log`, not about readers.
+
+        So `follow` records the fact at assembly instead: this directory's
+        table is empty and nothing will ever fill it. One durable `meta` row,
+        written once by the code that knows, read here — not a mode anything
+        can toggle later.
         """
-        self._checked_extent()
+        return self._buffer.get_meta(FOLLOWED_KEY) is not None
 
-        try:
-            return self._reader.query(query, include_archive=True)
-        except FileNotFoundError as exc:
-            # Narrow: the race where the primary sweeps the metadata JSON
-            # between `_checked_extent`'s reload and `_prepare_remote`'s read.
-            # Those are two separate metadata GETs — `_prepare_remote` calls
-            # `reload()` itself (`_read.py`) — and pyiceberg raises
-            # `FileNotFoundError` when the second one finds the object gone.
-            #
-            # It is narrow in the other direction too, which was tested rather
-            # than assumed: an endpoint cut out from under a live follower
-            # raises `OSError` (NETWORK_CONNECTION), and bad credentials raise
-            # `OSError` (ACCESS_DENIED). Neither is mislabelled "reassemble".
-            #
-            # It does NOT cover the archive's data files or manifests. Within
-            # this call those are DuckDB's to read — pyiceberg reads manifests
-            # too, but only when `metadata_location` changes, and a follower's
-            # is pinned, so `_prepare_remote` always finds that cache warm. A
-            # missing data file surfaces as `HTTPException` raised inside
-            # `execute`, and a missing manifest can abort the process outright:
-            # DuckDB's iceberg extension calls `std::terminate`, which is
-            # pre-existing and reaches a plain `Log` reading its own archive
-            # too. Neither is catchable here — but do not read this handler as
-            # covering them.
-            #
-            # "Can", not "does": that abort was observed on a COLD read. A
-            # follower that has already scanned serves the same query from
-            # DuckDB's cache and neither aborts nor raises, because nothing
-            # goes back for the manifest. Do not treat the abort as a reliable
-            # signal that the archive is damaged.
-            #
-            # Three earlier versions of this comment claimed otherwise.
-            #
-            # The cold missing-manifest case IS caught, earlier, by the handler
-            # around `adopted.extent()`.
-            raise self._swept(exc) from exc
+    def _archive_extent(self) -> tuple[int, int] | None:
+        """The archive's extent, forcing a real re-read, or None if unreachable.
 
-    def _checked_extent(self) -> tuple[int, int]:
-        """The adopted archive's extent, or a refusal saying to reassemble.
-
-        **Two failures, and neither may be silent.** `Archive.table()` returns
-        None when the catalog row is gone, and the read would then quietly fall
-        to the buffer leg — on a follower, whose local table is empty, that is
-        every archived row missing with no error.
-
-        And the adopted metadata is PINNED at assembly, so this must force a
-        re-read. Without `reload()` it is an in-memory replay: `Archive.table`
-        short-circuits on a cached handle and `LogTable.extent` on an unchanged
-        `metadata_location`, so neither touches the network and the guard below
-        is unreachable on any follower that has read once. `coverage()` would
-        go on reporting a healthy, gap-free follower against a snapshot the
-        primary has already swept — the honesty guarantee lying, which is this
-        design's worst failure.
+        **The re-read is not optional.** On a followed log the adopted metadata
+        is pinned, and both caches short-circuit: `Archive.table` on a live
+        handle and `LogTable.extent` on an unchanged `metadata_location`. So
+        without `reload()` this is an in-memory replay that never touches the
+        network — and `coverage()` would go on reporting a healthy, gap-free
+        reader against a snapshot the primary had already swept, which is the
+        honesty guarantee lying.
 
         The archive carries `previous-versions-max: 10` — ten previous versions
         beside the current one — so the ELEVENTH further archive commit deletes
-        the object this names, with no time component at all. Archive commits
-        are what count: `sync`, `rewrite_archive`, archive expiry. A local
+        a pinned object, with no time component at all. Archive commits are
+        what count: `sync`, `rewrite_archive`, archive expiry. A local
         `maintain()` moves nothing in the bucket.
 
-        One metadata GET, and it cannot change what reads serve: it re-reads
-        this follower's own `archive.db` row, which nothing updates.
+        On a log whose own writer owns the archive this cannot bite: `sync`
+        moves the `archive.db` row, so the re-read finds the current pointer.
         """
         try:
             adopted = self._archive.table(repair=False)
-            if adopted is not None:
-                adopted.reload()
+            if adopted is None:
+                return None
+
+            adopted.reload()
+
+            return adopted.extent()
         except FileNotFoundError as exc:
             raise self._swept(exc) from exc
 
-        if adopted is None:
-            msg = (
-                f"{self.root}/{self.name} can no longer reach its archive, and a "
-                f"follower's local table is empty — reading on would omit every "
-                f"archived row. Reassemble with `Log.follow`"
-            )
-            raise RuntimeError(msg)
+    def _checked_extent(self) -> tuple[int, int]:
+        """The archive's extent, or a refusal — for when it is load-bearing.
 
-        try:
-            extent = adopted.extent()
-        except FileNotFoundError as exc:
-            raise self._swept(exc) from exc
-
+        Two failures, and neither may be silent. An unreachable archive would
+        otherwise fall through to the buffer leg, which on an empty local table
+        is every archived row missing with no error; and an archive reporting
+        no extent has nothing for this to merge.
+        """
+        extent = self._archive_extent()
         if extent is None:
             msg = (
-                f"the archive at {self._archive.uri!r} reports no extent; there is "
-                f"nothing for this follower to merge"
+                f"{self.root}/{self.name} can no longer reach its archive, and it "
+                f"holds no local files — reading on would omit every archived row. "
+                f"Reassemble with `follow`"
             )
             raise RuntimeError(msg)
 
@@ -3776,9 +3508,9 @@ class Follower:
 
     def _swept(self, exc: FileNotFoundError) -> RuntimeError:
         return RuntimeError(
-            f"this follower's archive snapshot has been swept — the primary has "
-            f"committed past it ({exc}). A follower is a snapshot, not a "
-            f"subscription: reassemble with `Log.follow`"
+            f"this reader's archive snapshot has been swept — the writer has "
+            f"committed past it ({exc}). A followed log is a snapshot, not a "
+            f"subscription: reassemble with `follow`"
         )
 
 

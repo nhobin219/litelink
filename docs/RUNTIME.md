@@ -25,7 +25,8 @@ with what the writer leaves behind: turn the buffer into Parquet. Compaction, ev
 and expiry are what it then does with the files that produces.
 
 A reader is not a role in this sense. Any number of processes may open the log
-`read_only`; they hold nothing, mutate nothing, and coordinate with nobody.
+with `litelink.reader`; they hold nothing, mutate nothing, and coordinate with
+nobody, and a `LogReader` has no write surface to hold back.
 
 **Why the maintainer is a separate process.** A seal is CPU-bound pure Python — most of
 its commit is pyiceberg copying table metadata — so doing it on a *thread* inside the
@@ -373,7 +374,7 @@ listed is not one.
 | | |
 |---|---|
 | one writer process per log | §1. Two processes appending to one log is unsupported and unchecked |
-| any number of reader processes | `Log.open(..., read_only=True)`. They claim nothing and mutate nothing |
+| any number of reader processes | `litelink.reader(root, name)`. They claim nothing and mutate nothing |
 | maintainers on disjoint offsets | claims exclude by RANGE, so two passes that cannot touch each other's files run at once; one that finds its range claimed skips it |
 | open the log *after* forking | a SQLite handle does not survive `fork`, and neither does a DuckDB one |
 

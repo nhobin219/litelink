@@ -2038,7 +2038,7 @@ The consequence worth planning for is that local disk holds roughly
    | reader | result |
    |---|---|
    | same process, via `sqlite_query` | corrupt on the FIRST scan; `integrity_check` fails afterwards |
-   | separate process, via `Log.open(read_only=True)` | 327 scans, clean |
+   | separate process, via `litelink.reader(...)` | 327 scans, clean |
    | same process, strictly sequential append→scan | 300 iterations, clean |
 
    The symptoms were `database disk image is malformed` and, when the torn mapping was the

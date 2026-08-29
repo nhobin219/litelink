@@ -41,6 +41,7 @@ PRELUDE = """
 import time
 import pyarrow as pa
 from datetime import timedelta
+import litelink
 from litelink import Log, LogConfig
 from litelink._s3 import S3Options
 
@@ -142,7 +143,7 @@ MAINTAINER = """
 # each exactly once. A seal, a compaction, an eviction or a sync landing
 # mid-query would show up here as a gap or a repeat.
 READER = """
-    log = Log.open(ROOT, "s", read_only=True, s3=S3)
+    log = litelink.reader(ROOT, "s", s3=S3)
     samples, high = 0, 0
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
