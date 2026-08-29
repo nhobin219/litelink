@@ -3689,3 +3689,18 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
     # The write surface is not merely refused, it is absent.
     for absent in ("append", "extend", "seal", "sync", "maintain", "set_config"):
         assert not hasattr(Follower, absent), f"Follower exposes {absent}"
+
+    # And the surface is exactly this, because `docs/API.md` prints it as
+    # "the whole of it". A member added here without updating that table
+    # makes the documented surface a lie, which this catches.
+    assert {n for n in vars(Follower) if not n.startswith("_")} == {
+        "scan",
+        "sql",
+        "coverage",
+        "end_offset",
+        "root",
+        "name",
+        "config",
+        "sort_by",
+        "close",
+    }

@@ -29,7 +29,7 @@ that gets copied and attached elsewhere.
 | **lifecycle** | `new` · `open` · `restore` · `recover` · `recovery` · `close` |
 | **write** | `append` · `extend` |
 | **read** | `scan` · `sql` |
-| **follow** | `Log.follow` → `Follower`: `scan` · `sql` · `coverage` · `end_offset` · `close` |
+| **follow** | `Log.follow` → `Follower` — the whole of it: `scan` · `sql` · `coverage` · `end_offset` · `root` · `name` · `config` · `sort_by` · `close` |
 | **seal** | `seal_due` · `seal` · `await_seal` |
 | **maintain** | `maintain` · `compact` · `evict` · `expire` |
 | **archive** | `sync` · `hydrate` · `rewrite_archive` |
