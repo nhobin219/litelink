@@ -509,9 +509,10 @@ class Log:
         something the log does not agree with, and the log is the one that is
         right.
 
-        `read_only=True` opens a second view of a log another process is
-        writing. It runs no recovery and refuses every mutation, so it cannot
-        disturb the single writer §1 assumes.
+        Always recovers, because this always returns a writer. For a second
+        view of a log another process is writing, use `litelink.reader`, which
+        runs no recovery and has no mutation to refuse — so it cannot disturb
+        the single writer §1 assumes.
         """
         layout = Layout(Path(root), name)
         # Asked of THIS log's table, not of `catalog.db`. That file is shared
@@ -2059,7 +2060,7 @@ class Log:
             # `acquire()`, this one waits and then RAISES if a maintainer is
             # holding the whole-log range — and `recover()` is unguarded in
             # `open`, so that would fail the open for every writer while
-            # `read_only=True` kept working. That is the failure this method
+            # `litelink.reader` kept working. That is the failure this method
             # exists to avoid; leaving the acquisition outside meant it could
             # still happen, just for a different reason.
             lease = self._claim_settings()
