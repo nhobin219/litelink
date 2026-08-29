@@ -272,6 +272,7 @@ class Buffer:
         self,
         writer: sqlite3.Connection,
         reader: sqlite3.Connection,
+        sealer: sqlite3.Connection,
         schema: pa.Schema,
     ) -> None:
         """Take built collaborators. `open` is what builds and validates them.
@@ -292,6 +293,54 @@ class Buffer:
         """
         self._con = writer
         self._reader = reader
+        # A THIRD connection, for the seal alone, and it exists because
+        # `_reader` cannot be shared with it.
+        #
+        # `_rows` steps a statement for the whole of its `fetchall`, and in WAL
+        # a stepping statement pins that CONNECTION's read snapshot. Sharing
+        # one between a scan and a seal therefore hands the seal whatever
+        # snapshot the scan pinned — it writes its Parquet file from a stale
+        # view, and `finish_seal` then deletes every buffered row through the
+        # group's end, including rows that never reached the file. Measured:
+        # 1,000 acknowledged offsets in neither tier, from a scan and a seal
+        # running concurrently through the public API.
+        #
+        # Readers do not need this among themselves: `rows_above` holds
+        # `_tail_lock` across its fetch, so only one steps at a time. A stale
+        # view would be self-correcting there anyway, and structurally so —
+        # offsets come from AUTOINCREMENT under one serialised writer and
+        # deletions are prefix-only, so what a stale snapshot lacks is always a
+        # SUFFIX, and `_rows("> _tail_hi")` cannot skip it.
+        #
+        # **This isolates the seal from READERS.** What keeps seals off each
+        # other is the CLAIM: `Claim.acquire` filters on range overlap and
+        # owner, not on kind, so it is a global range mutex. `_seal_queued`'s
+        # re-read of the queue head closes the one hole in that — a sealer
+        # whose claim succeeds because the range went free while it blocked,
+        # and which would otherwise read a group that is gone. Measured across
+        # 2.5M rows under four concurrent sealers: 0 overlapping reads here.
+        #
+        # Not an absolute, and the residual is the claim's TTL. Two overlapping
+        # claims can coexist only if one expired, so a read would have to run
+        # the full 30 s — about 15M rows at the measured 261 ms/150k, which
+        # needs `target_seal_size` far above its 8 MiB default. Both would then
+        # read the SAME range, whose rows were all committed before the group
+        # closed, so the joiner still sees them.
+        #
+        # **That re-read is load-bearing, and the cost of removing it is
+        # measured, not theoretical.** Without it a stale sealer reaches
+        # `rows_between` and pins this connection for the length of a full
+        # group read — 314 ms over 150k rows, against 8.5 ms for everything a
+        # victim must do inside that window. Same probe without the re-read:
+        # 49 stale pins and 48 overlapping reads over the same 2.5M rows, and
+        # a gated run loses 100 acknowledged offsets, written into a file whose
+        # recorded range is three times the rows it holds.
+        #
+        # An earlier version of this comment argued the overlap was harmless
+        # because the fsyncs cost more than the pin lasts. That is backwards by
+        # a factor of about 37, and it is recorded here so nobody restores the
+        # shortcut on the strength of it.
+        self._sealer = sealer
         # What `shape()` falls back to when `meta` has no schema row yet. Two
         # callers need that and both would otherwise fail at construction:
         # `_create` runs inside `Buffer.open` BEFORE `Log.new` writes the row,
@@ -322,8 +371,15 @@ class Buffer:
         # transactions. A bare SELECT issued while another thread has a
         # transaction open joins it and sees uncommitted rows, which a rollback
         # then unmakes; that is the same mechanism that once let a lease
-        # evaporate under its holder. `_reader` needs none of this precisely
-        # because nothing ever opens a transaction on it.
+        # evaporate under its holder.
+        #
+        # This used to say `_reader` needed none of it "precisely because
+        # nothing ever opens a transaction on it". **A stepping statement IS an
+        # open read transaction**, and `_rows` steps one for the whole of its
+        # `fetchall` — so that premise was false and cost acknowledged rows.
+        # What actually keeps `_reader` safe is that its one caller,
+        # `rows_above`, holds `_tail_lock` across the fetch; the seal reads on
+        # `_sealer` for the same reason. See `_sealer`.
         self._lock = threading.RLock()
         # The read cache — see `rows_above`. Its own lock rather than the one
         # above, which appends hold: a read must not wait behind a write to
@@ -415,7 +471,11 @@ class Buffer:
         if readonly:
             con = cls._connect_readonly(path)
 
+            # A readonly buffer never seals, so it needs no third connection —
+            # `rows_between` is unreachable without a claim, which needs a
+            # writer.
             return cls(
+                con,
                 con,
                 con,
                 schema,
@@ -438,6 +498,7 @@ class Buffer:
 
         buffer = cls(
             writer,
+            cls._connect_readonly(path),
             cls._connect_readonly(path),
             schema,
         )
@@ -1266,7 +1327,10 @@ class Buffer:
         `start` costs nothing to supply: `pending_group` and `pending_seal` both
         already carry it, and both call sites already unpack it.
         """
-        return self._rows("BETWEEN ? AND ?", (start, end - 1))
+        # On the seal's OWN connection. See `_sealer`: sharing `_reader` with a
+        # concurrent scan means reading that scan's pinned snapshot and then
+        # deleting rows this never saw.
+        return self._rows("BETWEEN ? AND ?", (start, end - 1), self._sealer)
 
     def rows_above(self, boundary: int | None) -> pa.Table:
         """Buffered rows with `offset > boundary`, as Arrow. The read's input.
@@ -1384,7 +1448,12 @@ class Buffer:
 
         return kept
 
-    def _rows(self, predicate: str, params: tuple[object, ...]) -> pa.Table:
+    def _rows(
+        self,
+        predicate: str,
+        params: tuple[object, ...],
+        con: sqlite3.Connection | None = None,
+    ) -> pa.Table:
         """Buffered rows matching `offset <predicate>`, in offset order.
 
         The predicate is on the INTEGER PRIMARY KEY so SQLite answers it with
@@ -1394,7 +1463,7 @@ class Buffer:
         """
         shape = self.shape()
         names = ", ".join(f'"{c}"' for c in (OFFSET, *shape.columns))
-        cursor = self._reader.execute(
+        cursor = (con or self._reader).execute(
             f'SELECT {names} FROM buffer WHERE "litelink_offset" {predicate}'
             ' ORDER BY "litelink_offset"',
             params,
@@ -2398,5 +2467,8 @@ class Buffer:
         # all, and a caller keeping the object alive should not keep the rows.
         self._drop_tail()
         self._con.close()
-        if self._reader is not self._con:
-            self._reader.close()
+        # Identity-checked, because a readonly buffer passes one connection
+        # three times.
+        for extra in (self._reader, self._sealer):
+            if extra is not self._con:
+                extra.close()

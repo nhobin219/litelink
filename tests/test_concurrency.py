@@ -196,3 +196,97 @@ def test_a_reader_is_not_destroyed_by_the_next_query(tmp_path: Path) -> None:
         assert len(held.read_all()) == 200, (
             "the first reader saw the second query's relation"
         )
+
+
+def test_a_seal_does_not_read_a_scan_s_pinned_snapshot(tmp_path: Path) -> None:
+    """A stepping statement pins its CONNECTION's snapshot (#34).
+
+    `Buffer._rows` steps a statement for the whole of its `fetchall`, and in
+    WAL that pins the read snapshot of the connection it ran on. When the seal
+    shared `_reader` with scans, a scan in flight handed the seal a stale view:
+    it wrote its Parquet file from that view and `finish_seal` then deleted
+    every buffered row through the group's end — including rows that never
+    reached the file. Measured before the fix: 1,000 acknowledged offsets in
+    neither tier.
+
+    Staged rather than raced, so it is deterministic. An undrained cursor on
+    `_reader` is exactly the state a concurrent `scan()` is in for the length
+    of its fetch.
+
+    Falsify by passing `self._reader` to `_rows` from `rows_between`: the seal
+    reads 10 rows instead of 20 and the last 10 are lost.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA)
+    with log:
+        log.extend([{"event_ts": i, "key": "k"} for i in range(10)])
+
+        buffer = log._buffer
+        # Pin a snapshot on the shared read connection, as a scan's fetch does.
+        pinned = buffer._reader.execute("SELECT * FROM buffer")
+        pinned.fetchone()
+        try:
+            log.extend([{"event_ts": i, "key": "k"} for i in range(10, 20)])
+
+            # The seal's input must include everything committed, not what the
+            # pinned statement can see.
+            assert buffer.rows_between(1, 21).num_rows == 20
+        finally:
+            pinned.fetchall()
+
+
+def test_a_sealer_that_woke_to_a_finished_group_abandons_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The queue head is read before the claim, so it can go stale (#37).
+
+    `_seal_queued` reads `pending_group()` and only then blocks in
+    `acquire()`, which is a `BEGIN IMMEDIATE` and can wait the whole busy
+    timeout. A sealer that wakes to find another has sealed that group finds
+    its claim succeeds anyway — the range is free again — and proceeds on a
+    group that no longer exists.
+
+    `sealing` holds one row, so its `claim_seal` deletes the live sealer's, and
+    that sealer's `finish_seal` then returns False: its Iceberg commit landed,
+    but its `extent` row is never named and its buffer rows are never dropped.
+    A wasted rewrite rather than loss, since reads are bounded by the table
+    extent and the next attempt re-names the group.
+
+    Staged on `pending_group` because that IS the race: the pre-claim read
+    returns the group this sealer saw, the post-claim re-read returns what is
+    actually queued. Falsify by removing the re-read — the stale sealer
+    proceeds and overwrites `sealing` with a range nobody is working on.
+    """
+    log = Log.new(tmp_path, "s", schema=SCHEMA, config=LogConfig(target_seal_size=1024))
+    with log:
+        log.extend([{"event_ts": i, "key": "k" * 200} for i in range(200)])
+
+        stale = log._buffer.pending_group()
+
+        assert stale is not None
+        # Another sealer takes that group and finishes it.
+        assert log._seal_queued() == stale[1]
+
+        current = log._buffer.pending_group()
+
+        assert current is not None
+        assert current != stale
+
+        # Now the blocked sealer wakes, still holding the group it read.
+        truth = log._buffer.pending_group
+        seen: list[int] = []
+
+        def staged() -> tuple[int, int] | None:
+            seen.append(1)
+
+            return stale if len(seen) == 1 else truth()
+
+        monkeypatch.setattr(log._buffer, "pending_group", staged)
+        before = log._buffer.pending_seal()
+
+        assert log._seal_queued() is None
+        assert len(seen) >= 2, "the queue head was not re-read under the claim"
+
+        monkeypatch.undo()
+
+        assert log._buffer.pending_seal() == before
+        assert log._buffer.pending_group() == current

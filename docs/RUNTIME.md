@@ -502,9 +502,25 @@ takes that lock, reads included. A statement issued while another thread has a
 transaction open on the same connection *joins* it: a read sees uncommitted rows that a
 rollback then unmakes, and a write commits or rolls back with someone else's work. That
 is not a hot-path concern, it is how a lease once evaporated under its holder and how two
-sealers came to write the same file. The read-only connection needs no such lock, and
-that is the proof the rule is about transactions rather than about threads — nothing ever
-opens one on it.
+sealers came to write the same file.
+
+This section used to add that the read-only connection "needs no such lock … nothing ever
+opens one on it", and offer that as proof the rule is about transactions rather than
+threads. **That was wrong, and it cost acknowledged rows.** A stepping statement is an open
+read transaction, and the buffer's row reads step one for the whole of their fetch — so a
+scan and a seal sharing that connection meant the seal read the scan's pinned snapshot,
+wrote its file from a stale view, and then deleted the rows it had not written.
+
+Reads are safe among themselves because the tail cache's lock already serialises them on a
+writable buffer — a readonly one shares a single handle across all three roles, which is
+harmless because every use of it is a read. The seal reads on its own connection, because it
+is the caller that DELETES on the strength of what it read. Seals are kept off each other
+by the claim, which excludes on range regardless of kind; re-reading the queue head under
+it closes the case where a claim succeeds because the range went free while the sealer
+blocked. Measured under four concurrent sealers, no two overlap on that connection.
+
+The rule is unchanged; what was wrong was the claim that one connection was exempt from
+it.
 
 **The seal has two ceilings, and the tighter one binds.** `target_seal_size` bounds the
 bytes a file holds, `target_seal_rows` the number of rows, and the cut lands on whichever is

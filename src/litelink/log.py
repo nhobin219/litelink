@@ -1795,6 +1795,30 @@ class Log:
         # through it. Detected with a keyed read rather than by asking the
         # table, which would walk manifests on every ordinary seal to learn
         # something only a replay needs to know.
+        # Re-read the queue head UNDER the claim, because the read above
+        # happened before it. A sealer that blocked in `acquire()` — which is a
+        # `BEGIN IMMEDIATE` and can wait the whole busy timeout — may wake to
+        # find another sealer has since sealed this group and moved on. Its
+        # claim then succeeds because the range is free again, and it proceeds
+        # on a group that no longer exists.
+        #
+        # The damage is not the wasted work. `sealing` holds ONE row, so this
+        # sealer's `claim_seal` would delete the live sealer's, and that
+        # sealer's `finish_seal` then returns False: its Iceberg commit has
+        # landed, but its `extent` row is never named and its buffer rows are
+        # never dropped. Reads stay correct — the buffer leg is bounded by the
+        # table extent — so it is a wasted rewrite rather than loss, and the
+        # next attempt re-names the group. Observed under three concurrent
+        # sealers.
+        #
+        # Aborting is what the acquire-failure path above already does when
+        # two sealers want the same group, so a caller draining in a loop
+        # treats the two identically.
+        if self._buffer.pending_group() != group:
+            lease.release()
+
+            return None
+
         claimed = self._buffer.pending_seal()
         if claimed is not None and claimed[1] == end:
             # In the `try` below in spirit, and now in fact: returning from
