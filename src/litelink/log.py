@@ -179,7 +179,7 @@ def _repointed_mid_push() -> RuntimeError:
     )
 
 
-def scan_query(
+def _scan_query(
     declared: Sequence[str],
     *,
     columns: Sequence[str] | None = None,
@@ -189,11 +189,12 @@ def scan_query(
 ) -> str:
     """The SQL behind `scan`, built from the declared columns alone.
 
-    A free function because two different readers ask for it and only one of
-    them is a `WriteHandle`. When `Follower` wrapped a whole `WriteHandle` it got this by
-    calling `Log.scan`, which meant its read went out through `Log.sql` — and
-    that is exactly how it lost the swept-snapshot translation, since a wrapper
-    can intercept the call it makes but not the dispatch inside it.
+    A function rather than a method because it touches no handle state: give
+    it column names and bounds and it returns a string, which makes it
+    testable without a log. That is the whole of the reason now — an earlier
+    version of this docstring said the separation existed because two classes
+    needed it, which was true while `Follower` and `Log` each had a read path
+    and stopped being true when the hierarchy gave them one.
 
     Taking the column names rather than a schema keeps it independent of who
     stores them.
@@ -352,7 +353,7 @@ class LogHandle:
         materialising it is the caller's choice to make.
         """
         return self.sql(
-            scan_query(
+            _scan_query(
                 self.schema.names,
                 columns=columns,
                 where=where,
