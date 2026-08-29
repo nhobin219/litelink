@@ -3447,26 +3447,50 @@ class Follower:
         `Log.scan`'s `include_archive` is absent deliberately — see the class
         docstring. Everything else passes through.
         """
-        self._checked_extent()
-
-        return self._log.scan(
-            columns=columns,
-            where=where,
-            start_offset=start_offset,
-            end_offset=end_offset,
-            include_archive=True,
+        return self._guarded(
+            lambda: self._log.scan(
+                columns=columns,
+                where=where,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                include_archive=True,
+            )
         )
 
     def sql(self, query: str) -> pa.RecordBatchReader:
         """Arbitrary DuckDB SQL against the merged view, exposed as `log`."""
+        return self._guarded(lambda: self._log.sql(query, include_archive=True))
+
+    def _guarded(
+        self, read: Callable[[], pa.RecordBatchReader]
+    ) -> pa.RecordBatchReader:
+        """Every read's two obligations, in one place because `scan` lost one.
+
+        **This exists because inheritance was hiding a dependency.** As a
+        subclass, only `sql` carried the translation below and `scan` carried a
+        comment explaining why it needed none: `Log.scan` ends in `self.sql`,
+        which bound to the OVERRIDE, so a scan picked up both halves through
+        dispatch. Composition breaks that silently — `self` inside `Log.scan`
+        is the wrapped `Log`, so it reaches `Log.sql` and the handler never
+        runs. The guard survived the refactor because it was an explicit call;
+        the translation did not, because it was inherited.
+
+        A follower then died with a raw `FileNotFoundError` on the exact path
+        §3b and `docs/API.md` both promise refuses with "reassemble" — so a
+        caller looping `except RuntimeError: reassemble` crashed instead of
+        recovering. Routing both reads through here is what makes that
+        impossible to lose again.
+        """
         self._checked_extent()
 
         try:
-            return self._log.sql(query, include_archive=True)
+            return read()
         except FileNotFoundError as exc:
             # Narrow: the race where the primary sweeps the metadata JSON
             # between `_checked_extent`'s reload and `_prepare_remote`'s read.
-            # pyiceberg raises `FileNotFoundError` there.
+            # Those are two separate metadata GETs — `_prepare_remote` calls
+            # `reload()` itself (`_read.py`) — and pyiceberg raises
+            # `FileNotFoundError` when the second one finds the object gone.
             #
             # It does NOT cover the archive's data files or manifests. Within
             # this call those are DuckDB's to read — pyiceberg reads manifests

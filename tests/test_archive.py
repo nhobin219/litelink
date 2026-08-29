@@ -19,6 +19,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import duckdb
 import pyarrow as pa
 import pytest
 
@@ -27,7 +28,7 @@ from litelink._archive import Archive
 from litelink._buffer import Buffer
 from litelink._layout import NAMESPACE, Layout
 from litelink._maintenance import Maintenance
-from litelink._read import load_extension, secret_sql
+from litelink._read import Reader, load_extension, secret_sql
 from litelink._s3 import S3Options
 from litelink._table import (
     VERSION_HINT,
@@ -3594,6 +3595,98 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
         for call in (follower.coverage, lambda: follower.scan().read_all()):
             with pytest.raises(RuntimeError, match="reassemble"):
                 call()
+
+
+@pytest.mark.slow
+def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep that lands BETWEEN a follower's two metadata reads.
+
+    Every read takes two: `_checked_extent()` reloads to decide whether to
+    serve at all, and `Reader._prepare_remote` reloads again to resolve the
+    snapshot it scans. A primary committing between them is past the guard and
+    into pyiceberg, which raises a bare `FileNotFoundError` naming an S3 key.
+
+    The other swept test cannot reach this. It sweeps BEFORE the call, so
+    `_checked_extent` fires first and the guard produces the refusal — the
+    window is never entered. This one injects the delete inside it.
+
+    **It is `scan` that this protects, and inheritance is why.** As a subclass,
+    only `sql` carried the translation; `scan` needed none because `Log.scan`
+    ends in `self.sql`, which bound to the override. Composition sends that
+    call to `Log.sql` instead, so the handler stopped running and `scan` — the
+    main read entry point — began dying with the raw error on the exact path
+    §3b promises refuses with "reassemble". A caller looping
+    `except RuntimeError: reassemble` crashed rather than recovering.
+
+    Falsify by narrowing `Follower._guarded` back to `sql` alone: `sql` still
+    refuses and `scan` raises `FileNotFoundError`.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-window"
+    config = replace(
+        LogConfig(),
+        target_seal_size=16 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(2000))
+        while log.seal() is not None:
+            pass
+
+        log.maintain()
+        log.sync()
+        replication = log.write_replication_config()
+
+    _replicate(binary, replication, s3)
+
+    fs = filesystem(s3)
+    original = Reader._prepare_remote
+    armed: dict[str, object] = {"on": False, "path": ""}
+
+    def sweeping(self: Reader, cursor: duckdb.DuckDBPyConnection) -> object:
+        # Inside the window: past `_checked_extent`, before the read's own
+        # `reload()`. Deleting the pinned metadata here is what a primary's
+        # eleventh commit does, and nothing about it is time-dependent.
+        if armed["on"]:
+            armed["on"] = False
+            fs.rm(str(armed["path"]))
+            fs.invalidate_cache()
+
+        return original(self, cursor)
+
+    monkeypatch.setattr(Reader, "_prepare_remote", sweeping)
+
+    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        # Warm every cache first, so the guard alone cannot be what fires.
+        assert follower.scan().read_all().num_rows > 0
+
+        pinned = follower._log._archive.table(repair=False)  # noqa: SLF001
+        assert pinned is not None
+        key = pinned.metadata_location.removeprefix("s3://")
+        armed["path"] = key
+        kept = fs.cat_file(key)
+
+        for call in (
+            lambda: follower.sql("SELECT count(*) FROM log").read_all(),
+            lambda: follower.scan().read_all(),
+        ):
+            armed["on"] = True
+            with pytest.raises(RuntimeError, match="reassemble"):
+                call()
+
+            # Put it back so the next call reaches the window rather than
+            # being turned away by the guard.
+            fs.pipe_file(key, kept)
+            fs.invalidate_cache()
 
 
 @pytest.mark.slow
