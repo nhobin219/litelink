@@ -631,11 +631,27 @@ class LogHandle:
           eviction case unreachable, which hid a real defect behind what looked
           like a design boundary.
 
-        The archive is the authority on what the archive holds. `table()` uses
-        the cached handle rather than forcing a reload, so the cost is one
-        metadata resolve the first time a reader with an empty table asks — and
-        `_archive_extent` still forces its own re-read where staleness is the
-        thing being detected.
+        The archive is the authority on what the archive holds, and it is asked
+        through the RESOLVING read. A first version asked `Archive.table()`
+        directly, on the theory that the cached handle cost one metadata
+        resolve and no more. That was the fourth wrong proxy: `Archive.table`
+        returns its handle unchanged while the URI matches, and `LogTable.extent`
+        short-circuits on an unchanged `metadata_location`, so a handle first
+        touched while the archive table EXISTED BUT WAS EMPTY answered None for
+        the rest of its life.
+
+        That state is ordinary — `sync` creates the table on a maintenance tick
+        before anything is sealed, and `set_archive` creates one at a new
+        prefix — and one early call was enough to pin it: a `scan`, an
+        `end_offset`, even a bare metadata poll. The handle then served the
+        buffer alone with no error while `coverage()`, which does resolve,
+        reported the same log gap-free. Measured: 0 of 20 rows, indefinitely,
+        on both a reader and a writer.
+
+        So the cost is a metadata GET per read on a log with an empty local
+        table. A log with local files never reaches this line, which is what
+        keeps I5 intact for a hot read; a log without them has no local data to
+        protect and the alternative is silently wrong results.
         """
         self._table.reload()
         if self._table.extent() is not None:
@@ -644,9 +660,7 @@ class LogHandle:
         if not self._archive.configured():
             return False
 
-        adopted = self._archive.table(repair=False)
-
-        return adopted is not None and adopted.extent() is not None
+        return self._archive_extent() is not None
 
     def _archive_extent(self) -> tuple[int, int] | None:
         """The archive's extent, forcing a real re-read, or None if unreachable.

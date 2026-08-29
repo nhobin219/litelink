@@ -160,7 +160,7 @@ reach. `schema` is your columns — the library prepends
 `FileNotFoundError` for a log that is not there, and `ValueError` for one whose stored config
 or sort order is missing — a log that exists but is corrupt.
 
-**`reader()` opens a second view alongside a live writer.** Any number of processes may hold
+**`open(..., read_only=True)` opens a second view alongside a live writer.** Any number of processes may hold
 one. They take no lease, mutate nothing, and coordinate with nobody. Reading in the *same*
 process as the writer is the case to avoid — see RUNTIME.md on two SQLite libraries in one
 process.
@@ -299,7 +299,7 @@ with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
 own `meta`. It requires a published archive — a log before its first successful sync cannot be
 followed, because serving the buffer alone would silently omit every archived row.
 
-**This returns a `LogHandle`, the same type `reader()` does.** It holds the read
+**This returns a `RemoteReadHandle`, a sibling of the `LocalReadHandle` that `open(..., read_only=True)` returns.** It holds the read
 collaborators — the replicated buffer, the local table, the archive handle, and the reader
 over them — so `append`, `seal`, `sync`, `compact` and `evict` are *absent* rather than
 raising: the writer machinery is not built at all.

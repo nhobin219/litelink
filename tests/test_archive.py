@@ -3460,6 +3460,81 @@ def test_buffered_rows_sees_another_process_seal(
 
 
 @pytest.mark.slow
+def test_a_handle_that_read_an_empty_archive_still_sees_it_fill(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Handle lifetime, which is where the last two criticals both lived.
+
+    `Archive.table` returns its cached handle while the URI matches, and
+    `LogTable.extent` short-circuits on an unchanged `metadata_location`. So a
+    handle that first touches the archive while the table EXISTS BUT IS EMPTY
+    pins the answer "no extent" — and `_archive_required` then derives that the
+    archive is not load-bearing, for the rest of that handle's life.
+
+    The empty-but-existing archive is ordinary, not a corner: `sync` creates
+    the table on a maintenance tick before anything is sealed, and
+    `set_archive` creates one at a new prefix. One early call is enough to pin
+    it — a `scan`, an `end_offset`, even a bare metadata poll of the kind
+    `examples/adsb/tail.py` makes on its first tick.
+
+    Measured before the fix, on the documented two-role topology: after the
+    maintainer sealed, synced and evicted 20 rows, a reader that had scanned
+    once beforehand returned **0 of 20, indefinitely**, while `coverage()` on
+    the same handle reported it gap-free. `coverage` resolves, so touching it
+    repaired the pointer by accident; a scan-only loop never healed.
+
+    Every other test opens a fresh handle after the eviction, which is why
+    nine review rounds did not reach this.
+
+    Falsify by reading `self._archive.table(repair=False).extent()` in
+    `_archive_required` instead of `self._archive_extent()`.
+    """
+    where = f"s3://{bucket}/prefix"
+    config = replace(
+        LogConfig(),
+        target_seal_size=64 * 1024,
+        target_compact_size=64 * 1024,
+        compact_min_files=2,
+        local_retention=timedelta(0),
+        snapshot_retention=timedelta(seconds=0),
+    )
+    with litelink.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=where,
+        s3=s3,
+    ) as writer:
+        # A maintenance tick BEFORE anything is sealed: this creates the
+        # archive table, empty. That is the state that used to poison a handle.
+        writer.sync()
+
+        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+            assert reader.scan().read_all().num_rows == 0
+            assert reader.end_offset() >= 1
+
+            # Now the log fills, is archived, and is evicted dry — the rows
+            # exist only in the archive.
+            writer.extend(rows(ROWS))
+            writer.seal_due()
+            writer.sync()
+            writer.maintain()
+            assert writer.table_extent() is None, "the fixture must evict dry"
+
+            # The SAME handle, which read the archive while it was empty.
+            served = reader.scan().read_all().column(OFFSET).to_pylist()
+            assert sorted(served) == list(range(1, ROWS + 1)), (
+                f"a handle that read the archive while it was empty served "
+                f"{len(served)} of {ROWS} rows afterwards"
+            )
+
+            # And the writer's own handle, which did the same.
+            assert writer.scan().read_all().num_rows == ROWS
+
+
+@pytest.mark.slow
 def test_an_evicted_log_still_serves_every_row(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
