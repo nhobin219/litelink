@@ -3273,3 +3273,388 @@ def test_creating_a_log_with_an_empty_archive_is_a_local_only_log(
             config=replace(LogConfig(), local_retention=timedelta(0), local_rows=0),
             archive="",
         )
+
+
+def _replicate(binary: Path, config: Path, s3: S3Options) -> None:
+    """Run the sidecar once so a replica exists to follow."""
+    environment = dict(os.environ)
+    resolved = s3.resolved()
+    if resolved.access_key and resolved.secret_key:
+        environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
+        environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
+
+    subprocess.run(  # noqa: S603
+        [str(binary), "replicate", "-config", str(config), "-exec", "sleep 3"],
+        check=True,
+        env=environment,
+        capture_output=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.slow
+def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The whole point: rows the archive does not have (§3a).
+
+    A follower is fresher than the archive alone because WAL replication ships
+    the UNSEALED rows — down to the replication lag rather than the seal
+    cadence. Asserts the merged range, not just a count, so a follower serving
+    one tier cannot pass.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow"
+    config = replace(
+        LogConfig(),
+        target_seal_size=32 * 1024,
+        target_compact_size=32 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(2000))
+        while primary.seal() is not None:
+            pass
+
+        primary.maintain()
+        primary.sync()
+        archived = primary._archive.table(repair=False)  # noqa: SLF001
+
+        assert archived is not None
+
+        frontier = archived.extent()
+
+        assert frontier is not None
+        # The tail the archive cannot have.
+        primary.extend(rows(100))
+        served = primary.scan(include_archive=True).read_all().num_rows
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3)
+
+    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        got = follower.scan().read_all()
+        offsets = got.column(OFFSET).to_pylist()
+
+        assert got.num_rows == served
+        assert len(set(offsets)) == len(offsets), "a row was served by both tiers"
+        assert min(offsets) == 1
+
+        report = follower.coverage()
+
+        assert report.archive == frontier
+        assert report.gap is None
+        assert report.buffered is not None
+        assert report.buffered[0] == frontier[1] + 1, "the seam is not contiguous"
+
+
+@pytest.mark.slow
+def test_a_follower_refuses_to_read_without_the_archive(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`include_archive=False` has no coherent meaning on a follower.
+
+    `Log.scan` and `Log.sql` default it to False, which is safe for an ordinary
+    log because its local table holds the sealed history. A follower's local
+    table is EMPTY by construction, so that default returns the replicated
+    buffer alone — measured at 308 of 800 rows, silently. Refused on both entry
+    points; overriding only `scan` would leave `sql` serving the tail.
+
+    Falsify by returning a plain `Log` from `follow`: `scan()` with no
+    arguments drops every archived row and raises nothing.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-partial"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(2000))
+        while primary.seal() is not None:
+            pass
+
+        primary.maintain()
+        primary.sync()
+        pushed = primary._archive.table(repair=False)  # noqa: SLF001
+
+        assert pushed is not None
+        assert pushed.extent() is not None, "the archive got nothing; config too small"
+
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3)
+
+    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        for call in (
+            lambda: follower.scan(include_archive=False),
+            lambda: follower.sql("SELECT 1 FROM log", include_archive=False),
+        ):
+            with pytest.raises(ValueError, match="cannot read without the archive"):
+                call()
+
+        # And the default really does include it.
+        assert follower.scan().read_all().num_rows > 0
+
+
+@pytest.mark.slow
+def test_a_follower_writes_nothing_the_primary_shares(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """It reads someone else's log, which is a weaker position than anything
+    else here occupies.
+
+    Three specifics. It adds no object to the bucket — `repair=False` would
+    never adopt and `repair=True` with no published hint would CREATE, so the
+    bucket is asked first with `archive_extent`. It leaves no `litestream.yml`
+    in its root, where the replica key would be byte-identical to the
+    primary's. And `write_replication_config` is refused on a follower — gated
+    on follower-ness rather than on `readonly`, which would break the ADS-B
+    example that deliberately generates a config from a read-only log.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-readonly"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(2000))
+        while primary.seal() is not None:
+            pass
+
+        primary.maintain()
+        primary.sync()
+        pushed = primary._archive.table(repair=False)  # noqa: SLF001
+
+        assert pushed is not None
+        assert pushed.extent() is not None, "the archive got nothing; config too small"
+
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3)
+
+    fs = filesystem(s3)
+    before = sorted(fs.find(f"{bucket}/follow-readonly"))
+
+    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        follower.scan().read_all()
+        root = follower.root
+
+        assert not (root / "litestream.yml").exists()
+
+        # Both, not just the writer: `replication_config` produces the payload
+        # the writer withholds, and it is public and documented.
+        with pytest.raises(ValueError, match="is a follower"):
+            follower.write_replication_config()
+
+        with pytest.raises(ValueError, match="is a follower"):
+            follower.replication_config()
+
+    assert sorted(fs.find(f"{bucket}/follow-readonly")) == before
+    assert not root.exists(), "the scratch root outlived the follower"
+
+
+@pytest.mark.slow
+def test_a_follower_refuses_an_archive_that_has_published_nothing(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The pre-flight, and why it is the pre-flight rather than a `repair` flag.
+
+    Neither `repair` value adopts safely alone. `repair=False` never creates —
+    and never adopts either, since it reads the local `archive.db` row a
+    follower has none of, so `Archive.table` returns None and the follower
+    serves the buffer alone. `repair=True` adopts, but against a prefix with no
+    published hint it takes the CREATE branch: a READER writing a
+    `metadata.json` and a `version-hint.text` into the bucket, onto which the
+    primary then commits.
+
+    So the bucket is asked first, and a log before its first successful sync
+    cannot be followed. That is a real cost — for `Log.new(archive=...)` it is
+    every young log — and it is the right one: serving the buffer alone would
+    be a reader silently missing every archived row.
+
+    Falsify by removing the pre-flight: this follow succeeds and the bucket
+    gains two objects it did not have.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-unpublished"
+    config = replace(LogConfig(), target_seal_size=32 * 1024, wal_replication=True)
+    with Log.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        # Buffered only: nothing sealed, so nothing was ever pushed.
+        primary.extend(rows(50))
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3)
+
+    fs = filesystem(s3)
+    before = sorted(fs.find(f"{bucket}/follow-unpublished"))
+
+    with pytest.raises(ValueError, match="published nothing yet"):
+        Log.follow("s", archive=where, s3=s3, binary=str(binary))
+
+    assert sorted(fs.find(f"{bucket}/follow-unpublished")) == before, (
+        "a reader wrote into the archive"
+    )
+
+
+@pytest.mark.slow
+def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A follower's archive view is pinned, and the pin does not last (§3a).
+
+    The adopted metadata is fixed at assembly — `reload()` re-reads the
+    follower's OWN catalog row, which nothing updates. The archive carries
+    `previous-versions-max: 10`, so ten further primary commits delete the
+    object it names, with no time component at all: on a busy log, minutes.
+
+    **Both paths must fail, and `coverage()` is the one that matters.** Its
+    inputs are cached — `Archive.table` on a live handle, `LogTable.extent` on
+    an unchanged `metadata_location` — so without a deliberate re-read it goes
+    on reporting a healthy, gap-free follower while every scan raises. That is
+    this design's worst failure: not incompleteness, but the honesty guarantee
+    lying about it.
+
+    Falsify by removing `adopted.reload()` from `_followed_extent`: `coverage()`
+    returns `gap=None` against a snapshot that no longer exists, and the read
+    raises a bare `FileNotFoundError` naming an S3 key from inside pyiceberg
+    rather than saying to reassemble.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-swept"
+    config = replace(
+        LogConfig(),
+        target_seal_size=16 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(2000))
+        while log.seal() is not None:
+            pass
+
+        log.maintain()
+        log.sync()
+        replication = log.write_replication_config()
+
+    _replicate(binary, replication, s3)
+
+    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        # Warm both caches, which is what makes the naive detector unreachable.
+        assert follower.scan().read_all().num_rows > 0
+        assert follower.coverage().gap is None
+
+        # Commit past the pin. `previous-versions-max` is 10.
+        with Log.open(primary, "s", s3=s3) as live:
+            for _ in range(12):
+                live.extend(rows(400))
+                while live.seal() is not None:
+                    pass
+
+                live.maintain()
+                live.sync()
+
+        for call in (follower.coverage, lambda: follower.scan().read_all()):
+            with pytest.raises(RuntimeError, match="reassemble"):
+                call()
+
+
+@pytest.mark.slow
+def test_a_follow_refuses_a_root_that_holds_a_table(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Keyed on the table as well as the buffer, unlike `restore`.
+
+    `restore` must admit a root holding a table with no buffer — that is its
+    resuming case. `follow` has none, so it can be stricter, and needs to be:
+    assembling on top of a damaged log's catalog row leaves a root whose local
+    table names one log's Parquet while its buffer and archive URI belong to
+    another. `Log.open` opens that happily, and a `sync` from it would push the
+    first log's files into the second's archive.
+
+    Falsify by keying the guard on `buffer.db` alone: the follow proceeds,
+    restores the primary's buffer over the victim's root, adopts the archive
+    into the victim's `archive.db`, and only then fails on the pre-existing
+    table — too late, the mixture already exists.
+
+    The `-wal` and `-shm` files go with the buffer deliberately. Leaving them
+    makes SQLite replay the victim's stale WAL over the freshly restored
+    replica, so the falsification fails for the wrong reason — a missing
+    `archive` key rather than the mixture this guard exists to prevent.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-occupied"
+    config = replace(
+        LogConfig(),
+        target_seal_size=16 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    with Log.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(2000))
+        while primary.seal() is not None:
+            pass
+
+        primary.maintain()
+        primary.sync()
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3)
+
+    # A different log at the target root, with its buffer removed by hand.
+    victim = tmp_path / "victim"
+    with Log.new(victim, "s", schema=SCHEMA) as other:
+        other.extend(rows(200))
+        other.seal()
+
+    buffer_db = Layout(victim, "s").buffer_db
+    buffer_db.unlink()
+    for sidecar in (".-wal", ".-shm"):
+        stale = buffer_db.with_name(buffer_db.name + sidecar[1:])
+        stale.unlink(missing_ok=True)
+
+    before = LogTable.load(Layout(victim, "s"), readonly=True).metadata_location
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        Log.follow("s", archive=where, s3=s3, binary=str(binary), root=victim)
+
+    assert LogTable.load(Layout(victim, "s"), readonly=True).metadata_location == before

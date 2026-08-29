@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import random
+import tempfile
 import threading
 import time
 import uuid
@@ -1012,6 +1013,234 @@ class Log:
         destination.write_text(self.replication_config())
 
         return destination
+
+    @classmethod
+    def follow(
+        cls,
+        name: str,
+        *,
+        archive: str,
+        s3: S3Options | None = None,
+        binary: str | None = None,
+        root: PathLike[str] | str | None = None,
+        scratch_dir: PathLike[str] | str | None = None,
+    ) -> Follower:
+        """A read-only view of a log running somewhere else (§3a).
+
+        The archive merged with a replicated copy of the writer's buffer, so a
+        reader sees data fresher than the archive alone — down to the
+        replication lag rather than to the seal cadence. It never takes over as
+        writer and never writes anything the primary shares.
+
+        **This is `restore`'s assembly without the takeover.** `restore` burns
+        `RESTORE_RESERVE` offsets to fence a machine that may still be writing;
+        a follower appends nothing, so there is nothing to fence and it
+        reserves none. It opens read-only, which is also what keeps `recover()`
+        from finishing a seal the primary owns.
+
+        **A snapshot, not a subscription.** litestream restores to a point in
+        time, so refreshing means assembling another one — exit the block and
+        reopen. That is why `root` defaults to a temporary directory this owns
+        and removes on `close`: a follower's root is scaffolding for one read
+        session, not a durable artefact. Pass `root` to keep it (for inspection
+        after a surprise), or `scratch_dir` to choose where the temporary one
+        lives without giving up the cleanup — the restored buffer holds the
+        unsealed tail *plus* the band the archive lacks, which on a log whose
+        sync is behind is not small, and `/tmp` is often memory-backed.
+
+        Raises if the archive has never been published. `archive_extent`
+        returns None both for "nothing pushed" and for "a hint over an empty
+        table", and `set_archive` creates the second on re-point — so a log
+        before its first successful sync cannot be followed. Serving the buffer
+        alone instead would be a reader silently missing every archived row,
+        which is the one failure this must not have.
+        """
+        options = s3 or S3Options()
+        owned: tempfile.TemporaryDirectory[str] | None = None
+        if root is None:
+            owned = tempfile.TemporaryDirectory(
+                prefix="litelink-follow-",
+                dir=None if scratch_dir is None else Path(scratch_dir),
+            )
+            root = owned.name
+
+        try:
+            layout = Layout(Path(root), name)
+            cls._restore_replica(layout, archive, options, binary)
+            schema, sort_by, prefix = cls._followed_shape(layout)
+            cls._assemble_follower(layout, schema, sort_by, prefix, options)
+            follower = Follower.open(layout.root, name, read_only=True, s3=options)
+        except BaseException:
+            if owned is not None:
+                owned.cleanup()
+
+            raise
+
+        follower._owned_root = owned
+
+        return follower
+
+    @staticmethod
+    def _restore_replica(
+        layout: Layout,
+        archive: str,
+        options: S3Options,
+        binary: str | None,
+    ) -> None:
+        """Pull `buffer.db` down, with the sidecar's config kept out of `root`.
+
+        `restore` writes that config into the root at its START, because
+        `restore_buffer` needs `-config` to run. A follower must not leave one
+        there: `litestream_config` keys each replica on the path RELATIVE to
+        the root, so a follower with the same log name produces a key identical
+        to the primary's. Running a sidecar in that directory — which this
+        project's own convention says to do — would ship the follower's
+        stripped scratch copy over the primary's only off-box record of its
+        unsealed rows.
+
+        So it goes in a temporary directory of its own and is deleted with it,
+        on the exception path too. Nothing needs it once the restore returns.
+        """
+        try:
+            occupied = layout.buffer_db.exists() or LogTable.exists_for(layout)
+        except LookupError:
+            occupied = True
+
+        if occupied:
+            # The table as well as the buffer, which is stricter than `restore`
+            # and can afford to be: `restore` must admit a root holding a table
+            # with no buffer, because that is its resuming case. `follow` has
+            # none. Keying on the buffer alone would let a follow assemble on
+            # top of a damaged log's catalog row — leaving a root whose local
+            # table names one log's files while its buffer and archive URI
+            # belong to another, which `Log.open` will happily open and `sync`
+            # would push into the wrong archive.
+            msg = (
+                f"a log already exists at {layout.root}/{layout.name}; follow refuses "
+                f"to overwrite it. Follow into an empty root, or omit `root` and let "
+                f"one be made"
+            )
+            raise FileExistsError(msg)
+
+        layout.root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="litelink-follow-cfg-") as cfg:
+            config_path = Path(cfg) / "litestream.yml"
+            config_path.write_text(
+                litestream_config(layout.databases, layout.root, archive, options)
+            )
+            restore_buffer(config_path, layout.buffer_db, options, binary)
+
+        if not layout.buffer_db.exists():
+            msg = (
+                f"no replica of {layout.buffer_db.name} under {archive} — there is "
+                f"nothing to follow. A log with wal_replication off has no off-box "
+                f"copy of its unsealed rows"
+            )
+            raise FileNotFoundError(msg)
+
+    @staticmethod
+    def _followed_shape(layout: Layout) -> tuple[pa.Schema, tuple[str, ...], str]:
+        """The log's shape, and where its archive is, from the replica's `meta`.
+
+        The prefix comes from here rather than from `follow`'s `archive=`,
+        which only says where the WAL replica lives. That is also why the
+        archive pre-flight cannot come first: there is no prefix to check until
+        `buffer.db` is on disk.
+        """
+        encoded = Buffer.peek_meta(layout.buffer_db, _CONFIG_KEY)
+        raw_schema = Buffer.peek_meta(layout.buffer_db, _SCHEMA_KEY)
+        raw_sort = Buffer.peek_meta(layout.buffer_db, _SORT_KEY)
+        if encoded is None or raw_schema is None or raw_sort is None:
+            msg = (
+                f"the replica of {layout.root}/{layout.name} carries no stored shape; "
+                f"it is corrupt or was captured mid-creation"
+            )
+            raise ValueError(msg)
+
+        prefix = Buffer.peek_meta(layout.buffer_db, _ARCHIVE_KEY)
+        if not prefix:
+            msg = (
+                f"{layout.root}/{layout.name} records no archive, so there is nothing "
+                f"to merge the replicated buffer with. A local-only log cannot be "
+                f"followed — its sealed files exist only on the machine that wrote them"
+            )
+            raise ValueError(msg)
+
+        return (
+            pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema))),
+            tuple(json.loads(raw_sort)),
+            prefix,
+        )
+
+    @staticmethod
+    def _assemble_follower(
+        layout: Layout,
+        schema: pa.Schema,
+        sort_by: tuple[str, ...],
+        prefix: str,
+        options: S3Options,
+    ) -> None:
+        """Adopt the archive and build the empty local table `open` expects.
+
+        **Neither `repair` value adopts safely on its own, which is why the
+        bucket is asked first.** `repair=False` never creates — and never
+        adopts either: it reads the local `archive.db` row, which a follower
+        has none of, and `Archive.table` swallows the resulting `ArchiveAbsent`
+        into `None`. The follower would then serve the buffer alone, silently
+        missing every archived row. `repair=True` adopts, but with no published
+        hint it takes the CREATE branch and writes a `metadata.json` and a
+        `version-hint.text` into the bucket — a reader publishing a lineage the
+        primary then commits onto.
+
+        `archive_extent` reads the hint from the bucket alone, with no
+        `archive.db` and no catalog, and separates "no hint" from "cannot
+        read". Once it has answered, `repair=True` cannot reach the create
+        branch, because a published hint is exactly what it proved.
+        """
+        covered = archive_extent(layout, prefix, options)
+        if covered is None:
+            msg = (
+                f"the archive at {prefix!r} has published nothing yet, so following "
+                f"it would serve only the replicated buffer and silently omit every "
+                f"archived row. Sync the primary at least once first"
+            )
+            raise ValueError(msg)
+
+        buffer = Buffer.open(layout.buffer_db, schema)
+        try:
+            # Reserves nothing: a follower never appends, so there is no
+            # offset to fence. `strip_local_state` still runs — the `extent`
+            # rows naming the primary's Parquet describe files this machine
+            # cannot open, and the copy is scratch, so dropping them is free.
+            buffer.strip_local_state(0)
+            remote = Archive(layout, buffer, options)
+            if remote.table(repair=True) is None:
+                msg = (
+                    f"restored the buffer but could not adopt the archive at "
+                    f"{prefix!r}: it holds nothing this log can read"
+                )
+                raise RuntimeError(msg)
+
+            adopted = remote.table()
+            extent = None if adopted is None else adopted.extent()
+            if extent is not None:
+                buffer.release_archived(extent[1])
+                buffer.reseed_group()
+        finally:
+            buffer.close()
+
+        try:
+            LogTable.create(layout, table_schema(schema), sort_by)
+        except TableAlreadyExistsError:
+            # Never forgotten, exactly as `restore` refuses to: a row that
+            # pre-exists belongs to a log whose local Parquet this is the only
+            # pointer to, and the blanket handler below would drop it.
+            raise
+        except Exception:
+            with contextlib.suppress(Exception):
+                LogTable.forget(layout)
+
+            raise
 
     def recovery(self) -> _Recovery | None:
         """What `restore` recovered, or None on a log opened normally.
@@ -3136,6 +3365,259 @@ class _ArchiveDeferred(RuntimeError):
     open anyway", while `add_column` lets it out to the caller — the same
     condition, but a failed call and a deferred replay are different answers.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class Coverage:
+    """What a follower holds, and any offsets in neither tier.
+
+    Reported rather than enforced. `gap` is a range this follower cannot serve;
+    whether that is lost data or a never-issued reserve is a question only the
+    caller can answer — see `Follower.coverage`.
+    """
+
+    archive: tuple[int, int]
+    buffered: tuple[int, int] | None
+    gap: tuple[int, int] | None
+    wal_replication: bool
+
+
+class Follower(Log):
+    """A read-only view of someone else's log, assembled by `Log.follow`.
+
+    A `Log` subclass rather than a wrapper, so the whole read path is reused.
+    What it changes is the three places where a follower is not an ordinary
+    read-only log.
+    """
+
+    _owned_root: tempfile.TemporaryDirectory[str] | None = None
+
+    def scan(
+        self,
+        *,
+        columns: Sequence[str] | None = None,
+        where: str | None = None,
+        start_offset: int | None = None,
+        end_offset: int | None = None,
+        include_archive: bool = True,
+    ) -> pa.RecordBatchReader:
+        """As `Log.scan`, but the archive is not optional here.
+
+        `Log` defaults `include_archive=False` because an ordinary log's local
+        Iceberg table holds the sealed history. **A follower's local table is
+        empty by construction** — `LogTable.create` makes it and nothing ever
+        registers a file into it — so that default would return the buffer leg
+        alone. Measured on an assembled follower: 308 of 800 rows, silently.
+
+        Refused rather than honoured when False, because on a follower it can
+        only mean "serve the tail and hide the rest". A caller who wants the
+        unsealed tail alone is asking for something else.
+        """
+        # No `_followed_extent` here: `Log.scan` delegates to `self.sql`, which
+        # is this class's override, so the check and the translation happen
+        # once rather than paying two metadata reads per scan.
+        self._refuse_partial(include_archive=include_archive)
+
+        return super().scan(
+            columns=columns,
+            where=where,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            include_archive=True,
+        )
+
+    def sql(self, query: str, *, include_archive: bool = True) -> pa.RecordBatchReader:
+        """As `Log.sql`, with the same default and the same refusal as `scan`.
+
+        Both, not just `scan`: `sql` is public and carries the same
+        `include_archive=False` default, so overriding one would leave the
+        other serving the buffer alone.
+        """
+        self._refuse_partial(include_archive=include_archive)
+        self._followed_extent()
+
+        try:
+            return super().sql(query, include_archive=True)
+        except FileNotFoundError as exc:
+            # Narrow, and narrower than an earlier version of this comment
+            # claimed. It covers the race where the primary sweeps the
+            # metadata JSON between `_followed_extent`'s reload and
+            # `_prepare_remote`'s own read — pyiceberg raises
+            # `FileNotFoundError` there.
+            #
+            # It does NOT cover the archive's data files or manifests. Within
+            # this call those are DuckDB's to read — pyiceberg reads manifests
+            # too, but only when `metadata_location` changes, and a follower's
+            # is pinned, so `_prepare_remote` always finds that cache warm.
+            # A missing data file surfaces
+            # as `HTTPException`, and a missing manifest aborts the process
+            # outright — DuckDB's iceberg extension calls `std::terminate`,
+            # which is pre-existing and reaches a plain `Log` reading its own
+            # archive too. Neither is catchable here, and both happen before
+            # any row is served, so nothing is short — but do not read this
+            # handler as covering them.
+            #
+            # Two earlier versions of this comment claimed otherwise, and a
+            # third put the data-file failure at `read_all()`. It is raised
+            # inside `execute`, and `scan` appends an ORDER BY that forces
+            # materialisation there regardless.
+            #
+            # The cold missing-manifest case IS caught, earlier, by the handler
+            # around `adopted.extent()`.
+            raise self._swept(exc) from exc
+
+    def coverage(self) -> Coverage:
+        """What this follower can actually serve, and where it cannot.
+
+        A follower is assembled from two tiers and can only report what they
+        hold — it cannot ask the primary. So it reports rather than adjudicates,
+        because the failure to avoid is SILENCE, not incompleteness.
+
+        **A gap here is not necessarily loss.** An offset range in neither tier
+        is either a band the buffer lost — rows sealed while `wal_replication`
+        was off are discarded at seal and gone for ever — or a reserve that was
+        never issued, which `Log.restore` creates 2**20 of and `start_offset`
+        creates on purpose. Nothing distinguishes them from a replica: the
+        reserve "leaves no trace once the sequence has moved". A caller who
+        knows whether their log has ever failed over can read a gap that this
+        cannot.
+
+        That is also why an earlier design refusing to open on a gap was wrong:
+        it refused every followed log that had failed over, on a million
+        offsets that never existed.
+        """
+        archive = self._followed_extent()
+        buffered = self._buffer.extent()
+        gap: tuple[int, int] | None = None
+        if buffered is not None and buffered[0] > archive[1] + 1:
+            gap = (archive[1] + 1, buffered[0] - 1)
+
+        return Coverage(
+            archive=archive,
+            buffered=buffered,
+            gap=gap,
+            wal_replication=self.config.wal_replication,
+        )
+
+    def _followed_extent(self) -> tuple[int, int]:
+        """The adopted archive's extent, or a refusal saying to reassemble.
+
+        **Two failures, and neither may be silent.** `Archive.table()` returns
+        None when the catalog row is gone, and `_union` would then quietly fall
+        to the buffer leg — on a follower, whose local table is empty, that is
+        every archived row missing with no error.
+
+        And the adopted metadata is PINNED at assembly: `reload()` re-reads this
+        follower's own `archive.db` row, which nothing updates. The archive's
+        `previous-versions-max` is 10, so ten further primary commits delete the
+        object this names — with no time component, which on a busy log is
+        minutes. `coverage()` would otherwise keep reporting a healthy,
+        gap-free follower against a snapshot it can no longer read, while every
+        scan raised. The honesty guarantee lying is the worst failure available
+        to this design, so both paths fail the same way.
+        """
+        try:
+            adopted = self._archive.table(repair=False)
+            if adopted is not None:
+                # **The re-read is the detector.** Without it this method is an
+                # in-memory replay: `Archive.table` short-circuits on a cached
+                # handle and `LogTable.extent` on an unchanged
+                # `metadata_location`, so neither touches the network and the
+                # `FileNotFoundError` below is unreachable on any follower that
+                # has read once. `coverage()` would then keep reporting a
+                # healthy, gap-free follower against a snapshot the primary has
+                # already swept — which is this design's worst failure, the
+                # honesty guarantee lying.
+                #
+                # One metadata GET, and it cannot change what reads serve: it
+                # re-reads this follower's own `archive.db` row, which nothing
+                # updates after adoption.
+                adopted.reload()
+        except FileNotFoundError as exc:
+            raise self._swept(exc) from exc
+
+        if adopted is None:
+            msg = (
+                f"{self.root}/{self.name} can no longer reach its archive, and a "
+                f"follower's local table is empty — reading on would omit every "
+                f"archived row. Reassemble with `Log.follow`"
+            )
+            raise RuntimeError(msg)
+
+        try:
+            extent = adopted.extent()
+        except FileNotFoundError as exc:
+            raise self._swept(exc) from exc
+
+        if extent is None:
+            msg = (
+                f"the archive at {self._archive.uri!r} reports no extent; there is "
+                f"nothing for this follower to merge"
+            )
+            raise RuntimeError(msg)
+
+        return extent
+
+    def _swept(self, exc: FileNotFoundError) -> RuntimeError:
+        return RuntimeError(
+            f"this follower's archive snapshot has been swept — the primary has "
+            f"committed past it ({exc}). A follower is a snapshot, not a "
+            f"subscription: reassemble with `Log.follow`"
+        )
+
+    @staticmethod
+    def _refuse_partial(*, include_archive: bool) -> None:
+        if not include_archive:
+            msg = (
+                "a follower cannot read without the archive: its local table is "
+                "empty by construction, so this would return the replicated "
+                "buffer alone and silently omit every archived row"
+            )
+            raise ValueError(msg)
+
+    def replication_config(self) -> str:
+        """Refused too: this is what `write_replication_config` withholds.
+
+        Gating only the writer leaves the door half closed. This method
+        produces the payload — a config naming the PRIMARY's replica key, for
+        this follower's stripped scratch buffer — and it is public and
+        documented, so a caller can obtain the string and write it themselves.
+        """
+        raise self._refuse_config()
+
+    def write_replication_config(self) -> Path:
+        """Refused on a follower, and only on a follower.
+
+        `litestream_config` keys each replica on the path RELATIVE to the root,
+        so a follower with the same log name writes a config naming the
+        PRIMARY's replica key. Running a sidecar against it would ship this
+        stripped scratch copy over the primary's only off-box record of its
+        unsealed rows.
+
+        Gated here rather than on `readonly`, which would be the obvious place
+        and is wrong: `examples/adsb/replicate.py` deliberately opens a log
+        read-only to generate its config, precisely so a config generator does
+        not take the write lock alongside a live writer.
+        """
+        raise self._refuse_config()
+
+    def _refuse_config(self) -> ValueError:
+        return ValueError(
+            f"{self.root}/{self.name} is a follower, and its replication config "
+            f"would name the primary's replica path — pointing a sidecar at it "
+            f"would ship this scratch copy over the primary's only off-box "
+            f"record of its unsealed rows. Generate it from the log being "
+            f"replicated instead"
+        )
+
+    def close(self) -> None:
+        """Close, and remove the scratch root if this made one."""
+        try:
+            super().close()
+        finally:
+            owned, self._owned_root = self._owned_root, None
+            if owned is not None:
+                owned.cleanup()
 
 
 def _intent(name: str, type_: pa.DataType) -> str:

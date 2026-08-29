@@ -18,11 +18,19 @@ see ``litelink._s3``, which is where the reasoning lives.
 from importlib.metadata import PackageNotFoundError, version
 
 from litelink._s3 import S3Options
-from litelink.log import Log, LogConfig, Row
+from litelink.log import Coverage, Follower, Log, LogConfig, Row
 
 try:
     __version__ = version("litelink")
 except PackageNotFoundError:  # a source tree that was never installed
     __version__ = "0.0.0"
 
-__all__ = ["Log", "LogConfig", "Row", "S3Options", "__version__"]
+__all__ = [
+    "Coverage",
+    "Follower",
+    "Log",
+    "LogConfig",
+    "Row",
+    "S3Options",
+    "__version__",
+]
