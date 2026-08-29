@@ -179,6 +179,38 @@ def _repointed_mid_push() -> RuntimeError:
     )
 
 
+def scan_query(
+    declared: Sequence[str],
+    *,
+    columns: Sequence[str] | None = None,
+    where: str | None = None,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
+) -> str:
+    """The SQL behind `scan`, built from the declared columns alone.
+
+    A free function because two different readers ask for it and only one of
+    them is a `Log`. When `Follower` wrapped a whole `Log` it got this by
+    calling `Log.scan`, which meant its read went out through `Log.sql` — and
+    that is exactly how it lost the swept-snapshot translation, since a wrapper
+    can intercept the call it makes but not the dispatch inside it.
+
+    Taking the column names rather than a schema keeps it independent of who
+    stores them.
+    """
+    projection = ", ".join(f'"{c}"' for c in (columns or (OFFSET, *declared)))
+    predicates = [f"({where})"] if where else []
+    if start_offset is not None:
+        predicates.append(f'"{OFFSET}" >= {int(start_offset)}')
+
+    if end_offset is not None:
+        predicates.append(f'"{OFFSET}" < {int(end_offset)}')
+
+    clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+
+    return f'SELECT {projection} FROM log{clause} ORDER BY "{OFFSET}"'
+
+
 class Log:
     """One append-only stream.
 
@@ -1069,14 +1101,51 @@ class Log:
             cls._restore_replica(layout, archive, options, binary)
             schema, sort_by, prefix = cls._followed_shape(layout)
             cls._assemble_follower(layout, schema, sort_by, prefix, options)
-            inner = cls.open(layout.root, name, read_only=True, s3=options)
+            follower = cls._followed_reader(layout, schema, options, owned)
         except BaseException:
             if owned is not None:
                 owned.cleanup()
 
             raise
 
-        return Follower(inner, owned)
+        return follower
+
+    @staticmethod
+    def _followed_reader(
+        layout: Layout,
+        schema: pa.Schema,
+        options: S3Options,
+        owned: tempfile.TemporaryDirectory[str] | None,
+    ) -> Follower:
+        """Build the read collaborators, which is all a follower is.
+
+        This used to be `cls.open(..., read_only=True)`, and the `Follower` held
+        the whole `Log` that produced. The writer half of it was never usable —
+        the point of `read_only` — but it was still constructed, still open, and
+        still the thing a follower reached past to answer its own questions.
+
+        So the same four objects `Log.open` hands its reader are built here and
+        handed to the follower directly. No `Maintenance`, because nothing
+        maintains a follower; no `recover()`, because finishing a seal is the
+        primary's to do and read-only is what stopped it; no `LogTable` on the
+        follower itself, because `Reader` owns it and a follower's is empty.
+        """
+        table = LogTable.load(layout, readonly=True)
+        buffer = Buffer.open(layout.buffer_db, schema, readonly=True)
+        try:
+            remote = Archive(layout, buffer, options)
+
+            return Follower(
+                layout=layout,
+                buffer=buffer,
+                archive=remote,
+                reader=Reader(layout, table, buffer, duckdb_connection, archive=remote),
+                owned=owned,
+            )
+        except BaseException:
+            buffer.close()
+
+            raise
 
     @staticmethod
     def _restore_replica(
@@ -1815,20 +1884,14 @@ class Log:
         a 400-byte payload column is 611 ms and proportional to the data, so
         materialising it is the caller's choice to make.
         """
-        projection = ", ".join(
-            f'"{c}"' for c in (columns or ("litelink_offset", *self._schema.names))
-        )
-        predicates = [f"({where})"] if where else []
-        if start_offset is not None:
-            predicates.append(f'"litelink_offset" >= {int(start_offset)}')
-
-        if end_offset is not None:
-            predicates.append(f'"litelink_offset" < {int(end_offset)}')
-
-        clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
-
         return self.sql(
-            f'SELECT {projection} FROM log{clause} ORDER BY "litelink_offset"',
+            scan_query(
+                self._schema.names,
+                columns=columns,
+                where=where,
+                start_offset=start_offset,
+                end_offset=end_offset,
+            ),
             include_archive=include_archive,
         )
 
@@ -3383,48 +3446,74 @@ class Coverage:
 class Follower:
     """A read-only view of a log running somewhere else (§3b), from `Log.follow`.
 
-    Wraps a `Log` rather than extending one. A follower does three things —
-    read, report what it covers, and go away — and inheriting `Log` gave it a
-    surface carrying `append`, `seal`, `sync`, `compact` and `evict`, every one
-    of them raising. The interface described the base class rather than the
-    thing.
+    **It holds the same read collaborators a `Log` holds, not a `Log`.** Two
+    earlier shapes were wrong in the same direction. Subclassing gave a
+    read-only follower a public surface of 42 members carrying `append`,
+    `seal`, `sync`, `compact` and `evict`, every one of them raising. Wrapping
+    a whole `Log` hid that surface but kept the object: a follower still
+    constructed the writer machinery it must never use, and then reached PAST
+    it into `_buffer` and `_archive` to answer questions `Log` answers for a
+    writer.
 
-    **Composition also makes two guarantees unrepresentable rather than
-    guarded.** There is no `include_archive` parameter, because a follower's
-    local table is empty by construction and reading without the archive would
-    return the replicated buffer alone — 308 of 800 rows, silently. And there
-    is no `write_replication_config`, because `litestream_config` keys replicas
-    on the path relative to the root, so a follower's config would name the
-    PRIMARY's replica key. Neither needs a refusal now: there is nothing to
-    call.
+    Both bugs review found on this class came from that seam:
 
-    The cost is that `scan` and `sql` are hand-written delegations that could
-    drift from `Log`'s, which a test pins.
+    - `scan` lost its swept-snapshot translation, because delegating to
+      `Log.scan` sent the read out through `Log.sql` — a wrapper intercepts the
+      call it makes, not the dispatch inside it. It now builds its query with
+      `scan_query` and calls `Reader` directly, so there is no inner dispatch.
+    - `end_offset` under-reported, because `Log.end_offset` answers a WRITER's
+      question — what the next append will receive, from `sqlite_sequence` — and
+      a follower needs the highest offset it can serve. It now computes that
+      from the two extents.
+
+    So the decomposition is `Log = writer state + Reader` and
+    `Follower = Reader + the pin check`. `config` and `sort_by` read through to
+    the buffer exactly as `Log`'s do, because that is where they live; neither
+    needs a `Maintenance` and neither is a copy.
+
+    The write surface is not refused here, it is absent — there is nothing to
+    call and nothing to forget to guard. `scan` and `sql` take no
+    `include_archive`: a follower's local table is empty by construction, so
+    reading without the archive would return the replicated buffer alone.
     """
 
     def __init__(
-        self, log: Log, owned: tempfile.TemporaryDirectory[str] | None
+        self,
+        *,
+        layout: Layout,
+        buffer: Buffer,
+        archive: Archive,
+        reader: Reader,
+        owned: tempfile.TemporaryDirectory[str] | None = None,
     ) -> None:
-        self._log = log
+        self._layout = layout
+        self._buffer = buffer
+        self._archive = archive
+        self._reader = reader
         self._owned_root = owned
 
     @property
     def root(self) -> Path:
         """Where this follower was assembled. Scratch unless `root` was given."""
-        return self._log.root
+        return self._layout.root
 
     @property
     def name(self) -> str:
-        return self._log.name
+        return self._layout.name
 
     @property
     def config(self) -> LogConfig:
-        """The followed log's policy, as its replica recorded it."""
-        return self._log.config
+        """The followed log's policy, as its replica recorded it.
+
+        Read through to the buffer on every access, like `Log.config` — same
+        durable row, no second copy.
+        """
+        return self._buffer.config()
 
     @property
     def sort_by(self) -> tuple[str, ...]:
-        return self._log.sort_by
+        """The clustering the primary declared (§7), read through like `config`."""
+        return self._buffer.sort_by()
 
     def end_offset(self) -> int:
         """The offset after the last row this follower can see.
@@ -3446,15 +3535,36 @@ class Follower:
         skipped that were present and readable"*. `follow` reuses `restore`'s
         assembly, so it inherits the same skew and needs the same `max`.
 
-        Measured before the fix: a follower serving 2,288 rows reported 2,001.
-        The error is always low, so nothing is lost — but a caller using this
-        as a resume cursor re-delivers the difference, and an operator reads a
-        healthy follower as far behind.
+        Measured: a follower serving 2,288 rows reported 2,001.
+
+        **The buffer's contribution is its EXTENT, not `next_offset()`**, and a
+        first version of this fix got that wrong in the opposite direction.
+        `next_offset` reads `sqlite_sequence`, which its own docstring calls
+        "the highest value ever assigned and never lowers" — so it keeps
+        counting rows the replica no longer carries. A seal taken while
+        `_discard_on_seal()` was true, which is any log with `wal_replication`
+        off, deletes its rows from the buffer and they reach the archive only
+        at the next `sync`. Between those two moments the offsets are in
+        neither tier while the sequence still counts them.
+
+        That is the state an operator passes through to ADOPT following: an
+        archived log with replication off, turned on, sidecar started, followed
+        before the next sync. Measured there: a follower serving 864 rows
+        reported 1,501, and a caller using this as a resume cursor skipped 636
+        rows permanently once the primary synced. Over-reporting loses data;
+        under-reporting only re-delivers. This is the dangerous direction.
+
+        `Log.restore` takes `buffered[1]` for exactly this reason. So does
+        this now.
 
         Taking the archive frontier also brings this under the swept-snapshot
         refusal, which it escaped while it read SQLite alone.
         """
-        return max(self._log.end_offset(), self._checked_extent()[1] + 1)
+        buffered = self._buffer.extent()
+
+        return (
+            max(self._checked_extent()[1], 0 if buffered is None else buffered[1]) + 1
+        )
 
     def scan(
         self,
@@ -3466,76 +3576,22 @@ class Follower:
     ) -> pa.RecordBatchReader:
         """Read the merged view: the archive plus the replicated tail.
 
-        `Log.scan`'s `include_archive` is absent deliberately — see the class
-        docstring. Everything else passes through.
+        Builds its own query rather than routing through a `Log`, so the guard
+        and the translation below apply to the read this actually performs.
         """
-        return self._guarded(
-            lambda: self._log.scan(
+        return self._read(
+            scan_query(
+                self._schema().names,
                 columns=columns,
                 where=where,
                 start_offset=start_offset,
                 end_offset=end_offset,
-                include_archive=True,
             )
         )
 
     def sql(self, query: str) -> pa.RecordBatchReader:
         """Arbitrary DuckDB SQL against the merged view, exposed as `log`."""
-        return self._guarded(lambda: self._log.sql(query, include_archive=True))
-
-    def _guarded(
-        self, read: Callable[[], pa.RecordBatchReader]
-    ) -> pa.RecordBatchReader:
-        """Every read's two obligations, in one place because `scan` lost one.
-
-        **This exists because inheritance was hiding a dependency.** As a
-        subclass, only `sql` carried the translation below and `scan` carried a
-        comment explaining why it needed none: `Log.scan` ends in `self.sql`,
-        which bound to the OVERRIDE, so a scan picked up both halves through
-        dispatch. Composition breaks that silently — `self` inside `Log.scan`
-        is the wrapped `Log`, so it reaches `Log.sql` and the handler never
-        runs. The guard survived the refactor because it was an explicit call;
-        the translation did not, because it was inherited.
-
-        A follower then died with a raw `FileNotFoundError` on the exact path
-        §3b and `docs/API.md` both promise refuses with "reassemble" — so a
-        caller looping `except RuntimeError: reassemble` crashed instead of
-        recovering. Routing both reads through here is what makes that
-        impossible to lose again.
-        """
-        self._checked_extent()
-
-        try:
-            return read()
-        except FileNotFoundError as exc:
-            # Narrow: the race where the primary sweeps the metadata JSON
-            # between `_checked_extent`'s reload and `_prepare_remote`'s read.
-            # Those are two separate metadata GETs — `_prepare_remote` calls
-            # `reload()` itself (`_read.py`) — and pyiceberg raises
-            # `FileNotFoundError` when the second one finds the object gone.
-            #
-            # It does NOT cover the archive's data files or manifests. Within
-            # this call those are DuckDB's to read — pyiceberg reads manifests
-            # too, but only when `metadata_location` changes, and a follower's
-            # is pinned, so `_prepare_remote` always finds that cache warm. A
-            # missing data file surfaces as `HTTPException` raised inside
-            # `execute`, and a missing manifest can abort the process outright:
-            # DuckDB's iceberg extension calls `std::terminate`, which is
-            # pre-existing and reaches a plain `Log` reading its own archive
-            # too. Neither is catchable here — but do not read this handler as
-            # covering them.
-            #
-            # "Can", not "does": that abort was observed on a COLD read. A
-            # follower that has already scanned serves the same query from
-            # DuckDB's cache and neither aborts nor raises, because nothing
-            # goes back for the manifest. Do not treat the abort as a
-            # reliable signal that the archive is damaged.
-            #
-            # Three earlier versions of this comment claimed otherwise.
-            #
-            # The cold missing-manifest case IS caught, earlier, by the handler
-            # around `adopted.extent()`.
-            raise self._swept(exc) from exc
+        return self._read(query)
 
     def coverage(self) -> Coverage:
         """What this follower can serve, and where it cannot.
@@ -3559,27 +3615,50 @@ class Follower:
         low end, which nothing here compares against, so it can never surface
         as a gap.
 
-        That is why an earlier design refusing to open on a gap was wrong: it
-        refused every followed log that had failed over, on a million offsets
-        that never existed.
+        That is also why an earlier design refusing to open on a gap was wrong:
+        it refused every followed log that had failed over, on a million
+        offsets that never existed.
+
+        **An EMPTY buffer is the case that must not report `gap=None`**, and an
+        earlier version did. The comparison was `buffered[0]` against the
+        archive's frontier, so with no buffered rows there was no lower bound
+        and the whole band above the archive went unexamined — a follower
+        serving 864 rows of 1,500 reporting itself gap-free, which is precisely
+        the silence this method exists to prevent.
+
+        The sequence is what closes it. `next_offset` counts every offset ever
+        assigned on the replica, including rows a seal discarded, so when the
+        buffer holds nothing it still says how far the log had got. The bound
+        above the archive is therefore the buffer's first offset when it has
+        one and the sequence's end when it does not.
+
+        What this does NOT model is a second, disjoint band above the buffer's
+        own top: `gap` is one range, and it reports the one adjoining the
+        archive.
         """
         archive = self._checked_extent()
-        buffered = self._log._buffer.extent()  # noqa: SLF001
+        buffered = self._buffer.extent()
+        above = self._buffer.next_offset() if buffered is None else buffered[0]
         gap: tuple[int, int] | None = None
-        if buffered is not None and buffered[0] > archive[1] + 1:
-            gap = (archive[1] + 1, buffered[0] - 1)
+        if above > archive[1] + 1:
+            gap = (archive[1] + 1, above - 1)
 
         return Coverage(
             archive=archive,
             buffered=buffered,
             gap=gap,
-            wal_replication=self._log.config.wal_replication,
+            wal_replication=self.config.wal_replication,
         )
 
     def close(self) -> None:
-        """Close, and remove the scratch root if this made one."""
+        """Release handles, then remove the scratch root if this made one.
+
+        The same two closes `Log.close` performs, for the same two objects —
+        there is no third thing a follower opened.
+        """
         try:
-            self._log.close()
+            self._reader.close()
+            self._buffer.close()
         finally:
             owned, self._owned_root = self._owned_root, None
             if owned is not None:
@@ -3590,6 +3669,64 @@ class Follower:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    def _schema(self) -> pa.Schema:
+        """The declared columns, read from the replica rather than remembered."""
+        return self._buffer.schema
+
+    def _read(self, query: str) -> pa.RecordBatchReader:
+        """Every read's two obligations, in one place because `scan` lost one.
+
+        **This exists because inheritance was hiding a dependency.** As a
+        subclass, only `sql` carried the translation below and `scan` carried a
+        comment explaining why it needed none: `Log.scan` ends in `self.sql`,
+        which bound to the OVERRIDE, so a scan picked up both halves through
+        dispatch. Delegation to a wrapped `Log` broke that silently — the call
+        reached `Log.sql` and the handler never ran. The guard survived because
+        it was explicit; the translation did not because it was inherited.
+
+        Building the query here and calling `Reader` directly removes the inner
+        dispatch that made the loss possible, and routing both reads through
+        this makes the pair inseparable.
+        """
+        self._checked_extent()
+
+        try:
+            return self._reader.query(query, include_archive=True)
+        except FileNotFoundError as exc:
+            # Narrow: the race where the primary sweeps the metadata JSON
+            # between `_checked_extent`'s reload and `_prepare_remote`'s read.
+            # Those are two separate metadata GETs — `_prepare_remote` calls
+            # `reload()` itself (`_read.py`) — and pyiceberg raises
+            # `FileNotFoundError` when the second one finds the object gone.
+            #
+            # It is narrow in the other direction too, which was tested rather
+            # than assumed: an endpoint cut out from under a live follower
+            # raises `OSError` (NETWORK_CONNECTION), and bad credentials raise
+            # `OSError` (ACCESS_DENIED). Neither is mislabelled "reassemble".
+            #
+            # It does NOT cover the archive's data files or manifests. Within
+            # this call those are DuckDB's to read — pyiceberg reads manifests
+            # too, but only when `metadata_location` changes, and a follower's
+            # is pinned, so `_prepare_remote` always finds that cache warm. A
+            # missing data file surfaces as `HTTPException` raised inside
+            # `execute`, and a missing manifest can abort the process outright:
+            # DuckDB's iceberg extension calls `std::terminate`, which is
+            # pre-existing and reaches a plain `Log` reading its own archive
+            # too. Neither is catchable here — but do not read this handler as
+            # covering them.
+            #
+            # "Can", not "does": that abort was observed on a COLD read. A
+            # follower that has already scanned serves the same query from
+            # DuckDB's cache and neither aborts nor raises, because nothing
+            # goes back for the manifest. Do not treat the abort as a reliable
+            # signal that the archive is damaged.
+            #
+            # Three earlier versions of this comment claimed otherwise.
+            #
+            # The cold missing-manifest case IS caught, earlier, by the handler
+            # around `adopted.extent()`.
+            raise self._swept(exc) from exc
 
     def _checked_extent(self) -> tuple[int, int]:
         """The adopted archive's extent, or a refusal saying to reassemble.
@@ -3609,16 +3746,16 @@ class Follower:
         design's worst failure.
 
         The archive carries `previous-versions-max: 10` — ten previous versions
-        beside the current one — so the ELEVENTH further archive commit
-        deletes the object this names, with no time component at all. Archive
-        commits are what count: `sync`, `rewrite_archive`, archive expiry. A
-        local `maintain()` moves nothing in the bucket.
+        beside the current one — so the ELEVENTH further archive commit deletes
+        the object this names, with no time component at all. Archive commits
+        are what count: `sync`, `rewrite_archive`, archive expiry. A local
+        `maintain()` moves nothing in the bucket.
+
         One metadata GET, and it cannot change what reads serve: it re-reads
         this follower's own `archive.db` row, which nothing updates.
         """
-        archive = self._log._archive  # noqa: SLF001
         try:
-            adopted = archive.table(repair=False)
+            adopted = self._archive.table(repair=False)
             if adopted is not None:
                 adopted.reload()
         except FileNotFoundError as exc:
@@ -3639,8 +3776,8 @@ class Follower:
 
         if extent is None:
             msg = (
-                f"the archive at {archive.uri!r} reports no extent; there is nothing "
-                f"for this follower to merge"
+                f"the archive at {self._archive.uri!r} reports no extent; there is "
+                f"nothing for this follower to merge"
             )
             raise RuntimeError(msg)
 

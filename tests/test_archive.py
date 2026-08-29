@@ -3401,8 +3401,8 @@ def test_a_follower_refuses_to_read_without_the_archive(
     _replicate(binary, replication, s3)
 
     with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
-        # Unrepresentable rather than refused: a `Follower` wraps a `Log`, it
-        # does not extend one, so the parameter simply is not there.
+        # Unrepresentable rather than refused: a `Follower` holds the read
+        # collaborators, not a `Log`, so the parameter simply is not there.
         for call in (
             lambda: follower.scan(include_archive=False),  # ty: ignore[unknown-argument]
             lambda: follower.sql("SELECT 1 FROM log", include_archive=False),  # ty: ignore[unknown-argument]
@@ -3678,6 +3678,114 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
 
 
 @pytest.mark.slow
+def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The adoption path, where over-reporting would lose a caller's rows.
+
+    An archived log with `wal_replication` OFF discards each seal's rows into
+    Parquet, and they reach the archive only at the next `sync`. Between those
+    moments they are in neither of a follower's tiers — while
+    `sqlite_sequence` still counts them, because it records "the highest value
+    ever assigned and never lowers".
+
+    That is exactly the transition an operator makes to ADOPT following: turn
+    replication on, start the sidecar, follow before the next sync. The
+    replica's buffer is empty and its sequence is far above the archive.
+
+    **Two failures, and the first one loses data.** `end_offset` built on
+    `next_offset()` returned 1,501 while the follower served through 864, so a
+    caller using it as a resume cursor — the use its own docstring names —
+    skipped 636 rows permanently once the primary synced. Under-reporting only
+    re-delivers; over-reporting is the direction that loses.
+
+    And `coverage()` compared `buffered[0]` against the frontier, so with no
+    buffered rows there was no lower bound and the band went unexamined:
+    `gap=None` over 636 missing offsets, from the method SPEC §3b calls the
+    honesty guarantee.
+
+    The control is the same fixture with rows left unsealed, where the buffer
+    is non-empty. It reported the band correctly all along, which is why only
+    the empty case was missed.
+
+    Falsify by restoring either half — `next_offset()` in `end_offset`, or the
+    `buffered is not None` guard in `coverage` — and this fails while the
+    control still passes.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    def build(tag: str, *, unsealed: int) -> str:
+        where = f"s3://{bucket}/{tag}"
+        config = replace(
+            LogConfig(),
+            target_seal_size=16 * 1024,
+            target_compact_size=16 * 1024,
+            compact_min_files=2,
+            wal_replication=False,
+        )
+        with Log.new(
+            tmp_path / tag, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        ) as log:
+            log.extend(rows(1000))
+            while log.seal() is not None:
+                pass
+
+            log.maintain()
+            log.sync()
+            # Sealed with replication off: discarded from the buffer, and NOT
+            # synced. In neither tier, but still counted by the sequence.
+            log.extend(rows(500))
+            while log.seal() is not None:
+                pass
+
+            if unsealed:
+                log.extend(rows(unsealed))
+
+            # The operator turns replication on so the log can be followed.
+            log.set_config(replace(log.config, wal_replication=True))
+            replication = log.write_replication_config()
+
+        _replicate(binary, replication, s3)
+
+        return where
+
+    # The control first, so a failure here means the fixture is wrong rather
+    # than the code: a non-empty buffer always reported this band correctly.
+    with Log.follow(
+        "s", archive=build("ctl", unsealed=40), s3=s3, binary=str(binary)
+    ) as control:
+        served = control.scan().read_all().column(OFFSET).to_pylist()
+        assert control.coverage().buffered is not None
+        assert control.coverage().gap is not None
+        assert control.end_offset() == max(served) + 1
+
+    with Log.follow(
+        "s", archive=build("empty", unsealed=0), s3=s3, binary=str(binary)
+    ) as follower:
+        served = follower.scan().read_all().column(OFFSET).to_pylist()
+        coverage = follower.coverage()
+        assert coverage.buffered is None, (
+            "the fixture must leave the replica's buffer empty"
+        )
+
+        # It must not claim to reach past what it serves: that is the cursor
+        # a caller resumes from.
+        assert follower.end_offset() == max(served) + 1, (
+            f"end_offset {follower.end_offset()} over-reports a follower "
+            f"serving through {max(served)} — a resume cursor would skip the "
+            f"difference for good"
+        )
+
+        # And it must say the band is missing rather than report itself whole.
+        assert coverage.gap is not None, (
+            "a follower serving a fraction of the log reported gap=None"
+        )
+        assert coverage.gap[0] == max(served) + 1
+
+
+@pytest.mark.slow
 def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3749,7 +3857,7 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
         # Warm every cache first, so the guard alone cannot be what fires.
         assert follower.scan().read_all().num_rows > 0
 
-        pinned = follower._log._archive.table(repair=False)  # noqa: SLF001
+        pinned = follower._archive.table(repair=False)  # noqa: SLF001
         assert pinned is not None
         key = pinned.metadata_location.removeprefix("s3://")
         armed["path"] = key
@@ -3838,13 +3946,15 @@ def test_a_follow_refuses_a_root_that_holds_a_table(
 
 
 def test_a_follower_delegates_the_whole_read_signature() -> None:
-    """Composition's one real cost, pinned.
+    """The cost of not inheriting, pinned.
 
-    `Follower.scan` is hand-written delegation, so it can drift from
-    `Log.scan` — a parameter added there would silently not reach a follower,
-    and the caller would get a `TypeError` naming an argument the docs say
-    exists. Inheriting would have kept them in step for free; this is what is
-    paid instead, and it is cheaper than the interface inheritance imposed.
+    `Log` and `Follower` reach the same reader by different routes — `Log.scan`
+    through `Log.sql`, `Follower.scan` through `Reader` directly — and both
+    build their query with `scan_query`. Nothing keeps their signatures in
+    step, so a parameter added to one would silently not reach the other and a
+    caller would get a `TypeError` naming an argument the docs say exists.
+    Inheriting kept them aligned for free; this assertion is what is paid
+    instead, and it is cheaper than the interface inheritance imposed.
 
     `include_archive` is deliberately absent: a follower's local table is empty
     by construction, so reading without the archive would return the buffer
@@ -3877,3 +3987,11 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         "sort_by",
         "close",
     }
+
+    # And it builds from the read collaborators alone. Passing a `Log` in was
+    # the previous shape, and the one that produced both of this class's bugs:
+    # a follower that holds a `Log` inevitably asks it questions it answers for
+    # a writer, and routes reads through dispatch it cannot intercept.
+    taken = set(inspect.signature(Follower.__init__).parameters) - {"self"}
+    assert taken == {"layout", "buffer", "archive", "reader", "owned"}
+    assert "log" not in taken

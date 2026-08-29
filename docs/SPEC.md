@@ -358,8 +358,16 @@ and archive expiry — not a local `maintain()`, which moves nothing in the buck
 syncing steadily can still sweep a follower in seconds. Every read therefore re-reads that pointer and refuses with "reassemble" rather
 than serving from a snapshot that is gone.
 
-**Two things are unrepresentable rather than refused**, which is why `Follower` wraps a
-`Log` instead of extending one:
+**A `Follower` holds the same read collaborators a `Log` holds — it does not hold a `Log`.**
+The decomposition is `Log = writer state + Reader` and `Follower = Reader + the pin check`,
+so `Log.follow` builds the buffer, the archive handle and the `Reader` directly and hands
+them over. Two earlier shapes were wrong in the same direction: subclassing `Log` published
+a write surface that only raised, and wrapping a whole `Log` hid that surface while still
+constructing the writer machinery and then reaching past it. Both bugs review found on this
+class came from that seam — a read that lost its error translation to the wrapped object's
+internal dispatch, and a staleness number answered by a writer's method.
+
+**Two things are then unrepresentable rather than refused:**
 
 - **There is no `include_archive=False`.** A follower's local Iceberg table is empty by
   construction — `_assemble_follower` creates it that way — so reading without the archive
@@ -378,10 +386,19 @@ returns the archive extent, the buffered extent, the gap between them if any, an
 the followed log declared `wal_replication`.
 
 **A gap is not necessarily loss**, and nothing local can tell the two apart. The gap this
-reports sits strictly BETWEEN the tiers — above the archive's frontier, below the buffer's
-first offset — and a range there is either a band the buffer lost, since rows sealed while
-`wal_replication` was off are discarded at seal and gone, or a `Log.restore` fence, which
-burns 2**20 offsets in exactly that position. From a replica the two are indistinguishable:
+reports sits above the archive's frontier and below the next thing the replica knows of —
+the buffer's first offset when it holds rows, and the sequence's end when it does not. A
+range there is either a band the buffer lost, since rows sealed while `wal_replication` was
+off are discarded at seal and gone, or a `Log.restore` fence, which burns 2**20 offsets in
+exactly that position.
+
+**The empty-buffer case is why the bound is not simply the buffer's first offset.** An
+archived log with replication off discards each seal's rows and they reach the archive only
+at the next `sync`; a follower assembled in that window — the ordinary way an operator
+adopts following — has an empty buffer and a sequence far above the archive. Comparing
+against the buffer alone reported such a follower gap-free while it served a fraction of the
+log. `sqlite_sequence` closes it, because it counts every offset ever assigned and never
+lowers. From a replica the two are indistinguishable:
 the fence "leaves no trace once the sequence has moved" (§13.4). A caller who knows whether
 their log has failed over can read a gap that this cannot, so it reports the gap and lets
 them.

@@ -209,10 +209,12 @@ with Log.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
 own `meta`. It requires a published archive — a log before its first successful sync cannot be
 followed, because serving the buffer alone would silently omit every archived row.
 
-**A `Follower` is not a `Log`.** It wraps one and exposes the read surface only, so `append`,
-`seal`, `sync`, `compact`, `evict` and `write_replication_config` are *absent* rather than
-raising. `scan` and `sql` take no `include_archive`: a follower's local table is empty by
-construction, so reading without the archive would return the replicated buffer alone.
+**A `Follower` is not a `Log` and does not hold one.** It holds the same read collaborators a
+`Log` holds — the replicated buffer, the archive handle, and the reader over both — so
+`append`, `seal`, `sync`, `compact`, `evict` and `write_replication_config` are *absent*
+rather than raising: the writer machinery is not built at all. `scan` and `sql` take no
+`include_archive` either, because a follower's local table is empty by construction and
+reading without the archive would return the replicated buffer alone.
 
 **A snapshot, not a subscription.** litestream restores to a point in time, so refreshing means
 assembling another follower — exit the block and reopen. `root` defaults to a temporary
@@ -232,8 +234,10 @@ Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=Tru
 ```
 
 `coverage()` reports; it does not adjudicate. A follower cannot ask the primary anything, so the
-failure it avoids is silence. The gap it reports sits strictly *between* the tiers — above the
-archive's frontier, below the buffer's first offset. **A gap there is not necessarily loss**:
+failure it avoids is silence. The gap it reports sits above the archive's frontier and below
+the next thing the replica knows of — the buffer's first offset when it holds rows, the
+sequence's end when it does not, so an empty replica still reports the band it cannot serve.
+**A gap there is not necessarily loss**:
 it is either rows the buffer discarded at seal with replication off, or a `Log.restore` fence,
 which burns 2**20 offsets in exactly that position — and nothing local tells the two apart. A
 caller who knows whether their log has failed over can read a gap that this cannot.
