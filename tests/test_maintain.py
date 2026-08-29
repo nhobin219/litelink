@@ -11,15 +11,16 @@ from pathlib import Path
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
+import litelink
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import COMPACT_MULTIPLE
 from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
-from litelink.log import Log, LogConfig, validate
+from litelink.log import LogConfig, WriteHandle, validate
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
 
-def seal_files(log: Log, count: int, per_file: int = 4) -> None:
+def seal_files(log: WriteHandle, count: int, per_file: int = 4) -> None:
     """Produce `count` sealed files, each holding `per_file` rows."""
     for i in range(count):
         log.extend(rows(per_file, start=i * per_file))
@@ -85,7 +86,7 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
     import pyarrow.parquet as pq
 
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
-    with Log.new(
+    with litelink.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
         for ts in (500, 100, 400, 200):
@@ -163,7 +164,7 @@ def test_eviction_waits_for_the_archive_to_hold_the_file(tmp_path: Path) -> None
     and was the only boundary in the log that could move backwards.
     """
     config = LogConfig(local_retention=timedelta(0))
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -325,7 +326,7 @@ def test_recovery_never_removes_a_file_the_table_adopted(tmp_path: Path) -> None
         assert len(read_all(recovered)) == 4
 
 
-def tracked_paths(log: Log) -> set[Path]:
+def tracked_paths(log: WriteHandle) -> set[Path]:
     """Every file the log can account for without listing a directory.
 
     Referenced by a live snapshot, claimed by an in-flight seal or compaction,
@@ -342,7 +343,7 @@ def tracked_paths(log: Log) -> set[Path]:
     return tracked
 
 
-def assert_nothing_untracked(log: Log) -> set[Path]:
+def assert_nothing_untracked(log: WriteHandle) -> set[Path]:
     on_disk = set(log.root.rglob("*.parquet"))
     untracked = on_disk - tracked_paths(log)
     assert untracked == set(), f"{len(untracked)} file(s) findable only by scanning"
@@ -1083,7 +1084,7 @@ def test_compaction_will_not_merge_a_file_the_archive_holds(tmp_path: Path) -> N
         compact_min_files=2,
         snapshot_retention=timedelta(0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1129,7 +1130,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
     wrong at once. Per segment there is nothing to reset: files already pushed
     keep naming the bucket that holds them.
     """
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1180,7 +1181,7 @@ def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) ->
     business and merged across its extent. Neither heals, because nothing ever
     re-cuts the archive back.
     """
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1210,7 +1211,7 @@ def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) ->
 
 def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
     """Coverage must join adjacent files without inventing rows between them."""
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1566,7 +1567,7 @@ def test_a_refreshed_policy_reaches_compaction_sync_and_the_buffer(
 ) -> None:
     """One owner, or compaction and sync can disagree about what is in play.
 
-    `Log` used to keep its own copy of the policy beside `Maintenance`'s, kept
+    `WriteHandle` used to keep its own copy of the policy beside `Maintenance`'s, kept
     in step by `set_config` writing both. Refreshing only one of them left
     compaction reading the new policy while `sync` read the old — and `runs`
     exists precisely so those two cannot disagree, because a file `sync`
@@ -1584,7 +1585,7 @@ def test_a_refreshed_policy_reaches_compaction_sync_and_the_buffer(
         log.evict()
 
         assert log.config.target_compact_size == raised.target_compact_size, (
-            "sync reads the policy through Log; it must be the refreshed one"
+            "sync reads the policy through WriteHandle; it must be the refreshed one"
         )
         assert log._maintenance.config.local_rows == raised.local_rows
         assert log._buffer.config().target_seal_size == raised.target_seal_size, (
@@ -1724,7 +1725,7 @@ def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
     rather than argued.
     """
     random.seed(20260823)
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,

@@ -8,7 +8,7 @@ import importlib.util
 from pathlib import Path
 
 import litelink
-from litelink import Log, LogConfig
+from litelink import LogConfig, WriteHandle
 
 
 def test_version_is_a_string() -> None:
@@ -56,7 +56,7 @@ def test_the_websocket_example_builds_a_readable_log(tmp_path: Path) -> None:
         "sell_order_id": 2043649227448330,
     }
     config = LogConfig(target_seal_size=4096, compact_min_files=2)
-    with Log.new(tmp_path, "trades", schema=module.SCHEMA, config=config) as log:
+    with litelink.new(tmp_path, "trades", schema=module.SCHEMA, config=config) as log:
         for index in range(400):
             log.append(module.row({**frame, "id": frame["id"] + index}))
             log.seal_due()
@@ -84,7 +84,7 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
     and to nothing else.
 
     Written against the whole surface rather than those two names, because the
-    defect is structural: anything `Log` asks a caller to pass can grow the
+    defect is structural: anything `WriteHandle` asks a caller to pass can grow the
     same hole.
 
     Collected from the SOURCE, which is what an earlier version of this test
@@ -140,11 +140,11 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
     assert {"S3Options", "Row"} <= nameable, f"collector missed a fixture: {nameable}"
 
     leaked: dict[str, set[str]] = {}
-    for name in dir(Log):
+    for name in dir(WriteHandle):
         if name.startswith("_"):
             continue
 
-        attribute = inspect.getattr_static(Log, name)
+        attribute = inspect.getattr_static(WriteHandle, name)
         target = attribute.__func__ if isinstance(attribute, classmethod) else attribute
         if not inspect.isfunction(target):
             continue

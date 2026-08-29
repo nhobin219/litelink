@@ -390,7 +390,7 @@ class LogTable:
         TWO commits, not one: the catalog row lands first and the sort order
         after it. Nothing in this library reads that declaration back — `open`
         takes `sort_by` from `meta` (§4) — so it is there for anything reading
-        the Iceberg table directly. `Log.restore` cares about the split, since
+        the Iceberg table directly. `litelink.restore` cares about the split, since
         the first commit is what makes a root openable; see there.
 
         §4 wants the order declared as table metadata AND applied at write
@@ -440,7 +440,7 @@ class LogTable:
 
         Its catalog is a SQLite file beside the local one and its warehouse is
         the object-store prefix — §2's two-catalog shape. Created lazily rather
-        than at `Log.new`, because a log may be configured with an archive long
+        than at `litelink.new`, because a log may be configured with an archive long
         before anything is pushed to it and creating a remote table costs a
         round trip a local-only run should never pay.
 
@@ -642,7 +642,7 @@ class LogTable:
         """Drop this log's local catalog row, leaving the root unopenable.
 
         `create` is two commits and only the first makes a root openable, so a
-        failure in the second needs undoing — see `Log.restore`. The objects it
+        failure in the second needs undoing — see `litelink.restore`. The objects it
         may have written stay: a metadata JSON nothing references is inert, and
         the alternative is deleting files on a path already handling a failure.
         """
@@ -662,7 +662,7 @@ class LogTable:
         `_recorded_location` makes and for a sharper reason. `catalog.db` runs
         in `journal_mode=delete` with no busy timeout on this connection, so a
         read landing in another process's commit window returns `SQLITE_BUSY`.
-        Answering False there tells `Log.restore` it is resuming an interrupted
+        Answering False there tells `litelink.restore` it is resuming an interrupted
         restore when it is looking at a LIVE log — and the resume path then
         reserves 2**20 offsets on it, deletes every `extent` row including
         queued cuts, wipes `sealing` and `claim`, drops the archive catalog

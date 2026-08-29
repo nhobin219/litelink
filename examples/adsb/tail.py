@@ -18,11 +18,11 @@ from pathlib import Path
 from _stream import NAME
 
 import litelink
-from litelink import LogReader
+from litelink import LogHandle
 from litelink._s3 import S3Options
 
 
-def snapshot(log: LogReader) -> tuple[int, int, int, int, int]:
+def snapshot(log: LogHandle) -> tuple[int, int, int, int, int]:
     """(stream rows, local rows, buffer rows, local files, archived rows).
 
     Nothing here scans data. Iceberg tracks a row count per file, so the table's
@@ -77,7 +77,7 @@ class ScanCost:
     def due(self) -> bool:
         return time.monotonic() - self._at >= self._every
 
-    def measure(self, log: LogReader, *, archived: bool) -> None:
+    def measure(self, log: LogHandle, *, archived: bool) -> None:
         self._at = time.monotonic()
         started = time.monotonic()
         # `read_all`, not a count: a count is answered from statistics without
@@ -120,7 +120,7 @@ class ArchiveCount:
         self._watermark = -1
         self._files = 0
 
-    def at(self, log: LogReader, watermark: int) -> int:
+    def at(self, log: LogHandle, watermark: int) -> int:
         if watermark != self._watermark:
             self._watermark = watermark
             self._files = log.archive_files()
@@ -142,7 +142,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log = litelink.reader(args.root, NAME, s3=S3Options())
+    log = litelink.open(args.root, NAME, read_only=True, s3=S3Options())
     print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.")
     if log.archive:
         print(f"archive: {log.archive}")

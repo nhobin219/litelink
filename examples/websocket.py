@@ -32,7 +32,8 @@ from pathlib import Path
 import pyarrow as pa
 import websockets
 
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig
 
 FEED = "wss://ws.bitstamp.net"
 CHANNEL = "live_trades_btcusd"
@@ -73,9 +74,9 @@ async def main() -> None:
     # real deployment leaves this at the default.
     config = LogConfig(target_seal_size=16 * 1024, compact_min_files=2)
     try:
-        log = Log.open(args.root, "trades")
+        log = litelink.open(args.root, "trades")
     except FileNotFoundError:
-        log = Log.new(
+        log = litelink.new(
             args.root, "trades", schema=SCHEMA, sort_by=("event_ts",), config=config
         )
 

@@ -35,7 +35,7 @@ Two regressions this has already caught, both worth not reintroducing:
 
   - a `min/max` query on every append, to decide whether the buffer was empty —
     13-62% against the floor for a fact an O(1) counter already had
-  - constructing the Log inside the timed region, which charges an Iceberg
+  - constructing the WriteHandle inside the timed region, which charges an Iceberg
     catalog and table creation to write throughput and reports ~100% overhead
     that is not real
 """
@@ -50,7 +50,7 @@ from pathlib import Path
 
 from _bench import COLUMNS, best_of_setup, fresh_log, observations
 
-from litelink import Log
+from litelink import WriteHandle
 
 RUNS = 3
 
@@ -88,7 +88,7 @@ def write_raw(
         connection.execute("COMMIT")
 
 
-def write_litelink(log: Log, batch: int, rows: int, payload: int) -> None:
+def write_litelink(log: WriteHandle, batch: int, rows: int, payload: int) -> None:
     source = observations(payload)
     for _ in range(rows // batch):
         log.extend(itertools.islice(source, batch))

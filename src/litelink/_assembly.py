@@ -1,8 +1,8 @@
 """Building logs and readers.
 
-`log.py` owns what a `Log` and a `LogReader` *do*; this module owns how they
-come to exist. The split is why `Log.follow` could return something that was
-not a `Log` and read as though it should — a classmethod names its receiver as
+`log.py` owns what a `WriteHandle` and a `LogReader` *do*; this module owns how they
+come to exist. The split is why `litelink.follow` could return something that was
+not a `WriteHandle` and read as though it should — a classmethod names its receiver as
 the thing being built, and four of these build three different types.
 
 Every factory here builds its object's collaborators and hands them over
@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 import pyarrow as pa
 
@@ -27,9 +27,11 @@ from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config, restore_buffer
 from litelink._table import LogTable, archive_extent
 from litelink.log import (
-    Log,
+    LocalReadHandle,
     LogConfig,
-    LogReader,
+    LogHandle,
+    RemoteReadHandle,
+    WriteHandle,
     _declared_schema,
     application_schema,
     table_schema,
@@ -42,47 +44,96 @@ if TYPE_CHECKING:
     from litelink._s3 import S3Options
 
 
-def reader(
+@overload
+def open(  # noqa: A001
     root: PathLike[str] | str,
     name: str,
     *,
+    read_only: Literal[False] = False,
     s3: S3Options | None = None,
-) -> LogReader:
-    """A read-only view of a log on this machine, alongside its writer.
+) -> WriteHandle: ...
 
-    **This replaces `Log.open(read_only=True)`**, which returned a `Log` whose
-    thirteen write methods existed and raised. The flag is gone with it: a
-    reader has no write surface to gate, so `_writable()` and the runtime
-    "this Log was opened readonly" no longer exist.
 
-    Opens nothing exclusively and never recovers — finishing an interrupted
-    seal is the writer's to do, and a second process doing it is the race
-    `read_only` existed to avoid. SQLite is opened `mode=ro` and the Iceberg
-    table is loaded read-only, so this cannot advance the log even by accident.
+@overload
+def open(  # noqa: A001
+    root: PathLike[str] | str,
+    name: str,
+    *,
+    read_only: Literal[True],
+    s3: S3Options | None = None,
+) -> LocalReadHandle: ...
 
-    Sees the writer's commits as they land: `catalog.db` and `archive.db` live
-    at the root and both processes read the same rows, so this is a live second
-    view rather than a snapshot. That is the difference from `follow`, which
-    reads a replica captured at a point in time.
+
+def open(  # noqa: A001
+    root: PathLike[str] | str,
+    name: str,
+    *,
+    read_only: bool = False,
+    s3: S3Options | None = None,
+) -> LogHandle:
+    """Open an existing log, for writing or for reading beside its writer.
+
+    **One constructor, two types out.** The overloads above give the precise
+    class for a literal `read_only`, so `open(root, name).append(...)` checks
+    and `open(root, name, read_only=True).append(...)` does not — the builtin
+    `open()` is typed the same way, returning `TextIOWrapper` or
+    `BufferedReader` from the mode literal. Passing a non-literal falls back to
+    `LogHandle` and the caller narrows.
+
+    That is the difference from the flag this replaced. `litelink.open(read_only=…)`
+    returned ONE class whose thirteen write methods existed and raised, so
+    misuse was invisible until it ran. Here read-only returns a class that has
+    no write methods at all.
+
+    Takes none of the log's shape: columns, config, archive and sort order all
+    come from the log itself, so nothing at the call site can disagree with
+    what is on disk.
+
+    **Read-only recovers nothing**, which is the point of it. Finishing an
+    interrupted seal is the writer's to do, and a second process doing it is a
+    race — `examples/adsb/replicate.py` runs beside a live writer and became
+    one for a commit, taking both whole-log claims and queueing the other
+    process's Parquet for deletion. SQLite is opened `mode=ro` and the Iceberg
+    table read-only, so this cannot advance the log even by accident.
+
+    Reading sees the writer's commits as they land: `catalog.db` and
+    `archive.db` live at the root and both processes read the same rows. That
+    is the difference from `follow`, which reads a replica captured at a point
+    in time.
     """
     layout = Layout(Path(root), name)
-    table, schema = _existing(layout, name, readonly=True)
-    buffer = Buffer.open(layout.buffer_db, schema, readonly=True)
+    table, schema = _existing(layout, name, readonly=read_only)
+    buffer = Buffer.open(layout.buffer_db, schema, readonly=read_only)
     try:
-        _validated_shape(layout, buffer, name)
+        config = _validated_shape(layout, buffer, name)
         remote = Archive(layout, buffer, s3)
+        reader = Reader(layout, table, buffer, duckdb_connection, archive=remote)
+        if read_only:
+            return LocalReadHandle(
+                layout=layout,
+                table=table,
+                buffer=buffer,
+                archive=remote,
+                reader=reader,
+            )
 
-        return LogReader(
+        handle = WriteHandle(
             layout=layout,
             table=table,
             buffer=buffer,
+            reader=reader,
+            maintenance=Maintenance(table, buffer, layout, remote),
+            config=config,
             archive=remote,
-            reader=Reader(layout, table, buffer, duckdb_connection, archive=remote),
         )
     except BaseException:
         buffer.close()
 
         raise
+
+    handle.recover()
+
+    return handle
 
 
 def follow(
@@ -92,7 +143,7 @@ def follow(
     s3: S3Options | None = None,
     binary: str | None = None,
     scratch_dir: PathLike[str] | str | None = None,
-) -> LogReader:
+) -> RemoteReadHandle:
     """A read-only view of a log running somewhere else (§3b).
 
     The archive merged with a replicated copy of the writer's buffer, so a
@@ -146,7 +197,7 @@ def follow(
         buffer = Buffer.open(layout.buffer_db, schema, readonly=True)
         try:
             remote = Archive(layout, buffer, options)
-            view = LogReader(
+            view = RemoteReadHandle(
                 layout=layout,
                 table=table,
                 buffer=buffer,
@@ -378,9 +429,9 @@ def new(
     archive: str | None = None,
     s3: S3Options | None = None,
     start_offset: int = 1,
-) -> Log:
-    """Create a log. See `Log.new` for the shape it fixes and why."""
-    return Log.new(
+) -> WriteHandle:
+    """Create a log. See `litelink.new` for the shape it fixes and why."""
+    return WriteHandle.new(
         root,
         name,
         schema=schema,
@@ -392,21 +443,6 @@ def new(
     )
 
 
-def open(  # noqa: A001
-    root: PathLike[str] | str,
-    name: str,
-    *,
-    s3: S3Options | None = None,
-) -> Log:
-    """Open an existing log for writing, and recover it.
-
-    Takes none of the shape — the columns, config, archive and sort order all
-    come from the log itself. For a second view alongside a live writer, use
-    `reader`, which cannot advance the log and does not recover.
-    """
-    return Log.open(root, name, s3=s3)
-
-
 def restore(
     root: PathLike[str] | str,
     name: str,
@@ -414,10 +450,10 @@ def restore(
     archive: str,
     s3: S3Options | None = None,
     binary: str | None = None,
-) -> Log:
+) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
-    assigned. See `Log.restore`."""
-    return Log.restore(root, name, archive=archive, s3=s3, binary=binary)
+    assigned. See `litelink.restore`."""
+    return WriteHandle.restore(root, name, archive=archive, s3=s3, binary=binary)
 
 
-__all__ = ["follow", "new", "open", "reader", "restore"]
+__all__ = ["follow", "new", "open", "restore"]

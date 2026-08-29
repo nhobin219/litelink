@@ -128,7 +128,8 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
     result = run_offline(f"""
         import pyarrow as pa
         from datetime import timedelta
-        from litelink import Log, LogConfig
+        import litelink
+        from litelink import LogConfig
 
         schema = pa.schema([
             pa.field("event_ts", pa.int64()),
@@ -145,7 +146,7 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
             for i in range(400)
         ]
 
-        with Log.new({str(tmp_path / "offline")!r}, "s", schema=schema,
+        with litelink.new({str(tmp_path / "offline")!r}, "s", schema=schema,
                      sort_by=("event_ts",), config=config) as log:
             log.extend(rows)
             log.seal()
@@ -156,7 +157,7 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
             bounded = log.scan(where="event_ts < 10").read_all().num_rows
             print("ROWS", total, "BOUNDED", bounded, "END", log.end_offset())
 
-        with Log.open({str(tmp_path / "offline")!r}, "s") as reopened:
+        with litelink.open({str(tmp_path / "offline")!r}, "s") as reopened:
             print("REOPENED", reopened.scan().read_all().num_rows)
     """)
 

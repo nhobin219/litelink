@@ -24,7 +24,7 @@ import pyarrow as pa
 import pytest
 
 import litelink
-from litelink import Log, LogConfig
+from litelink import LogConfig, WriteHandle
 from litelink._archive import Archive
 from litelink._buffer import Buffer
 from litelink._layout import NAMESPACE, Layout
@@ -37,7 +37,7 @@ from litelink._table import (
     _recorded_location,
     forget_archive_entry,
 )
-from litelink.log import OFFSET, RESTORE_RESERVE, LogReader, table_schema
+from litelink.log import OFFSET, RESTORE_RESERVE, LogHandle, table_schema
 from tests.conftest import filesystem
 
 pytestmark = pytest.mark.s3
@@ -75,7 +75,9 @@ def scrambled(count: int) -> list[dict[str, object]]:
     ]
 
 
-def archived_log(root: Path, bucket: str, s3: S3Options, **overrides: object) -> Log:
+def archived_log(
+    root: Path, bucket: str, s3: S3Options, **overrides: object
+) -> WriteHandle:
     settings: dict[str, object] = {
         "target_seal_size": 64 * 1024,
         # Conversion off, so these tests are about what reaches the archive and
@@ -92,7 +94,7 @@ def archived_log(root: Path, bucket: str, s3: S3Options, **overrides: object) ->
     settings.update(overrides)
     config = LogConfig(**settings)  # ty: ignore[invalid-argument-type]
 
-    return Log.new(
+    return litelink.new(
         root,
         "s",
         schema=SCHEMA,
@@ -681,10 +683,10 @@ def test_a_read_never_repairs_the_archive_catalog(
     # Written straight to `meta` rather than through `set_archive`, so nothing
     # has had the chance to repair the entry before the read sees it.
     second = f"s3://{bucket}/elsewhere"
-    with Log.open(tmp_path, "s", s3=s3) as writer:
+    with litelink.open(tmp_path, "s", s3=s3) as writer:
         writer._buffer.set_meta("archive", second)
 
-    with litelink.reader(tmp_path, "s", s3=s3) as reader:
+    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         with pytest.raises(ValueError, match="not under"):
             reader._archive.table()
 
@@ -729,7 +731,7 @@ def test_a_repoint_leaves_reads_working(
 
         log.set_archive(f"s3://{bucket}/moved")
 
-    with litelink.reader(tmp_path, "s", s3=s3) as reader:
+    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         merged = reader.sql("SELECT * FROM log", include_archive=True).read_all()
 
         assert merged.num_rows == ROWS, "a re-pointed log must still be readable"
@@ -953,7 +955,7 @@ def test_the_backfill_sees_copies_another_process_pushed(
         writer.seal_due()
         writer.sync()
 
-        with Log.open(tmp_path, "s", s3=s3) as other:
+        with litelink.open(tmp_path, "s", s3=s3) as other:
             # `other` caches its archive handle here, at today's extent.
             assert other.archive_files() > 0
 
@@ -1074,7 +1076,7 @@ def test_set_meta_if_writes_only_while_the_guard_still_holds(tmp_path: Path) -> 
     tried to land inside it would be a race that usually loses. Atomicity here
     is by construction — one `BEGIN IMMEDIATE`, per SPEC §4a.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     with log:
         log._buffer.set_meta("archive", "s3://a/p")
 
@@ -1152,13 +1154,15 @@ def test_eviction_learns_about_an_archive_attached_by_another_process(
         local_rows=1,
         snapshot_retention=timedelta(seconds=0),
     )
-    writer = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
+    writer = litelink.new(
+        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
+    )
     with writer:
         writer.extend(rows(ROWS))
         writer.seal_due()
 
         # The maintainer opened while the log was local-only.
-        with Log.open(tmp_path, "s", s3=s3) as maintainer:
+        with litelink.open(tmp_path, "s", s3=s3) as maintainer:
             assert not maintainer._archive.configured()
 
             writer.set_archive(f"s3://{bucket}/prefix")
@@ -1214,7 +1218,7 @@ def test_restating_the_archive_from_a_stale_process_keeps_the_watermark(
         settled = writer.archived_through()
         assert settled > 0
 
-        with Log.open(tmp_path, "s", s3=s3) as other:
+        with litelink.open(tmp_path, "s", s3=s3) as other:
             # There is no per-process memory to go stale any more, so the
             # case this once modelled cannot arise: re-asserting the archive
             # the log already has reads the same durable value either way.
@@ -1326,7 +1330,7 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
         local_rows=2000,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1420,7 +1424,7 @@ def test_a_stale_handle_cannot_repair_the_archive_it_was_pointed_away_from(
         writer.seal_due()
         writer.sync()
 
-        with Log.open(tmp_path, "s", s3=s3) as stale:
+        with litelink.open(tmp_path, "s", s3=s3) as stale:
             # `stale` remembers the first archive and never opens its handle.
             assert stale._archive.uri == f"s3://{bucket}/prefix"
 
@@ -1462,7 +1466,7 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1520,7 +1524,7 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
         snapshot_retention=timedelta(seconds=0),
     )
     archive = f"s3://{bucket}/prefix"
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1581,7 +1585,7 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1647,7 +1651,7 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
     the same hint. The claim the code makes has been narrowed to match.
     """
     where = f"s3://{bucket}/hinted"
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1697,7 +1701,7 @@ def test_the_archive_reads_as_a_directory_with_no_catalog_at_all(
         compact_min_files=2,
         local_rows=200,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         for _ in range(4):
@@ -1750,7 +1754,7 @@ def test_pointing_back_at_an_archive_restores_everything_it_held(
         snapshot_retention=timedelta(seconds=0),
     )
     first = f"s3://{bucket}/first"
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1815,7 +1819,7 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1847,7 +1851,7 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
         assert log.archived_through() > 0, "the watermark never moved"
 
 
-def _crash_before_recording(log: Log) -> None:
+def _crash_before_recording(log: WriteHandle) -> None:
     """Sync, dying between the register and the rows recording it."""
     original = Buffer.record_file
 
@@ -1886,7 +1890,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1946,7 +1950,7 @@ def test_eviction_never_acts_on_an_intended_copy(
     direction a `confirmed` column would have handed an older build for free.
     """
     config = replace(LogConfig(), local_rows=50, target_seal_size=1 << 30)
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2032,7 +2036,7 @@ def test_a_healed_row_carries_the_measured_bytes(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2097,7 +2101,7 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2169,7 +2173,7 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2226,7 +2230,7 @@ def test_replication_holds_sealed_rows_until_the_archive_has_them(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2276,7 +2280,7 @@ def test_without_replication_a_seal_still_drops_its_rows(
     does not flip it.
     """
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2324,7 +2328,7 @@ def test_a_held_seal_does_not_widen_the_next_file(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2363,7 +2367,7 @@ def test_the_archive_declares_the_same_sort_order_as_the_log(
     archive alone.
     """
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -2392,7 +2396,7 @@ def test_attaching_an_archive_that_is_ahead_of_the_log_is_refused(
 ) -> None:
     """The obvious failover attempt, which wedges the log silently.
 
-    `Log.new` on a second box then `set_archive` at the old prefix: `sync`
+    `WriteHandle.new` on a second box then `set_archive` at the old prefix: `sync`
     computes its floor from the archive's extent, every local file sits below
     it, so nothing is ever pushed. The watermark is still written, eviction's
     I4 clamp finds no `extent` rows and pins at zero, and local disk grows
@@ -2401,7 +2405,7 @@ def test_attaching_an_archive_that_is_ahead_of_the_log_is_refused(
     where = f"s3://{bucket}/ahead"
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
     # A populated archive: this is the log that legitimately owns it.
-    with Log.new(
+    with litelink.new(
         tmp_path / "first", "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as owner:
         owner.extend(rows(1200))
@@ -2412,7 +2416,7 @@ def test_attaching_an_archive_that_is_ahead_of_the_log_is_refused(
         assert owner.archived_through() > 0
 
     # A fresh log elsewhere, appending from offset 1, pointed at that archive.
-    with Log.new(
+    with litelink.new(
         tmp_path / "second", "s", schema=SCHEMA, config=config, s3=s3
     ) as fresh:
         fresh.extend(rows(10))
@@ -2434,7 +2438,7 @@ def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
     raised on an unreadable prefix would turn a routine restart into a coin
     toss against object storage.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
         log.extend(rows(10))
         log.set_archive(f"s3://{bucket}/never-written-to")
 
@@ -2459,7 +2463,7 @@ def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
     hint = f"{bucket}/corrupt/{NAMESPACE}/s/metadata/{VERSION_HINT}"
     fs.pipe(hint, b"00042-does-not-exist")
 
-    with Log.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
         log.extend(rows(10))
         log.set_archive(prefix)
 
@@ -2490,7 +2494,7 @@ def test_a_log_is_recovered_onto_another_machine(
         wal_replication=True,
     )
     primary = tmp_path / "primary"
-    with Log.new(
+    with litelink.new(
         primary,
         "s",
         schema=SCHEMA,
@@ -2533,7 +2537,7 @@ def test_a_log_is_recovered_onto_another_machine(
     # is hole B, and it is what makes the offset reserve necessary rather than
     # decorative — without these the replica's frontier equals the primary's
     # and no reuse is possible to detect.
-    with Log.open(primary, "s", s3=s3) as log:
+    with litelink.open(primary, "s", s3=s3) as log:
         log.extend(rows(50))
         written = log.end_offset() - 1
 
@@ -2542,7 +2546,9 @@ def test_a_log_is_recovered_onto_another_machine(
     # The machine dies.
     second = tmp_path / "second"
 
-    with Log.restore(second, "s", archive=where, s3=s3, binary=str(binary)) as revived:
+    with litelink.restore(
+        second, "s", archive=where, s3=s3, binary=str(binary)
+    ) as revived:
         report = revived.recovery()
 
         assert report is not None
@@ -2594,7 +2600,7 @@ def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
     pointer a later recovery depends on.
 
     Both halves are asserted here — the hazard, so it stays documented, and
-    that `forget_archive_entry` removes it. `Log.restore` calls that before
+    that `forget_archive_entry` removes it. `WriteHandle.restore` calls that before
     opening, so an operator who restored all three databases by hand gets the
     same protection as one who did not.
     """
@@ -2607,7 +2613,9 @@ def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
     )
     root = tmp_path / "log"
     layout = Layout(root, "s")
-    with Log.new(root, "s", schema=SCHEMA, config=config, archive=where, s3=s3) as log:
+    with litelink.new(
+        root, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
         log.extend(rows(600))
         log.seal_due()
         log.maintain()
@@ -2619,7 +2627,7 @@ def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
     stale = tmp_path / "stale-archive.db"
     shutil.copyfile(layout.archive_db, stale)
 
-    with Log.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3=s3) as log:
         for _ in range(3):
             log.extend(rows(600))
             log.seal_due()
@@ -2632,7 +2640,7 @@ def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
 
     # The hazard: the old catalog wins over the bucket's own pointer.
     shutil.copyfile(stale, layout.archive_db)
-    with Log.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3=s3) as log:
         assert log.archive_files() == early, (
             "expected the stale catalog to be believed; the case has changed"
         )
@@ -2640,7 +2648,7 @@ def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
     # And the fix, which is what `restore` does before it opens anything.
     assert forget_archive_entry(layout), "there was no entry to drop"
 
-    with Log.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3=s3) as log:
         # A reader may not adopt — that is a write to `archive.db` — so it
         # still sees nothing until a repairing caller runs.
         assert log.archive_files() == 0
@@ -2691,7 +2699,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
         wal_replication=True,
     )
     primary = tmp_path / "primary"
-    with Log.new(
+    with litelink.new(
         primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(800))
@@ -2726,7 +2734,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
         buffer.close()
 
     LogTable.create(Layout(second, "s"), table_schema(SCHEMA), ())
-    with Log.open(second, "s", s3=s3) as revived:
+    with litelink.open(second, "s", s3=s3) as revived:
         revived._archive.table(repair=True)  # noqa: SLF001
         # `seal()`, not `seal_due()`. The recovered group is OPEN — `_seed_group`
         # builds it, and the appender never cut it — so `seal_due` drains
@@ -2761,7 +2769,7 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(600))
@@ -2805,7 +2813,7 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
     from either moved with the contamination.
 
     Both entry points, because either can be the one that points the log —
-    `Log.new(archive=...)` is exactly what an operator reaches for when failing
+    `litelink.new(archive=...)` is exactly what an operator reaches for when failing
     over by hand.
     """
     foreign = f"s3://{bucket}/foreign"
@@ -2816,7 +2824,7 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
         wal_replication=True,
     )
     # Someone else's log, which fills that prefix.
-    with Log.new(
+    with litelink.new(
         tmp_path / "owner", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
     ) as owner:
         owner.extend(rows(1200))
@@ -2828,7 +2836,7 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
 
     # Creating a log against it — the failover-by-hand shape.
     with pytest.raises(ValueError, match="no record of pushing"):
-        Log.new(
+        litelink.new(
             tmp_path / "mine", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
         )
 
@@ -2840,7 +2848,7 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
     # `wal_replication` — `validate` refuses that pair, and the archive is
     # what this is about to try to attach.
     local_only = replace(config, wal_replication=False)
-    with Log.new(
+    with litelink.new(
         tmp_path / "other", "s", schema=SCHEMA, config=local_only, s3=s3
     ) as other:
         other.extend(rows(2000))
@@ -2879,7 +2887,7 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
         wal_replication=True,
     )
     primary = tmp_path / "primary"
-    with Log.new(
+    with litelink.new(
         primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(800))
@@ -2911,7 +2919,7 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
     )
 
     # Restored from that snapshot, then worked the way a revived box is.
-    with Log.restore(second, "s", archive=where, s3=s3) as revived:
+    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
         # Checked BEFORE any work: the first seal recycles the open group, so
         # a stale one is invisible a moment later. Releasing the archived rows
         # empties this buffer — every row in the snapshot is below the frontier
@@ -2944,11 +2952,11 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
 def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`Log.restore` has two durable writes; the order between them decides.
+    """`WriteHandle.restore` has two durable writes; the order between them decides.
 
     `LogTable.create` is what makes a root openable, and the offset reserve is
     what makes its offsets safe. With the table first, an interruption between
-    them left a root that `restore` refuses to retry and `Log.open` cheerfully
+    them left a root that `restore` refuses to retry and `WriteHandle.open` cheerfully
     accepts — reporting `recovery() is None`, sequence still at the replica's
     frontier, handing out offsets the dead primary had already served.
 
@@ -2963,7 +2971,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
         wal_replication=True,
     )
     primary = tmp_path / "primary"
-    with Log.new(
+    with litelink.new(
         primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(600))
@@ -2990,7 +2998,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     monkeypatch.setattr(Buffer, "strip_local_state", die)
 
     with pytest.raises(RuntimeError, match="interrupted"):
-        Log.restore(second, "s", archive=where, s3=s3)
+        litelink.restore(second, "s", archive=where, s3=s3)
 
     monkeypatch.undo()
 
@@ -2998,10 +3006,10 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     # table created FIRST this root would open, report `recovery() is None`,
     # and hand out offsets the primary already served.
     with pytest.raises(FileNotFoundError):
-        Log.open(second, "s", s3=s3)
+        litelink.open(second, "s", s3=s3)
 
     # And the half state is resumable rather than a dead end.
-    with Log.restore(second, "s", archive=where, s3=s3) as revived:
+    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
         resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
 
         assert resumed > served, (
@@ -3016,7 +3024,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
 
     That table is what makes a root openable. Wherever it sits, an interruption
     AFTER it leaves a root `restore` refuses to retry — both databases exist —
-    and `Log.open` cheerfully accepts, reporting `recovery() is None`. An
+    and `WriteHandle.open` cheerfully accepts, reporting `recovery() is None`. An
     earlier ordering put it second and claimed no such state existed; it had
     one, one write later, and the measured consequence was worse than the
     offset reuse that ordering was fixing: the open group still at the
@@ -3036,7 +3044,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
         wal_replication=True,
     )
     primary = tmp_path / "primary"
-    with Log.new(
+    with litelink.new(
         primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(600))
@@ -3051,7 +3059,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
     # Every step that can fail, INCLUDING the sort-order commit inside
     # `LogTable.create`. That method is two commits — the catalog row makes the
     # root openable, the declaration follows — so a failure in the second used
-    # to leave a root refusing to retry while `Log.open` accepted it, telling
+    # to leave a root refusing to retry while `WriteHandle.open` accepted it, telling
     # the operator to delete a log whose data was intact.
     for attempt, (target, method) in enumerate(
         [
@@ -3073,7 +3081,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
             patched.setattr(target, method, die)
 
             with pytest.raises(RuntimeError, match="bad minute"):
-                Log.restore(root, "s", archive=where, s3=s3)
+                litelink.restore(root, "s", archive=where, s3=s3)
 
         # The root is not a log. Whatever failed, nothing here can be opened
         # and handed offsets, because the table that would make it openable is
@@ -3082,10 +3090,10 @@ def test_a_failed_restore_never_leaves_an_openable_root(
             f"{method} failed and still left an openable root"
         )
         with pytest.raises(FileNotFoundError):
-            Log.open(root, "s", s3=s3)
+            litelink.open(root, "s", s3=s3)
 
         # And it is resumable rather than a dead end.
-        with Log.restore(root, "s", archive=where, s3=s3) as revived:
+        with litelink.restore(root, "s", archive=where, s3=s3) as revived:
             assert revived.scan(include_archive=True).read_all().num_rows > 0
 
 
@@ -3116,7 +3124,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(1200))
@@ -3148,12 +3156,12 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     Layout(tmp_path, "s").buffer_db.unlink()
 
     with pytest.raises(Exception, match="already exists"):
-        Log.restore(tmp_path, "s", archive=where, s3=s3, binary=str(binary))
+        litelink.restore(tmp_path, "s", archive=where, s3=s3, binary=str(binary))
 
     # The row survives, so the local files are still referenced and the log
-    # still reads. Before this, `Log.open` answered "use new() to create one".
+    # still reads. Before this, `WriteHandle.open` answered "use new() to create one".
     assert LogTable.exists_for(Layout(tmp_path, "s"))
-    with litelink.reader(tmp_path, "s", s3=s3) as reopened:
+    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reopened:
         assert reopened.scan(include_archive=True).read_all().num_rows == readable
 
 
@@ -3184,7 +3192,7 @@ def test_detaching_with_a_retention_floor_is_refused(
         compact_min_files=2,
         local_rows=100,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(600))
@@ -3214,7 +3222,7 @@ def test_detaching_a_log_with_no_retention_floor_is_allowed(
     both None by default, so refusing here would refuse the ordinary case.
     """
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -3246,7 +3254,7 @@ def test_an_empty_archive_string_is_a_detach_and_is_refused_as_one(
     config = replace(
         LogConfig(), target_seal_size=8 * 1024, compact_min_files=2, local_rows=100
     )
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -3273,14 +3281,14 @@ def test_creating_a_log_with_an_empty_archive_is_a_local_only_log(
 ) -> None:
     """And `validate` judges it as one.
 
-    `Log.new(archive="")` was non-None to `validate`, so every rule that
+    `litelink.new(archive="")` was non-None to `validate`, so every rule that
     presupposes an archive was skipped — while `Archive.configured()` came back
     False. `local_retention=0` means "evict on upload" and is refused with no
     archive; with an empty string it was accepted, which is the exact pair the
     rule exists to prevent.
     """
     with pytest.raises(ValueError, match="presuppose an archive"):
-        Log.new(
+        litelink.new(
             tmp_path,
             "s",
             schema=SCHEMA,
@@ -3341,7 +3349,7 @@ def test_an_evicted_log_still_serves_every_row(
         )
 
         # And a reader on the same root agrees, because it is the same object.
-        with litelink.reader(tmp_path, "s", s3=s3) as view:
+        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
             assert view.scan().read_all().num_rows == ROWS
 
         # Asking for local-only is refused rather than answered short: there
@@ -3365,7 +3373,7 @@ def test_an_evicted_log_serves_everything_across_a_re_point(
 
     **So the watermark cannot stand in for "the archive holds rows".** Deriving
     it that way sent an evicted-dry log back to serving its buffer alone:
-    measured, 550 of 4,000 rows with no error, `litelink.reader()` agreeing,
+    measured, 550 of 4,000 rows with no error, `litelink.open(, read_only=True)` agreeing,
     and `coverage()` reporting `gap=None` over the missing 3,450. The window
     closes only at the next `sync()`, which is why the existing detach test
     passes — it reads after one.
@@ -3400,7 +3408,7 @@ def test_an_evicted_log_serves_everything_across_a_re_point(
         )
 
         # And a separate reader process agrees, since it derives the same way.
-        with litelink.reader(tmp_path, "s", s3=s3) as view:
+        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
             assert view.scan().read_all().num_rows == ROWS
             assert view.coverage().gap is None
 
@@ -3486,7 +3494,7 @@ def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as primary:
         primary.extend(rows(2000))
@@ -3531,13 +3539,13 @@ def test_a_follower_refuses_to_read_without_the_archive(
 ) -> None:
     """`include_archive=False` has no coherent meaning on a follower.
 
-    `Log.scan` and `Log.sql` default it to False, which is safe for an ordinary
+    `WriteHandle.scan` and `WriteHandle.sql` default it to False, which is safe for an ordinary
     log because its local table holds the sealed history. A follower's local
     table is EMPTY by construction, so that default returns the replicated
     buffer alone — measured at 308 of 800 rows, silently. Refused on both entry
     points; overriding only `scan` would leave `sql` serving the tail.
 
-    Falsify by returning a plain `Log` from `follow`: `scan()` with no
+    Falsify by returning a plain `WriteHandle` from `follow`: `scan()` with no
     arguments drops every archived row and raises nothing.
     """
     binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
@@ -3551,7 +3559,7 @@ def test_a_follower_refuses_to_read_without_the_archive(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as primary:
         primary.extend(rows(2000))
@@ -3571,9 +3579,9 @@ def test_a_follower_refuses_to_read_without_the_archive(
 
     with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Refused, not absent. Unifying the two read-only shapes into one
-        # `LogReader` means the parameter has to exist for the local case,
+        # `LogHandle` means the parameter has to exist for the local case,
         # where a hot read is local disk only (I5). This is the cost, and it
-        # is named in `LogReader`'s docstring: a followed log's table is empty
+        # is named in `LogHandle`'s docstring: a followed log's table is empty
         # by construction, so asking to skip the archive raises.
         for call in (
             lambda: follower.scan(include_archive=False),
@@ -3611,7 +3619,7 @@ def test_a_follower_writes_nothing_the_primary_shares(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as primary:
         primary.extend(rows(2000))
@@ -3638,20 +3646,20 @@ def test_a_follower_writes_nothing_the_primary_shares(
 
         assert not (root / "litestream.yml").exists()
 
-        # A followed log refuses these rather than lacking them. They belong
-        # on a reader — generating a config is exactly what you do alongside a
-        # live writer, and reaching for a writer to do it takes both whole-log
-        # claims and can recover another process's in-flight seal. What must
-        # not happen is a FOLLOWER emitting one: `litestream_config` keys each
-        # replica on the path relative to the root, so it would name the
-        # primary's key and ship this scratch copy over the primary's only
-        # off-box record of its unsealed rows.
-        for call in (follower.write_replication_config, follower.replication_config):
-            with pytest.raises(ValueError, match="followed log"):
-                call()
+        # ABSENT, not refused. `RemoteReadHandle` is a SIBLING of
+        # `LocalReadHandle`, so it never inherits these — which is the whole
+        # reason for the sibling split, since a followed log emitting one would
+        # name the PRIMARY's replica key (`litestream_config` keys on the path
+        # relative to the root) and a sidecar run there would ship this scratch
+        # copy over the primary's only off-box record of its unsealed rows.
+        #
+        # The type checker sees this too: it rejected these three lines when
+        # they still called the methods.
+        for absent in ("replication_config", "write_replication_config", "databases"):
+            assert not hasattr(follower, absent), f"a followed log exposes {absent}"
 
-        with pytest.raises(ValueError, match="followed log"):
-            _ = follower.databases
+        # And a LOCAL reader has them, because its key IS the primary's own.
+        assert hasattr(litelink.LocalReadHandle, "replication_config")
 
         # And the whole write surface is gone with them.
         for absent in ("append", "extend", "seal", "sync", "compact", "evict"):
@@ -3676,7 +3684,7 @@ def test_a_follower_refuses_an_archive_that_has_published_nothing(
     primary then commits.
 
     So the bucket is asked first, and a log before its first successful sync
-    cannot be followed. That is a real cost — for `Log.new(archive=...)` it is
+    cannot be followed. That is a real cost — for `litelink.new(archive=...)` it is
     every young log — and it is the right one: serving the buffer alone would
     be a reader silently missing every archived row.
 
@@ -3689,7 +3697,7 @@ def test_a_follower_refuses_an_archive_that_has_published_nothing(
 
     where = f"s3://{bucket}/follow-unpublished"
     config = replace(LogConfig(), target_seal_size=32 * 1024, wal_replication=True)
-    with Log.new(
+    with litelink.new(
         tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as primary:
         # Buffered only: nothing sealed, so nothing was ever pushed.
@@ -3745,7 +3753,7 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
         wal_replication=True,
     )
     primary = tmp_path / "primary"
-    with Log.new(
+    with litelink.new(
         primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(2000))
@@ -3764,7 +3772,7 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
         assert follower.coverage().gap is None
 
         # Commit past the pin. `previous-versions-max` is 10.
-        with Log.open(primary, "s", s3=s3) as live:
+        with litelink.open(primary, "s", s3=s3) as live:
             for _ in range(12):
                 live.extend(rows(400))
                 while live.seal() is not None:
@@ -3801,7 +3809,7 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
     replica's `sqlite_sequence` describes a tier contributing nothing, while
     the archive leg serves hundreds of rows past it.
 
-    `Log.restore` corrects the same arithmetic on the same two tiers and
+    `WriteHandle.restore` corrects the same arithmetic on the same two tiers and
     records the cost of finding it: *"16,100 offsets reported skipped that were
     present and readable"*. `follow` reuses that assembly, so it inherits the
     skew.
@@ -3827,7 +3835,7 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
         wal_replication=True,
     )
     primary = tmp_path / "primary"
-    with Log.new(
+    with litelink.new(
         primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(2000))
@@ -3839,7 +3847,7 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
     # Then the primary races ahead of that snapshot: it seals, syncs, appends
     # and syncs again, with no sidecar running. This is the ordinary shape of
     # a sidecar restart or a crash, which `_replication.py` calls supported.
-    with Log.open(primary, "s", s3=s3) as log:
+    with litelink.open(primary, "s", s3=s3) as log:
         while log.seal() is not None:
             pass
 
@@ -3916,7 +3924,7 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
             compact_min_files=2,
             wal_replication=False,
         )
-        with Log.new(
+        with litelink.new(
             tmp_path / tag, "s", schema=SCHEMA, config=config, archive=where, s3=s3
         ) as log:
             log.extend(rows(1000))
@@ -3992,14 +4000,14 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
     window is never entered. This one injects the delete inside it.
 
     **It is `scan` that this protects, and inheritance is why.** As a subclass,
-    only `sql` carried the translation; `scan` needed none because `Log.scan`
+    only `sql` carried the translation; `scan` needed none because `WriteHandle.scan`
     ends in `self.sql`, which bound to the override. Composition sends that
-    call to `Log.sql` instead, so the handler stopped running and `scan` — the
+    call to `WriteHandle.sql` instead, so the handler stopped running and `scan` — the
     main read entry point — began dying with the raw error on the exact path
     §3b promises refuses with "reassemble". A caller looping
     `except RuntimeError: reassemble` crashed rather than recovering.
 
-    Falsify by narrowing `LogReader._guarded` back to `sql` alone: `sql` still
+    Falsify by narrowing `LogHandle._guarded` back to `sql` alone: `sql` still
     refuses and `scan` raises `FileNotFoundError`.
     """
     binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
@@ -4014,7 +4022,7 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
         compact_min_files=2,
         wal_replication=True,
     )
-    with Log.new(
+    with litelink.new(
         tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as log:
         log.extend(rows(2000))
@@ -4069,9 +4077,9 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
 
 
 def test_a_follower_delegates_the_whole_read_signature() -> None:
-    """`Log` delegates its reads; the signatures must not drift.
+    """`WriteHandle` delegates its reads; the signatures must not drift.
 
-    `Log` holds a `LogReader` and passes every read through to it, so the two
+    `WriteHandle` holds a `LogHandle` and passes every read through to it, so the two
     signatures have to match exactly — a parameter added to one and not the
     other would be a caller getting a `TypeError` naming an argument the docs
     say exists. Delegation is hand-written, so nothing enforces it but this.
@@ -4079,7 +4087,7 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
     `include_archive` is present on both now. Unifying the two read-only
     shapes means the parameter has to exist for the local case; a followed log
     refuses it rather than not having it, which is the cost recorded in
-    `LogReader`'s docstring.
+    `LogHandle`'s docstring.
     """
     taken = set(inspect.signature(litelink.follow).parameters)
     assert taken == {"name", "archive", "s3", "binary", "scratch_dir"}
@@ -4090,22 +4098,41 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         "bucket's own hint. Both were unreachable once the parameter went"
     )
 
-    followed = set(inspect.signature(LogReader.scan).parameters) - {"self"}
-    logged = set(inspect.signature(Log.scan).parameters) - {"self"}
+    # Drift is now impossible rather than merely detectable: every handle
+    # inherits ONE read path, so these are the same function object. When
+    # `Follower` wrapped a `Log` this had to be a signature comparison, and the
+    # gap it could not see is exactly where `scan` lost its swept-snapshot
+    # translation — a wrapper intercepts the call it makes, not the dispatch
+    # inside it.
+    for shared in ("scan", "sql", "coverage", "end_offset", "close"):
+        assert getattr(WriteHandle, shared) is getattr(LogHandle, shared), (
+            f"{shared} is reimplemented rather than inherited"
+        )
+        assert (
+            getattr(litelink.RemoteReadHandle, shared) is getattr(LogHandle, shared)
+            or shared == "close"
+        ), f"{shared} is reimplemented on the remote handle"
 
-    assert followed == logged, "LogReader.scan has drifted from Log.scan"
-    assert set(inspect.signature(LogReader.sql).parameters) - {"self"} == set(
-        inspect.signature(Log.sql).parameters
-    ) - {"self"}
+    # Every subclass ADDS; none refuses. That is the property the earlier
+    # shapes kept failing, and it is what makes the hierarchy safe.
+    assert issubclass(WriteHandle, litelink.LocalReadHandle)
+    assert issubclass(litelink.LocalReadHandle, LogHandle)
+    assert issubclass(litelink.RemoteReadHandle, LogHandle)
+    assert not issubclass(litelink.RemoteReadHandle, litelink.LocalReadHandle), (
+        "a followed log must not inherit the replication surface"
+    )
 
     # The write surface is not merely refused, it is absent.
     for absent in ("append", "extend", "seal", "sync", "maintain", "set_config"):
-        assert not hasattr(LogReader, absent), f"LogReader exposes {absent}"
+        assert not hasattr(LogHandle, absent), f"LogHandle exposes {absent}"
 
     # And the surface is exactly this, because `docs/API.md` prints it as
     # "the whole of it". A member added here without updating that table
     # makes the documented surface a lie, which this catches.
-    assert {n for n in vars(LogReader) if not n.startswith("_")} == {
+    # The surface of each class is exactly this, because `docs/API.md` prints
+    # the hierarchy and a member added without updating it makes the
+    # documented surface a lie.
+    assert {n for n in vars(LogHandle) if not n.startswith("_")} == {
         # read
         "scan",
         "sql",
@@ -4125,39 +4152,35 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         "sort_by",
         "schema",
         "archive",
-        # replicate — refused on a followed log, not absent
-        "databases",
-        "replication_config",
-        "write_replication_config",
         # lifecycle
         "close",
     }
 
-    # Every one of those is on `Log` too, because `Log` delegates to it. A
-    # reader that could answer something a log could not would mean the
-    # decomposition had leaked.
-    for member in vars(LogReader):
-        # `root` and `name` are instance attributes on `Log`, set in its
-        # `__init__`, so they are not visible on the class.
-        if not member.startswith("_") and member not in {"root", "name"}:
-            assert hasattr(Log, member), f"Log cannot answer {member}"
+    assert {n for n in vars(litelink.LocalReadHandle) if not n.startswith("_")} == {
+        "databases",
+        "replication_config",
+        "write_replication_config",
+    }, "the local handle adds the replication surface and nothing else"
 
-    # And the write surface is on `Log` alone — the flag that used to gate it
-    # is gone, so there is nothing to open readonly and nothing to raise.
-    for absent in ("append", "extend", "seal", "sync", "maintain", "set_config"):
-        assert not hasattr(LogReader, absent), f"LogReader exposes {absent}"
+    assert {n for n in vars(litelink.RemoteReadHandle) if not n.startswith("_")} == {
+        "close",
+    }, "the remote handle adds only ownership of its scratch root"
 
-    assert not hasattr(Log, "readonly"), "the read_only flag survived"
-    assert "read_only" not in inspect.signature(Log.open).parameters
-
-    # And it builds from the read collaborators alone. Passing a `Log` in was
+    # And it builds from the read collaborators alone. Passing a `WriteHandle` in was
     # the previous shape, and the one that produced both of this class's bugs:
-    # a follower that holds a `Log` inevitably asks it questions it answers for
+    # a follower that holds a `WriteHandle` inevitably asks it questions it answers for
     # a writer, and routes reads through dispatch it cannot intercept.
-    taken = set(inspect.signature(LogReader.__init__).parameters) - {"self"}
-    assert taken == {"layout", "table", "buffer", "archive", "reader", "owned"}
+    taken = set(inspect.signature(LogHandle.__init__).parameters) - {"self"}
+    assert taken == {"layout", "table", "buffer", "archive", "reader"}
     assert "log" not in taken, (
-        "a reader that holds a Log asks it questions it answers for a writer, "
-        "and routes reads through dispatch it cannot intercept — both bugs "
-        "this class shipped came from exactly that"
+        "a handle that holds a WriteHandle asks it questions it answers for a "
+        "writer, and routes reads through dispatch it cannot intercept — two "
+        "of this branch's criticals came from exactly that"
     )
+
+    # Only the remote handle takes ownership of a root, because only `follow`
+    # makes one. A local handle never owns the directory it reads.
+    assert "owned" in set(
+        inspect.signature(litelink.RemoteReadHandle.__init__).parameters
+    )
+    assert "owned" not in taken

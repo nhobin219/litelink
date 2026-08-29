@@ -5,18 +5,28 @@ local Iceberg table, and the archive on object storage — and a log survives
 losing its machine (``restore``). Schema evolution (§9) is implemented for
 ``add_column``; blob fields (§15) are specified and are not.
 
-**Two objects, and the constructors say which one you get.** ``Log`` is the
-writer: it appends, seals, maintains and syncs. ``LogReader`` is everything you
-can ask a log without writing to it, and it is what ``reader`` and ``follow``
-return. There is no mode flag — ``Log.open(read_only=True)`` used to return a
-``Log`` whose thirteen write methods raised, and both it and the flag are gone.
+**The log is the directory and the objects in the bucket; these classes are
+handles to it.** That is why none of them is called ``Log`` — a class named
+after the data invites the question of why a read-only one is a lesser version
+of it. Every handle can read, and each subclass only adds:
+
+.. code-block:: text
+
+    LogHandle                    identity, read, observe, close
+    ├── LocalReadHandle          + the replication config surface
+    │   └── WriteHandle          + append, seal, maintain, sync, ...
+    └── RemoteReadHandle         + owns the scratch root it was built in
+
+Nothing inherits a method it has to refuse. Annotate ``LogHandle`` when you do
+not care which you were given.
 
 **The local/remote boundary is the constructor you call**, not an argument you
 pass:
 
-- ``open`` and ``reader`` want a *root on this machine*. They read the log's
-  own directory, see the writer's commits as they land, and take no ``archive``
-  argument because the log already records where its archive is.
+- ``open`` wants a *root on this machine*, and ``read_only=`` picks the type it
+  returns. It reads the log's own directory, sees the writer's commits as they
+  land, and takes no ``archive`` argument because the log already records where
+  its archive is.
 - ``follow`` wants an *archive URI* and no root. It restores the writer's
   buffer from object storage into scratch space and merges it with the archive,
   so it reads a log running on another machine, as of a point in time.
@@ -29,9 +39,17 @@ where the reasoning lives.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from litelink._assembly import follow, new, open, reader, restore  # noqa: A004
+from litelink._assembly import follow, new, open, restore  # noqa: A004
 from litelink._s3 import S3Options
-from litelink.log import Coverage, Log, LogConfig, LogReader, Row
+from litelink.log import (
+    Coverage,
+    LocalReadHandle,
+    LogConfig,
+    LogHandle,
+    RemoteReadHandle,
+    Row,
+    WriteHandle,
+)
 
 try:
     __version__ = version("litelink")
@@ -40,15 +58,16 @@ except PackageNotFoundError:  # a source tree that was never installed
 
 __all__ = [
     "Coverage",
-    "Log",
+    "LocalReadHandle",
     "LogConfig",
-    "LogReader",
+    "LogHandle",
+    "RemoteReadHandle",
     "Row",
     "S3Options",
+    "WriteHandle",
     "__version__",
     "follow",
     "new",
     "open",
-    "reader",
     "restore",
 ]

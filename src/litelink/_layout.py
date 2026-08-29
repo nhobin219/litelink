@@ -80,7 +80,7 @@ class Layout:
         it is TIME-dependent, and a stale copy is worse than none:
         `open_archive` consults `version-hint.text` only when the catalog has
         no row, so a stale row wins over the bucket's own pointer and the
-        archive reads short, silently. See `Log.restore`.
+        archive reads short, silently. See `litelink.restore`.
         """
         return self.root / "archive.db"
 

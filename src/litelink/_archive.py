@@ -4,8 +4,8 @@ Its own object because three collaborators need the same answer and none of
 them owns it. The Log decides whether an archive is attached, `Maintenance`
 asks whether I4 is owed anything before it evicts, and `Reader` needs a table
 handle when a query passes `include_archive`. Held on the Log and reached
-through it, that last one is a problem: a reader is constructed by `Log.new`
-and `Log.open` and injected into the Log, so at the moment the reader is built
+through it, that last one is a problem: a reader is constructed by `litelink.new`
+and `litelink.open` and injected into the handle, so at the moment the reader is built
 there is no Log to ask. The previous shape resolved it by mutating the reader
 after construction with a callback bound to a half-built Log — which works, and
 which no reader test can set up without building a Log first.
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 
 # Where the archive's location is recorded. It lives here rather than in `log`
-# because it is not `Log`'s private business: `evict` acts on I4 and so has to
+# because it is not `WriteHandle`'s private business: `evict` acts on I4 and so has to
 # be able to ask the buffer, not this object's memory, whether an archive is
 # owed anything.
 ARCHIVE_KEY = "archive"

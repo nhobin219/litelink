@@ -1,7 +1,7 @@
 """The concurrency contract, asserted rather than described.
 
 `docs/RUNTIME.md` states what is safe to call from where. These pin the part
-that is easy to break by accident: one `Log` reached from many threads, with no
+that is easy to break by accident: one `WriteHandle` reached from many threads, with no
 thread calling the same method twice in a row.
 
 That shape is not hypothetical. `fsync` cannot run on an event loop, so an
@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pytest
 
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig, WriteHandle
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,8 +35,8 @@ SCHEMA = pa.schema(
 )
 
 
-def open_log(root: Path, config: LogConfig | None = None) -> Log:
-    return Log.new(root, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
+def open_log(root: Path, config: LogConfig | None = None) -> WriteHandle:
+    return litelink.new(root, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
 
 
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
@@ -216,7 +217,7 @@ def test_a_seal_does_not_read_a_scan_s_pinned_snapshot(tmp_path: Path) -> None:
     Falsify by passing `self._reader` to `_rows` from `rows_between`: the seal
     reads 10 rows instead of 20 and the last 10 are lost.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA)
+    log = litelink.new(tmp_path, "s", schema=SCHEMA)
     with log:
         log.extend([{"event_ts": i, "key": "k"} for i in range(10)])
 
@@ -256,7 +257,9 @@ def test_a_sealer_that_woke_to_a_finished_group_abandons_it(
     actually queued. Falsify by removing the re-read — the stale sealer
     proceeds and overwrites `sealing` with a range nobody is working on.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, config=LogConfig(target_seal_size=1024))
+    log = litelink.new(
+        tmp_path, "s", schema=SCHEMA, config=LogConfig(target_seal_size=1024)
+    )
     with log:
         log.extend([{"event_ts": i, "key": "k" * 200} for i in range(200)])
 
