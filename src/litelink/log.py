@@ -3431,8 +3431,30 @@ class Follower:
 
         The affordance for measuring staleness: compare it against the
         primary's. This makes no promise about the distance — it cannot ask.
+
+        **Both tiers, because they are captured at different times.** The
+        buffer alone is `sqlite_sequence.seq + 1` of the REPLICA, which
+        litestream shipped at some earlier point than `_assemble_follower`
+        adopted the archive. When the primary sealed and synced rows the
+        sidecar had not yet shipped, the archive frontier is higher and
+        `release_archived` empties the buffer outright — so the replica's
+        sequence describes a tier that no longer contributes anything, while
+        the archive leg serves hundreds of rows above it.
+
+        `Log.restore` corrects the identical arithmetic on the identical two
+        tiers, and records what it cost to find: *"16,100 offsets reported
+        skipped that were present and readable"*. `follow` reuses `restore`'s
+        assembly, so it inherits the same skew and needs the same `max`.
+
+        Measured before the fix: a follower serving 2,288 rows reported 2,001.
+        The error is always low, so nothing is lost — but a caller using this
+        as a resume cursor re-delivers the difference, and an operator reads a
+        healthy follower as far behind.
+
+        Taking the archive frontier also brings this under the swept-snapshot
+        refusal, which it escaped while it read SQLite alone.
         """
-        return self._log.end_offset()
+        return max(self._log.end_offset(), self._checked_extent()[1] + 1)
 
     def scan(
         self,
@@ -3497,11 +3519,17 @@ class Follower:
             # too, but only when `metadata_location` changes, and a follower's
             # is pinned, so `_prepare_remote` always finds that cache warm. A
             # missing data file surfaces as `HTTPException` raised inside
-            # `execute`, and a missing manifest aborts the process outright:
+            # `execute`, and a missing manifest can abort the process outright:
             # DuckDB's iceberg extension calls `std::terminate`, which is
             # pre-existing and reaches a plain `Log` reading its own archive
-            # too. Neither is catchable here, and both happen before any row is
-            # served — but do not read this handler as covering them.
+            # too. Neither is catchable here — but do not read this handler as
+            # covering them.
+            #
+            # "Can", not "does": that abort was observed on a COLD read. A
+            # follower that has already scanned serves the same query from
+            # DuckDB's cache and neither aborts nor raises, because nothing
+            # goes back for the manifest. Do not treat the abort as a
+            # reliable signal that the archive is damaged.
             #
             # Three earlier versions of this comment claimed otherwise.
             #
@@ -3516,13 +3544,20 @@ class Follower:
         it reports rather than adjudicates — the failure to avoid is SILENCE,
         not incompleteness.
 
-        **A gap is not necessarily loss.** An offset range in neither tier is
-        either a band the buffer lost — rows sealed while `wal_replication` was
-        off are discarded at seal and gone — or a reserve that was never
-        issued, which `Log.restore` creates 2**20 of and `start_offset` creates
-        on purpose. Nothing distinguishes them from a replica: the reserve
-        "leaves no trace once the sequence has moved". A caller who knows
-        whether their log has failed over can read a gap that this cannot.
+        **A gap is not necessarily loss.** The gap reported here sits strictly
+        BETWEEN the tiers — above the archive's frontier, below the buffer's
+        first offset — because that is the only comparison made below. A range
+        there is either a band the buffer lost, since rows sealed while
+        `wal_replication` was off are discarded at seal and gone, or a
+        `Log.restore` fence, which burns 2**20 offsets in exactly that
+        position. Nothing distinguishes them from a replica: the fence "leaves
+        no trace once the sequence has moved". A caller who knows whether their
+        log has failed over can read a gap that this cannot.
+
+        A `start_offset` reserve is NOT among them, though an earlier version
+        of this docstring said it was. That reserve lies BELOW the archive's
+        low end, which nothing here compares against, so it can never surface
+        as a gap.
 
         That is why an earlier design refusing to open on a gap was wrong: it
         refused every followed log that had failed over, on a million offsets
@@ -3573,8 +3608,11 @@ class Follower:
         primary has already swept — the honesty guarantee lying, which is this
         design's worst failure.
 
-        The archive carries `previous-versions-max: 10`, so ten further primary
-        commits delete the object this names, with no time component at all.
+        The archive carries `previous-versions-max: 10` — ten previous versions
+        beside the current one — so the ELEVENTH further archive commit
+        deletes the object this names, with no time component at all. Archive
+        commits are what count: `sync`, `rewrite_archive`, archive expiry. A
+        local `maintain()` moves nothing in the bucket.
         One metadata GET, and it cannot change what reads serve: it re-reads
         this follower's own `archive.db` row, which nothing updates.
         """

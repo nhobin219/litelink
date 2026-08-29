@@ -221,8 +221,10 @@ place the temporary one somewhere other than `/tmp`, which is often memory-backe
 restored buffer can outgrow.
 
 Reads refuse rather than lie once the primary has committed past the pinned snapshot. The
-archive keeps `previous-versions-max: 10`, so **ten further primary commits are enough — there
-is no time component**, and a busy primary can sweep a follower in seconds. The error says to
+archive keeps `previous-versions-max: 10` — ten previous versions beside the current one — so
+the **eleventh further archive commit** is enough, and **there is no time component**. Archive
+commits are `sync`, `rewrite_archive` and archive expiry; a local `maintain()` moves nothing in
+the bucket. A primary syncing steadily can sweep a follower in seconds. The error says to
 reassemble.
 
 ```python
@@ -230,11 +232,14 @@ Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=Tru
 ```
 
 `coverage()` reports; it does not adjudicate. A follower cannot ask the primary anything, so the
-failure it avoids is silence. **A gap is not necessarily loss**: a range in neither tier is
-either rows the buffer discarded at seal with replication off, or a reserve that was never
-issued — `Log.restore` burns 2**20 of them and `start_offset` creates one deliberately — and
-nothing local tells the two apart. A caller who knows whether their log has failed over can
-read a gap that this cannot.
+failure it avoids is silence. The gap it reports sits strictly *between* the tiers — above the
+archive's frontier, below the buffer's first offset. **A gap there is not necessarily loss**:
+it is either rows the buffer discarded at seal with replication off, or a `Log.restore` fence,
+which burns 2**20 offsets in exactly that position — and nothing local tells the two apart. A
+caller who knows whether their log has failed over can read a gap that this cannot.
+
+A `start_offset` reserve never appears here: it lies below the archive's low end, which this
+does not compare against.
 
 ## Sealing
 

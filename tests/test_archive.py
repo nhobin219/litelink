@@ -3598,6 +3598,86 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
 
 
 @pytest.mark.slow
+def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The two tiers are captured at different times, and this is the seam.
+
+    litestream ships `buffer.db` at one moment; `_assemble_follower` adopts the
+    archive at another, later one. When the primary sealed and synced rows the
+    sidecar had not yet shipped, the archive frontier lands ABOVE the replica's
+    sequence and `release_archived` empties the buffer outright — so the
+    replica's `sqlite_sequence` describes a tier contributing nothing, while
+    the archive leg serves hundreds of rows past it.
+
+    `Log.restore` corrects the same arithmetic on the same two tiers and
+    records the cost of finding it: *"16,100 offsets reported skipped that were
+    present and readable"*. `follow` reuses that assembly, so it inherits the
+    skew.
+
+    The harm is not loss — the error is always low. It is a documented method
+    contradicting `scan()` on the same object: an operator reads a healthy
+    follower as far behind, and a caller using it as a resume cursor
+    re-delivers everything between the two numbers.
+
+    Falsify by returning `self._log.end_offset()` alone: the assertion below
+    fails with an end offset at or under the highest row the follower serves.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-ahead"
+    config = replace(
+        LogConfig(),
+        target_seal_size=16 * 1024,
+        target_compact_size=16 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with Log.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(2000))
+        replication = log.write_replication_config()
+
+    # Snapshot the buffer here — nothing sealed, sequence at 2000.
+    _replicate(binary, replication, s3)
+
+    # Then the primary races ahead of that snapshot: it seals, syncs, appends
+    # and syncs again, with no sidecar running. This is the ordinary shape of
+    # a sidecar restart or a crash, which `_replication.py` calls supported.
+    with Log.open(primary, "s", s3=s3) as log:
+        while log.seal() is not None:
+            pass
+
+        log.maintain()
+        log.sync()
+        log.extend(rows(400))
+        while log.seal() is not None:
+            pass
+
+        log.maintain()
+        log.sync()
+
+    with Log.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        served = follower.scan().read_all().column(OFFSET).to_pylist()
+        assert served, "the fixture must serve rows for this to mean anything"
+
+        # The archive really is ahead of the replica, or the skew is untested.
+        assert follower.coverage().buffered is None, (
+            "the fixture must drive the archive past the replica's sequence"
+        )
+
+        assert follower.end_offset() > max(served), (
+            f"end_offset {follower.end_offset()} does not cover offset "
+            f"{max(served)}, which this same follower serves"
+        )
+        assert follower.end_offset() == max(served) + 1
+
+
+@pytest.mark.slow
 def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
