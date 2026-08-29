@@ -3351,6 +3351,61 @@ def test_an_evicted_log_still_serves_every_row(
 
 
 @pytest.mark.slow
+def test_an_evicted_log_serves_everything_across_a_re_point(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Detach and re-attach must not make an evicted log read short.
+
+    `_repoint` zeroes `archive_through` when the location moves, deliberately:
+    a maintainer re-asserting a stale location must not claim the new bucket
+    already holds rows. A detach-and-reattach is two moves, so a log returning
+    to the archive it just left carries watermark 0 while the bucket still
+    holds every row — and `set_archive`'s own docstring promises "Pointing BACK
+    undoes that".
+
+    **So the watermark cannot stand in for "the archive holds rows".** Deriving
+    it that way sent an evicted-dry log back to serving its buffer alone:
+    measured, 550 of 4,000 rows with no error, `litelink.reader()` agreeing,
+    and `coverage()` reporting `gap=None` over the missing 3,450. The window
+    closes only at the next `sync()`, which is why the existing detach test
+    passes — it reads after one.
+
+    The archive is asked directly now.
+
+    Falsify by keying `_archive_required` on `archived_through() > 0`: this
+    fails while every other reader test still passes.
+    """
+    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+        where = log.archive
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.sync()
+        log.maintain()
+
+        assert log.table_extent() is None, "the fixture must evict the tier dry"
+        assert log.scan().read_all().num_rows == ROWS
+
+        # The floor comes off first, which detaching requires: an evict-on-upload
+        # policy presupposes an archive to upload to.
+        log.set_config(replace(log.config, local_retention=None, local_rows=None))
+        log.set_archive(None)
+        log.set_archive(where)
+        assert log.archived_through() == 0, (
+            "the fixture must reproduce the zeroed watermark a re-point leaves"
+        )
+
+        served = log.scan().read_all().column(OFFSET).to_pylist()
+        assert sorted(served) == list(range(1, ROWS + 1)), (
+            f"served {len(served)} of {ROWS} after a re-point, before any sync"
+        )
+
+        # And a separate reader process agrees, since it derives the same way.
+        with litelink.reader(tmp_path, "s", s3=s3) as view:
+            assert view.scan().read_all().num_rows == ROWS
+            assert view.coverage().gap is None
+
+
+@pytest.mark.slow
 def test_coverage_counts_the_local_tier_between_archive_and_buffer(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:

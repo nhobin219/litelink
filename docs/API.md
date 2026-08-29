@@ -64,7 +64,7 @@ This is the distinction worth internalising, because everything else follows fro
 # already records where its archive is, and reads come off local disk.
 with litelink.reader("data", "trades") as r:
     r.scan(where="side = 0")          # local: buffer + local Iceberg table
-    r.end_offset()                    # cheap; sqlite_sequence is authoritative here
+    r.end_offset()                    # local while the table has files (see below)
 
 # On any other box: no root, an archive URI, and a WAL sidecar on the writer.
 with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as r:
@@ -403,7 +403,14 @@ log.archived_through() -> int                # highest offset the archive holds,
 log.archive_files() -> int
 ```
 
-All cheap, and none of them opens a data file. `archived_through()` against `end_offset()` is
+All local and none of them opens a data file, with one exception: on a log whose local table
+holds **nothing** while its archive holds rows — a fully evicted log, or a followed one —
+`end_offset()` and `coverage()` read the archive's metadata, because the buffer's sequence is
+not authoritative there. `sqlite_sequence` never lowers, so it keeps counting rows a seal
+discarded, and taking it at face value made a followed log claim 1,501 while serving 864.
+Everything else stays local, and so does `end_offset()` on any log with local files.
+
+`archived_through()` against `end_offset()` is
 the sync lag, which is the number to alarm on: eviction may never precede registration (I4),
 so a stalled sync stalls eviction, and the local file count grows until seals feel it.
 

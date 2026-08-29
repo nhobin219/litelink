@@ -3476,46 +3476,45 @@ class LogReader:
     def _archive_required(self) -> bool:
         """Whether the archive is the only source of this log's archived rows.
 
-        Three conditions, all answerable from local disk and none of them a
-        flag: an archive is configured, it is known to HOLD something, and the
-        local table holds nothing. `configured()` opens nothing,
-        `archived_through` is a keyed `meta` read, and the extent comes from
-        manifest statistics — so deciding whether a read needs the network
-        costs no network.
+        True when the local table holds nothing and the archive holds
+        something. Both halves are asked directly, and the ORDER is what keeps
+        a hot read local: the table is checked first, from manifest statistics
+        already on disk, so a log with local files answers False without
+        touching the network. I5 protects a read that HAS local disk to serve;
+        one with none faces a metadata GET or silently wrong results.
 
-        **The watermark is what stops this over-firing.** Without it, a log
-        created with an archive but never synced looks identical to a followed
-        one: empty table, archive configured. It would demand an archive that
-        has published nothing, and a first read would refuse instead of simply
-        serving the buffer. `archived_through` is 0 until a sync lands.
+        **Do not reintroduce a local proxy for "the archive holds rows". This
+        has now been wrong three times, each time in the silent direction.**
 
-        **Two earlier versions got this wrong in both directions, and the
-        shape of the second mistake is worth keeping.** The first derived from
-        the empty table alone and broke fresh logs. The second added the
-        watermark and was right — but it failed five eviction tests, and I read
-        those as encoding a behaviour I must preserve, replaced the whole thing
-        with a durable marker `follow` wrote, and recorded the eviction case as
-        future work. The tests were failing because this FIXES a local defect:
-        a fully evicted log holds its rows only in the archive, and a default
-        read that skipped it returned 476 of 1,500 rows with no error. The
-        marker made a real bug look like a design boundary.
+        - Keying on the empty table alone demanded an archive from a log
+          created with one and never synced, refusing a first read that should
+          simply have served the buffer.
+        - Adding `archived_through() > 0` fixed that and broke re-pointing:
+          `_repoint` deliberately zeroes that watermark when the location
+          moves, and a detach-and-reattach is two moves, so a log returning to
+          the archive it just left reads 0 while the bucket still holds
+          everything. Measured on an evicted log: `scan()` returned 550 of
+          4,000 rows with no error, and `coverage()` called it gap-free.
+        - Replacing it with a durable marker `follow` wrote made the local
+          eviction case unreachable, which hid a real defect behind what looked
+          like a design boundary.
 
-        I5 still holds where it means anything. "A hot read is local disk only"
-        protects a read that HAS local disk to serve; a log whose table is
-        empty has none, and the choice there is a metadata GET or silently
-        wrong results.
-
-        The table is reloaded first because this decides whether a read
-        consults the archive at all, and the dangerous direction is a stale
-        "the table has files" on one that has just been emptied — that would
-        drop the archive leg and serve short with no error.
+        The archive is the authority on what the archive holds. `table()` uses
+        the cached handle rather than forcing a reload, so the cost is one
+        metadata resolve the first time a reader with an empty table asks — and
+        `_archive_extent` still forces its own re-read where staleness is the
+        thing being detected.
         """
-        if not self._archive.configured() or self.archived_through() == 0:
+        self._table.reload()
+        if self._table.extent() is not None:
             return False
 
-        self._table.reload()
+        if not self._archive.configured():
+            return False
 
-        return self._table.extent() is None
+        adopted = self._archive.table(repair=False)
+
+        return adopted is not None and adopted.extent() is not None
 
     def _archive_extent(self) -> tuple[int, int] | None:
         """The archive's extent, forcing a real re-read, or None if unreachable.
