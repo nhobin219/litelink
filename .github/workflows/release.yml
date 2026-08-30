@@ -162,15 +162,31 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Full history and tags: the notes are generated from the commits since
+      # the previous tag, and the default shallow checkout has neither.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
-      # Notes generated from the commits since the last tag. The history is
-      # written to be read — Conventional Commits with a body explaining the
-      # why — so generated notes are worth more here than a hand-written
-      # summary that says less.
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+      # Notes from the commit BODIES, not from pull request titles.
+      # `--generate-notes` lists PR titles and throws the bodies away, which in
+      # this history is the part worth reading: every commit carries the reason
+      # for the change. `scripts/release_notes.py` takes each body's lead
+      # paragraph and groups by Conventional Commit type.
+      #
+      # `--notes-file`, so a failure to generate them fails the step rather
+      # than publishing a release with an empty body.
+      - name: Generate the notes
+        run: |
+          previous=$(git tag --sort=-creatordate | grep -v "^$GITHUB_REF_NAME$" | head -1)
+          python scripts/release_notes.py \
+            ${previous:+--since "$previous"} \
+            --version "${GITHUB_REF_NAME#v}" > notes.md
+          cat notes.md
+
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --notes-file notes.md --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}

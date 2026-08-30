@@ -33,6 +33,12 @@ bootstrap:
     # LOAD does not autoinstall — so leaving it out buys nothing and costs a
     # cryptic DuckDB error on the first archive read.
     @just duckdb-extensions --remote
+    # And litestream, or eleven tests skip: every follower, restore and
+    # replication test guards on it. CI fetches it, so leaving it out here
+    # means a contributor's green run and CI's green run check different
+    # things — which is how the archive tier went unexamined for the life of
+    # that workflow.
+    @just litestream
 
 # Of what the SPEC §7 read path touches, only `parquet` is compiled into the
 # duckdb wheel; `iceberg` and `avro` are fetched from extensions.duckdb.org on
@@ -462,3 +468,8 @@ litestream-checksums:
         print(f'    "{key}": "{published[f"litestream-{VERSION}-{suffix}.tar.gz"]}",')
     print("}")
     PY
+
+# Release notes from the commit bodies since the last tag. What the release
+# workflow publishes — run it first to see what a tag would say.
+notes version="":
+    @uv run python scripts/release_notes.py {{ if version != "" { "--version " + version } else { "" } }}
