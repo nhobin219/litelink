@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -11,8 +12,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import litelink
 from litelink._buffer import Buffer
-from litelink.log import OFFSET, Log, LogConfig
+from litelink.log import OFFSET, LogConfig, WriteHandle
 
 SCHEMA = pa.schema(
     [
@@ -23,24 +25,26 @@ SCHEMA = pa.schema(
 )
 
 
-def open_log(root: Path, config: LogConfig | None = None) -> Log:
+def open_log(root: Path, config: LogConfig | None = None) -> WriteHandle:
     """Create the log, or reopen it — the shape is only stated once."""
     if (root / "catalog.db").exists():
-        log = Log.open(root, "s")
+        log = litelink.open(root, "s")
         if config is not None:
             log.set_config(config)
 
         return log
 
-    return Log.new(root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), config=config)
+    return litelink.new(
+        root, "s", schema=SCHEMA, sort_by=("event_ts", "key"), config=config
+    )
 
 
 def _today() -> date:
     return datetime.now(UTC).date()
 
 
-def open_log_readonly(root: Path) -> Log:
-    return Log.open(root, "s", read_only=True)
+def open_log_readonly(root: Path) -> litelink.LogHandle:
+    return litelink.open(root, "s", read_only=True)
 
 
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
@@ -50,7 +54,7 @@ def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
     ]
 
 
-def read_all(log: Log) -> list[tuple[object, ...]]:
+def read_all(log: WriteHandle | litelink.LogHandle) -> list[tuple[object, ...]]:
     return [tuple(r.values()) for r in log.scan().read_all().to_pylist()]
 
 
@@ -71,7 +75,7 @@ def test_caller_supplied_offset_is_rejected(tmp_path: Path) -> None:
 def test_offset_in_schema_is_rejected(tmp_path: Path) -> None:
     """I11 again, one layer earlier."""
     with pytest.raises(ValueError, match="I11"):
-        Log.new(
+        litelink.new(
             tmp_path,
             "s",
             schema=pa.schema([pa.field("litelink_offset", pa.int64())]),
@@ -324,25 +328,50 @@ def test_readonly_sees_a_writer_s_committed_rows(tmp_path: Path) -> None:
             assert len(read_all(reader)) == 5, "still exactly once across the seal"
 
 
-def test_readonly_refuses_every_mutation(tmp_path: Path) -> None:
+def test_a_reader_has_no_mutation_to_refuse(tmp_path: Path) -> None:
+    """Absent, not raising — which is the whole point of dropping the flag.
+
+    `litelink.open(read_only=True)` returned a `WriteHandle` whose thirteen write methods
+    existed and raised "this WriteHandle was opened readonly". The interface described
+    the writer rather than the thing. `reader()` returns a `LogHandle`, which
+    has no write surface at all, so there is nothing to gate and no
+    `_writable()` call anyone can forget to add.
+
+    Falsify by giving `LogHandle` any one of these as a delegation.
+    """
     with open_log(tmp_path) as writer:
         writer.extend(rows(2))
 
     with open_log_readonly(tmp_path) as reader:
-        for mutate in (
-            lambda: reader.append(rows(1)[0]),
-            lambda: reader.extend(rows(1)),
-            reader.seal,
-            reader.maintain,
+        for absent in (
+            "append",
+            "extend",
+            "seal",
+            "await_seal",
+            "maintain",
+            "compact",
+            "evict",
+            "expire",
+            "sync",
+            "hydrate",
+            "rewrite_archive",
+            "set_config",
+            "set_sort_by",
+            "set_archive",
+            "add_column",
+            "recover",
         ):
-            with pytest.raises(RuntimeError, match="readonly"):
-                mutate()
+            assert not hasattr(reader, absent), f"a reader exposes {absent}"
+
+        # And it still answers everything a reader should.
+        assert reader.end_offset() == 3
+        assert len(read_all(reader)) == 2
 
 
 def test_readonly_will_not_create_a_log(tmp_path: Path) -> None:
     """Opening a log that does not exist must fail rather than quietly make one."""
     with pytest.raises(FileNotFoundError, match="no litelink log at"):
-        Log.open(tmp_path / "nothing-here", "s", read_only=True)
+        litelink.open(tmp_path / "nothing-here", "s", read_only=True)
 
 
 def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
@@ -439,7 +468,7 @@ def test_set_config_reaches_the_thing_that_makes_the_cut(tmp_path: Path) -> None
     """§12 says policy can change under a running log. All of it, not most.
 
     `target_seal_size` decides where the appender cuts, and the appender is the
-    buffer — so a config update that stopped at `Log` left the log sizing
+    buffer — so a config update that stopped at `WriteHandle` left the log sizing
     files to whatever it was opened with, silently and for its whole life.
     """
     with open_log(tmp_path, LogConfig(target_seal_size=1 << 30)) as log:
@@ -462,7 +491,7 @@ def test_a_log_needs_no_sort_by(tmp_path: Path) -> None:
     `sort_by` unset means no sort runs at seal time at all. It is the cheapest
     option as well as the safest one.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
         log.extend(rows(50))
         log.seal()
 
@@ -480,10 +509,10 @@ def test_a_log_needs_no_sort_by(tmp_path: Path) -> None:
 def test_an_unsorted_log_reopens_unsorted(tmp_path: Path) -> None:
     """`open` recovers the shape from the table, and "no sort order" is a
     shape — not a missing value to be guessed at."""
-    with Log.new(tmp_path, "s", schema=SCHEMA) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
         log.extend(rows(4))
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened.sort_by == ()
 
 
@@ -498,7 +527,7 @@ def test_a_sort_key_correlated_with_the_offset_keeps_files_prunable(
     scattered one gives every file nearly the whole domain, and there is
     nothing left to prune with.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         for batch in range(4):
             log.extend(rows(20, start=batch * 20))
             log.seal()
@@ -703,7 +732,7 @@ def test_append_refuses_a_value_that_would_wedge_every_scan(
     Falsify by removing the type gate from `_insert`: the append succeeds and
     the assert on the surviving rows fails with `ArrowInvalid`.
     """
-    log = Log.new(tmp_path, "s", schema=TYPED)
+    log = litelink.new(tmp_path, "s", schema=TYPED)
     with log:
         log.extend([{"event_ts": i, "key": "k"} for i in range(50)])
 
@@ -733,7 +762,7 @@ def test_append_refuses_a_value_that_would_be_silently_rewritten(
     and a string column is declared `ANY` so a `typeof` CHECK can see that
     `12345` is an integer before SQLite would have stringified it.
     """
-    log = Log.new(tmp_path, "s", schema=TYPED)
+    log = litelink.new(tmp_path, "s", schema=TYPED)
     with log:
         for row in (
             {"event_ts": 1.5, "key": "k"},
@@ -773,7 +802,7 @@ def test_append_refuses_a_string_that_sqlite_would_convert(
     Falsify by declaring the columns with their affinities instead of ANY:
     every row below is accepted and silently rewritten.
     """
-    log = Log.new(tmp_path, "s", schema=TYPED)
+    log = litelink.new(tmp_path, "s", schema=TYPED)
     with log:
         for row in (
             {"event_ts": "77"},
@@ -802,7 +831,7 @@ def test_a_column_added_later_is_validated_like_any_other(
     Falsify by building the ALTER from the affinity alone: all three rows
     below are accepted, and the seal at the end raises `ArrowInvalid`.
     """
-    log = Log.new(tmp_path, "s", schema=TYPED)
+    log = litelink.new(tmp_path, "s", schema=TYPED)
     with log:
         log.extend([{"event_ts": i} for i in range(5)])
         log.add_column("late", pa.int32())
@@ -840,7 +869,7 @@ def test_append_refuses_an_integer_a_float_column_cannot_hold(
     Falsify by allowing `typeof IN ('integer','real')` without the bound: all
     four rows are accepted and the scan at the end raises `ArrowInvalid`.
     """
-    log = Log.new(tmp_path, "s", schema=RANGED_FLOAT)
+    log = litelink.new(tmp_path, "s", schema=RANGED_FLOAT)
     with log:
         log.extend([{"k": i, "f64": 1.5} for i in range(5)])
 
@@ -860,7 +889,7 @@ def test_a_float_column_still_takes_an_integer_it_can_hold(
     tmp_path: Path,
 ) -> None:
     """`{"price": 5}` is too natural to refuse, and the exact bounds are legal."""
-    log = Log.new(tmp_path, "s", schema=RANGED_FLOAT)
+    log = litelink.new(tmp_path, "s", schema=RANGED_FLOAT)
     with log:
         log.append({"k": 1, "f64": 5})
         log.append({"k": 2, "f64": 2**53})
@@ -877,7 +906,7 @@ def test_the_type_refusal_names_the_column_the_value_and_the_declared_type(
     tmp_path: Path,
 ) -> None:
     """ "Wrong type" alone does not say which of six columns, or what it wanted."""
-    log = Log.new(tmp_path, "s", schema=TYPED)
+    log = litelink.new(tmp_path, "s", schema=TYPED)
     with (
         log,
         pytest.raises(ValueError, match=r"event_ts=1\.5 \(float, declared int64\)"),
@@ -900,7 +929,7 @@ def test_append_accepts_values_the_exact_check_alone_would_refuse(
     class Region(enum.StrEnum):
         EU = "eu-west-1"
 
-    log = Log.new(tmp_path, "s", schema=TYPED)
+    log = litelink.new(tmp_path, "s", schema=TYPED)
     with log:
         log.append({"event_ts": 1, "key": Region.EU, "price": 5})
 
@@ -935,7 +964,7 @@ def test_append_refuses_a_value_the_column_cannot_hold(tmp_path: Path) -> None:
     scan raise `Integer value ... not in range`, while the float32 reads back
     as `inf` with no error raised anywhere.
     """
-    log = Log.new(tmp_path, "s", schema=RANGED)
+    log = litelink.new(tmp_path, "s", schema=RANGED)
     with log:
         log.extend([{"event_ts": i} for i in range(20)])
 
@@ -960,7 +989,7 @@ def test_append_accepts_the_exact_bounds_and_an_explicit_infinity(
     become infinite. Falsify by dropping the `_INFINITE` clause: the explicit
     infinities below are then refused.
     """
-    log = Log.new(tmp_path, "s", schema=RANGED)
+    log = litelink.new(tmp_path, "s", schema=RANGED)
     with log:
         log.append({"event_ts": 1, "n32": 2**31 - 1})
         log.append({"event_ts": 2, "n32": -(2**31)})
@@ -1024,7 +1053,7 @@ def test_start_offset_reserves_the_range_below_it(tmp_path: Path) -> None:
     The reserve exists so a cutover can point live capture at litelink today
     and backfill the history later, into offsets live capture will never take.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, start_offset=1000)
+    log = litelink.new(tmp_path, "s", schema=SCHEMA, start_offset=1000)
     with log:
         assert log.append({"event_ts": 1, "key": "a", "payload": "p"}) == 1000
         assert log.extend(rows(3)) == [1001, 1002, 1003]
@@ -1037,22 +1066,22 @@ def test_start_offset_reserves_the_range_below_it(tmp_path: Path) -> None:
 def test_start_offset_is_recorded_durably(tmp_path: Path) -> None:
     """And only when there IS a reserve.
 
-    A backfill has to tell this reserve from a `Log.restore` fence, and nothing
-    else can: both are empty ranges below the log's offsets, and `Log` says
+    A backfill has to tell this reserve from a `WriteHandle.restore` fence, and nothing
+    else can: both are empty ranges below the log's offsets, and `WriteHandle` says
     "the skipped range leaves no trace once the sequence has moved". Absent
     must therefore mean "no reserve" rather than "a reserve of nothing" — a log
     created at 1 and later restored has a gap below its offsets too, and that
     gap is a fence that must never be filled.
     """
-    log = Log.new(tmp_path / "seeded", "s", schema=SCHEMA, start_offset=1000)
+    log = litelink.new(tmp_path / "seeded", "s", schema=SCHEMA, start_offset=1000)
     with log:
         assert log._buffer.get_meta("start_offset") == "1000"
 
-    with Log.open(tmp_path / "seeded", "s") as reopened:
+    with litelink.open(tmp_path / "seeded", "s") as reopened:
         assert reopened._buffer.get_meta("start_offset") == "1000"
         assert reopened.end_offset() == 1000
 
-    plain = Log.new(tmp_path / "plain", "s", schema=SCHEMA)
+    plain = litelink.new(tmp_path / "plain", "s", schema=SCHEMA)
     with plain:
         assert plain._buffer.get_meta("start_offset") is None
         assert plain.append({"event_ts": 1}) == 1
@@ -1062,9 +1091,9 @@ def test_start_offset_below_one_is_refused(tmp_path: Path) -> None:
     """`1` is the current behaviour, not an error; below it is meaningless."""
     for bad in (0, -1):
         with pytest.raises(ValueError, match="at least 1"):
-            Log.new(tmp_path / str(bad), "s", schema=SCHEMA, start_offset=bad)
+            litelink.new(tmp_path / str(bad), "s", schema=SCHEMA, start_offset=bad)
 
-    with Log.new(tmp_path / "one", "s", schema=SCHEMA, start_offset=1) as log:
+    with litelink.new(tmp_path / "one", "s", schema=SCHEMA, start_offset=1) as log:
         assert log.append({"event_ts": 1}) == 1
 
 
@@ -1084,7 +1113,7 @@ def test_the_tail_cache_serves_a_seeded_log_before_its_first_seal(
     the buffer's floor instead of only raising it (about half), and one that
     drops the lower bound entirely. So this asserts the mechanism.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, start_offset=1_000_000)
+    log = litelink.new(tmp_path, "s", schema=SCHEMA, start_offset=1_000_000)
     with log:
         log.extend(rows(500))
 
@@ -1149,3 +1178,67 @@ def test_the_tail_cache_refuses_a_boundary_below_what_it_holds(
 
         assert buffer.rows_above(30).num_rows == 10
         assert buffer.rows_above(0).num_rows == 40
+
+
+def test_the_identity_surface_is_properties_not_methods(tmp_path: Path) -> None:
+    """`schema` lost its `@property` in a refactor and nothing noticed.
+
+    That is the failure mode of a mechanical rewrite, and it is silent: the
+    attribute still resolves, so there is no `AttributeError` at the call site.
+    A caller gets a bound method, `if handle.schema:` stays true, and the break
+    surfaces somewhere else entirely — `pa.Table.from_pylist(rows,
+    schema=handle.schema)` raising `TypeError: Schema must be an instance of
+    pyarrow.Schema`.
+
+    `docs/API.md` distinguishes the two by convention: methods are written with
+    parens, properties without. This asserts the code matches.
+
+    Falsify by removing any of these decorators: the value becomes a bound
+    method and the isinstance check fails.
+    """
+    for name in ("root", "name", "config", "sort_by", "schema", "archive"):
+        for cls in (litelink.LogHandle, WriteHandle):
+            attr = inspect.getattr_static(cls, name)
+            assert isinstance(attr, property), (
+                f"{cls.__name__}.{name} is not a property"
+            )
+
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        assert isinstance(log.schema, pa.Schema)
+        assert isinstance(log.sort_by, tuple)
+        assert isinstance(log.root, Path)
+
+        # The use that failed: it must be usable AS a schema.
+        pa.Table.from_pylist([{"event_ts": 1, "key": "k", "payload": "p"}], log.schema)
+
+
+def test_a_writer_reports_where_its_next_append_lands(tmp_path: Path) -> None:
+    """A writer's `end_offset` is the sequence, never the tiers it can serve.
+
+    `LogHandle.end_offset` answers "past the last row I can SERVE", which is
+    what a follower needs. A writer is asked where its next row will land, and
+    only `sqlite_sequence` knows — it is what assigns it. The two coincide on a
+    healthy log and diverge where the local table is empty while the archive
+    holds rows.
+
+    `restore` is that state by construction: the fence reserves
+    `RESTORE_RESERVE` offsets, so the sequence sits far above the archive's
+    frontier while the rebuilt local table is empty. Inheriting the reader's
+    answer reported 801 where the next append took 1,049,377 — a caller
+    reading it as "what comes next" would collide with the fence I9 exists to
+    hold.
+
+    Falsify by deleting `WriteHandle.end_offset`: the writer inherits the
+    reader's version and this fails by exactly `RESTORE_RESERVE`.
+    """
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        log.extend(rows(5))
+
+        assert log.end_offset() == 6
+        assert log.append({"event_ts": 9, "key": "k", "payload": "p"}) == 6
+        assert log.end_offset() == 7, "it must move with the sequence, not with a tier"
+
+        # And it is a local read: no archive is configured, so nothing here
+        # can reach for one.
+        assert log.archive is None
+        assert log.end_offset() == 7

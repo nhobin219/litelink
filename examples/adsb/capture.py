@@ -34,7 +34,8 @@ from typing import TYPE_CHECKING
 
 from _stream import NAME, SCHEMA, SORT_BY, observations
 
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig
 from litelink._s3 import S3Options
 
 if TYPE_CHECKING:
@@ -118,7 +119,7 @@ def main() -> None:
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
         # None without an archive, because with nowhere to push to a retention
-        # is a policy for deleting the only copy — which `Log.new` refuses to
+        # is a policy for deleting the only copy — which `WriteHandle.new` refuses to
         # be told by accident.
         local_retention=(
             timedelta(seconds=args.local_retention) if args.archive else None
@@ -138,7 +139,7 @@ def main() -> None:
     # prints the exports for a local endpoint.
     s3 = S3Options()
     try:
-        log = Log.open(args.root, NAME, s3=s3)
+        log = litelink.open(args.root, NAME, s3=s3)
         # The ARCHIVE first, then the policy. `validate` refuses a pair, and
         # each call is checked against the durable other half — so setting the
         # policy first refuses `--local-retention 0` and `--replicate` on a log
@@ -158,7 +159,7 @@ def main() -> None:
 
         _settle(lambda: log.set_config(config), "applying the config")
     except FileNotFoundError:
-        log = Log.new(
+        log = litelink.new(
             args.root,
             NAME,
             schema=SCHEMA,

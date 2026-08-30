@@ -70,7 +70,8 @@ from typing import TYPE_CHECKING
 from _stream import NAME
 from pyiceberg.exceptions import CommitFailedException
 
-from litelink import Log
+import litelink
+from litelink import WriteHandle
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -78,7 +79,7 @@ if TYPE_CHECKING:
 from litelink._s3 import S3Options
 
 
-def seal_pass(log: Log) -> str | None:
+def seal_pass(log: WriteHandle) -> str | None:
     """Drain the seal queue. Reports only when it did something.
 
     Silence is the healthy state: the queue is usually empty, and a line every
@@ -96,7 +97,7 @@ def seal_pass(log: Log) -> str | None:
     )
 
 
-def compact_pass(log: Log) -> str | None:
+def compact_pass(log: WriteHandle) -> str | None:
     """Convert sealed files into `target_compact_size` ones."""
     before = log.table_files()
     log.compact()
@@ -107,7 +108,7 @@ def compact_pass(log: Log) -> str | None:
     return f"converted {before} files -> {after}  local {log.table_rows():,} rows"
 
 
-def reclaim_pass(log: Log, root: Path) -> str | None:
+def reclaim_pass(log: WriteHandle, root: Path) -> str | None:
     """Settle, evict past `local_retention`, expire, delete what came due.
 
     Settling first because eviction never goes above the watermark (§4a), and
@@ -127,7 +128,7 @@ def reclaim_pass(log: Log, root: Path) -> str | None:
     )
 
 
-def sync_pass(log: Log) -> str | None:
+def sync_pass(log: WriteHandle) -> str | None:
     """Push what compaction has finished with, and record the watermark."""
     before = log.archived_through()
     log.sync()
@@ -138,7 +139,7 @@ def sync_pass(log: Log) -> str | None:
     return f"archived through {after:,}  archive files {log.archive_files():,}"
 
 
-def all_passes(log: Log, root: Path) -> str | None:
+def all_passes(log: WriteHandle, root: Path) -> str | None:
     """`maintain()` plus a push: every local pass, in the order
     it encodes — eviction queues deletions that expiry then drains, so running
     them the other way round only makes files wait a cycle."""
@@ -187,7 +188,7 @@ def main() -> None:
         # Credentials from the environment, never from the log — see
         # `capture.py`. Harmless when there is no archive: nothing resolves
         # them unless a push actually happens.
-        log = Log.open(args.root, NAME, s3=S3Options())
+        log = litelink.open(args.root, NAME, s3=S3Options())
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 
@@ -327,7 +328,7 @@ def _litestream() -> str:
     `just litestream` puts a pinned release in `.bin/`, and a checkout should
     replicate with the version it pinned rather than whatever the machine
     happens to carry. That is not fastidiousness: litestream v0.5.0 changed the
-    config format, and `Log.replication_config` writes one shape.
+    config format, and `WriteHandle.replication_config` writes one shape.
 
     Resolved against the REPO, not the cwd. This is an example run through
     `just` from the repo root today, but a `cd` into `examples/` would
@@ -367,7 +368,7 @@ class Sidecar:
     which is the strongest argument for running the sidecar independently.
     """
 
-    def __init__(self, log: Log) -> None:
+    def __init__(self, log: WriteHandle) -> None:
         self.config = log.write_replication_config()
         self._process: subprocess.Popen[bytes] | None = None
         # An OS lock on a file beside the log, held for this process's whole
@@ -448,7 +449,7 @@ class Sidecar:
             self._process.kill()
 
 
-def _maintain(log: Log, root: Path) -> None:
+def _maintain(log: WriteHandle, root: Path) -> None:
     """One pass, phase by phase.
 
     `log.maintain()` does all of this in one call and is what most deployments
@@ -499,7 +500,7 @@ def _maintain(log: Log, root: Path) -> None:
     )
 
 
-def _reclaim(log: Log) -> Callable[[], None]:
+def _reclaim(log: WriteHandle) -> Callable[[], None]:
     """Eviction and expiry as one phase: both are metadata commits that finish
     in milliseconds, and splitting them further would report noise."""
 

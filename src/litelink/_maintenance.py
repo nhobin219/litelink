@@ -1,7 +1,7 @@
 """Local storage reclamation: compact, evict, expire, drain (SPEC §6, §8, §12).
 
 Separate from the write path because it shares nothing with it but the tables it
-reads, and separate from `Log` because it is the half of the library with no
+reads, and separate from `WriteHandle` because it is the half of the library with no
 opinion about appends.
 
 The four run in order and none is useful alone. Compaction alone INCREASES
@@ -27,7 +27,7 @@ from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import fsync
 
 # Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
-# `Log`'s private business, because eviction decides deletions from it.
+# `WriteHandle`'s private business, because eviction decides deletions from it.
 CONFIG_KEY = "config"
 
 if TYPE_CHECKING:

@@ -16,7 +16,7 @@ are silently wrong when written by hand.
 `archive.db` is in the set, though the archive can now name its own metadata
 (`version-hint.text`) and a FAILOVER deliberately does not restore it — a
 stale copy wins over the bucket's own pointer. It is replicated for the
-same-machine case, where it saves a round trip. See `Log.restore`.
+same-machine case, where it saves a round trip. See `litelink.restore`.
 
 **One sidecar per ROOT, not per log.** `catalog.db` and `archive.db` live at the
 root and are shared by every log under it, so two logs each running their own

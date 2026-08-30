@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pytest
 
-from litelink import Log
+import litelink
 from litelink._types import column_type, validate_schema
 
 if TYPE_CHECKING:
@@ -59,7 +59,7 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
     root = tmp_path / str(type_).replace("[", "_").replace("]", "")
     sample = SAMPLE[str(type_)]
 
-    with Log.new(root, "s", schema=schema, sort_by=("event_ts",)) as log:
+    with litelink.new(root, "s", schema=schema, sort_by=("event_ts",)) as log:
         log.extend([{"event_ts": 1, "c": sample}, {"event_ts": 2, "c": None}])
         assert log.scan().read_all()["c"].to_pylist() == [sample, None], "from buffer"
 
@@ -95,7 +95,7 @@ def test_a_log_refuses_an_uncarryable_column_at_creation(tmp_path: Path) -> None
     )
 
     with pytest.raises(TypeError, match="'counter'.*unsigned"):
-        Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",))
+        litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",))
 
     assert not (tmp_path / "s" / "buffer.db").exists(), "nothing left behind"
 
@@ -124,7 +124,7 @@ def test_declared_types_come_back_as_declared(tmp_path: Path) -> None:
         ]
     )
 
-    with Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
         log.append({"event_ts": 1, "key": "a", "payload": "p"})
 
         from_buffer = log.scan().read_all().schema
@@ -137,7 +137,7 @@ def test_declared_types_come_back_as_declared(tmp_path: Path) -> None:
         assert from_table.field("key").type == pa.large_string()
         assert from_table.field("payload").type == pa.string()
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         reopened_schema = reopened.scan().read_all().schema
         assert reopened_schema.field("key").type == pa.large_string()
         assert reopened_schema.field("payload").type == pa.string()
@@ -152,28 +152,28 @@ def test_a_log_with_no_stored_schema_refuses_to_open(tmp_path: Path) -> None:
     data does not have.
     """
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
-    Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
+    litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
 
-    log = Log.open(tmp_path, "s")
+    log = litelink.open(tmp_path, "s")
     log._buffer._con.execute("DELETE FROM meta WHERE k = 'arrow_schema'")
     log.close()
 
     with pytest.raises(ValueError, match="no stored Arrow schema"):
-        Log.open(tmp_path, "s")
+        litelink.open(tmp_path, "s")
 
 
 def test_a_schema_disagreeing_with_the_table_refuses_to_open(tmp_path: Path) -> None:
     """The two records disagreeing means something wrote outside litelink."""
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
-    Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
+    litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
 
     stale = pa.schema([pa.field("event_ts", pa.int64()), pa.field("gone", pa.string())])
-    log = Log.open(tmp_path, "s")
+    log = litelink.open(tmp_path, "s")
     log._buffer.set_meta("arrow_schema", stale.serialize().to_pybytes().hex())
     log.close()
 
     with pytest.raises(ValueError, match="disagrees with the Iceberg table"):
-        Log.open(tmp_path, "s")
+        litelink.open(tmp_path, "s")
 
 
 # The values a fixture reaches for by default are the ones that cannot fail.
@@ -211,7 +211,7 @@ def test_extreme_values_survive_the_round_trip(
     """
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("c", type_)])
 
-    with Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
         log.append({"event_ts": 1, "c": value})
 
         assert log.scan().read_all()["c"].to_pylist() == [value], "from the buffer"
@@ -234,7 +234,7 @@ def test_nan_is_refused_rather_than_silently_nulled(tmp_path: Path) -> None:
     """
     schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("c", pa.float64())])
 
-    with Log.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
         with pytest.raises(ValueError, match="NaN"):
             log.append({"event_ts": 1, "c": float("nan")})
 

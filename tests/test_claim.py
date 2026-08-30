@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pytest
 
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig, WriteHandle
 from litelink._claim import Claim, new_owner
 from litelink.log import EVERYTHING
 
@@ -28,11 +29,11 @@ if TYPE_CHECKING:
 SCHEMA = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string())])
 
 
-def open_log(root: Path, config: LogConfig | None = None) -> Log:
+def open_log(root: Path, config: LogConfig | None = None) -> WriteHandle:
     if (root / "catalog.db").exists():
-        return Log.open(root, "s")
+        return litelink.open(root, "s")
 
-    return Log.new(root, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
+    return litelink.new(root, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
 
 
 def rows(n: int, start: int = 0) -> list[dict[str, object]]:
@@ -94,7 +95,7 @@ def test_a_second_owner_is_refused(tmp_path: Path) -> None:
 def test_one_log_hands_out_a_distinct_owner_every_time(tmp_path: Path) -> None:
     """Which is what lets the lease be the only guard.
 
-    An owner fixed per Log would be re-entered by every thread sharing it, and
+    An owner fixed per WriteHandle would be re-entered by every thread sharing it, and
     the role would exclude nothing inside a process. Minting per attempt means
     the second caller is a stranger to the row, wherever it is running.
     """
@@ -142,7 +143,7 @@ def test_recovery_leaves_another_owners_seal_alone(tmp_path: Path) -> None:
     holder._buffer.claim_seal(1, 5, path)
 
     # Someone else holds the seal role and is still working. Taken on the
-    # holder's own connection so it outlives the Log opened below.
+    # holder's own connection so it outlives the WriteHandle opened below.
     other = Claim(
         holder._buffer._con, holder._buffer._lock, "seal", 0, EVERYTHING, new_owner()
     )
@@ -202,7 +203,7 @@ def test_maintain_does_nothing_while_another_owner_holds_the_range(
 
 def test_a_rejected_maintain_does_not_strand_the_lease(tmp_path: Path) -> None:
     """A refusal must not lock out the process that could have done the work."""
-    log = Log.new(
+    log = litelink.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), archive="s3://bucket/x"
     )
     # sync() refuses without credentials reaching a real endpoint; what matters
@@ -261,7 +262,7 @@ def test_a_separate_process_can_seal(tmp_path: Path) -> None:
     everything here is the other process's work.
     """
     config = LogConfig(target_seal_size=1 << 30)
-    with Log.new(
+    with litelink.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
     ) as log:
         log.extend(rows(500))
@@ -273,8 +274,8 @@ def test_a_separate_process_can_seal(tmp_path: Path) -> None:
             sys.executable,
             "-c",
             textwrap.dedent(f"""
-                from litelink import Log
-                with Log.open({str(tmp_path)!r}, "s") as log:
+                import litelink
+                with litelink.open({str(tmp_path)!r}, "s") as log:
                     end = log.seal()
                     print("SEALED", end, log.table_rows())
             """),
@@ -288,7 +289,7 @@ def test_a_separate_process_can_seal(tmp_path: Path) -> None:
     assert sealer.returncode == 0, sealer.stderr
     assert "SEALED 501 500" in sealer.stdout, f"{sealer.stdout}\n{sealer.stderr}"
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened.table_rows() == 500, "the other process's seal is not visible"
         assert reopened.buffered_rows() == 0, "buffer was not cleared"
         assert len(reopened.scan().read_all()) == 500

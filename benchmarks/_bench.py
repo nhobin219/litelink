@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, TypeVar
 
 import pyarrow as pa
 
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig, WriteHandle
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -85,7 +86,7 @@ def best_of_setup(
 ) -> float:
     """Like `best_of`, but with per-run setup excluded from the timing.
 
-    Necessary for anything comparing against a floor: creating a Log builds an
+    Necessary for anything comparing against a floor: creating a WriteHandle builds an
     Iceberg catalog and table, and charging that to write throughput made
     litelink look 100% slower than raw SQLite when the real gap is single
     digits.
@@ -100,9 +101,9 @@ def best_of_setup(
     return min(timings)
 
 
-def fresh_log(root: Path, config: LogConfig | None = None) -> Log:
+def fresh_log(root: Path, config: LogConfig | None = None) -> WriteHandle:
     shutil.rmtree(root, ignore_errors=True)
 
-    return Log.new(
+    return litelink.new(
         root, NAME, schema=SCHEMA, sort_by=SORT_BY, config=config or NEVER_SEAL
     )

@@ -12,8 +12,9 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+import litelink
 from litelink._s3 import S3Options
-from litelink.log import Log, LogConfig
+from litelink.log import LogConfig, WriteHandle
 
 SCHEMA = pa.schema(
     [
@@ -23,11 +24,11 @@ SCHEMA = pa.schema(
 )
 
 
-def open_log(root: Path) -> Log:
+def open_log(root: Path) -> WriteHandle:
     if (root / "catalog.db").exists():
-        return Log.open(root, "s")
+        return litelink.open(root, "s")
 
-    return Log.new(root, "s", schema=SCHEMA)
+    return litelink.new(root, "s", schema=SCHEMA)
 
 
 def rows(n: int, *, start: int = 0, **extra: object) -> list[dict[str, object]]:
@@ -80,7 +81,7 @@ def test_a_sealer_that_never_appends_does_not_lose_the_new_column(
         writer.extend(rows(10))
 
         # Opened BEFORE the change, and it never appends — only seals.
-        with Log.open(tmp_path, "s") as sealer:
+        with litelink.open(tmp_path, "s") as sealer:
             writer.add_column("region", pa.string())
             writer.extend(rows(5, start=10, region="eu-west-1"))
 
@@ -102,7 +103,7 @@ def test_a_reader_opened_before_the_change_serves_the_new_column(
     Its schema used to be injected at construction, so a long-lived reader
     opened before a change would keep projecting the columns it started with.
     """
-    with open_log(tmp_path) as writer, Log.open(tmp_path, "s") as reader:
+    with open_log(tmp_path) as writer, litelink.open(tmp_path, "s") as reader:
         writer.extend(rows(3))
         assert reader.scan().read_all().num_rows == 3
 
@@ -181,8 +182,8 @@ def test_the_change_survives_a_reopen(tmp_path: Path) -> None:
         assert not reopened._buffer.get_meta("schema_intent")
 
 
-def archived_log(root: Path, bucket: str, s3: S3Options) -> Log:
-    return Log.new(
+def archived_log(root: Path, bucket: str, s3: S3Options) -> WriteHandle:
+    return litelink.new(
         root,
         "s",
         schema=SCHEMA,
@@ -239,7 +240,7 @@ def test_a_change_interrupted_before_step_seven_completes_on_reopen(
     landed is a no-op — `union_by_name` is idempotent where
     `update_schema().add_column` raises `name already exists`. Falsify by
     swapping it: recovery then raises inside `open`, which is unguarded, so
-    every writer fails to open while `read_only=True` still works.
+    every writer fails to open while `reader()` still works.
     """
     with archived_log(tmp_path, bucket, s3) as log:
         log.extend(rows(20))
@@ -262,7 +263,7 @@ def test_a_change_interrupted_before_step_seven_completes_on_reopen(
         assert log._buffer.get_meta("schema_intent"), "the intent must stand"
         assert "region" not in log._buffer.shape().columns
 
-    with Log.open(tmp_path, "s", s3=s3) as reopened:
+    with litelink.open(tmp_path, "s", s3=s3) as reopened:
         assert "region" in reopened._buffer.shape().columns, (
             "recovery must finish the change"
         )
@@ -284,7 +285,7 @@ def test_add_column_with_the_archive_unreachable_leaves_the_log_writable(
     log opens, appends, seals and reads; the change simply has not finished.
 
     Falsify by letting `_ArchiveDeferred` escape `_recover_schema_change`:
-    every writer then fails to open while `read_only=True` still works.
+    every writer then fails to open while `reader()` still works.
     """
     with archived_log(tmp_path, bucket, s3) as log:
         log.extend(rows(10))
@@ -298,7 +299,7 @@ def test_add_column_with_the_archive_unreachable_leaves_the_log_writable(
         region=s3.region,
     )
 
-    with Log.open(tmp_path, "s", s3=dead) as offline:
+    with litelink.open(tmp_path, "s", s3=dead) as offline:
         with pytest.raises(Exception, match="unreachable|[Cc]ould not connect"):
             offline.add_column("region", pa.string())
 
@@ -310,12 +311,12 @@ def test_add_column_with_the_archive_unreachable_leaves_the_log_writable(
         assert "region" not in offline._buffer.shape().columns
 
     # And it opens again, still offline, rather than wedging on the replay.
-    with Log.open(tmp_path, "s", s3=dead) as still_offline:
+    with litelink.open(tmp_path, "s", s3=dead) as still_offline:
         assert still_offline.scan().read_all().num_rows == 15
         assert still_offline._buffer.get_meta("schema_intent"), "the intent stands"
 
     # The archive returns; the next open finishes what was started.
-    with Log.open(tmp_path, "s", s3=s3) as back:
+    with litelink.open(tmp_path, "s", s3=s3) as back:
         assert "region" in back._buffer.shape().columns
         assert not back._buffer.get_meta("schema_intent")
 
@@ -337,7 +338,7 @@ def test_recovery_defers_when_the_archive_commit_itself_fails(
     Recovery must still defer rather than fail the open. Falsify by narrowing
     the catch in `_recover_schema_change` to `_ArchiveDeferred`: this open then
     raises, and because `recover()` is unguarded in `open`, every writer is
-    locked out while `read_only=True` keeps working.
+    locked out while `reader()` keeps working.
     """
     from litelink.log import _intent
 
@@ -356,7 +357,7 @@ def test_recovery_defers_when_the_archive_commit_itself_fails(
 
     monkeypatch.setattr(LogTable, "add_column", explode)
 
-    with Log.open(tmp_path, "s", s3=s3) as offline:
+    with litelink.open(tmp_path, "s", s3=s3) as offline:
         assert offline._buffer.get_meta("schema_intent"), "the intent must stand"
         assert "region" not in offline._buffer.shape().columns
 
@@ -366,7 +367,7 @@ def test_recovery_defers_when_the_archive_commit_itself_fails(
 
     monkeypatch.undo()
 
-    with Log.open(tmp_path, "s", s3=s3) as healed:
+    with litelink.open(tmp_path, "s", s3=s3) as healed:
         assert "region" in healed._buffer.shape().columns
         assert not healed._buffer.get_meta("schema_intent")
 

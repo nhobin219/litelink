@@ -1,6 +1,6 @@
 """The core append-only stream.
 
-A `Log` is one stream: one SQLite buffer, one local Iceberg table, and
+A `WriteHandle` is one stream: one SQLite buffer, one local Iceberg table, and
 optionally one archive table (SPEC §1). Rows are durable at commit and
 queryable immediately; `offset` is assigned by the library and is the only
 column it owns (§2, I11).
@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import random
+import tempfile
 import threading
 import time
 import uuid
@@ -64,7 +65,6 @@ from litelink._types import column_type, validate_schema
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from os import PathLike
-    from types import TracebackType
     from typing import Self
 
     from litelink._table import DataFile
@@ -121,6 +121,7 @@ _START_OFFSET_KEY = START_OFFSET_KEY
 # it too — see `Buffer.sort_by`.
 _SORT_KEY = SORT_KEY
 
+
 # How many offsets a restore skips before resuming (§3a).
 #
 # `sqlite_sequence` comes back from the replica, so it resumes above everything
@@ -158,7 +159,7 @@ def _foreign_archive(archive: str) -> ValueError:
         f"the archive at {archive!r} holds data this log has no record of pushing, "
         f"so it belongs to another log. Attaching it would let its contents be read "
         f"as this log's own, push nothing, and pin eviction — silently. To resume "
-        f"that log here use Log.restore; to start a new one, point at an unused "
+        f"that log here use litelink.restore; to start a new one, point at an unused "
         f"prefix"
     )
 
@@ -178,7 +179,719 @@ def _repointed_mid_push() -> RuntimeError:
     )
 
 
-class Log:
+def _scan_query(
+    declared: Sequence[str],
+    *,
+    columns: Sequence[str] | None = None,
+    where: str | None = None,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
+) -> str:
+    """The SQL behind `scan`, built from the declared columns alone.
+
+    A function rather than a method because it touches no handle state: give
+    it column names and bounds and it returns a string, which makes it
+    testable without a log. That is the whole of the reason now — an earlier
+    version of this docstring said the separation existed because two classes
+    needed it, which was true while `Follower` and `Log` each had a read path
+    and stopped being true when the hierarchy gave them one.
+
+    Taking the column names rather than a schema keeps it independent of who
+    stores them.
+    """
+    projection = ", ".join(f'"{c}"' for c in (columns or (OFFSET, *declared)))
+    predicates = [f"({where})"] if where else []
+    if start_offset is not None:
+        predicates.append(f'"{OFFSET}" >= {int(start_offset)}')
+
+    if end_offset is not None:
+        predicates.append(f'"{OFFSET}" < {int(end_offset)}')
+
+    clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+
+    return f'SELECT {projection} FROM log{clause} ORDER BY "{OFFSET}"'
+
+
+class _ArchiveDeferred(RuntimeError):
+    """Step 4 could not run because the archive is not reachable.
+
+    Its own type because recovery treats it as "leave the intent standing and
+    open anyway", while `add_column` lets it out to the caller — the same
+    condition, but a failed call and a deferred replay are different answers.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class Coverage:
+    """What a reader holds, and any offsets in neither tier.
+
+    Reported rather than enforced. `gap` is a range the reader cannot serve;
+    whether that is lost data or a never-issued reserve is a question only the
+    caller can answer — see `LogHandle.coverage`. `archive` is None when the
+    log has no archive configured.
+    """
+
+    archive: tuple[int, int] | None
+    buffered: tuple[int, int] | None
+    gap: tuple[int, int] | None
+    wal_replication: bool
+
+
+class LogHandle:
+    """Everything you can ask a log without writing to it.
+
+    One type for both read-only cases, because they differ in STATE and not in
+    kind. A reader on the writer's box shares the log's directory and sees its
+    local Iceberg table fill; a reader assembled by `follow` has a restored
+    replica of the buffer and a local table that is empty and stays empty.
+    Nothing else about them differs, and an earlier design that made them two
+    classes — a `WriteHandle` with a `readonly` flag guarding thirteen write methods,
+    and a separate `Follower` — had to keep two answers to every question.
+
+    **What the follower used to encode as a type is derived here.** The
+    archive is load-bearing exactly when the local table holds nothing and the
+    archive is known to hold something: then it is the only place the archived
+    rows can come from, so reads must include it and a missing archive must
+    refuse rather than quietly serve the buffer alone. That is true of a
+    followed log, whose table is empty by construction, and equally true of a
+    local log that has evicted everything — a case the old split got wrong,
+    measured at 476 of 1,500 rows returned with no error. See
+    `_archive_required` for why the watermark is part of the test.
+
+    **One thing is NOT derived, and it is a real cost of unifying.**
+    `include_archive=False` was absent from `Follower` and is merely refused
+    here, because the parameter has to exist for the local case. Asking for it
+    where the archive is load-bearing raises instead of being unrepresentable.
+    """
+
+    def __init__(
+        self,
+        *,
+        layout: Layout,
+        table: LogTable,
+        buffer: Buffer,
+        archive: Archive,
+        reader: Reader,
+    ) -> None:
+        self._layout = layout
+        self._table = table
+        self._buffer = buffer
+        self._archive = archive
+        self._reader = reader
+
+    # -- identity ----------------------------------------------------------
+
+    @property
+    def root(self) -> Path:
+        return self._layout.root
+
+    @property
+    def name(self) -> str:
+        return self._layout.name
+
+    @property
+    def config(self) -> LogConfig:
+        """The policy in force, read through to the log on every access."""
+        return self._buffer.config()
+
+    @property
+    def sort_by(self) -> tuple[str, ...]:
+        """The declared clustering (§7), read through like `config`."""
+        return self._buffer.sort_by()
+
+    @property
+    def schema(self) -> pa.Schema:
+        """The caller's columns, as declared at `new`, without the offset (I11).
+
+        `open` takes no schema, so this is the only way to ask a log what shape
+        it is. A property, like `config` and `sort_by` beside it — the refactor
+        that built this class dropped the decorator, and because attribute
+        access still SUCCEEDED it failed silently: callers got a bound method,
+        `if handle.schema:` stayed true, and the break surfaced only where the
+        value was used as a schema.
+        """
+        return self._buffer.schema
+
+    @property
+    def archive(self) -> str | None:
+        """Where the archive is, or None for a local-only log.
+
+        Read from `meta` on every access, so a caller cannot disagree with the
+        log about it.
+        """
+        return self._archive.uri
+
+    # -- read --------------------------------------------------------------
+
+    def scan(
+        self,
+        *,
+        columns: Sequence[str] | None = None,
+        where: str | None = None,
+        start_offset: int | None = None,
+        end_offset: int | None = None,
+        include_archive: bool | None = None,
+    ) -> pa.RecordBatchReader:
+        """Read the log as one relation, newest data included.
+
+        Unions the tiers and bounds each by its neighbour's committed offset
+        extent, resolved from manifest statistics at query time (§7, I3). The
+        tiers overlap by design, so the bounds are what make each row appear
+        exactly once.
+
+        `include_archive` defaults to whether the archive is load-bearing —
+        False for an ordinary local read, which keeps a hot read on local disk
+        (I5), and True when the local table holds nothing and the archive is
+        the only source of the archived rows.
+
+        Always bound on a LEADING column of `sort_by`. §7 measures a
+        non-leading predicate at 119 ms against 13 ms for the same predicate
+        with a leading bound.
+
+        Returns a streaming reader rather than a table: a full-window read with
+        a 400-byte payload column is 611 ms and proportional to the data, so
+        materialising it is the caller's choice to make.
+        """
+        return self.sql(
+            _scan_query(
+                self.schema.names,
+                columns=columns,
+                where=where,
+                start_offset=start_offset,
+                end_offset=end_offset,
+            ),
+            include_archive=include_archive,
+        )
+
+    def sql(
+        self, query: str, *, include_archive: bool | None = None
+    ) -> pa.RecordBatchReader:
+        """Run arbitrary DuckDB SQL against the log, exposed as `log`.
+
+        The escape hatch for what `scan` cannot express. Quote
+        `"litelink_offset"` — it is a DuckDB reserved word.
+        """
+        required = self._archive_required()
+        if include_archive is None:
+            include_archive = required
+        elif not include_archive and required:
+            msg = (
+                f"{self.root}/{self.name} holds no local files, so the archive is "
+                f"the only source of its archived rows — reading without it would "
+                f"return the buffer alone and silently omit them"
+            )
+            raise ValueError(msg)
+
+        if required:
+            # Refuses rather than serving short. Not called otherwise: a log
+            # with local files does not need the archive to be correct, and a
+            # read must not start costing a metadata GET because one exists.
+            self._checked_extent()
+
+        try:
+            # No lock. `Reader` guards its own connection and `LogTable` its
+            # own cache, both briefly.
+            return self._reader.query(query, include_archive=include_archive)
+        except FileNotFoundError as exc:
+            # Narrow: the race where a primary sweeps the metadata JSON between
+            # `_checked_extent`'s reload and `_prepare_remote`'s own — two
+            # separate GETs. pyiceberg raises `FileNotFoundError` there.
+            #
+            # Narrow in the other direction too, which was tested rather than
+            # assumed: an endpoint cut out from under a live reader raises
+            # `OSError` (NETWORK_CONNECTION) and bad credentials raise `OSError`
+            # (ACCESS_DENIED). Neither is mislabelled "reassemble".
+            #
+            # It does NOT cover the archive's data files or manifests. A
+            # missing data file surfaces as `HTTPException` inside `execute`,
+            # and a missing manifest can abort the process outright — DuckDB's
+            # iceberg extension calls `std::terminate` — which is pre-existing
+            # and reaches an ordinary local read of an archive too. Neither is
+            # catchable here.
+            #
+            # "Can", not "does": that abort was observed on a COLD read. A
+            # reader that has already scanned serves from DuckDB's cache and
+            # neither aborts nor raises.
+            #
+            # Three earlier versions of this comment claimed otherwise.
+            raise self._swept(exc) from exc
+
+    # -- observe -----------------------------------------------------------
+
+    def end_offset(self) -> int:
+        """The offset after the last row this reader can see.
+
+        **Which tier answers depends on whether the archive is load-bearing.**
+        With local files, `sqlite_sequence` is authoritative: it is the offset
+        the next append receives, and nothing below it is missing, because the
+        local table holds whatever the buffer has sealed. That keeps this a
+        cheap SQLite read on the writer's own log.
+
+        With an empty local table it is not authoritative, and this is where a
+        followed log bit. `next_offset` reads a sequence its own docstring
+        calls "the highest value ever assigned and never lowers", so it keeps
+        counting rows the replica no longer carries: a seal taken while
+        `_discard_on_seal()` was true deletes its rows and they reach the
+        archive only at the next `sync`. In between they are in neither tier.
+
+        Measured on a followed log in that window: it served 864 rows and
+        reported 1,501, and a caller using this as a resume cursor skipped 636
+        rows permanently once the primary synced. Over-reporting loses data;
+        under-reporting only re-delivers. So the answer is taken from the
+        tiers that actually hold rows, which is `litelink.restore`'s formula.
+        """
+        if not self._archive_required():
+            return self._buffer.next_offset()
+
+        buffered = self._buffer.extent()
+
+        return (
+            max(self._checked_extent()[1], 0 if buffered is None else buffered[1]) + 1
+        )
+
+    def buffered_rows(self) -> int:
+        """Rows durable in the buffer but not yet sealed.
+
+        Counted against the local table's boundary rather than by asking the
+        buffer how many rows it holds, because a seal LEAVES its rows there
+        when `wal_replication` is on (§3a) — the buffer is the off-box copy
+        until the archive has the range, so its row count is not the unsealed
+        tail.
+
+        **Through `table_extent`, which reloads.** `LogTable.extent` compares
+        against this handle's in-memory `metadata_location` and resolves
+        nothing, so reading it directly pins the boundary to whatever snapshot
+        was last loaded and every row another process has since sealed still
+        counts as unsealed. Measured against a maintainer that had just sealed
+        20 rows: a reader reported `buffered=20, table=20` for a log holding
+        20, double-counting the whole band across the §7 boundary that I3 says
+        each row crosses exactly once.
+
+        A refactor inlined this method's body minus the reload, and it hid
+        because every other observation here reloads — `examples/adsb/tail.py`
+        only reads the right number because it happens to call `table_rows()`
+        first in the same tuple.
+        """
+        extent = self.table_extent()
+
+        return self._buffer.count_above(0 if extent is None else extent[1])
+
+    def table_rows(self) -> int:
+        """Rows in the local Iceberg table, from the manifests."""
+        self._table.reload()
+
+        return self._table.record_count()
+
+    def table_files(self) -> int:
+        """Data files in the local table — what compaction is bringing down."""
+        self._table.reload()
+
+        return self._table.file_count()
+
+    def table_extent(self) -> tuple[int, int] | None:
+        """`(lo, hi)` offset extent of the local table, from statistics (§7)."""
+        self._table.reload()
+
+        return self._table.extent()
+
+    def archived_through(self) -> int:
+        """Highest offset the archive is known to hold, 0 if none (§5, I4).
+
+        The log's own cached watermark, not a network read — the same `meta`
+        row eviction consults so it can ask a keyed read instead of a round
+        trip. On a followed log that row came from the replica, so it describes
+        what the PRIMARY had pushed as of the snapshot; `coverage()` is the one
+        that asks the bucket.
+        """
+        recorded = self._buffer.get_meta(Maintenance.ARCHIVED_KEY)
+
+        return 0 if recorded is None else int(recorded)
+
+    def archive_files(self) -> int:
+        """How many data files the archive holds, or 0 with no archive.
+
+        A network round trip, unlike `table_files()`.
+        """
+        archive = self._archive.table()
+        if archive is None:
+            return 0
+
+        try:
+            archive.reload()
+
+            return len(archive.data_files())
+        except FileNotFoundError as exc:
+            # The same refusal every other archive-touching member gives. This
+            # was the one that escaped the conversion and raised a bare
+            # `FileNotFoundError` naming an S3 key — loud either way, but a
+            # caller handling "the snapshot was swept" should not have to
+            # handle it twice.
+            raise self._swept(exc) from exc
+
+    def coverage(self) -> Coverage:
+        """What this reader can serve, and where it cannot.
+
+        A reader assembled from a replica cannot ask the primary anything, so
+        it reports rather than adjudicates — the failure to avoid is SILENCE,
+        not incompleteness.
+
+        **A gap is not necessarily loss.** The gap sits above the archive's
+        frontier and below the next thing this knows of: the buffer's first
+        offset when it holds rows, and the sequence's end when it does not. A
+        range there is either a band the buffer lost, since rows sealed while
+        `wal_replication` was off are discarded at seal and gone, or a
+        `litelink.restore` fence, which burns 2**20 offsets in exactly that
+        position. Nothing distinguishes them locally: the fence "leaves no
+        trace once the sequence has moved". A caller who knows whether their
+        log has failed over can read a gap that this cannot.
+
+        A `start_offset` reserve is NOT among them. It lies BELOW the archive's
+        low end, which nothing here compares against, so it never surfaces.
+
+        **An EMPTY buffer is the case that must not report `gap=None`**, and an
+        earlier version did: the comparison was against `buffered[0]`, so with
+        no buffered rows there was no lower bound and the whole band above the
+        archive went unexamined — a reader serving 864 rows of 1,500 reporting
+        itself gap-free. The sequence closes it, because it counts every offset
+        ever assigned and never lowers.
+
+        What this does NOT model is a second, disjoint band above the buffer's
+        own top: `gap` is one range, and it reports the one adjoining the
+        archive.
+        """
+        archive = self._archive_extent()
+        buffered = self._buffer.extent()
+        gap: tuple[int, int] | None = None
+        if archive is not None:
+            self._table.reload()
+            # ALL THREE TIERS. This arrived for a followed log, whose local
+            # table is empty by construction, so "archive frontier to the
+            # buffer's first offset" described everything it could serve. A
+            # local log has a third tier in between, and leaving it out
+            # reported every offset sealed-but-not-yet-synced as unservable —
+            # measured, a healthy log with `archive=(1, 432)` and a local table
+            # of `(1, 10000)` reported `gap=(433, 10000)` while serving all
+            # 9,568 of those rows. Sync lagging the table is the design rather
+            # than an error, so that was wrong on nearly every archived log.
+            starts = [
+                extent[0]
+                for extent in (self._table.extent(), buffered)
+                if extent is not None
+            ]
+            above = min(starts) if starts else self._buffer.next_offset()
+            if above > archive[1] + 1:
+                gap = (archive[1] + 1, above - 1)
+
+        return Coverage(
+            archive=archive,
+            buffered=buffered,
+            gap=gap,
+            wal_replication=self.config.wal_replication,
+        )
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Release the reader's connection and the buffer's. Nothing else.
+
+        `RemoteReadHandle` extends this to remove the scratch root it owns —
+        extends rather than replaces, adding a step rather than changing one.
+
+        It is one of two overrides in the hierarchy. The other is
+        `WriteHandle.end_offset`, which answers a genuinely different question
+        than this class's: where the next append lands, rather than past the
+        last row this handle can serve.
+        """
+        self._reader.close()
+        self._buffer.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    # -- internals ---------------------------------------------------------
+
+    def _archive_required(self) -> bool:
+        """Whether the archive is the only source of this log's archived rows.
+
+        True when the local table holds nothing and the archive holds
+        something. Both halves are asked directly, and the ORDER is what keeps
+        a hot read local: the table is checked first, from manifest statistics
+        already on disk, so a log with local files answers False without
+        touching the network. I5 protects a read that HAS local disk to serve;
+        one with none faces a metadata GET or silently wrong results.
+
+        **Do not reintroduce a local proxy for "the archive holds rows". This
+        has now been wrong three times, each time in the silent direction.**
+
+        - Keying on the empty table alone demanded an archive from a log
+          created with one and never synced, refusing a first read that should
+          simply have served the buffer.
+        - Adding `archived_through() > 0` fixed that and broke re-pointing:
+          `_repoint` deliberately zeroes that watermark when the location
+          moves, and a detach-and-reattach is two moves, so a log returning to
+          the archive it just left reads 0 while the bucket still holds
+          everything. Measured on an evicted log: `scan()` returned 550 of
+          4,000 rows with no error, and `coverage()` called it gap-free.
+        - Replacing it with a durable marker `follow` wrote made the local
+          eviction case unreachable, which hid a real defect behind what looked
+          like a design boundary.
+
+        The archive is the authority on what the archive holds, and it is asked
+        through the RESOLVING read. A first version asked `Archive.table()`
+        directly, on the theory that the cached handle cost one metadata
+        resolve and no more. That was the fourth wrong proxy: `Archive.table`
+        returns its handle unchanged while the URI matches, and `LogTable.extent`
+        short-circuits on an unchanged `metadata_location`, so a handle first
+        touched while the archive table EXISTED BUT WAS EMPTY answered None for
+        the rest of its life.
+
+        That state is ordinary — `sync` creates the table on a maintenance tick
+        before anything is sealed, and `set_archive` creates one at a new
+        prefix — and one early call was enough to pin it: a `scan`, an
+        `end_offset`, even a bare metadata poll. The handle then served the
+        buffer alone with no error while `coverage()`, which does resolve,
+        reported the same log gap-free. Measured: 0 of 20 rows, indefinitely,
+        on both a reader and a writer.
+
+        So the cost is archive metadata GETs on a read of a log with an empty
+        local table — two of them, since the read that follows resolves the
+        archive again for its own bounds, and an earlier version of this
+        docstring said one. A log with local files never reaches this line,
+        which is what keeps I5 intact for a hot read; a log without them has no
+        local data to protect, and the alternative is silently wrong results.
+
+        **On a log that DOES have local files, the reload above costs 0.63 ms
+        and the read resolves the table a second time for its own bounds.**
+        Measured two ways that agree: `LogTable.reload()` in isolation at
+        0.6278 ms, and the p10 of an end-to-end scan with and without this
+        check at 0.63 and 0.61 ms, against an A/A noise floor of 0.34 ms.
+
+        It is a FIXED cost, so it is ~10% of the smallest possible scan
+        (6.5 ms over 1,710 rows) and ~0.1% of the full-window read §7 measures
+        at 611 ms. Collapsing it means deriving this inside `Reader.query`,
+        after the resolve that already happens there — which is possible, and
+        is not worth doing on the strength of 0.63 ms, because that path's own
+        docstring explains that getting it wrong leaves "rows silently missing
+        from the answer". Revisit if a workload ever shows it.
+        """
+        # Cheapest first, and the order is load-bearing for I5. `configured()`
+        # is a keyed `meta` read and opens nothing, so a local-only log answers
+        # here without resolving anything — measured at 4.3 ms saved per read,
+        # against a 37 ms scan, purely from not reloading a catalog whose
+        # answer could not have mattered.
+        if not self._archive.configured():
+            return False
+
+        # Then the local table, which is manifest statistics and no network.
+        # Reloaded because the dangerous direction is a stale "the table has
+        # files" on one another process has just evicted — that would drop the
+        # archive leg and serve short with no error.
+        self._table.reload()
+        if self._table.extent() is not None:
+            return False
+
+        return self._archive_extent() is not None
+
+    def _archive_extent(self) -> tuple[int, int] | None:
+        """The archive's extent, forcing a real re-read, or None if unreachable.
+
+        **The re-read is not optional.** On a followed log the adopted metadata
+        is pinned, and both caches short-circuit: `Archive.table` on a live
+        handle and `LogTable.extent` on an unchanged `metadata_location`. So
+        without `reload()` this is an in-memory replay that never touches the
+        network — and `coverage()` would go on reporting a healthy, gap-free
+        reader against a snapshot the primary had already swept, which is the
+        honesty guarantee lying.
+
+        The archive carries `previous-versions-max: 10` — ten previous versions
+        beside the current one — so the ELEVENTH further archive commit deletes
+        a pinned object, with no time component at all. Archive commits are
+        what count: `sync`, `rewrite_archive`, archive expiry. A local
+        `maintain()` moves nothing in the bucket.
+
+        On a log whose own writer owns the archive this cannot bite: `sync`
+        moves the `archive.db` row, so the re-read finds the current pointer.
+        """
+        try:
+            adopted = self._archive.table(repair=False)
+            if adopted is None:
+                return None
+
+            adopted.reload()
+
+            return adopted.extent()
+        except FileNotFoundError as exc:
+            raise self._swept(exc) from exc
+
+    def _checked_extent(self) -> tuple[int, int]:
+        """The archive's extent, or a refusal — for when it is load-bearing.
+
+        Two failures, and neither may be silent. An unreachable archive would
+        otherwise fall through to the buffer leg, which on an empty local table
+        is every archived row missing with no error; and an archive reporting
+        no extent has nothing for this to merge.
+        """
+        extent = self._archive_extent()
+        if extent is None:
+            msg = (
+                f"{self.root}/{self.name} can no longer reach its archive, and it "
+                f"holds no local files — reading on would omit every archived row. "
+                f"Reassemble with `follow`"
+            )
+            raise RuntimeError(msg)
+
+        return extent
+
+    def _swept(self, exc: FileNotFoundError) -> RuntimeError:
+        return RuntimeError(
+            f"this reader's archive snapshot has been swept — the writer has "
+            f"committed past it ({exc}). A followed log is a snapshot, not a "
+            f"subscription: reassemble with `follow`"
+        )
+
+
+class LocalReadHandle(LogHandle):
+    """A read-only handle to a log on THIS machine, beside its writer.
+
+    Adds the replication surface, and that is the whole of the difference from
+    a remote one. Generating a sidecar config is exactly what you do alongside
+    a live writer — and reaching for a writer to do it takes both whole-log
+    claims and the SQLite write lock, and runs `recover()`, which can finish
+    and replace the writer's in-flight seal. `examples/adsb/replicate.py` did
+    that for one commit.
+
+    A `RemoteReadHandle` does not have these at all, rather than refusing
+    them: `litestream_config` keys each replica on the path RELATIVE to the
+    root, so a followed log would emit the PRIMARY's key and a sidecar run
+    there would ship its scratch copy over the primary's only off-box record
+    of its unsealed rows. A local handle shares the primary's root and name,
+    so the key it emits IS the primary's own correct one.
+
+    Sees the writer's commits as they land: `catalog.db` and `archive.db` live
+    at the root and both processes read the same rows. That is the difference
+    from following, which reads a replica captured at a point in time.
+    """
+
+    @property
+    def databases(self) -> tuple[Path, ...]:
+        """The SQLite files a restore needs (§3a), for a sidecar to replicate.
+
+        Public because deciding to run a sidecar is a deployment choice, but
+        knowing WHICH files carry the log's state is not — it is this library's,
+        and a sidecar configured by hand against a guess silently omits one.
+        """
+        return self._layout.databases
+
+    def replication_config(self) -> str:
+        """A litestream config for this log (§3a).
+
+        **A read, which is why it belongs here.** Generating it is exactly what
+        you do alongside a live writer, and doing that through a writer takes
+        both whole-log claims and the SQLite write lock on a log another
+        process owns — and runs `recover()`, which can finish and replace that
+        process's in-flight seal. `examples/adsb/replicate.py` did that for one
+        commit, because this surface was on `WriteHandle` alone and the example had to
+        reach for a writer to get at it.
+
+        **Absent on a followed log**, which is why `RemoteReadHandle` is a
+        sibling of this class rather than a child: `litestream_config` keys
+        each replica on the path relative to the root, so a follower with the
+        same log name emits a key identical to the primary's, and a sidecar
+        run there ships the follower's stripped scratch copy over the
+        primary's only off-box record of its unsealed rows. A local handle
+        shares the primary's root and name, so the key it emits IS the
+        primary's own correct one.
+
+        This used to be a runtime refusal on one shared class. Moving it here
+        made the guard unnecessary — there is nothing to call.
+        """
+        archive = self.archive
+        if archive is None:
+            msg = (
+                f"{self.root}/{self.name} has no archive, so there is nowhere to "
+                f"ship its WAL — replication needs one"
+            )
+            raise ValueError(msg)
+
+        return litestream_config(
+            self._layout.databases,
+            self._layout.root,
+            archive,
+            self._archive.s3,
+            self.config.wal_retention,
+        )
+
+    def write_replication_config(self) -> Path:
+        """Write that config next to the log, and return where.
+
+        Beside the data rather than at a configured path, for the same reason
+        every other path is derived: a setting for it would be one more thing
+        to keep in step with the log it describes.
+        """
+        destination = self._layout.root / "litestream.yml"
+        destination.write_text(self.replication_config())
+
+        return destination
+
+
+class RemoteReadHandle(LogHandle):
+    """A read-only handle to a log running somewhere else, from `follow` (§3b).
+
+    Adds ownership of the scratch directory it was assembled into, and nothing
+    else — every difference in how it READS is derived from its state by
+    `LogHandle`, because its local Iceberg table is empty and its archive
+    holds rows. A local handle to a fully evicted log meets the same two
+    conditions and is treated the same way, correctly.
+
+    It is a SIBLING of `LocalReadHandle` rather than a child so that the
+    replication surface is absent rather than refused. See there for why that
+    matters.
+
+    **A snapshot, not a subscription.** litestream restores to a point in
+    time, so refreshing means assembling another one.
+    """
+
+    def __init__(
+        self,
+        *,
+        layout: Layout,
+        table: LogTable,
+        buffer: Buffer,
+        archive: Archive,
+        reader: Reader,
+        owned: tempfile.TemporaryDirectory[str],
+    ) -> None:
+        super().__init__(
+            layout=layout,
+            table=table,
+            buffer=buffer,
+            archive=archive,
+            reader=reader,
+        )
+        # Always owned: `follow` builds into a directory it made, and removes
+        # it on close. There is no way to follow into a caller's root.
+        self._owned_root: tempfile.TemporaryDirectory[str] | None = owned
+
+    def close(self) -> None:
+        """Release the handles, then remove the scratch root.
+
+        Nulled first so a second close is a no-op rather than a second
+        `cleanup()`, and in a `finally` so a failing close still removes the
+        directory — it holds a restored copy of the primary's buffer, which is
+        not small on a log whose sync is behind.
+        """
+        try:
+            super().close()
+        finally:
+            owned, self._owned_root = self._owned_root, None
+            if owned is not None:
+                owned.cleanup()
+
+
+class WriteHandle(LocalReadHandle):
     """One append-only stream.
 
     Single writer per log (§1): SQLite's write lock is per file, and one process
@@ -190,7 +903,7 @@ class Log:
     writes the buffer database, so it is a writer, and two of those is the case
     §1 excludes.
 
-    Construct through `new`, `open`, or `restore`; `open(read_only=True)`
+    Construct through `litelink.new`, `open` or `restore`; `litelink.open(..., read_only=True)`
     gives a second view alongside a live writer. The initialiser takes already
     built collaborators and does no I/O, so a test can substitute any of them.
     """
@@ -205,30 +918,20 @@ class Log:
         maintenance: Maintenance,
         config: LogConfig,
         archive: Archive,
-        readonly: bool = False,
     ) -> None:
-        self.name = layout.name
-        self.root = layout.root
-        self.readonly = readonly
-
-        self._layout = layout
-        self._table = table
-        self._buffer = buffer
-        # The same object the reader and the maintainer were handed. See
-        # `_archive.Archive`: it owns the credentials and the lazily opened
-        # handle, and reads the URI from `meta` on every access rather than
-        # holding a copy — so `set_archive` moves what all three see by
-        # changing one row, instead of fanning out to each. Required rather than defaulted, because a
-        # collaborator this constructor builds for itself is one no caller can
-        # substitute — the reason `new` and `open` build every other one.
-        self._archive = archive
+        super().__init__(
+            layout=layout,
+            table=table,
+            buffer=buffer,
+            archive=archive,
+            reader=reader,
+        )
         # Set only by `restore`, and read only by `recovery()`. What a failover
         # recovered and what it skipped are facts about one operation, knowable
         # at the moment it runs and not afterwards — the skipped range leaves no
         # trace once the sequence has moved, and the recovered count is
         # indistinguishable from ordinary buffered rows a second later.
         self._restored_from: _Recovery | None = None
-        self._reader = reader
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
         # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
@@ -253,9 +956,6 @@ class Log:
         # directions — a maintenance process redoing the writer's in-flight
         # seal, a writer deleting a maintenance process's half-written
         # compaction — and ownership is what resolves it.
-        # The last failure from the sealing thread, which has no caller to
-        # raise to. Surfaced by `close`, so a process that never checks still
-        # finds out.
 
     # -- construction ------------------------------------------------------
 
@@ -293,7 +993,7 @@ class Log:
         that has one.
 
         The value is recorded in `meta` when it is greater than 1, because a
-        backfill has to tell that reserve from a `Log.restore` fence. Both are
+        backfill has to tell that reserve from a `litelink.restore` fence. Both are
         empty ranges below the log's offsets and nothing else distinguishes
         them — see `START_OFFSET_KEY`.
 
@@ -344,7 +1044,7 @@ class Log:
         # Same normalisation as `set_archive`, and for the same reason: an
         # empty string is not None to `validate`, so every rule that
         # presupposes an archive was skipped while `configured()` came back
-        # False — `Log.new(archive="", config=LogConfig(local_retention=0))`
+        # False — `litelink.new(archive="", config=LogConfig(local_retention=0))`
         # was accepted, which is exactly the pair `validate` exists to refuse.
         archive = (archive or "").rstrip("/") or None
         validate(schema, order, settings, archive)
@@ -366,7 +1066,7 @@ class Log:
         #
         # A fresh log holds no `extent` rows at all, so any archive that
         # already has data belongs to something else. This is the shape an
-        # operator reaches for when failing over by hand: `Log.new` on the
+        # operator reaches for when failing over by hand: `litelink.new` on the
         # second box, pointed at the old prefix. Silently, that log pushes
         # nothing — its offsets are below the archive's — eviction pins, and
         # the archive's contents read back as its own. `set_archive` refuses
@@ -396,10 +1096,10 @@ class Log:
         # string type and one binary type, so `large_binary` would come back
         # `binary` and the declaration would be quietly overruled.
         # BEFORE either `meta` write, and that ordering is the whole of its
-        # crash safety. `Log.open` refuses a log with no stored schema or
+        # crash safety. `litelink.open` refuses a log with no stored schema or
         # config, so every window between here and `set_meta_all` fails closed.
         # Seeding AFTER them leaves one whose crash yields a log that reopens
-        # silently at offset 1 — and `Log.new` then refuses to retry, because
+        # silently at offset 1 — and `litelink.new` then refuses to retry, because
         # the buffer exists. The reserve would be lost with no error anywhere.
         if start_offset > 1:
             buffer.seed_offsets(start_offset)
@@ -450,7 +1150,6 @@ class Log:
         root: PathLike[str] | str,
         name: str,
         *,
-        read_only: bool = False,
         s3: S3Options | None = None,
     ) -> Self:
         """Open an existing log, and recover it.
@@ -464,9 +1163,10 @@ class Log:
         something the log does not agree with, and the log is the one that is
         right.
 
-        `read_only=True` opens a second view of a log another process is
-        writing. It runs no recovery and refuses every mutation, so it cannot
-        disturb the single writer §1 assumes.
+        Always recovers, because this always returns a writer. For a second
+        view of a log another process is writing, use `litelink.open(..., read_only=True)`, which
+        runs no recovery and has no mutation to refuse — so it cannot disturb
+        the single writer §1 assumes.
         """
         layout = Layout(Path(root), name)
         # Asked of THIS log's table, not of `catalog.db`. That file is shared
@@ -484,7 +1184,7 @@ class Log:
             msg = f"no litelink log at {layout.root}/{name} — use new() to create one"
             raise FileNotFoundError(msg)
 
-        table = LogTable.load(layout, readonly=read_only)
+        table = LogTable.load(layout, readonly=False)
         schema = _declared_schema(layout, application_schema(table.arrow_schema()))
 
         # Read through a throwaway connection, like the schema above it,
@@ -502,11 +1202,7 @@ class Log:
             raise ValueError(msg)
 
         config = LogConfig.from_json(encoded)
-        buffer = Buffer.open(
-            layout.buffer_db,
-            schema,
-            readonly=read_only,
-        )
+        buffer = Buffer.open(layout.buffer_db, schema)
         # From `meta`, not from the table. Required like the config and for
         # the same reason: `new` always writes it, so its absence is a damaged
         # log, and defaulting to no order would silently de-cluster every file
@@ -536,10 +1232,8 @@ class Log:
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
             archive=remote,
-            readonly=read_only,
         )
-        if not read_only:
-            log.recover()
+        log.recover()
 
         return log
 
@@ -617,7 +1311,7 @@ class Log:
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
         # its last write, not a log. Refusing it would leave the root in a
-        # state neither this nor `Log.open` accepts, so the only way out would
+        # state neither this nor `litelink.open` accepts, so the only way out would
         # be deleting it by hand. Resumed instead: everything before that write
         # is repeatable, and the reserve simply skips another window.
         #
@@ -726,7 +1420,7 @@ class Log:
         #
         # That table is what makes this root openable, so wherever it sits, an
         # interruption after it leaves a root `restore` refuses to retry — both
-        # databases now exist — and `Log.open` cheerfully accepts, reporting
+        # databases now exist — and `litelink.open` cheerfully accepts, reporting
         # `recovery() is None`. An earlier version put it second and claimed
         # "this order has no such state"; it had one, one write later. Measured
         # from that window: the open group still at the replica's stale
@@ -751,7 +1445,7 @@ class Log:
             # carried, and every `include_archive` read silently leaves the
             # archive leg out.
             #
-            # Built standalone rather than reached through a `Log`, because
+            # Built standalone rather than reached through a `WriteHandle`, because
             # there is no local table yet — which is the whole point of doing
             # it here. It reads the archive's location from the restored
             # `meta`, so it adopts the archive THIS log wrote, not whatever
@@ -818,7 +1512,7 @@ class Log:
             # the row present — which the `FileExistsError` guard above cannot
             # catch, keying as it does on the buffer — and reproduced: a table
             # at offsets 1..1152 with the archive at 504 lost the reference to
-            # 505..1152, sealed locally and never archived, with `Log.open`
+            # 505..1152, sealed locally and never archived, with `litelink.open`
             # then answering "use new() to create one".
             raise
         except Exception:
@@ -876,22 +1570,12 @@ class Log:
     def _schema(self) -> pa.Schema:
         """The declared columns, read from the log rather than remembered.
 
-        A `Log` opened before a schema change would otherwise validate against
+        A `WriteHandle` opened before a schema change would otherwise validate against
         the columns it was constructed with for the rest of its life. The
         buffer owns the durable copy and caches the decode, so this costs one
         keyed `meta` read.
         """
         return self._buffer.shape().schema
-
-    @property
-    def config(self) -> LogConfig:
-        """The policy in force, owned by `Maintenance` (§12).
-
-        A property rather than a field, because two copies of a policy that
-        another process can change is a way for compaction and `sync` to
-        disagree about which files are still in play.
-        """
-        return self._maintenance.config
 
     def set_config(self, config: LogConfig) -> None:
         """Replace the operational policy (§12).
@@ -901,7 +1585,6 @@ class Log:
         schema are not in here precisely because they do.
         """
         with self._lock:
-            self._writable()
             # The same claim `set_archive` takes, and for the same reason.
             # `validate` refuses a PAIR — an evict-on-upload policy with no
             # archive to evict into — so the two halves have to be decided
@@ -937,82 +1620,6 @@ class Log:
             finally:
                 lease.release()
 
-    def archived_through(self) -> int:
-        """Highest offset the archive holds, 0 if none (§5, I4).
-
-        Eviction never goes above it, so the lag between this and `end_offset`
-        is what an operator watches: a stalled sync shows up first as local
-        disk that stops being reclaimed.
-        """
-        return self._maintenance.archived_through()
-
-    @property
-    def databases(self) -> tuple[Path, ...]:
-        """The SQLite files a restore needs (§3a).
-
-        For a WAL-shipping sidecar to replicate. Public because deciding to run
-        one is a deployment choice, but knowing WHICH files carry the log's
-        state is not — it is this library's, and a sidecar configured by hand
-        against a guess is one that silently omits a file.
-
-        litelink does not run the sidecar. It is a separate process reading the
-        WAL, which is exactly why it does not put the network in the write path
-        (§3a); a library that supervised it would.
-        """
-        return self._layout.databases
-
-    def archive_files(self) -> int:
-        """How many data files the archive holds, or 0 with no archive.
-
-        A network round trip, unlike `table_files()`: it reloads the remote
-        table to answer. Paired with `table_files()` it is the two halves of
-        where the data is — local disk and object storage — which is otherwise
-        only visible as a watermark in offsets.
-        """
-        archive = self._archive.table()
-        if archive is None:
-            return 0
-
-        archive.reload()
-
-        return len(archive.data_files())
-
-    def replication_config(self) -> str:
-        """A litestream config for this log (§3a).
-
-        Derived, not configured: the file set is `databases`, the destination
-        is `_wal` beside the archived data, and the endpoint comes from the
-        credentials this log was opened with. Everything a hand-written config
-        would have to restate, and each of those a way to get it silently
-        wrong.
-        """
-        # One read, checked and used. Read twice, a detach landing between them
-        # hands `litestream_config` a None it has no branch for.
-        archive = self._archive.uri
-        if archive is None:
-            msg = "replication needs an archive; this log is local-only"
-            raise ValueError(msg)
-
-        return litestream_config(
-            self.databases,
-            self._layout.root,
-            archive,
-            self._archive.s3,
-            self.config.wal_retention,
-        )
-
-    def write_replication_config(self) -> Path:
-        """Write that config next to the log, and return where.
-
-        Beside the data rather than at a configured path, for the same reason
-        every other path is derived: a setting for it would be one more thing
-        to keep in step with the log it describes.
-        """
-        destination = self._layout.root / "litestream.yml"
-        destination.write_text(self.replication_config())
-
-        return destination
-
     def recovery(self) -> _Recovery | None:
         """What `restore` recovered, or None on a log opened normally.
 
@@ -1021,16 +1628,6 @@ class Log:
         reissuing ones the dead machine had already served.
         """
         return self._restored_from
-
-    @property
-    def archive(self) -> str | None:
-        """Where the archive is, or None for a local-only log.
-
-        The question a maintenance loop has to answer before calling `sync`,
-        and one only the log can: the archive is recovered from `meta` on
-        `open`, so a caller that restated it could disagree with the log.
-        """
-        return self._archive.uri
 
     def set_archive(self, archive: str | None) -> None:
         """Point the log at an archive, or detach it (§5).
@@ -1059,7 +1656,7 @@ class Log:
         **An archive AHEAD of this log is refused.** One whose extent reaches
         at or above the next offset to be assigned is another log's history,
         and attaching it wedges this one silently — nothing is ever pushed,
-        eviction pins, and local disk grows without bound. `Log.restore` is
+        eviction pins, and local disk grows without bound. `litelink.restore` is
         the operation for resuming that log here. Re-attaching to an archive
         this log has moved past is unaffected, and supported.
 
@@ -1086,7 +1683,6 @@ class Log:
         archive = (archive or "").rstrip("/") or None
 
         with self._lock:
-            self._writable()
             lease = self._claim_settings()
 
             # Every write inside, so a failure — a full disk, a busy database —
@@ -1220,9 +1816,9 @@ class Log:
         without bound while `sync()` returns success having uploaded nothing.
         No error surfaces at any step.
 
-        It is reachable by the obvious failover attempt — `Log.new` on a second
+        It is reachable by the obvious failover attempt — `litelink.new` on a second
         box, then `set_archive` at the old prefix — which is exactly what
-        `Log.restore` exists to do properly.
+        `litelink.restore` exists to do properly.
 
         **`>= next_offset`, not "overlaps".** Re-attaching to an archive that
         holds offsets this log has moved PAST is supported and tested; the
@@ -1260,7 +1856,7 @@ class Log:
                 f"the archive at {archive!r} holds offsets up to {covered[1]}, at or "
                 f"above this log's next offset ({nxt}) — it is another log's "
                 f"history. Attaching it would push nothing and pin eviction, "
-                f"silently. To resume that log here, use Log.restore"
+                f"silently. To resume that log here, use litelink.restore"
             )
             raise ValueError(msg)
 
@@ -1320,7 +1916,7 @@ class Log:
 
         # Reaches the maintainer and the reader because all three hold this
         # object. `evict` asks it whether I4 is owed anything, and a setting
-        # that stopped at `Log` would leave the maintainer deleting the only
+        # that stopped at `WriteHandle` would leave the maintainer deleting the only
         # copy of rows an archive was just configured to receive.
 
         # Repaired here as well as at open, and the difference is who waits.
@@ -1336,33 +1932,6 @@ class Log:
         if self._archive.configured():
             with contextlib.suppress(Exception):
                 self._archive.table(repair=True)
-
-    @property
-    def schema(self) -> pa.Schema:
-        """The caller's columns, as declared at `new`.
-
-        `open` takes no schema, so this is the only way to ask a log what shape
-        it is. `litelink_offset` is stripped: this is the schema the caller
-        wrote and the one `append` accepts, while the TABLE's schema carries
-        the library's column in front of it (I11).
-        """
-        return self._schema
-
-    @property
-    def sort_by(self) -> tuple[str, ...]:
-        """The within-file sort order, read from the log on every access (§7).
-
-        §7 tells a reader to bound every scan on a LEADING column of this —
-        measured at 13 ms against 119 ms for the same predicate without one —
-        which is advice no caller can follow without being able to ask.
-
-        Read through to `meta` like `config` and `archive`, and for the reason
-        they are: `set_sort_by` in one process must not leave another holding
-        the key it opened with. An earlier draft of this property returned a
-        field and claimed parity with those two in its own docstring while
-        being the copy they exist to avoid.
-        """
-        return self._buffer.sort_by()
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, re-clustering every file the local table owns.
@@ -1393,7 +1962,6 @@ class Log:
         archive keeps the clustering it was written with.
         """
         with self._lock:
-            self._writable()
             requested = tuple(sort_by)
             validate(self._schema, requested, self.config, self._archive.uri)
             if requested == self._buffer.sort_by() and not rewrite:
@@ -1514,12 +2082,39 @@ class Log:
         """
         return self._buffer.claim(role, lo, hi, new_owner())
 
-    def _writable(self) -> None:
-        if self.readonly:
-            msg = "this Log was opened readonly"
-            raise RuntimeError(msg)
+    # -- write ---------------------------------------------------------------
 
-    # -- write -------------------------------------------------------------
+    def end_offset(self) -> int:
+        """The offset the next append will receive — an EXCLUSIVE upper bound.
+
+        Half-open, matching the `[start, end)` seal ranges in §4, so this on a
+        fresh log is the first offset it will ever assign and never a sentinel.
+
+        **A writer answers a different question than a reader, and inheriting
+        the reader's answer was wrong twice.** `LogHandle.end_offset` reports
+        the offset after the last row THAT HANDLE CAN SERVE, which is what a
+        follower needs and what a reader assembled from two tiers can honestly
+        claim. A writer is asked where its next row will land, and only
+        `sqlite_sequence` knows that — it is the thing that assigns it.
+
+        The two coincide on a healthy log and diverge exactly where the local
+        table is empty while the archive holds rows:
+
+        - **After `restore`.** The fence reserves `RESTORE_RESERVE` offsets, so
+          the sequence is 1,048,576 above the archive's frontier and the
+          rebuilt local table is empty. The inherited version reported 801
+          where the next append took 1,049,377 — a caller reading it as "what
+          comes next" would collide with the fence I9 exists to hold.
+        - **After `evict` empties the table.** The inherited version reads
+          archive metadata, so a writer's cheapest observation became a
+          network call that RAISES when the bucket is unreachable. It returned
+          3,001 locally before, and could not fail. `docs/API.md` calls
+          `archived_through()` against `end_offset()` the number to alarm on,
+          which made the monitoring call the one that dies in an outage.
+
+        So this reads SQLite and nothing else. It cannot fail and cannot lag.
+        """
+        return self._buffer.next_offset()
 
     def append(self, row: Row) -> int:
         """Append one row. Returns the assigned offset.
@@ -1548,7 +2143,6 @@ class Log:
         be worse than refusal — it would hand back offsets for some rows while
         the caller learns nothing about the rest.
         """
-        self._writable()
 
         # No lock. `Buffer` serialises its own connection, which is the only
         # thing two appending threads share — and the append decides nothing
@@ -1558,124 +2152,7 @@ class Log:
         # files to compact.
         return self._buffer.append(rows)
 
-    # -- read --------------------------------------------------------------
-
-    def scan(
-        self,
-        *,
-        columns: Sequence[str] | None = None,
-        where: str | None = None,
-        start_offset: int | None = None,
-        end_offset: int | None = None,
-        include_archive: bool = False,
-    ) -> pa.RecordBatchReader:
-        """Read the log as one relation, newest data included.
-
-        Unions the tiers and bounds each by its neighbour's committed offset
-        extent, resolved from manifest statistics at query time (§7, I3). The
-        tiers overlap by design, so the bounds are what make each row appear
-        exactly once.
-
-        `include_archive=False` by default: a hot read is local disk only and
-        must stay that way (I5). Opting in is opting into network I/O.
-
-        Always bound on a LEADING column of `sort_by`. §7 measures a non-leading
-        predicate at 119 ms against 13 ms for the same predicate with a leading
-        bound — the column is in the sort key and still does not prune on its
-        own.
-
-        Returns a streaming reader rather than a table: a full-window read with
-        a 400-byte payload column is 611 ms and proportional to the data, so
-        materialising it is the caller's choice to make.
-        """
-        projection = ", ".join(
-            f'"{c}"' for c in (columns or ("litelink_offset", *self._schema.names))
-        )
-        predicates = [f"({where})"] if where else []
-        if start_offset is not None:
-            predicates.append(f'"litelink_offset" >= {int(start_offset)}')
-
-        if end_offset is not None:
-            predicates.append(f'"litelink_offset" < {int(end_offset)}')
-
-        clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
-
-        return self.sql(
-            f'SELECT {projection} FROM log{clause} ORDER BY "litelink_offset"',
-            include_archive=include_archive,
-        )
-
-    def sql(self, query: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
-        """Run arbitrary DuckDB SQL against the log, exposed as `log`.
-
-        The escape hatch for what `scan` cannot express. Quote `"litelink_offset"` — it
-        is a DuckDB reserved word.
-        """
-        # No lock here. `Reader` guards its own connection and `LogTable` its
-        # own cache, both briefly — whereas this used to be the SAME lock a
-        # whole maintenance pass held, so a read waited out a compaction.
-        return self._reader.query(query, include_archive=include_archive)
-
-    def end_offset(self) -> int:
-        """The offset the next append will receive — an EXCLUSIVE upper bound.
-
-        Half-open, matching the `[start, end)` seal ranges in §4, so
-        `end_offset()` on a fresh log is the first offset it will ever assign
-        and never a sentinel.
-
-        This is the log's end, NOT §7's tier boundary `hi`, which is the local
-        Iceberg table's committed maximum and excludes everything still in the
-        buffer. A consumer resuming from here sees every durable row; one
-        resuming from `hi` silently skips the unsealed tail.
-        """
-        return self._buffer.next_offset()
-
-    def buffered_rows(self) -> int:
-        """Rows durable in the buffer but not yet sealed.
-
-        The unsealed tail, which is what §7 measures as the variable cost of a
-        read — so it is the number to watch when tuning the seal threshold.
-
-        Counted in SQLite against the tier boundary rather than through the
-        union: a `count(*)` over the log would make DuckDB evaluate the same
-        predicate against the Iceberg leg too, reading the offset column out of
-        every Parquet file to establish that none of them qualify.
-        """
-        extent = self.table_extent()
-
-        # Deliberately unlocked, and therefore approximate: a seal landing
-        # between the two reads shifts the boundary under the count. This is a
-        # number to watch, not one to derive anything from, and locking it
-        # would put a metric on the path of every append.
-        return self._buffer.count_above(0 if extent is None else extent[1])
-
-    def table_rows(self) -> int:
-        """Rows in the local Iceberg table.
-
-        From the manifests, which track a count per file, so this costs nothing
-        beyond the snapshot read the boundary already needs.
-        """
-        self._table.reload()
-
-        return self._table.record_count()
-
-    def table_files(self) -> int:
-        """Data files in the local table — what compaction is bringing down."""
-        self._table.reload()
-
-        return self._table.file_count()
-
-    def table_extent(self) -> tuple[int, int] | None:
-        """`(lo, hi)` offset extent of the local table, from statistics.
-
-        §7's tier boundary. Read from manifest column statistics — no data file
-        is opened, which is what makes it ~0.6 ms rather than a scan.
-        """
-        self._table.reload()
-
-        return self._table.extent()
-
-    # -- seal --------------------------------------------------------------
+    # -- seal ---------------------------------------------------------------
 
     def seal(self) -> int | None:
         """Cut everything buffered into files. Returns the exclusive end offset.
@@ -1704,7 +2181,6 @@ class Log:
         One seal at a time. A second would claim a range overlapping the first,
         and `sealing` holds one row by design (§2).
         """
-        self._writable()
         # Cut unconditionally, and that is the whole contract. Cutting only
         # when the queue happened to be empty made this method's effect depend
         # on how far behind a sealer was: the rows the caller had just appended
@@ -1747,7 +2223,6 @@ class Log:
         Split from `seal` so that draining the queue can never cut a group
         short: everything this writes was sized when its rows arrived.
         """
-        self._writable()
         # Outside `_lock`, because the lease excludes other OWNERS and the lock
         # sequences this process's own buffer writes — different jobs. Taking
         # it inside put two more fsyncs under the lock an append needs, and at
@@ -1877,8 +2352,12 @@ class Log:
         queue itself, which does nothing while another owner holds the lease —
         and everything once that owner dies and its lease lapses. Purely
         watching would hang until the timeout, or forever without one, over
-        work no survivor was going to do. A readonly log has no such option and
-        can only wait.
+        work no survivor was going to do.
+
+        This is a `WriteHandle` method and not a `LogHandle` one for that reason: a
+        reader could only watch, and a watcher that cannot help is the case
+        this exists to avoid. It used to branch on `readonly` to decide, which
+        is the flag that no longer exists.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -1887,8 +2366,7 @@ class Log:
             ):
                 return True
 
-            if not self.readonly:
-                self._seal_queued()
+            self._seal_queued()
 
             if deadline is not None and time.monotonic() >= deadline:
                 return False
@@ -2020,7 +2498,6 @@ class Log:
 
         A group whose lease is held elsewhere is left alone, not waited for.
         """
-        self._writable()
 
         end = None
         # Peeked before `_seal_queued` takes the lock, because almost every
@@ -2071,7 +2548,7 @@ class Log:
         Every step is settled by ASKING the thing itself rather than by a
         record of what was done. A stamp cannot be made atomic with the commit
         it describes — it only moves the unreconciled gap from before the
-        commit to after it — and a stamp can be false: `Log.restore` rebuilds
+        commit to after it — and a stamp can be false: `litelink.restore` rebuilds
         the local table from `meta`, so a replica captured after step 5 would
         arrive carrying a stamp for a step that never landed on THIS machine.
 
@@ -2102,7 +2579,7 @@ class Log:
             # `acquire()`, this one waits and then RAISES if a maintainer is
             # holding the whole-log range — and `recover()` is unguarded in
             # `open`, so that would fail the open for every writer while
-            # `read_only=True` kept working. That is the failure this method
+            # `litelink.open(..., read_only=True)` kept working. That is the failure this method
             # exists to avoid; leaving the acquisition outside meant it could
             # still happen, just for a different reason.
             lease = self._claim_settings()
@@ -2265,7 +2742,6 @@ class Log:
         skipped. Sync's remaining obligation to eviction is the registration
         watermark it records in `meta`, which is what lets `maintain` enforce I4.
         """
-        self._writable()
         if not self._archive.configured():
             msg = "sync() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -2631,7 +3107,6 @@ class Log:
         is open — §11 treats stalled eviction as an operational condition, and
         returning None says nothing about it.
         """
-        self._writable()
 
         # The lease is the exclusion, and it is the only one this needs. There
         # is no lock around the pass any more: a compaction reads every file it
@@ -2694,7 +3169,6 @@ class Log:
         is not a way around it: a second owner is refused whichever entry point
         it came through.
         """
-        self._writable()
         # No claim here. Each pass claims the range it actually works on —
         # compaction a run, eviction the prefix it removes — so two maintainers
         # exclude each other only where their work overlaps, which is what §4a
@@ -2716,7 +3190,6 @@ class Log:
         lease as `maintain` and `sync`, and it rewrites the same files they
         would.
         """
-        self._writable()
         if not self._archive.configured():
             msg = "rewrite_archive() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -2760,7 +3233,6 @@ class Log:
         archive it just came from. Eviction still applies to it, which is the
         point: this is temporary unless `local_retention` is raised too.
         """
-        self._writable()
         if not self._archive.configured():
             msg = "hydrate() needs an archive; this log is local-only"
             raise ValueError(msg)
@@ -2907,7 +3379,6 @@ class Log:
         # make every existing file invalid, and Iceberg refuses it too.
 
         with self._lock:
-            self._writable()
             # The claim `set_config` and `set_archive` share. Claims exclude by
             # RANGE, not by kind, and this one is `[0, EVERYTHING]` — so seal,
             # compact, sync, evict, `rewrite_archive`, `hydrate` and
@@ -2926,7 +3397,7 @@ class Log:
                 # Step 3: the intent, before anything it describes (I16).
                 # Nothing else is recorded — every step below is settled by
                 # asking the thing itself, because a stamp can be FALSE.
-                # `Log.restore` rebuilds the local table from `meta`, so a
+                # `litelink.restore` rebuilds the local table from `meta`, so a
                 # replica captured mid-change would carry a stamp saying step 5
                 # had landed onto a machine where it had not.
                 self._buffer.set_meta(INTENT_KEY, _intent(name, type_))
@@ -3056,37 +3527,6 @@ class Log:
         reject_reserved(name)
         raise NotImplementedError
 
-    # -- lifecycle ---------------------------------------------------------
-
-    def close(self) -> None:
-        """Release handles. Does not seal, and has nothing to stop.
-
-        Not sealing is deliberate: committed rows are already durable, and an
-        implicit seal on close would emit an undersized file every time a
-        process restarted. Groups already queued are left queued — they are
-        durable, correctly sized, and whoever opens the log next will find
-        them, which is the point of writing the cut down rather than deriving
-        it.
-
-        Nothing to stop because nothing was started. Sealing happens when a
-        caller asks for it, in the caller's own loop, so there is no thread
-        here whose lifetime has to be managed and no error from one to
-        re-raise at a place the caller never asked about.
-        """
-        self._reader.close()
-        self._buffer.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close()
-
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
     """The Arrow schema as declared, checked against the table's columns.
@@ -3127,15 +3567,6 @@ def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
             raise ValueError(msg)
 
     return declared
-
-
-class _ArchiveDeferred(RuntimeError):
-    """Step 4 could not run because the archive is not reachable.
-
-    Its own type because recovery treats it as "leave the intent standing and
-    open anyway", while `add_column` lets it out to the caller — the same
-    condition, but a failed call and a deferred replay are different answers.
-    """
 
 
 def _intent(name: str, type_: pa.DataType) -> str:

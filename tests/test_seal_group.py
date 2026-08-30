@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig, WriteHandle
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -36,8 +37,8 @@ PAYLOAD = "p" * 400
 TARGET = 32 * 1024
 
 
-def open_log(root: Path, config: LogConfig | None = None) -> Log:
-    return Log.new(root, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
+def open_log(root: Path, config: LogConfig | None = None) -> WriteHandle:
+    return litelink.new(root, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)
 
 
 def rows(n: int, *, start: int = 0) -> list[dict[str, object]]:
@@ -51,7 +52,7 @@ def _today() -> date:
     return datetime.now(UTC).date()
 
 
-def groups(log: Log) -> list[tuple[int, int | None, int | None, int]]:
+def groups(log: WriteHandle) -> list[tuple[int, int | None, int | None, int]]:
     """Every queue row: `(group_id, start, end, bytes)`, oldest first.
 
     Unnamed extents only. A row keeps its identity after it seals — it gains
@@ -290,7 +291,7 @@ def test_a_reopened_log_adopts_the_rows_it_finds(tmp_path: Path) -> None:
     log.extend(rows(10))
     log.close()
 
-    reopened = Log.open(root, "s")
+    reopened = litelink.open(root, "s")
     try:
         open_group = [g for g in groups(reopened) if g[2] is None]
 

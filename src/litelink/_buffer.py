@@ -49,10 +49,10 @@ INTENT_KEY = "schema_intent"
 
 # Where a log records the offset it was created to start at, or nothing if it
 # started at 1. Durable because a future backfill needs to tell the RESERVE
-# below it — deliberate, empty, safe to fill — from a `Log.restore` fence,
+# below it — deliberate, empty, safe to fill — from a `litelink.restore` fence,
 # which is empty for the opposite reason and must never be filled.
 #
-# Nothing distinguishes them after the fact: `Log` says "the skipped range
+# Nothing distinguishes them after the fact: `WriteHandle` says "the skipped range
 # leaves no trace once the sequence has moved", and a restore whose replica was
 # empty leaves the log high with nothing below it, positionally identical to a
 # reserve. The recorded value is the only thing that separates the two.
@@ -343,7 +343,7 @@ class Buffer:
         self._sealer = sealer
         # What `shape()` falls back to when `meta` has no schema row yet. Two
         # callers need that and both would otherwise fail at construction:
-        # `_create` runs inside `Buffer.open` BEFORE `Log.new` writes the row,
+        # `_create` runs inside `Buffer.open` BEFORE `litelink.new` writes the row,
         # and the scratch buffer an archive rewrite cuts through is handed a
         # schema directly and only ever has `CONFIG_KEY` written into it.
         #
@@ -451,7 +451,7 @@ class Buffer:
     ) -> Buffer:
         """Connect, configure, and create the tables. Then hand them to `cls`.
 
-        The I/O half, kept out of `__init__` for the same reason `Log.open` is
+        The I/O half, kept out of `__init__` for the same reason `litelink.open` is
         kept out of `Log.__init__`: a constructor that opens files cannot be
         handed a substitute, and a test that wants one should not have to
         monkeypatch its way in.
@@ -1566,7 +1566,7 @@ class Buffer:
         same end, and `finish_seal` then hits the `rel_path` UNIQUE after the
         Iceberg commit has already landed.
 
-        Unreachable until `Log.restore` began releasing archived rows out from
+        Unreachable until `litelink.restore` began releasing archived rows out from
         under a knowingly-stale group (§3a), which is one transaction away from
         the reseed that fixes it.
 
@@ -2084,7 +2084,7 @@ class Buffer:
         There is exactly one copy of this, and it is the `meta` row. Everything
         that decides from the policy reads it here, so nothing can hold a stale
         one — which is the failure this replaces: the policy used to live in
-        `Log`, in `Maintenance` and, derived, in this object's seal target, all
+        `WriteHandle`, in `Maintenance` and, derived, in this object's seal target, all
         kept in step by `set_config` writing each. A refresh call had to sit
         wherever a decision was made, and a design needing N of those is always
         one short somewhere, because nothing says where N is.
@@ -2117,7 +2117,7 @@ class Buffer:
         """The declared clustering, read from the log rather than remembered.
 
         The rule `config` follows, for the reason `config` follows it (§4a).
-        This used to live in four places — `meta`, `Log`, `Maintenance` and
+        This used to live in four places — `meta`, `WriteHandle`, `Maintenance` and
         `Archive` — kept in step by `set_sort_by` writing each. That is a
         fan-out, and a fan-out is only correct in the process that ran it: a
         maintainer already open elsewhere went on sorting by the key IT opened
@@ -2368,7 +2368,7 @@ class Buffer:
         - **`compacting` stays.** It only queues deletions, and its outputs
           are archive objects this machine never wrote.
 
-        Finally the offset sequence is raised by `reserve`. See `Log.restore`.
+        Finally the offset sequence is raised by `reserve`. See `litelink.restore`.
         """
         with self._transaction():
             self._con.execute(
@@ -2411,7 +2411,7 @@ class Buffer:
         left the buffer changes nothing. This drops the stale row first.
 
         For the restore path, where the group was seeded from a replica's view
-        of the archive and the archive has since moved on: see `Log.restore`.
+        of the archive and the archive has since moved on: see `litelink.restore`.
         """
         with self._transaction():
             self._con.execute(

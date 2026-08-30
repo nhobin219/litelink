@@ -1,6 +1,6 @@
 """Construction, validation, and what the injected collaborators buy.
 
-`Log.__init__` takes built collaborators and does no I/O; `open` and
+`WriteHandle.__init__` takes built collaborators and does no I/O; `open` and
 `open_readonly` are what construct and validate them. These tests exercise both
 halves — the validation rules on the way in, and the substitutability that
 having them as parameters is for.
@@ -19,7 +19,8 @@ import pyarrow.parquet as pq
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig, WriteHandle
 from litelink._archive import Archive
 from litelink._buffer import SORT_KEY, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
@@ -69,7 +70,7 @@ def test_table_schema_puts_offset_first() -> None:
 def test_init_does_no_io(tmp_path: Path) -> None:
     """The initialiser assigns; `open` is what touches the disk.
 
-    Constructing a Log against a root that does not exist must therefore
+    Constructing a WriteHandle against a root that does not exist must therefore
     succeed, because nothing in __init__ should be looking at it.
     """
     layout = Layout(tmp_path / "does-not-exist", "s")
@@ -79,11 +80,11 @@ def test_init_does_no_io(tmp_path: Path) -> None:
 
     config = LogConfig()
     # Local-only, and still a real object: the reader, the maintainer and the
-    # Log are handed the same one. It stores no location — it reads the log's,
+    # WriteHandle are handed the same one. It stores no location — it reads the log's,
     # so `set_archive` reaches all three by writing one row.
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
     archive = Archive(layout, buffer, S3Options())
-    log = Log(
+    log = WriteHandle(
         layout=layout,
         table=table,
         buffer=buffer,
@@ -118,7 +119,7 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
     archive = Archive(layout, buffer, S3Options())
 
-    log = Log(
+    log = WriteHandle(
         layout=layout,
         table=table,
         buffer=buffer,
@@ -149,7 +150,7 @@ def test_layout_paths_are_derived_not_discovered(tmp_path: Path) -> None:
 
 def test_open_readonly_refuses_a_missing_log(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="no litelink log at"):
-        Log.open(tmp_path / "nothing", "s", read_only=True)
+        litelink.open(tmp_path / "nothing", "s", read_only=True)
 
 
 def test_the_extent_cache_follows_the_metadata_pointer(tmp_path: Path) -> None:
@@ -160,7 +161,7 @@ def test_the_extent_cache_follows_the_metadata_pointer(tmp_path: Path) -> None:
     to notice: a cache that never invalidated would still pass most of them,
     because most do not commit between two reads.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     table = log._table
 
     assert table.extent() is None, "nothing sealed yet"
@@ -186,7 +187,7 @@ def test_the_extent_cache_is_reused_while_the_pointer_holds(tmp_path: Path) -> N
     Asserted by object identity — `_read_extent` builds a fresh tuple every
     time, so the same object coming back proves the manifests were not touched.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     log.extend([{"event_ts": 1, "key": "a"}])
     log.seal()
 
@@ -208,10 +209,10 @@ def test_the_extent_cache_is_reused_while_the_pointer_holds(tmp_path: Path) -> N
 
 
 def test_new_refuses_to_clobber_an_existing_log(tmp_path: Path) -> None:
-    Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)).close()
+    litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)).close()
 
     with pytest.raises(FileExistsError, match="already exists"):
-        Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+        litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
 
 
 def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
@@ -221,7 +222,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
     order (§4), config and archive from the buffer's `meta` table (§2).
     """
     config = LogConfig(target_seal_size=4096, compact_min_files=7)
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -231,7 +232,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
     ) as created:
         created.append({"event_ts": 1, "key": "a"})
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened.sort_by == ("key", "event_ts")
         assert reopened._archive.uri == "s3://bucket/prefix"
         assert reopened.config == config
@@ -247,28 +248,28 @@ def test_a_log_with_no_stored_config_refuses_to_open(tmp_path: Path) -> None:
     Substituting defaults would quietly change how a log seals and what it
     retains, which is worse than refusing to open it.
     """
-    Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)).close()
+    litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)).close()
 
-    log = Log.open(tmp_path, "s")
+    log = litelink.open(tmp_path, "s")
     log._buffer._con.execute("DELETE FROM meta WHERE k = 'config'")
     log.close()
 
     with pytest.raises(ValueError, match="no stored config"):
-        Log.open(tmp_path, "s")
+        litelink.open(tmp_path, "s")
 
 
 def test_set_config_persists(tmp_path: Path) -> None:
     """Every knob in LogConfig governs future work, so no rewrite is needed."""
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         log.set_config(LogConfig(target_seal_size=1234, compact_min_files=9))
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened.config.target_seal_size == 1234
         assert reopened.config.compact_min_files == 9
 
 
 def test_set_config_validates(tmp_path: Path) -> None:
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         with pytest.raises(ValueError, match="archive"):
             log.set_config(LogConfig(local_retention=timedelta(0)))
 
@@ -276,25 +277,25 @@ def test_set_config_validates(tmp_path: Path) -> None:
 
 
 def test_set_archive_persists(tmp_path: Path) -> None:
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         log.set_archive("s3://bucket/x")
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened._archive.uri == "s3://bucket/x"
         reopened.set_archive(None)
 
-    with Log.open(tmp_path, "s") as detached:
+    with litelink.open(tmp_path, "s") as detached:
         assert detached._archive.uri is None
 
 
 def test_sort_by_is_declared_on_the_table(tmp_path: Path) -> None:
     """§4: declared as table metadata AND applied at write time."""
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("key", "event_ts")) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("key", "event_ts")) as log:
         assert log._table.sort_by() == ("key", "event_ts")
 
 
 def test_changing_sort_by_requires_an_explicit_rewrite(tmp_path: Path) -> None:
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         with pytest.raises(ValueError, match="rewrite=True"):
             log.set_sort_by(("key",), rewrite=False)
 
@@ -311,7 +312,7 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
     """
     import pyarrow.parquet as pq
 
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         log.extend(
             [
                 {"event_ts": 3, "key": "a"},
@@ -335,7 +336,7 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
         assert rows["litelink_offset"].to_pylist() == [1, 2, 3]
         assert rows.num_rows == 3
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened.sort_by == ("key",), "the new order must survive a reopen"
 
 
@@ -346,7 +347,7 @@ def test_the_reserved_column_is_refused_at_schema_change_time(tmp_path: Path) ->
     introduce or retire the library's column, and monotonicity and non-reuse
     cannot be enforced on a column the application controls.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         with pytest.raises(ValueError, match="litelink_offset"):
             log.add_column("litelink_offset", pa.int64())
 
@@ -378,7 +379,7 @@ def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
     to quote it forever, failing with a syntax error that says nothing about
     why.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         log.append({"event_ts": 1, "key": "a"})
 
         unquoted = log.sql("SELECT max(litelink_offset) FROM log").read_all()
@@ -387,7 +388,7 @@ def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
 
 
 def test_a_relative_root_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`Log.new("litelink-data", …)` — what the demo scripts actually pass.
+    """`litelink.new("litelink-data", …)` — what the demo scripts actually pass.
 
     A relative root produced `file://litelink-data/…`, which is not a relative
     file URI: it parses as host `litelink-data`, and DuckDB reports a missing
@@ -397,7 +398,7 @@ def test_a_relative_root_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     """
     monkeypatch.chdir(tmp_path)
 
-    with Log.new("data", "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new("data", "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         assert log.root.is_absolute()
         assert log._layout.warehouse_uri.startswith("file:///")
         assert log._layout.catalog_uri.startswith("sqlite:////")
@@ -410,7 +411,7 @@ def test_a_relative_root_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         # Iceberg metadata path at all.
         assert log.scan().read_all().num_rows == 3
 
-    with Log.open("data", "s") as reopened:
+    with litelink.open("data", "s") as reopened:
         assert reopened.scan().read_all().num_rows == 3
 
 
@@ -419,7 +420,7 @@ def test_a_relative_root_is_resolved_once(
 ) -> None:
     """Resolved at construction, so a later chdir cannot move the log."""
     monkeypatch.chdir(tmp_path)
-    log = Log.new("data", "s", schema=SCHEMA, sort_by=("event_ts",))
+    log = litelink.new("data", "s", schema=SCHEMA, sort_by=("event_ts",))
     root = log.root
 
     (tmp_path / "elsewhere").mkdir()
@@ -525,7 +526,7 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
     opened with. A config written by hand knows what someone remembered.
     """
     s3 = S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1")
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -572,7 +573,7 @@ def test_the_config_uses_litestreams_current_single_replica_key(
     # An endpoint and a region, so every optional field is rendered — the
     # ones most likely to be left behind at the old indentation are exactly
     # the ones a bare `S3Options()` omits.
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -620,7 +621,7 @@ def test_wal_retention_writes_a_snapshot_window_the_sidecar_can_act_on(
     with "cannot unmarshal into time.Duration" when the retention is replaced
     with a non-duration — so the field is genuinely parsed, not ignored.
     """
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -676,7 +677,7 @@ def test_replication_needs_somewhere_to_ship_to(tmp_path: Path) -> None:
 def test_the_replication_config_is_written_beside_the_log(tmp_path: Path) -> None:
     """Derived like every other path: a setting for it would be one more thing
     to keep in step with the log it describes."""
-    with Log.new(
+    with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -737,8 +738,8 @@ def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> N
     """
     shared = "s3://bucket/prefix"
     with (
-        Log.new(tmp_path, "one", schema=SCHEMA, archive=shared) as first,
-        Log.new(tmp_path, "two", schema=SCHEMA, archive=shared) as second,
+        litelink.new(tmp_path, "one", schema=SCHEMA, archive=shared) as first,
+        litelink.new(tmp_path, "two", schema=SCHEMA, archive=shared) as second,
     ):
         # The REPLICA path, not the database path — both spell themselves
         # `path:`. Told apart by indentation: the database's sits at the list
@@ -768,7 +769,7 @@ def test_compact_min_files_below_two_is_refused(tmp_path: Path) -> None:
     """
     for value in (0, 1):
         with pytest.raises(ValueError, match="compact_min_files must be at least 2"):
-            Log.new(
+            litelink.new(
                 tmp_path,
                 f"s{value}",
                 schema=SCHEMA,
@@ -785,7 +786,7 @@ def test_local_rows_zero_without_an_archive_is_refused(tmp_path: Path) -> None:
     zero rows — and was accepted, evicting every sealed file as the only copy.
     """
     with pytest.raises(ValueError, match="evict on upload"):
-        Log.new(
+        litelink.new(
             tmp_path,
             "s",
             schema=SCHEMA,
@@ -804,7 +805,7 @@ def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
     make an old binary respect the new table, so refuse rather than run beside
     one.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     with log:
         with log._buffer._lock:
             log._buffer._con.execute(
@@ -812,7 +813,7 @@ def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
             )
 
     with pytest.raises(RuntimeError, match="coordinated through a `lease` table"):
-        Log.open(tmp_path, "s")
+        litelink.open(tmp_path, "s")
 
 
 def test_negative_local_retention_is_refused(tmp_path: Path) -> None:
@@ -825,7 +826,7 @@ def test_negative_local_retention_is_refused(tmp_path: Path) -> None:
     because it tests equality.
     """
     with pytest.raises(ValueError, match="local_retention must not be negative"):
-        Log.new(
+        litelink.new(
             tmp_path,
             "s",
             schema=SCHEMA,
@@ -842,7 +843,7 @@ def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> N
     config that keeps a million rows regardless of age, with a message that is
     false for it.
     """
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -868,14 +869,14 @@ def test_two_processes_cannot_assemble_the_pair_validate_refuses(
     other detaches the archive against a policy it read before that. The next
     maintenance pass then executes it and deletes the only copy of everything.
     """
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
         archive="s3://bucket/prefix",
     )
-    with log, Log.open(tmp_path, "s") as other:
+    with log, litelink.open(tmp_path, "s") as other:
         # `other` opened while an archive was configured and a normal policy
         # was in force; it still remembers both.
         log.set_config(LogConfig(local_rows=0))
@@ -897,7 +898,7 @@ def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) ->
     Both setters take the same claim now, so the interleaving cannot happen —
     modelled here by holding that claim while the second call runs.
     """
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -930,7 +931,7 @@ def test_negative_snapshot_retention_is_refused(tmp_path: Path) -> None:
     tests and demos ask for on purpose.
     """
     with pytest.raises(ValueError, match="snapshot_retention must not be negative"):
-        Log.new(
+        litelink.new(
             tmp_path,
             "s",
             schema=SCHEMA,
@@ -938,7 +939,7 @@ def test_negative_snapshot_retention_is_refused(tmp_path: Path) -> None:
             config=LogConfig(snapshot_retention=timedelta(hours=-1)),
         )
 
-    Log.new(
+    litelink.new(
         tmp_path,
         "zero",
         schema=SCHEMA,
@@ -956,7 +957,7 @@ def test_a_configuration_change_waits_for_maintenance(tmp_path: Path) -> None:
     wait existed: one startup in six failed, which turns a routine restart into
     a coin toss.
     """
-    log = Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
+    log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     with log:
         log._settings_wait = 5.0  # ty: ignore[unresolved-attribute]
         held = log._lease("maintain")
@@ -992,7 +993,7 @@ def test_a_setter_that_lost_its_claim_does_not_write(tmp_path: Path) -> None:
     pass carries out. Every data commit already asks the claim again at the
     write; the setters stopped one line short.
     """
-    log = Log.new(
+    log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
@@ -1049,10 +1050,10 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
     There is one copy now, in `meta`. A handle that has never heard of a change
     cannot be wrong about it, because it holds nothing to be wrong with.
     """
-    first = Log.new(
+    first = litelink.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=LogConfig()
     )
-    with first, Log.open(tmp_path, "s") as second:
+    with first, litelink.open(tmp_path, "s") as second:
         assert second.config.local_rows is None
         assert not second._archive.configured()
 
@@ -1082,7 +1083,7 @@ def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
     table: the declaration is removed from under a closed log and the order
     still comes back.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         assert log._table.sort_by() == ("event_ts",)  # noqa: SLF001
 
     catalog = SqlCatalog(
@@ -1094,7 +1095,7 @@ def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
     with table.update_sort_order() as update:
         update._apply()  # noqa: SLF001
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened.sort_by == ("event_ts",), (  # noqa: SLF001
             "open read the table's declaration rather than meta"
         )
@@ -1107,7 +1108,7 @@ def test_a_log_with_no_stored_sort_order_is_refused(tmp_path: Path) -> None:
     every file the next compaction rewrites while the table still declared a
     key. Same rule as the stored config, one line above it.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)):
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)):
         pass
 
     buffer = Buffer.open(Layout(tmp_path, "s").buffer_db, SCHEMA)
@@ -1117,7 +1118,7 @@ def test_a_log_with_no_stored_sort_order_is_refused(tmp_path: Path) -> None:
         buffer.close()
 
     with pytest.raises(ValueError, match="no stored sort order"):
-        Log.open(tmp_path, "s")
+        litelink.open(tmp_path, "s")
 
 
 def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
@@ -1128,14 +1129,14 @@ def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
     key. Harmless while `open` read that declaration and reverted; permanent
     once `meta` is the source of truth, because nothing would reconcile them.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         log.extend([{"event_ts": i, "key": f"k{i}"} for i in range(20)])
         log.set_sort_by((), rewrite=True)
 
         assert log._table.sort_by() == ()  # noqa: SLF001
         assert log._buffer.get_meta("sort_by") == "[]"  # noqa: SLF001
 
-    with Log.open(tmp_path, "s") as reopened:
+    with litelink.open(tmp_path, "s") as reopened:
         assert reopened.sort_by == ()  # noqa: SLF001
 
 
@@ -1156,7 +1157,7 @@ def test_a_rewrite_finishes_a_re_sort_that_died_after_the_meta_write(
     declarations: both of those already said the right thing in the broken
     state, which is what made it silent.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         # `key` descending as `event_ts` ascends, so the two clusterings are
         # distinguishable and neither is the insertion order by accident.
         log.extend([{"event_ts": i, "key": f"k{20 - i:02d}"} for i in range(20)])
@@ -1216,7 +1217,7 @@ def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
 ) -> None:
     """ "Cannot tell" and "no table" have opposite safe answers here.
 
-    `Log.restore` reads this to decide whether it is resuming an interrupted
+    `WriteHandle.restore` reads this to decide whether it is resuming an interrupted
     restore. Answering False when the catalog merely could not be READ tells it
     to resume over a LIVE log — and the resume path reserves 2**20 offsets on
     it, deletes every `extent` row including queued cuts, wipes `sealing` and
@@ -1228,7 +1229,7 @@ def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
     landing in another process's commit window returns SQLITE_BUSY.
     `_recorded_location` refuses the same conflation, in the same words.
     """
-    with Log.new(tmp_path, "s", schema=SCHEMA):
+    with litelink.new(tmp_path, "s", schema=SCHEMA):
         pass
 
     layout = Layout(tmp_path, "s")
@@ -1243,4 +1244,4 @@ def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
 
     # And the caller that matters treats it as "exists" rather than proceeding.
     with pytest.raises((LookupError, FileExistsError, ValueError, RuntimeError)):
-        Log.restore(tmp_path, "s", archive="s3://bucket/prefix")
+        litelink.restore(tmp_path, "s", archive="s3://bucket/prefix")

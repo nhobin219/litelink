@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import litelink
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -41,7 +43,8 @@ PRELUDE = """
 import time
 import pyarrow as pa
 from datetime import timedelta
-from litelink import Log, LogConfig
+import litelink
+from litelink import LogConfig, WriteHandle
 from litelink._s3 import S3Options
 
 SCHEMA = pa.schema([
@@ -96,7 +99,7 @@ WRITER = """
         local_retention=timedelta(seconds=0),
         snapshot_retention=timedelta(seconds=0),
     )
-    log = Log.new(ROOT, "s", schema=SCHEMA, sort_by=("event_ts",),
+    log = litelink.new(ROOT, "s", schema=SCHEMA, sort_by=("event_ts",),
                   config=config, archive=ARCHIVE, s3=S3)
     print("ready", flush=True)
     for start in range(0, ROWS, BATCH):
@@ -112,7 +115,7 @@ WRITER = """
 # Seals, compacts, evicts and pushes — nothing else. It never appends, and it
 # holds the seal and maintain leases the writer therefore never takes.
 MAINTAINER = """
-    log = Log.open(ROOT, "s", s3=S3)
+    log = litelink.open(ROOT, "s", s3=S3)
     passes = 0
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
@@ -142,7 +145,7 @@ MAINTAINER = """
 # each exactly once. A seal, a compaction, an eviction or a sync landing
 # mid-query would show up here as a gap or a repeat.
 READER = """
-    log = Log.open(ROOT, "s", read_only=True, s3=S3)
+    log = litelink.open(ROOT, "s", read_only=True, s3=S3)
     samples, high = 0, 0
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -200,7 +203,6 @@ def test_the_archive_actually_took_part(
     Without this the three-process test above would pass just as well with the
     archive doing nothing — every row would simply still be local.
     """
-    from litelink import Log
 
     root = tmp_path / "log"
     archive = f"s3://{bucket}/prefix"
@@ -212,7 +214,7 @@ def test_the_archive_actually_took_part(
     finish(writer, "writer")
     finish(maintainer, "maintainer")
 
-    with Log.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3=s3) as log:
         watermark = int(log._buffer.get_meta("archive_through") or 0)
         assert watermark > 0, "nothing was ever archived"
 

@@ -144,7 +144,7 @@ Everything else is the application's schema, declared at stream creation and tre
 opaque. Iceberg computes statistics for every column, so all of them prune.
 
 ```python
-litelink.Log.new(
+litelink.new(
     root, name,
     schema=pa.schema([...]),          # the application's columns
     sort_by=("event_ts", "key"),      # names from that schema
@@ -240,7 +240,7 @@ replication lag, which is a property of a sidecar rather than of the layout.
 **Litestream (or equivalent WAL shipping) is the sidecar.** It continuously replicates
 SQLite WAL frames to object storage, and litelink never starts it — that is a separate
 process reading the WAL, which is exactly why replication does not put the network in the
-write path. What the library owns is `Log.databases`: which files carry the log's state and
+write path. What the library owns is `LocalReadHandle.databases`: which files carry the log's state and
 therefore have to be replicated.
 
 **`wal_replication` is a declaration, not a supervisor.** This paragraph used to say the
@@ -267,11 +267,11 @@ That last justification used to be "omit it and the objects in S3 survive with n
 say what they are". It is no longer true — the archive publishes `version-hint.text` and can
 name its own metadata — and the file is now replicated for the *same-machine* case, where
 it saves a round trip, while a failover deliberately does NOT restore it: a stale copy wins
-over the bucket's own pointer and reads the archive short. See §3a and `Log.restore`.
+over the bucket's own pointer and reads the archive short. See §3a and `litelink.restore`.
 
 **One sidecar per root.** Two of those three live at the root and are shared by every log
 under it, so a sidecar per log would run two instances against the same `catalog.db` — what
-litestream forbids — and ship them to one replica path. `Log.replication_config` describes
+litestream forbids — and ship them to one replica path. `replication_config` describes
 the log it was asked about, so a root holding several logs needs one config naming every
 buffer under it, written by hand until this generates it. One log per root avoids the
 question.
@@ -332,7 +332,93 @@ what made an out-of-date replica safe before it.
 It is NOT the same claim as "a restore is correct by construction", which this said until
 a measurement disproved it: `catalog.db` records absolute paths to local Iceberg metadata
 that no sidecar replicates, so restoring the databases onto another machine and opening
-the log fails outright. See §3a's failover notes and `Log.restore`.
+the log fails outright. See §3a's failover notes and `litelink.restore`.
+
+## 3b. Reading a log from another machine
+
+`litelink.follow` assembles a **read-only view of a log running somewhere else**: the archive
+merged with a restored copy of the writer's `buffer.db`, so a reader sees data fresher than
+the archive alone — down to the replication lag rather than to the seal cadence. It is what
+§3a's replication buys on the read side, and it exists because the alternative readers had
+was the archive, which is `sync`-fresh at best.
+
+**It is `restore`'s assembly without the takeover.** `restore` burns `RESTORE_RESERVE`
+offsets to fence a machine that may still be writing (I9); a follower appends nothing, so
+there is nothing to fence and it reserves none. It opens read-only, which is also what keeps
+`recover()` from finishing a seal the primary owns.
+
+**A snapshot, not a subscription.** litestream restores to a point in time, so refreshing
+means assembling another one. That is why the root is always a temporary directory the
+follower owns and removes on close: it is scaffolding for one read session, not a durable
+artefact. There is deliberately no `root` parameter — a caller-supplied one could land on a
+directory that already held a live log, whose `catalog.db` and `archive.db` are shared by
+every log under it, and could leave a stale `archive.db` to win over the bucket's own hint.
+Both were reachable only through that argument, so removing it was cheaper than guarding it. The archive metadata is pinned at assembly for the same reason — and because
+`previous-versions-max: 10` keeps ten previous versions beside the current one, so the
+**eleventh further archive commit** deletes the metadata object a follower is holding, **with
+no time component at all**. Archive commits are the ones that count — `sync`, `rewrite_archive`
+and archive expiry — not a local `maintain()`, which moves nothing in the bucket. A primary
+syncing steadily can still sweep a follower in seconds. Every read therefore re-reads that pointer and refuses with "reassemble" rather
+than serving from a snapshot that is gone.
+
+**Following returns a `RemoteReadHandle`, a sibling of the `LocalReadHandle` that
+`open(read_only=True)` returns.** The
+decomposition is `WriteHandle = LocalReadHandle + writes`, so `follow` builds the buffer, the local
+table, the archive handle and the `Reader` directly and hands them over. What makes it a
+follower is state: an empty local table beside an archive that holds rows, which is the same
+condition a fully evicted local log meets and gets the same treatment for. Two earlier shapes were wrong in the same direction: subclassing `WriteHandle` published
+a write surface that only raised, and wrapping a whole `WriteHandle` hid that surface while still
+constructing the writer machinery and then reaching past it. Both bugs review found on this
+class came from that seam — a read that lost its error translation to the wrapped object's
+internal dispatch, and a staleness number answered by a writer's method.
+
+**Two things are then unrepresentable rather than refused:**
+
+- **There is no `include_archive=False`.** A follower's local Iceberg table is empty by
+  construction — `_assemble_follower` creates it that way — so reading without the archive
+  returns the replicated buffer alone: a fraction of the log, silently. As a subclass this
+  was a parameter that had to raise; wrapping deletes it.
+- **There is no `write_replication_config`.** `litestream_config` keys each replica on the
+  path *relative to the root*, so a follower with the same log name produces a key identical
+  to the primary's. A sidecar run in a follower's root — which this project's own convention
+  says to do — would ship the follower's stripped scratch copy over the primary's only
+  off-box record of its unsealed rows. `_restore_replica` keeps the config it needs in a
+  temporary directory of its own for the same reason.
+
+**`coverage()` reports, it does not adjudicate.** A follower is assembled from two tiers and
+cannot ask the primary anything, so the failure to avoid is silence, not incompleteness. It
+returns the archive extent, the buffered extent, the gap between them if any, and whether
+the followed log declared `wal_replication`.
+
+**A gap is not necessarily loss**, and nothing local can tell the two apart. The gap this
+reports sits above the archive's frontier and below the next thing the replica knows of —
+the buffer's first offset when it holds rows, and the sequence's end when it does not. A
+range there is either a band the buffer lost, since rows sealed while `wal_replication` was
+off are discarded at seal and gone, or a `litelink.restore` fence, which burns 2**20 offsets in
+exactly that position.
+
+**The empty-buffer case is why the bound is not simply the buffer's first offset.** An
+archived log with replication off discards each seal's rows and they reach the archive only
+at the next `sync`; a follower assembled in that window — the ordinary way an operator
+adopts following — has an empty buffer and a sequence far above the archive. Comparing
+against the buffer alone reported such a follower gap-free while it served a fraction of the
+log. `sqlite_sequence` closes it, because it counts every offset ever assigned and never
+lowers. From a replica the two are indistinguishable:
+the fence "leaves no trace once the sequence has moved" (§13.4). A caller who knows whether
+their log has failed over can read a gap that this cannot, so it reports the gap and lets
+them.
+
+A `start_offset` reserve is NOT one of the possibilities, and an earlier draft of this
+section wrongly said it was. That reserve lies below the archive's low end, and nothing here
+compares against it — so it never surfaces as a gap at all.
+
+An earlier design refused to open on a gap. It was wrong for exactly this reason: it refused
+every followed log that had ever failed over, on a million offsets that never existed.
+
+**It requires a published archive.** `archive_extent` returns None both for "nothing pushed"
+and for "a hint over an empty table", so a log before its first successful sync cannot be
+followed. Serving the buffer alone instead would be a reader silently missing every archived
+row — the one failure this must not have.
 
 ## 4. Seal
 
@@ -587,7 +673,7 @@ reason: it writes durable state that no running process would otherwise hear abo
 §8's retention reads as an obligation rather than a hint.
 
 That refresh also forced a correction worth stating on its own: the policy now has ONE
-owner. `Log` used to keep a copy beside `Maintenance`'s, with the buffer's seal target as a
+owner. `WriteHandle` used to keep a copy beside `Maintenance`'s, with the buffer's seal target as a
 third, kept in step by `set_config` writing all three. Two copies is one too many the moment
 anything else can change the policy — refreshing one would leave compaction reading the new
 grouping while `sync` read the old, and `runs` is shared by exactly those two so that they
@@ -616,7 +702,7 @@ a statement about the past. Each setter could pass against a state the other was
 change, so between them the two calls assembled the very pair neither would accept — and the
 next maintenance pass carried it out. **`set_config` and `set_archive` therefore take the
 same claim**, which is §4a's own rule about data, applied to the configuration that governs
-it: the check and the act share a transaction, or they are not a guard. `Log.new` records
+it: the check and the act share a transaction, or they are not a guard. `litelink.new` records
 the pair in one `meta` transaction for the same reason, and both setters ask for the claim
 again at the write — the read and the write are one decision only while it is held, and a
 stall past the TTL between them lets the other setter take the lapsed claim lawfully and
@@ -1361,7 +1447,7 @@ replays it, and the table's columns say which half already landed.
 **Probe, never stamp.** The intent records WHAT the change is, never which of its steps have
 run. Recording a step does not make it atomic with the commit it describes — it only moves
 the unreconciled gap from before that commit to after it — and a stamp can be *false*:
-`Log.restore` rebuilds the local table from the declared schema, so a replica captured
+`litelink.restore` rebuilds the local table from the declared schema, so a replica captured
 mid-change arrives carrying a record of a step that never landed on that machine. Every step
 is settled by asking the thing itself: the archive's columns, the local table's, `PRAGMA
 table_info(buffer)`, the `meta` row. This requires the Iceberg step to be replayable against
@@ -1509,7 +1595,7 @@ wal_retention          how far back a restore may go      (None = litestream's o
 
 `sort_by` is NOT in here. Everything above governs future work only, so `set_config` needs
 no rewrite; the sort order is a read-shape decision that re-clusters every file the local
-table owns, so it is set at `Log.new` and changed by `set_sort_by`. It lives in `meta` beside the
+table owns, so it is set at `litelink.new` and changed by `set_sort_by`. It lives in `meta` beside the
 schema, not in `LogConfig`.
 
 `maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no
@@ -1669,8 +1755,8 @@ The consequence worth planning for is that local disk holds roughly
    already batching hard enough to want this endpoint instead.
 
    **`start_offset` is recorded durably in `meta`, and that is not bookkeeping.** A backfill
-   has to tell this reserve from a `Log.restore` fence, and after the fact nothing else can:
-   both are empty ranges below the log's offsets, and `Log` says of the failover reserve that
+   has to tell this reserve from a `litelink.restore` fence, and after the fact nothing else can:
+   both are empty ranges below the log's offsets, and `WriteHandle` says of the failover reserve that
    it *"leaves no trace once the sequence has moved"*. Position does not separate them either — a restore whose replica
    was empty leaves the log high with nothing beneath it, which is a reserve's own shape. So
    the recorded value is the only thing a backfill may bound itself by, and its ABSENCE must
@@ -1690,7 +1776,7 @@ The consequence worth planning for is that local disk holds roughly
    trips; the `sqlite_sequence` bump is the cheaper way to satisfy it.
 
    **Reserving DOWNWARD is what makes a cutover cheap, and it is the same mechanism.** A log
-   created with a non-zero starting offset — `Log.new(..., start_offset=N)` — leaves
+   created with a non-zero starting offset — `litelink.new(..., start_offset=N)` — leaves
    `[1, N-1]` permanently unassigned. Live capture begins immediately at `N`, and the
    historical corpus is bulk-ingested into the reserve afterwards, at whatever pace the
    rewrite takes. The two never contend: the backfill writes strictly below every offset
@@ -1710,7 +1796,7 @@ The consequence worth planning for is that local disk holds roughly
    RANGE; the library still assigns every value inside it. That is the distinction I11 is
    drawing — not "the library picks the number" but "no caller-supplied number can collide
    with, or reuse, one the library has issued". A `start_offset` at creation cannot: nothing
-   has been issued yet. `Log.restore` already reserves a gap this way (`RESTORE_RESERVE`),
+   has been issued yet. `litelink.restore` already reserves a gap this way (`RESTORE_RESERVE`),
    for the same reason in a different direction.
 
    **The API takes `offsets` or `start_offset`, not both.** A backfill that is one contiguous
@@ -1849,9 +1935,9 @@ The consequence worth planning for is that local disk holds roughly
    connection is in autocommit so that one statement is one transaction.
 
    **The lease is the only exclusion mechanism**, threads included. It works for both
-   because an owner is a UUID minted per acquisition rather than per `Log`, so two threads
+   because an owner is a UUID minted per acquisition rather than per `WriteHandle`, so two threads
    calling `seal()` are two owners and the second loses on the same row that would refuse
-   another process. An owner fixed per `Log` would be re-entered by every thread sharing it,
+   another process. An owner fixed per `WriteHandle` would be re-entered by every thread sharing it,
    and an owner derived from the pid or thread ident would be worse than useless: both are
    reused after their holder exits, so a new arrival could inherit a dead one's identity and
    re-enter a lease it never took.
@@ -1954,7 +2040,7 @@ The consequence worth planning for is that local disk holds roughly
    | reader | result |
    |---|---|
    | same process, via `sqlite_query` | corrupt on the FIRST scan; `integrity_check` fails afterwards |
-   | separate process, via `Log.open(read_only=True)` | 327 scans, clean |
+   | separate process, via `litelink.open(..., read_only=True)` | 327 scans, clean |
    | same process, strictly sequential append→scan | 300 iterations, clean |
 
    The symptoms were `database disk image is malformed` and, when the torn mapping was the
@@ -2264,7 +2350,7 @@ tunable. See §15.5.
 Declared at stream creation, alongside the application schema:
 
 ```python
-litelink.Log.new(
+litelink.new(
     root, name,
     schema=pa.schema([...]),
     sort_by=("event_ts", "key"),

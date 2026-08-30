@@ -29,7 +29,7 @@ so they fall outside the buffer's contribution automatically.
 Restoring onto ANOTHER machine is a different operation and this is not it.
 `catalog.db` records absolute paths to local Iceberg metadata that no sidecar
 replicates, so the restore above works back onto the same paths and fails
-elsewhere. Use `Log.restore` for that.
+elsewhere. Use `WriteHandle.restore` for that.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from pathlib import Path
 
 from _stream import NAME
 
-from litelink import Log
+import litelink
 from litelink._s3 import S3Options
 
 
@@ -52,7 +52,7 @@ def main() -> None:
     # generator that took the write lock would be a strange thing to run
     # alongside a live writer, which is exactly when you want it.
     try:
-        log = Log.open(args.root, NAME, read_only=True, s3=S3Options())
+        log = litelink.open(args.root, NAME, read_only=True, s3=S3Options())
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 
