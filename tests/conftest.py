@@ -71,8 +71,19 @@ def s3() -> S3Options:
     fs = filesystem(resolved)
     try:
         fs.ls("/")
-    except OSError as exc:
-        pytest.skip(f"no S3 endpoint at {resolved.endpoint}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        # Broad on purpose. This used to catch `OSError`, which is what a
+        # refused connection raises through pyarrow — but s3fs answers with
+        # `botocore.exceptions.EndpointConnectionError`, which is not one. The
+        # result was 91 ERRORS instead of 91 skips the moment s3fs was
+        # installed without an endpoint to talk to.
+        #
+        # Anything at all here means the tier cannot be exercised, and the
+        # honest response is to say so once rather than to fail every test in
+        # it with the same connection error.
+        pytest.skip(
+            f"no S3 endpoint at {resolved.endpoint}: {type(exc).__name__}: {exc}"
+        )
 
     return resolved
 

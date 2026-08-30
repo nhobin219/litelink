@@ -99,6 +99,24 @@ jobs:
   test:
     name: Tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+
+    # An S3-compatible endpoint, because without one the ENTIRE archive tier
+    # skips — and it did, silently, for the whole life of this workflow. The
+    # tier most of this library's bugs have been found in was never run here.
+    # What finally said so was `286 passed, 1 skipped, 91 errors`, and only
+    # because s3fs became a dev dependency and the skip turned into an error.
+    #
+    # Same image and credentials as `just rustfs`, so CI and a developer
+    # machine are one environment rather than two that drift.
+    services:
+      rustfs:
+        image: rustfs/rustfs:latest
+        env:
+          RUSTFS_ACCESS_KEY: litelink
+          RUSTFS_SECRET_KEY: litelink-secret
+        ports:
+          - 9000:9000
+
     strategy:
       fail-fast: false
       matrix:
@@ -117,10 +135,24 @@ jobs:
       # as its own step means a fetch failure reads as a provisioning failure
       # rather than as a mysterious IO error inside a test.
       - run: uv run python scripts/install_duckdb_extensions.py
+
       # Then assert the box can load them with autoinstall off — the same check
       # an offline deployment target would run. This is what catches a new
       # extension being added to the read path without being added here.
       - run: uv run python scripts/install_duckdb_extensions.py --check
+      # Any HTTP answer means it is listening. NOT `curl -f`: an unauthenticated
+      # S3 root answers 403, which is a healthy server refusing an anonymous
+      # request, and -f reads that as a failure. Same check `just rustfs` makes.
+      - name: Wait for the S3 endpoint
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -s -o /dev/null http://127.0.0.1:9000 2>/dev/null; then
+              echo "rustfs is listening"; exit 0
+            fi
+            sleep 1
+          done
+          echo "rustfs never came up; the archive tier would not run" >&2
+          exit 1
       # tests/test_offline.py proves I5 by running the capture loop inside a
       # network namespace, which Ubuntu blocks for unprivileged users through
       # AppArmor. Without this the suite still passes — the tests skip — and
