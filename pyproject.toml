@@ -29,19 +29,46 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The remote tier (§1). Local-first capture never resolves this.
-s3 = ["pyiceberg[s3fs]>=0.11.1"]
+# Deliberately empty of an `s3` extra, which used to be here declaring
+# `pyiceberg[s3fs]`. It was cargo: nothing in `src/` imports s3fs, pyiceberg
+# resolves `PyArrowFileIO` first, and arrow speaks S3 natively. Measured on a
+# clean venv with only the base wheel — 21 files pushed to a bucket and read
+# back, with s3fs absent.
+#
+# The archive and replication tiers need BINARIES rather than packages, which
+# an extra cannot deliver: extras add dependencies, not files. They ship in the
+# platform wheel instead (see `hatch_build.py`) and are checked by
+# `python -m litelink`.
 
 [project.urls]
 Source = "https://github.com/nhobin219/litelink"
 Specification = "https://github.com/nhobin219/litelink/blob/main/docs/SPEC.md"
 
 [build-system]
-requires = ["uv_build>=0.11.0,<0.12.0"]
-build-backend = "uv_build"
+# hatchling rather than uv_build, for one reason: a build hook that can stamp a
+# wheel with a platform tag and put a native binary inside it. `uv_build` has
+# no such hook, and litelink runs litestream on a public code path, so the
+# binary has to be able to travel with the wheel.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/litelink"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+# The sdist stays source-only. Someone building from it gets the pure wheel and
+# resolves litestream from PATH, which is the behaviour that predates this.
+include = ["src", "scripts", "README.md", "LICENSE", "NOTICE", "docs/SPEC.md"]
 
 [dependency-groups]
 dev = [
+    # The build backend, so the type checker can see `hatch_build.py`'s hook
+    # interface rather than reporting it unresolvable. It is a build dependency
+    # either way; installing it makes the hook checkable like everything else.
+    "hatchling>=1.27",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
     "ruff>=0.15.0",
@@ -82,6 +109,14 @@ ignore = ["E501"]
 # reports every construction as missing its arguments. Scoped to the one module
 # that builds predicates so the suppression cannot hide a real call error
 # anywhere else.
+# `hatch_build.py` reaches into `scripts/` through `sys.path`, which the type
+# checker cannot follow — the alternative is duplicating the vendoring logic
+# into the hook, and one fetch-and-verify is better than two.
+[[tool.ty.overrides]]
+include = ["hatch_build.py"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [[tool.ty.overrides]]
 include = ["src/litelink/_predicates.py"]
 [tool.ty.overrides.rules]
