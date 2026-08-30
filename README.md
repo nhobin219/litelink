@@ -242,22 +242,42 @@ configuration closes that gap. It is a **local, in-process, real-time analytics 
 is durable at commit and queryable immediately, so freshness is sub-second *with* durability —
 but "real-time" means fresh, not point-lookup fast.
 
-Nor is it an unbounded local archive. **Keeping everything on one machine — `archive=None`
-with no `local_retention` — degrades as the table grows.** A seal's cost tracks what the
-table's metadata holds, and a residue grows with the file count: compaction never revisits a
-file already at the target size, and only eviction removes one. With no retention set nothing
-evicts, and the seal is on the write path, so the cost lands on appends. Configure a
-retention, or an archive to evict into — [`docs/SPEC.md`](docs/SPEC.md) §13.7.
+Nor is it an unbounded local archive, though the reason is narrower than an earlier version
+of this paragraph claimed. **A seal commits, and a commit's cost tracks what the table's
+metadata holds — mostly retained snapshots, and only secondarily files.** Measured at one file
+per seal:
+
+```
+snapshots retained     40 files /  40 snapshots     61.6 ms
+                      240 files / 240 snapshots    247.6 ms
+snapshots expired      40 files /   1 snapshot      43.2 ms
+                      240 files /   1 snapshot      86.3 ms
+```
+
+**`maintain()` already arrests the larger factor**, by expiring snapshots past
+`snapshot_retention`. What is left grows with file count — six times the files for twice the
+cost — and only eviction removes a file, since compaction stops revisiting one once it reaches
+the target size. So a log that runs `maintain()` and never evicts grows slowly; one that runs
+neither grows steeply, and the seal is on the write path, so it lands on appends.
+
+Set a retention to bound it. An archive is not what bounds it — a log with an archive and no
+retention evicts nothing either — but it is what makes eviction safe rather than lossy, since
+I4 stops eviction from passing what the archive holds. Without one, a retention deletes the
+only copy, which is a contract a local-only log can ask for deliberately.
+[`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet
 
-**Schema evolution** ([`docs/SPEC.md`](docs/SPEC.md) §9) and **blob fields** (§15) are
-specified and unbuilt, and are what the code lacks against its own design. `add_column`,
-`rename_column` and `drop_column` exist and raise; `binary` columns are refused outright,
+**Schema evolution** ([`docs/SPEC.md`](docs/SPEC.md) §9) is half built. `add_column` works —
+widening the archive, then the local table, then the buffer, so a reader never sees a column
+the tables do not have — and `append` validates against the declared schema on every row.
+`rename_column` and `drop_column` exist and raise `NotImplementedError`.
+
+**Blob fields** (§15) are specified and unbuilt: `binary` columns are refused outright,
 because §15 has large payloads bypass the buffer rather than travel through it.
 
-Still open: payload encoding, local-disk backpressure, bulk ingest, and extension provisioning
-for embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
+Still open: payload encoding, local-disk backpressure, and bulk ingest — all three in
+[`docs/SPEC.md`](docs/SPEC.md) §13.
 
 ## Documentation
 
@@ -272,13 +292,15 @@ for embedders. All four in [`docs/SPEC.md`](docs/SPEC.md) §13.
 ## Development
 
 ```bash
-just bootstrap          # uv sync + git hooks + DuckDB extensions
+just bootstrap          # uv sync + git hooks + DuckDB extensions + litestream
 just check              # lint + format-check + typecheck + tests, same as CI
 just --list             # the rest
 ```
 
-`just bootstrap` provisions the `iceberg`, `avro` and `httpfs` DuckDB extensions, which are
-downloaded rather than bundled — see [`docs/SPEC.md`](docs/SPEC.md) §7. Tooling is uv + ruff +
+`just bootstrap` provisions the `iceberg`, `avro` and `httpfs` DuckDB extensions and fetches
+litestream. A *checkout* downloads both, unlike an installed wheel, which carries them — so a
+contributor has to provision what a user does not. It fetches litestream because eleven tests
+skip without it, and a contributor's green run should check what CI's does. Tooling is uv + ruff +
 [ty](https://github.com/astral-sh/ty) + pytest. Commits follow
 [Conventional Commits](https://www.conventionalcommits.org), enforced by a `commit-msg` hook;
 [`CONTRIBUTING.md`](CONTRIBUTING.md) has the types, scopes and style gates.

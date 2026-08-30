@@ -54,11 +54,16 @@ bootstrap:
 duckdb-extensions *args:
     uv run python scripts/install_duckdb_extensions.py {{args}}
 
-# litestream is a single Go binary, not a project dependency: it is a sidecar,
-# and a library that pulled it in would be claiming to run it. This fetches the
-# pinned build into `.bin/`, which `demo-replicate` and the maintainer both
-# prefer over whatever is on PATH — the config format is version-dependent, so
+# litestream is a single Go binary. This recipe fetches the pinned build into
+# `.bin/`, which `demo-replicate`, the maintainer and the test suite all prefer
+# over whatever is on PATH — the config format is version-dependent, so
 # "whichever one is installed" is not a detail.
+#
+# This comment used to say litestream was "not a project dependency: a sidecar,
+# and a library that pulled it in would be claiming to run it". That was only
+# ever true of `replicate`. `restore` shells out to the binary on a public code
+# path, so litelink already ran it, and since v0.1.0 the platform wheels ship
+# it — the framing was half right and the wrong half was the recovery path.
 #
 #   just litestream     fetch it; idempotent, and a no-op if the pin is there
 

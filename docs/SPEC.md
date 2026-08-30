@@ -27,9 +27,9 @@ A data file is written locally, uploaded, then registered in the archive; local 
 later shrinks the window without touching the archive.
 
 **No hot-path read touches the network.** A hot read is the local Iceberg table plus the
-SQLite buffer, both on local disk. This holds once the machine is provisioned — DuckDB's
-`iceberg` and `avro` extensions are downloaded rather than bundled, and the first read on
-a fresh machine fetches them. See §7.
+SQLite buffer, both on local disk. Since v0.1.0 the platform wheels carry DuckDB's `iceberg`,
+`avro` and `httpfs` extensions, so an installed package holds unconditionally; a CHECKOUT
+still downloads them on first use, which is what `just bootstrap` discharges. See §7.
 
 **Everything Iceberg provides is used, not reimplemented** — manifests, per-file column
 statistics, schema with field IDs, atomic snapshot commits. The catalog is a SQLite file,
@@ -238,10 +238,17 @@ the WAL separates them completely: files are sized by `target_seal_size` and RPO
 replication lag, which is a property of a sidecar rather than of the layout.
 
 **Litestream (or equivalent WAL shipping) is the sidecar.** It continuously replicates
-SQLite WAL frames to object storage, and litelink never starts it — that is a separate
-process reading the WAL, which is exactly why replication does not put the network in the
-write path. What the library owns is `LocalReadHandle.databases`: which files carry the log's state and
-therefore have to be replicated.
+SQLite WAL frames to object storage, and litelink never starts the CONTINUOUS one — that is a
+separate process reading the WAL, which is exactly why replication does not put the network in
+the write path. What the library owns is `LocalReadHandle.databases`: which files carry the
+log's state and therefore have to be replicated.
+
+**"never starts it" was too broad, and the exception is the recovery path.** `restore` shells
+out to the binary itself, on a public code path — a one-shot batch call that runs and exits,
+not a supervised daemon. So litestream is a runtime dependency of that path rather than purely
+an operator's concern, which is why the platform wheels ship it: leaving it to `PATH` puts the
+discovery of a missing binary inside a failover. A `litelink replicate` that daemonised would
+be the real crossing, and there is deliberately none.
 
 **`wal_replication` is a declaration, not a supervisor.** This paragraph used to say the
 opposite — that replication is not configured in `LogConfig`, because a boolean claiming a
@@ -1154,10 +1161,10 @@ with autoinstall disabled and nothing cached, `LOAD iceberg` fails with an IO er
 The cache is keyed by DuckDB version and platform (`~/.duckdb/extensions/v1.5.5/linux_amd64`),
 so raising the duckdb floor invalidates it and every machine downloads again.
 
-This is a provisioning obligation, not a dependency — no package pins it, so nothing fails at
-install time. Install the extensions at build or deploy time, or vendor them for the
-air-gapped case. How an *embedding application* discharges it, as opposed to this repo, is
-§13.5.
+This is a provisioning obligation for a CHECKOUT, discharged by `just bootstrap` and by CI.
+An installed wheel discharges it differently: the platform wheels vendor the extensions, which
+is §13.5 and is closed. The obligation remains for anyone building from the sdist or running
+on a platform with no published wheel, and `python -m litelink` is what reports it.
 
 Two details that are easy to get wrong, both verified against duckdb 1.5.5. **The extension
 directory is not settable by environment variable** — `DUCKDB_EXTENSION_DIRECTORY` is
@@ -1833,11 +1840,23 @@ The consequence worth planning for is that local disk holds roughly
    put the oldest data in the coldest tier. Once compaction has run a single file straddles
    the era boundary and stops pruning, and it costs the same in both orders — measured, three
    files read either way — so that is not a reason to prefer one.
-5. **Extension provisioning for embedders.** §7 makes the extension download a provisioning
-   obligation. A repo can discharge it in its bootstrap and its CI; an application that
-   `pip install`s the library runs neither. It gets the read path and no extensions, so its
-   first read is the network read the design says it is not — and the offline claim is about
-   that application, not about this repo.
+5. ~~**Extension provisioning for embedders.**~~ **Closed: shipped in the wheel.** §7 made the
+   extension download a provisioning obligation. A repo can discharge it in its bootstrap and
+   its CI; an application that `pip install`s the library runs neither, so it got the read path
+   and no extensions, and its first read was the network read the design says it is not.
+
+   Since v0.1.0 the platform wheels carry `iceberg`, `avro` and `httpfs` built for the DuckDB
+   they pin, alongside a checksum-verified litestream, and `python -m litelink` reports what a
+   machine is missing. Verified with no network, nothing on PATH and an empty DuckDB home.
+
+   Two things the closing turned up. `avro` is not requested by litelink at all — `iceberg`
+   auto-installs it from inside its own init function, over the network — so a bundle without
+   it is not offline-capable. And the extensions are keyed by exact DuckDB version AND
+   platform, which is why `duckdb` is pinned to a single patch: a wheel is immutable, and the
+   day the next patch ships an uncapped range would make every published wheel useless offline
+   with no way to amend it.
+
+   The original text below stands as the reasoning that led here.
 
    **Installing at import time is the option that needs no API, and it is the wrong one.**
    Network I/O inside `import litelink` fires in test suites, in processes that only ever
