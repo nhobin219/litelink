@@ -44,6 +44,13 @@ HEADER = re.compile(
 
 SEPARATOR = "\x1e"
 
+# GitHub rejects a release body over 125,000 characters. The first release of
+# this repo came to 98,720 with reasons included, so the headroom is real but
+# not large, and a release that FAILS because its notes grew is a bad way to
+# find out. Over the budget, the reasons are dropped and the subjects kept:
+# every change stays announced, which is the part that must not be lost.
+BODY_LIMIT = 120_000
+
 
 def _git(*args: str) -> str:
     return subprocess.run(  # noqa: S603
@@ -52,9 +59,19 @@ def _git(*args: str) -> str:
 
 
 def last_tag() -> str | None:
-    """The most recent tag reachable from HEAD, or None on a first release."""
+    """The most recent tag BEFORE the commit being described.
+
+    From `HEAD^`, not `HEAD`, and that is the whole point: on a release run
+    the tag being published points AT HEAD, so describing from HEAD returns it
+    and the range `v0.1.0..HEAD` is empty. That is exactly how this failed on
+    the first release it was used for — the notes step exited 1 with "no
+    commits since v0.1.0" after PyPI had already accepted the upload.
+
+    None on a first release, or on a root commit, which means the full history
+    — the right answer for notes that have no predecessor to diff against.
+    """
     try:
-        return _git("describe", "--tags", "--abbrev=0")
+        return _git("describe", "--tags", "--abbrev=0", "HEAD^")
     except subprocess.CalledProcessError:
         return None
 
@@ -114,8 +131,30 @@ def lead(body: str) -> str:
     return " ".join(paragraph.split())
 
 
-def render(entries: list[dict[str, str]], version: str | None, repo: str) -> str:
-    """Markdown, grouped by type, breaks first."""
+def render(
+    entries: list[dict[str, str]],
+    version: str | None,
+    repo: str,
+    *,
+    limit: int = BODY_LIMIT,
+) -> str:
+    """Markdown, grouped by type, breaks first — and inside the body limit."""
+    full = _render(entries, version, repo, reasons=True)
+    if len(full) <= limit:
+        return full
+
+    trimmed = _render(entries, version, repo, reasons=False)
+    note = (
+        f"\n\n_Reasons omitted: the full notes ran to {len(full):,} characters, "
+        f"over GitHub's release body limit. Follow any commit link for the why._\n"
+    )
+
+    return trimmed.rstrip("\n") + note
+
+
+def _render(
+    entries: list[dict[str, str]], version: str | None, repo: str, *, reasons: bool
+) -> str:
     out: list[str] = []
     if version:
         out.append(f"## {version}\n")
@@ -124,7 +163,7 @@ def render(entries: list[dict[str, str]], version: str | None, repo: str) -> str
     if breaking:
         out.append("### Breaking\n")
         for entry in breaking:
-            out.append(_bullet(entry, repo))
+            out.append(_bullet(entry, repo, reasons=reasons))
 
         out.append("")
 
@@ -135,7 +174,7 @@ def render(entries: list[dict[str, str]], version: str | None, repo: str) -> str
 
         out.append(f"### {heading}\n")
         for entry in chosen:
-            out.append(_bullet(entry, repo))
+            out.append(_bullet(entry, repo, reasons=reasons))
 
         out.append("")
 
@@ -143,19 +182,19 @@ def render(entries: list[dict[str, str]], version: str | None, repo: str) -> str
     if rest:
         out.append("### Other\n")
         for entry in rest:
-            out.append(_bullet(entry, repo))
+            out.append(_bullet(entry, repo, reasons=reasons))
 
         out.append("")
 
     return "\n".join(out).strip() + "\n"
 
 
-def _bullet(entry: dict[str, str], repo: str) -> str:
+def _bullet(entry: dict[str, str], repo: str, *, reasons: bool = True) -> str:
     scope = f"**{entry['scope']}**: " if entry["scope"] else ""
     short = entry["commit"][:7]
     link = f"([`{short}`]({repo}/commit/{entry['commit']}))"
     line = f"- {scope}{entry['subject']} {link}"
-    reason = lead(entry["body"])
+    reason = lead(entry["body"]) if reasons else ""
 
     return f"{line}\n  {reason}" if reason else line
 
