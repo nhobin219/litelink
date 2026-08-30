@@ -254,6 +254,13 @@ stating it falsely costs the growth without buying the durability that growth wa
 for: seals hold their rows, nothing ships them, and only `sync` reaching the range releases
 them.
 
+**The sidecar needs a monotonic clock that does not run backwards.** litestream reports a
+measured interval through a Prometheus counter, which panics on a negative value, so one
+regression of `CLOCK_MONOTONIC` crash-loops it — while logging successful syncs right up to
+each panic. On a slow stream that is a durability failure, because the buffer holds the only
+copy of unsealed rows. The known trigger is a VM on the `tsc` clocksource; see `docs/API.md`
+under Replication, and `python -m litelink` warns on the combination.
+
 `wal_retention` is the other half, and the sidecar enforces it rather than litelink.
 `replication_config` emits it as a per-database `snapshot:` block, deriving `interval` as
 half the retention so a window can never hold zero snapshots — a restore needs a snapshot at
