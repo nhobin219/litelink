@@ -214,3 +214,69 @@ def test_the_required_check_depends_on_every_job() -> None:
     condition = workflow["jobs"]["ci-success"]["steps"][0]["if"]
     for outcome in ("failure", "cancelled", "skipped"):
         assert outcome in condition, f"the gate ignores a {outcome} job"
+
+
+def test_release_notes_group_and_carry_the_reason() -> None:
+    """The notes exist to preserve WHY, which is what PR-title notes discard.
+
+    `gh --generate-notes` lists pull request titles. This history puts the
+    reason in the commit body, so notes that drop the body throw away the part
+    worth reading — and a squashed PR's body is the one thing GitHub does not
+    show you.
+
+    Falsify by dropping `lead()` from the bullet: the reason disappears and
+    this fails.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from release_notes import lead, render
+
+    entries = [
+        {
+            "type": "feat",
+            "scope": "read",
+            "subject": "follow a log from another machine",
+            "body": "The archive merged with a replicated buffer.\n\nDetail after.",
+            "commit": "a" * 40,
+            "breaking": "",
+        },
+        {
+            "type": "fix",
+            "scope": "",
+            "subject": "stop double-counting a cross-process seal",
+            "body": "",
+            "commit": "b" * 40,
+            "breaking": "!",
+        },
+        {
+            "type": "wat",
+            "scope": "",
+            "subject": "an unrecognised type",
+            "body": "",
+            "commit": "c" * 40,
+            "breaking": "",
+        },
+    ]
+    notes = render(entries, "1.2.3", "https://example.test/r")
+
+    assert "## 1.2.3" in notes
+    assert "### Breaking" in notes
+    assert notes.index("### Breaking") < notes.index("### Added"), (
+        "a breaking change has to lead"
+    )
+
+    # The reason travels, and only the lead paragraph of it.
+    assert "The archive merged with a replicated buffer." in notes
+    assert "Detail after." not in notes
+
+    # An unknown type is SHOWN, not dropped. A change that ships unannounced is
+    # worse than an untidy heading.
+    assert "an unrecognised type" in notes
+    assert "### Other" in notes
+
+    # Commits are linkable, since the evidence lives there.
+    assert f"https://example.test/r/commit/{'a' * 40}" in notes
+
+    # Trailers are not a reason.
+    assert lead("Co-Authored-By: someone <a@b.c>") == ""
