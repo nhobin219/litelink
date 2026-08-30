@@ -145,12 +145,16 @@ jobs:
       # The read path's DuckDB extensions are downloaded, not bundled. Doing it
       # as its own step means a fetch failure reads as a provisioning failure
       # rather than as a mysterious IO error inside a test.
-      - run: uv run python scripts/install_duckdb_extensions.py
+      # `--remote` includes httpfs, which the archive tier needs. It was absent
+      # for as long as that tier skipped in CI, so nothing noticed; the moment
+      # an S3 endpoint made those tests run, every archive read failed on a
+      # missing extension.
+      - run: uv run python scripts/install_duckdb_extensions.py --remote
 
       # Then assert the box can load them with autoinstall off — the same check
       # an offline deployment target would run. This is what catches a new
       # extension being added to the read path without being added here.
-      - run: uv run python scripts/install_duckdb_extensions.py --check
+      - run: uv run python scripts/install_duckdb_extensions.py --check --remote
       # Any HTTP answer means it is listening. NOT `curl -f`: an unauthenticated
       # S3 root answers 403, which is a healthy server refusing an anonymous
       # request, and -f reads that as a failure. Same check `just rustfs` makes.
