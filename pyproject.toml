@@ -22,13 +22,20 @@ classifiers = [
 # real import path rather than a declared intention.
 #   sql-sqlite: SqlCatalog on SQLite (§1). pyarrow: the seal path (§15.4).
 dependencies = [
-    # Capped, and the ceiling is load-bearing rather than caution. The wheel
-    # bundles DuckDB extensions built for one exact version — the download path
-    # is `/v1.5.5/linux_amd64/...` — so an uncapped floor lets a resolver pick a
-    # duckdb the bundle cannot serve. The wheel is already on PyPI by then and
-    # cannot be amended, and the failure is quiet: the bundle is skipped by
-    # design, so the package merely stops working offline.
-    "duckdb>=1.5.5,<1.6",
+    # Pinned to ONE PATCH, and that is not excess caution. The wheel bundles
+    # DuckDB extensions built for an exact version — they are looked up under
+    # `.bin/<duckdb.__version__>/<platform>/`, and DuckDB refuses a
+    # cross-version extension — so the coupling is at the patch level, not the
+    # minor. A first attempt capped this at `<1.6`, which admits 1.5.6: that
+    # release is already on PyPI as `1.5.6.devN`, and the day it goes final
+    # every `pip install litelink` resolves it, the bundle is skipped by
+    # design, and 100 MB of extensions become dead weight in a wheel that is
+    # immutable and cannot be corrected.
+    #
+    # The failure is quiet in both directions. Offline, the log cannot be read
+    # at all; online, `LOAD iceberg` silently autoinstalls over the network and
+    # the package regains the dependency the bundling exists to remove.
+    "duckdb>=1.5.5,<1.5.6",
     "pyarrow>=17.0.0",
     "pyiceberg[pyarrow,sql-sqlite]>=0.11.1",
     "xxhash>=3.6.0",
@@ -84,6 +91,8 @@ dev = [
     # interface rather than reporting it unresolvable. It is a build dependency
     # either way; installing it makes the hook checkable like everything else.
     "hatchling>=1.27",
+    # Read by `test_packaging` to assert the CI gate depends on every job.
+    "pyyaml>=6.0",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
     "ruff>=0.15.0",

@@ -4,10 +4,13 @@ The same fetch `just litestream` does, in Python so a build backend can call
 it, and able to fetch for a platform that is not the build host — which is what
 lets one machine produce every wheel.
 
-**Verified, not trusted.** The binary comes over the network and is then run
-against a log's databases with write access to its replica; a checksum is the
-cheapest thing that makes "what the release published" and "what arrived here"
-the same question.
+**Verified against a digest recorded HERE, not one fetched alongside.** The
+binary comes over the network and is then run against a log's databases with
+write access to its replica. An earlier version compared the download against
+the release's own `checksums.txt` — which detects corruption but not
+substitution, because GitHub release assets are mutable and a re-cut asset
+comes with regenerated checksums. Pinning the digest in the repository makes
+what ships a reviewable fact, the way `vendor_duckdb_extension.py` does.
 
 Run directly to vendor for this machine:
 
@@ -35,6 +38,15 @@ from pathlib import Path
 # together or not at all.
 VERSION = "0.5.16"
 BASE = f"https://github.com/benbjohnson/litestream/releases/download/v{VERSION}"
+
+# sha256 of each release asset, recorded rather than fetched. Regenerate with
+# `just litestream-checksums` after bumping VERSION; a mismatch is fatal.
+CHECKSUMS = {
+    "linux-x86_64": "9e29112380a942e4a62ee07773684396cb8b308dc4d67e130bef41f75e937f0a",
+    "linux-arm64": "678022e4103145302598e35d37f8718392d42e153feeb1e2d4a64dd0cd3aaf10",
+    "macos-x86_64": "eb554b93c9e2833351b017707e9ba5ac97ffd91d07e8b8b836b3ca7661399c36",
+    "macos-arm64": "3e64028ff3522caca7a5ab67244e0373b25f3db68b6e25cac0056bf71c30c337",
+}
 
 # The wheel tags litelink publishes, and the release asset each one needs.
 # Keys are what `--platform` accepts; the tag is what the wheel is stamped with.
@@ -66,18 +78,6 @@ def host_platform() -> str:
     return f"{name}-{arch}"
 
 
-def _checksum(url: str, asset: str) -> str:
-    """The published sha256 for one asset, from the release's checksums file."""
-    with urllib.request.urlopen(url, timeout=120) as response:  # noqa: S310
-        for line in response.read().decode().splitlines():
-            digest, _, name = line.partition("  ")
-            if name.strip() == asset:
-                return digest.strip()
-
-    msg = f"{asset} is not listed in the release checksums"
-    raise SystemExit(msg)
-
-
 def vendor(target: str, into: Path) -> Path:
     """Fetch, verify, extract. Returns where the binary landed."""
     if target not in PLATFORMS:
@@ -86,7 +86,14 @@ def vendor(target: str, into: Path) -> Path:
 
     suffix, _ = PLATFORMS[target]
     asset = f"litestream-{VERSION}-{suffix}.tar.gz"
-    expected = _checksum(f"{BASE}/checksums.txt", asset)
+    expected = CHECKSUMS.get(target)
+    if expected is None:
+        msg = (
+            f"no recorded checksum for {target}. Regenerate CHECKSUMS after "
+            f"changing VERSION or the platform table — an unrecorded download "
+            f"is one nobody has looked at."
+        )
+        raise SystemExit(msg)
 
     with tempfile.TemporaryDirectory() as scratch:
         archive = Path(scratch) / asset

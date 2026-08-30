@@ -440,3 +440,25 @@ duckdb-extension-checksums:
             print(f'    "{platform}/{name}": "{digest}",')
     print("}")
     PY
+
+# Recompute the pinned litestream digests. Run after bumping LITESTREAM_VERSION
+# in scripts/vendor_litestream.py — an unrecorded download is refused.
+litestream-checksums:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run python - <<'PY'
+    import sys, urllib.request
+    sys.path.insert(0, "scripts")
+    from vendor_litestream import BASE, PLATFORMS, VERSION
+    with urllib.request.urlopen(f"{BASE}/checksums.txt", timeout=120) as response:
+        published = dict(
+            (name.strip(), digest.strip())
+            for digest, _, name in (
+                line.partition("  ") for line in response.read().decode().splitlines()
+            )
+        )
+    print("CHECKSUMS = {")
+    for key, (suffix, _) in PLATFORMS.items():
+        print(f'    "{key}": "{published[f"litestream-{VERSION}-{suffix}.tar.gz"]}",')
+    print("}")
+    PY

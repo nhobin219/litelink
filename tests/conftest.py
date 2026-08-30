@@ -72,6 +72,15 @@ def s3() -> S3Options:
     try:
         fs.ls("/")
     except Exception as exc:  # noqa: BLE001
+        if os.environ.get("LITELINK_REQUIRE_S3"):
+            # CI sets this. A skip there is not a neutral outcome — it is ~91
+            # tests silently not running, which is how the archive tier went
+            # unchecked for the life of that workflow.
+            pytest.fail(
+                f"LITELINK_REQUIRE_S3 is set but the endpoint at "
+                f"{resolved.endpoint} did not answer: {type(exc).__name__}: {exc}"
+            )
+
         # Broad on purpose. This used to catch `OSError`, which is what a
         # refused connection raises through pyarrow — but s3fs answers with
         # `botocore.exceptions.EndpointConnectionError`, which is not one. The

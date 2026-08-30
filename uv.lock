@@ -515,6 +515,7 @@ dev = [
     { name = "hatchling" },
     { name = "pre-commit" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
     { name = "s3fs" },
     { name = "ty" },
@@ -523,7 +524,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "duckdb", specifier = ">=1.5.5,<1.6" },
+    { name = "duckdb", specifier = ">=1.5.5,<1.5.6" },
     { name = "pyarrow", specifier = ">=17.0.0" },
     { name = "pyiceberg", extras = ["pyarrow", "sql-sqlite"], specifier = ">=0.11.1" },
     { name = "xxhash", specifier = ">=3.6.0" },
@@ -534,6 +535,7 @@ dev = [
     { name = "hatchling", specifier = ">=1.27" },
     { name = "pre-commit", specifier = ">=4.5.1" },
     { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.15.0" },
     { name = "s3fs", specifier = ">=2024.6.0" },
     { name = "ty", specifier = ">=0.0.15" },

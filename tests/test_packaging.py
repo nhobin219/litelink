@@ -68,6 +68,20 @@ def test_the_bundled_extension_matches_the_pinned_duckdb(pyproject: dict) -> Non
         f"outside the declared range {declared!r}"
     )
 
+    # And the ceiling has to be the next PATCH, because that is where the
+    # coupling actually is: the bundle is looked up under
+    # `.bin/<duckdb.__version__>/`, an exact string, and DuckDB refuses a
+    # cross-version extension. A first attempt capped at the next MINOR, which
+    # admits 1.5.6 — already on PyPI as `1.5.6.devN` — so every wheel would
+    # have gone dead the day it went final, with no way to amend it.
+    major, minor, patch = _parse(DUCKDB_VERSION)
+
+    assert _parse(ceiling) == (major, minor, patch + 1), (
+        f"{declared!r} admits duckdb versions the bundle cannot serve. The "
+        f"extensions are built for {DUCKDB_VERSION} exactly, so the ceiling "
+        f"must be {major}.{minor}.{patch + 1}, not {ceiling}."
+    )
+
 
 def test_the_bundle_is_looked_up_by_the_running_duckdb() -> None:
     """A mismatched bundle must be ignored, not loaded.
@@ -157,3 +171,35 @@ def test_the_s3_tier_is_not_silently_skipped() -> None:
             "s3fs is not installed, so the entire archive tier will SKIP rather "
             "than run. It is a dev dependency of the test fixtures. Run `uv sync`."
         )
+
+
+def test_the_required_check_depends_on_every_job() -> None:
+    """`ci-success` is the one required check, so a job missing from it is invisible.
+
+    This branch found three defects of the shape "provisioned nothing, said
+    nothing, went green", and then found a fourth in the gate meant to catch
+    them: `packaging` — the only job that verifies the wheel works on a cold
+    box, which is this branch's entire point — was not in `needs`, so it could
+    fail red on a PR while the required check reported success.
+
+    The comment above that gate claimed a job added later was covered
+    automatically. `needs.*` expands only to the jobs named, and the job right
+    below the comment disproved it.
+
+    Falsify by removing any job from `needs`.
+    """
+    yaml = pytest.importorskip("yaml", reason="PyYAML is a dev dependency")
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+
+    jobs = set(workflow["jobs"]) - {"ci-success"}
+    gate = set(workflow["jobs"]["ci-success"]["needs"])
+
+    assert jobs == gate, (
+        f"these jobs are not gated by the required check: {sorted(jobs - gate)}. "
+        f"A job outside `needs` can fail while the merge gate passes."
+    )
+
+    # And a needed job that never RAN is not a job that passed.
+    condition = workflow["jobs"]["ci-success"]["steps"][0]["if"]
+    for outcome in ("failure", "cancelled", "skipped"):
+        assert outcome in condition, f"the gate ignores a {outcome} job"

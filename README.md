@@ -59,9 +59,10 @@ and cannot on the box that matters.
 python -m litelink          # PASS/FAIL per requirement, non-zero exit if not ready
 ```
 
-Platform wheels are published for Linux and macOS on x86-64 and arm64. Anywhere else you get
-the pure-Python wheel and supply litestream and the extensions yourself; `python -m litelink`
-tells you which are missing and how to get them.
+Platform wheels are published for Linux and macOS on x86-64 and arm64. Anywhere else, pip
+builds from the sdist — which produces a working pure-Python wheel with no binaries — and you
+supply litestream and the DuckDB extensions yourself; `python -m litelink` tells you which are
+missing and how to get them.
 
 ## Quick start
 

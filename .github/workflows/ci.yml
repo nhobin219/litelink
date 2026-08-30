@@ -121,7 +121,12 @@ jobs:
     # machine are one environment rather than two that drift.
     services:
       rustfs:
-        image: rustfs/rustfs:latest
+        # Pinned, not `:latest`. A floating tag that renames its credential
+        # env vars would still answer on the port — the readiness check below
+        # only asks for any HTTP response — so `fs.ls("/")` would fail, the
+        # session fixture would skip, and the archive tier would vanish green
+        # again. That is the exact failure this service was added to end.
+        image: rustfs/rustfs:1.0.0-rc.4
         env:
           RUSTFS_ACCESS_KEY: litelink
           RUSTFS_SECRET_KEY: litelink-secret
@@ -183,16 +188,33 @@ jobs:
       # Tolerated if the knob is absent, since the skip is then correct.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # A skip is not a pass. Without this the fixture would skip on a dead
+      # endpoint and take the archive tier with it, quietly.
       - run: uv run pytest -q
+        env:
+          LITELINK_REQUIRE_S3: "1"
 
   ci-success:
     name: CI success
     if: always()
-    needs: [lint, typecheck, test]
+    needs: [lint, typecheck, test, packaging]
     runs-on: ubuntu-latest
     steps:
-      # One required check for branch protection / the merge queue. Reading the
-      # aggregate result rather than each `needs.*.result` means a job added
-      # later is covered without editing this gate.
-      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      # One required check for branch protection / the merge queue.
+      #
+      # **Every job must be listed in `needs` above.** This comment used to
+      # claim that reading the aggregate `needs.*.result` covered a job added
+      # later without editing the gate. That is false — `needs.*` expands only
+      # to the jobs named — and it was disproved by the job right above it:
+      # `packaging` was added, was not listed, and could fail red on a PR while
+      # this reported success. The one check that verifies the wheel works on a
+      # cold box was invisible to the check that gates the merge.
+      #
+      # `skipped` counts as a failure too. A needed job that never ran is not a
+      # job that passed, and every "went green having provisioned nothing"
+      # defect on this branch came from treating an absence as an approval.
+      - if: >-
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
+          || contains(needs.*.result, 'skipped')
         run: exit 1
