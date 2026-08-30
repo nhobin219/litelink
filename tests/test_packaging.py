@@ -18,6 +18,10 @@ from litelink._replication import litestream_binary
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _parse(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
 @pytest.fixture(scope="module")
 def pyproject() -> dict:
     return tomllib.loads((ROOT / "pyproject.toml").read_text())
@@ -44,12 +48,24 @@ def test_the_bundled_extension_matches_the_pinned_duckdb(pyproject: dict) -> Non
     declared = next(
         dep for dep in pyproject["project"]["dependencies"] if dep.startswith("duckdb")
     )
-    floor = declared.split(">=")[1].split(",")[0].strip()
 
-    assert DUCKDB_VERSION == floor, (
-        f"the build vendors extensions for duckdb {DUCKDB_VERSION} while "
-        f"pyproject declares {declared!r}. A wheel built this way carries a "
-        f"bundle its own floor cannot load."
+    # A CEILING, not just a floor. Pinning the vendored version to the floor is
+    # the wrong end of the range: an uncapped `duckdb>=1.5.5` lets a resolver
+    # install 1.5.6 the day it ships, and the bundle — built for 1.5.5 — is
+    # then skipped by design. The wheel is already published and immutable, and
+    # the failure is silent, so the package just stops working offline.
+    assert "<" in declared, (
+        f"{declared!r} has no upper bound. The wheel bundles extensions built "
+        f"for duckdb {DUCKDB_VERSION} exactly; without a ceiling the next "
+        f"duckdb release makes every published wheel useless offline."
+    )
+
+    floor = declared.split(">=")[1].split(",")[0].strip()
+    ceiling = declared.split("<")[1].strip().strip('"')
+
+    assert _parse(floor) <= _parse(DUCKDB_VERSION) < _parse(ceiling), (
+        f"the build vendors extensions for duckdb {DUCKDB_VERSION}, which is "
+        f"outside the declared range {declared!r}"
     )
 
 

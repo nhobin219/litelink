@@ -523,7 +523,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "duckdb", specifier = ">=1.5.5" },
+    { name = "duckdb", specifier = ">=1.5.5,<1.6" },
     { name = "pyarrow", specifier = ">=17.0.0" },
     { name = "pyiceberg", extras = ["pyarrow", "sql-sqlite"], specifier = ">=0.11.1" },
     { name = "xxhash", specifier = ">=3.6.0" },

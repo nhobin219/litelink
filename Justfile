@@ -419,3 +419,24 @@ bench *args:
 # What litelink costs on top of the raw SQLite write it is built on.
 bench-floor *args:
     uv run --quiet python benchmarks/vs_sqlite.py {{args}}
+
+# Recompute the vendored DuckDB extension checksums. Run after bumping
+# DUCKDB_VERSION or the platform table — `vendor_duckdb_extension.py` refuses
+# an unrecorded download, so a bump without this fails the build loudly.
+duckdb-extension-checksums:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run python - <<'PY'
+    import hashlib, sys, urllib.request
+    sys.path.insert(0, "scripts")
+    from vendor_duckdb_extension import BASE, DUCKDB_VERSION, EXTENSIONS, PLATFORMS
+    print("CHECKSUMS = {")
+    for platform in PLATFORMS.values():
+        for name in EXTENSIONS:
+            url = f"{BASE}/v{DUCKDB_VERSION}/{platform}/{name}.duckdb_extension.gz"
+            request = urllib.request.Request(url, headers={"User-Agent": "litelink-vendor"})
+            with urllib.request.urlopen(request, timeout=300) as response:
+                digest = hashlib.sha256(response.read()).hexdigest()
+            print(f'    "{platform}/{name}": "{digest}",')
+    print("}")
+    PY

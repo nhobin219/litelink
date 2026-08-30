@@ -95,6 +95,11 @@ jobs:
       # binaries ship at all: no network, nothing on PATH, no DuckDB extension
       # cache. Provisioning the extensions here first — as this step used to —
       # would test a machine no user has.
+      # ubuntu-24.04 runners set kernel.apparmor_restrict_unprivileged_userns=1,
+      # which blocks the `unshare` below. The `test` job already does this.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Round-trip a row with no egress
         run: |
           uv venv --python 3.11 cold
@@ -109,7 +114,13 @@ jobs:
           import pyarrow as pa
           import litelink
 
-          assert os.system("ping -c1 -W1 8.8.8.8 >/dev/null 2>&1") != 0
+          import socket
+          try:
+              socket.create_connection(("1.1.1.1", 443), timeout=3).close()
+          except OSError:
+              pass
+          else:
+              raise AssertionError("expected no network, but a connection succeeded")
           assert shutil.which("litestream") is None
 
           print(f"litelink {litelink.__version__}")

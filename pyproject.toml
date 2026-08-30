@@ -22,7 +22,13 @@ classifiers = [
 # real import path rather than a declared intention.
 #   sql-sqlite: SqlCatalog on SQLite (§1). pyarrow: the seal path (§15.4).
 dependencies = [
-    "duckdb>=1.5.5",
+    # Capped, and the ceiling is load-bearing rather than caution. The wheel
+    # bundles DuckDB extensions built for one exact version — the download path
+    # is `/v1.5.5/linux_amd64/...` — so an uncapped floor lets a resolver pick a
+    # duckdb the bundle cannot serve. The wheel is already on PyPI by then and
+    # cannot be amended, and the failure is quiet: the bundle is skipped by
+    # design, so the package merely stops working offline.
+    "duckdb>=1.5.5,<1.6",
     "pyarrow>=17.0.0",
     "pyiceberg[pyarrow,sql-sqlite]>=0.11.1",
     "xxhash>=3.6.0",

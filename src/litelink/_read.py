@@ -144,9 +144,22 @@ def load_extension(
     """
     bundled = _bundled_extension(connection, name)
     if bundled is not None:
-        connection.execute(f"LOAD '{bundled}'")
-
-        return
+        try:
+            connection.execute(f"LOAD '{bundled}'")
+        except duckdb.Error:
+            # The bundle is a fast path, not a trapdoor. A copy that arrived
+            # wrong — a mangling proxy, a partial install, a corrupt download —
+            # would otherwise break a machine that has a perfectly good
+            # extension in its own DuckDB home, and break it with a raw
+            # `IOException` naming a path inside site-packages rather than the
+            # message below that says how to fix it.
+            #
+            # DuckDB verifies the signature on LOAD, so a substituted extension
+            # is refused rather than run; what falling through buys is that the
+            # refusal is recoverable.
+            pass
+        else:
+            return
 
     try:
         connection.execute(f"LOAD {name}")
