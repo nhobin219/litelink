@@ -536,6 +536,48 @@ which is the chicken-and-egg a restore has to solve.
 the root. A root holding several logs needs one config naming every buffer under it, which
 this does not generate.
 
+### The sidecar needs a monotonic clock
+
+litestream measures an interval and adds it to a Prometheus counter, and `Counter.Add` panics
+on a negative value. So **one backwards tick of `CLOCK_MONOTONIC` kills the process**, and
+under `Restart=always` that is a crash loop
+([litestream#1488](https://github.com/benbjohnson/litestream/issues/1488)).
+
+That is a durability failure rather than an inconvenience. On a stream that never reaches
+`target_seal_size`, the buffer holds the only copy of those rows until it does (§3a) — which
+is the case `wal_replication` exists for.
+
+**The symptom lies, so check restarts rather than log lines.** The sidecar logs `replica sync`
+and `ltx file uploaded` right up to each panic, so a minute of watching shows healthy
+replication. Nothing in litelink looks wrong either, because the *log* is fine; only the
+sidecar is dying.
+
+```bash
+systemctl --user show <your-litestream-unit> -p NRestarts --value
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+```
+
+The known trigger is a virtual machine using the `tsc` clocksource, where the TSC is not
+guaranteed synchronised across vCPUs — a KVM guest booted with `clocksource=tsc` is the
+reported case, at 4 regressions in 45 seconds and 13 panics in 15 minutes. Switching to
+`kvm-clock` fixed it; make the change persistent, because a sysfs write does not survive
+reboot.
+
+`python -m litelink` warns when it sees that combination:
+
+```
+WARN  host clock: clocksource tsc on a kvm guest. If CLOCK_MONOTONIC regresses here,
+      litestream panics and crash-loops — and it logs successful syncs up to each panic,
+      so check restarts, not log lines. A paravirtualised source is available: kvm-clock.
+```
+
+It warns rather than fails, and deliberately does **not** sample the clock to decide. Spinning
+for a second counting backwards steps was measured on a KVM guest running `tsc` — the affected
+configuration — at 105 million samples over 20 seconds with zero regressions, while the
+reporter's host showed 4 in 45 seconds. A sampling check would print PASS on hardware that can
+still crash-loop, and false confidence is worse than no check. What it reports is the risky
+combination, which is a fact rather than a sample.
+
 ## Schema evolution
 
 ```python

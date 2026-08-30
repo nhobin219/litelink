@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -151,3 +152,63 @@ def test_preflight_is_exported() -> None:
     """It is the first thing a new operator runs, so it is public."""
     assert "preflight" in litelink.__all__
     assert litelink.preflight is preflight
+
+
+def test_a_warning_is_visible_without_failing_the_report() -> None:
+    """A risk worth acting on is not a reason to refuse to provision.
+
+    `Check.warning` is a third state on top of `ok`. The case it exists for is
+    the host clock: a VM on the `tsc` clocksource CAN crash-loop the sidecar,
+    but plenty of such guests never do, so failing would be a false alarm — and
+    burying it in a PASS line would be missed, which is the whole problem with
+    this failure. It logs successful syncs right up to each panic.
+
+    Falsify by making `warning` fail the report, or by rendering it as PASS.
+    """
+    risky = Check("host clock", ok=True, detail="tsc on a kvm guest", warning=True)
+    report = Report((Check("a", ok=True, detail="fine"), risky))
+
+    assert report.ok, "a warning must not refuse to provision"
+    assert "WARN" in str(risky)
+    assert "PASS" not in str(risky)
+    assert "READY, with warnings" in str(report)
+
+    # And a failure still dominates a warning.
+    broken = Report((risky, Check("b", ok=False, detail="no")))
+    assert not broken.ok
+    assert "NOT READY" in str(broken)
+
+
+def test_the_clock_check_does_not_sample_and_does_not_fail() -> None:
+    """It reports a COMBINATION, because sampling cannot prove absence.
+
+    The obvious implementation — spin for a second counting backwards steps —
+    was measured on a KVM guest running `tsc`, which is the affected
+    configuration: 105 million samples over 20 seconds, zero regressions, while
+    the upstream reporter saw 4 in 45 seconds on their host. So a sampling
+    check prints PASS on hardware that can still crash-loop, and false
+    confidence is worse than no check.
+
+    It also must not fail: this is a risk, not a defect, and refusing to
+    provision over it would be wrong on the many guests that are fine.
+    """
+    from litelink._preflight import _clocksource
+
+    started = time.monotonic()
+    check = _clocksource()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, (
+        f"the clock check took {elapsed:.2f}s — it must not be sampling, "
+        f"because sampling cannot prove the clock is well behaved"
+    )
+    assert check.ok, "a clock risk must never fail provisioning"
+
+    # Whatever this host is, the detail has to say which clocksource it saw.
+    assert "clocksource" in check.detail or "not reported" in check.detail
+
+    if check.warning:
+        # On an affected host it must say the two things that are easy to get
+        # wrong: what to check, and that the fix needs to persist.
+        assert "check restarts, not log lines" in check.detail
+        assert "persistent" in check.detail

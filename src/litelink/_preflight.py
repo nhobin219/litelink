@@ -48,13 +48,23 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class Check:
-    """One thing that has to be true, and what was found instead."""
+    """One thing that has to be true, and what was found instead.
+
+    `warning` is a third state on top of `ok`: something worth acting on that
+    is not proven wrong here. It prints as WARN and does NOT fail the report,
+    because refusing to provision a host over a risk that may not materialise
+    is its own kind of wrong.
+    """
 
     name: str
     ok: bool
     detail: str
+    warning: bool = False
 
     def __str__(self) -> str:
+        if self.warning and self.ok:
+            return f"WARN  {self.name}: {self.detail}"
+
         return f"{'PASS' if self.ok else 'FAIL'}  {self.name}: {self.detail}"
 
 
@@ -78,7 +88,12 @@ class Report:
     def __str__(self) -> str:
         lines = [str(check) for check in self.checks]
         lines.append("")
-        lines.append("READY" if self.ok else "NOT READY — see the failures above")
+        if not self.ok:
+            lines.append("NOT READY — see the failures above")
+        elif any(check.warning for check in self.checks):
+            lines.append("READY, with warnings above worth reading before you deploy")
+        else:
+            lines.append("READY")
 
         return "\n".join(lines)
 
@@ -211,6 +226,99 @@ def _archive(prefix: str, name: str, s3: S3Options | None) -> Check:
     )
 
 
+def _clocksource() -> Check:
+    """Whether this host's monotonic clock can crash-loop the sidecar.
+
+    **litestream panics on a backwards monotonic tick.** It measures an
+    interval and adds it to a Prometheus counter, and `Counter.Add` panics on
+    a negative value — so one regression kills the process, and under
+    `Restart=always` that is a crash loop. Reported upstream as
+    benbjohnson/litestream#1488.
+
+    The symptom lies. The sidecar logs successful syncs and uploads right up
+    to each panic, so a minute of watching the log shows healthy replication;
+    the damage is only visible in the restart count. And this is a durability
+    failure rather than an inconvenience, because on a stream that never
+    reaches `target_seal_size` the buffer holds the only copy of those rows
+    until it does (§3a).
+
+    **This does not sample the clock, deliberately.** The obvious check —
+    spin for a second counting backwards steps — was measured on a KVM guest
+    running `tsc`, the affected configuration: 105 million samples over 20
+    seconds, zero regressions. The upstream reporter saw 4 in 45 seconds on
+    their host. So a sampling check prints PASS on hardware that can still
+    crash-loop, which is worse than not checking.
+
+    What it reports instead is the known-risky COMBINATION, which is a fact
+    rather than a sample: a virtual machine using `tsc` where the TSC is not
+    guaranteed synchronised across vCPUs. It warns rather than fails, because
+    plenty of such guests are fine — this one is — and refusing to provision
+    over a risk that may not materialise is its own kind of wrong.
+    """
+    name = "host clock"
+    try:
+        source = (
+            Path("/sys/devices/system/clocksource/clocksource0/current_clocksource")
+            .read_text()
+            .strip()
+        )
+    except OSError:
+        return Check(name, ok=True, detail="not reported by this OS; nothing to check")
+
+    if source != "tsc":
+        return Check(name, ok=True, detail=f"clocksource {source}")
+
+    virtual = _virtualised()
+    if virtual is None:
+        return Check(name, ok=True, detail="clocksource tsc on bare metal")
+
+    try:
+        available = (
+            Path("/sys/devices/system/clocksource/clocksource0/available_clocksource")
+            .read_text()
+            .split()
+        )
+    except OSError:
+        available = []
+
+    better = [c for c in available if c != "tsc"]
+    remedy = (
+        f" A paravirtualised source is available: {', '.join(better)}. Switching "
+        f"needs to be made persistent — a sysfs write does not survive reboot."
+        if better
+        else ""
+    )
+
+    return Check(
+        name,
+        ok=True,
+        warning=True,
+        detail=(
+            f"clocksource tsc on a {virtual} guest. If CLOCK_MONOTONIC regresses "
+            f"here, litestream panics and crash-loops — and it logs successful "
+            f"syncs up to each panic, so check restarts, not log lines."
+            f"{remedy}"
+        ),
+    )
+
+
+def _virtualised() -> str | None:
+    """The hypervisor's name, or None on bare metal / when unknowable."""
+    detect = shutil.which("systemd-detect-virt")
+    if detect is not None:
+        done = subprocess.run(  # noqa: S603
+            [detect], capture_output=True, text=True, check=False, timeout=10
+        )
+        kind = done.stdout.strip()
+        if done.returncode == 0 and kind and kind != "none":
+            return kind
+
+    try:
+        return Path("/sys/hypervisor/type").read_text().strip() or None
+    except OSError:
+        return None
+
+
 def preflight(
     *,
     archive: str | None = None,
@@ -237,6 +345,7 @@ def preflight(
 
     if replication:
         checks.append(_litestream())
+        checks.append(_clocksource())
 
     return Report(tuple(checks))
 
