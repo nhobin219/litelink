@@ -155,6 +155,14 @@ jobs:
       # an offline deployment target would run. This is what catches a new
       # extension being added to the read path without being added here.
       - run: uv run python scripts/install_duckdb_extensions.py --check --remote
+
+      # litestream, or eleven tests skip: every follower, restore and
+      # replication test guards on it. They were skipping here for the same
+      # reason the archive tier was — nothing provisioned it and nothing said
+      # so — and they are the tests that found most of this library's recent
+      # bugs. Checksum-verified by the same script the wheel build uses.
+      - name: Fetch litestream
+        run: uv run python scripts/vendor_litestream.py --into .bin
       # Any HTTP answer means it is listening. NOT `curl -f`: an unauthenticated
       # S3 root answers 403, which is a healthy server refusing an anonymous
       # request, and -f reads that as a failure. Same check `just rustfs` makes.
