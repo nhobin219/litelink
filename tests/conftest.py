@@ -44,7 +44,13 @@ def options() -> S3Options:
 
 
 def filesystem(s3: S3Options):  # noqa: ANN201  — s3fs is an optional import
-    s3fs = pytest.importorskip("s3fs", reason="the `s3` extra is not installed")
+    s3fs = pytest.importorskip(
+        "s3fs",
+        reason=(
+            "s3fs is missing — it is a dev dependency used by the test "
+            "fixtures, not by litelink. Run `uv sync`."
+        ),
+    )
 
     return s3fs.S3FileSystem(
         key=s3.access_key,

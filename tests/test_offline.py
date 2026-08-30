@@ -202,7 +202,7 @@ def test_an_unprovisioned_extension_names_the_command_that_fixes_it(
     # with a checkout. The message used to name only the last two, which are
     # both useless to a `pip install` consumer — the failure this whole test
     # is about is provisioning that LOOKS complete.
-    assert "pip install 'litelink[archive]'" in message
+    assert "platform wheels ship it" in message
     assert "INSTALL httpfs" in message
     assert "just duckdb-extensions --remote" in message
 

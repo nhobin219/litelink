@@ -21,6 +21,57 @@ permissions:
   contents: read
 
 jobs:
+  packaging:
+    name: The wheel works on a cold box
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # A PLATFORM wheel, which is what a user on this OS installs. The pure
+      # wheel is the fallback for platforms with no build, and it cannot carry
+      # the binaries this job exists to check.
+      - name: Build the platform wheel
+        run: LITELINK_WHEEL_PLATFORM=linux-x86_64 uv build --wheel --out-dir dist
+
+      # The claim the README makes: no network, nothing on PATH, no DuckDB
+      # extension cache. Every one of those has produced a real failure — a
+      # missing binary found during a failover, an `iceberg` that autoinstalls
+      # on a laptop and cannot on the target, an `avro` pulled in from inside
+      # another extension's init. None reproduce on a warm developer machine.
+      - name: Install and run it with no egress
+        run: |
+          uv venv --python 3.11 cold
+          uv pip install --python cold/bin/python dist/*.whl
+          cold_home=$(mktemp -d)
+          cd /tmp && env -i "HOME=$cold_home" PATH=/usr/bin:/bin \
+            unshare --map-root-user --net \
+            "$GITHUB_WORKSPACE/cold/bin/python" - <<'PY'
+          import os, shutil, tempfile
+          from pathlib import Path
+          import pyarrow as pa
+          import litelink
+
+          assert os.system("ping -c1 -W1 8.8.8.8 >/dev/null 2>&1") != 0, "expected no network"
+          assert shutil.which("litestream") is None, "expected nothing on PATH"
+          assert not os.listdir(os.environ["HOME"]), "expected an empty HOME"
+
+          report = litelink.preflight(replication=True)
+          print(report)
+          report.raise_if_not_ready()
+
+          schema = pa.schema([pa.field("event_ts", pa.int64(), nullable=False)])
+          with litelink.new(Path(tempfile.mkdtemp()), "cold", schema=schema) as log:
+              log.extend([{"event_ts": i} for i in range(500)])
+              log.seal_due()
+              assert log.scan().read_all().num_rows == 500
+              assert log.sql("SELECT count(*) c FROM log").read_all()["c"][0].as_py() == 500
+
+          print("cold box: preflight READY, 500 rows through DuckDB")
+          PY
+
   lint:
     name: Lint + format
     runs-on: ubuntu-latest

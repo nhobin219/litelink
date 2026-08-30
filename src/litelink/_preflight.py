@@ -107,7 +107,8 @@ def _litestream() -> Check:
             ok=False,
             detail=(
                 "not found on PATH and not bundled. Needed by restore() and "
-                "follow(). Install with `pip install 'litelink[replication]'`"
+                "follow(). The platform wheels ship it; see "
+                "https://litestream.io/install to supply it yourself"
             ),
         )
 

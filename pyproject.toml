@@ -65,6 +65,15 @@ include = ["src", "scripts", "README.md", "LICENSE", "NOTICE", "docs/SPEC.md"]
 
 [dependency-groups]
 dev = [
+    # s3fs is a TEST dependency, not a library one. `conftest.filesystem` uses
+    # it to assert against a bucket directly — what litelink pushed, and that a
+    # reader wrote nothing — which is a different job from litelink's own S3
+    # access, and that goes through pyarrow. It moved here from an `s3` extra
+    # that declared it as though the library needed it.
+    #
+    # Its absence skips the whole archive tier, which is 91 tests. That is a
+    # silent loss, so `test_s3_tier_is_not_silently_skipped` fails instead.
+    "s3fs>=2024.6.0",
     # The build backend, so the type checker can see `hatch_build.py`'s hook
     # interface rather than reporting it unresolvable. It is a build dependency
     # either way; installing it makes the hook checkable like everything else.
@@ -113,7 +122,7 @@ ignore = ["E501"]
 # checker cannot follow — the alternative is duplicating the vendoring logic
 # into the hook, and one fetch-and-verify is better than two.
 [[tool.ty.overrides]]
-include = ["hatch_build.py"]
+include = ["hatch_build.py", "tests/test_packaging.py"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 

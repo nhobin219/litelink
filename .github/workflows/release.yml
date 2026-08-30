@@ -35,7 +35,41 @@ jobs:
           fi
           echo "both say $packaged"
 
-      - run: uv build
+      # The sdist, plus one wheel per published platform. All of them build
+      # here: `vendor_litestream.py` and `vendor_duckdb_extension.py` fetch by
+      # platform rather than for the host, so a macOS arm64 wheel is produced
+      # on this Linux runner. That keeps the matrix in one job and means every
+      # wheel of a release is cut from one checkout.
+      - name: Build the sdist and every platform wheel
+        run: |
+          uv build --sdist
+          for platform in linux-x86_64 linux-arm64 macos-x86_64 macos-arm64; do
+            LITELINK_WHEEL_PLATFORM="$platform" uv build --wheel
+          done
+          ls -la dist/
+
+      # A wheel that shipped without its binaries would install fine and fail
+      # at the first restore. Assert the contents rather than trusting the hook.
+      - name: Every wheel carries its binaries
+        run: |
+          uv run --no-project python - <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          platform_wheels = [w for w in wheels if "none-any" not in w.name]
+          assert len(platform_wheels) == 4, f"expected 4 platform wheels, got {[w.name for w in wheels]}"
+
+          for wheel in platform_wheels:
+              names = zipfile.ZipFile(wheel).namelist()
+              assert any(n.endswith(".bin/litestream") for n in names), f"{wheel.name}: no litestream"
+              for extension in ("avro", "iceberg", "httpfs"):
+                  assert any(n.endswith(f"{extension}.duckdb_extension") for n in names), (
+                      f"{wheel.name}: no {extension}"
+                  )
+              print(f"{wheel.name}: litestream + avro + iceberg + httpfs")
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -47,8 +81,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          sparse-checkout: scripts
       - uses: astral-sh/setup-uv@v6
       - uses: actions/download-artifact@v4
         with:
@@ -59,25 +91,36 @@ jobs:
       # This is the one check that covers what a user actually installs: a
       # missing package directory, an unshipped py.typed, a dependency declared
       # in the dev group by accident. None of those fail in a repo checkout.
-      - name: Round-trip a row through the installed package
+      # On a COLD box, which is the claim the README makes and the reason the
+      # binaries ship at all: no network, nothing on PATH, no DuckDB extension
+      # cache. Provisioning the extensions here first — as this step used to —
+      # would test a machine no user has.
+      - name: Round-trip a row with no egress
         run: |
-          uv venv
-          uv pip install dist/*.whl
-          uv run --no-project python scripts/install_duckdb_extensions.py
-          uv run --no-project python - <<'PY'
-          import tempfile
+          uv venv --python 3.11 cold
+          uv pip install --python cold/bin/python \
+            dist/litelink-*-manylinux_2_17_x86_64*.whl
+          cold_home=$(mktemp -d)
+          cd /tmp && env -i "HOME=$cold_home" PATH=/usr/bin:/bin \
+            unshare --map-root-user --net \
+            "$GITHUB_WORKSPACE/cold/bin/python" - <<'PY'
+          import os, shutil, tempfile
+          from pathlib import Path
           import pyarrow as pa
           import litelink
-          from litelink import Log
+
+          assert os.system("ping -c1 -W1 8.8.8.8 >/dev/null 2>&1") != 0
+          assert shutil.which("litestream") is None
 
           print(f"litelink {litelink.__version__}")
-          schema = pa.schema([pa.field("event_ts", pa.int64())])
-          with tempfile.TemporaryDirectory() as root:
-              with Log.new(root, "smoke", schema=schema) as log:
-                  log.append({"event_ts": 1})
-                  assert log.scan().read_all().num_rows == 1
+          litelink.preflight(replication=True).raise_if_not_ready()
 
-          print("append and read back: ok")
+          schema = pa.schema([pa.field("event_ts", pa.int64(), nullable=False)])
+          with litelink.new(Path(tempfile.mkdtemp()), "smoke", schema=schema) as log:
+              log.append({"event_ts": 1})
+              assert log.scan().read_all().num_rows == 1
+
+          print("cold box: preflight READY, append and read back ok")
           PY
 
   publish:
