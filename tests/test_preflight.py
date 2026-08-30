@@ -65,7 +65,7 @@ def test_the_local_tier_needs_nothing_beyond_the_wheel() -> None:
     report = preflight(replication=False)
 
     assert report.ok, str(report)
-    assert [check.name for check in report.checks] == ["duckdb `iceberg`"]
+    assert [check.name for check in report.checks] == ["duckdb read path"]
 
 
 def test_it_finds_litestream_and_reports_the_version() -> None:

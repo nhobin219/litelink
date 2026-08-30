@@ -7,7 +7,9 @@ its planning happens in Python and costs ~100 ms per scan, paid on every query.
 
 from __future__ import annotations
 
+import contextlib
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -78,6 +80,36 @@ class ExtensionMissing(RuntimeError):
     """A DuckDB extension the read path needs is not on this machine (§7)."""
 
 
+def _bundled_extension(connection: duckdb.DuckDBPyConnection, name: str) -> Path | None:
+    """The copy shipped in the wheel, if there is one this DuckDB can load.
+
+    **Checked against the RUNNING version and platform, never assumed.** DuckDB
+    builds extensions per version and per platform — the download path is
+    `/v1.5.5/linux_amd64/...` — so a bundle is only usable by the exact DuckDB
+    it was fetched for. `duckdb>=1.5.5` has no ceiling, so a user can perfectly
+    well resolve a newer one than the wheel was built against, and loading a
+    mismatched extension is not something to find out at read time.
+
+    Returning None on a miss is deliberate: the caller falls through to the
+    ordinary `LOAD`, which finds a machine-provisioned copy if there is one and
+    otherwise raises the message that says how to get one. The bundle is a fast
+    path, not the mechanism.
+    """
+    root = Path(__file__).resolve().parent / ".bin"
+    if not root.is_dir():
+        return None
+
+    platform = connection.execute("PRAGMA platform").fetchone()
+    if platform is None:
+        return None
+
+    candidate = (
+        root / duckdb.__version__ / str(platform[0]) / f"{name}.duckdb_extension"
+    )
+
+    return candidate if candidate.is_file() else None
+
+
 def load_extension(
     connection: duckdb.DuckDBPyConnection, name: str, *, remote: bool
 ) -> None:
@@ -110,6 +142,12 @@ def load_extension(
     archive or is reading one, and someone who has not can ignore it entirely.
     It also picks the flag for the contributor recipe.
     """
+    bundled = _bundled_extension(connection, name)
+    if bundled is not None:
+        connection.execute(f"LOAD '{bundled}'")
+
+        return
+
     try:
         connection.execute(f"LOAD {name}")
     except duckdb.IOException as exc:
@@ -154,6 +192,13 @@ def duckdb_connection() -> duckdb.DuckDBPyConnection:
     appends should not pay at `open`.
     """
     connection = duckdb.connect()
+    # `avro` BEFORE `iceberg`, and quietly: `iceberg`'s init auto-installs it
+    # otherwise, which needs the network and defeats the point of bundling.
+    # Missing is not fatal here — a machine-provisioned `iceberg` may resolve
+    # it however it already does — so the failure to report is `iceberg`'s.
+    with contextlib.suppress(ExtensionMissing, duckdb.Error):
+        load_extension(connection, "avro", remote=False)
+
     load_extension(connection, "iceberg", remote=False)
     # No ATTACH of the buffer database. `Buffer.rows_above` records what that
     # cost: two SQLite libraries in one process is silent corruption, not a

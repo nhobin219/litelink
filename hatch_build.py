@@ -32,6 +32,7 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 
+import vendor_duckdb_extension  # noqa: E402
 from vendor_litestream import PLATFORMS, vendor  # noqa: E402
 
 ENV = "LITELINK_WHEEL_PLATFORM"
@@ -60,12 +61,26 @@ class LitestreamHook(BuildHookInterface):
             raise ValueError(msg)
 
         vendor(target, bundled)
+
+        # And the DuckDB extension, which is pinned twice over: to the
+        # platform AND to the exact DuckDB the wheel is built against. The
+        # loader checks the running version before using it, so a user who
+        # resolves a newer duckdb falls back to machine provisioning rather
+        # than loading something that cannot work. The version is declared in
+        # the vendor script rather than imported here: the build runs isolated,
+        # and the wheel should state which DuckDB it serves.
+        vendor_duckdb_extension.vendor(
+            target, vendor_duckdb_extension.DUCKDB_VERSION, bundled
+        )
+
         _, tag = PLATFORMS[target]
         build_data["pure_python"] = False
         build_data["tag"] = f"py3-none-{tag}"
-        build_data["force_include"][str(bundled / "litestream")] = (
-            "litelink/.bin/litestream"
-        )
+        for path in sorted(bundled.rglob("*")):
+            if path.is_file():
+                build_data["force_include"][str(path)] = str(
+                    Path("litelink/.bin") / path.relative_to(bundled)
+                )
 
     def finalize(
         self, version: str, build_data: dict[str, Any], artifact_path: str

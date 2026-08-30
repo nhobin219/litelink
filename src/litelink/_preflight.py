@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 import duckdb
 
 from litelink._layout import Layout
-from litelink._read import ExtensionMissing, load_extension
+from litelink._read import ExtensionMissing, duckdb_connection, load_extension
 from litelink._replication import litestream_binary
 from litelink._s3 import S3Options
 from litelink._table import archive_extent
@@ -126,14 +126,39 @@ def _litestream() -> Check:
     return Check("litestream", ok=True, detail=f"{version} at {found}")
 
 
-def _extension(name: str, *, required: bool) -> Check:
-    """`LOAD name` against a throwaway connection.
+def _read_path() -> Check:
+    """Build the connection a log builds, the way a log builds it.
 
-    A throwaway rather than the log's, because the point is what this machine
-    can provision, not what some already-open connection happens to have.
+    Through `duckdb_connection` rather than a bare `LOAD iceberg`, because the
+    two are not the same check and the difference is not academic: `iceberg`
+    auto-installs `avro` inside its own init function, so a connection that
+    does not load `avro` first fails on a box with no network. An earlier
+    version of this check did exactly that and reported a machine NOT READY
+    while every real read on it worked.
     """
     try:
-        load_extension(duckdb.connect(), name, remote=not required)
+        duckdb_connection()
+    except ExtensionMissing as exc:
+        return Check("duckdb read path", ok=False, detail=str(exc).splitlines()[0])
+    except duckdb.Error as exc:
+        return Check("duckdb read path", ok=False, detail=str(exc)[:200])
+
+    return Check(
+        "duckdb read path",
+        ok=True,
+        detail=f"iceberg + avro load for duckdb {duckdb.__version__}",
+    )
+
+
+def _extension(name: str, *, required: bool) -> Check:
+    """`LOAD name` onto the connection a log would use.
+
+    Onto a real read-path connection rather than a bare one, so an extension
+    with its own dependencies is loaded in the same company it will have at
+    runtime.
+    """
+    try:
+        load_extension(duckdb_connection(), name, remote=not required)
     except ExtensionMissing as exc:
         return Check(
             f"duckdb `{name}`",
@@ -204,7 +229,7 @@ def preflight(
     never restores or follows. Everything else is always checked, because a
     log that only writes locally still reads through DuckDB.
     """
-    checks: list[Check] = [_extension("iceberg", required=True)]
+    checks: list[Check] = [_read_path()]
     if archive is not None:
         checks.append(_extension("httpfs", required=False))
         checks.append(_archive(archive, name, s3))
