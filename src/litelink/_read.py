@@ -80,6 +80,23 @@ class ExtensionMissing(RuntimeError):
     """A DuckDB extension the read path needs is not on this machine (§7)."""
 
 
+def _duckdb_library_version() -> str:
+    """The version DuckDB's extension repository is keyed on.
+
+    `duckdb.__version__` is the DISTRIBUTION version — what pip resolved —
+    while extensions are published under the LIBRARY version, which duckdb
+    exposes separately. They agree for every release duckdb has published so
+    far (0 post-releases in 129), but a `1.5.5.post1` would make them differ,
+    and the dependency range admits one: `<1.5.6` is a bound on the
+    distribution.
+
+    A post-release would then miss the bundle for all three extensions, which
+    degrades to a network fetch online and to an unreadable log offline. One
+    `getattr` removes the whole question.
+    """
+    return str(getattr(duckdb, "__duckdb_version__", duckdb.__version__)).lstrip("v")
+
+
 def _bundled_extension(connection: duckdb.DuckDBPyConnection, name: str) -> Path | None:
     """The copy shipped in the wheel, if there is one this DuckDB can load.
 
@@ -104,7 +121,7 @@ def _bundled_extension(connection: duckdb.DuckDBPyConnection, name: str) -> Path
         return None
 
     candidate = (
-        root / duckdb.__version__ / str(platform[0]) / f"{name}.duckdb_extension"
+        root / _duckdb_library_version() / str(platform[0]) / f"{name}.duckdb_extension"
     )
 
     return candidate if candidate.is_file() else None

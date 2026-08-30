@@ -188,7 +188,18 @@ def test_the_required_check_depends_on_every_job() -> None:
 
     Falsify by removing any job from `needs`.
     """
-    yaml = pytest.importorskip("yaml", reason="PyYAML is a dev dependency")
+    # NOT `importorskip`. This is the guard on the guard, and skipping it if
+    # PyYAML goes missing is the exact shape it exists to catch — the same one
+    # that let `importorskip("s3fs")` hide 91 tests. An absence here has to be
+    # loud.
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover - the failure this makes loud
+        pytest.fail(
+            "PyYAML is not installed, so the check that the CI gate covers "
+            "every job cannot run. It is a dev dependency. Run `uv sync`."
+        )
+
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
 
     jobs = set(workflow["jobs"]) - {"ci-success"}
