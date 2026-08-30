@@ -30,6 +30,7 @@ from litelink._buffer import Buffer
 from litelink._layout import NAMESPACE, Layout
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, load_extension, secret_sql
+from litelink._replication import WAL_PREFIX
 from litelink._s3 import S3Options
 from litelink._table import (
     VERSION_HINT,
@@ -3297,7 +3298,7 @@ def test_creating_a_log_with_an_empty_archive_is_a_local_only_log(
         )
 
 
-def _replicate(binary: Path, config: Path, s3: S3Options) -> None:
+def _replicate(binary: Path, config: Path, s3: S3Options, prefix: str) -> None:
     """Run the sidecar once so a replica exists to follow."""
     environment = dict(os.environ)
     resolved = s3.resolved()
@@ -3305,13 +3306,50 @@ def _replicate(binary: Path, config: Path, s3: S3Options) -> None:
         environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
         environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
 
-    subprocess.run(  # noqa: S603
-        [str(binary), "replicate", "-config", str(config), "-exec", "sleep 3"],
-        check=True,
-        env=environment,
-        capture_output=True,
-        timeout=120,
-    )
+    # `-exec` bounds the sidecar's life: it replicates, runs the command, and
+    # exits. A fixed `sleep 3` here was both slow — nine tests use this, so 27
+    # seconds of the suite was spent sleeping — and a latent flake, since three
+    # seconds is a guess that a slower box loses.
+    #
+    # So: ask for a short one, then CHECK, and only pay for more if the replica
+    # is not there yet.
+    fs = filesystem(s3)
+    replica = f"{prefix.rstrip('/')}/{WAL_PREFIX}"
+    # 2s is the measured floor: at 1s the buffer replica is reliably absent
+    # (so a 1s first attempt made this SLOWER, always escalating), at 2s it is
+    # reliably present. The rest is a safety net for a slower box, which the
+    # old fixed 3s did not have.
+    for wait in (2, 5, 10):
+        subprocess.run(  # noqa: S603
+            [
+                str(binary),
+                "replicate",
+                "-config",
+                str(config),
+                "-exec",
+                f"sleep {wait}",
+            ],
+            check=True,
+            env=environment,
+            capture_output=True,
+            timeout=120,
+        )
+        fs.invalidate_cache()
+        # `buffer.db` specifically, not just anything under `_wal`. The
+        # archive.db and catalog.db replicas land first, so an existence check
+        # on the prefix passes while the one `restore_buffer` actually pulls is
+        # still missing — which made the short wait look sufficient when it was
+        # not, and turned a slow test into a flaky one.
+        landed = [
+            path
+            for path in fs.find(replica.removeprefix("s3://"))
+            if "/buffer.db/" in path
+        ]
+        if landed:
+            return
+
+    msg = f"litestream published no replica under {replica}"
+    raise AssertionError(msg)
 
 
 @pytest.mark.slow
@@ -3735,7 +3773,7 @@ def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
         served = primary.scan(include_archive=True).read_all().num_rows
         replication = primary.write_replication_config()
 
-    _replicate(binary, replication, s3)
+    _replicate(binary, replication, s3, where)
 
     with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         got = follower.scan().read_all()
@@ -3795,7 +3833,7 @@ def test_a_follower_refuses_to_read_without_the_archive(
 
         replication = primary.write_replication_config()
 
-    _replicate(binary, replication, s3)
+    _replicate(binary, replication, s3, where)
 
     with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Refused, not absent. Unifying the two read-only shapes into one
@@ -3855,7 +3893,7 @@ def test_a_follower_writes_nothing_the_primary_shares(
 
         replication = primary.write_replication_config()
 
-    _replicate(binary, replication, s3)
+    _replicate(binary, replication, s3, where)
 
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-readonly"))
@@ -3924,7 +3962,7 @@ def test_a_follower_refuses_an_archive_that_has_published_nothing(
         primary.extend(rows(50))
         replication = primary.write_replication_config()
 
-    _replicate(binary, replication, s3)
+    _replicate(binary, replication, s3, where)
 
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-unpublished"))
@@ -3984,7 +4022,7 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
         log.sync()
         replication = log.write_replication_config()
 
-    _replicate(binary, replication, s3)
+    _replicate(binary, replication, s3, where)
 
     with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Warm both caches, which is what makes the naive detector unreachable.
@@ -4062,7 +4100,7 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
         replication = log.write_replication_config()
 
     # Snapshot the buffer here — nothing sealed, sequence at 2000.
-    _replicate(binary, replication, s3)
+    _replicate(binary, replication, s3, where)
 
     # Then the primary races ahead of that snapshot: it seals, syncs, appends
     # and syncs again, with no sidecar running. This is the ordinary shape of
@@ -4166,7 +4204,7 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
             log.set_config(replace(log.config, wal_replication=True))
             replication = log.write_replication_config()
 
-        _replicate(binary, replication, s3)
+        _replicate(binary, replication, s3, where)
 
         return where
 
@@ -4253,7 +4291,7 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
         log.sync()
         replication = log.write_replication_config()
 
-    _replicate(binary, replication, s3)
+    _replicate(binary, replication, s3, where)
 
     fs = filesystem(s3)
     original = Reader._prepare_remote

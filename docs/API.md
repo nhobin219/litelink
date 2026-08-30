@@ -207,7 +207,7 @@ transaction, and returns.
 
 ```python
 log.scan(*, columns=None, where=None, start_offset=None,
-         end_offset=None, include_archive=False) -> pa.RecordBatchReader
+         end_offset=None, include_archive=None) -> pa.RecordBatchReader
 log.sql(query, *, include_archive=False) -> pa.RecordBatchReader
 ```
 
@@ -215,7 +215,8 @@ log.sql(query, *, include_archive=False) -> pa.RecordBatchReader
 from manifest statistics at query time (§7, I3). The tiers overlap by design; the bounds are
 what make each row appear exactly once.
 
-**`include_archive=False` by default**, because a hot read is local disk only and must stay
+**`include_archive` defaults to `None`, meaning "decide from the tiers".** That resolves to
+False whenever the local table holds files, because a hot read is local disk only and must stay
 that way (I5). Opting in is opting into network I/O.
 
 `sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. Both return a

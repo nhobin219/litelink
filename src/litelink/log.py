@@ -516,9 +516,17 @@ class LogHandle:
         if archive is None:
             return 0
 
-        archive.reload()
+        try:
+            archive.reload()
 
-        return len(archive.data_files())
+            return len(archive.data_files())
+        except FileNotFoundError as exc:
+            # The same refusal every other archive-touching member gives. This
+            # was the one that escaped the conversion and raised a bare
+            # `FileNotFoundError` naming an S3 key — loud either way, but a
+            # caller handling "the snapshot was swept" should not have to
+            # handle it twice.
+            raise self._swept(exc) from exc
 
     def coverage(self) -> Coverage:
         """What this reader can serve, and where it cannot.
@@ -648,10 +656,26 @@ class LogHandle:
         reported the same log gap-free. Measured: 0 of 20 rows, indefinitely,
         on both a reader and a writer.
 
-        So the cost is a metadata GET per read on a log with an empty local
-        table. A log with local files never reaches this line, which is what
-        keeps I5 intact for a hot read; a log without them has no local data to
-        protect and the alternative is silently wrong results.
+        So the cost is archive metadata GETs on a read of a log with an empty
+        local table — two of them, since the read that follows resolves the
+        archive again for its own bounds, and an earlier version of this
+        docstring said one. A log with local files never reaches this line,
+        which is what keeps I5 intact for a hot read; a log without them has no
+        local data to protect, and the alternative is silently wrong results.
+
+        **On a log that DOES have local files, the reload above costs 0.63 ms
+        and the read resolves the table a second time for its own bounds.**
+        Measured two ways that agree: `LogTable.reload()` in isolation at
+        0.6278 ms, and the p10 of an end-to-end scan with and without this
+        check at 0.63 and 0.61 ms, against an A/A noise floor of 0.34 ms.
+
+        It is a FIXED cost, so it is ~10% of the smallest possible scan
+        (6.5 ms over 1,710 rows) and ~0.1% of the full-window read §7 measures
+        at 611 ms. Collapsing it means deriving this inside `Reader.query`,
+        after the resolve that already happens there — which is possible, and
+        is not worth doing on the strength of 0.63 ms, because that path's own
+        docstring explains that getting it wrong leaves "rows silently missing
+        from the answer". Revisit if a workload ever shows it.
         """
         # Cheapest first, and the order is load-bearing for I5. `configured()`
         # is a keyed `meta` read and opens nothing, so a local-only log answers
@@ -932,9 +956,6 @@ class WriteHandle(LocalReadHandle):
         # directions — a maintenance process redoing the writer's in-flight
         # seal, a writer deleting a maintenance process's half-written
         # compaction — and ownership is what resolves it.
-        # The last failure from the sealing thread, which has no caller to
-        # raise to. Surfaced by `close`, so a process that never checks still
-        # finds out.
 
     # -- construction ------------------------------------------------------
 
