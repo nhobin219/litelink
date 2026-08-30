@@ -280,3 +280,63 @@ def test_release_notes_group_and_carry_the_reason() -> None:
 
     # Trailers are not a reason.
     assert lead("Co-Authored-By: someone <a@b.c>") == ""
+
+
+def test_release_notes_survive_a_first_release_and_a_long_history() -> None:
+    """Both ways the notes broke on the first release they were used for.
+
+    **`last_tag` returned the tag being released.** `git describe --tags` from
+    HEAD names the tag AT HEAD on a release run, so the range was
+    `v0.1.0..HEAD` — empty — and the step exited 1 with "no commits since
+    v0.1.0" *after PyPI had already accepted the upload*. It describes from
+    `HEAD^` now, so a first release means the full history.
+
+    **And the full history nearly did not fit.** GitHub rejects a release body
+    over 125,000 characters; this repo's first release came to 98,720 with
+    reasons included. Rather than fail, it drops the reasons and keeps every
+    subject, because an unannounced change is the thing that must not happen.
+
+    Falsify by describing from HEAD, or by removing the limit branch.
+    """
+    import subprocess
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from release_notes import last_tag, render
+
+    tags = subprocess.run(  # noqa: S603
+        ["git", "tag"], capture_output=True, check=True, text=True, cwd=ROOT
+    ).stdout.split()
+    head = subprocess.run(  # noqa: S603
+        ["git", "tag", "--points-at", "HEAD"],
+        capture_output=True,
+        check=True,
+        text=True,
+        cwd=ROOT,
+    ).stdout.split()
+
+    if tags:
+        assert last_tag() not in head, (
+            "last_tag() returned a tag pointing at HEAD, so a release run would "
+            "diff the tag against itself and find nothing"
+        )
+
+    entries = [
+        {
+            "type": "fix",
+            "scope": "",
+            "subject": f"change number {n}",
+            "body": "A reason long enough to matter. " * 12,
+            "commit": f"{n:040d}",
+            "breaking": "",
+        }
+        for n in range(60)
+    ]
+
+    full = render(entries, "9.9.9", "https://x.test")
+    capped = render(entries, "9.9.9", "https://x.test", limit=2_000)
+
+    assert len(full) > len(capped)
+    assert "Reasons omitted" in capped
+    assert capped.count("\n- ") == 60, "every change must still be listed"
+    assert "A reason long enough" not in capped
