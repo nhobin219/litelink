@@ -175,9 +175,23 @@ def litestream_binary(override: str | None = None) -> str:
     if override is not None:
         return override
 
+    # A checkout's binary first, so a contributor tests what `just litestream`
+    # pinned rather than whatever the machine carries.
     pinned = Path(__file__).resolve().parents[2] / ".bin" / "litestream"
+    if os.access(pinned, os.X_OK):
+        return str(pinned)
 
-    return str(pinned) if os.access(pinned, os.X_OK) else "litestream"
+    # Then the one shipped inside the wheel. This is the case that makes an
+    # installed package self-sufficient: it needs no PATH, which matters
+    # because systemd user units do not inherit a login shell's, so
+    # `which litestream` succeeding proves nothing about the unit that will
+    # run the restore.
+    bundled = Path(__file__).resolve().parent / ".bin" / "litestream"
+    if os.access(bundled, os.X_OK):
+        return str(bundled)
+
+    # And finally PATH, for someone who installed it themselves.
+    return "litestream"
 
 
 def restore_buffer(

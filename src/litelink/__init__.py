@@ -40,6 +40,7 @@ where the reasoning lives.
 from importlib.metadata import PackageNotFoundError, version
 
 from litelink._assembly import follow, new, open, restore  # noqa: A004
+from litelink._preflight import Check, Report, preflight
 from litelink._s3 import S3Options
 from litelink.log import (
     Coverage,
@@ -57,11 +58,13 @@ except PackageNotFoundError:  # a source tree that was never installed
     __version__ = "0.0.0"
 
 __all__ = [
+    "Check",
     "Coverage",
     "LocalReadHandle",
     "LogConfig",
     "LogHandle",
     "RemoteReadHandle",
+    "Report",
     "Row",
     "S3Options",
     "WriteHandle",
@@ -69,5 +72,6 @@ __all__ = [
     "follow",
     "new",
     "open",
+    "preflight",
     "restore",
 ]
