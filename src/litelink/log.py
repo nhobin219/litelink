@@ -1078,7 +1078,18 @@ class WriteHandle(LocalReadHandle):
             except Exception:
                 # Unreachable or unreadable is "cannot tell", which passes:
                 # configuring an archive is a statement of intent, not a claim
-                # that the bucket is already there.
+                # that the bucket is already there. Measured: an empty prefix
+                # and a nonexistent bucket both return None, while bad
+                # credentials and a dead endpoint raise — and all four have to
+                # pass, because credentials commonly attach to a box AFTER the
+                # log is configured.
+                #
+                # An attempt to narrow this to `except OSError` broke sixteen
+                # tests that configure an archive with no live endpoint, which
+                # is the pattern this is protecting, not an accident of theirs.
+                # The way to catch a typo'd key is `litelink.preflight`, which
+                # can also check the things this cannot: the litestream binary
+                # and the DuckDB extensions.
                 covered = None
 
             if covered is not None:

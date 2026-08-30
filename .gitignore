@@ -35,3 +35,4 @@ docs/plans/
 .claude/worktrees/
 /.roborev/
 .env
+src/litelink/.bin/

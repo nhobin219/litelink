@@ -40,6 +40,30 @@ Durable capture, file sizing and tiering are each easy alone and nobody's job to
 **Status: early.** All three tiers work, and a log survives losing its machine. Read
 [what it is not](#what-it-is-not) and [not implemented yet](#not-implemented-yet) first.
 
+## Install
+
+```bash
+pip install litelink        # or: uv add litelink
+```
+
+That is the whole of it. The wheel carries what the library shells out to — a
+checksum-verified litestream, and the DuckDB `iceberg`, `avro` and `httpfs` extensions built
+for the DuckDB it pins — so a machine with no egress, nothing on `PATH` and no DuckDB
+extension cache still reads, writes and restores. Verified that way in CI, not assumed.
+
+That costs about 124 MB per wheel, and it buys the failure mode you do not want: a missing
+binary discovered during a failover, or an extension that autoinstalls fine on your laptop
+and cannot on the box that matters.
+
+```bash
+python -m litelink          # PASS/FAIL per requirement, non-zero exit if not ready
+```
+
+Platform wheels are published for Linux and macOS on x86-64 and arm64. Anywhere else, pip
+builds from the sdist — which produces a working pure-Python wheel with no binaries — and you
+supply litestream and the DuckDB extensions yourself; `python -m litelink` tells you which are
+missing and how to get them.
+
 ## Quick start
 
 ```bash
@@ -48,8 +72,9 @@ just bootstrap         # uv sync + git hooks + DuckDB extensions
 just demo-websocket    # capture a live public feed, one process, ~30 seconds
 ```
 
-You need [`uv`](https://docs.astral.sh/uv/) and [`just`](https://github.com/casey/just), and
-nothing else: no producer, no credentials, no maintainer, no container. That demo is
+For working ON litelink you need [`uv`](https://docs.astral.sh/uv/) and
+[`just`](https://github.com/casey/just); for using it you need neither. Either way the demo
+needs nothing else: no producer, no credentials, no maintainer, no container. That demo is
 [`examples/websocket.py`](examples/websocket.py), and this is its shape:
 
 ```python
@@ -114,13 +139,45 @@ untouched, and a log directory never carries a key with it.
 To survive losing the machine, ship the SQLite WAL alongside:
 
 ```bash
-just litestream        # once: fetch the pinned, checksum-verified sidecar
 just demo-replicate    # generates litestream.yml from the log, runs it
 ```
 
 `litelink.restore(root, name, archive=...)` then rebuilds the log on another box, reserving an
 offset window so nothing the dead machine served is reissued. Verified against a local
 S3-compatible store and against AWS. See [`examples/`](examples/).
+
+### Run the sidecar as its own process
+
+**litelink emits the config; your supervisor runs the binary.** `replication_config()` writes
+a `litestream.yml` describing which databases carry the log's state, and systemd, Kubernetes
+or anything else runs `litestream replicate -config …` beside the writer. litelink never
+starts it and never supervises it, and that is a design commitment rather than an omission:
+
+- **It keeps the network out of the write path.** A sidecar reads the WAL from outside the
+  process. If litelink owned the replicator, a stalled upload could push back on `append`,
+  and "durable when it returns, with no network in the write path" is the property the whole
+  design rests on.
+- **The lifecycles are the wrong way round otherwise.** A writer that owns its replicator
+  kills it at exactly the moment you need the last frames shipped. A separate process keeps
+  draining what is already on disk.
+- **§1 allows one writer per log.** Two `Log` handles each spawning a replicator would run
+  two litestream instances against one database, which litestream forbids.
+
+litelink *does* run litestream in one place — `restore`, which shells out to it once and waits.
+That is a batch call, not a supervised daemon, and it is why the binary ships in the wheel
+rather than being left to PATH: the alternative is discovering it is missing during a
+failover.
+
+Check the machine before you need it:
+
+```bash
+python -m litelink                             # extensions, litestream
+python -m litelink s3://bucket/prefix trades   # ...and the archive is reachable
+```
+
+Run that as the user and from the process manager that will own the log. A systemd user unit
+does not inherit a login shell's PATH, so `which litestream` succeeding in your terminal says
+nothing about the unit that will actually perform the restore.
 
 ## Reading it from another machine
 

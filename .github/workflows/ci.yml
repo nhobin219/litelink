@@ -21,6 +21,68 @@ permissions:
   contents: read
 
 jobs:
+  packaging:
+    name: The wheel works on a cold box
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # A PLATFORM wheel, which is what a user on this OS installs. The pure
+      # wheel is the fallback for platforms with no build, and it cannot carry
+      # the binaries this job exists to check.
+      - name: Build the platform wheel
+        run: LITELINK_WHEEL_PLATFORM=linux-x86_64 uv build --wheel --out-dir dist
+
+      # The claim the README makes: no network, nothing on PATH, no DuckDB
+      # extension cache. Every one of those has produced a real failure — a
+      # missing binary found during a failover, an `iceberg` that autoinstalls
+      # on a laptop and cannot on the target, an `avro` pulled in from inside
+      # another extension's init. None reproduce on a warm developer machine.
+      # ubuntu-24.04 runners set kernel.apparmor_restrict_unprivileged_userns=1,
+      # which blocks the `unshare` below. The `test` job already does this.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Install and run it with no egress
+        run: |
+          uv venv --python 3.11 cold
+          uv pip install --python cold/bin/python dist/*.whl
+          cold_home=$(mktemp -d)
+          cd /tmp && env -i "HOME=$cold_home" PATH=/usr/bin:/bin \
+            unshare --map-root-user --net \
+            "$GITHUB_WORKSPACE/cold/bin/python" - <<'PY'
+          import os, shutil, tempfile
+          from pathlib import Path
+          import pyarrow as pa
+          import litelink
+
+          import socket
+          try:
+              socket.create_connection(("1.1.1.1", 443), timeout=3).close()
+          except OSError:
+              pass
+          else:
+              raise AssertionError("expected no network, but a connection succeeded")
+          assert shutil.which("litestream") is None, "expected nothing on PATH"
+          assert not os.listdir(os.environ["HOME"]), "expected an empty HOME"
+
+          report = litelink.preflight(replication=True)
+          print(report)
+          report.raise_if_not_ready()
+
+          schema = pa.schema([pa.field("event_ts", pa.int64(), nullable=False)])
+          with litelink.new(Path(tempfile.mkdtemp()), "cold", schema=schema) as log:
+              log.extend([{"event_ts": i} for i in range(500)])
+              log.seal_due()
+              assert log.scan().read_all().num_rows == 500
+              assert log.sql("SELECT count(*) c FROM log").read_all()["c"][0].as_py() == 500
+
+          print("cold box: preflight READY, 500 rows through DuckDB")
+          PY
+
   lint:
     name: Lint + format
     runs-on: ubuntu-latest
@@ -48,6 +110,29 @@ jobs:
   test:
     name: Tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+
+    # An S3-compatible endpoint, because without one the ENTIRE archive tier
+    # skips — and it did, silently, for the whole life of this workflow. The
+    # tier most of this library's bugs have been found in was never run here.
+    # What finally said so was `286 passed, 1 skipped, 91 errors`, and only
+    # because s3fs became a dev dependency and the skip turned into an error.
+    #
+    # Same image and credentials as `just rustfs`, so CI and a developer
+    # machine are one environment rather than two that drift.
+    services:
+      rustfs:
+        # Pinned, not `:latest`. A floating tag that renames its credential
+        # env vars would still answer on the port — the readiness check below
+        # only asks for any HTTP response — so `fs.ls("/")` would fail, the
+        # session fixture would skip, and the archive tier would vanish green
+        # again. That is the exact failure this service was added to end.
+        image: rustfs/rustfs:1.0.0-rc.4
+        env:
+          RUSTFS_ACCESS_KEY: litelink
+          RUSTFS_SECRET_KEY: litelink-secret
+        ports:
+          - 9000:9000
+
     strategy:
       fail-fast: false
       matrix:
@@ -65,11 +150,37 @@ jobs:
       # The read path's DuckDB extensions are downloaded, not bundled. Doing it
       # as its own step means a fetch failure reads as a provisioning failure
       # rather than as a mysterious IO error inside a test.
-      - run: uv run python scripts/install_duckdb_extensions.py
+      # `--remote` includes httpfs, which the archive tier needs. It was absent
+      # for as long as that tier skipped in CI, so nothing noticed; the moment
+      # an S3 endpoint made those tests run, every archive read failed on a
+      # missing extension.
+      - run: uv run python scripts/install_duckdb_extensions.py --remote
+
       # Then assert the box can load them with autoinstall off — the same check
       # an offline deployment target would run. This is what catches a new
       # extension being added to the read path without being added here.
-      - run: uv run python scripts/install_duckdb_extensions.py --check
+      - run: uv run python scripts/install_duckdb_extensions.py --check --remote
+
+      # litestream, or eleven tests skip: every follower, restore and
+      # replication test guards on it. They were skipping here for the same
+      # reason the archive tier was — nothing provisioned it and nothing said
+      # so — and they are the tests that found most of this library's recent
+      # bugs. Checksum-verified by the same script the wheel build uses.
+      - name: Fetch litestream
+        run: uv run python scripts/vendor_litestream.py --into .bin
+      # Any HTTP answer means it is listening. NOT `curl -f`: an unauthenticated
+      # S3 root answers 403, which is a healthy server refusing an anonymous
+      # request, and -f reads that as a failure. Same check `just rustfs` makes.
+      - name: Wait for the S3 endpoint
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -s -o /dev/null http://127.0.0.1:9000 2>/dev/null; then
+              echo "rustfs is listening"; exit 0
+            fi
+            sleep 1
+          done
+          echo "rustfs never came up; the archive tier would not run" >&2
+          exit 1
       # tests/test_offline.py proves I5 by running the capture loop inside a
       # network namespace, which Ubuntu blocks for unprivileged users through
       # AppArmor. Without this the suite still passes — the tests skip — and
@@ -77,16 +188,33 @@ jobs:
       # Tolerated if the knob is absent, since the skip is then correct.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # A skip is not a pass. Without this the fixture would skip on a dead
+      # endpoint and take the archive tier with it, quietly.
       - run: uv run pytest -q
+        env:
+          LITELINK_REQUIRE_S3: "1"
 
   ci-success:
     name: CI success
     if: always()
-    needs: [lint, typecheck, test]
+    needs: [lint, typecheck, test, packaging]
     runs-on: ubuntu-latest
     steps:
-      # One required check for branch protection / the merge queue. Reading the
-      # aggregate result rather than each `needs.*.result` means a job added
-      # later is covered without editing this gate.
-      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      # One required check for branch protection / the merge queue.
+      #
+      # **Every job must be listed in `needs` above.** This comment used to
+      # claim that reading the aggregate `needs.*.result` covered a job added
+      # later without editing the gate. That is false — `needs.*` expands only
+      # to the jobs named — and it was disproved by the job right above it:
+      # `packaging` was added, was not listed, and could fail red on a PR while
+      # this reported success. The one check that verifies the wheel works on a
+      # cold box was invisible to the check that gates the merge.
+      #
+      # `skipped` counts as a failure too. A needed job that never ran is not a
+      # job that passed, and every "went green having provisioned nothing"
+      # defect on this branch came from treating an absence as an approval.
+      - if: >-
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
+          || contains(needs.*.result, 'skipped')
         run: exit 1

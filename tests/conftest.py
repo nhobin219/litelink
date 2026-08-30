@@ -44,7 +44,13 @@ def options() -> S3Options:
 
 
 def filesystem(s3: S3Options):  # noqa: ANN201  — s3fs is an optional import
-    s3fs = pytest.importorskip("s3fs", reason="the `s3` extra is not installed")
+    s3fs = pytest.importorskip(
+        "s3fs",
+        reason=(
+            "s3fs is missing — it is a dev dependency used by the test "
+            "fixtures, not by litelink. Run `uv sync`."
+        ),
+    )
 
     return s3fs.S3FileSystem(
         key=s3.access_key,
@@ -65,8 +71,28 @@ def s3() -> S3Options:
     fs = filesystem(resolved)
     try:
         fs.ls("/")
-    except OSError as exc:
-        pytest.skip(f"no S3 endpoint at {resolved.endpoint}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        if os.environ.get("LITELINK_REQUIRE_S3"):
+            # CI sets this. A skip there is not a neutral outcome — it is ~91
+            # tests silently not running, which is how the archive tier went
+            # unchecked for the life of that workflow.
+            pytest.fail(
+                f"LITELINK_REQUIRE_S3 is set but the endpoint at "
+                f"{resolved.endpoint} did not answer: {type(exc).__name__}: {exc}"
+            )
+
+        # Broad on purpose. This used to catch `OSError`, which is what a
+        # refused connection raises through pyarrow — but s3fs answers with
+        # `botocore.exceptions.EndpointConnectionError`, which is not one. The
+        # result was 91 ERRORS instead of 91 skips the moment s3fs was
+        # installed without an endpoint to talk to.
+        #
+        # Anything at all here means the tier cannot be exercised, and the
+        # honest response is to say so once rather than to fail every test in
+        # it with the same connection error.
+        pytest.skip(
+            f"no S3 endpoint at {resolved.endpoint}: {type(exc).__name__}: {exc}"
+        )
 
     return resolved
 

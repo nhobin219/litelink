@@ -175,9 +175,23 @@ def litestream_binary(override: str | None = None) -> str:
     if override is not None:
         return override
 
+    # A checkout's binary first, so a contributor tests what `just litestream`
+    # pinned rather than whatever the machine carries.
     pinned = Path(__file__).resolve().parents[2] / ".bin" / "litestream"
+    if os.access(pinned, os.X_OK):
+        return str(pinned)
 
-    return str(pinned) if os.access(pinned, os.X_OK) else "litestream"
+    # Then the one shipped inside the wheel. This is the case that makes an
+    # installed package self-sufficient: it needs no PATH, which matters
+    # because systemd user units do not inherit a login shell's, so
+    # `which litestream` succeeding proves nothing about the unit that will
+    # run the restore.
+    bundled = Path(__file__).resolve().parent / ".bin" / "litestream"
+    if os.access(bundled, os.X_OK):
+        return str(bundled)
+
+    # And finally PATH, for someone who installed it themselves.
+    return "litestream"
 
 
 def restore_buffer(
@@ -215,8 +229,17 @@ def restore_buffer(
         subprocess.run(command, check=True, env=environment, capture_output=True)  # noqa: S603
     except FileNotFoundError:
         msg = (
-            "litestream was not found. Fetch the pinned build with "
-            "`just litestream`, or install it: https://litestream.io/install"
+            "litestream was not found, and this log needs it to restore.\n"
+            "\n"
+            "litelink's platform wheels ship it, so this is either a "
+            "pure-Python wheel — the fallback for a platform with no build — "
+            "or an install from source. Put litestream on PATH "
+            "(https://litestream.io/install), or pass `binary=` explicitly.\n"
+            "\n"
+            "PATH is worth checking rather than assuming: systemd user units do "
+            "not inherit a login shell's PATH, so `which litestream` succeeding "
+            "in a terminal says nothing about the unit that will actually run "
+            "the restore."
         )
         raise RuntimeError(msg) from None
     except subprocess.CalledProcessError as exc:

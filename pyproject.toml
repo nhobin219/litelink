@@ -22,26 +22,77 @@ classifiers = [
 # real import path rather than a declared intention.
 #   sql-sqlite: SqlCatalog on SQLite (§1). pyarrow: the seal path (§15.4).
 dependencies = [
-    "duckdb>=1.5.5",
+    # Pinned to ONE PATCH, and that is not excess caution. The wheel bundles
+    # DuckDB extensions built for an exact version — they are looked up under
+    # `.bin/<duckdb.__version__>/<platform>/`, and DuckDB refuses a
+    # cross-version extension — so the coupling is at the patch level, not the
+    # minor. A first attempt capped this at `<1.6`, which admits 1.5.6: that
+    # release is already on PyPI as `1.5.6.devN`, and the day it goes final
+    # every `pip install litelink` resolves it, the bundle is skipped by
+    # design, and 100 MB of extensions become dead weight in a wheel that is
+    # immutable and cannot be corrected.
+    #
+    # The failure is quiet in both directions. Offline, the log cannot be read
+    # at all; online, `LOAD iceberg` silently autoinstalls over the network and
+    # the package regains the dependency the bundling exists to remove.
+    "duckdb>=1.5.5,<1.5.6",
     "pyarrow>=17.0.0",
     "pyiceberg[pyarrow,sql-sqlite]>=0.11.1",
     "xxhash>=3.6.0",
 ]
 
 [project.optional-dependencies]
-# The remote tier (§1). Local-first capture never resolves this.
-s3 = ["pyiceberg[s3fs]>=0.11.1"]
+# Deliberately empty of an `s3` extra, which used to be here declaring
+# `pyiceberg[s3fs]`. It was cargo: nothing in `src/` imports s3fs, pyiceberg
+# resolves `PyArrowFileIO` first, and arrow speaks S3 natively. Measured on a
+# clean venv with only the base wheel — 21 files pushed to a bucket and read
+# back, with s3fs absent.
+#
+# The archive and replication tiers need BINARIES rather than packages, which
+# an extra cannot deliver: extras add dependencies, not files. They ship in the
+# platform wheel instead (see `hatch_build.py`) and are checked by
+# `python -m litelink`.
 
 [project.urls]
 Source = "https://github.com/nhobin219/litelink"
 Specification = "https://github.com/nhobin219/litelink/blob/main/docs/SPEC.md"
 
 [build-system]
-requires = ["uv_build>=0.11.0,<0.12.0"]
-build-backend = "uv_build"
+# hatchling rather than uv_build, for one reason: a build hook that can stamp a
+# wheel with a platform tag and put a native binary inside it. `uv_build` has
+# no such hook, and litelink runs litestream on a public code path, so the
+# binary has to be able to travel with the wheel.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/litelink"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+# The sdist stays source-only. Someone building from it gets the pure wheel and
+# resolves litestream from PATH, which is the behaviour that predates this.
+include = ["src", "scripts", "README.md", "LICENSE", "NOTICE", "docs/SPEC.md"]
 
 [dependency-groups]
 dev = [
+    # s3fs is a TEST dependency, not a library one. `conftest.filesystem` uses
+    # it to assert against a bucket directly — what litelink pushed, and that a
+    # reader wrote nothing — which is a different job from litelink's own S3
+    # access, and that goes through pyarrow. It moved here from an `s3` extra
+    # that declared it as though the library needed it.
+    #
+    # Its absence skips the whole archive tier, which is 91 tests. That is a
+    # silent loss, so `test_s3_tier_is_not_silently_skipped` fails instead.
+    "s3fs>=2024.6.0",
+    # The build backend, so the type checker can see `hatch_build.py`'s hook
+    # interface rather than reporting it unresolvable. It is a build dependency
+    # either way; installing it makes the hook checkable like everything else.
+    "hatchling>=1.27",
+    # Read by `test_packaging` to assert the CI gate depends on every job.
+    "pyyaml>=6.0",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
     "ruff>=0.15.0",
@@ -82,6 +133,14 @@ ignore = ["E501"]
 # reports every construction as missing its arguments. Scoped to the one module
 # that builds predicates so the suppression cannot hide a real call error
 # anywhere else.
+# `hatch_build.py` reaches into `scripts/` through `sys.path`, which the type
+# checker cannot follow — the alternative is duplicating the vendoring logic
+# into the hook, and one fetch-and-verify is better than two.
+[[tool.ty.overrides]]
+include = ["hatch_build.py", "tests/test_packaging.py"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [[tool.ty.overrides]]
 include = ["src/litelink/_predicates.py"]
 [tool.ty.overrides.rules]

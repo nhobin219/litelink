@@ -7,7 +7,9 @@ its planning happens in Python and costs ~100 ms per scan, paid on every query.
 
 from __future__ import annotations
 
+import contextlib
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -78,6 +80,53 @@ class ExtensionMissing(RuntimeError):
     """A DuckDB extension the read path needs is not on this machine (§7)."""
 
 
+def _duckdb_library_version() -> str:
+    """The version DuckDB's extension repository is keyed on.
+
+    `duckdb.__version__` is the DISTRIBUTION version — what pip resolved —
+    while extensions are published under the LIBRARY version, which duckdb
+    exposes separately. They agree for every release duckdb has published so
+    far (0 post-releases in 129), but a `1.5.5.post1` would make them differ,
+    and the dependency range admits one: `<1.5.6` is a bound on the
+    distribution.
+
+    A post-release would then miss the bundle for all three extensions, which
+    degrades to a network fetch online and to an unreadable log offline. One
+    `getattr` removes the whole question.
+    """
+    return str(getattr(duckdb, "__duckdb_version__", duckdb.__version__)).lstrip("v")
+
+
+def _bundled_extension(connection: duckdb.DuckDBPyConnection, name: str) -> Path | None:
+    """The copy shipped in the wheel, if there is one this DuckDB can load.
+
+    **Checked against the RUNNING version and platform, never assumed.** DuckDB
+    builds extensions per version and per platform — the download path is
+    `/v1.5.5/linux_amd64/...` — so a bundle is only usable by the exact DuckDB
+    it was fetched for. `duckdb>=1.5.5` has no ceiling, so a user can perfectly
+    well resolve a newer one than the wheel was built against, and loading a
+    mismatched extension is not something to find out at read time.
+
+    Returning None on a miss is deliberate: the caller falls through to the
+    ordinary `LOAD`, which finds a machine-provisioned copy if there is one and
+    otherwise raises the message that says how to get one. The bundle is a fast
+    path, not the mechanism.
+    """
+    root = Path(__file__).resolve().parent / ".bin"
+    if not root.is_dir():
+        return None
+
+    platform = connection.execute("PRAGMA platform").fetchone()
+    if platform is None:
+        return None
+
+    candidate = (
+        root / _duckdb_library_version() / str(platform[0]) / f"{name}.duckdb_extension"
+    )
+
+    return candidate if candidate.is_file() else None
+
+
 def load_extension(
     connection: duckdb.DuckDBPyConnection, name: str, *, remote: bool
 ) -> None:
@@ -104,20 +153,60 @@ def load_extension(
     precisely what that check is written to detect, so adding one would leave
     the check passing on a machine it was meant to fail.
 
-    `remote` picks the flag to name, which is the only thing the two callers
-    differ on: `httpfs` is behind `--remote` because a local-first log never
-    loads it.
+    `remote` says whether this extension is needed only for the archive tier,
+    which changes what the message should tell the reader: a local-first log
+    never loads `httpfs`, so someone who hits it has either configured an
+    archive or is reading one, and someone who has not can ignore it entirely.
+    It also picks the flag for the contributor recipe.
     """
+    bundled = _bundled_extension(connection, name)
+    if bundled is not None:
+        try:
+            connection.execute(f"LOAD '{bundled}'")
+        except duckdb.Error:
+            # The bundle is a fast path, not a trapdoor. A copy that arrived
+            # wrong — a mangling proxy, a partial install, a corrupt download —
+            # would otherwise break a machine that has a perfectly good
+            # extension in its own DuckDB home, and break it with a raw
+            # `IOException` naming a path inside site-packages rather than the
+            # message below that says how to fix it.
+            #
+            # DuckDB verifies the signature on LOAD, so a substituted extension
+            # is refused rather than run; what falling through buys is that the
+            # refusal is recoverable.
+            pass
+        else:
+            return
+
     try:
         connection.execute(f"LOAD {name}")
     except duckdb.IOException as exc:
         flag = " --remote" if remote else ""
+        tier = (
+            "\n\nOnly the archive tier needs this. A local-first log never "
+            "loads it, so if you are not reading an archive you can ignore it."
+            if remote
+            else ""
+        )
         msg = (
             f"the DuckDB `{name}` extension is not installed on this machine. "
             f"It is not compiled into the duckdb wheel, and an explicit LOAD "
             f"does not fetch it, so it has to be provisioned:\n"
-            f"    just duckdb-extensions{flag}\n"
-            f"    python scripts/install_duckdb_extensions.py{flag}"
+            f"\n"
+            f"litelink's platform wheels ship it, built for the DuckDB they "
+            f"pin — so either this is a pure-Python wheel, or duckdb "
+            f"{duckdb.__version__} is not the version those extensions were "
+            f"built for.\n"
+            f"\n"
+            f"Fetch it into this machine's DuckDB home, which needs network:\n"
+            f"\n"
+            f'    python -c "import duckdb; '
+            f"duckdb.connect().execute('INSTALL {name}')\"\n"
+            f"\n"
+            f"Extensions are built per DuckDB version and platform, so one "
+            f"fetched for a different duckdb will not load."
+            f"\n\nFrom a checkout:    just duckdb-extensions{flag}"
+            f"{tier}"
         )
         raise ExtensionMissing(msg) from exc
 
@@ -134,6 +223,13 @@ def duckdb_connection() -> duckdb.DuckDBPyConnection:
     appends should not pay at `open`.
     """
     connection = duckdb.connect()
+    # `avro` BEFORE `iceberg`, and quietly: `iceberg`'s init auto-installs it
+    # otherwise, which needs the network and defeats the point of bundling.
+    # Missing is not fatal here — a machine-provisioned `iceberg` may resolve
+    # it however it already does — so the failure to report is `iceberg`'s.
+    with contextlib.suppress(ExtensionMissing, duckdb.Error):
+        load_extension(connection, "avro", remote=False)
+
     load_extension(connection, "iceberg", remote=False)
     # No ATTACH of the buffer database. `Buffer.rows_above` records what that
     # cost: two SQLite libraries in one process is silent corruption, not a
