@@ -104,20 +104,40 @@ def load_extension(
     precisely what that check is written to detect, so adding one would leave
     the check passing on a machine it was meant to fail.
 
-    `remote` picks the flag to name, which is the only thing the two callers
-    differ on: `httpfs` is behind `--remote` because a local-first log never
-    loads it.
+    `remote` says whether this extension is needed only for the archive tier,
+    which changes what the message should tell the reader: a local-first log
+    never loads `httpfs`, so someone who hits it has either configured an
+    archive or is reading one, and someone who has not can ignore it entirely.
+    It also picks the flag for the contributor recipe.
     """
     try:
         connection.execute(f"LOAD {name}")
     except duckdb.IOException as exc:
         flag = " --remote" if remote else ""
+        tier = (
+            "\n\nOnly the archive tier needs this. A local-first log never "
+            "loads it, so if you are not reading an archive you can ignore it."
+            if remote
+            else ""
+        )
         msg = (
             f"the DuckDB `{name}` extension is not installed on this machine. "
             f"It is not compiled into the duckdb wheel, and an explicit LOAD "
             f"does not fetch it, so it has to be provisioned:\n"
-            f"    just duckdb-extensions{flag}\n"
-            f"    python scripts/install_duckdb_extensions.py{flag}"
+            f"\n"
+            f"    pip install 'litelink[archive]'   # ships it for duckdb "
+            f"{duckdb.__version__}\n"
+            f"\n"
+            f"or fetch it into this machine's DuckDB home, which needs "
+            f"network:\n"
+            f"\n"
+            f'    python -c "import duckdb; '
+            f"duckdb.connect().execute('INSTALL {name}')\"\n"
+            f"\n"
+            f"Extensions are built per DuckDB version and platform, so one "
+            f"fetched for a different duckdb will not load."
+            f"\n\nFrom a checkout:    just duckdb-extensions{flag}"
+            f"{tier}"
         )
         raise ExtensionMissing(msg) from exc
 

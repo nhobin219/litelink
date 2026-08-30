@@ -215,8 +215,18 @@ def restore_buffer(
         subprocess.run(command, check=True, env=environment, capture_output=True)  # noqa: S603
     except FileNotFoundError:
         msg = (
-            "litestream was not found. Fetch the pinned build with "
-            "`just litestream`, or install it: https://litestream.io/install"
+            "litestream was not found, and this log needs it to restore.\n"
+            "\n"
+            "  pip install 'litelink[replication]'   # ships the pinned binary\n"
+            "\n"
+            "If your platform has no wheel, install it yourself "
+            "(https://litestream.io/install) and put it on PATH, or pass "
+            "`binary=` explicitly.\n"
+            "\n"
+            "PATH is worth checking rather than assuming: systemd user units do "
+            "not inherit a login shell's PATH, so `which litestream` succeeding "
+            "in a terminal says nothing about the unit that will actually run "
+            "the restore."
         )
         raise RuntimeError(msg) from None
     except subprocess.CalledProcessError as exc:

@@ -197,8 +197,21 @@ def test_an_unprovisioned_extension_names_the_command_that_fixes_it(
     # The flag, not just the script. `httpfs` is behind `--remote`, and an
     # error naming the bare command sends the reader to a run that installs
     # everything except the extension they are missing.
+    # Three remedies, for three readers: someone who installed the wheel,
+    # someone who will fetch it into their own DuckDB home, and a contributor
+    # with a checkout. The message used to name only the last two, which are
+    # both useless to a `pip install` consumer — the failure this whole test
+    # is about is provisioning that LOOKS complete.
+    assert "pip install 'litelink[archive]'" in message
+    assert "INSTALL httpfs" in message
     assert "just duckdb-extensions --remote" in message
-    assert "install_duckdb_extensions.py --remote" in message
+
+    # And it says the thing that makes a wrong fix look right: extensions are
+    # built per DuckDB version and platform.
+    assert "per DuckDB version and platform" in message
+
+    # `remote=True` earns its keep by saying who can ignore this.
+    assert "Only the archive tier needs this" in message
     # DuckDB's own error is kept as the cause rather than swallowed: it names
     # the exact path that was searched, which is the only way to tell a missing
     # extension from one installed under a different HOME.
