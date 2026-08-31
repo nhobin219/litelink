@@ -119,9 +119,19 @@ FROM iceberg_scan('s3://bucket/prefix/trades',
 seen and asks for what came after.
 
 That read is only as fresh as the last `sync`. With a WAL sidecar running,
-`litelink.follow(...)` restores the writer's buffer alongside the archive and merges them, so
-a reader sees down to the replication lag instead — and `coverage()` reports what it can and
-cannot serve rather than guessing. Details in [`docs/API.md`](docs/API.md).
+`litelink.follow` does better: it restores the writer's buffer alongside the archive and
+merges them, so a reader sees down to the replication lag instead.
+
+```python
+with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
+    reader.coverage()   # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, ...)
+    reader.scan(where="price > 78000", columns=["event_ts", "price"])
+```
+
+It cannot append — a read handle has no write surface at all, rather than one that raises —
+and it is a **snapshot, not a subscription**: refreshing means assembling another one.
+`coverage()` is how it stays honest about what it can and cannot serve.
+Details in [`docs/API.md`](docs/API.md).
 
 ## How it works
 
