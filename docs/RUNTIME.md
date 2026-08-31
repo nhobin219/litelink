@@ -72,6 +72,28 @@ range claimed skips it and finds the work still there next pass.
 
 ---
 
+## Migrating from 0.1
+
+0.1.0 put `catalog.db` and `archive.db` at the root, shared
+by every stream, and Iceberg metadata under `<root>/litelink/<name>/metadata` — outside the
+data it described. `open` detects the old tree and names the fix:
+
+```bash
+python -m litelink.migrate --root ./data --name trades              # dry run
+python -m litelink.migrate --root ./data --name trades --apply
+```
+
+Data files are not touched or rewritten; only pointers move. Pass `--archive s3://...` to
+move the archive's metadata too, then restart the sidecar so it replicates to the new
+`<prefix>/<name>/_wal` before dropping the old one with `--drop-legacy-wal`.
+
+A root holding several streams migrates one at a time. `catalog.db`, `archive.db`,
+`litestream.yml` and `<prefix>/_wal` are shared until the last stream has moved — leave the
+old sidecar running until then, since it is still replicating the streams that have not.
+`--drop-legacy-wal` is run once per stream and refuses until every stream in the root has
+migrated and a fresh replica has landed — that old replica holds the only off-box copy of
+unsealed rows, which are in no Parquet file and no archive manifest.
+
 ## End to end
 
 ```
