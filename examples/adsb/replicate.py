@@ -3,7 +3,8 @@
     uv run python examples/adsb/replicate.py [--root DIR]
 
 Everything in it is derived: which SQLite files carry the log's state, where
-they go (`_wal` beside the archived data), and the endpoint they go through.
+they go (`<prefix>/<name>/_wal`, beside the archived data), and the endpoint
+they go through.
 That is the point of asking the log rather than writing the file by hand — the
 set is not obvious and getting it wrong is silent. `buffer.db` holds rows no
 Parquet file has yet, the one everybody remembers. `catalog.db` says which
@@ -16,11 +17,12 @@ maintainer writes the config and runs the sidecar itself. This is for running
 litestream as an independent process instead —
 
     uv run python examples/adsb/replicate.py --root DIR
-    litestream replicate -config DIR/litestream.yml
+    litestream replicate -config DIR/positions/litestream.yml
 
 To restore, per database:
 
-    litestream restore -config DIR/litestream.yml -o RESTORED/buffer.db DIR/positions/buffer.db
+    litestream restore -config DIR/positions/litestream.yml \
+        -o RESTORED/buffer.db DIR/positions/buffer.db
 
 A restored buffer holding rows already sealed into the table needs no
 reconciliation: the read boundary (§7) comes from the table's committed extent,

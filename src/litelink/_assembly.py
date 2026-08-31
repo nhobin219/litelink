@@ -228,6 +228,19 @@ def _existing(
     layout: Layout, name: str, *, readonly: bool
 ) -> tuple[LogTable, pa.Schema]:
     """The log's table and declared schema, or a message naming what is wrong."""
+    # Asked BEFORE `exists_for`, which refuses to answer for a legacy tree
+    # rather than reporting one as absent — a distinction that is destructive
+    # to get wrong on the restore path. Here it is only a matter of saying
+    # which: told "use new()", an operator creates an empty log beside data
+    # that is still there.
+    if layout.is_legacy():
+        msg = (
+            f"the log at {layout.root}/{name} uses the pre-0.2 layout, whose "
+            f"catalogs sit at the root. Move it with:\n"
+            f"  python -m litelink.migrate --root {layout.root} --name {name}"
+        )
+        raise FileNotFoundError(msg)
+
     try:
         present = LogTable.exists_for(layout)
     except LookupError:
@@ -292,9 +305,7 @@ def _restore_replica(
     layout.root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="litelink-follow-cfg-") as cfg:
         config_path = Path(cfg) / "litestream.yml"
-        config_path.write_text(
-            litestream_config(layout.databases, layout.root, archive, options)
-        )
+        config_path.write_text(litestream_config(layout, archive, options))
         restore_buffer(config_path, layout.buffer_db, options, binary)
 
     if not layout.buffer_db.exists():

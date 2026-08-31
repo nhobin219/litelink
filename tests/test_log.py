@@ -14,6 +14,7 @@ import pytest
 
 import litelink
 from litelink._buffer import Buffer
+from litelink._layout import Layout
 from litelink.log import OFFSET, LogConfig, WriteHandle
 
 SCHEMA = pa.schema(
@@ -27,7 +28,7 @@ SCHEMA = pa.schema(
 
 def open_log(root: Path, config: LogConfig | None = None) -> WriteHandle:
     """Create the log, or reopen it — the shape is only stated once."""
-    if (root / "catalog.db").exists():
+    if Layout(root, "s").buffer_db.exists():
         log = litelink.open(root, "s")
         if config is not None:
             log.set_config(config)

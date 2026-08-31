@@ -107,7 +107,7 @@ independently instead, generate the same config and use it directly:
 
 ```
 uv run python examples/adsb/replicate.py --root litelink-data
-.bin/litestream replicate -config litelink-data/litestream.yml
+.bin/litestream replicate -config litelink-data/positions/litestream.yml
 ```
 
 Two roles, because there are two kinds of work: **the hot path, and everything else.**

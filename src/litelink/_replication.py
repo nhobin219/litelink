@@ -36,26 +36,36 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from datetime import timedelta
 
+    from litelink._layout import Layout
     from litelink._s3 import S3Options
 
-# Where the WAL goes inside the archive prefix. Beside the log's own directory
-# rather than inside it: the warehouse holds `<name>/data` and `<name>/metadata`
-# per log, and WAL segments among them would be swept up by anything walking a
-# log's prefix.
+# Where the WAL goes inside the archive prefix. INSIDE the log's own directory,
+# beside `data/` and `metadata/`, so a stream is one self-contained prefix that
+# can be replicated, restored or deleted whole.
+#
+# It used to sit at the prefix root, one `_wal/` for every log, on the reasoning
+# that WAL segments among the table's own directories "would be swept up by
+# anything walking a log's prefix". Nothing here walks — that refusal is why
+# `pending_delete` exists — and the underscore says what the directory is to
+# anything that does, which is the same convention Iceberg's own `metadata/`
+# relies on. What kept it at the prefix root was the CATALOGS: `catalog.db` and
+# `archive.db` were shared per root — `buffer.db` never was — so a sidecar per
+# log would have run two litestream instances against one database, which
+# litestream forbids. Per-stream catalogs removed that, and the replica
+# followed them into the stream's own prefix.
 WAL_PREFIX = "_wal"
 
 
-def destination(archive: str) -> str:
-    """Where WAL segments go, given the archive prefix.
+def destination(archive: str, name: str) -> str:
+    """Where a stream's WAL segments go, given the archive prefix.
 
     Derived rather than configured. A second setting for it would be a second
     bucket to provision, and the failure it invites is replicating the WAL
     somewhere nobody backs up — which looks fine until the restore.
     """
-    return f"{archive.rstrip('/')}/{WAL_PREFIX}"
+    return f"{archive.rstrip('/')}/{name}/{WAL_PREFIX}"
 
 
 def snapshot_block(retention: timedelta) -> list[str]:
@@ -93,8 +103,7 @@ def snapshot_block(retention: timedelta) -> list[str]:
 
 
 def litestream_config(
-    databases: Sequence[Path],
-    root: Path,
+    layout: Layout,
     archive: str,
     s3: S3Options,
     retention: timedelta | None = None,
@@ -115,18 +124,22 @@ def litestream_config(
     the generated config is safe to commit, copy and hand around — the same
     reason `S3Options` is not part of `LogConfig`.
     """
-    target = destination(archive)
+    target = destination(archive, layout.name)
     bucket, _, prefix = target.removeprefix("s3://").rstrip("/").partition("/")
     resolved = s3.resolved()
 
     lines = ["dbs:"]
-    for database in databases:
-        # Keyed by the path RELATIVE TO THE ROOT, not the bare filename. A
-        # buffer lives at `<root>/<log>/buffer.db`, so two logs under one root
-        # sharing an archive prefix would flatten to the same replica path —
-        # two sidecars writing one replica, which is the corruption litestream
-        # is explicit about, and a restore that hands back the other log's WAL.
-        name = database.relative_to(root).as_posix()
+    for database in layout.databases:
+        # Keyed by the path relative to the STREAM's directory, which is where
+        # all three databases now live, so the replica path is
+        # `<prefix>/<name>/_wal/buffer.db`. The stream name is already in
+        # `target`; repeating it here would nest it twice.
+        #
+        # It has to stay a derived name rather than `database.name`: two logs
+        # sharing an archive prefix must not flatten to one replica path — two
+        # sidecars writing one replica is the corruption litestream is explicit
+        # about, and a restore that hands back the other log's WAL.
+        name = database.relative_to(layout.directory).as_posix()
         key = f"{prefix}/{name}" if prefix else name
         # `replica`, singular. litestream v0.5.0 made it one replica per
         # database and carries the `replicas` list as deprecated

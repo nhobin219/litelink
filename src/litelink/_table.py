@@ -199,9 +199,18 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     """What the archive at `prefix` says its current metadata is, or None.
 
     Read from the bucket, which is the point: it answers for an archive this
-    log has no catalog row for. The directory is reconstructed from pyiceberg's
-    layout — `{prefix}/{namespace}/{name}/metadata` — rather than from a table
-    handle, because there is no handle yet; that is the situation.
+    log has no catalog row for. The directory is reconstructed from the layout
+    — `{prefix}/{name}/metadata` — rather than from a table handle, because
+    there is no handle yet; that is the situation.
+
+    It must be reconstructed the SAME way `create_table` is told to lay the
+    archive out. It once was not: this rebuilt pyiceberg's default
+    `{prefix}/{namespace}/{name}/metadata` while the table location had been
+    set explicitly to `{prefix}/{name}`, so `publish_pointer` — which derives
+    its path from the live metadata location — wrote the hint to one place and
+    this looked for it in another. Every write was correct and every read said
+    ABSENT, which is the one answer that makes the caller create an empty table
+    over a live archive.
 
     **None means ABSENT, never "could not tell".** An earlier version swallowed
     every failure into None, and the caller reads None as "nothing here yet,
@@ -217,8 +226,7 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     `set_archive` guard, which must not fail closed on a bad minute in object
     storage — catch it themselves and say so.
     """
-    namespace, _, name = layout.table_id.rpartition(".")
-    directory = f"{prefix.rstrip('/')}/{namespace}/{name}/metadata"
+    directory = f"{layout.archive_table_location(prefix)}/metadata"
     source = io.new_input(f"{directory}/{VERSION_HINT}")
     if not source.exists():
         return None
@@ -401,7 +409,10 @@ class LogTable:
         catalog = cls._catalog_for(layout)
         catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
         catalog.create_table(
-            layout.table_id, schema=schema, properties=METADATA_PROPERTIES
+            layout.table_id,
+            schema=schema,
+            location=layout.table_location,
+            properties=METADATA_PROPERTIES,
         )
 
         table = cls(catalog, layout, catalog.load_table(layout.table_id))
@@ -587,7 +598,10 @@ class LogTable:
             try:
                 if published is None:
                     table = catalog.create_table(
-                        layout.table_id, schema=schema, properties=METADATA_PROPERTIES
+                        layout.table_id,
+                        schema=schema,
+                        location=layout.archive_table_location(prefix),
+                        properties=METADATA_PROPERTIES,
                     )
                 else:
                     # Deliberately unguarded, like the load below. A hint
@@ -652,8 +666,11 @@ class LogTable:
     def exists_for(layout: Layout) -> bool:
         """Whether the LOCAL catalog holds a table for this log.
 
-        Not whether `catalog.db` is there: that file is shared by every log
-        under the root (§2), so its presence says nothing about this one.
+        Not whether `catalog.db` is there. It is per-stream since 0.2, so its
+        presence does say this log exists — but its ABSENCE has two meanings,
+        and one of them is a live log that has not been migrated, whose catalog
+        is still at the root. That case raises rather than answering False, for
+        the reason spelled out below.
 
         Read straight out of the catalog's own SQLite, like
         `_recorded_location` and for the same reason — the question has to be
@@ -668,6 +685,23 @@ class LogTable:
         queued cuts, wipes `sealing` and `claim`, drops the archive catalog
         row, and deletes buffered rows below the frontier.
         """
+        if layout.is_legacy():
+            # A LIVE pre-0.2 log. False here is the destructive answer: it
+            # tells `litelink.restore` it is resuming an interrupted restore,
+            # and the resume path then burns 2**20 offsets on a log that is
+            # still being written to, empties its buffer, and writes a fresh
+            # empty catalog beside the real one — measured at 300 readable rows
+            # down to 240, with eight Parquet files stranded and referenced by
+            # nothing. Raising routes every caller to the same refusal a busy
+            # catalog gets, which is the safe direction.
+            msg = (
+                f"the log at {layout.root}/{layout.name} uses the pre-0.2 "
+                f"layout, whose catalogs sit at the root. Move it with:\n"
+                f"  python -m litelink.migrate --root {layout.root} "
+                f"--name {layout.name}"
+            )
+            raise LookupError(msg)
+
         if not layout.catalog_db.exists():
             return False
 

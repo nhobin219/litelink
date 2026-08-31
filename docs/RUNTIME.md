@@ -606,6 +606,10 @@ just litestream          # once: fetch the pinned, checksum-verified binary into
 just demo-replicate      # generates litestream.yml from the log, runs the sidecar
 ```
 
+The config lands at `<root>/<name>/litestream.yml` and names replicas under
+`<prefix>/<name>/_wal` — one sidecar per stream, since 0.2 put all three databases in the
+stream's own directory (SPEC §2).
+
 **`wal_retention` bounds how far BACK a restore can go**, and nothing else. A restore always
 recovers the latest replicated state; retention only trims point-in-time depth. Set it from
 the un-archived window — which `adsb/tail.py` shows as the gap between `stream rows` and
@@ -640,7 +644,7 @@ is otherwise the only pointer to the current metadata, and re-pointing drops it.
 with no catalog at all reads the prefix directly:
 
 ```sql
-SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/litelink/positions',
+SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/positions',
                                   version_name_format = '%s%s.metadata.json');
 ```
 
@@ -661,7 +665,7 @@ Restoring the databases onto another machine and opening the log FAILS once anyt
 sealed — measured:
 
 ```
-FileNotFoundError: .../orig/litelink/s/metadata/00009-....metadata.json
+FileNotFoundError: .../orig/s/metadata/00009-....metadata.json
 ```
 
 `catalog.db` records absolute paths to the local Iceberg metadata, and a sidecar ships the

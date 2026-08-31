@@ -340,3 +340,68 @@ def test_release_notes_survive_a_first_release_and_a_long_history() -> None:
     assert "Reasons omitted" in capped
     assert capped.count("\n- ") == 60, "every change must still be listed"
     assert "A reason long enough" not in capped
+
+
+# Every place a reader is told where a log's files are. Kept as one list
+# because the failure these guard against is documentation drifting from
+# `Layout` — which is not hypothetical: the 0.2 layout change left an
+# `iceberg_scan` example in three files pointing at a prefix that no longer
+# holds a table, and each one was a command someone would copy and run.
+DOCUMENTED = (
+    "README.md",
+    "docs/SPEC.md",
+    "docs/API.md",
+    "docs/RUNTIME.md",
+    "examples/README.md",
+)
+
+
+def test_no_documented_scan_points_at_the_pre_0_2_archive_path() -> None:
+    """`iceberg_scan` examples are copy-pasteable, so they have to be right.
+
+    The archive's table location is `<prefix>/<name>`. It was
+    `<prefix>/litelink/<name>` before 0.2 — pyiceberg's
+    `<warehouse>/<namespace>/<table>` default — and an engine pointed there now
+    finds no table at all.
+    """
+    import re
+
+    offenders = []
+    for name in DOCUMENTED:
+        text = (ROOT / name).read_text()
+        for match in re.finditer(r"iceberg_scan\('([^']+)'", text):
+            if "/litelink/" in match.group(1):
+                offenders.append(f"{name}: {match.group(1)}")
+
+    assert not offenders, (
+        "these scan examples name the pre-0.2 archive path:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_the_documented_tree_matches_the_layout() -> None:
+    """SPEC §2 draws the on-disk tree; `Layout` decides it.
+
+    Asserted against the real object rather than a second copy of the list, so
+    moving a file without redrawing the tree fails here instead of in a user's
+    directory.
+    """
+    from litelink._layout import Layout
+
+    layout = Layout(ROOT / "example-root", "trades")
+    drawn = (ROOT / "docs" / "SPEC.md").read_text()
+    block = drawn.split("## 2. Layout", 1)[1].split("**One SQLite database", 1)[0]
+
+    for path in (
+        layout.buffer_db,
+        layout.catalog_db,
+        layout.archive_db,
+        layout.replication_config,
+    ):
+        assert path.parent == layout.directory, (
+            f"{path.name} is outside the stream directory; SPEC §2 says it is inside"
+        )
+        assert path.name in block, f"SPEC §2's tree does not mention {path.name}"
+
+    assert "data/" in block and "metadata/" in block
+    assert f"{layout.name}/data/" in layout.seal_path(1, 2, "tok")

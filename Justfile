@@ -244,10 +244,13 @@ demo-archive *args:
 #   just demo-archive     # terminal 1
 #   just demo-replicate   # terminal 2: ship the WAL continuously
 #
-# Then to prove it, delete the log directory and:
+# Then to prove it: keep a copy of the config, because since 0.2 it lives INSIDE
+# the log directory and deleting that takes it with you.
 #
-#   litestream restore -config litestream.yml -o RESTORED/positions/buffer.db \
-#       litelink-data/positions/buffer.db
+#   cp litelink-data/positions/litestream.yml /tmp/positions.yml
+#   rm -rf litelink-data
+#   litestream restore -config /tmp/positions.yml \
+#       -o RESTORED/positions/buffer.db litelink-data/positions/buffer.db
 #
 # Continuously replicate the demo log's SQLite state to rustfs (§3a).
 demo-replicate root="litelink-data":
@@ -278,8 +281,15 @@ demo-replicate root="litelink-data":
     export LITESTREAM_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
     export LITESTREAM_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
     # Destination and file set both come from the log — see `replicate.py`.
-    uv run python examples/adsb/replicate.py --root {{root}}
-    "$litestream" replicate -config {{root}}/litestream.yml
+    # The config's PATH comes from it too, rather than being spelled again
+    # here: it lives in the stream's directory, and this recipe does not know
+    # the stream's name — `_stream.NAME` does.
+    config=$(uv run python examples/adsb/replicate.py --root {{root}} | sed -n 's/^wrote //p')
+    if [ -z "$config" ]; then
+        echo "replicate.py wrote no config" >&2
+        exit 1
+    fi
+    "$litestream" replicate -config "$config"
 
 # Create the demo bucket. Idempotent, and through the same s3fs the library
 # uses rather than an AWS CLI nobody is required to have installed.
@@ -392,17 +402,14 @@ demo-clean root="litelink-data" ws_root="litelink-ws":
     # Never the bare prefix. It is shared by every demo run and may be
     # somewhere real (see the env template), so a recursive delete of it takes
     # another run archived rows, or objects that were never ours. Only what
-    # this log wrote: its own warehouse subtree, and the WAL beside it. The
-    # namespace comes from the library rather than a literal, so the two cannot
-    # drift apart.
-    from litelink._layout import NAMESPACE
+    # this log wrote, which since 0.2 is one subtree: `{prefix}/{name}` holds
+    # `data/`, `metadata/` and `_wal/` together.
     base = archive.removeprefix('s3://').rstrip('/')
-    # BOTH subtrees. pyiceberg puts the table metadata under
-    # {prefix}/{namespace}/{name}/, while sync uploads data files under
-    # {prefix}/{name}/ — the root-relative name they have locally. Removing
-    # only the first leaves every data object stranded, and deletes the
-    # metadata that could have named them.
-    for suffix in (f'{NAMESPACE}/{NAME}', NAME, '_wal'):
+    # The legacy prefixes stay in the list so this still cleans a demo root
+    # left over from 0.1, where metadata went to `{prefix}/litelink/{name}` and
+    # the WAL to `{prefix}/_wal`. Both are no-ops on a current log.
+    from litelink._layout import NAMESPACE
+    for suffix in (NAME, f'{NAMESPACE}/{NAME}', '_wal'):
         target = f'{base}/{suffix}'
         if fs.exists(target):
             print(f'  removing s3://{target}')

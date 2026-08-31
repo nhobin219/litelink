@@ -817,8 +817,7 @@ class LocalReadHandle(LogHandle):
             raise ValueError(msg)
 
         return litestream_config(
-            self._layout.databases,
-            self._layout.root,
+            self._layout,
             archive,
             self._archive.s3,
             self.config.wal_retention,
@@ -831,7 +830,7 @@ class LocalReadHandle(LogHandle):
         every other path is derived: a setting for it would be one more thing
         to keep in step with the log it describes.
         """
-        destination = self._layout.root / "litestream.yml"
+        destination = self._layout.replication_config
         destination.write_text(self.replication_config())
 
         return destination
@@ -1180,12 +1179,27 @@ class WriteHandle(LocalReadHandle):
         the single writer §1 assumes.
         """
         layout = Layout(Path(root), name)
-        # Asked of THIS log's table, not of `catalog.db`. That file is shared
-        # by every log under the root (§2), so a root holding one log answered
-        # the question for every other name in it — and the caller got
+        # The pre-0.2 tree first, and separately, because it is indistinguishable
+        # from an absent log by the test below — its catalog is at the root —
+        # and the two want opposite advice. `_assembly._existing` says the same
+        # thing on the read-only path; both open paths have to, or the same
+        # directory gets two different diagnoses.
+        if layout.is_legacy():
+            msg = (
+                f"the log at {layout.root}/{name} uses the pre-0.2 layout, whose "
+                f"catalogs sit at the root. Move it with:\n"
+                f"  python -m litelink.migrate --root {layout.root} --name {name}"
+            )
+            raise FileNotFoundError(msg)
+
+        # Asked of THIS log's table, not merely of `catalog.db`. The file was
+        # once shared by every log under the root, so a root holding one log
+        # answered the question for every other name in it — and the caller got
         # pyiceberg's `NoSuchTableError` out of the load below instead of the
-        # message here. "Cannot tell" falls through and lets the load answer,
-        # which is slower and correct.
+        # message here. It is per-stream now, but the row check still earns its
+        # keep: the file exists from the moment the catalog is created, before
+        # any table is registered in it. "Cannot tell" falls through and lets
+        # the load answer, which is slower and correct.
         try:
             present = LogTable.exists_for(layout)
         except LookupError:
@@ -1267,9 +1281,7 @@ class WriteHandle(LocalReadHandle):
         """
         layout = Layout(Path(root), name)
 
-        return litestream_config(
-            layout.databases, layout.root, archive, s3 or S3Options(), retention
-        )
+        return litestream_config(layout, archive, s3 or S3Options(), retention)
 
     @classmethod
     def restore(
@@ -1335,6 +1347,23 @@ class WriteHandle(LocalReadHandle):
         # tables — safe on an interrupted restore, catastrophic on a live log —
         # so "cannot tell" has exactly one safe reading, and it is not the one
         # that proceeds.
+        # Before anything, and before `exists_for` — which refuses to answer
+        # for this tree rather than reporting it absent. A pre-0.2 log has its
+        # catalog at the root, so `<name>/catalog.db` is missing and every
+        # test below reads it as "no table here": `resuming` becomes True, the
+        # guard that refuses to overwrite a live log is skipped, and the resume
+        # path burns RESTORE_RESERVE offsets on a log that is still being
+        # written to. Measured on a real one: 300 readable rows down to 240,
+        # with eight Parquet files stranded and referenced by nothing.
+        if layout.is_legacy():
+            msg = (
+                f"the log at {layout.root}/{name} uses the pre-0.2 layout, whose "
+                f"catalogs sit at the root. restore refuses to touch it — move "
+                f"it first with:\n"
+                f"  python -m litelink.migrate --root {layout.root} --name {name}"
+            )
+            raise FileExistsError(msg)
+
         try:
             has_table = LogTable.exists_for(layout)
         except LookupError:
@@ -1348,13 +1377,13 @@ class WriteHandle(LocalReadHandle):
             )
             raise FileExistsError(msg)
 
-        # One config per ROOT, and `litestream_config` describes the log it was
-        # asked about — so writing one here over a root that already replicates
-        # another log would leave that log unreplicated at the sidecar's next
-        # restart, silently. Refused rather than merged: §3a's advice is one
-        # log per root until a per-root generator exists, and this is that
-        # advice enforced.
-        config_path = layout.root / "litestream.yml"
+        # One config per STREAM, in the stream's own directory, so the
+        # collision this once guarded against is gone by construction: a root
+        # holding several logs gives each its own config and its own sidecar.
+        # The check below survives for the case that remains — a hand-written
+        # config naming a database outside this log, which restoring here would
+        # overwrite and silently stop replicating.
+        config_path = layout.replication_config
         if config_path.exists():
             # Every `- path:` the file names, which is the database list. It
             # must be a subset of THIS log's, and an earlier version only
@@ -1377,10 +1406,8 @@ class WriteHandle(LocalReadHandle):
                 raise FileExistsError(msg)
 
         options = s3 or S3Options()
-        layout.root.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            litestream_config(layout.databases, layout.root, archive, options)
-        )
+        layout.create()
+        config_path.write_text(litestream_config(layout, archive, options))
 
         # ONLY the buffer, and with no `-if-replica-exists`: that flag exits 0
         # when there is no backup, which would make the check below unable to

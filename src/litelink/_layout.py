@@ -4,6 +4,25 @@ Pure path derivation, no I/O beyond creating the directories. Isolated because
 these names are load-bearing in two directions: a seal's path is claimed in
 SQLite before the file exists (I2), and reclamation is a keyed read of those
 same paths rather than a directory scan.
+
+**One directory per stream, holding everything that stream owns.** Every path
+below is under `<root>/<name>`, so a log is a subtree that can be copied,
+replicated or deleted whole. It was not always so: `catalog.db` and
+`archive.db` used to sit at the root and be shared by every log under it,
+which bought nothing — every query against them is keyed by
+`(catalog, namespace, table)` and no code has ever read across streams — and
+cost three things. A sidecar per log would have run two litestream instances
+against one `catalog.db`, which litestream forbids, so replication was
+one-sidecar-per-root with a config that had to be written by hand. `follow`
+had to drop its `root` parameter, because a caller-supplied directory could
+collide with a live log's shared catalogs. And one corrupt catalog took every
+stream under the root with it.
+
+Contention was NOT among the costs, which is worth recording because it is the
+first thing anyone assumes: two streams sealing concurrently against one
+shared `catalog.db` measured a 57.3 ms median against 66.1 ms for separate
+roots, over 16 seals. The Iceberg commit is a tiny transaction; a seal's
+seconds go to the Parquet and Avro writes, which were always per-stream.
 """
 
 from __future__ import annotations
@@ -42,14 +61,45 @@ class Layout:
         object.__setattr__(self, "root", Path(self.root).resolve())
 
     @property
+    def directory(self) -> Path:
+        """Everything this stream owns, and nothing another stream does.
+
+        The unit of replication, restore and deletion. `data/` and `metadata/`
+        sit under it because that is where Iceberg puts them once the table
+        location is this directory, and the three SQLite files sit beside them
+        because they describe this stream alone.
+        """
+        return self.root / self.name
+
+    @property
     def buffer_db(self) -> Path:
         """One SQLite database per stream — SQLite's write lock is per file."""
-        return self.root / self.name / "buffer.db"
+        return self.directory / "buffer.db"
 
     @property
     def catalog_db(self) -> Path:
-        """The catalog is a file, not a service. Shared by every log under root."""
+        """The catalog is a file, not a service. One per stream (§2)."""
+        return self.directory / "catalog.db"
+
+    @property
+    def legacy_catalog_db(self) -> Path:
+        """Where `catalog.db` sat before 0.2 — shared by every log under root.
+
+        Kept as a derived path rather than a literal at each call site, because
+        several places have to distinguish "no log here" from "a log here that
+        has not been migrated", and answering that wrong is destructive: see
+        `LogTable.exists_for`.
+        """
         return self.root / "catalog.db"
+
+    def is_legacy(self) -> bool:
+        """Whether this log still keeps its catalogs at the root (pre-0.2).
+
+        Both halves matter. A root-level `catalog.db` alone could be a sibling
+        stream's leftover; what says THIS log has not moved is that it has none
+        of its own.
+        """
+        return self.legacy_catalog_db.exists() and not self.catalog_db.exists()
 
     @property
     def catalog_uri(self) -> str:
@@ -57,18 +107,62 @@ class Layout:
 
     @property
     def warehouse_uri(self) -> str:
+        """Still the root, because `relative` is what turns a local file into
+        an archive key and both tiers have to agree on it.
+
+        The table's location is passed explicitly at creation rather than left
+        to `<warehouse>/<namespace>/<table>`, so this no longer decides where
+        metadata lands. See `table_location`.
+        """
         return f"file://{self.root}"
+
+    @property
+    def table_location(self) -> str:
+        """Where the local Iceberg table lives — data AND metadata (§2).
+
+        Passed to `create_table` explicitly, which is the whole point. Left to
+        pyiceberg it resolved to `<warehouse>/<namespace>/<table>`, so metadata
+        landed in `<root>/litelink/<name>/metadata` while `seal_path` wrote
+        data to `<root>/<name>/data`: a table whose data files were outside its
+        own location, held together only by the absolute paths in its
+        manifests. Deleting the table directory would have left every Parquet
+        file behind.
+        """
+        return f"file://{self.directory}"
+
+    def archive_table_location(self, prefix: str) -> str:
+        """The same, in the archive prefix.
+
+        A data file keeps its root-relative name in the archive — `LogTable`
+        maps `<name>/data/...` to `<prefix>/<name>/data/...` — so the remote
+        table's location has to be `<prefix>/<name>` for its metadata to sit
+        beside its data the way the local one now does.
+        """
+        return f"{prefix.rstrip('/')}/{self.name}"
+
+    @property
+    def replication_config(self) -> Path:
+        """Where `write_replication_config` puts the sidecar's config.
+
+        Inside the stream's directory, because there is now one sidecar per
+        stream: all three databases are here, and `destination` sends them to
+        `<prefix>/<name>/_wal`. At the root — where this used to be — two logs
+        would write one file and the second would silently stop replicating the
+        first.
+        """
+        return self.directory / "litestream.yml"
 
     @property
     def rewrite_db(self) -> Path:
         """Scratch buffer for an archive rewrite.
 
-        Its own file, alongside the real one rather than inside it: the rewrite
-        re-ingests archived rows through an ordinary `Buffer` to re-cut them,
-        and that buffer must not be the log's own — appends are still landing
-        there, and its offsets are the live ones.
+        Its own file, not the log's: the rewrite re-ingests archived rows
+        through an ordinary `Buffer` to re-cut them, and that buffer must not
+        be the log's own — appends are still landing there, and its offsets are
+        the live ones. Inside the stream directory like everything else, so a
+        crash leaves the strays where the stream's own cleanup can see them.
         """
-        return self.root / f"{self.name}-rewrite.db"
+        return self.directory / "rewrite.db"
 
     @property
     def archive_db(self) -> Path:
@@ -82,20 +176,11 @@ class Layout:
         no row, so a stale row wins over the bucket's own pointer and the
         archive reads short, silently. See `litelink.restore`.
         """
-        return self.root / "archive.db"
+        return self.directory / "archive.db"
 
     @property
     def archive_catalog_uri(self) -> str:
         return f"sqlite:///{self.archive_db}"
-
-    def archive_key(self, rel_path: str) -> str:
-        """Where a local file lands in the archive prefix.
-
-        The same root-relative name under the archive's prefix, so a file's
-        identity is its offset range in both tiers and neither has to translate
-        the other's paths.
-        """
-        return rel_path
 
     @property
     def databases(self) -> tuple[Path, ...]:
@@ -124,16 +209,14 @@ class Layout:
 
     @property
     def table_id(self) -> str:
-        return f"{NAMESPACE}.{self.name}"
+        """The catalog identifier, which is NOT a path.
 
-    @property
-    def data_dirs(self) -> tuple[Path, ...]:
-        """Every directory this log may put a data file in.
-
-        Its own seal output, and the warehouse directory pyiceberg writes into.
-        Scoped to one log: anything wider would reach a sibling stream's files.
+        The namespace survives the move to per-stream directories on purpose:
+        it names the table inside its catalog, and `table_location` decides
+        where the bytes go. Keeping them separate is what let the layout change
+        without rewriting a single catalog row's identity.
         """
-        return (self.root / self.name, self.root / f"{NAMESPACE}.db" / self.name)
+        return f"{NAMESPACE}.{self.name}"
 
     def seal_path(self, start: int, end: int, token: str) -> str:
         """Root-relative path for a seal covering `[start, end)` (§4).
@@ -187,4 +270,4 @@ class Layout:
 
     def create(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / self.name).mkdir(parents=True, exist_ok=True)
+        self.directory.mkdir(parents=True, exist_ok=True)

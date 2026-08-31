@@ -14,6 +14,7 @@ from pyiceberg.catalog.sql import SqlCatalog
 import litelink
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import COMPACT_MULTIPLE
+from litelink._layout import Layout
 from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
 from litelink.log import LogConfig, WriteHandle, validate
@@ -458,10 +459,9 @@ def test_metadata_properties_are_applied_to_an_existing_table(tmp_path: Path) ->
 
     # Reach past litelink to strip the property, standing in for a table created
     # before these defaults existed.
+    layout = Layout(tmp_path, "s")
     catalog = SqlCatalog(
-        "local",
-        uri=f"sqlite:///{tmp_path / 'catalog.db'}",
-        warehouse=f"file://{tmp_path}",
+        "local", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
     )
     table = catalog.load_table("litelink.s")
     with table.transaction() as transaction:

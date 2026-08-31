@@ -188,7 +188,7 @@ no local root and no litelink install:
 
 ```sql
 SELECT count(*), max(litelink_offset)
-FROM iceberg_scan('s3://bucket/prefix/litelink/trades',
+FROM iceberg_scan('s3://bucket/prefix/trades',
                   version_name_format = '%s%s.metadata.json');
 ```
 
@@ -234,6 +234,49 @@ See [§3b](docs/SPEC.md) for why a gap in that report is not necessarily loss.
 Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead. The numbers
 behind all of this are [`docs/SPEC.md`](docs/SPEC.md) §7 and §12; how the pieces run is
 [`docs/RUNTIME.md`](docs/RUNTIME.md); `just bench` is the same measurement on your hardware.
+
+### On disk
+
+One directory per stream, holding everything that stream owns — and the archive prefix
+mirrors it, so a stream can be copied, replicated or deleted whole in either tier:
+
+```
+data/trades/                     s3://bucket/prefix/trades/
+    buffer.db                        _wal/
+    catalog.db                           buffer.db/
+    archive.db                           catalog.db/
+    litestream.yml                       archive.db/
+    data/                            data/
+        *.parquet                        *.parquet
+        compacted/*.parquet              compacted/*.parquet
+    metadata/                        metadata/
+        *.metadata.json                  *.metadata.json
+        *.avro                           *.avro
+                                         version-hint.text
+```
+
+Data files sit under the table's own location, so the path an engine reads
+(`s3://bucket/prefix/trades`) is the directory that holds both halves of the table.
+
+> **Upgrading from 0.1.** That release put `catalog.db` and `archive.db` at the root, shared
+> by every stream, and Iceberg metadata under `<root>/litelink/<name>/metadata` — outside the
+> data it described. `open` detects the old tree and names the fix:
+>
+> ```bash
+> python -m litelink.migrate --root ./data --name trades              # dry run
+> python -m litelink.migrate --root ./data --name trades --apply
+> ```
+>
+> Data files are not touched or rewritten; only pointers move. Pass `--archive s3://...` to
+> move the archive's metadata too, then restart the sidecar so it replicates to the new
+> `<prefix>/<name>/_wal` before dropping the old one with `--drop-legacy-wal`.
+>
+> A root holding several streams migrates one at a time. `catalog.db`, `archive.db`,
+> `litestream.yml` and `<prefix>/_wal` are shared until the last stream has moved — leave the
+> old sidecar running until then, since it is still replicating the streams that have not.
+> `--drop-legacy-wal` is run once per stream and refuses until every stream in the root has
+> migrated and a fresh replica has landed — that old replica holds the only off-box copy of
+> unsealed rows, which are in no Parquet file and no archive manifest.
 
 ## What it is not
 
