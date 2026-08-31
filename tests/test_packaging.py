@@ -960,3 +960,42 @@ def test_a_squash_subject_with_an_empty_footer_still_leads_the_notes(
     assert "### Breaking" in rendered
     assert "One directory per stream" in rendered.split("### Breaking", 1)[1]
     assert "### Other" not in rendered
+
+
+def test_a_squash_composed_subject_list_is_not_a_reason() -> None:
+    """GitHub builds a squash body from the branch's commit SUBJECTS.
+
+    Taking that as the reason prints them a second time under the subject —
+    `0.2.0, release-notes fixes, and a README cut (#48)` followed by
+    `* build: 0.2.0` — which is the PR-title-shaped note this whole script
+    exists to avoid. It shipped that way in 0.2.0's own release body.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from release_notes import lead
+
+    assert lead("* build: 0.2.0\n* fix(ci): a footer was filed under Added") == ""
+    # A body that merely begins with bullets is not a subject list, and keeps
+    # its reason: the test is whether every line parses as a commit subject.
+    assert lead("* the first reason\n* the second reason").startswith("* the first")
+
+
+def test_a_squash_still_yields_the_reason_below_its_subject_list() -> None:
+    """Skipped, not stopped at.
+
+    A squash usually carries the real commit bodies under the generated list,
+    so treating the list as "no reason" would discard the reason rather than
+    the noise — replacing one silent loss with another.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from release_notes import lead
+
+    body = "* build: 0.2.0\n\nthe version bump, because #47 is breaking."
+
+    assert lead(body) == "the version bump, because #47 is breaking."
+    # And trailers still terminate it rather than being skipped past.
+    assert lead("the reason.\n\nCo-Authored-By: x <y>") == "the reason."
+    assert lead("Co-Authored-By: x <y>") == ""

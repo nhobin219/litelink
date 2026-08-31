@@ -287,11 +287,36 @@ def lead(body: str) -> str:
         # reason is what the bare-reason warning is for.
         return ""
 
-    paragraph = body.split("\n\n", 1)[0]
-    if paragraph.startswith(("Co-Authored-By:", "Claude-Session:")):
-        return ""
+    # SKIPPED, not stopped at. GitHub composes a squash body from the branch's
+    # commit SUBJECTS as a bullet list, and taking that as the reason prints
+    # them a second time under the subject — `0.2.0, release-notes fixes, and a
+    # README cut (#48)` followed by `* build: 0.2.0`, which is exactly the
+    # PR-title-shaped note this script exists to avoid. But a squash often
+    # carries the real bodies BELOW that list, so returning empty here would
+    # throw away the reason rather than the noise.
+    for paragraph in body.split("\n\n"):
+        if not paragraph.strip():
+            continue
 
-    return " ".join(paragraph.split())
+        if paragraph.startswith(("Co-Authored-By:", "Claude-Session:")):
+            return ""
+
+        if _only_subjects(paragraph):
+            continue
+
+        return " ".join(paragraph.split())
+
+    return ""
+
+
+def _only_subjects(paragraph: str) -> bool:
+    """Whether a paragraph is nothing but a bullet list of commit subjects."""
+    lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+
+    return bool(lines) and all(
+        line.startswith(("* ", "- ")) and HEADER.match(line[2:]) is not None
+        for line in lines
+    )
 
 
 def render(
