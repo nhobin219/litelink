@@ -25,12 +25,12 @@ import pytest
 
 import litelink
 from litelink import LogConfig, WriteHandle
-from litelink._archive import Archive
+from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
-from litelink._layout import NAMESPACE, Layout
+from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, load_extension, secret_sql
-from litelink._replication import WAL_PREFIX
+from litelink._replication import destination
 from litelink._s3 import S3Options
 from litelink._table import (
     VERSION_HINT,
@@ -874,7 +874,7 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
     instead stops the queue draining at all, for ever.
     """
     with archived_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
-        log.set_archive(f"s3://{bucket}/slashed/")
+        log.set_archive(f"s3://{bucket}/slashed")
         log.extend(rows(ROWS))
         log.seal_due()
         log.sync()
@@ -882,8 +882,32 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         fs = filesystem(s3)
         objects = fs.find(f"{bucket}/slashed")
         assert objects
-        doomed = f"s3://{objects[0]}"
+
+        # An object the archive does NOT reference, chosen deliberately. This
+        # used to take `objects[0]`, which passed on listing order rather than
+        # on the guard under test: the first key happened to be an unreferenced
+        # metadata object, so when the layout changed and a live data file
+        # sorted first, the drain refused for the referenced-file veto — a
+        # correct refusal, with nothing to do with slashes.
+        remote = log._archive.table(repair=True)
+        assert remote is not None
+        referenced = remote.referenced_paths()
+        doomed = next(
+            f"s3://{obj}" for obj in objects if f"s3://{obj}" not in referenced
+        )
         log._buffer.enqueue_deletions([doomed], 0)
+
+        # The slash goes into `meta` DIRECTLY, because every public way in
+        # normalises it away: `set_archive`, `new` and `open` all `rstrip("/")`
+        # before storing. Written through any of them this test cannot fail —
+        # verified by deleting the guard's own `rstrip` and watching it still
+        # pass — so it proved nothing about the guard it names.
+        #
+        # A durable value with a trailing slash is still reachable: it is what
+        # a log written by a version that normalised somewhere else carries,
+        # and `drain` reads `meta`, not the argument someone once passed.
+        log._buffer.set_meta(ARCHIVE_KEY, f"s3://{bucket}/slashed/")
+        assert log._archive.uri == f"s3://{bucket}/slashed/"
 
         log._maintenance.drain()
 
@@ -1670,7 +1694,7 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
         current = str(archive.metadata_location)
 
     fs = filesystem(s3)
-    published = fs.cat(f"{bucket}/hinted/{NAMESPACE}/s/metadata/{VERSION_HINT}")
+    published = fs.cat(f"{bucket}/hinted/s/metadata/{VERSION_HINT}")
 
     assert current.endswith(f"/{published.decode().strip()}.metadata.json"), (
         f"hint {published!r} does not name {current!r}"
@@ -1719,7 +1743,12 @@ def test_the_archive_reads_as_a_directory_with_no_catalog_at_all(
     load_extension(connection, "iceberg", remote=False)
     load_extension(connection, "httpfs", remote=True)
     connection.execute(secret_sql(s3))
-    directory = f"{where}/{NAMESPACE}/s"
+    # `{prefix}/{name}`, which is the table location itself now. It used to be
+    # `{prefix}/litelink/{name}` — pyiceberg's `<warehouse>/<namespace>/<table>`
+    # default — while the data files sat at `{prefix}/{name}/data`, so an engine
+    # pointed at the table read metadata from one directory describing files in
+    # another.
+    directory = f"{where}/s"
     rows_read = connection.execute(
         f"SELECT count(*) FROM iceberg_scan('{directory}',"
         " version_name_format = '%s%s.metadata.json')"
@@ -2461,7 +2490,7 @@ def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
     """
     prefix = f"s3://{bucket}/corrupt"
     fs = filesystem(s3)
-    hint = f"{bucket}/corrupt/{NAMESPACE}/s/metadata/{VERSION_HINT}"
+    hint = f"{bucket}/corrupt/s/metadata/{VERSION_HINT}"
     fs.pipe(hint, b"00042-does-not-exist")
 
     with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
@@ -3298,7 +3327,9 @@ def test_creating_a_log_with_an_empty_archive_is_a_local_only_log(
         )
 
 
-def _replicate(binary: Path, config: Path, s3: S3Options, prefix: str) -> None:
+def _replicate(
+    binary: Path, config: Path, s3: S3Options, prefix: str, name: str = "s"
+) -> None:
     """Run the sidecar once so a replica exists to follow."""
     environment = dict(os.environ)
     resolved = s3.resolved()
@@ -3314,7 +3345,11 @@ def _replicate(binary: Path, config: Path, s3: S3Options, prefix: str) -> None:
     # So: ask for a short one, then CHECK, and only pay for more if the replica
     # is not there yet.
     fs = filesystem(s3)
-    replica = f"{prefix.rstrip('/')}/{WAL_PREFIX}"
+    # Through `destination`, not a second spelling of it. This held its own
+    # copy of the rule and went on passing a prefix-level `_wal` after the
+    # replica moved inside the stream's directory, so every follower test
+    # failed on "published no replica" rather than on anything it tested.
+    replica = destination(prefix, name)
     # 2s is the measured floor: at 1s the buffer replica is reliably absent
     # (so a 1s first attempt made this SLOWER, always escalating), at 2s it is
     # reliably present. The rest is a safety net for a slower box, which the
@@ -3902,7 +3937,10 @@ def test_a_follower_writes_nothing_the_primary_shares(
         follower.scan().read_all()
         root = follower.root
 
+        # Neither at the root nor in the stream's directory, which is where a
+        # log that writes one puts it now.
         assert not (root / "litestream.yml").exists()
+        assert not (root / "s" / "litestream.yml").exists()
 
         # ABSENT, not refused. `RemoteReadHandle` is a SIBLING of
         # `LocalReadHandle`, so it never inherits these — which is the whole

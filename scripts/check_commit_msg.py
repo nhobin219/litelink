@@ -35,6 +35,7 @@ SCOPES = {
     "config",  # §12
     "blob",  # §15 blob fields
     "catalog",  # the SqlCatalog pair
+    "layout",  # §2  where a log's files live, in either tier
     "spec",  # docs/SPEC.md itself
     "ci",  # workflows, hooks, Justfile
     "deps",  # dependency floors and the lockfile

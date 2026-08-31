@@ -538,12 +538,13 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
 
         for database in log.databases:
             assert f"path: {database}" in rendered
-            # Keyed by the LOG-RELATIVE path, not the bare filename: two logs
-            # under one root sharing an archive prefix would otherwise ship
-            # their distinct buffers to the same replica path, which is two
-            # sidecars writing one replica.
-            relative = database.relative_to(tmp_path).as_posix()
-            assert f"path: prefix/{WAL_PREFIX}/{relative}" in rendered
+            # The replica path carries the stream name once, in the prefix —
+            # `prefix/<name>/_wal/<db>` — because all three databases now live
+            # in the stream's own directory. Two logs sharing an archive prefix
+            # still cannot collide, which is the property that matters: the
+            # name is in the destination rather than in the key.
+            relative = database.relative_to(tmp_path / "s").as_posix()
+            assert f"path: prefix/s/{WAL_PREFIX}/{relative}" in rendered
 
         assert "bucket: bucket" in rendered
         # A non-AWS endpoint needs both, and neither can be left to the
@@ -686,7 +687,9 @@ def test_the_replication_config_is_written_beside_the_log(tmp_path: Path) -> Non
     ) as log:
         written = log.write_replication_config()
 
-        assert written == tmp_path / "litestream.yml"
+        # In the STREAM's directory, not the root: one sidecar per stream now,
+        # so two logs under one root no longer write one file.
+        assert written == tmp_path / "s" / "litestream.yml"
         assert written.read_text() == log.replication_config()
 
 

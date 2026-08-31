@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 
 import litelink
+from litelink._layout import Layout
 from litelink._s3 import S3Options
 from litelink.log import LogConfig, WriteHandle
 
@@ -25,7 +26,7 @@ SCHEMA = pa.schema(
 
 
 def open_log(root: Path) -> WriteHandle:
-    if (root / "catalog.db").exists():
+    if Layout(root, "s").buffer_db.exists():
         return litelink.open(root, "s")
 
     return litelink.new(root, "s", schema=SCHEMA)

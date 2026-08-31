@@ -21,6 +21,7 @@ import pytest
 import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._claim import Claim, new_owner
+from litelink._layout import Layout
 from litelink.log import EVERYTHING
 
 if TYPE_CHECKING:
@@ -30,7 +31,7 @@ SCHEMA = pa.schema([pa.field("event_ts", pa.int64()), pa.field("key", pa.string(
 
 
 def open_log(root: Path, config: LogConfig | None = None) -> WriteHandle:
-    if (root / "catalog.db").exists():
+    if Layout(root, "s").buffer_db.exists():
         return litelink.open(root, "s")
 
     return litelink.new(root, "s", schema=SCHEMA, sort_by=("event_ts",), config=config)

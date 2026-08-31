@@ -340,3 +340,98 @@ def test_release_notes_survive_a_first_release_and_a_long_history() -> None:
     assert "Reasons omitted" in capped
     assert capped.count("\n- ") == 60, "every change must still be listed"
     assert "A reason long enough" not in capped
+
+
+# Every place a reader is told where a log's files are. Kept as one list
+# because the failure these guard against is documentation drifting from
+# `Layout` — which is not hypothetical: the 0.2 layout change left an
+# `iceberg_scan` example in three files pointing at a prefix that no longer
+# holds a table, and each one was a command someone would copy and run.
+DOCUMENTED = (
+    "README.md",
+    "docs/SPEC.md",
+    "docs/API.md",
+    "docs/RUNTIME.md",
+    "examples/README.md",
+)
+
+
+# Words that mark a sentence as describing the OLD layout. A `/litelink/` path
+# is only allowed to appear near one of these.
+HISTORICAL = ("before 0.2", "pre-0.2", "used to", "no longer", "0.1", "moves from")
+
+
+def test_no_document_states_the_pre_0_2_path_as_current() -> None:
+    r"""Every `<...>/litelink/<name>` in the docs must be marked as history.
+
+    Scoped by MEANING rather than by syntax, because the defect that survived
+    the first pass was prose, not code: `docs/API.md` said "The table sits at
+    `<archive prefix>/litelink/<log name>`" four lines under an `iceberg_scan`
+    example that had already been corrected. An earlier version of this test
+    matched `iceberg_scan\('...'\)` and found nothing — it pinned the snippets
+    and left the sentence explaining them free to contradict them.
+    """
+    offenders = []
+    for name in DOCUMENTED:
+        lines = (ROOT / name).read_text().splitlines()
+        for number, line in enumerate(lines, start=1):
+            if "/litelink/" not in line or "github.com" in line:
+                continue
+
+            # The PARAGRAPH, not the line: these documents wrap at 100 columns,
+            # so the sentence that marks a passage as history — "Before 0.2 it
+            # was not so ..." — routinely opens several lines above the path it
+            # is about. A three-line window missed exactly that in SPEC §2.
+            context = " ".join(lines[max(0, number - 7) : number + 2]).lower()
+            if not any(marker in context for marker in HISTORICAL):
+                offenders.append(f"{name}:{number}: {line.strip()}")
+
+    assert not offenders, (
+        "these name the pre-0.2 layout without marking it as history:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_the_documented_trees_match_the_layout() -> None:
+    """SPEC §2 draws both trees; `Layout` and `destination` decide them.
+
+    Each fenced block is checked against the tier it describes, and each file
+    is looked for on a LINE OF ITS OWN. Substring-matching the whole section
+    was close to vacuous: `buffer.db`, `catalog.db` and `archive.db` all appear
+    on the archive tree's `_wal/` line, so all three could be deleted from the
+    on-disk diagram with this still green. Only `litestream.yml` was pinned.
+    """
+    from litelink._layout import Layout
+    from litelink._replication import destination
+
+    layout = Layout(ROOT / "example-root", "trades")
+    section = (ROOT / "docs" / "SPEC.md").read_text().split("## 2. Layout", 1)[1]
+    section = section.split("**One SQLite database", 1)[0]
+    blocks = section.split("```")
+    local, archive = blocks[1], blocks[3]
+
+    for path in (
+        layout.buffer_db,
+        layout.catalog_db,
+        layout.archive_db,
+        layout.replication_config,
+    ):
+        assert path.parent == layout.directory, (
+            f"{path.name} is outside the stream directory; SPEC §2 says it is inside"
+        )
+        assert any(line.strip().startswith(path.name) for line in local.splitlines()), (
+            f"SPEC §2's on-disk tree has no entry for {path.name}"
+        )
+
+    for entry in ("data/", "metadata/"):
+        assert any(line.strip().startswith(entry) for line in local.splitlines())
+        assert any(line.strip().startswith(entry) for line in archive.splitlines())
+
+    # The archive half, against the code that builds it — the half that drifted
+    # and produced a scan example naming a prefix with no table in it.
+    assert layout.archive_table_location("s3://b/p") == "s3://b/p/trades"
+    assert destination("s3://b/p", "trades").endswith("/trades/_wal")
+    assert "_wal/" in archive, "SPEC §2's archive tree must show the replica"
+    assert "/litelink/" not in local and "/litelink/" not in archive, (
+        "the trees must draw the current layout, not the pre-0.2 one"
+    )

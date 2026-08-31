@@ -48,6 +48,69 @@ not a service, so this costs no daemon.
 
 ## 2. Layout
 
+**One directory per stream, holding everything that stream owns.**
+
+```
+<root>/<name>/
+    buffer.db            unsealed rows, offsets, claims, queues  (§2, §4a)
+    catalog.db           the local Iceberg catalog               (one stream)
+    archive.db           the archive's Iceberg catalog           (one stream)
+    litestream.yml       the sidecar's config, if replicating    (§3a)
+    data/                sealed Parquet, and data/compacted/     (§4, §6)
+    metadata/            Iceberg metadata JSON and Avro
+```
+
+and in the archive prefix, mirroring it:
+
+```
+<prefix>/<name>/
+    _wal/                LTX segments, one directory per database  (§3a)
+        buffer.db/  catalog.db/  archive.db/
+    data/                the same Parquet, same relative path
+    metadata/            Iceberg metadata, plus version-hint.text  (§3b)
+```
+
+A stream is therefore a subtree that can be copied, replicated, restored or deleted whole,
+in either tier: a data file keeps its root-relative name in the archive, so its identity is
+its offset range in both tiers and neither has to translate the other's paths.
+
+**Before 0.2 it was not so, and what that cost is worth recording.** `catalog.db` and
+`archive.db` sat at `<root>` and were shared by every stream under it, while Iceberg
+metadata went to pyiceberg's default `<warehouse>/<namespace>/<table>` — so a table's
+metadata lived at `<root>/litelink/<name>/metadata` while its own data files were at
+`<root>/<name>/data`, outside the location the table claimed, held together only by the
+absolute paths in its manifests. Deleting a table's directory would have left every Parquet
+file behind.
+
+The sharing bought nothing: every query against those catalogs is keyed by
+`(catalog, namespace, table)` and nothing has ever read across streams. It cost three
+things. Replication had to be one sidecar per *root*, because a sidecar per log would have
+run two litestream instances against one `catalog.db` — which litestream forbids — so a
+root with several streams needed a config written by hand. `follow` had to drop its `root`
+parameter, since a caller-supplied directory could collide with a live log's shared
+catalogs. And one corrupt catalog took every stream under the root with it.
+
+Contention was *not* among the costs, which is worth stating because it is the first thing
+assumed: two streams sealing concurrently against one shared `catalog.db` measured a
+57.3 ms median against 66.1 ms for separate roots, over 16 seals. The Iceberg commit is a
+tiny transaction; a seal's seconds go to the Parquet and Avro writes, which were always
+per-stream.
+
+Logs written before 0.2 keep working only after being moved — `open` detects the old tree
+and names the command rather than reporting an absent log. See `python -m litelink.migrate`,
+which rewrites metadata pointers in place and preserves snapshot ids and commit times,
+because §8 derives a file's age from the snapshot that added it. Data files are neither
+moved nor rewritten: they were always at `<root>/<name>/data`.
+
+A root holding several streams moves one stream at a time, and four things stay shared until
+the last of them has: `catalog.db`, `archive.db`, the root `litestream.yml` — which names
+every stream's buffer — and `<prefix>/_wal`. Each is kept while any stream still resolves
+through it, and the old sidecar keeps running, because an unmigrated stream's layout has not
+changed. Dropping the old replica is a separate pass per stream, refused while any stream in
+the root is outstanding and until something has reached `<prefix>/<name>/_wal`: that replica
+holds the only off-box copy of unsealed rows, which are by definition in no Parquet file and
+no archive manifest.
+
 **One SQLite database per stream.** SQLite's write lock is per file, not per table, and one
 process per stream is the intended topology.
 
@@ -188,9 +251,15 @@ predicates use `event_ts`; both prune from Iceberg statistics like any other col
 **Catalogs:**
 
 ```python
-local  = SqlCatalog("local",  uri=f"sqlite:///{root}/catalog.db", warehouse=f"file://{root}")
-remote = SqlCatalog("remote", uri=f"sqlite:///{root}/archive.db", warehouse=s3_prefix)
+local  = SqlCatalog("local",  uri=f"sqlite:///{root}/{name}/catalog.db", warehouse=f"file://{root}")
+remote = SqlCatalog("remote", uri=f"sqlite:///{root}/{name}/archive.db", warehouse=s3_prefix)
 ```
+
+Both tables are created with an **explicit location** — `<root>/<name>` and
+`<prefix>/<name>` — rather than the `<warehouse>/<namespace>/<table>` pyiceberg would
+otherwise derive. The namespace survives as the table's name inside its catalog; it is no
+longer part of any path. That separation is what let the layout move without rewriting a
+single catalog row's identity.
 
 The archive catalog's SQLite file is itself replicated to S3, so other machines can attach.
 A REST catalog is a drop-in replacement once more than one machine needs to write.
@@ -283,12 +352,16 @@ name its own metadata — and the file is now replicated for the *same-machine* 
 it saves a round trip, while a failover deliberately does NOT restore it: a stale copy wins
 over the bucket's own pointer and reads the archive short. See §3a and `litelink.restore`.
 
-**One sidecar per root.** Two of those three live at the root and are shared by every log
-under it, so a sidecar per log would run two instances against the same `catalog.db` — what
-litestream forbids — and ship them to one replica path. `replication_config` describes
-the log it was asked about, so a root holding several logs needs one config naming every
-buffer under it, written by hand until this generates it. One log per root avoids the
-question.
+**One sidecar per stream.** All three databases live in the stream's own directory (§2) and
+replicate to `<prefix>/<name>/_wal`, so a root holding several streams runs one sidecar per
+stream, each with a config `write_replication_config` generates into
+`<root>/<name>/litestream.yml`.
+
+This is what the per-stream layout bought. Until 0.2 two of the three sat at the root and
+were shared, so a sidecar per log would have run two litestream instances against one
+`catalog.db` — which litestream forbids — and shipped them to one replica path. A root with
+several logs needed a single config naming every buffer under it, *written by hand*, and the
+advice was to keep one log per root to avoid the question.
 
 Optional. Three things to be clear about:
 
@@ -365,9 +438,14 @@ there is nothing to fence and it reserves none. It opens read-only, which is als
 means assembling another one. That is why the root is always a temporary directory the
 follower owns and removes on close: it is scaffolding for one read session, not a durable
 artefact. There is deliberately no `root` parameter — a caller-supplied one could land on a
-directory that already held a live log, whose `catalog.db` and `archive.db` are shared by
-every log under it, and could leave a stale `archive.db` to win over the bucket's own hint.
-Both were reachable only through that argument, so removing it was cheaper than guarding it. The archive metadata is pinned at assembly for the same reason — and because
+directory that already held a live log and leave a stale `archive.db` to win over the
+bucket's own hint. That was reachable only through the argument, so removing it was cheaper
+than guarding it.
+
+It once carried a second reason, which the per-stream layout has since removed: a supplied
+root could collide with a live log's `catalog.db` and `archive.db`, because those were
+shared by every log under a root. They are per-stream now (§2), so only the stale-hint
+hazard remains — and it is sufficient on its own. The archive metadata is pinned at assembly for the same reason — and because
 `previous-versions-max: 10` keeps ten previous versions beside the current one, so the
 **eleventh further archive commit** deletes the metadata object a follower is holding, **with
 no time component at all**. Archive commits are the ones that count — `sync`, `rewrite_archive`

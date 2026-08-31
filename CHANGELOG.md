@@ -7,6 +7,54 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Changed
+
+- **One directory per stream, in both tiers** (breaking). `catalog.db` and
+  `archive.db` move from `<root>` into `<root>/<name>`, Iceberg metadata moves
+  from `<root>/litelink/<name>/metadata` to `<root>/<name>/metadata`, the WAL
+  replica moves from `<prefix>/_wal` to `<prefix>/<name>/_wal`, and
+  `litestream.yml` from `<root>` to `<root>/<name>`. Data files do not move —
+  they were already at `<root>/<name>/data`.
+
+  The old shape had metadata describing data that lived outside the location
+  the table claimed, held together only by absolute paths in its manifests, and
+  shared catalogs that bought nothing: every query against them is keyed by
+  `(catalog, namespace, table)` and nothing has ever read across streams. What
+  the sharing cost was replication — one sidecar per *root*, with a
+  multi-stream config that had to be written by hand — and `follow`'s `root`
+  parameter, and a blast radius of every stream under the root. It was never
+  contention: two streams sealing against one shared catalog measured 57.3 ms
+  median against 66.1 ms for separate roots.
+
+- **One sidecar per stream**, following from the above.
+  `write_replication_config()` writes a config that is complete on its own for
+  the stream its handle is open on — call it once per stream — where a
+  multi-stream root previously needed a single config written by hand.
+
+- An external engine reads the archive at `s3://bucket/prefix/<name>` rather
+  than `s3://bucket/prefix/litelink/<name>`.
+
+### Added
+
+- **`python -m litelink.migrate`** — move a 0.1 log to the new layout. A dry
+  run by default; `--apply` to act, `--archive` to move the archive's metadata
+  too. It rewrites metadata pointers and re-encodes manifest lists rather than
+  recreating the table, because retention derives a file's age from the
+  snapshot that added it and a fresh commit would silently reset the retention
+  clock on both tiers. Data is neither moved nor rewritten. It verifies row
+  counts before deleting anything. A root holding several streams migrates one
+  at a time: `catalog.db`, `archive.db`, `litestream.yml` and `<prefix>/_wal`
+  are shared, so each is kept until the last stream has moved.
+  `--drop-legacy-wal` is a separate pass, run once per stream, and refuses
+  until the root has fully migrated and a fresh replica has landed — the old
+  one holds the only off-box copy of unsealed rows.
+
+- `open()` on a log still in the 0.1 layout now says so and names the migration
+  command, rather than reporting an absent log — which would invite creating an
+  empty one beside data that is still there.
+
 ## 0.1.0 — 2026-08-30
 
 First release.

@@ -242,11 +242,12 @@ INSTALL httpfs; LOAD httpfs;
 CREATE SECRET (TYPE s3, PROVIDER credential_chain);
 
 SELECT count(*), max(litelink_offset)
-FROM iceberg_scan('s3://bucket/prefix/litelink/trades',
+FROM iceberg_scan('s3://bucket/prefix/trades',
                   version_name_format = '%s%s.metadata.json');
 ```
 
-The table sits at `<archive prefix>/litelink/<log name>`. **`version_name_format` is not
+The table sits at `<archive prefix>/<log name>` — its data and metadata together, since
+0.2. **`version_name_format` is not
 optional**: DuckDB defaults to the Hadoop `v%s%s.metadata.json` while pyiceberg names its
 metadata `00003-<uuid>.metadata.json`, so the hint carries that stem and the format has to stop
 prepending the `v`. `credential_chain` is the ordinary AWS resolution — profile, instance
@@ -324,8 +325,9 @@ would ship its scratch copy over the primary's only off-box record of its unseal
 assembling another follower — exit the block and reopen. The root is always a temporary
 directory the follower owns and deletes on close; there is no `root` parameter, because
 aiming a follow at a caller's directory could land it on a root that already held a live log
-— `catalog.db` and `archive.db` are shared by every log under a root — and could leave a
-stale `archive.db` that wins over the bucket's own hint. `scratch_dir` places the temporary
+and could leave a stale `archive.db` that wins over the bucket's own hint. (It once also
+risked colliding with a live log's shared catalogs; those are per-stream since 0.2, so the
+stale-hint hazard is the whole of it now.) `scratch_dir` places the temporary
 one somewhere other than `/tmp`, which is often memory-backed and which the restored buffer
 can outgrow.
 
@@ -532,9 +534,15 @@ silently wrong, which is why this is generated rather than written by hand.
 `replication_config_for` is the classmethod form, for a log that does not exist here yet —
 which is the chicken-and-egg a restore has to solve.
 
-**One sidecar per root**, not per log: two of the three databases are shared by every log under
-the root. A root holding several logs needs one config naming every buffer under it, which
-this does not generate.
+**One sidecar per stream.** All three databases live in the stream's own directory and
+replicate to `<prefix>/<name>/_wal`, so a root holding several streams runs one sidecar each.
+`write_replication_config()` writes the config for the stream its handle is open on, into
+`<root>/<name>/litestream.yml` — so a multi-stream root means calling it once per stream, and
+each config is complete on its own rather than needing to be merged by hand.
+
+Before 0.2 it was one sidecar per *root*: `catalog.db` and `archive.db` were shared, so a
+sidecar per log would have run two litestream instances against one database, and a
+multi-stream root needed a config written by hand.
 
 ### The sidecar needs a monotonic clock
 
