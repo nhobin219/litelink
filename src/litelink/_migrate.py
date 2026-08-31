@@ -461,7 +461,7 @@ def build_plan(
                 "Migrate first, restart the sidecar so it writes to "
                 f"{fresh}, confirm that landed, then re-run with the flag"
             )
-        elif not _prefix_holds(fresh, s3):
+        elif not _prefix_holds(fresh, s3, only_files=True):
             plan.blockers.append(
                 f"refusing --drop-legacy-wal: nothing has been replicated to "
                 f"{fresh} yet, so {legacy_wal} is still the only off-box copy "
@@ -470,8 +470,17 @@ def build_plan(
                 f"log no longer replicates at all, remove the old prefix with "
                 f"your own object-store tooling instead"
             )
+            # `only_files` above, and it is the difference between testing what
+            # this says and testing something weaker. Object stores leave
+            # zero-byte `.../` keys behind, pyarrow reports them as
+            # directories, and counting them would let a marker holding no data
+            # answer "something has been replicated here" — unlocking the
+            # strongest of these three gates on a replica that does not exist.
         elif _prefix_holds(legacy_wal, s3):
-            plan.steps.append(Step("drop-wal", f"remove {legacy_wal} recursively"))
+            owned = _legacy_wal_keys(root, name, legacy_wal)
+            plan.steps.append(
+                Step("drop-wal", f"remove {len(owned)} owned key(s) under {legacy_wal}")
+            )
         else:
             plan.notes.append(f"nothing under {legacy_wal} — already dropped")
 
@@ -756,7 +765,11 @@ def migrate(
 
     (root / f"{name}-rewrite.db").unlink(missing_ok=True)
 
-    _drop_legacy_wal(plan, root, name, archive, s3, drop=drop_legacy_wal)
+    # No drop here, and not by omission: `build_plan` refuses the flag whenever
+    # the tree is still legacy, which is the only condition under which this
+    # path runs. A call would be unreachable with `drop=True` and would read
+    # like a live second site for an operation that must happen exactly once,
+    # in the second pass. See the `not is_legacy` branch above.
 
     return plan
 

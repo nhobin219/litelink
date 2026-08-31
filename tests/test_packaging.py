@@ -356,41 +356,59 @@ DOCUMENTED = (
 )
 
 
-def test_no_documented_scan_points_at_the_pre_0_2_archive_path() -> None:
-    """`iceberg_scan` examples are copy-pasteable, so they have to be right.
+# Words that mark a sentence as describing the OLD layout. A `/litelink/` path
+# is only allowed to appear near one of these.
+HISTORICAL = ("before 0.2", "pre-0.2", "used to", "no longer", "0.1", "moves from")
 
-    The archive's table location is `<prefix>/<name>`. It was
-    `<prefix>/litelink/<name>` before 0.2 — pyiceberg's
-    `<warehouse>/<namespace>/<table>` default — and an engine pointed there now
-    finds no table at all.
+
+def test_no_document_states_the_pre_0_2_path_as_current() -> None:
+    r"""Every `<...>/litelink/<name>` in the docs must be marked as history.
+
+    Scoped by MEANING rather than by syntax, because the defect that survived
+    the first pass was prose, not code: `docs/API.md` said "The table sits at
+    `<archive prefix>/litelink/<log name>`" four lines under an `iceberg_scan`
+    example that had already been corrected. An earlier version of this test
+    matched `iceberg_scan\('...'\)` and found nothing — it pinned the snippets
+    and left the sentence explaining them free to contradict them.
     """
-    import re
-
     offenders = []
     for name in DOCUMENTED:
-        text = (ROOT / name).read_text()
-        for match in re.finditer(r"iceberg_scan\('([^']+)'", text):
-            if "/litelink/" in match.group(1):
-                offenders.append(f"{name}: {match.group(1)}")
+        lines = (ROOT / name).read_text().splitlines()
+        for number, line in enumerate(lines, start=1):
+            if "/litelink/" not in line or "github.com" in line:
+                continue
+
+            # The PARAGRAPH, not the line: these documents wrap at 100 columns,
+            # so the sentence that marks a passage as history — "Before 0.2 it
+            # was not so ..." — routinely opens several lines above the path it
+            # is about. A three-line window missed exactly that in SPEC §2.
+            context = " ".join(lines[max(0, number - 7) : number + 2]).lower()
+            if not any(marker in context for marker in HISTORICAL):
+                offenders.append(f"{name}:{number}: {line.strip()}")
 
     assert not offenders, (
-        "these scan examples name the pre-0.2 archive path:\n  "
+        "these name the pre-0.2 layout without marking it as history:\n  "
         + "\n  ".join(offenders)
     )
 
 
-def test_the_documented_tree_matches_the_layout() -> None:
-    """SPEC §2 draws the on-disk tree; `Layout` decides it.
+def test_the_documented_trees_match_the_layout() -> None:
+    """SPEC §2 draws both trees; `Layout` and `destination` decide them.
 
-    Asserted against the real object rather than a second copy of the list, so
-    moving a file without redrawing the tree fails here instead of in a user's
-    directory.
+    Each fenced block is checked against the tier it describes, and each file
+    is looked for on a LINE OF ITS OWN. Substring-matching the whole section
+    was close to vacuous: `buffer.db`, `catalog.db` and `archive.db` all appear
+    on the archive tree's `_wal/` line, so all three could be deleted from the
+    on-disk diagram with this still green. Only `litestream.yml` was pinned.
     """
     from litelink._layout import Layout
+    from litelink._replication import destination
 
     layout = Layout(ROOT / "example-root", "trades")
-    drawn = (ROOT / "docs" / "SPEC.md").read_text()
-    block = drawn.split("## 2. Layout", 1)[1].split("**One SQLite database", 1)[0]
+    section = (ROOT / "docs" / "SPEC.md").read_text().split("## 2. Layout", 1)[1]
+    section = section.split("**One SQLite database", 1)[0]
+    blocks = section.split("```")
+    local, archive = blocks[1], blocks[3]
 
     for path in (
         layout.buffer_db,
@@ -401,7 +419,19 @@ def test_the_documented_tree_matches_the_layout() -> None:
         assert path.parent == layout.directory, (
             f"{path.name} is outside the stream directory; SPEC §2 says it is inside"
         )
-        assert path.name in block, f"SPEC §2's tree does not mention {path.name}"
+        assert any(line.strip().startswith(path.name) for line in local.splitlines()), (
+            f"SPEC §2's on-disk tree has no entry for {path.name}"
+        )
 
-    assert "data/" in block and "metadata/" in block
-    assert f"{layout.name}/data/" in layout.seal_path(1, 2, "tok")
+    for entry in ("data/", "metadata/"):
+        assert any(line.strip().startswith(entry) for line in local.splitlines())
+        assert any(line.strip().startswith(entry) for line in archive.splitlines())
+
+    # The archive half, against the code that builds it — the half that drifted
+    # and produced a scan example naming a prefix with no table in it.
+    assert layout.archive_table_location("s3://b/p") == "s3://b/p/trades"
+    assert destination("s3://b/p", "trades").endswith("/trades/_wal")
+    assert "_wal/" in archive, "SPEC §2's archive tree must show the replica"
+    assert "/litelink/" not in local and "/litelink/" not in archive, (
+        "the trees must draw the current layout, not the pre-0.2 one"
+    )

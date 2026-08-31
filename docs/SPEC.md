@@ -99,7 +99,17 @@ per-stream.
 Logs written before 0.2 keep working only after being moved — `open` detects the old tree
 and names the command rather than reporting an absent log. See `python -m litelink.migrate`,
 which rewrites metadata pointers in place and preserves snapshot ids and commit times,
-because §8 derives a file's age from the snapshot that added it.
+because §8 derives a file's age from the snapshot that added it. Data files are neither
+moved nor rewritten: they were always at `<root>/<name>/data`.
+
+A root holding several streams moves one stream at a time, and four things stay shared until
+the last of them has: `catalog.db`, `archive.db`, the root `litestream.yml` — which names
+every stream's buffer — and `<prefix>/_wal`. Each is kept while any stream still resolves
+through it, and the old sidecar keeps running, because an unmigrated stream's layout has not
+changed. Dropping the old replica is a separate pass per stream, refused while any stream in
+the root is outstanding and until something has reached `<prefix>/<name>/_wal`: that replica
+holds the only off-box copy of unsealed rows, which are by definition in no Parquet file and
+no archive manifest.
 
 **One SQLite database per stream.** SQLite's write lock is per file, not per table, and one
 process per stream is the intended topology.
