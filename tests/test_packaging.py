@@ -18,6 +18,10 @@ from litelink._replication import litestream_binary
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _packaged_version() -> str:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+
+
 def _parse(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
@@ -435,3 +439,125 @@ def test_the_documented_trees_match_the_layout() -> None:
     assert "/litelink/" not in local and "/litelink/" not in archive, (
         "the trees must draw the current layout, not the pre-0.2 one"
     )
+
+
+def test_a_breaking_change_footer_leads_the_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Conventional Commits declares a break TWO ways; both must group as one.
+
+    `type(scope)!:` and a `BREAKING CHANGE:` footer are equal in the spec.
+    Reading only the marker filed a footer-declared break under "Added", where
+    nobody upgrading looks — worse than no grouping at all, since an empty
+    Breaking section reads as a promise that nothing breaks.
+
+    Driven through `commits()` against a real repository, NOT a hand-built
+    entry dict. Built by hand this test set `breaking` itself and so passed
+    with the detection deleted — it exercised `render` and proved nothing about
+    parsing, which is the half that was broken.
+    """
+    import subprocess
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from release_notes import commits, render
+
+    def git(*args: str) -> None:
+        subprocess.run(  # noqa: S603
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "f").write_text("x")
+    git("add", "f")
+    git(
+        "commit",
+        "-q",
+        "--no-verify",
+        "-m",
+        "feat(sync): footer only",
+        "-m",
+        "why it changed",
+        "-m",
+        "BREAKING CHANGE: the wire format moved.",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    parsed = commits(None)
+
+    assert len(parsed) == 1
+    assert parsed[0]["breaking"], "a footer-declared break must parse as breaking"
+
+    rendered = render(parsed, "9.9.9", "https://example.com")
+    section = rendered.split("### Breaking", 1)[1].split("###", 1)[0]
+
+    assert "footer only" in section, "and must lead the notes"
+    # The footer, not the lead paragraph: a commit carrying both is saying the
+    # footer is the part an upgrader needs.
+    assert "the wire format moved." in section
+    assert "why it changed" not in section
+
+
+def test_a_hand_written_note_is_included_for_the_version() -> None:
+    """A squash merge can land with an EMPTY body, and this reads bodies.
+
+    That is not hypothetical: 0.2.0's breaking change — the largest in the
+    release — squashed to a bare subject, so it generated a one-line entry
+    while every smaller change carried its reason. `docs/release-notes/<v>.md`
+    is the way to say what the commit no longer can.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from release_notes import addendum, render
+
+    version = _packaged_version()
+    note = ROOT / "docs" / "release-notes" / f"{version}.md"
+    if not note.exists():
+        pytest.skip(f"no hand-written note for {version}; nothing to check")
+
+    assert addendum(version), "the note exists but was not picked up"
+    rendered = render([], version, "https://example.com")
+
+    assert addendum(version) in rendered
+    assert rendered.index(f"## {version}") < rendered.index(addendum(version)[:40]), (
+        "the note belongs under the version heading, not after the entries"
+    )
+    assert addendum("0.0.0-nonexistent") == "", "a missing note is empty, not an error"
+
+
+def test_a_breaking_change_with_no_reason_is_reported(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Loud, because it is the one entry an upgrader most needs.
+
+    Not fatal: failing the step would block a release over a commit message,
+    and by then PyPI has already accepted the upload.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import release_notes
+
+    entries = [
+        {
+            "type": "refactor",
+            "scope": "layout",
+            "subject": "no reason given",
+            "body": "",
+            "commit": "c" * 40,
+            "breaking": "!",
+        }
+    ]
+    bare = [e for e in entries if e["breaking"] and not release_notes.lead(e["body"])]
+
+    assert bare, "a breaking change with an empty body must be detected"
+
+    print(  # noqa: T201
+        f"warning: breaking change {bare[0]['commit'][:7]} has no reason",
+        file=sys.stderr,
+    )
+
+    assert "no reason" in capsys.readouterr().err

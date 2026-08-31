@@ -23,6 +23,7 @@ import argparse
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 # Conventional Commit types, in the order a reader cares about them, with the
 # heading each becomes. Types absent from this map are still shown, under
@@ -42,6 +43,13 @@ HEADER = re.compile(
     r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]+)\))?(?P<break>!)?: (?P<subject>.+)$"
 )
 
+# The OTHER half of the spec. Conventional Commits declares a break two ways —
+# the `!` above, and a `BREAKING CHANGE:` footer — and reading only the first
+# files a break under "Added", where nobody upgrading will look for it. That is
+# worse than not grouping at all: the section exists, so its absence reads as a
+# promise that nothing breaks.
+BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:\s*(?P<reason>.*)$", re.MULTILINE)
+
 SEPARATOR = "\x1e"
 
 # GitHub rejects a release body over 125,000 characters. The first release of
@@ -50,6 +58,27 @@ SEPARATOR = "\x1e"
 # find out. Over the budget, the reasons are dropped and the subjects kept:
 # every change stays announced, which is the part that must not be lost.
 BODY_LIMIT = 120_000
+
+
+def addendum(version: str | None) -> str:
+    """A hand-written note for this version, if one is checked in.
+
+    `docs/release-notes/<version>.md`, included right under the heading. It
+    exists because a squash merge can land with an EMPTY body — GitHub composes
+    the message and whoever merges can clear it — and this script reads bodies.
+    That is how 0.2.0's breaking change, the largest in the release, generated a
+    bare line while every smaller entry carried its reason.
+
+    Found by convention rather than passed as a flag, so the release workflow
+    needs no change and the file is discoverable by anyone cutting a release.
+    """
+    if version is None:
+        return ""
+
+    path = Path(__file__).resolve().parents[1] / "docs" / "release-notes"
+    note = path / f"{version}.md"
+
+    return note.read_text().strip() if note.exists() else ""
 
 
 def _git(*args: str) -> str:
@@ -105,6 +134,7 @@ def commits(since: str | None) -> list[dict[str, str]]:
             )
             continue
 
+        footer = BREAKING_FOOTER.search(body)
         parsed.append(
             {
                 "type": match["type"],
@@ -112,7 +142,7 @@ def commits(since: str | None) -> list[dict[str, str]]:
                 "subject": match["subject"],
                 "body": body,
                 "commit": commit,
-                "breaking": match["break"] or "",
+                "breaking": match["break"] or ("!" if footer else ""),
             }
         )
 
@@ -120,9 +150,18 @@ def commits(since: str | None) -> list[dict[str, str]]:
 
 
 def lead(body: str) -> str:
-    """The body's first paragraph, unwrapped onto one line."""
+    """The body's reason: a `BREAKING CHANGE:` footer, else the first paragraph.
+
+    The footer wins when there is one, because a commit that carries both is
+    saying the footer is the part an upgrader needs — the lead paragraph
+    explains the change, the footer explains what it breaks.
+    """
     if not body:
         return ""
+
+    footer = BREAKING_FOOTER.search(body)
+    if footer and footer["reason"].strip():
+        return " ".join(footer["reason"].split())
 
     paragraph = body.split("\n\n", 1)[0]
     if paragraph.startswith(("Co-Authored-By:", "Claude-Session:")):
@@ -158,6 +197,10 @@ def _render(
     out: list[str] = []
     if version:
         out.append(f"## {version}\n")
+
+    note = addendum(version)
+    if note:
+        out.append(note + "\n")
 
     breaking = [e for e in entries if e["breaking"]]
     if breaking:
@@ -212,6 +255,19 @@ def main() -> int:
 
     since = args.since if args.since is not None else last_tag()
     entries = commits(since)
+
+    # Loud, not fatal. A break with no reason is the one entry an upgrader most
+    # needs and the one this script cannot supply — but failing the step would
+    # block a release over a commit message, after PyPI has already accepted the
+    # upload. See `addendum` for the fix when it happens.
+    bare = [e for e in entries if e["breaking"] and not lead(e["body"])]
+    for entry in bare:
+        print(  # noqa: T201
+            f"warning: breaking change {entry['commit'][:7]} "
+            f"({entry['subject']}) has no reason in its body",
+            file=sys.stderr,
+        )
+
     if not entries:
         print(f"no commits since {since}", file=sys.stderr)  # noqa: T201
 
