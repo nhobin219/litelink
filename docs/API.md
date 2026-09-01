@@ -227,9 +227,11 @@ load, and every acknowledged row must already be in a file — call `seal()` and
 first, or it raises and names what is outstanding. `ingest` is called by the single writer in
 its own process; concurrent `append` is excluded by §1, not by a lock.
 
-**It refuses `wal_replication`**, because these rows never enter the buffer and WAL shipping
-therefore cannot carry them at all — scope, not timing. Load first, turn replication on when
-capture starts.
+**WAL shipping does not carry a loaded range**, because these rows never enter the buffer.
+That is a fact about scope, and it is stated rather than enforced: `ingest` runs with
+`wal_replication` on, and turning it off to load would be worse, since `_discard_on_seal`
+reads the same flag and the next seal would drop the buffer's copy of everything already
+captured.
 
 **The archive is a loaded range's only second copy.** Compare `archived_through()` against the
 `hi` this returns; until they meet, the corpus you loaded from is the range's second copy.

@@ -2343,13 +2343,29 @@ class WriteHandle(LocalReadHandle):
         not acceptable. `ingest` is called BY the single writer, in its process,
         and that is part of the contract rather than something checked.
 
-        **`wal_replication` is refused, and the reason is scope rather than
-        timing.** With it on and an archive configured the buffer IS the off-box
-        copy until the archive has the range (§3a) — and a bulk range never
-        enters the buffer, so WAL shipping cannot carry it at all, ever.
-        Reproduced against a zero-lag replica: 920 rows acknowledged, 420
-        restored, `recovery()` reporting plain success. Turning replication on
-        would state an RPO that silently excludes exactly these rows.
+        **`wal_replication` is not refused, and the reason it once was is worth
+        recording.** WAL shipping genuinely cannot carry a bulk range: with
+        replication on and an archive configured the buffer IS the off-box copy
+        until the archive has the range (§3a), and these rows never enter the
+        buffer. Reproduced against a zero-lag replica: 920 rows acknowledged,
+        420 restored, `recovery()` reporting plain success.
+
+        That is a true statement about SCOPE, and it was briefly turned into a
+        refusal — load with replication off, turn it on afterwards. Which is
+        strictly worse, because `_discard_on_seal` reads the same flag: turn
+        replication off and the next seal stops retaining its rows, so the
+        buffer's copy of everything ALREADY captured is dropped. Measured on a
+        replicated log with an archive: 300 sealed rows retained in the buffer,
+        `set_config(wal_replication=False)`, one more seal, and all 300 are gone
+        from it with the archive holding none — 350 acknowledged rows in local
+        Parquet alone. To load rows that could never be replicated, the
+        workaround stripped the off-box copy from rows that were.
+
+        It also fixed nothing: the range is uncovered until `sync` either way,
+        and `recovery()` reports plain success either way. A refusal that
+        relocates an exposure, adds a second one, and leaves the reporting
+        defect untouched is not a safety measure. What the caller needs is the
+        scope stated, which is the paragraph below.
 
         **So the archive is a loaded range's only second copy, and `sync` may
         lag its tail.** `stable_prefix` holds back a trailing run still under
@@ -2397,19 +2413,6 @@ class WriteHandle(LocalReadHandle):
         Returns None for a source with no rows, which is the one answer a range
         cannot express.
         """
-        if self.config.wal_replication:
-            msg = (
-                "bulk ingest is refused while wal_replication is on. These rows "
-                "never enter the buffer, so WAL shipping cannot carry them: "
-                "replication states an RPO over every acknowledged row (SPEC "
-                "3a) and a bulk range would silently be the exception. Load "
-                "into the log first and turn replication on when capture "
-                "starts. The loaded range is off-box once sync() has pushed "
-                "it, which archived_through() reports; until then the corpus "
-                "you loaded from is its second copy."
-            )
-            raise RuntimeError(msg)
-
         shape = self._buffer.shape()
         reader = source.to_reader() if isinstance(source, pa.Table) else source
         _refuse_foreign_schema(reader.schema, shape.schema)

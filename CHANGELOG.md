@@ -22,8 +22,10 @@ minor version carries breaking changes.
   Files come out sorted and sized at `target_compact_size`, so maintenance
   never has to touch them. It refuses concurrency rather than surviving it —
   the whole log is claimed for the whole load and every acknowledged row must
-  already be in a file — and refuses `wal_replication`, because these rows
-  never enter the buffer and WAL shipping therefore cannot carry them at all.
+  already be in a file. WAL shipping does not carry a loaded range, because
+  these rows never enter the buffer — stated rather than enforced, since
+  turning replication off to load would drop the buffer's copy of everything
+  already captured.
   The archive is a loaded range's only second copy: compare `archived_through()`
   against the `hi` it returns.
 
