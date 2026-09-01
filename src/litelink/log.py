@@ -2353,8 +2353,11 @@ class WriteHandle(LocalReadHandle):
         the load divides evenly. Measured: 3000 rows loaded into 11 files, one
         `sync()`, `archived_through()` 2830, the last 170 rows in one local file
         with `coverage()` reporting no gap. It is not a stall: the run settles
-        as soon as capture writes past it, and the next `sync` takes it — one
-        400-row batch sufficed above.
+        once roughly another `target_compact_size` of rows has been written
+        above it, and the next `sync` takes it — under a minute of capture on
+        the deployment this was built for, but SCALED BY THE BUDGET, not fixed.
+        A second `ingest` settles the first one's tail the same way, so only the
+        last load in a pipeline needs the check.
 
         **Compare `archived_through()` against the `hi` this returns.** Until
         they meet, the corpus you loaded from is the range's second copy, which

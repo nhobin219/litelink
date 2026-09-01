@@ -234,7 +234,9 @@ capture starts.
 **The archive is a loaded range's only second copy.** Compare `archived_through()` against the
 `hi` this returns; until they meet, the corpus you loaded from is the range's second copy.
 `sync` lags the tail on purpose — it holds back a trailing run still under
-`target_compact_size` — and the run settles as soon as capture writes past it.
+`target_compact_size` — and the run settles once roughly another
+`target_compact_size` of rows sits above it, whether from capture or from the
+next `ingest`.
 
 **A load that fails costs its reservation.** The offsets of the file being written are gone,
 leaving a gap. Files stay non-overlapping and adjacent in offset order, which is what §6
