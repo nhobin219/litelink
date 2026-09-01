@@ -39,6 +39,24 @@ minor version carries breaking changes.
   §15.5 requires `none` for blob columns, where a codec spends CPU proving
   already-compressed bytes are incompressible.
 
+### Fixed
+
+- **A restore no longer reissues offsets the archive already holds.** The
+  resume fence was measured `RESTORE_RESERVE` above the sequence the *replica*
+  carried, which is the right floor only while the replica's sequence is the
+  highest offset anyone issued — and the reconcile beside it exists precisely
+  because the bucket routinely holds ranges the replicated rows have never
+  heard of. Reproduced: a replica stalled at offset 301 against an archive
+  holding through 2,864,714 resumed at 1,048,877, inside the archive's range.
+  The reissued rows sealed into the rebuilt table, `sync` reported success
+  while pushing nothing for ever, and `scan(include_archive=True)` returned
+  1,048,881 rows of 3,000,600 acknowledged. The recovery report's own `skipped`
+  range came back inverted, which is now asserted rather than merely computed.
+
+  It needs the archive more than `RESTORE_RESERVE` ahead of the replica, which
+  took a million rows through the buffer during a sidecar outage before bulk
+  ingest and takes one reservation after it.
+
 ### Changed
 
 - **Data files are written with zstd rather than Snappy** (default change). No
