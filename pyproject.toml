@@ -1,6 +1,6 @@
 [project]
 name = "litelink"
-version = "0.2.1"
+version = "0.2.2"
 description = "Durable append-only capture into Iceberg tables. Embedded and local-first."
 readme = "README.md"
 authors = [

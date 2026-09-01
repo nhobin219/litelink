@@ -7,7 +7,15 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
-## 0.2.1 — 2026-09-01
+## 0.2.2 — 2026-09-01
+
+**0.2.1 was yanked and 0.2.2 is what it should have been.** Its artifacts reached
+PyPI from a tag that was cut before two fixes below had landed, and PyPI files
+cannot be replaced. 0.2.1 refuses `ingest` while `wal_replication` is on — which
+pushes an operator into turning replication off to load, the exact sequence that
+makes a replica stale enough to hit the restore defect — and it does not carry
+the fix for that defect. Everything else in it is identical to this release.
+
 
 ### Added
 
