@@ -2979,6 +2979,107 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
         assert revived.scan(include_archive=True).read_all().num_rows > 0
 
 
+def test_a_restore_fence_clears_the_archive_and_not_just_the_replica(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`RESTORE_RESERVE` is measured from the REPLICA's sequence, and the
+    replica's sequence is not the highest offset anyone issued.
+
+    `strip_local_state` runs before `restore` knows where the archive is, so it
+    fences above what the snapshot carried. The reconcile below it exists
+    precisely because that is not the whole truth — the bucket routinely holds
+    ranges the replicated `extent` rows have never heard of — and the fence was
+    never told. Left alone the restored log issues offsets the archive already
+    holds: I9 broken, `sync` reporting success while pushing nothing for ever
+    because the file sits below the archive's floor, and the union truncating
+    the archive leg at the colliding local extent, so archived rows are served
+    by no leg at all.
+
+    The report already knew, and said so in a way nothing read: `skipped` is
+    built from a `highest` that includes this frontier, so it came back as an
+    INVERTED range. That is what an invariant looks like when it is computed
+    and then not checked, and it is asserted here as one.
+
+    The sequence is advanced with `reserve` rather than by writing a million
+    rows, because the hazard is the DISTANCE between the replica's sequence and
+    the archive's frontier and nothing about how it was travelled. Bulk ingest
+    makes that distance cheap; it does not create it.
+    """
+    where = f"s3://{bucket}/fence"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        # Equal to the seal target, so the load emits several files AT the
+        # budget rather than one under it — `stable_prefix` holds back a
+        # trailing run with room in it, and a single undersized file would
+        # leave the archive exactly where the snapshot left it.
+        target_compact_size=8 * 1024,
+        compact_min_files=2,
+        wal_replication=True,
+    )
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(300))
+        log.seal()
+        log.await_seal()
+        log.maintain()
+
+        # THE SNAPSHOT. The replica stalls here, at a low sequence.
+        second = tmp_path / "second"
+        (second / "s").mkdir(parents=True)
+        source = sqlite3.connect(Layout(primary, "s").buffer_db)
+        copy = sqlite3.connect(Layout(second, "s").buffer_db)
+        source.backup(copy)
+        source.close()
+        copy.close()
+        stalled_at = log.end_offset()
+
+        # The primary carries on past the fence's whole width and PUSHES, so
+        # the archive holds offsets a `RESTORE_RESERVE` above the snapshot
+        # cannot reach.
+        log._buffer.reserve(2 * RESTORE_RESERVE)  # noqa: SLF001
+        log.ingest(
+            pa.Table.from_pylist(rows(400), schema=SCHEMA).select(
+                [f.name for f in SCHEMA]
+            )
+        )
+        log.sync()
+        archived = log._archive.require().extent()  # noqa: SLF001
+
+        assert archived is not None, "the archive holds nothing to outrun with"
+        ahead = archived[1]
+
+    assert ahead > stalled_at + RESTORE_RESERVE, (
+        "the archive did not outrun the snapshot by more than the fence, "
+        "so the case is not set up"
+    )
+
+    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
+        report = revived.recovery()
+
+        assert report is not None, "a restored log must carry its report"
+        assert revived.end_offset() > ahead, (
+            f"resumed at {revived.end_offset()} while the archive holds "
+            f"through {ahead}: the next append reuses an archived offset"
+        )
+        # A WHOLE fence above the frontier, not one offset past it. The
+        # archive is a lower bound on what the primary issued — rows it
+        # acknowledged and never got to sync are above it, and their offsets
+        # must not be reissued either. That is the same reason the reserve
+        # exists over the replica's own sequence.
+        assert report.resumed_at > ahead + RESTORE_RESERVE
+        # The inverted range was the symptom, and it is an invariant now.
+        assert report.skipped[0] <= report.skipped[1] + 1, (
+            f"skipped range is inverted: {report.skipped}"
+        )
+
+        issued = revived.extend(rows(5))
+
+        assert min(issued) > ahead, f"reissued archived offsets: {issued}"
+
+
 def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:

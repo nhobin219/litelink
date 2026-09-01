@@ -125,6 +125,12 @@ def test_a_reserve_never_lands_on_a_buffered_row(tmp_path: Path) -> None:
 # -- ingest: the shape it produces (§13.4, stages 2b and 2c) --------------------
 
 
+def buffered(log: WriteHandle) -> int:
+    """Rows the buffer actually holds — not `buffered_rows`, which reports the
+    unsealed tail and so reads 0 for rows a seal deliberately retained."""
+    return int(log._buffer._con.execute("SELECT count(*) FROM buffer").fetchone()[0])
+
+
 def table(n: int, *, start: int = 0) -> pa.Table:
     return pa.Table.from_pylist(rows(n, start=start), schema=SCHEMA)
 
@@ -256,23 +262,55 @@ def test_ingest_is_refused_while_a_seal_is_in_flight(tmp_path: Path) -> None:
         assert log.end_offset() == 1
 
 
-def test_ingest_is_refused_under_wal_replication(
+def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A bulk range never enters the buffer, so with replication on nothing
-    off-box holds it between the load and the first sync (§3a)."""
+    """It used to refuse this, and refusing was strictly worse.
+
+    WAL shipping genuinely cannot carry a bulk range — those rows never enter
+    the buffer. But `_discard_on_seal` reads the same flag, so the prescribed
+    workaround of turning replication off to load would drop the buffer's copy
+    of everything already captured: to protect rows that cannot be replicated,
+    it stripped the off-box copy from rows that were. What the caller gets
+    instead is the scope stated and `archived_through()` to check.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8192,
+        snapshot_retention=timedelta(seconds=0),
+        wal_replication=True,
+    )
     with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
         archive=f"s3://{bucket}/prefix",
         s3=s3,
-        config=LogConfig(wal_replication=True),
     ) as log:
-        with pytest.raises(RuntimeError, match="wal_replication"):
-            log.ingest(table(100))
+        log.extend(rows(300))
+        log.seal()
+        log.await_seal()
+        # A seal RETAINS its rows here: with replication on the buffer is the
+        # off-box copy until the archive has the range (§3a).
+        retained = buffered(log)
+        assert retained == 300
 
-        assert log.end_offset() == 1
+        lo, hi = log.ingest(table(500, start=300)) or (0, 0)
+
+        assert (lo, hi) == (301, 800)
+        assert log.scan().read_all().num_rows == 800
+        # The captured rows keep their off-box copy — the load did not disturb
+        # it, which is the whole of what refusing got wrong.
+        assert buffered(log) == retained
+        # And the loaded range is NOT in it, which is the honest scope claim:
+        # nothing WAL shipping carries holds these rows.
+        assert buffered(log) < hi - lo + 1
+
+        log.sync()
+
+        assert log.archived_through() >= 300
 
 
 def test_ingest_is_refused_while_another_owner_holds_the_log(tmp_path: Path) -> None:

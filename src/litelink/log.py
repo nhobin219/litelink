@@ -1639,6 +1639,42 @@ class WriteHandle(LocalReadHandle):
             if covered is not None:
                 released -= buffer.release_archived(covered[1])
                 buffer.reseed_group()
+
+            # **And the fence has to clear the ARCHIVE, not just the replica.**
+            # `strip_local_state` ran fifty lines up, before this method knew
+            # where the archive was, so it reserved `RESTORE_RESERVE` above the
+            # sequence the REPLICA carried. That is the right floor only while
+            # the replica's sequence is the highest offset anyone issued, and
+            # the paragraph above is this method admitting it is not: the whole
+            # reason for the reconcile is that the bucket routinely holds
+            # ranges the replicated `extent` rows have never heard of.
+            #
+            # Left alone the restored log issues offsets the archive already
+            # holds, which is I9 broken in the one direction nothing detects.
+            # Reproduced: replica at seq 301, 3M rows loaded and pushed,
+            # `archived_through` 2,864,714 — and the restore resumed at
+            # 1,048,877, inside the archive's range. The reissued rows seal
+            # into the rebuilt local table, `sync` reports success and pushes
+            # nothing for ever because the file sits below the archive's floor,
+            # and `scan(include_archive=True)` returns 1,048,881 rows of the
+            # 3,000,600 acknowledged: the union truncates the archive leg at
+            # the colliding local extent, so ~1.95M archived rows are served by
+            # no leg at all while five offsets durably name two different rows.
+            #
+            # The report already knew. `skipped` is `(highest + 1, resumed - 1)`
+            # over a `highest` that takes this frontier into account, so it came
+            # back INVERTED — `(2864715, 1048876)` — which is what an invariant
+            # looks like when it is computed and then not checked.
+            #
+            # Reachable before bulk ingest existed, and cheaper with it: this
+            # needs the archive more than `RESTORE_RESERVE` ahead of the
+            # replica, which used to take a million rows through the buffer
+            # during a sidecar outage and now takes one `reserve` that ships
+            # almost no WAL. The hazard is lag plus restore either way, so it
+            # is closed here rather than by refusing the load.
+            wanted = frontier + RESTORE_RESERVE + 1
+            if wanted > resumed:
+                resumed = buffer.reserve(wanted - resumed)[1] + 1
         finally:
             buffer.close()
 
@@ -2343,13 +2379,29 @@ class WriteHandle(LocalReadHandle):
         not acceptable. `ingest` is called BY the single writer, in its process,
         and that is part of the contract rather than something checked.
 
-        **`wal_replication` is refused, and the reason is scope rather than
-        timing.** With it on and an archive configured the buffer IS the off-box
-        copy until the archive has the range (§3a) — and a bulk range never
-        enters the buffer, so WAL shipping cannot carry it at all, ever.
-        Reproduced against a zero-lag replica: 920 rows acknowledged, 420
-        restored, `recovery()` reporting plain success. Turning replication on
-        would state an RPO that silently excludes exactly these rows.
+        **`wal_replication` is not refused, and the reason it once was is worth
+        recording.** WAL shipping genuinely cannot carry a bulk range: with
+        replication on and an archive configured the buffer IS the off-box copy
+        until the archive has the range (§3a), and these rows never enter the
+        buffer. Reproduced against a zero-lag replica: 920 rows acknowledged,
+        420 restored, `recovery()` reporting plain success.
+
+        That is a true statement about SCOPE, and it was briefly turned into a
+        refusal — load with replication off, turn it on afterwards. Which is
+        strictly worse, because `_discard_on_seal` reads the same flag: turn
+        replication off and the next seal stops retaining its rows, so the
+        buffer's copy of everything ALREADY captured is dropped. Measured on a
+        replicated log with an archive: 300 sealed rows retained in the buffer,
+        `set_config(wal_replication=False)`, one more seal, and all 300 are gone
+        from it with the archive holding none — 350 acknowledged rows in local
+        Parquet alone. To load rows that could never be replicated, the
+        workaround stripped the off-box copy from rows that were.
+
+        It also fixed nothing: the range is uncovered until `sync` either way,
+        and `recovery()` reports plain success either way. A refusal that
+        relocates an exposure, adds a second one, and leaves the reporting
+        defect untouched is not a safety measure. What the caller needs is the
+        scope stated, which is the paragraph below.
 
         **So the archive is a loaded range's only second copy, and `sync` may
         lag its tail.** `stable_prefix` holds back a trailing run still under
@@ -2397,19 +2449,6 @@ class WriteHandle(LocalReadHandle):
         Returns None for a source with no rows, which is the one answer a range
         cannot express.
         """
-        if self.config.wal_replication:
-            msg = (
-                "bulk ingest is refused while wal_replication is on. These rows "
-                "never enter the buffer, so WAL shipping cannot carry them: "
-                "replication states an RPO over every acknowledged row (SPEC "
-                "3a) and a bulk range would silently be the exception. Load "
-                "into the log first and turn replication on when capture "
-                "starts. The loaded range is off-box once sync() has pushed "
-                "it, which archived_through() reports; until then the corpus "
-                "you loaded from is its second copy."
-            )
-            raise RuntimeError(msg)
-
         shape = self._buffer.shape()
         reader = source.to_reader() if isinstance(source, pa.Table) else source
         _refuse_foreign_schema(reader.schema, shape.schema)
