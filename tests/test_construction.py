@@ -24,7 +24,7 @@ from litelink import LogConfig, WriteHandle
 from litelink._archive import Archive
 from litelink._buffer import SORT_KEY, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
-from litelink._layout import Layout
+from litelink._layout import Layout, validate_archive
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection, secret_sql
 from litelink._replication import WAL_PREFIX
@@ -1248,3 +1248,114 @@ def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
     # And the caller that matters treats it as "exists" rather than proceeding.
     with pytest.raises((LookupError, FileExistsError, ValueError, RuntimeError)):
         litelink.restore(tmp_path, "s", archive="s3://bucket/prefix")
+
+
+@pytest.mark.parametrize(
+    ("archive", "expected"),
+    [
+        # The one that motivated the rule: a single missing slash. It reaches
+        # `litestream_config` intact, splits at the first slash it finds, and
+        # yields the bucket `s3:` — which litestream rejects as a YAML error
+        # naming a generated file the caller never sees.
+        ("s3:/bucket/prefix", "missing a slash"),
+        ("s3:bucket/prefix", "missing a slash"),
+        # No scheme at all: the same positional split, silently addressing a
+        # bucket named after the first path segment.
+        ("bucket/prefix", "must be an s3:// URI"),
+        ("/local/path", "must be an s3:// URI"),
+        ("https://bucket/prefix", "must be an s3:// URI"),
+        # A scheme and nothing else.
+        ("s3://", "names no bucket"),
+        ("s3:///prefix", "names no bucket"),
+        # Characters that break the config the bucket is written into. A `:`
+        # in a bucket name emits `bucket: a:b`, a plain scalar ending in a
+        # colon, which is the same YAML failure by another route.
+        ("s3://a:b/prefix", "cannot appear in one"),
+        ("s3://a b/prefix", "cannot appear in one"),
+    ],
+)
+def test_a_malformed_archive_uri_is_refused_with_its_own_shape(
+    archive: str, expected: str
+) -> None:
+    """Every consumer of `archive` parses it POSITIONALLY.
+
+    Which is why a malformed prefix cannot be left to fail downstream: it does
+    not fail, it means something else. `s3:/bucket/prefix` is a valid string to
+    every one of them, describing a bucket called `s3:`.
+
+    Falsify by deleting the `validate_archive` call in `validate`: every case
+    here is accepted, and the first four reach litestream as
+    `yaml: line 5: mapping values are not allowed in this context`.
+    """
+    with pytest.raises(ValueError, match=expected):
+        validate_archive(archive)
+
+
+def test_a_well_formed_archive_uri_is_accepted() -> None:
+    """The control for the rule above, and the reason it is not stricter.
+
+    Bucket naming is the endpoint's rule, not litelink's — rustfs and MinIO
+    accept names AWS would refuse, and this library is tested against both. So
+    the check covers the shape the parsers depend on and the characters that
+    break the generated config, and nothing else.
+
+    Falsify by tightening `_BUCKET_CHARS` to AWS's own rule: the underscore
+    and uppercase cases here start failing.
+    """
+    for archive in (
+        "s3://bucket",
+        "s3://bucket/prefix",
+        "s3://bucket/prefix/nested",
+        "s3://bucket/prefix/",
+        "s3://has_underscore/p",
+        "s3://Has-Upper/p",
+        "s3://has.dots/p",
+    ):
+        validate_archive(archive)
+
+
+def test_every_entry_point_taking_an_archive_checks_its_shape(tmp_path: Path) -> None:
+    """`new` reaches it through `validate`; `restore` and `follow` do not.
+
+    Neither of those takes a schema or a config, so neither calls `validate` —
+    and both hand the string straight to the litestream config writer. They
+    need the check of their own, and the point of asserting all three together
+    is that adding a fourth entry point without one is visible here.
+
+    Falsify by removing either explicit `validate_archive` call: the `restore`
+    or `follow` case raises RuntimeError from the subprocess instead, after
+    creating a root or a scratch directory.
+    """
+    bad = "s3:/bucket/prefix"
+
+    with pytest.raises(ValueError, match="missing a slash"):
+        litelink.new(tmp_path / "new", "s", schema=SCHEMA, archive=bad)
+
+    with pytest.raises(ValueError, match="missing a slash"):
+        litelink.restore(tmp_path / "restore", "s", archive=bad)
+
+    with pytest.raises(ValueError, match="missing a slash"):
+        litelink.follow("s", archive=bad)
+
+    # And nothing was created on the way to refusing. A shape error is decided
+    # from the argument alone, so it must land before any directory does.
+    assert not (tmp_path / "new").exists()
+    assert not (tmp_path / "restore").exists()
+
+
+def test_repointing_a_log_at_a_malformed_archive_is_refused(tmp_path: Path) -> None:
+    """`set_archive` goes through `validate` too, and must.
+
+    A log that is already running is the worse place to accept one: the
+    location is written to `meta` and every later sync reads it back, so a
+    malformed prefix becomes durable state that fails at the next maintenance
+    pass rather than at the call that set it.
+
+    Falsify by deleting the `validate_archive` call in `validate`: the repoint
+    succeeds and the string is stored.
+    """
+    with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
+        with pytest.raises(ValueError, match="missing a slash"):
+            log.set_archive("s3:/bucket/prefix")
+
+        assert log.archive is None, "a refused repoint was stored anyway"

@@ -287,3 +287,82 @@ class Layout:
     def create(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.directory.mkdir(parents=True, exist_ok=True)
+
+
+# The only scheme an archive prefix may carry. Not a general URI parser: the
+# archive is object storage, everything downstream builds `s3://` paths from
+# it, and `litestream_config` emits a `type: s3` replica.
+ARCHIVE_SCHEME = "s3://"
+
+# What may appear in a bucket name. Deliberately laxer than AWS's own rule —
+# litelink is tested against rustfs and MinIO, which accept names AWS would
+# not — and strict about exactly the characters that break the consumer: a `:`
+# or a space in a bucket makes `litestream_config` emit `bucket: a:b`, which
+# is the same unparseable YAML the missing slash produced. Bucket naming is
+# the endpoint's rule, not this library's; the point here is the generated
+# config, not conformance.
+_BUCKET_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_")
+
+
+def validate_archive(archive: str) -> None:
+    """Refuse an archive prefix that is not `s3://bucket[/prefix]`.
+
+    Checked where the caller hands one over, because nothing downstream can
+    tell a malformed prefix from a deliberate one — every consumer parses it
+    POSITIONALLY, so a wrong shape does not fail, it means something else.
+
+    The case that motivated this is a single missing slash.
+    `litestream_config` does `archive.removeprefix("s3://").partition("/")`, so
+    `s3:/bucket/prefix` keeps its scheme, splits at the first slash, and yields
+    the bucket `s3:` — which it writes into the config as `bucket: s3:`, a
+    plain scalar ending in a colon. litestream then fails with
+
+        yaml: line 5: mapping values are not allowed in this context
+
+    three frames below the argument that caused it, naming a generated file the
+    caller never sees and a line number that means nothing to them. The same
+    string reaches the Iceberg path builders, where it would address a prefix
+    nobody meant.
+
+    Raises `ValueError`, like every other rule in `validate`: it is a
+    configuration that cannot mean what it says, not a failure to reach
+    anything. Nothing here touches the network — whether the bucket EXISTS is a
+    different question, answered by the operation that needs it.
+    """
+    if not archive.startswith(ARCHIVE_SCHEME):
+        # The near-miss first and by name. A caller who typed one slash is not
+        # helped by being told the general rule; they are helped by being shown
+        # their own string with the slash put back.
+        if archive.startswith("s3:"):
+            fixed = ARCHIVE_SCHEME + archive[len("s3:") :].lstrip("/")
+            msg = (
+                f"archive={archive!r} is missing a slash after the scheme. "
+                f"Did you mean {fixed!r}?"
+            )
+            raise ValueError(msg)
+
+        msg = (
+            f"archive must be an s3:// URI, not {archive!r}. It is the remote "
+            f"prefix a log's data is published under — `s3://bucket` or "
+            f"`s3://bucket/prefix` — and the log's own name is appended to it, "
+            f"so the prefix names the DIRECTORY that holds the logs, not one "
+            f"log. A local-only log takes archive=None."
+        )
+        raise ValueError(msg)
+
+    bucket, _, _ = archive.removeprefix(ARCHIVE_SCHEME).partition("/")
+    if not bucket:
+        msg = (
+            f"archive={archive!r} names no bucket. The form is "
+            f"`s3://bucket` or `s3://bucket/prefix`."
+        )
+        raise ValueError(msg)
+
+    if not set(bucket) <= _BUCKET_CHARS:
+        bad = sorted(set(bucket) - _BUCKET_CHARS)
+        msg = (
+            f"archive={archive!r} has {''.join(bad)!r} in its bucket name "
+            f"{bucket!r}, which cannot appear in one. The form is "
+            f"`s3://bucket` or `s3://bucket/prefix`."
+        )
+        raise ValueError(msg)

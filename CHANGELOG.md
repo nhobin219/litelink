@@ -7,6 +7,52 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Fixed
+
+- **A mistyped archive prefix is refused where it is typed**, instead of
+  surfacing as a YAML parse error from the litestream subprocess. Every
+  consumer of the prefix parses it positionally, so a malformed one does not
+  fail — it means something else. `s3:/bucket/prefix`, with one slash, kept its
+  scheme, split at the first slash it found, and produced a bucket named `s3:`,
+  which the generated config wrote as `bucket: s3:` — a plain scalar ending in
+  a colon. What reached the caller was
+  `litestream restore failed: Error: yaml: line 5: mapping values are not
+  allowed in this context`, naming a temporary file they never see and a line
+  number in it. `new`, `set_archive`, `restore` and `follow` now all raise
+  `ValueError` naming the prefix, and the one-slash case suggests the corrected
+  string. `open` is unaffected and still opens a log whose stored prefix is
+  malformed — it takes no archive argument, and refusing to open the log would
+  remove the `set_archive` call that repairs it.
+
+  `python -m litelink <archive-uri>` reports it too, as a failed check rather
+  than a traceback out of argv — it is the command an operator reaches for to
+  find out what is wrong, and the prefix arrives there from a shell, where a
+  missing slash survives every layer that would otherwise catch it. It
+  previously answered `ArrowInvalid: Not a valid bucket name: ''`.
+
+- **"There is no replica here" reaches the caller again.** Both `restore` and
+  `follow` carried an explanatory
+  `FileNotFoundError` for an archive holding no replica of the log — and
+  neither could ever raise it. `restore_buffer` ran litestream without
+  `-if-replica-exists`, so an absent replica exited non-zero and became
+  `litestream restore failed: Error: no matching backup files available` one
+  frame below, leaving both messages unreachable for the life of the callers.
+
+  The message now states both readings, because nothing in the arguments
+  separates them: the WAL was never replicated, or `name` and `archive` do not
+  together name a log that exists. Reproduced against a real bucket by passing
+  a log's own name as the last segment of the prefix. Genuine failures are
+  unaffected — measured against litestream 0.5.16, a missing bucket still exits
+  1 with `NoSuchBucket` and a bad key with `InvalidAccessKeyId`; only absence
+  is quiet.
+
+- **`just rustfs` creates its bucket again.** Both recipes still ran
+  `uv run --extra s3`, and that extra was deliberately deleted when s3fs moved
+  to the dev group — so the endpoint came up and the bucket did not, and the
+  ~91 tests in the S3 tier skipped on a fresh checkout.
+
 ## 0.2.2 — 2026-09-01
 
 **0.2.1 was yanked and 0.2.2 is what it should have been.** Its artifacts reached

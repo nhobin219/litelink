@@ -44,7 +44,7 @@ from litelink._buffer import (
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
 from litelink._fs import write_parquet
-from litelink._layout import Layout
+from litelink._layout import Layout, validate_archive
 from litelink._maintenance import (
     CONFIG_KEY,
     Maintenance,
@@ -1444,6 +1444,11 @@ class WriteHandle(LocalReadHandle):
         resolve, and it is the only record of which Parquet the local table is
         made of in a design that refuses directory listing.
         """
+        # First, because this path does not go through `validate` — it takes no
+        # schema and no config — and a malformed prefix would otherwise surface
+        # as a YAML parse error from the litestream subprocess, after the root
+        # has already been created.
+        validate_archive(archive)
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
         # its last write, not a log. Refusing it would leave the root in a
@@ -1522,9 +1527,11 @@ class WriteHandle(LocalReadHandle):
         layout.create()
         config_path.write_text(litestream_config(layout, archive, options))
 
-        # ONLY the buffer, and with no `-if-replica-exists`: that flag exits 0
-        # when there is no backup, which would make the check below unable to
-        # tell a restored database from an absent one.
+        # ONLY the buffer. `restore_buffer` passes `-if-replica-exists`, so an
+        # absent replica returns quietly and the check below is what reports
+        # it — which is the point, since this is the caller that knows what
+        # "no replica" means here. See `restore_buffer` for why that flag does
+        # not hide a real failure.
         #
         # Skipped when resuming — the buffer is already here, and litestream
         # would refuse to write over it anyway.
@@ -1532,11 +1539,13 @@ class WriteHandle(LocalReadHandle):
             restore_buffer(config_path, layout.buffer_db, options, binary)
 
         if not layout.buffer_db.exists():
+            # Both readings, for `follow`'s reason: nothing in the arguments
+            # separates them. See `_assembly._restore_replica`.
             msg = (
                 f"no replica of {layout.buffer_db.name} under {archive} — there is "
                 f"nothing to restore. A log with wal_replication off has no off-box "
-                f"copy of its unsealed rows, and cannot be recovered onto another "
-                f"machine"
+                f"copy of its unsealed rows and cannot be recovered onto another "
+                f"machine, or `name` and `archive` do not describe a log that exists"
             )
             raise FileNotFoundError(msg)
 
@@ -4136,6 +4145,14 @@ def validate(
     # Before anything else: a column the library cannot carry end-to-end must
     # fail here, not on the first read after the data is already durable.
     validate_schema(schema)
+
+    # The archive's SHAPE, before any rule that reads its meaning. Callers
+    # reach this with the empty string already normalised to None, so a string
+    # here is one somebody meant — and a malformed one is not caught anywhere
+    # downstream, because every consumer parses it positionally. See
+    # `validate_archive`.
+    if archive is not None:
+        validate_archive(archive)
 
     missing = [c for c in sort_by if c not in schema.names]
     if missing:
