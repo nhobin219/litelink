@@ -23,14 +23,13 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._archive import ARCHIVE_KEY, Archive
@@ -40,10 +39,11 @@ from litelink._buffer import (
     SORT_KEY,
     START_OFFSET_KEY,
     Buffer,
+    Shape,
 )
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
-from litelink._fs import fsync
+from litelink._fs import write_parquet
 from litelink._layout import Layout
 from litelink._maintenance import (
     CONFIG_KEY,
@@ -97,6 +97,13 @@ _SETTINGS_WAIT_S = 10.0
 
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
+# Bulk ingest's own role, and NOT `seal`. Reusing the sealer's would put a bulk
+# range into `sealing`, where `_recover_seal` reads `rows_between(lo, hi + 1)`
+# from a buffer that never held it, writes an EMPTY Parquet, registers it as
+# covering the range and then discards every buffered row below it. Measured:
+# 40 acknowledged rows deleted into no file, and an empty file carries no
+# column statistics, so `extent()` raises on every call afterwards.
+INGEST_ROLE = "ingest"
 
 
 # One home, in `_maintenance`, because eviction reads it too.
@@ -136,6 +143,112 @@ _SORT_KEY = SORT_KEY
 # int64. It errs large on purpose: a gap is visible to a consumer, and a
 # rewind looks like ordinary operation.
 RESTORE_RESERVE = 1 << 20
+
+
+# How many staged files one Iceberg commit takes.
+#
+# A commit costs far more than the write it publishes — 4.1 s against 648 ms,
+# measured against S3 — because it reads each footer and writes a manifest, a
+# manifest list, a fresh `metadata.json` and a new catalog pointer, none of
+# which gets cheaper for holding one file instead of twenty. At `compact_size`
+# and 200-byte rows a 160M-row load is roughly 480 files, which is half an hour
+# of commits alone if each registers on its own.
+#
+# What batching costs is a wider window in which a written file is not yet
+# registered. It is not a new KIND of window: every one of these paths is in
+# `compacting` before its bytes exist (I2), so recovery finds them either way.
+_INGEST_BATCH = 20
+
+# The Parquet codecs `LogConfig.compression` accepts. pyarrow's set, minus the
+# ones there is no reason to offer: `brotli` and `lz4` are neither the smallest
+# nor the fastest here, and a codec nobody has measured on this shape is a
+# setting whose consequences the library cannot describe.
+_CODECS = frozenset({"none", "snappy", "gzip", "zstd"})
+
+
+def _refuse_foreign_schema(incoming: pa.Schema, declared: pa.Schema) -> None:
+    """Check a bulk source against the log's schema BEFORE anything is reserved.
+
+    An Arrow batch carries its schema, so one comparison proves the names and
+    types of every row in it by construction — the per-row validation the
+    mapping path does is not optimised away here, it stops being necessary
+    (§13.4). That is the second argument for this endpoint, independent of
+    avoiding the row-by-row rewrite, and for a backfill it is the larger one.
+
+    Up front, and only here, because a rejection AFTER a reservation is a
+    permanent hole in the offset space. Type compatibility is settled by casting
+    an empty table, which costs nothing and answers the same question the real
+    cast will.
+    """
+    if OFFSET in incoming.names:
+        msg = f"`{OFFSET}` is assigned by the library and cannot be supplied (I11)"
+        raise ValueError(msg)
+
+    missing = [name for name in declared.names if name not in incoming.names]
+    unknown = [name for name in incoming.names if name not in declared.names]
+    if missing or unknown:
+        msg = (
+            "this source does not match the log's schema"
+            + (f"; missing {missing}" if missing else "")
+            + (f"; unknown {unknown}" if unknown else "")
+        )
+        raise ValueError(msg)
+
+    try:
+        incoming.empty_table().select(declared.names).cast(declared)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+        msg = f"this source's types cannot be cast to the log's schema: {exc}"
+        raise ValueError(msg) from exc
+
+
+def _chunks(
+    reader: pa.RecordBatchReader, size: int, row_cap: int | None
+) -> Iterator[pa.Table]:
+    """One output file's worth of rows at a time, bounded by memory.
+
+    A batch that would overshoot is SLICED rather than taken whole, because the
+    source may be one `pa.Table` holding the entire corpus in a single chunk —
+    and then "emit a file per batch" is one file for the load, which is the
+    split not happening. Slicing an Arrow batch copies nothing.
+
+    The budget is `target_compact_size` in Arrow's in-memory bytes, and the per
+    row cost is averaged over the batch it came from rather than summed per
+    row: a seal counts exactly because it sees rows one at a time and this does
+    not, and paying a per-row measurement to place a file boundary would cost
+    more than the boundary is worth. Files land near the target rather than on
+    it, which is the tolerance `runs()` already works within — and a file at the
+    target forms a run of one there, so landing near it is what keeps these
+    files out of compaction rather than merely close to a number.
+
+    A single row larger than the whole budget still becomes a file of one row.
+    That is deliberate — the alternative is a loop that cannot advance.
+    """
+    held: list[pa.RecordBatch] = []
+    measured = 0
+    counted = 0
+    for batch in reader:
+        if not batch.num_rows:
+            continue
+
+        per_row = max(1, batch.nbytes // batch.num_rows)
+        cursor = 0
+        while cursor < batch.num_rows:
+            take = batch.num_rows - cursor
+            if row_cap is not None:
+                take = min(take, row_cap - counted)
+
+            take = min(take, max(1, (size - measured) // per_row))
+            piece = batch.slice(cursor, take)
+            held.append(piece)
+            measured += per_row * piece.num_rows
+            counted += piece.num_rows
+            cursor += take
+            if measured >= size or (row_cap is not None and counted >= row_cap):
+                yield pa.Table.from_batches(held, schema=reader.schema)
+                held, measured, counted = [], 0, 0
+
+    if held:
+        yield pa.Table.from_batches(held, schema=reader.schema)
 
 
 @dataclass(frozen=True)
@@ -2190,6 +2303,327 @@ class WriteHandle(LocalReadHandle):
         # files to compact.
         return self._buffer.append(rows)
 
+    # -- bulk ingest ---------------------------------------------------------
+
+    def ingest(self, source: pa.Table | pa.RecordBatchReader) -> tuple[int, int] | None:
+        """Write Arrow straight into the immutable tier (§13.4). Returns `(lo, hi)`.
+
+        The SQLite buffer exists to make a row durable before it is in Parquet
+        (§2). A bulk load's source is ALREADY durable — a Parquet corpus, or an
+        Arrow table read from one — so every row pushed through the buffer at
+        `synchronous=FULL` pays once more for a guarantee it already has.
+        Measured here on 400k rows, where fsync is cheap and the gap is
+        therefore understated: 182,801 rows/s through the buffer against
+        5,103,266 rows/s writing Arrow straight to Parquet. On the deployment
+        that wanted this, the same load measured about 32 hours.
+
+        **This path refuses concurrency rather than surviving it**, and that is
+        a decision rather than an omission. Everything about a load is sized in
+        hours, and a design that stayed correct beside live capture needs a
+        range-aware coverage predicate `register` does not have: `_covers`
+        answers from the extent's upper bound alone, so the FIRST live seal
+        after the reserve raises that bound past this range's end and the
+        commit is declined — which `_write_and_commit` turns into a queued
+        deletion and a normal return. Reproduced with one ordinary 50-row batch
+        and one ordinary seal: 3000 rows acknowledged, 50 readable, no error at
+        any step. Concurrent bulk ingest is its own problem and its own issue.
+
+        So the whole log is claimed for the whole load, and three reads have to
+        pass before it starts. They are not three heuristics: acknowledged rows
+        live in exactly one table, `buffer`; exactly one function turns them
+        into a file, `_write_and_commit`; it has exactly two callers, whose
+        ranges come from `pending_group()` and `pending_seal()`; and the only
+        two things that put a range into `pending_group()` — `_cut` and
+        `close_open_group` — both require the open group to have taken rows. A
+        third caller of `_write_and_commit`, or a second function that turns
+        buffer rows into Parquet, needs a fourth read.
+
+        **Concurrent appends are excluded by §1, not by the claim.**
+        `Buffer.append` consults no claim, and putting one on the hot path is
+        not acceptable. `ingest` is called BY the single writer, in its process,
+        and that is part of the contract rather than something checked.
+
+        **`wal_replication` is refused, and the reason is scope rather than
+        timing.** With it on and an archive configured the buffer IS the off-box
+        copy until the archive has the range (§3a) — and a bulk range never
+        enters the buffer, so WAL shipping cannot carry it at all, ever.
+        Reproduced against a zero-lag replica: 920 rows acknowledged, 420
+        restored, `recovery()` reporting plain success. Turning replication on
+        would state an RPO that silently excludes exactly these rows.
+
+        **So the archive is a loaded range's only second copy, and `sync` may
+        lag its tail.** `stable_prefix` holds back a trailing run still under
+        `target_compact_size`, because a run with room in it may yet take files
+        that have not been written — and the last file of a load is short unless
+        the load divides evenly. Measured: 3000 rows loaded into 11 files, one
+        `sync()`, `archived_through()` 2830, the last 170 rows in one local file
+        with `coverage()` reporting no gap. It is not a stall: the run settles
+        once roughly another `target_compact_size` of rows has been written
+        above it, and the next `sync` takes it — under a minute of capture on
+        the deployment this was built for, but SCALED BY THE BUDGET, not fixed.
+        A second `ingest` settles the first one's tail the same way, so only the
+        last load in a pipeline needs the check.
+
+        **Compare `archived_through()` against the `hi` this returns.** Until
+        they meet, the corpus you loaded from is the range's second copy, which
+        is the same durability this path's whole premise rests on: the source is
+        already durable, which is why the buffer is not in the way. Do not
+        enable replication expecting it to close that window — nothing it ships
+        contains these rows.
+
+        Files come out sized at `target_compact_size` and sorted by `sort_by`,
+        which is what makes them indistinguishable from a compacted file and so
+        born past the maintenance lifecycle: `runs()` closes a run when the next
+        file would exceed the budget, so a file already at it forms a run of
+        one, and `_merge` rewrites only at `compact_min_files`. Sorted WITHIN a
+        file, like a seal's output — offsets are materialised in input order and
+        then permuted by the sort, so the range stays dense while the rows move.
+        "Sorted" and "contiguous" are claims about two different columns.
+
+        **A load that fails leaves a hole, and that is the accepted cost.** The
+        offsets of the reservation being written when it failed are gone; §6
+        needs files non-overlapping and adjacent in offset order, not free of
+        integer gaps, and every pass was measured correct on a gapped log. The
+        one price worth stating rather than discovering: compaction will merge
+        across the gap, and a merged file spanning one can never be re-cut by
+        `rewrite_archive`.
+
+        Takes a `pa.Table` or a `pa.RecordBatchReader` and nothing else.
+        Parquet-to-Arrow is the caller's — `pq.ParquetFile(...).iter_batches()`
+        is a reader, and how they got there is theirs. Memory is bounded at one
+        output file either way, because a Table is a reader that ends after one
+        pull.
+
+        Returns None for a source with no rows, which is the one answer a range
+        cannot express.
+        """
+        if self.config.wal_replication:
+            msg = (
+                "bulk ingest is refused while wal_replication is on. These rows "
+                "never enter the buffer, so WAL shipping cannot carry them: "
+                "replication states an RPO over every acknowledged row (SPEC "
+                "3a) and a bulk range would silently be the exception. Load "
+                "into the log first and turn replication on when capture "
+                "starts. The loaded range is off-box once sync() has pushed "
+                "it, which archived_through() reports; until then the corpus "
+                "you loaded from is its second copy."
+            )
+            raise RuntimeError(msg)
+
+        shape = self._buffer.shape()
+        reader = source.to_reader() if isinstance(source, pa.Table) else source
+        _refuse_foreign_schema(reader.schema, shape.schema)
+
+        lease = self._lease(INGEST_ROLE)
+        if not lease.acquire():
+            msg = (
+                "another owner holds a claim over this log; bulk ingest needs "
+                "the whole of it for the whole load"
+            )
+            raise RuntimeError(msg)
+
+        try:
+            self._refuse_unfiled_rows()
+            # Once, under the claim. The arithmetic below says `register`
+            # cannot decline, and that argument is about the CURRENT table —
+            # a handle that has only appended for hours holds the snapshot it
+            # opened with.
+            self._table.reload()
+
+            return self._ingest_chunks(reader, shape, lease)
+        finally:
+            lease.release()
+
+    def _refuse_unfiled_rows(self) -> None:
+        """Refuse an ingest while any acknowledged row is still owed a file.
+
+        The reservation goes ABOVE everything the log has issued, so a row left
+        below it lands in a file that spans the reservation — and §6 forbids two
+        files covering one offset. Transiently it is worse than that: `_union`
+        bounds the buffer leg by the table's extent, which the bulk file raises
+        past the stranded row, so the row is in no leg of the read at all.
+        Measured: 501 acknowledged, `scan` returned 500. Durably, the next seal
+        cuts from that row upward and commits a file overlapping the bulk range,
+        which nothing objects to — `_write_and_commit` passes no `lo`, so
+        `_refuse_straddle` never fires on the seal path.
+
+        **The obvious one-read version of this is not enough**, and the failure
+        is silent. `seal()` cuts and then returns even when it sealed nothing —
+        losing the lease is not a failure — so a writer that appends and calls
+        `seal()` while a maintainer holds the range is left with a FRESH empty
+        open group and its rows sitting in a group already queued. Checking the
+        open group alone passes; the rows are below `lo`, in no file; the
+        maintainer drains its queue, `_covers` declines the file, and
+        `finish_seal(discard=True)` deletes them. The resulting table is
+        contiguous, non-overlapping and undetectably wrong.
+
+        `pending_seal()` is the same shape one step later, and worse: `recover()`
+        runs unguarded at every `open`.
+        """
+        queued = self._buffer.pending_group()
+        if queued is not None:
+            msg = (
+                f"the seal queue still holds {queued[0]}-{queued[1]}: bulk "
+                "ingest reserves offsets above everything this log has issued, "
+                "and a file cut from those rows afterwards would span the "
+                "reservation. Call seal() and await_seal() first."
+            )
+            raise RuntimeError(msg)
+
+        flight = self._buffer.pending_seal()
+        if flight is not None:
+            msg = (
+                f"a seal of {flight[0]}-{flight[1]} is in flight: bulk ingest "
+                "needs every acknowledged row already in a file. Call "
+                "await_seal() first."
+            )
+            raise RuntimeError(msg)
+
+        if self._buffer.open_group_started():
+            msg = (
+                "the buffer holds rows no seal has been asked to cut: bulk "
+                "ingest needs every acknowledged row already in a file. Call "
+                "seal() and await_seal() first."
+            )
+            raise RuntimeError(msg)
+
+    def _ingest_chunks(
+        self, reader: pa.RecordBatchReader, shape: Shape, lease: Claim
+    ) -> tuple[int, int] | None:
+        """The loop: reserve, materialise, sort, write, register in batches.
+
+        **A reservation per output file, not one for the load.** `reserve(n)`
+        needs `n` up front and a `RecordBatchReader` cannot say how many rows it
+        has; materialising to find out is bounded by memory and defeats the
+        point at 160M rows. Consuming to a file's worth and reserving exactly
+        that many keeps memory at one file, needs no branch between a Table and
+        a reader, and leaves a stream that dies half way with N complete files
+        registered and one reservation lost rather than one enormous one.
+
+        Ranges stay contiguous with nothing computing or checking it: sequential
+        reserves are adjacent, because `reserve` reads and advances one counter.
+
+        **`register` cannot decline these, by arithmetic rather than by the
+        claim**, and the difference matters to whoever later tries to shorten
+        the claim believing they are trading only concurrency. `lo` is `seq + 1`
+        and AUTOINCREMENT never issues above `seq`, so every file already in the
+        table ends at or below `lo - 1`, and `_covers` is False by construction
+        — file by file, since after file N registers the frontier is its `hi`
+        and the next reserve starts above it. The same arithmetic settles
+        `archived_through`, which is some file's `hi`. What the claim actually
+        buys is keeping a maintainer's `evict` or `compact` off the range while
+        this runs.
+        """
+        config = self.config
+        order = self._buffer.sort_by()
+        offset_field = shape.table.field(0)
+        first: int | None = None
+        last: int | None = None
+        staged: list[tuple[str, int, int, int]] = []
+        try:
+            for chunk in _chunks(reader, config.compact_size, config.compact_rows):
+                rows = chunk.select(shape.columns).cast(shape.schema)
+                lo, hi = self._buffer.reserve(rows.num_rows)
+                rows = rows.add_column(
+                    0, offset_field, pa.array(range(lo, hi + 1), type=pa.int64())
+                )
+                if order:
+                    rows = rows.sort_by([(c, "ascending") for c in order])
+
+                rel_path = self._layout.ingest_path(lo, hi, uuid.uuid4().hex[:8])
+                # I2: the path is in SQLite before the bytes are on disk, so a
+                # crash before the commit leaves a file recovery can name rather
+                # than one only a directory scan could find. `claim_output`
+                # rather than `claim_seal` — see `INGEST_ROLE`.
+                self._buffer.claim_output(lo, hi + 1, rel_path)
+                dest = self._layout.absolute(rel_path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                write_parquet(rows, dest, config.compression)
+                staged.append((rel_path, lo, hi + 1, rows.nbytes))
+                first = lo if first is None else first
+                last = hi
+                # `DEFAULT_TTL_MS` is 30 s and this path is sized in hours, so
+                # without a renew per file the exclusion evaporates during the
+                # first `pq.write_table`.
+                checkpoint(lease.renew)
+                if len(staged) >= _INGEST_BATCH:
+                    self._commit_staged(staged, lease)
+                    staged = []
+
+            if staged:
+                self._commit_staged(staged, lease)
+                staged = []
+        except BaseException:
+            # Queued BEFORE the claims go, which is the whole of the ordering:
+            # a unique name with no queue entry is a file this database can no
+            # longer name. `drain` refuses anything the table references, so
+            # queueing a file whose commit turns out to have landed is safe.
+            self._abandon(staged)
+
+            raise
+
+        return None if first is None or last is None else (first, last)
+
+    def _commit_staged(
+        self, staged: list[tuple[str, int, int, int]], lease: Claim
+    ) -> None:
+        """Register a batch of written files in ONE commit, then record them.
+
+        A decline is raised rather than swallowed. `_write_and_commit` queues a
+        declined seal and returns normally, which is right there — another owner
+        sealed the same range, so the rows are in a file either way — and is
+        exactly wrong here, where nothing else holds these rows. That silent
+        return is the shape this path was reviewed for.
+        """
+        checkpoint(lease.renew)
+        added = self._table.register(
+            [str(self._layout.absolute(rel_path)) for rel_path, _, _, _ in staged],
+            sealed_through=staged[-1][2],
+            archived_through=self._maintenance.archived_through(),
+            # The last line of defence, which the seal path does not get: a
+            # range partially overlapping the table is refused rather than
+            # admitted into two files at once. It cannot fire here — see the
+            # arithmetic in `_ingest_chunks` — and it costs one extent read.
+            lo=staged[0][1],
+        )
+        if not added:
+            msg = (
+                f"the table declined a bulk range starting at {staged[0][1]}, "
+                "which cannot happen while this log is quiescent and means "
+                "something advanced the frontier during the load. Nothing was "
+                "committed and the staged files have been queued for deletion."
+            )
+            raise RuntimeError(msg)
+
+        for rel_path, lo, end, held in staged:
+            # What the file holds UNCOMPRESSED, which is the currency
+            # `target_compact_size` and every `extent.bytes` are stated in —
+            # never its size on disk, which on data that compresses 8:1 would
+            # have compaction merge eight already-full files into one.
+            #
+            # Arrow's own accounting rather than the appender's sum. The two
+            # differ in the third digit and not in kind: Arrow adds four bytes
+            # per string for its offsets and a validity bit per value, and
+            # counts a narrow fixed-width column at its real width where the
+            # buffer's SQL counts eight. It is measured, O(1), and visible to a
+            # static checker, which `pyarrow.compute` is not — see `_verify`.
+            #
+            # Recorded AFTER the commit: a crash between the two leaves the
+            # size unknown, and unknown reads as full, which is the direction
+            # that leaves the file alone.
+            self._buffer.record_file(rel_path, lo, end, held)
+            self._buffer.clear_compaction(rel_path)
+
+    def _abandon(self, staged: list[tuple[str, int, int, int]]) -> None:
+        """Queue written-but-unregistered files, then release their claims."""
+        if not staged:
+            return
+
+        paths = [rel_path for rel_path, _, _, _ in staged]
+        self._buffer.enqueue_deletions(paths, int(datetime.now(UTC).timestamp()))
+        for rel_path in paths:
+            self._buffer.clear_compaction(rel_path)
+
     # -- seal ---------------------------------------------------------------
 
     def seal(self) -> int | None:
@@ -2475,8 +2909,7 @@ class WriteHandle(LocalReadHandle):
 
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(rows, dest)
-        fsync(dest)
+        write_parquet(rows, dest, self.config.compression)
 
         # Checked immediately before the commit, because this is the moment a
         # lapsed owner does real damage. Its file now has a name of its own, so
@@ -3782,4 +4215,16 @@ def validate(
 
     if config.local_rows is not None and config.local_rows < 0:
         msg = f"local_rows must not be negative: {config.local_rows}"
+        raise ValueError(msg)
+
+    if config.compression not in _CODECS:
+        # Here rather than at the first write, because the first write is a
+        # seal — in a maintainer, minutes after the config was accepted, with
+        # the rows already acknowledged and the buffer filling behind a seal
+        # that now fails every time it is retried. pyarrow raises on the
+        # unknown codec and nothing upstream would turn that into a message
+        # naming the setting.
+        msg = (
+            f"compression must be one of {sorted(_CODECS)}, not {config.compression!r}"
+        )
         raise ValueError(msg)

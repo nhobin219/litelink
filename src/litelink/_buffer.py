@@ -1292,6 +1292,104 @@ class Buffer:
                     (first - 1,),
                 )
 
+    def reserve(self, n: int) -> tuple[int, int]:
+        """Take `n` offsets without writing a row. Returns `(lo, hi)`, inclusive.
+
+        What bulk ingest needs and nothing else provides (§13.4). A path that
+        writes Parquet directly still has to make those offsets unissuable, or
+        live capture hands the same ones to different rows and I9 is gone —
+        and `sqlite_sequence` is the sole authority on which offsets have been
+        issued, so the sequence is what has to move.
+
+        Neither existing writer of it fits. `seed_offsets` sets an ABSOLUTE
+        value, which is the direction that is dangerous: SQLite assigns
+        `max(largest rowid, seq) + 1`, so a caller computing `first` from a
+        stale read seeds below the rows present and every later row lands on an
+        offset belonging to different data. `strip_local_state` advances by a
+        reserve, but it is a restore path that also deletes extents, groups,
+        claims and pending deletes. This one does the advance and nothing else,
+        and it is RELATIVE — the caller says how many, never from where — so
+        the hazardous direction is not expressible.
+
+        **Keyed `WHERE name = 'buffer'`.** `extent.group_id` and the claim
+        table are AUTOINCREMENT too, so an unkeyed `seq = seq + ?` would
+        advance every sequence in the database, moving group ids and claim ids
+        the same distance for no reason anyone would later be able to explain.
+
+        The floor is `max(seq, max(offset))` rather than `seq` alone, as
+        `strip_local_state` computes it. AUTOINCREMENT keeps the two in step,
+        so they agree on every log this code has seen; taking the maximum costs
+        one indexed edge seek and means a database where they have somehow
+        parted still cannot hand back an offset a buffered row already holds.
+
+        Read back before returning, because the failure is silent. A reservation
+        that did not land looks exactly like one that did — the caller writes
+        its file over offsets live capture is still free to issue, and nothing
+        downstream can tell.
+        """
+        if n <= 0:
+            msg = f"cannot reserve {n} offsets: a reservation is at least one"
+            raise ValueError(msg)
+
+        with self._transaction():
+            seq = self._con.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone()
+            highest = self._con.execute(
+                'SELECT max("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+            floor = max(int(seq[0]) if seq else 0, int(highest or 0))
+            ceiling = floor + n
+            # An UPDATE with an INSERT behind it rather than an upsert:
+            # `sqlite_sequence` carries no unique constraint, and its row
+            # appears only after the first AUTOINCREMENT insert — which for a
+            # log whose whole load arrives through this path never happens.
+            updated = self._con.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
+                (ceiling,),
+            )
+            if not updated.rowcount:
+                self._con.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
+                    (ceiling,),
+                )
+
+            landed = int(
+                self._con.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+                ).fetchone()[0]
+            )
+            if landed != ceiling:
+                msg = (
+                    f"reserving {n} offsets from {floor} left the sequence at "
+                    f"{landed} rather than {ceiling}; nothing has been issued"
+                )
+                raise RuntimeError(msg)
+
+        return floor + 1, ceiling
+
+    def open_group_started(self) -> bool:
+        """Whether the open group has taken rows — bulk ingest's third read.
+
+        `ingest` refuses to run while any acknowledged row is still owed a
+        file, and this is the read that says so for the rows no seal has been
+        asked to cut yet. `pending_group` and `pending_seal` cover the two that
+        have.
+
+        True when there is NO open group either, which `_seed_group` makes
+        unreachable while a log is open. It is refused rather than reasoned
+        about: every unknown here has to point at declining the ingest, because
+        the cost of being wrong the other way is a file registered over rows
+        that are still in the buffer.
+        """
+        with self._lock:
+            row = self._con.execute(
+                "SELECT start_offset FROM extent"
+                " WHERE end_offset IS NULL AND rel_path IS NULL"
+            ).fetchone()
+
+        return row is None or row[0] is not None
+
     def group_bytes(self, end: int) -> int:
         """What the extent ending at `end` holds, before a file claims it.
 

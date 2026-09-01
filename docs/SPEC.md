@@ -535,6 +535,14 @@ produced worse files. Freshness in the cloud is §3a's job.
 the table's Iceberg `sort_order` *and* actually applied at write time — the metadata records
 intent, it does not sort for you.
 
+**"Sorted" and "contiguous" are claims about two different columns**, and reading them as
+one claim is what made §13.4's design look harder than it is. A file is sorted WITHIN itself
+by `sort_by`; the set of files is ordered by `litelink_offset`, which nothing sorts because
+nothing has to — the offsets are assigned in a contiguous block before the sort permutes the
+rows inside it. So a file's offset range stays dense while its rows move, and neither
+property constrains the other. That is what lets bulk ingest sort per output file rather
+than across a corpus that may not fit in memory.
+
 **Declared in three places, and each answers a different reader.** The local table's
 `sort_order` and the ARCHIVE's say what the data is clustered by, to anything reading either
 Iceberg table directly; the archive's went undeclared until failover needed it, which made
@@ -1799,6 +1807,14 @@ The consequence worth planning for is that local disk holds roughly
    lock writes, reserve a contiguous offset range, materialise `litelink_offset` into the file, and
    commit. Four things it meets, none blocking, none free.
 
+   **Phase 2 is implemented — `WriteHandle.ingest`, taking Arrow.** Three things below
+   shipped differently and the differences are recorded where they appear: the exclusivity
+   rule is three reads rather than "seal the buffer empty"; the staging table is the
+   `compacting` one, which already has the shape this section asks for; and the reservation
+   is per output file rather than one for the load. What is NOT implemented is bulk-loading
+   history into a `start_offset` reserve under live capture, which is #33's deferred backfill
+   and needs a range-aware coverage predicate `register` does not have.
+
    **It is a rewrite, not a registration.** I11 forbids a caller-supplied `litelink_offset` and §7
    derives every tier boundary from its extents, so a file lacking the column cannot be
    registered — `add_files` zero-copy is unavailable. §4's sort applies equally, or
@@ -1816,21 +1832,41 @@ The consequence worth planning for is that local disk holds roughly
    **A reservation is a hole in the offset space.** A seal spanning it writes a file whose
    `litelink_offset` statistics cover `[lo, hi]` while containing none of it; when the staged file
    commits, the two overlap, which is exactly what §6's *"no other file overlaps that
-   range"* forbids. Sealing the buffer empty before reserving closes it — every subsequent
-   live row is then above `hi`, so no seal has rows on both sides. This holds only if the
-   seal takes `start` from the buffer's own minimum rather than the previous file's `end`.
-   The weaker property is also the correct one: §6 needs files non-overlapping and adjacent
-   in offset order, not free of integer gaps, and gaps already arise from rolled-back
-   batches (§15.3).
+   range"* forbids. The weaker property is also the correct one: §6 needs files
+   non-overlapping and adjacent in offset order, not free of integer gaps, and gaps already
+   arise from rolled-back batches (§15.3).
+
+   **"Seal the buffer empty before reserving" is not the check, and the one-read version
+   loses rows.** `seal()` cuts and then returns even when it sealed nothing — losing the
+   lease is not a failure — so a writer that appends and calls `seal()` while a maintainer
+   holds the range is left with a FRESH empty open group and its rows in a group already
+   queued. Asking only the open group passes; the rows are below `lo`, in no file; the
+   maintainer drains its queue, the register is declined, and `finish_seal(discard=True)`
+   deletes them into a table that is contiguous, non-overlapping and undetectably wrong.
+   The check is three reads — `pending_group()`, `pending_seal()`, and the open group's
+   `start_offset` — and they are complete because of the CALL GRAPH rather than because they
+   cover the cases found so far: acknowledged rows live only in `buffer`, only
+   `_write_and_commit` turns one into a file, it has exactly two callers, and those callers'
+   two range sources plus the open group are these three reads. A third caller, or a second
+   function that writes buffer rows to Parquet, needs a fourth read.
 
    **The orphan sweep does not transfer.** §15.4 sweeps by offset against the §7 boundary,
    which works because every staged blob has a buffer row carrying `{name}_staged`. A bulk
    file has no buffer row and sits *above* the boundary until it commits, so an abandoned
-   ingest reads as still-referenced forever. It needs its own table parallel to `sealing`,
-   holding `(lo, hi, rel_path)` — not a row in `buffer`, which §7's hot read would union
-   into reader output, and not `sealing` itself, which holds one row and would block seals
-   for the length of a rewrite. The sweep rule then mirrors §15.3: a staged file with no
-   row is an orphan by definition.
+   ingest reads as still-referenced forever. It needs a table parallel to `sealing`, holding
+   `(lo, hi, rel_path)` — not a row in `buffer`, which §7's hot read would union into reader
+   output, and not `sealing` itself, which holds one row and would block seals for the
+   length of a rewrite.
+
+   That table already exists: `compacting` holds exactly `(lo, hi, rel_path)`, takes several
+   rows because an archive rewrite claims one object at a time, and its recovery already
+   does the right thing for an abandoned ingest — queue every claimed path, and let `drain`
+   refuse the ones the table turned out to reference. A second table of the same shape would
+   be a second mechanism for one fact. What ingest must NOT reuse is `claim_seal`: on reopen
+   `_recover_seal` reads `rows_between(lo, hi + 1)` from a buffer that never held the range,
+   writes an EMPTY Parquet, registers it as covering `[lo, hi]`, and discards every buffered
+   row below `hi + 1`. Measured: 40 acknowledged rows deleted into no file, and an empty file
+   carries no column statistics, so `extent()` then raises on every call.
 
    **It amortises I17, which is per-row today and cannot be otherwise.** A row arriving as a
    mapping carries no schema, so every row is checked on its own: its key set against the

@@ -262,6 +262,22 @@ class Layout:
         """
         return f"{self.name}/data/compacted/{lo}-{hi}-{token}.parquet"
 
+    def ingest_path(self, lo: int, hi: int, token: str) -> str:
+        """Root-relative path for a bulk-ingested file covering `[lo, hi]` (§13.4).
+
+        Its own directory, beside `compacted/`, because the file is neither: it
+        was never buffered and never merged. That is worth being able to see
+        from a listing when a load is being investigated, and it costs nothing
+        — no reader walks these directories, and Iceberg finds files by the
+        path in its manifests.
+
+        `token` per attempt, for `compaction_path`'s reason rather than
+        `seal_path`'s: the name is recorded in `compacting` before the bytes
+        exist and read back from there, so it never has to be derivable, and
+        two owners racing the range must not write one file.
+        """
+        return f"{self.name}/data/ingested/{lo}-{hi}-{token}.parquet"
+
     def absolute(self, rel_path: str) -> Path:
         return self.root / rel_path
 

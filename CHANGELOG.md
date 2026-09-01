@@ -7,6 +7,55 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`WriteHandle.ingest`** — a bulk load path that takes a `pa.Table` or a
+  `pa.RecordBatchReader` and writes Parquet without the rows ever entering
+  SQLite. The buffer exists to make a row durable before it is in Parquet, and
+  a bulk load's source is already durable, so every row through it pays a
+  second time for a guarantee it has. Measured on 400k rows on local disk,
+  where fsync is cheap and the gap is therefore understated: 182,801 rows/s
+  through the buffer against 5,103,266 rows/s straight out.
+
+  Files come out sorted and sized at `target_compact_size`, so maintenance
+  never has to touch them. It refuses concurrency rather than surviving it —
+  the whole log is claimed for the whole load and every acknowledged row must
+  already be in a file — and refuses `wal_replication`, because these rows
+  never enter the buffer and WAL shipping therefore cannot carry them at all.
+  The archive is a loaded range's only second copy: compare `archived_through()`
+  against the `hi` it returns.
+
+  Bulk-loading history into a `start_offset` reserve *under live capture* is
+  not this, is still deferred, and needs a range-aware coverage predicate
+  `register` does not have.
+
+- **`LogConfig.compression`** — the Parquet codec every data file is written
+  with, across seals, compactions, archive rewrites and bulk ingest. A setting
+  rather than a constant because the right answer is a property of the payload:
+  §15.5 requires `none` for blob columns, where a codec spends CPU proving
+  already-compressed bytes are incompressible.
+
+### Changed
+
+- **Data files are written with zstd rather than Snappy** (default change). No
+  write site specified a codec at all, so every file took pyarrow's Snappy
+  default. Measured end to end through `ingest` on a 400k-row JSON payload
+  column: 28.5 MB against 15.2 MB, 71 bytes/row against 38. On a real 177M-row
+  archive that is 34.8 GB against roughly 15 GB.
+
+  It is not a size-for-speed trade, which is why this is a default change and
+  not a note in the docs: zstd measured a full-scan read at 0.65x Snappy's,
+  because there is less to read and decompressing it is cheap, and the load
+  itself ran no slower. The cost is write CPU, against a write path that is
+  fsync-bound and an archive push that is network-bound.
+
+  **Nothing is rewritten and no action is required.** Parquet records the codec
+  per column chunk, so a table holding both reads correctly through `scan` and
+  `sql`; existing files are untouched and stay readable. `rewrite_archive`
+  re-cuts history into the new codec for anyone who wants the space back.
+
 ## 0.2.0 — 2026-08-31
 
 ### Changed
