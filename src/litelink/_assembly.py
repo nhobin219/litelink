@@ -21,7 +21,7 @@ import pyarrow as pa
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import CONFIG_KEY, SCHEMA_KEY, SORT_KEY, Buffer
-from litelink._layout import Layout
+from litelink._layout import Layout, validate_archive
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config, restore_buffer
@@ -184,6 +184,11 @@ def follow(
     buffer alone would be a reader silently missing every archived row, which
     is the one failure this must not have.
     """
+    # First, because this path does not go through `validate` — a follower has
+    # no config to validate — and a malformed prefix would otherwise surface as
+    # a YAML parse error from the litestream subprocess, three frames down and
+    # naming a generated file the caller never sees.
+    validate_archive(archive)
     options = _options(s3)
     owned = tempfile.TemporaryDirectory(
         prefix="litelink-follow-",
@@ -309,10 +314,12 @@ def _restore_replica(
         restore_buffer(config_path, layout.buffer_db, options, binary)
 
     if not layout.buffer_db.exists():
+        # Both readings, because nothing in the arguments separates them.
         msg = (
             f"no replica of {layout.buffer_db.name} under {archive} — there is "
             f"nothing to follow. A log with wal_replication off has no off-box "
-            f"copy of its unsealed rows"
+            f"copy of its unsealed rows, or `name` and `archive` do not "
+            f"describe a log that exists"
         )
         raise FileNotFoundError(msg)
 

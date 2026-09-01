@@ -212,11 +212,25 @@ def restore_buffer(
 ) -> None:
     """Restore one database from its replica, into `destination`.
 
-    **No `-if-replica-exists`.** That flag exits 0 when no backup is found, so
-    a missing replica would be indistinguishable from a restored one — and the
-    caller's whole decision is whether there was anything to restore. Absence
-    has to be visible, so this lets the command fail and the caller checks for
-    the file.
+    **`-if-replica-exists`, so an ABSENT replica is not an error.** It exits 0
+    and writes nothing, which leaves the caller's `destination.exists()` check
+    to say what happened — and that check is the whole point, because "there is
+    no replica here" is the answer a follower and a restore both need to
+    explain in their own words. Without the flag litestream exits 1 on absence
+    and the RuntimeError below fires first, so both callers' explanatory
+    messages were unreachable and a mistyped log name surfaced as
+
+        litestream restore failed: Error: no matching backup files available
+
+    which names neither the prefix searched nor the log.
+
+    This module used to refuse the flag, on the reasoning that exiting 0 made a
+    missing replica "indistinguishable from a restored one". It does not: the
+    two differ by whether the file is there, which is exactly what the caller
+    tests. Nor does the flag swallow real failures — measured against
+    litestream 0.5.16, a bucket that does not exist still exits 1
+    (`NoSuchBucket`, 404) and a bad key still exits 1 (`InvalidAccessKeyId`,
+    403). Only absence is quiet.
 
     Credentials go to the child through the ENVIRONMENT, never into the config
     file, which is why that file is safe to commit and hand around. litestream
@@ -232,6 +246,7 @@ def restore_buffer(
     command = [
         litestream_binary(binary),
         "restore",
+        "-if-replica-exists",
         "-config",
         str(config),
         "-o",

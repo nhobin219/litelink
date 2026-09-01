@@ -212,3 +212,29 @@ def test_the_clock_check_does_not_sample_and_does_not_fail() -> None:
         # wrong: what to check, and that the fix needs to persist.
         assert "check restarts, not log lines" in check.detail
         assert "persistent" in check.detail
+
+
+def test_it_reports_a_malformed_archive_uri_without_touching_the_network() -> None:
+    """The check most likely to fire here, and the one that needs no endpoint.
+
+    This prefix comes from a shell, where a missing slash survives every layer
+    that would otherwise catch it — and it is the failure an operator is most
+    likely to be holding when they reach for this command. Reported rather than
+    raised: `python -m litelink` exists to answer "what is wrong", and a
+    traceback out of argv is the least useful form that answer can take.
+
+    No `s3` fixture on purpose. A shape error is decided from the string, so
+    this must be answerable with nothing reachable — which is also the state a
+    machine is in when the prefix is the reason nothing is reachable.
+
+    Falsify by moving `validate_archive` out of `_archive`: the check comes
+    back with whatever pyarrow says about a bucket named `s3:`, or hangs on a
+    DNS lookup for it.
+    """
+    report = preflight(archive="s3:/bucket/prefix", replication=False)
+    check = next(c for c in report.checks if c.name.startswith("archive"))
+
+    assert not check.ok
+    assert not report.ok
+    assert "missing a slash" in check.detail, check.detail
+    assert "'s3://bucket/prefix'" in check.detail, check.detail

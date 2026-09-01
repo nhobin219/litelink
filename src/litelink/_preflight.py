@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 
 import duckdb
 
-from litelink._layout import Layout
+from litelink._layout import Layout, validate_archive
 from litelink._read import ExtensionMissing, duckdb_connection, load_extension
 from litelink._replication import litestream_binary
 from litelink._s3 import S3Options
@@ -206,6 +206,12 @@ def _archive(prefix: str, name: str, s3: S3Options | None) -> Check:
     """
     layout = Layout(Path(tempfile.gettempdir()), name)
     try:
+        # Shape first, and inside the try so it is REPORTED rather than raised:
+        # this is a command an operator runs to find out what is wrong, and a
+        # traceback out of argv is the least useful form that answer can take.
+        # It is also the check most likely to fire here — the prefix arrives
+        # from a shell, where a missing slash survives every other layer.
+        validate_archive(prefix)
         extent = archive_extent(layout, prefix, (s3 or S3Options()).resolved())
     except Exception as exc:  # noqa: BLE001
         return Check(

@@ -300,7 +300,7 @@ _rustfs-bucket:
     AWS_ACCESS_KEY_ID={{RUSTFS_KEY}} \
     AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}} \
     AWS_REGION=us-east-1 \
-    uv run --extra s3 python -c "
+    uv run python -c "
     import os, s3fs
     fs = s3fs.S3FileSystem(
         key=os.environ['AWS_ACCESS_KEY_ID'],
@@ -383,7 +383,7 @@ demo-clean root="litelink-data" ws_root="litelink-ws":
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
         export AWS_REGION=us-east-1
     fi
-    uv run --extra s3 python -c "
+    uv run python -c "
     import sys
     from pathlib import Path
     sys.path.insert(0, 'examples/adsb')

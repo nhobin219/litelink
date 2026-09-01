@@ -15,6 +15,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -4597,3 +4598,123 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         inspect.signature(litelink.RemoteReadHandle.__init__).parameters
     )
     assert "owned" not in taken
+
+
+def test_a_follower_with_no_replica_says_which_two_things_it_could_be(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """And reaches its own message at all, which it could not before.
+
+    A prefix with no replica of this log under it means one of two things — the
+    log never replicated its WAL, or `name` and `archive` do not together name
+    a log that exists — and nothing in the arguments tells them apart, so the
+    message states both. The mistake this is drawn from was the second: a log's
+    own name passed as the last segment of the prefix.
+
+    Reaching this branch at all was the defect. `restore_buffer` ran without
+    `-if-replica-exists`, so an absent replica exited 1 and became a
+    RuntimeError one frame below — `no matching backup files available`, from
+    litestream rather than from here — which left the `exists()` check
+    unreachable for the life of both callers.
+
+    Falsify by dropping `-if-replica-exists` from `restore_buffer`: this raises
+    RuntimeError naming a generated config file instead.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-wrong-name"
+    config = replace(LogConfig(), target_seal_size=32 * 1024, wal_replication=True)
+    with litelink.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(50))
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3, where)
+
+    with pytest.raises(FileNotFoundError) as caught:
+        litelink.follow("trades", archive=where, s3=s3, binary=str(binary))
+
+    message = str(caught.value)
+    assert "wal_replication off" in message, message
+    assert "do not describe a log that exists" in message, message
+
+    # The control: the SAME call with the name that does exist gets past the
+    # restore. It stops later, at the pre-flight for an archive nothing has
+    # been pushed to yet, which is a different refusal — so this error is
+    # specific to the missing replica rather than to the setup.
+    with pytest.raises(ValueError, match="published nothing yet"):
+        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+
+
+def test_an_unreachable_archive_is_not_reported_as_an_absent_replica(
+    tmp_path: Path, s3: S3Options
+) -> None:
+    """The risk `-if-replica-exists` carries, held down.
+
+    The flag exits 0 when there is no backup, and the whole point of adding it
+    is that absence stops being an error. If it also quietened a bucket that
+    does not exist, or a key that is not accepted, then every credential and
+    endpoint mistake would arrive as "there is nothing to follow" — advice
+    pointing at the wrong thing entirely, and worse than the raw litestream
+    error it replaced.
+
+    Measured against litestream 0.5.16: only absence is quiet. A missing bucket
+    exits 1 with `NoSuchBucket`, a bad key exits 1 with `InvalidAccessKeyId`.
+
+    Falsify by making `restore_buffer` swallow a non-zero exit: this raises
+    FileNotFoundError blaming wal_replication for an unreachable endpoint.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    # A bucket, not a prefix inside the test's own: a nonexistent prefix is
+    # exactly the absent-replica case, and would prove nothing here.
+    absent = f"s3://litelink-no-such-bucket-{uuid.uuid4().hex[:12]}/p"
+    with pytest.raises(RuntimeError, match="litestream restore failed"):
+        litelink.follow("s", archive=absent, s3=s3, binary=str(binary))
+
+    assert not (tmp_path / "s").exists()
+
+
+def test_a_log_whose_stored_archive_is_malformed_can_still_be_repaired(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The escape hatch the new shape check must not close.
+
+    `validate` refuses a malformed prefix, and `set_config` and `set_sort_by`
+    pass the STORED one — so a log written before that rule existed would meet
+    it on a call that has nothing to do with the archive. That is acceptable
+    only while the repair is reachable, which is why `open` deliberately does
+    not validate: it takes no archive argument, and refusing to open the log
+    would remove the `set_archive` that fixes it.
+
+    Falsify by calling `validate_archive` from `open` as well: the log cannot
+    be opened, and there is no supported way to correct the prefix.
+    """
+    where = f"s3://{bucket}/repairable"
+    with litelink.new(tmp_path, "s", schema=SCHEMA, archive=where, s3=s3) as log:
+        log.extend(rows(1))
+
+    # The state the rule is retroactive about, forged directly: a stored prefix
+    # that `new` would refuse today.
+    with sqlite3.connect(tmp_path / "s" / "buffer.db") as con:
+        con.execute(
+            "UPDATE meta SET v = ? WHERE k = ?", ("s3:/bucket/bad", ARCHIVE_KEY)
+        )
+
+    with litelink.open(tmp_path, "s", s3=s3) as log:
+        assert log.archive == "s3:/bucket/bad", "open refused a malformed stored prefix"
+
+        with pytest.raises(ValueError, match="missing a slash"):
+            log.set_config(LogConfig())
+
+        log.set_archive(where)
+        assert log.archive == where
+
+        # And the setter that was blocked works again, which is what makes the
+        # repair a repair rather than a way to keep going around the rule.
+        log.set_config(LogConfig())
