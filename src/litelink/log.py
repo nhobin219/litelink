@@ -2338,12 +2338,30 @@ class WriteHandle(LocalReadHandle):
         not acceptable. `ingest` is called BY the single writer, in its process,
         and that is part of the contract rather than something checked.
 
-        `wal_replication` is refused outright. With it on and an archive
-        configured the buffer IS the off-box copy until the archive has the
-        range (§3a), and a bulk range never enters the buffer — so between this
-        call and the first `sync` nothing off-box holds it. Reproduced against a
-        zero-lag replica: 920 rows acknowledged, 420 restored, and `recovery()`
-        reporting plain success. Load first, `sync`, then turn replication on.
+        **`wal_replication` is refused, and the reason is scope rather than
+        timing.** With it on and an archive configured the buffer IS the off-box
+        copy until the archive has the range (§3a) — and a bulk range never
+        enters the buffer, so WAL shipping cannot carry it at all, ever.
+        Reproduced against a zero-lag replica: 920 rows acknowledged, 420
+        restored, `recovery()` reporting plain success. Turning replication on
+        would state an RPO that silently excludes exactly these rows.
+
+        **So the archive is a loaded range's only second copy, and `sync` may
+        lag its tail.** `stable_prefix` holds back a trailing run still under
+        `target_compact_size`, because a run with room in it may yet take files
+        that have not been written — and the last file of a load is short unless
+        the load divides evenly. Measured: 3000 rows loaded into 11 files, one
+        `sync()`, `archived_through()` 2830, the last 170 rows in one local file
+        with `coverage()` reporting no gap. It is not a stall: the run settles
+        as soon as capture writes past it, and the next `sync` takes it — one
+        400-row batch sufficed above.
+
+        **Compare `archived_through()` against the `hi` this returns.** Until
+        they meet, the corpus you loaded from is the range's second copy, which
+        is the same durability this path's whole premise rests on: the source is
+        already durable, which is why the buffer is not in the way. Do not
+        enable replication expecting it to close that window — nothing it ships
+        contains these rows.
 
         Files come out sized at `target_compact_size` and sorted by `sort_by`,
         which is what makes them indistinguishable from a compacted file and so
@@ -2373,11 +2391,14 @@ class WriteHandle(LocalReadHandle):
         """
         if self.config.wal_replication:
             msg = (
-                "bulk ingest is refused while wal_replication is on: a bulk "
-                "range never enters the buffer, and with replication on the "
-                "buffer is what holds the only off-box copy until the archive "
-                "has the range (SPEC 3a). Load first, sync(), then enable "
-                "replication and start capture."
+                "bulk ingest is refused while wal_replication is on. These rows "
+                "never enter the buffer, so WAL shipping cannot carry them: "
+                "replication states an RPO over every acknowledged row (SPEC "
+                "3a) and a bulk range would silently be the exception. Load "
+                "into the log first and turn replication on when capture "
+                "starts. The loaded range is off-box once sync() has pushed "
+                "it, which archived_through() reports; until then the corpus "
+                "you loaded from is its second copy."
             )
             raise RuntimeError(msg)
 

@@ -496,3 +496,45 @@ def test_an_ingested_range_survives_the_whole_archive_cycle(
 
         assert log.scan(include_archive=True).read_all().num_rows == 3400
         assert log.append(rows(1)[0]) == 3401
+
+
+def test_a_loaded_range_reaches_the_archive_only_once_its_run_settles(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The archive is a loaded range's only second copy, and `sync` lags its
+    tail — `stable_prefix` holds a trailing run still under the compaction
+    budget, and a load's last file is short unless it divides evenly.
+
+    Both halves matter. The lag is why `ingest` documents `archived_through()`
+    against the returned `hi` rather than telling an operator that one `sync()`
+    makes the load safe; that it TERMINATES is why the check is worth making
+    rather than a window nobody can ever close.
+    """
+    with litelink.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=LogConfig(
+            target_seal_size=4096,
+            target_compact_size=8192,
+            compact_min_files=2,
+            snapshot_retention=timedelta(seconds=0),
+        ),
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    ) as log:
+        _, hi = log.ingest(table(3000)) or (0, 0)
+        log.sync()
+
+        # The full files went; the short one at the end did not, and nothing
+        # buffered holds it — `coverage()` reports no gap either way.
+        assert 0 < log.archived_through() < hi
+        assert log.buffered_rows() == 0
+
+        log.extend(rows(400, start=3000))
+        log.seal()
+        log.await_seal()
+        log.sync()
+
+        assert log.archived_through() >= hi
