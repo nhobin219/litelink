@@ -170,6 +170,14 @@ whatever you actually use from there.
 It cannot append — a read handle has no write surface at all, rather than one that raises —
 and it is a **snapshot, not a subscription**: refreshing means assembling another one.
 `coverage()` is how it stays honest about what it can and cannot serve.
+
+**Assembling one is the expensive part, so hold onto it.** `follow` restores the writer's
+`buffer.db` from its replica before it can answer anything, and that dominates: measured
+against a 276k-row log, 22 s to assemble — 20 s of it the restore — and then 1.4 s per scan.
+Re-entering the `with` block per query pays the 22 s every time. Assemble once, scan many
+times, and re-assemble only when you want fresher data. The restore scales with the buffer
+file's SIZE rather than its row count, so a writer whose buffer has grown a large free list
+makes every follower slower.
 Details in [`docs/API.md`](docs/API.md).
 
 ## How it works
