@@ -7,6 +7,30 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`WriteHandle.ingest`** — a bulk load path that takes a `pa.Table` or a
+  `pa.RecordBatchReader` and writes Parquet without the rows ever entering
+  SQLite. The buffer exists to make a row durable before it is in Parquet, and
+  a bulk load's source is already durable, so every row through it pays a
+  second time for a guarantee it has. Measured on 400k rows on local disk,
+  where fsync is cheap and the gap is therefore understated: 182,801 rows/s
+  through the buffer against 5,103,266 rows/s straight out.
+
+  Files come out sorted and sized at `target_compact_size`, so maintenance
+  never has to touch them. It refuses concurrency rather than surviving it —
+  the whole log is claimed for the whole load and every acknowledged row must
+  already be in a file — and refuses `wal_replication`, because these rows
+  never enter the buffer and WAL shipping therefore cannot carry them at all.
+  The archive is a loaded range's only second copy: compare `archived_through()`
+  against the `hi` it returns.
+
+  Bulk-loading history into a `start_offset` reserve *under live capture* is
+  not this, is still deferred, and needs a range-aware coverage predicate
+  `register` does not have.
+
 ## 0.2.0 — 2026-08-31
 
 ### Changed

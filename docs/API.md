@@ -116,7 +116,7 @@ Each row is what that class **adds** to the one above it. A test pins every set 
 | **`LogHandle`** — lifecycle | `close` · context manager |
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
 | **`+ RemoteReadHandle`** | owns and removes its scratch root |
-| **`+ WriteHandle`** — write | `append` · `extend` |
+| **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal_due` · `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `maintain` · `compact` · `evict` · `expire` |
 | **`+ WriteHandle`** — archive | `sync` · `hydrate` · `rewrite_archive` |
@@ -202,6 +202,44 @@ choice: no `LogConfig` setting tunes it. `append(row)` is `extend([row])`.
 An append does no work beyond its own insert. It does not measure the buffer, decide whether
 to seal, or delete anything — it records where the next file should be cut, in the same
 transaction, and returns.
+
+### Bulk loading: `ingest`
+
+```python
+log.ingest(source: pa.Table | pa.RecordBatchReader) -> tuple[int, int] | None
+```
+
+Writes Parquet directly and never puts the rows through SQLite. Returns the inclusive offset
+range it assigned, or `None` for a source with no rows.
+
+The buffer exists to make a row durable before it is in Parquet, and a bulk load's source is
+already durable — so every row pushed through it at `synchronous=FULL` pays a second time for
+a guarantee it has. Measured on 400k rows on local disk, where fsync is cheap and the gap is
+therefore understated: **182,801 rows/s through the buffer against 5,103,266 rows/s writing
+Arrow straight out.**
+
+Parquet-to-Arrow is yours: hand it `pq.ParquetFile(path).iter_batches()` or a `pa.Table`.
+Memory is bounded at one output file either way. Files come out sorted by `sort_by` and sized
+at `target_compact_size`, so maintenance never has to touch them.
+
+**It refuses concurrency rather than surviving it.** The whole log is claimed for the whole
+load, and every acknowledged row must already be in a file — call `seal()` and `await_seal()`
+first, or it raises and names what is outstanding. `ingest` is called by the single writer in
+its own process; concurrent `append` is excluded by §1, not by a lock.
+
+**It refuses `wal_replication`**, because these rows never enter the buffer and WAL shipping
+therefore cannot carry them at all — scope, not timing. Load first, turn replication on when
+capture starts.
+
+**The archive is a loaded range's only second copy.** Compare `archived_through()` against the
+`hi` this returns; until they meet, the corpus you loaded from is the range's second copy.
+`sync` lags the tail on purpose — it holds back a trailing run still under
+`target_compact_size` — and the run settles as soon as capture writes past it.
+
+**A load that fails costs its reservation.** The offsets of the file being written are gone,
+leaving a gap. Files stay non-overlapping and adjacent in offset order, which is what §6
+needs; the one price is that compaction will merge across a gap and such a file can never be
+re-cut by `rewrite_archive`.
 
 ## Reading
 
