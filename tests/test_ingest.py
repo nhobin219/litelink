@@ -363,18 +363,20 @@ def test_a_load_that_dies_mid_write_leaves_nothing_unnameable(
     this database can still name — the one category §12 refuses to have."""
     config = LogConfig(target_seal_size=4096, target_compact_size=8192)
     written: list[object] = []
-    real = litelink.log.fsync
+    real = litelink.log.write_parquet
 
-    def failing(path: Any) -> None:
+    def failing(rows: Any, path: Any, compression: Any) -> None:
         written.append(path)
+        # The bytes land and the durable write then fails, so the third file is
+        # on disk under a name only `compacting` holds. That is the state I2
+        # exists for, and a raise BEFORE the write would not produce it.
+        real(rows, path, compression)
         if len(written) == 3:
             msg = "the disk went away"
             raise OSError(msg)
 
-        real(path)
-
     with open_log(tmp_path, config) as log:
-        monkeypatch.setattr(litelink.log, "fsync", failing)
+        monkeypatch.setattr(litelink.log, "write_parquet", failing)
 
         with pytest.raises(OSError, match="the disk went away"):
             log.ingest(table(4000))
@@ -538,3 +540,81 @@ def test_a_loaded_range_reaches_the_archive_only_once_its_run_settles(
         log.sync()
 
         assert log.archived_through() >= hi
+
+
+# -- the codec (§12) -----------------------------------------------------------
+
+
+def codecs_of(log: WriteHandle) -> set[str]:
+    """The compression every data file the log holds was written with."""
+    return {
+        pq.ParquetFile(f.path).metadata.row_group(0).column(0).compression
+        for f in log._table.data_files()
+    }
+
+
+@pytest.mark.parametrize(
+    ("setting", "written"),
+    [("zstd", "ZSTD"), ("snappy", "SNAPPY"), ("none", "UNCOMPRESSED")],
+)
+def test_every_write_path_uses_the_configured_codec(
+    tmp_path: Path, setting: str, written: str
+) -> None:
+    """A seal, a compaction and a bulk ingest, in one log. The codec had no
+    home at all before this — every site took pyarrow's Snappy default — so
+    what this pins is that a write path cannot quietly have its own answer."""
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8192,
+        compact_min_files=2,
+        compression=setting,
+    )
+    with open_log(tmp_path, config) as log:
+        log.extend(rows(400))
+        log.seal()
+        log.await_seal()
+        log.ingest(table(2000, start=400))
+        log.maintain()
+
+        assert codecs_of(log) == {written}
+        assert log.scan().read_all().num_rows == 2400
+
+
+def test_zstd_is_the_default(tmp_path: Path) -> None:
+    with open_log(tmp_path) as log:
+        assert log.config.compression == "zstd"
+        log.ingest(table(100))
+
+        assert codecs_of(log) == {"ZSTD"}
+
+
+def test_a_codec_this_build_cannot_write_is_refused_at_config_time(
+    tmp_path: Path,
+) -> None:
+    """Not at the first write, which is a seal in a maintainer minutes later,
+    with the rows already acknowledged and every retry failing the same way."""
+    with pytest.raises(ValueError, match="compression must be one of"):
+        litelink.new(
+            tmp_path, "s", schema=SCHEMA, config=LogConfig(compression="brotli")
+        )
+
+
+def test_a_log_reads_across_files_written_with_different_codecs(
+    tmp_path: Path,
+) -> None:
+    """Which is what makes changing the setting safe on a live log: Parquet
+    records the codec per column chunk, so nothing has to be rewritten."""
+    config = LogConfig(target_seal_size=4096, compression="snappy")
+    with open_log(tmp_path, config) as log:
+        log.ingest(table(500))
+        log.set_config(
+            LogConfig(target_seal_size=4096, compression="zstd"),
+        )
+        log.ingest(table(500, start=500))
+
+        assert codecs_of(log) == {"SNAPPY", "ZSTD"}
+        assert log.scan().read_all().num_rows == 1000
+        assert (
+            log.sql("SELECT count(*) c FROM log").read_all().column("c")[0].as_py()
+            == 1000
+        )

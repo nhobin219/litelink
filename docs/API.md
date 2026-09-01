@@ -548,6 +548,7 @@ snapshot_retention    timedelta       = 1 hour   how long expired snapshots surv
 compact_min_files     int             = 4        minimum adjacent files to merge
 wal_replication       bool            = False    needs an archive; also makes a seal KEEP its rows
 wal_retention         timedelta|None  = None     how far back a restore may go
+compression           str             = "zstd"   Parquet codec: none | snappy | gzip | zstd
 ```
 
 Frozen dataclass, with `to_json`/`from_json` and two derived properties, `compact_size` and
@@ -556,7 +557,30 @@ only, so `set_config` needs no rewrite.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
 construction: `compact_min_files` below 2, a compact size below the seal size, `wal_retention`
-without `wal_replication`, and `wal_replication` without an archive are each refused.
+without `wal_replication`, `wal_replication` without an archive, and a `compression` this
+build cannot write are each refused.
+
+**`compression` governs every data file** — a seal, a compaction, an archive rewrite, a bulk
+ingest. It is a setting rather than a constant because the right answer is a property of the
+payload: a text or JSON column is what zstd crushes, and §15.5 requires `none` for blob
+columns, where a codec spends CPU proving that already-compressed bytes are incompressible.
+
+Measured on a 200k-row JSON payload column, sorted as this library writes it:
+
+| codec | bytes/row | ratio | write | full-scan read |
+|---|---|---|---|---|
+| `snappy` | 97 | 2.07x | 1.0x | 1.00x |
+| `zstd` | 51 | 3.93x | 1.9x | **0.65x** |
+
+It is not a size-for-speed trade, which is why the default changed rather than the docs
+gaining advice: zstd reads *faster*, because there is less to read and decompressing it is
+cheap. The cost is write CPU, against a write path that is fsync-bound and an archive push
+that is network-bound.
+
+**Changing it rewrites nothing and is safe on a live log.** Parquet records the codec per
+column chunk, so a table holding both reads correctly through `scan` and `sql`, and existing
+files are never touched. `rewrite_archive` is what re-cuts history into the new codec, when
+the size is worth the transfer.
 
 ## Replication
 

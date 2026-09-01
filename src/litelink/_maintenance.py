@@ -19,12 +19,10 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-import pyarrow.parquet as pq
-
 from litelink._archive import Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
-from litelink._fs import fsync
+from litelink._fs import write_parquet
 
 # Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
 # `WriteHandle`'s private business, because eviction decides deletions from it.
@@ -589,8 +587,7 @@ class Maintenance:
         # remotely, uploaded and then removed.
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(merged, dest)
-        fsync(dest)
+        write_parquet(merged, dest, self.config.compression)
         if upload:
             table.put(dest, rel_path)
             dest.unlink(missing_ok=True)
@@ -1168,8 +1165,7 @@ class Maintenance:
 
             dest = self._layout.absolute(rel_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            pq.write_table(rows, dest)
-            fsync(dest)
+            write_parquet(rows, dest, self.config.compression)
             # The bytes the scratch buffer counted for exactly these rows,
             # which is the same number the appender would have recorded had
             # they been cut this way the first time — and the scratch is torn

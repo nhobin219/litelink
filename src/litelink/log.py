@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._archive import ARCHIVE_KEY, Archive
@@ -44,7 +43,7 @@ from litelink._buffer import (
 )
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
-from litelink._fs import fsync
+from litelink._fs import write_parquet
 from litelink._layout import Layout
 from litelink._maintenance import (
     CONFIG_KEY,
@@ -159,6 +158,12 @@ RESTORE_RESERVE = 1 << 20
 # registered. It is not a new KIND of window: every one of these paths is in
 # `compacting` before its bytes exist (I2), so recovery finds them either way.
 _INGEST_BATCH = 20
+
+# The Parquet codecs `LogConfig.compression` accepts. pyarrow's set, minus the
+# ones there is no reason to offer: `brotli` and `lz4` are neither the smallest
+# nor the fastest here, and a codec nobody has measured on this shape is a
+# setting whose consequences the library cannot describe.
+_CODECS = frozenset({"none", "snappy", "gzip", "zstd"})
 
 
 def _refuse_foreign_schema(incoming: pa.Schema, declared: pa.Schema) -> None:
@@ -2533,8 +2538,7 @@ class WriteHandle(LocalReadHandle):
                 self._buffer.claim_output(lo, hi + 1, rel_path)
                 dest = self._layout.absolute(rel_path)
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                pq.write_table(rows, dest)
-                fsync(dest)
+                write_parquet(rows, dest, config.compression)
                 staged.append((rel_path, lo, hi + 1, rows.nbytes))
                 first = lo if first is None else first
                 last = hi
@@ -2905,8 +2909,7 @@ class WriteHandle(LocalReadHandle):
 
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(rows, dest)
-        fsync(dest)
+        write_parquet(rows, dest, self.config.compression)
 
         # Checked immediately before the commit, because this is the moment a
         # lapsed owner does real damage. Its file now has a name of its own, so
@@ -4212,4 +4215,16 @@ def validate(
 
     if config.local_rows is not None and config.local_rows < 0:
         msg = f"local_rows must not be negative: {config.local_rows}"
+        raise ValueError(msg)
+
+    if config.compression not in _CODECS:
+        # Here rather than at the first write, because the first write is a
+        # seal — in a maintainer, minutes after the config was accepted, with
+        # the rows already acknowledged and the buffer filling behind a seal
+        # that now fails every time it is retried. pyarrow raises on the
+        # unknown codec and nothing upstream would turn that into a message
+        # naming the setting.
+        msg = (
+            f"compression must be one of {sorted(_CODECS)}, not {config.compression!r}"
+        )
         raise ValueError(msg)

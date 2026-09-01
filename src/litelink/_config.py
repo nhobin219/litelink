@@ -241,6 +241,33 @@ class LogConfig:
     # target, not its own setting — see `_maintenance.settled_size`.
     compact_min_files: int = 4
 
+    # The Parquet codec every data file is written with — a seal, a compaction,
+    # an archive rewrite, a bulk ingest.
+    #
+    # **A setting rather than a constant, because the right answer is a
+    # property of the payload.** §15.5 requires NONE for blob columns: sensor
+    # payloads and media are already compressed, and a codec will spend CPU
+    # proving it. A text or JSON payload is the opposite shape.
+    #
+    # zstd by default, and the default is what changed. Every write site used
+    # to call `pq.write_table` with no codec at all, taking pyarrow's Snappy —
+    # measured on a 200k-row JSON payload column, sorted as this library writes
+    # it: Snappy 97 bytes/row at 2.07x, zstd 51 bytes/row at 3.93x. On a real
+    # 177M-row archive that is 34.8 GB against roughly 15 GB.
+    #
+    # It is not a size-for-speed trade, which is why this is a default and not
+    # advice. The same measurement put zstd's full-scan read at 0.65x Snappy's,
+    # because there is less to read and decompressing it is cheap; the cost is
+    # write CPU, 1.9x, against a write path that is fsync-bound and an archive
+    # push that is network-bound.
+    #
+    # Changing it is safe at any time and rewrites nothing. Parquet records the
+    # codec per column chunk, so a table holding both reads correctly —
+    # verified across `scan` and `sql` — and existing files are never touched.
+    # `rewrite_archive` is what re-cuts history into the new one, when the size
+    # is worth the transfer.
+    compression: str = "zstd"
+
     def to_json(self) -> str:
         """Serialised for the `meta` table, so `open` recovers the policy.
 
@@ -268,6 +295,7 @@ class LogConfig:
                 ),
                 "snapshot_retention": self.snapshot_retention.total_seconds(),
                 "compact_min_files": self.compact_min_files,
+                "compression": self.compression,
             }
         )
 
@@ -319,4 +347,5 @@ class LogConfig:
                 else timedelta(seconds=snapshots)
             ),
             compact_min_files=raw.get("compact_min_files", defaults.compact_min_files),
+            compression=raw.get("compression", defaults.compression),
         )

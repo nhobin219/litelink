@@ -31,6 +31,31 @@ minor version carries breaking changes.
   not this, is still deferred, and needs a range-aware coverage predicate
   `register` does not have.
 
+- **`LogConfig.compression`** — the Parquet codec every data file is written
+  with, across seals, compactions, archive rewrites and bulk ingest. A setting
+  rather than a constant because the right answer is a property of the payload:
+  §15.5 requires `none` for blob columns, where a codec spends CPU proving
+  already-compressed bytes are incompressible.
+
+### Changed
+
+- **Data files are written with zstd rather than Snappy** (default change). No
+  write site specified a codec at all, so every file took pyarrow's Snappy
+  default. Measured end to end through `ingest` on a 400k-row JSON payload
+  column: 28.5 MB against 15.2 MB, 71 bytes/row against 38. On a real 177M-row
+  archive that is 34.8 GB against roughly 15 GB.
+
+  It is not a size-for-speed trade, which is why this is a default change and
+  not a note in the docs: zstd measured a full-scan read at 0.65x Snappy's,
+  because there is less to read and decompressing it is cheap, and the load
+  itself ran no slower. The cost is write CPU, against a write path that is
+  fsync-bound and an archive push that is network-bound.
+
+  **Nothing is rewritten and no action is required.** Parquet records the codec
+  per column chunk, so a table holding both reads correctly through `scan` and
+  `sql`; existing files are untouched and stay readable. `rewrite_archive`
+  re-cuts history into the new codec for anyone who wants the space back.
+
 ## 0.2.0 — 2026-08-31
 
 ### Changed
