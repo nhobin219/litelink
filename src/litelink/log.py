@@ -1639,6 +1639,42 @@ class WriteHandle(LocalReadHandle):
             if covered is not None:
                 released -= buffer.release_archived(covered[1])
                 buffer.reseed_group()
+
+            # **And the fence has to clear the ARCHIVE, not just the replica.**
+            # `strip_local_state` ran fifty lines up, before this method knew
+            # where the archive was, so it reserved `RESTORE_RESERVE` above the
+            # sequence the REPLICA carried. That is the right floor only while
+            # the replica's sequence is the highest offset anyone issued, and
+            # the paragraph above is this method admitting it is not: the whole
+            # reason for the reconcile is that the bucket routinely holds
+            # ranges the replicated `extent` rows have never heard of.
+            #
+            # Left alone the restored log issues offsets the archive already
+            # holds, which is I9 broken in the one direction nothing detects.
+            # Reproduced: replica at seq 301, 3M rows loaded and pushed,
+            # `archived_through` 2,864,714 — and the restore resumed at
+            # 1,048,877, inside the archive's range. The reissued rows seal
+            # into the rebuilt local table, `sync` reports success and pushes
+            # nothing for ever because the file sits below the archive's floor,
+            # and `scan(include_archive=True)` returns 1,048,881 rows of the
+            # 3,000,600 acknowledged: the union truncates the archive leg at
+            # the colliding local extent, so ~1.95M archived rows are served by
+            # no leg at all while five offsets durably name two different rows.
+            #
+            # The report already knew. `skipped` is `(highest + 1, resumed - 1)`
+            # over a `highest` that takes this frontier into account, so it came
+            # back INVERTED — `(2864715, 1048876)` — which is what an invariant
+            # looks like when it is computed and then not checked.
+            #
+            # Reachable before bulk ingest existed, and cheaper with it: this
+            # needs the archive more than `RESTORE_RESERVE` ahead of the
+            # replica, which used to take a million rows through the buffer
+            # during a sidecar outage and now takes one `reserve` that ships
+            # almost no WAL. The hazard is lag plus restore either way, so it
+            # is closed here rather than by refusing the load.
+            wanted = frontier + RESTORE_RESERVE + 1
+            if wanted > resumed:
+                resumed = buffer.reserve(wanted - resumed)[1] + 1
         finally:
             buffer.close()
 
