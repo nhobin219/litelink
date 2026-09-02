@@ -20,7 +20,13 @@ from typing import TYPE_CHECKING, Literal, overload
 import pyarrow as pa
 
 from litelink._archive import ARCHIVE_KEY, Archive
-from litelink._buffer import CONFIG_KEY, SCHEMA_KEY, SORT_KEY, Buffer
+from litelink._buffer import (
+    CONFIG_KEY,
+    SCHEMA_KEY,
+    SORT_KEY,
+    START_OFFSET_KEY,
+    Buffer,
+)
 from litelink._layout import Layout, validate_archive
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
@@ -178,11 +184,12 @@ def follow(
     every log under it, and could leave a stale `archive.db` to win over the
     bucket's own hint.
 
-    Raises if the archive has never been published. `archive_extent` returns
-    None both for "nothing pushed" and for "a hint over an empty table", so a
-    log before its first successful sync cannot be followed — serving the
-    buffer alone would be a reader silently missing every archived row, which
-    is the one failure this must not have.
+    **An archive that has published nothing is not automatically refused.**
+    That is the ordinary state of a slow capture — nothing reaches
+    `target_seal_size`, and with `wal_replication` a seal retains its rows — so
+    the buffer holds the whole log and the WAL carries every row there is. The
+    follower serves it alone when `_incomplete_buffer` can prove nothing is
+    missing, and refuses naming the band when it cannot.
     """
     # First, because this path does not go through `validate` — a follower has
     # no config to validate — and a malformed prefix would otherwise surface as
@@ -358,6 +365,64 @@ def _followed_shape(layout: Layout) -> tuple[pa.Schema, tuple[str, ...], str]:
     )
 
 
+def _incomplete_buffer(layout: Layout, schema: pa.Schema) -> str | None:
+    """Why the restored buffer is not the whole log, or None if it is.
+
+    Asked only when the archive publishes no pointer, where the buffer is the
+    only tier that can serve. Returns a phrase for the caller's message so the
+    ways of falling short are named rather than collapsed into one number.
+
+    **Rows leave the buffer two ways and arrive outside it a third, and each
+    needs its own evidence.** This took three attempts and a review round each,
+    so the shape is worth stating:
+
+    - `finish_seal(discard=True)` and `release_archived` delete a PREFIX, so
+      they raise the buffer's first offset above the log's. The log's own first
+      offset is `start_offset` in `meta`, absent meaning 1 (§2).
+    - `ingest` never puts its rows in the buffer at all, so it raises nothing
+      and leaves a hole strictly INSIDE the buffered range. `INGESTED_KEY`
+      records it, written at reservation time so a crash cannot under-report.
+
+    An earlier version keyed the second on `extent` rows naming local files.
+    That is a copy of what the Iceberg manifest owns and the code tolerates it
+    being absent, so a crash between the register and the record, or an ordinary
+    compaction unioning a loaded range with held rows on either side, left the
+    check permissive. `orphaned_local_ranges` survives only as a FALLBACK for
+    logs written before the key existed, where it can add refusals but never
+    remove one.
+
+    An empty buffer is complete only if the log never issued anything, which
+    `next_offset` answers from `sqlite_sequence` rather than from rows a seal
+    may have taken.
+    """
+    probe = Buffer.open(layout.buffer_db, schema, readonly=True)
+    try:
+        recorded = probe.get_meta(START_OFFSET_KEY)
+        first_issued = int(recorded) if recorded else 1
+        held = probe.extent()
+        first_held = probe.next_offset() if held is None else held[0]
+        if first_held != first_issued:
+            return f"it starts at offset {first_held} rather than {first_issued}"
+
+        loaded = probe.ingested_through()
+        if loaded:
+            return (
+                f"offsets up to {loaded} were bulk-loaded straight to Parquet "
+                f"and never entered it"
+            )
+
+        orphaned = probe.orphaned_local_ranges()
+        if orphaned:
+            lo, hi = orphaned[0]
+            more = f" (and {len(orphaned) - 1} more)" if len(orphaned) > 1 else ""
+
+            return f"offsets {lo}..{hi - 1} are in a local file it lacks{more}"
+
+        return None
+    finally:
+        probe.close()
+
+
 def _assemble_follower(
     layout: Layout,
     schema: pa.Schema,
@@ -388,12 +453,19 @@ def _assemble_follower(
 
     covered = archive_extent(layout, prefix, options)
     if covered is None:
-        msg = (
-            f"the archive at {prefix!r} has published nothing yet, so following "
-            f"it would serve only the replicated buffer and silently omit every "
-            f"archived row. Sync the primary at least once first"
-        )
-        raise ValueError(msg)
+        # Nothing published, so the buffer is the only tier that can serve —
+        # allowed exactly when it holds the whole log. That is the case a slow
+        # capture lives in: WAL replication carries every row it has, and until
+        # something seals and syncs there is nothing else to carry.
+        shortfall = _incomplete_buffer(layout, schema)
+        if shortfall is not None:
+            msg = (
+                f"{prefix!r} publishes no metadata pointer, so the replicated "
+                f"buffer is the only tier — and {shortfall}. Those rows are in "
+                f"neither tier, and following this would serve a short log "
+                f"with no error"
+            )
+            raise ValueError(msg)
 
     buffer = Buffer.open(layout.buffer_db, schema)
     try:
@@ -402,16 +474,30 @@ def _assemble_follower(
         # primary's Parquet describe files this machine cannot open, and the
         # copy is scratch, so dropping them is free.
         buffer.strip_local_state(0)
-        remote = Archive(layout, buffer, options)
-        if remote.table(repair=True) is None:
-            msg = (
-                f"restored the buffer but could not adopt the archive at "
-                f"{prefix!r}: it holds nothing this log can read"
-            )
-            raise RuntimeError(msg)
+        # Adoption is SKIPPED when nothing is published, not attempted.
+        # `repair=True` against a prefix with no hint takes the CREATE branch —
+        # a reader writing a `metadata.json` and a `version-hint.text` into the
+        # bucket, onto which the primary would then commit. Asking the bucket
+        # first is what guards that, and it is unchanged; what changed is that
+        # "empty" no longer has to mean "refuse".
+        #
+        # `_archive_required` then answers False for this follower — empty local
+        # table, archive resolving to nothing — so reads come from the buffer
+        # alone, which `_incomplete_buffer` has just established is the log.
+        adopted = None
+        extent = None
+        if covered is not None:
+            remote = Archive(layout, buffer, options)
+            if remote.table(repair=True) is None:
+                msg = (
+                    f"restored the buffer but could not adopt the archive at "
+                    f"{prefix!r}: it holds nothing this log can read"
+                )
+                raise RuntimeError(msg)
 
-        adopted = remote.table()
-        extent = None if adopted is None else adopted.extent()
+            adopted = remote.table()
+            extent = None if adopted is None else adopted.extent()
+
         if extent is not None:
             buffer.release_archived(extent[1])
             buffer.reseed_group()

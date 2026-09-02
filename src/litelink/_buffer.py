@@ -42,6 +42,13 @@ OFFSET = "litelink_offset"
 # could not read it without importing the module that names it.
 SCHEMA_KEY = "arrow_schema"
 
+# The highest offset written to a file WITHOUT passing through the buffer, which
+# only `ingest` does (§13.4). A follower needs it: rows that left the buffer show
+# up as a raised first offset, and rows that never entered it do not show up at
+# all. Monotone, and written at RESERVATION time rather than at commit, so a
+# crash mid-load leaves it covering at least what was written.
+INGESTED_KEY = "ingested_through"
+
 # Where a schema change records what it set out to do, before it does any of
 # it (I16). Cleared only when the change is complete — §9: a schema change is
 # finished when SQLite says so, not when Iceberg does.
@@ -2550,6 +2557,73 @@ class Buffer:
             )
 
         return cursor.rowcount
+
+    def note_ingested(self, through: int) -> None:
+        """Record that offsets up to `through` were written past the buffer.
+
+        Monotone by `max`, because a load reserves in ascending chunks and a
+        retry after a failure starts above where the last one stopped — taking
+        the smaller value would un-record a range that is on disk.
+        """
+        with self._lock, self._con:
+            current = self._con.execute(
+                "SELECT v FROM meta WHERE k = ?", (INGESTED_KEY,)
+            ).fetchone()
+            highest = max(int(current[0]) if current else 0, int(through))
+            self._con.execute(
+                "INSERT INTO meta (k, v) VALUES (?, ?)"
+                " ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (INGESTED_KEY, str(highest)),
+            )
+
+    def ingested_through(self) -> int:
+        """The highest offset that reached a file without entering the buffer.
+
+        0 for a log that has never bulk-loaded, which is the answer that lets a
+        follower serve the buffer alone. Absent reads as 0 as well — a log
+        written before this key existed — so the caller pairs it with evidence
+        that does not depend on it; see `orphaned_local_ranges`.
+        """
+        with self._lock:
+            row = self._con.execute(
+                "SELECT v FROM meta WHERE k = ?", (INGESTED_KEY,)
+            ).fetchone()
+
+        return int(row[0]) if row else 0
+
+    def orphaned_local_ranges(self) -> list[tuple[int, int]]:
+        """Local-file ranges this buffer no longer holds. `[(lo, hi_exclusive)]`.
+
+        The fallback for a log written before `INGESTED_KEY` existed, and only
+        that. It is weaker than the key on purpose: `extent` is a copy of what
+        the Iceberg manifest owns, and `log.py` states plainly that a crash
+        between the two "leaves the size unknown, and unknown reads as full", so
+        a row can be missing — and an ordinary compaction can union a loaded
+        range with held rows on either side, leaving `EXISTS` satisfied.
+
+        It is included anyway because it can only ADD refusals. Every state it
+        catches is one the buffer really cannot serve; every state it misses is
+        one the key would have caught on a log created since. It never turns a
+        refusal into an acceptance.
+
+        Rows naming an ARCHIVE copy (`://`) are excluded — those are the
+        follower's ordinary case, reachable through the archive tier. Rows with
+        no `end_offset` are the open group, which is the buffer itself.
+        """
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT start_offset, end_offset FROM extent e"
+                " WHERE e.rel_path IS NOT NULL"
+                " AND e.rel_path NOT LIKE '%://%'"
+                " AND e.end_offset IS NOT NULL"
+                " AND NOT EXISTS ("
+                '   SELECT 1 FROM buffer b WHERE b."litelink_offset" >= e.start_offset'
+                '   AND b."litelink_offset" < e.end_offset'
+                " )"
+                " ORDER BY start_offset"
+            ).fetchall()
+
+        return [(int(r[0]), int(r[1])) for r in rows]
 
     def reclaim_free_pages(self, min_free_ratio: float = 0.0) -> int:
         """Return the file's dead space to the OS. Bytes reclaimed, or 0 (§3a).

@@ -348,8 +348,13 @@ with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
 ```
 
 `archive` is where the *WAL replica* lives; the archive prefix itself comes from the replica's
-own `meta`. It requires a published archive — a log before its first successful sync cannot be
-followed, because serving the buffer alone would silently omit every archived row.
+own `meta`.
+
+**A log that has published nothing can still be followed if its buffer holds all of it** — the
+ordinary state of a slow capture, where `wal_replication` makes a seal retain its rows. It is
+refused when rows left the buffer (its first offset sits above the log's) or bypassed it
+(`ingest` writes straight to Parquet and records `ingested_through`), because serving it then
+would silently omit those rows.
 
 **This returns a `RemoteReadHandle`, a sibling of the `LocalReadHandle` that `open(..., read_only=True)` returns.** It holds the read
 collaborators — the replicated buffer, the local table, the archive handle, and the reader

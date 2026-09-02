@@ -507,10 +507,14 @@ compares against it — so it never surfaces as a gap at all.
 An earlier design refused to open on a gap. It was wrong for exactly this reason: it refused
 every followed log that had ever failed over, on a million offsets that never existed.
 
-**It requires a published archive.** `archive_extent` returns None both for "nothing pushed"
-and for "a hint over an empty table", so a log before its first successful sync cannot be
-followed. Serving the buffer alone instead would be a reader silently missing every archived
-row — the one failure this must not have.
+**It serves the buffer alone only when the buffer is the whole log.** With no published
+archive there is one tier, and a follower may use it exactly when it can prove nothing is
+missing from it. Rows LEAVE the buffer by prefix delete (`finish_seal(discard=True)`,
+`release_archived`), which raises its first offset above `start_offset` — or, when the delete
+empties it, raises the next offset it would issue; rows BYPASS it only
+through `ingest`, which raises nothing and so records `ingested_through` at reservation time.
+Either signal refuses. Otherwise the reader would be silently missing rows — the one failure
+this must not have.
 
 ## 4. Seal
 
