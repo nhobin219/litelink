@@ -550,6 +550,7 @@ snapshot_retention    timedelta       = 1 hour   how long expired snapshots surv
 compact_min_files     int             = 4        minimum adjacent files to merge
 wal_replication       bool            = False    needs an archive; also makes a seal KEEP its rows
 wal_retention         timedelta|None  = None     how far back a restore may go
+vacuum_free_ratio     float | None    = None     reclaim buffer dead space at this free share
 compression           str             = "zstd"   Parquet codec: none | snappy | gzip | zstd
 ```
 
@@ -559,8 +560,23 @@ only, so `set_config` needs no rewrite.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
 construction: `compact_min_files` below 2, a compact size below the seal size, `wal_retention`
-without `wal_replication`, `wal_replication` without an archive, and a `compression` this
-build cannot write are each refused.
+without `wal_replication`, `wal_replication` without an archive, a `vacuum_free_ratio` outside
+`[0, 1]`, and a `compression` this build cannot write are each refused.
+
+**`vacuum_free_ratio` is about what READERS pay.** SQLite puts pages freed by a delete on a
+free list and never shrinks the file, so a buffer that seals and archives for months keeps
+every page it has ever needed. Locally that is invisible — the free list is reused — but
+litestream replicates the FILE, so every `follow` and every `restore` downloads and applies
+the dead space. Measured on a 1-day-old capture: 457 MB holding 20,658 live rows with 92% of
+its pages free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
+
+Set it and `maintain` reclaims once the free list reaches that share of the file;
+`WriteHandle.reclaim_buffer()` does it on demand. **Off by default, because the cost lands on
+the write path**: `VACUUM` takes an exclusive lock and stalls appends for as long as the live
+data takes to copy — 0.3 s at 35 MB — and only the deployment knows whether its arrival rate
+can absorb that. A writer with no off-box readers can leave it None for ever and lose nothing
+but disk. 0.5 is the value to reach for: the win scales with what is reclaimed and the cost
+with what is kept, so the trade only improves above it.
 
 **`compression` governs every data file** — a seal, a compaction, an archive rewrite, a bulk
 ingest. It is a setting rather than a constant because the right answer is a property of the

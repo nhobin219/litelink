@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -1359,3 +1360,181 @@ def test_repointing_a_log_at_a_malformed_archive_is_refused(tmp_path: Path) -> N
             log.set_archive("s3:/bucket/prefix")
 
         assert log.archive is None, "a refused repoint was stored anyway"
+
+
+def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
+    tmp_path: Path,
+) -> None:
+    """Bounded free list, and I9 across the rewrite that bounds it.
+
+    SQLite never shrinks a file on its own, so a buffer that archives for months
+    keeps every page it has ever needed. Invisible locally — the free list is
+    reused — and paid off-box by every follower, because litestream replicates
+    the FILE. Measured on a real 1-day-old capture: 457 MB holding 20,658 live
+    rows, 92% of its pages free, restoring in 12.5 s against 0.8 s vacuumed.
+
+    Driven through `Buffer` rather than a whole log on purpose. This is a
+    property of the reclaim, and reaching it through seals would spend the
+    test's time writing thousands of tiny Parquet files that have nothing to do
+    with what is asserted.
+
+    The second half matters more. `VACUUM` rebuilds the database, and this runs
+    where the archive may have taken every row, so if the rewrite disturbed
+    `litelink_offset` — its values, its gaps, or the AUTOINCREMENT counter
+    behind them — the log would reissue offsets the archive already holds (I9).
+    Offsets are compared exactly, gaps included.
+
+    Falsify by making `reclaim_free_pages` return 0 without vacuuming: the
+    ratio assertion fails with most of the file on the free list.
+    """
+    payload = "k" * 400
+    buffer = Buffer.open(tmp_path / "buffer.db", SCHEMA)
+    try:
+        issued: list[int] = []
+        for _ in range(12):
+            issued += buffer.append(
+                {"event_ts": i, "key": payload} for i in range(2000)
+            )
+
+        # The archive takes all but a tail, which is `release_archived`'s shape.
+        boundary = issued[-300]
+        buffer.release_archived(boundary)
+        # Then punch holes in what is left, so a renumbering rewrite would show
+        # up as closed gaps rather than having to be inferred.
+        survivors = [o for o in issued if o > boundary and o % 3 == 0]
+        buffer._con.executemany(  # noqa: SLF001
+            'DELETE FROM buffer WHERE "litelink_offset" = ?',
+            [(o,) for o in issued if o > boundary and o % 3 != 0],
+        )
+
+        before = _page_stats(buffer)
+
+        assert before[1] / before[0] >= 0.5, (
+            "the fixture did not bloat the free list, so this proves nothing"
+        )
+
+        reclaimed = buffer.reclaim_free_pages()
+        pages, free = _page_stats(buffer)
+
+        assert reclaimed > 0
+        assert free / pages < 0.5, (
+            f"the buffer kept {free}/{pages} pages free after a reclaim"
+        )
+
+        live = [
+            int(row[0])
+            for row in buffer._con.execute(  # noqa: SLF001
+                'SELECT "litelink_offset" FROM buffer ORDER BY "litelink_offset"'
+            )
+        ]
+
+        assert live == survivors, "offsets were renumbered or gaps were closed"
+        assert buffer.append([{"event_ts": 1, "key": "after"}]) == [max(issued) + 1], (
+            "AUTOINCREMENT restarted inside the log"
+        )
+    finally:
+        buffer.close()
+
+
+def test_reclaiming_a_small_buffer_does_nothing(tmp_path: Path) -> None:
+    """The floor, and why it is not a policy knob.
+
+    A young log crosses any ratio on its first archive pass — delete most of a
+    few hundred KB and the free list is most of the file. Reclaiming there costs
+    an exclusive lock, and stalls appends, to save a rounding error on the wire.
+
+    Falsify by removing the `_VACUUM_FLOOR_BYTES` term: this reclaims, and every
+    log pays a write stall from its first pass onward.
+    """
+    buffer = Buffer.open(tmp_path / "buffer.db", SCHEMA)
+    try:
+        # Enough to leave a free list that is most of the file, and far enough
+        # under the floor that reclaiming it would be pure cost.
+        issued = buffer.append({"event_ts": i, "key": "k" * 400} for i in range(4000))
+        buffer.release_archived(issued[-1])
+        pages, free = _page_stats(buffer)
+        page_size = int(buffer._con.execute("PRAGMA page_size").fetchone()[0])  # noqa: SLF001
+
+        assert free / pages >= 0.5, "the premise is a mostly-empty file"
+        assert free * page_size < 8 * 1024 * 1024, "the premise is that it is SMALL"
+        assert buffer.reclaim_free_pages() == 0
+    finally:
+        buffer.close()
+
+
+def _page_stats(buffer: Buffer) -> tuple[int, int]:
+    """`(page_count, freelist_count)` for the buffer's own connection."""
+    con = buffer._con  # noqa: SLF001
+
+    return (
+        int(con.execute("PRAGMA page_count").fetchone()[0]),
+        int(con.execute("PRAGMA freelist_count").fetchone()[0]),
+    )
+
+
+def test_vacuum_free_ratio_survives_the_round_trip_and_is_bounded() -> None:
+    """The setting is persisted like every other, and refused when it cannot mean
+    what it says.
+
+    A share of a file has no reading outside `[0, 1]`, and the mistake it invites
+    is a percentage: `vacuum_free_ratio=50` would never fire, silently, for the
+    life of the log — which is the same shape of failure as never setting it, and
+    so invisible.
+
+    Falsify by deleting the range rule in `validate`: `50` is accepted and the
+    log quietly never reclaims.
+    """
+    config = replace(LogConfig(), vacuum_free_ratio=0.5)
+
+    assert LogConfig.from_json(config.to_json()).vacuum_free_ratio == 0.5
+    assert LogConfig.from_json(LogConfig().to_json()).vacuum_free_ratio is None
+    # A log written before the setting existed reads as "never reclaim".
+    assert (
+        LogConfig.from_json(json.dumps({"target_seal_size": 4096})).vacuum_free_ratio
+        is None
+    )
+
+    for bad in (50, -0.1, 1.5):
+        with pytest.raises(ValueError, match="between 0 and 1"):
+            validate(SCHEMA, (), replace(LogConfig(), vacuum_free_ratio=bad), None)
+
+
+def test_maintain_reclaims_only_when_the_ratio_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`maintain` is where a deployment opts into the pause, and the default is
+    to decline.
+
+    `VACUUM` blocks appends for as long as the live data takes to copy, so it is
+    the one part of a maintenance pass that a caller must ask for. This asserts
+    both directions, because a default that quietly reclaimed would put that
+    pause on every existing deployment at upgrade.
+
+    Falsify by calling `reclaim_buffer` unconditionally in `maintain`: the
+    `None` case records a call.
+    """
+    calls: list[float] = []
+    with litelink.new(tmp_path, "off", schema=SCHEMA) as log:
+        monkeypatch.setattr(
+            log._buffer,  # noqa: SLF001
+            "reclaim_free_pages",
+            lambda ratio=0.0: calls.append(ratio) or 0,
+        )
+        log.maintain()
+
+        assert calls == [], "reclaimed without being asked"
+
+    with litelink.new(
+        tmp_path / "on",
+        "on",
+        schema=SCHEMA,
+        config=replace(LogConfig(), vacuum_free_ratio=0.25),
+    ) as log:
+        monkeypatch.setattr(
+            log._buffer,  # noqa: SLF001
+            "reclaim_free_pages",
+            lambda ratio=0.0: calls.append(ratio) or 0,
+        )
+        log.maintain()
+
+        assert calls == [0.25], "the configured ratio did not reach the reclaim"
