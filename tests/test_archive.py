@@ -4068,26 +4068,26 @@ def test_a_follower_writes_nothing_the_primary_shares(
 
 
 @pytest.mark.slow
-def test_a_follower_refuses_an_archive_that_has_published_nothing(
+def test_a_follower_writes_nothing_into_an_unpublished_archive(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The pre-flight, and why it is the pre-flight rather than a `repair` flag.
+    """The hazard the old pre-flight was really holding shut.
 
-    Neither `repair` value adopts safely alone. `repair=False` never creates —
-    and never adopts either, since it reads the local `archive.db` row a
-    follower has none of, so `Archive.table` returns None and the follower
-    serves the buffer alone. `repair=True` adopts, but against a prefix with no
-    published hint it takes the CREATE branch: a READER writing a
-    `metadata.json` and a `version-hint.text` into the bucket, onto which the
-    primary then commits.
+    This used to assert that following an archive with no published hint was
+    REFUSED, reasoning that neither `repair` value adopts safely: with no hint,
+    `repair=True` takes the CREATE branch — a reader writing a `metadata.json`
+    and a `version-hint.text` into the bucket, onto which the primary then
+    commits.
 
-    So the bucket is asked first, and a log before its first successful sync
-    cannot be followed. That is a real cost — for `litelink.new(archive=...)` it is
-    every young log — and it is the right one: serving the buffer alone would
-    be a reader silently missing every archived row.
+    That reasoning is about ADOPTION, and refusing the whole follow was heavier
+    than it needed to be. A log whose buffer holds everything is now followable
+    (`test_a_log_whose_buffer_holds_everything_can_be_followed`); what must not
+    happen is the reader touching the bucket, which is what this pins. Adoption
+    is skipped rather than attempted, so the CREATE branch is unreachable.
 
-    Falsify by removing the pre-flight: this follow succeeds and the bucket
-    gains two objects it did not have.
+    Falsify by calling `Archive.table(repair=True)` unconditionally in
+    `_assemble_follower`: the bucket gains two objects it did not have, and a
+    READER has published a lineage the primary will commit onto.
     """
     binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
     if not os.access(binary, os.X_OK):
@@ -4098,7 +4098,6 @@ def test_a_follower_refuses_an_archive_that_has_published_nothing(
     with litelink.new(
         tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
     ) as primary:
-        # Buffered only: nothing sealed, so nothing was ever pushed.
         primary.extend(rows(50))
         replication = primary.write_replication_config()
 
@@ -4107,8 +4106,8 @@ def test_a_follower_refuses_an_archive_that_has_published_nothing(
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-unpublished"))
 
-    with pytest.raises(ValueError, match="published nothing yet"):
-        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        assert follower.scan().read_all().num_rows == 50
 
     assert sorted(fs.find(f"{bucket}/follow-unpublished")) == before, (
         "a reader wrote into the archive"
@@ -4641,12 +4640,12 @@ def test_a_follower_with_no_replica_says_which_two_things_it_could_be(
     assert "wal_replication off" in message, message
     assert "do not describe a log that exists" in message, message
 
-    # The control: the SAME call with the name that does exist gets past the
-    # restore. It stops later, at the pre-flight for an archive nothing has
-    # been pushed to yet, which is a different refusal — so this error is
-    # specific to the missing replica rather than to the setup.
-    with pytest.raises(ValueError, match="published nothing yet"):
-        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+    # The control: the SAME call with the name that does exist SUCCEEDS and
+    # serves the log, so this error is specific to the missing replica rather
+    # than to the setup. A sharper control than it used to be — the log that
+    # exists was once refused too, for never having synced.
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as ok:
+        assert ok.scan().read_all().num_rows == 50
 
 
 def test_an_unreachable_archive_is_not_reported_as_an_absent_replica(
@@ -4718,3 +4717,215 @@ def test_a_log_whose_stored_archive_is_malformed_can_still_be_repaired(
         # And the setter that was blocked works again, which is what makes the
         # repair a repair rather than a way to keep going around the rule.
         log.set_config(LogConfig())
+
+
+def test_a_log_whose_buffer_holds_everything_can_be_followed(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The case `follow` exists for, and refused for the life of the feature.
+
+    A slow or low-volume capture may not reach `target_seal_size` for months,
+    and with `wal_replication` a seal RETAINS its rows until the archive has
+    them — so the buffer holds the whole log even after sealing and compacting.
+    WAL shipping carries every row there is. That was refused because the
+    archive published no pointer, which is the one thing it could see.
+
+    Measured on the deployment this came from: a stream whose buffer held
+    offsets 1..7,763 with an archive holding nothing, unreadable off-box.
+
+    Falsify by restoring the unconditional raise on `archive_extent() is None`:
+    this raises "published nothing yet" and a slow stream stays unreadable from
+    any other machine.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-whole-buffer"
+    config = replace(LogConfig(), target_seal_size=16 * 1024, wal_replication=True)
+    with litelink.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(400))
+        # Seal AND compact: with replication on, both keep the rows.
+        while primary.seal() is not None:
+            pass
+
+        primary.maintain()
+        served = primary.scan().read_all().num_rows
+        held = primary._buffer.extent()  # noqa: SLF001
+
+        assert held == (1, 400), "the premise is that the buffer still holds it all"
+
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3, where)
+
+    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+        got = follower.scan().read_all()
+
+        assert got.num_rows == served == 400
+        assert got.column(OFFSET).to_pylist() == list(range(1, 401))
+
+        report = follower.coverage()
+
+        assert report.archive is None
+        assert report.gap is None
+        assert report.buffered == (1, 400)
+
+
+def test_a_follower_refuses_a_log_whose_seals_were_discarded(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Rows that LEFT the buffer, which raise its first offset.
+
+    `finish_seal(discard=True)` puts sealed rows in local Parquet whenever
+    `wal_replication` is off, and that flag is mutable after rows are sealed —
+    so this is the shipped restart path in `examples/adsb/capture.py`: capture
+    without replication, turn it on, start the sidecar, follow before any sync.
+
+    Reported by review against an earlier predicate that asked "was anything
+    pushed to this prefix": that answers NO here, and the follower served 50 of
+    1,050 acknowledged rows with `coverage()` reporting `gap=None`.
+
+    Falsify by dropping the `first_held != first_issued` term: this follow
+    succeeds and silently serves the tail alone.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-discarded"
+    with litelink.new(
+        tmp_path / "primary",
+        "s",
+        schema=SCHEMA,
+        config=replace(LogConfig(), target_seal_size=16 * 1024, wal_replication=False),
+        archive=where,
+        s3=s3,
+    ) as primary:
+        primary.extend(rows(1000))
+        while primary.seal() is not None:
+            pass
+
+        assert primary._buffer.extent() is None, (  # noqa: SLF001
+            "the premise is that the seals discarded their rows"
+        )
+
+        primary.set_config(replace(primary.config, wal_replication=True))
+        primary.extend(rows(50))
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3, where)
+
+    with pytest.raises(ValueError, match="starts at offset"):
+        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+
+
+def test_a_follower_refuses_a_log_with_a_bulk_loaded_hole(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Rows that never ENTERED the buffer, which raise nothing.
+
+    `ingest` reserves offsets and writes them straight to Parquet, so a log that
+    captured, sealed while HOLDING those rows, then bulk-loaded has a buffer
+    still starting at offset 1 with the loaded band missing from the middle. The
+    first-offset test passes and the follower served 350 of 2,350 rows, with
+    `coverage()` reporting the hole as `buffered`. Reported by review.
+
+    `INGESTED_KEY` is what catches it, and it is written at RESERVATION time —
+    so this asserts the marker rather than `extent` rows, which an earlier
+    version relied on and which a crash or an ordinary compaction can erase.
+
+    Falsify by removing the `ingested_through()` term: this follow succeeds and
+    serves the captured rows alone.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-bulk-hole"
+    config = replace(LogConfig(), target_seal_size=16 * 1024, wal_replication=True)
+    with litelink.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(300))
+        while primary.seal() is not None:
+            pass
+
+        held = primary._buffer.extent()  # noqa: SLF001
+
+        assert held is not None and held[0] == 1, "the premise is a held seal"
+
+        # `sync=False`: the point is a load the archive does NOT have.
+        loaded = primary.ingest(
+            pa.Table.from_pylist(rows(2000), schema=SCHEMA), sync=False
+        )
+
+        assert loaded is not None
+
+        primary.extend(rows(50))
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3, where)
+
+    with pytest.raises(ValueError, match="bulk-loaded straight to Parquet"):
+        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+
+
+def test_the_ingest_marker_catches_a_hole_the_extent_rows_no_longer_show(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Why the marker exists rather than a check over `extent` rows.
+
+    An earlier predicate found a bulk-loaded hole by looking for `extent` rows
+    naming a local file whose offsets the buffer lacks. Review broke it twice on
+    the same weakness: `extent` is a copy of what the Iceberg manifest owns, and
+    `log.py` says a crash between the register and the record "leaves the size
+    unknown, and unknown reads as full". A crash or a Ctrl-C between them writes
+    no row at all, and an ordinary compaction can union a loaded range with held
+    rows on either side so the row that remains looks satisfied.
+
+    Here the rows are deleted outright, which is the state either fault leaves.
+    `orphaned_local_ranges` then finds nothing — asserted, so this cannot pass
+    for the wrong reason — and only `INGESTED_KEY` still knows. It is written at
+    RESERVATION time, before the file exists, so nothing that happens afterwards
+    can lose it.
+
+    Falsify by removing the `ingested_through()` term: with the `extent` rows
+    gone the fallback is blind too, the follow succeeds, and it serves the
+    captured rows while silently omitting the load.
+    """
+    binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
+    if not os.access(binary, os.X_OK):
+        pytest.skip("litestream is not provisioned — run `just litestream`")
+
+    where = f"s3://{bucket}/follow-lost-extent"
+    config = replace(LogConfig(), target_seal_size=16 * 1024, wal_replication=True)
+    with litelink.new(
+        tmp_path / "primary", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as primary:
+        primary.extend(rows(300))
+        while primary.seal() is not None:
+            pass
+
+        primary.ingest(pa.Table.from_pylist(rows(2000), schema=SCHEMA), sync=False)
+        primary.extend(rows(50))
+
+        # The state a crash between `register` and `record_file` leaves, or an
+        # ordinary compaction unioning the range: no local row names it.
+        primary._buffer._con.execute(  # noqa: SLF001
+            "DELETE FROM extent WHERE rel_path LIKE '%/ingested/%'"
+        )
+
+        assert primary._buffer.orphaned_local_ranges() == [], (  # noqa: SLF001
+            "the fallback can still see the hole, so this proves nothing"
+        )
+        assert primary._buffer.ingested_through() > 0  # noqa: SLF001
+
+        replication = primary.write_replication_config()
+
+    _replicate(binary, replication, s3, where)
+
+    with pytest.raises(ValueError, match="bulk-loaded straight to Parquet"):
+        litelink.follow("s", archive=where, s3=s3, binary=str(binary))

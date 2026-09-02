@@ -2630,6 +2630,12 @@ class WriteHandle(LocalReadHandle):
             for chunk in _chunks(reader, config.compact_size, config.compact_rows):
                 rows = chunk.select(shape.columns).cast(shape.schema)
                 lo, hi = self._buffer.reserve(rows.num_rows)
+                # BEFORE the file is written, for I2's reason applied to a
+                # follower: a crash between here and the commit must leave the
+                # marker covering MORE than reached disk, never less. Rows that
+                # bypass the buffer are invisible to a follower otherwise —
+                # they raise no first offset and leave no row it can trust.
+                self._buffer.note_ingested(hi)
                 rows = rows.add_column(
                     0, offset_field, pa.array(range(lo, hi + 1), type=pa.int64())
                 )

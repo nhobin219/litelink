@@ -11,6 +11,39 @@ minor version carries breaking changes.
 
 ### Fixed
 
+- **A log whose buffer holds all of it can be followed.** `litelink.follow`
+  refused any archive with no published metadata pointer, which is exactly a
+  slow capture: nothing reaches `target_seal_size`, nothing is pushed, and with
+  `wal_replication` a seal RETAINS its rows — so the buffer holds the whole log
+  and the WAL carries every row there is. It was the one case where a follower
+  is the only way to read a log off-box, and the one case that did not work. On
+  the deployment this came from, a stream whose buffer held offsets 1..7,763
+  with an archive holding nothing.
+
+  A follower now serves the buffer alone when it can prove the buffer IS the
+  log, which takes two independent facts because rows go missing two ways.
+  Rows that LEFT — `finish_seal(discard=True)`, `release_archived` — delete a
+  prefix, so the buffer's first offset rises above the log's (`start_offset` in
+  `meta`, absent meaning 1). Rows that NEVER ENTERED — `ingest` writes straight
+  to Parquet — raise nothing and leave a hole inside the buffered range, so
+  `ingest` records `ingested_through` at RESERVATION time, before the file
+  exists, where no later crash or compaction can lose it.
+
+  Three earlier predicates were tried and broken by review, each on the last
+  one's fix: keyed on what was pushed to the prefix, then on the first offset
+  alone, then on `extent` rows naming local files. The last failed because
+  `extent` is a copy of what the Iceberg manifest owns and the code tolerates
+  its absence — a crash between the register and the record writes no row, and
+  an ordinary compaction can union a loaded range with held rows either side.
+  The marker depends on none of that. `orphaned_local_ranges` survives only as
+  a fallback for logs written before the key existed, where it can add refusals
+  and never remove one.
+
+  Adoption is skipped rather than attempted in the new path, which keeps the
+  guarantee the old refusal really protected: `repair=True` against a prefix
+  with no hint takes the CREATE branch, a reader publishing a lineage the
+  primary would commit onto.
+
 - **A mistyped archive prefix is refused where it is typed**, instead of
   surfacing as a YAML parse error from the litestream subprocess. Every
   consumer of the prefix parses it positionally, so a malformed one does not
