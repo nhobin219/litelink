@@ -3652,6 +3652,43 @@ class WriteHandle(LocalReadHandle):
         # otherwise compact a file it had just written.
         self.seal_due()
 
+        # LAST, and only when asked. The pass above is what frees pages —
+        # eviction and the archive's release both delete — so reclaiming before
+        # it would measure a free list that is about to grow. Off unless
+        # `vacuum_free_ratio` is set, because this is the one part of a
+        # maintenance pass that blocks appends; see `reclaim_buffer`.
+        ratio = self.config.vacuum_free_ratio
+        if ratio is not None:
+            self.reclaim_buffer(ratio)
+
+    def reclaim_buffer(self, min_free_ratio: float = 0.0) -> int:
+        """Return `buffer.db`'s dead space to the OS. Bytes reclaimed, or 0.
+
+        SQLite puts pages freed by a DELETE on a free list and never shrinks the
+        file, so a buffer that seals and archives for months keeps every page it
+        has ever needed. Locally that is invisible — the free list is reused —
+        and it is the READERS who pay, because litestream replicates the FILE:
+        every `follow` and every `restore` downloads and applies the dead space.
+        Measured on a 1-day-old capture, 457 MB holding 20,658 live rows with
+        92% of its pages free, restoring in 12.5 s against 0.8 s vacuumed.
+
+        **Manual, because the cost lands on the write path.** `VACUUM` takes an
+        exclusive lock and rebuilds the file, so appends stall for as long as the
+        LIVE data takes to copy — 0.3 s at 35 MB. Only the deployment knows
+        whether its arrival rate can absorb that, and a writer with no off-box
+        readers can decline for ever and lose nothing but disk. Set
+        `vacuum_free_ratio` to have `maintain` do it on the ordinary pass.
+
+        Call it when appends can tolerate the pause: after a batch, on a quiet
+        period, or from the same schedule that runs `maintain`. Cheap to call
+        and do nothing — the check is three PRAGMAs — so it is safe in a loop.
+
+        `litelink_offset` is untouched: values keep their gaps and the
+        AUTOINCREMENT counter survives, including on a buffer the archive has
+        fully drained (I9). See `Buffer.reclaim_free_pages`.
+        """
+        return self._buffer.reclaim_free_pages(min_free_ratio)
+
     def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
         """Convert sealed files into `target_compact_size` ones (§6).
 
@@ -4207,6 +4244,17 @@ def validate(
         msg = (
             "wal_replication needs an archive: WAL segments go beside the "
             "archived data, and a local-only log has nowhere to ship them"
+        )
+        raise ValueError(msg)
+
+    if (
+        config.vacuum_free_ratio is not None
+        and not 0.0 <= config.vacuum_free_ratio <= 1.0
+    ):
+        msg = (
+            f"vacuum_free_ratio is a share of the buffer file, so it must be "
+            f"between 0 and 1: {config.vacuum_free_ratio}. Use None to never "
+            f"reclaim, which is the default"
         )
         raise ValueError(msg)
 

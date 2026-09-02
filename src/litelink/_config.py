@@ -209,6 +209,33 @@ class LogConfig:
     # instances must never replicate one database. Supervising it belongs in
     # deployment code, where it is visible: see `examples/adsb/maintainer.py`.
     wal_replication: bool = False
+
+    # §3a. When a maintenance pass finds at least this share of `buffer.db` on
+    # SQLite's free list, reclaim it with a VACUUM. None never reclaims, which
+    # is the behaviour every version before this had.
+    #
+    # **Off by default, because the cost lands on the write path.** VACUUM takes
+    # an exclusive lock and rebuilds the file, so it stalls appends for as long
+    # as the LIVE data takes to copy — 0.3 s at 35 MB, measured. Only the
+    # deployment knows whether its arrival rate can absorb that, so litelink
+    # will not decide it: `WriteHandle.reclaim_buffer()` is the manual door, and
+    # this setting is for the deployments that would rather it happened on the
+    # ordinary pass.
+    #
+    # **What it buys is paid by READERS, not by this process.** SQLite never
+    # returns freed pages to the OS, and litestream replicates the FILE — so a
+    # log that seals and archives for months makes every `follow` and every
+    # `restore` download and apply its dead space. Measured on a 1-day-old
+    # capture: 457 MB holding 20,658 live rows, 92% of its pages free, restoring
+    # in 12.5 s against 0.8 s for the same content vacuumed. A writer with no
+    # off-box readers can leave this None for ever and lose nothing but disk.
+    #
+    # 0.5 is the value to reach for. The win scales with what is RECLAIMED and
+    # the cost with what is KEPT, so the trade only improves above it, and a
+    # buffer hovering under the line ships at most 2x the bytes it needs —
+    # bounded, unlike the growth it replaces.
+    vacuum_free_ratio: float | None = None
+
     # §3a. How far BACK a restore can go, which is not how much is kept safe.
     #
     # The distinction is the whole of this setting. A restore always recovers
@@ -288,6 +315,7 @@ class LogConfig:
                 ),
                 "local_rows": self.local_rows,
                 "wal_replication": self.wal_replication,
+                "vacuum_free_ratio": self.vacuum_free_ratio,
                 "wal_retention": (
                     None
                     if self.wal_retention is None
@@ -336,6 +364,7 @@ class LogConfig:
             ),
             local_rows=raw.get("local_rows", defaults.local_rows),
             wal_replication=raw.get("wal_replication", defaults.wal_replication),
+            vacuum_free_ratio=raw.get("vacuum_free_ratio", defaults.vacuum_free_ratio),
             wal_retention=(
                 wal
                 if isinstance(wal, timedelta) or wal is None

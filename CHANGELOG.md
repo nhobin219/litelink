@@ -53,6 +53,35 @@ minor version carries breaking changes.
   to the dev group — so the endpoint came up and the bucket did not, and the
   ~91 tests in the S3 tier skipped on a fresh checkout.
 
+### Added
+
+- **`WriteHandle.reclaim_buffer()` and `LogConfig.vacuum_free_ratio`**, for the
+  dead space SQLite never returns. Pages freed by a delete go on a free list and
+  the file never shrinks, so a buffer that seals and archives for months keeps
+  every page it has ever needed. That is invisible locally — the free list is
+  reused — and it is the READERS who pay, because litestream replicates the
+  file: every `follow` and every `restore` downloads and applies it. Measured on
+  a 1-day-old capture, 457 MB holding 20,658 live rows with 92% of its pages
+  free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
+
+  **Off by default and manual, because the cost lands on the write path.**
+  `VACUUM` takes an exclusive lock and rebuilds the file, so appends stall for as
+  long as the live data takes to copy — 0.3 s at 35 MB. Only the deployment knows
+  whether its arrival rate can absorb that. Call `reclaim_buffer()` when it can,
+  or set `vacuum_free_ratio` to have `maintain` do it once the free list reaches
+  that share of the file. A writer with no off-box readers can decline for ever
+  and lose nothing but disk.
+
+  The obvious objection — that rewriting the file must cost more in shipped WAL
+  than it saves — was measured and is wrong: two sidecars on the same workload
+  shipped 3.1 MB without and 0.3 MB with, because litestream ships LTX deltas of
+  a smaller database.
+
+  `litelink_offset` is untouched (I9): values keep their gaps, and the
+  `AUTOINCREMENT` counter survives a rewrite of a buffer the archive has fully
+  drained — which is the case that would otherwise restart at 1 and reissue
+  offsets the archive already holds.
+
 ## 0.2.2 — 2026-09-01
 
 **0.2.1 was yanked and 0.2.2 is what it should have been.** Its artifacts reached
