@@ -271,8 +271,14 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     the buffer. But `_discard_on_seal` reads the same flag, so the prescribed
     workaround of turning replication off to load would drop the buffer's copy
     of everything already captured: to protect rows that cannot be replicated,
-    it stripped the off-box copy from rows that were. What the caller gets
-    instead is the scope stated and `archived_through()` to check.
+    it stripped the off-box copy from rows that were.
+
+    The load now pushes its own output, so the scope statement is narrower than
+    it was: WAL still cannot carry a bulk range, but the archive has it before
+    `ingest` returns. Note the knock-on asserted below — the push is a PREFIX,
+    so it takes the captured rows as well, and `release_archived` then drops
+    what the archive holds. The rows move from buffer to bucket; they are never
+    in neither.
     """
     config = LogConfig(
         target_seal_size=4096,
@@ -301,11 +307,16 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
 
         assert (lo, hi) == (301, 800)
         assert log.scan().read_all().num_rows == 800
-        # The captured rows keep their off-box copy — the load did not disturb
-        # it, which is the whole of what refusing got wrong.
-        assert buffered(log) == retained
-        # And the loaded range is NOT in it, which is the honest scope claim:
-        # nothing WAL shipping carries holds these rows.
+        # The captured rows still have an off-box copy — the load did not strip
+        # it, which is the whole of what refusing got wrong. They have MOVED,
+        # though: the load's own sync pushed them, and `release_archived` then
+        # dropped what the archive had taken. Buffer or bucket, never neither.
+        assert log.archived_through() >= retained
+        # And the loaded range is second-copied too, which is the point of
+        # syncing from inside `ingest`: nothing WAL ships holds these rows, so
+        # without this they would be on local disk alone.
+        assert log.archived_through() >= hi
+        # Still not in the buffer, which is the honest scope claim about WAL.
         assert buffered(log) < hi - lo + 1
 
         log.sync()
@@ -538,17 +549,25 @@ def test_an_ingested_range_survives_the_whole_archive_cycle(
         assert log.append(rows(1)[0]) == 3401
 
 
-def test_a_loaded_range_reaches_the_archive_only_once_its_run_settles(
+def test_a_loaded_range_reaches_the_archive_whole(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The archive is a loaded range's only second copy, and `sync` lags its
-    tail — `stable_prefix` holds a trailing run still under the compaction
-    budget, and a load's last file is short unless it divides evenly.
+    """No tail left behind, which is the whole point of loading under an archive.
 
-    Both halves matter. The lag is why `ingest` documents `archived_through()`
-    against the returned `hi` rather than telling an operator that one `sync()`
-    makes the load safe; that it TERMINATES is why the check is worth making
-    rather than a window nobody can ever close.
+    A load's rows never enter the buffer, so WAL replication cannot carry them
+    and the archive is their ONLY second copy. This used to assert the opposite
+    — that one `sync()` reached everything except the short last file, because
+    `stable_prefix` holds a trailing run still under the compaction budget. The
+    lag was documented and was said to terminate once roughly another budget of
+    rows arrived above it.
+
+    On a stream that goes quiet it does not terminate. Measured on a real
+    deployment: 113,399 loaded rows on one disk, `coverage()` reporting no gap,
+    for as long as the stream stayed slow. So `ingest` now pushes its own output
+    with `push_unsettled=True`, and the assertion flips.
+
+    Falsify by passing `sync=False`: `archived_through()` drops back below `hi`
+    and the tail file is local-only again.
     """
     with litelink.new(
         tmp_path,
@@ -565,19 +584,15 @@ def test_a_loaded_range_reaches_the_archive_only_once_its_run_settles(
         s3=s3,
     ) as log:
         _, hi = log.ingest(table(3000)) or (0, 0)
-        log.sync()
 
-        # The full files went; the short one at the end did not, and nothing
-        # buffered holds it — `coverage()` reports no gap either way.
-        assert 0 < log.archived_through() < hi
+        # No explicit sync: the load pushed its own output, tail included.
+        assert log.archived_through() >= hi, "the loaded range is not second-copied"
         assert log.buffered_rows() == 0
 
-        log.extend(rows(400, start=3000))
-        log.seal()
-        log.await_seal()
-        log.sync()
+        # And the opt-out still leaves it behind, which is what the flag means.
+        _, hi2 = log.ingest(table(500, start=hi), sync=False) or (0, 0)
 
-        assert log.archived_through() >= hi
+        assert log.archived_through() < hi2
 
 
 # -- the codec (§12) -----------------------------------------------------------
@@ -656,3 +671,62 @@ def test_a_log_reads_across_files_written_with_different_codecs(
             log.sql("SELECT count(*) c FROM log").read_all().column("c")[0].as_py()
             == 1000
         )
+
+
+def test_a_load_pushes_the_undersized_seals_beneath_it_too(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The cost of syncing from inside `ingest`, pinned so it is not a surprise.
+
+    `stable_prefix` holds back a trailing run, and a deployment may rely on that
+    to keep undersized files out of its archive. A load cannot honour that rule
+    and still second-copy itself: `_push` takes a PREFIX, because the watermark
+    it records has to stay contiguous for eviction to trust it (I4). So an
+    unsettled SEAL below the load is pushed as well.
+
+    Measured while trying the narrow version — extending the push only through
+    bulk-loaded files never advances past a seal sitting at index 0, and
+    `archived_through()` stays 0 with the load unarchived.
+
+    The trade is deliberate, and cheap because of WHEN a load happens: `ingest`
+    claims the whole log, so it is a backfill-time operation with live capture
+    typically stopped, and the trailing run is the load's own. Against that, not
+    pushing leaves rows that never entered the buffer on a single disk.
+    `sync=False` opts out for a caller who would rather sequence it themselves.
+
+    Falsify by reverting `push_unsettled` to the ordinary `stable_prefix` gate:
+    `archived_through()` drops below the load's `hi`.
+    """
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=1024 * 1024,
+        compact_min_files=2,
+        snapshot_retention=timedelta(seconds=0),
+        wal_replication=True,
+    )
+    with litelink.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=config,
+        archive=f"s3://{bucket}/prefix",
+        s3=s3,
+    ) as log:
+        # Far below the compact target, so it lands in the trailing run.
+        log.extend(rows(200))
+        log.seal()
+        log.await_seal()
+        log.sync()
+
+        assert log.archived_through() == 0, "an ordinary sync pushed an undersized seal"
+
+        _, hi = log.ingest(table(300, start=200)) or (0, 0)
+
+        # The load is second-copied, and the seal beneath it went with it.
+        assert log.archived_through() >= hi
+
+        # And opting out leaves the next load where it was.
+        _, hi2 = log.ingest(table(50, start=hi), sync=False) or (0, 0)
+
+        assert log.archived_through() < hi2

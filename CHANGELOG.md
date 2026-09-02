@@ -53,6 +53,26 @@ minor version carries breaking changes.
   to the dev group — so the endpoint came up and the bucket did not, and the
   ~91 tests in the S3 tier skipped on a fresh checkout.
 
+- **A bulk load now second-copies itself.** `ingest` writes Arrow straight to
+  Parquet, so its rows never enter the buffer and WAL replication cannot carry
+  them — the archive is their only other copy. But an ordinary `sync` held a
+  load's short last file back: `stable_prefix` keeps a trailing run under the
+  compaction budget, because a run with room in it may yet take files that have
+  not been written. On a stream that then goes quiet the run never settles.
+  Measured on a live deployment: **113,399 loaded rows on one disk**, with
+  `coverage()` reporting no gap, across nine streams and ~698,000 rows.
+
+  `ingest` now compacts and then pushes with `sync(push_unsettled=True)` when an
+  archive is configured; `sync=False` opts out. The push is a PREFIX — the
+  watermark it records has to stay contiguous for eviction to trust it (I4) — so
+  it takes everything unarchived, undersized seals beneath the load included.
+  That is why the compaction runs first: it collapses accumulated small seals so
+  only what a run genuinely cannot fill reaches the archive. Measured on five
+  small seals, six undersized objects pushed without it against one with it.
+
+  A push that fails leaves the load durable and raises saying so, because
+  retrying the LOAD would reserve a fresh range and duplicate it.
+
 ### Added
 
 - **`WriteHandle.reclaim_buffer()` and `LogConfig.vacuum_free_ratio`**, for the
@@ -121,6 +141,7 @@ the fix for that defect. Everything else in it is identical to this release.
   rather than a constant because the right answer is a property of the payload:
   §15.5 requires `none` for blob columns, where a codec spends CPU proving
   already-compressed bytes are incompressible.
+
 
 ### Fixed
 
