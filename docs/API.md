@@ -206,11 +206,19 @@ transaction, and returns.
 ### Bulk loading: `ingest`
 
 ```python
-log.ingest(source: pa.Table | pa.RecordBatchReader) -> tuple[int, int] | None
+log.ingest(source: pa.Table | pa.RecordBatchReader, *,
+           sync: bool = True) -> tuple[int, int] | None
 ```
 
 Writes Parquet directly and never puts the rows through SQLite. Returns the inclusive offset
 range it assigned, or `None` for a source with no rows.
+
+**It pushes its own output to the archive when one is configured**, compacting first, and
+`sync=False` opts out. Those rows never enter the buffer, so WAL replication cannot carry them
+and the archive is their only second copy — while an ordinary `sync` holds a load's short last
+file back behind `stable_prefix` for a merge a quiet stream never earns. If the push fails the
+load is still durable and the error says so; retry the push, never the load, which would
+reserve a fresh range and duplicate it.
 
 The buffer exists to make a row durable before it is in Parquet, and a bulk load's source is
 already durable — so every row pushed through it at `synchronous=FULL` pays a second time for
@@ -441,13 +449,19 @@ eviction alone frees no disk, and expiry is what actually deletes bytes.
 ## Archive
 
 ```python
-log.sync() -> None
+log.sync(*, push_unsettled: bool = False) -> None
 log.hydrate(since) -> None            # since: timedelta
 log.rewrite_archive() -> None
 ```
 
 `sync` uploads data files, registers them into the archive, replicates compactions, and
-records the watermark (§5). It is lazy, restartable and arbitrarily far behind, and **no read
+records the watermark (§5). `push_unsettled=True` also pushes the trailing run that
+`stable_prefix` holds back for compaction — everything unarchived, not a subset, because the
+push walks a prefix and the watermark it records must stay contiguous. Use it to close a bulk
+load's tail on a log that has gone quiet; the cost is undersized objects the archive keeps
+until `rewrite_archive` re-cuts them.
+
+`sync` is lazy, restartable and arbitrarily far behind, and **no read
 depends on it**. All three raise `ValueError` on a log with no archive, and `RuntimeError`
 when another owner holds the claim.
 

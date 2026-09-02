@@ -2350,7 +2350,12 @@ class WriteHandle(LocalReadHandle):
 
     # -- bulk ingest ---------------------------------------------------------
 
-    def ingest(self, source: pa.Table | pa.RecordBatchReader) -> tuple[int, int] | None:
+    def ingest(
+        self,
+        source: pa.Table | pa.RecordBatchReader,
+        *,
+        sync: bool = True,
+    ) -> tuple[int, int] | None:
         """Write Arrow straight into the immutable tier (§13.4). Returns `(lo, hi)`.
 
         The SQLite buffer exists to make a row durable before it is in Parquet
@@ -2412,25 +2417,41 @@ class WriteHandle(LocalReadHandle):
         defect untouched is not a safety measure. What the caller needs is the
         scope stated, which is the paragraph below.
 
-        **So the archive is a loaded range's only second copy, and `sync` may
-        lag its tail.** `stable_prefix` holds back a trailing run still under
-        `target_compact_size`, because a run with room in it may yet take files
-        that have not been written — and the last file of a load is short unless
-        the load divides evenly. Measured: 3000 rows loaded into 11 files, one
-        `sync()`, `archived_through()` 2830, the last 170 rows in one local file
-        with `coverage()` reporting no gap. It is not a stall: the run settles
-        once roughly another `target_compact_size` of rows has been written
-        above it, and the next `sync` takes it — under a minute of capture on
-        the deployment this was built for, but SCALED BY THE BUDGET, not fixed.
-        A second `ingest` settles the first one's tail the same way, so only the
-        last load in a pipeline needs the check.
+        **This pushes its own output to the archive when one is configured**,
+        and `sync=False` opts out. That is the fix for the paragraph below,
+        which described the old behaviour: a load's rows never enter the buffer,
+        so WAL replication cannot carry them and the archive is their only
+        second copy — while an ordinary `sync` held the load's short last file
+        back behind `stable_prefix`. On a stream that then went quiet the run
+        never settled. Measured on the deployment that found it: 113,399 rows on
+        one disk, with `coverage()` reporting no gap.
 
-        **Compare `archived_through()` against the `hi` this returns.** Until
-        they meet, the corpus you loaded from is the range's second copy, which
-        is the same durability this path's whole premise rests on: the source is
-        already durable, which is why the buffer is not in the way. Do not
-        enable replication expecting it to close that window — nothing it ships
-        contains these rows.
+        The push runs after the load is durable, so a failure leaves the rows
+        loaded and raises saying so — retry the push, never the load, which
+        would reserve a fresh range and duplicate it.
+
+        **The archive is still a loaded range's only second copy**, which is
+        what the push above is for. An ORDINARY `sync` is not enough and that is
+        why this does not call one: `stable_prefix` holds back a trailing run
+        still under `target_compact_size`, because a run with room in it may yet
+        take files that have not been written — and the last file of a load is
+        short unless the load divides evenly. Measured: 3000 rows loaded into 11
+        files, one `sync()`, `archived_through()` 2830, the last 170 rows in one
+        local file with `coverage()` reporting no gap.
+
+        That was documented as terminating, since the run settles once roughly
+        another `target_compact_size` of rows arrives above it. On a stream that
+        goes quiet it does not: 113,399 loaded rows sat on one disk on the
+        deployment that found this, across nine streams and ~698,000 rows. The
+        window scaled by the arrival rate, and a slow stream has none.
+
+        **Compare `archived_through()` against the `hi` this returns whenever
+        the push did not run** — `sync=False`, or a push that raised after the
+        load had landed.** Until they meet, the corpus you loaded from is the range's
+        second copy, which is the same durability this path's whole premise
+        rests on: the source is already durable, which is why the buffer is not
+        in the way. Do not enable replication expecting it to close that
+        window — nothing it ships contains these rows.
 
         Files come out sized at `target_compact_size` and sorted by `sort_by`,
         which is what makes them indistinguishable from a compacted file and so
@@ -2478,9 +2499,46 @@ class WriteHandle(LocalReadHandle):
             # opened with.
             self._table.reload()
 
-            return self._ingest_chunks(reader, shape, lease)
+            loaded = self._ingest_chunks(reader, shape, lease)
         finally:
             lease.release()
+
+        # AFTER the claim is released, so the push takes the maintenance lease
+        # in the ordinary way rather than running under a role that excludes
+        # different things. Nothing is lost by the gap: a compaction landing in
+        # it merges files the push would then take instead, which is the same
+        # rows by another name.
+        #
+        # `push_unsettled`, because the trailing run is precisely what has no
+        # second copy — `stable_prefix` holds a load's short last file back for
+        # a merge that a quiet stream never earns.
+        if loaded is not None and sync and self._archive.configured():
+            try:
+                # COMPACT first, and it is not tidiness. The push below takes
+                # the whole trailing run, so every undersized seal still sitting
+                # below the load goes to the archive with it — and compaction
+                # will not merge what the archive holds, so they stay small
+                # there for ever. Merging them locally first collapses that to
+                # the one file a run genuinely cannot fill. Measured on five
+                # small seals: six undersized objects pushed without this, one
+                # with it.
+                self.compact()
+                self.sync(push_unsettled=True)
+            except Exception as exc:
+                # The LOAD succeeded and its rows are durable in Parquet; only
+                # the second copy is missing. Saying so leading with that is the
+                # difference between a caller retrying the load — which would
+                # reserve a fresh range and duplicate it — and retrying the push.
+                msg = (
+                    f"loaded offsets {loaded[0]}..{loaded[1]} successfully, but "
+                    f"could not push them to the archive: {exc}. The rows are in "
+                    f"local Parquet and are NOT yet second-copied; retry with "
+                    f"sync(push_unsettled=True) rather than re-running the "
+                    f"load, which would reserve a new range"
+                )
+                raise RuntimeError(msg) from exc
+
+        return loaded
 
     def _refuse_unfiled_rows(self) -> None:
         """Refuse an ingest while any acknowledged row is still owed a file.
@@ -3233,8 +3291,21 @@ class WriteHandle(LocalReadHandle):
 
     # -- maintenance -------------------------------------------------------
 
-    def sync(self) -> None:
+    def sync(self, *, push_unsettled: bool = False) -> None:
         """Push to the archive: upload, register, record the watermark (§5).
+
+        `push_unsettled=True` pushes EVERYTHING unarchived, including the
+        trailing run `stable_prefix` normally holds back for compaction. It is
+        not scoped to any subset — `_push` walks a prefix, because the watermark
+        it records has to stay contiguous for eviction to trust it (I4), so
+        there is no way to push the top of the list without the rest.
+
+        `ingest` passes it, because a load's rows never enter the buffer and so
+        have no second copy to wait behind. An operator passes it to close a
+        load's tail on a log that has gone quiet, where the run never settles.
+        The cost is undersized objects in the archive that compaction will not
+        merge afterwards; `ingest` runs a compaction first to keep that to what
+        a run genuinely cannot fill.
 
         Archive-facing work only. Lazy, restartable, and arbitrarily far
         behind — no read depends on it. Raises if no archive is configured;
@@ -3251,8 +3322,16 @@ class WriteHandle(LocalReadHandle):
         `compact_min_files` files, until compaction grows it past the line.
 
         There is therefore at most one undersized region in the system and it
-        is always the local one. The archive is well-sized by construction
-        rather than by a pass that repairs it afterwards.
+        is always the local one — **as long as nobody passes `push_unsettled`**.
+        That flag exists because a bulk load's rows never enter the buffer, so
+        the trailing run holding its short last file has no second copy to wait
+        behind, and the rule above would strand it on local disk for as long as
+        the stream stayed quiet. A load therefore can leave undersized objects
+        in the archive — up to `compact_min_files - 1` seals forming a run
+        `_merge` will not rewrite, plus the load's own tail — and compaction
+        will not merge them afterwards, because it refuses to touch anything the
+        archive holds. `rewrite_archive` re-cuts them. `ingest` compacts before
+        pushing to keep the count to what a run genuinely cannot fill.
 
         DEVIATES from §5, which also lists snapshot expiry (step 4) and local
         eviction (step 5). Both are local storage work and belong to `maintain`;
@@ -3300,12 +3379,32 @@ class WriteHandle(LocalReadHandle):
             # sides of the comparison change together. The fence passes, and
             # the watermark this push earned is recorded against an archive
             # that never received it.
-            self._push(lease, self._archive.uri)
+            self._push(lease, self._archive.uri, push_unsettled=push_unsettled)
         finally:
             lease.release()
 
-    def _push(self, lease: Claim, pinned: str | None) -> None:
+    def _push(
+        self, lease: Claim, pinned: str | None, *, push_unsettled: bool = False
+    ) -> None:
         """Upload and register everything above the archive's extent.
+
+        **`push_unsettled` pushes the trailing run too**, which `sync`
+        otherwise holds back because compaction may still merge it. Holding it
+        back is right when the rows have a second copy and wrong when they do
+        not: a bulk load's last file is short unless the load divides evenly,
+        and `ingest` rows never enter the buffer, so until that file is in the
+        archive the only copy is local disk. Measured on the deployment that
+        found this: 3,000 rows loaded into 11 files, one ordinary `sync()`,
+        `archived_through()` 2,830 — the last 170 rows local, with
+        `coverage()` reporting no gap. On a stream that then went quiet the run
+        never settled, and 113,399 rows sat on one disk.
+
+        Safe in the direction it moves. Compaction refuses to merge anything an
+        archive already holds, so a file pushed early is simply never merged —
+        the cost is a small object the archive keeps until `rewrite_archive`
+        re-cuts it, not a duplicate range. The deadlock the shared `runs`
+        exclusion guards against is the opposite direction: holding back a file
+        compaction will never touch.
 
         Everything compaction has finished with, which `stable_prefix` decides
         from compaction's own rule rather than from a size of its own. A file
@@ -3485,6 +3584,25 @@ class WriteHandle(LocalReadHandle):
             memory,
             config.compact_rows,
         )
+        if push_unsettled:
+            # EVERYTHING unarchived, and that is forced rather than chosen.
+            # `pending[:settled]` is a PREFIX because the watermark recorded
+            # below has to stay contiguous — eviction trusts it for I4 — so
+            # there is no way to push a load's tail while leaving an undersized
+            # SEAL beneath it unpushed. Attempted and measured: extending only
+            # through bulk-loaded files never advances past a seal sitting at
+            # index 0, and `archived_through()` stays 0 with the load
+            # unarchived. Hence the blunt name.
+            #
+            # So this ships those files. Acceptable because of WHEN a load
+            # happens: `ingest` claims the whole log and is a backfill-time
+            # operation, so live capture is typically stopped and the trailing
+            # run is the load's own. And the alternative is worse by a wide
+            # margin — a load's rows never enter the buffer, so not pushing them
+            # leaves them on one disk. Compaction will not merge what the
+            # archive holds, so any small objects persist until
+            # `rewrite_archive` re-cuts them.
+            settled = len(pending)
 
         uploaded: list[tuple[DataFile, str]] = []
         for data_file in pending[:settled]:
@@ -3737,10 +3855,12 @@ class WriteHandle(LocalReadHandle):
 
         An operation, not a policy. Nothing calls it on a schedule and normal
         operation does not need it: `sync` pushes only files compaction has
-        finished with, so the archive is well-sized by construction. It exists
-        for the two things that break that on purpose — an explicit `seal()`
-        stranding a small file, and a change to `target_compact_size`, which
-        applies to the future while the archive is immutable history.
+        finished with, so the archive is well-sized by construction — except for
+        what a bulk load pushed with `push_unsettled` to avoid stranding rows
+        that have no second copy. It exists for the three things that break that
+        on purpose — an explicit `seal()` stranding a small file, a change to
+        `target_compact_size`, which applies to the future while the archive is
+        immutable history, and that load's undersized push.
 
         Run it when nothing else is maintaining the log: it takes the same
         lease as `maintain` and `sync`, and it rewrites the same files they
