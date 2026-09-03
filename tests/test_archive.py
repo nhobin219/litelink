@@ -4486,8 +4486,10 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
     refuses it rather than not having it, which is the cost recorded in
     `LogHandle`'s docstring.
     """
-    taken = set(inspect.signature(litelink.follow).parameters)
-    assert taken == {"name", "archive", "s3", "binary", "scratch_dir"}
+    taken = set(inspect.signature(litelink.snapshot).parameters)
+    assert taken == {"name", "archive", "s3", "binary", "scratch_dir", "include_wal"}
+    # The deprecated alias forwards the whole surface, or it is not an alias.
+    assert set(inspect.signature(litelink.follow).parameters) == taken
     assert "root" not in taken, (
         "a caller-supplied root can land on a directory that already holds a "
         "live log, whose catalog.db and archive.db are shared by every log "
@@ -5089,3 +5091,71 @@ def test_follow_still_works_and_says_it_is_deprecated(
 
     with view:
         assert view.scan(include_archive=True).read_all().num_rows == frontier
+
+
+def test_an_archive_only_snapshot_keeps_a_column_added_mid_stream(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The column SET comes from Iceberg, not from the sampled file's footer.
+
+    A data file's schema is whatever was declared when it was written, and
+    files of two shapes land in ONE commit whenever rows were sealed-but-
+    unsynced as `add_column` ran — `plan_files()` promises no order, so the
+    footer alone answered with the pre-evolution set. Measured before the fix:
+    1,132 rows served without `region` while the archive durably held 600 rows
+    carrying it, and the handle's own `schema` agreed with its own `scan()`, so
+    nothing looked wrong from either.
+
+    No crash is needed. A sync interval that spans the `add_column` is enough,
+    which is the ordinary shape.
+    """
+    where = f"s3://{bucket}/evolved"
+    config = replace(
+        LogConfig(),
+        target_seal_size=4 * 1024,
+        target_compact_size=4 * 1024,
+        compact_min_files=2,
+    )
+    narrow = pa.schema(
+        [pa.field("event_ts", pa.int64(), nullable=False), pa.field("key", pa.string())]
+    )
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary,
+        "s",
+        schema=narrow,
+        sort_by=("event_ts",),
+        config=config,
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend([{"event_ts": i, "key": "k"} for i in range(300)])
+        log.seal()
+        log.await_seal()
+        log.sync()
+        # Sealed but NOT yet pushed when the column arrives — so old- and
+        # new-shape files reach the archive in one register.
+        log.extend([{"event_ts": i, "key": "k"} for i in range(300, 700)])
+        log.seal()
+        log.await_seal()
+        log.add_column("region", pa.string())
+        log.extend(
+            [{"event_ts": i, "key": "k", "region": "eu"} for i in range(700, 1300)]
+        )
+        log.seal()
+        log.await_seal()
+        log.maintain()
+        log.sync()
+        frontier = log.archived_through()
+        expected = [f.name for f in log.schema]
+
+    assert "region" in expected, "the fixture must evolve the schema"
+
+    with litelink.snapshot("s", archive=where, s3=s3, include_wal=False) as view:
+        assert [f.name for f in view.schema] == expected
+        served = view.scan(include_archive=True).read_all()
+
+        assert [f.name for f in served.schema if f.name != OFFSET] == expected
+        assert served.num_rows == frontier
+        # And the values are really there, not a null column bolted on.
+        assert served.column("region").drop_null().length() > 0

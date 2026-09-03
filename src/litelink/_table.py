@@ -330,34 +330,51 @@ def archive_shape(
     names = {f.field_id: f.name for f in table.schema().fields}
     sort_by = tuple(names[f.source_id] for f in table.sort_order().fields)
 
-    # **From a DATA FILE's footer, not from the Iceberg schema**, and the
-    # difference is observable. Iceberg has one string type, so a `string`
-    # column comes back from `schema().as_arrow()` as `large_string` — while
-    # every other path a caller can see reports `string`, because the Parquet
-    # is written from the DECLARED Arrow schema and the footer carries it
-    # verbatim. That footer is what DuckDB reads, which is why a local read and
-    # an archived read agree today; taking the schema from Iceberg here would
-    # have made this the one path that disagreed with `scan()` on its own
-    # handle.
+    # **The COLUMN SET comes from Iceberg and the TYPES come from a data file's
+    # footer**, and both halves are load-bearing.
     #
-    # One extra GET, against a path whose entire purpose is avoiding twenty.
-    # Read through the FileIO already built above rather than a second
-    # filesystem: `InputFile.open()` is seekable, which is all a footer needs.
+    # Iceberg for the set, because its schema is versioned and current while a
+    # data file's is whatever was declared when that file was written. Files of
+    # both shapes land in ONE commit whenever rows were sealed-but-unsynced as
+    # `add_column` ran, and `plan_files()` promises no order — so a footer alone
+    # answered with the PRE-evolution column set and the snapshot served every
+    # row without the new column. Reproduced: 1,132 rows served without
+    # `region` while the archive durably held 600 rows carrying it, with the
+    # handle's own `schema` and `scan()` agreeing so nothing looked wrong.
+    #
+    # The footer for the types, because Iceberg has one string type: a `string`
+    # column comes back from `schema().as_arrow()` as `large_string`, while
+    # every other path a caller can see reports what was declared — the Parquet
+    # is written from the declared Arrow schema and the footer carries it
+    # verbatim. That footer is also what DuckDB reads, which is why a local read
+    # and an archived read agree.
+    #
+    # A column added AFTER the sampled file falls back to Iceberg's type, which
+    # differs only in string width. That is the residual, and it is bounded:
+    # never a missing column, only a wider one.
+    #
+    # One extra GET, against a path whose purpose is avoiding twenty. Read
+    # through the FileIO already built above rather than a second filesystem:
+    # `InputFile.open()` is seekable, which is all a footer needs.
+    written: dict[str, pa.DataType] = {}
     for task in table.scan().plan_files():
         with io.new_input(task.file.file_path).open() as data:
-            written = pq.read_schema(data)
+            written = {field.name: field.type for field in pq.read_schema(data)}
 
-        return (
-            pa.schema([f for f in written if f.name != "litelink_offset"]),
-            sort_by,
-        )
+        break
 
-    # Published metadata naming no data file. Nothing can be served from it, so
-    # the schema is academic — but answering with Iceberg's projection would be
-    # the disagreement above, so it says so instead.
-    return pa.schema(
-        [f for f in table.schema().as_arrow() if f.name != "litelink_offset"]
-    ), sort_by
+    return (
+        pa.schema(
+            [
+                pa.field(
+                    field.name, written.get(field.name, field.type), field.nullable
+                )
+                for field in table.schema().as_arrow()
+                if field.name != "litelink_offset"
+            ]
+        ),
+        sort_by,
+    )
 
 
 def archive_columns(
