@@ -19,13 +19,14 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pyarrow as pa
 import pytest
 
 import litelink
-from litelink import LogConfig, WriteHandle
+from litelink import LogConfig, WriteHandle, _table
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
 from litelink._layout import Layout
@@ -5358,3 +5359,68 @@ def test_restore_refuses_a_buffer_that_records_no_archive(
     assert not LogTable.exists_for(Layout(revived, "s")), (
         "restore built the log before refusing; the root is no longer retryable"
     )
+
+
+def test_an_archive_only_snapshot_resolves_the_pointer_once(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assembly is round-trip bound, so a redundant resolve is most of it.
+
+    `archive_shape` and `archive_extent` do the identical first two steps —
+    fetch `version-hint.text`, parse the metadata it names — and an
+    archive-only snapshot called both, then `open_archive` fetched the hint a
+    third time. Measured before this: three hint GETs and two metadata parses
+    for one assembly. Against a bucket at 60-75 ms RTT that is most of the
+    wall clock, and on a large archive the metadata is not small.
+
+    Counted rather than timed: a timing assertion on a network path is a flaky
+    test, and the round trips are what the cost is made of.
+    """
+    where = f"s3://{bucket}/one-resolve"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=8 * 1024,
+        compact_min_files=2,
+    )
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        frontier = log.archived_through()
+
+    assert frontier > 0, "the fixture must archive something"
+
+    seen: list[str] = []
+    published = _table._published_location  # noqa: SLF001
+    static = _table.StaticTable.from_metadata
+
+    def counted_hint(*args: Any, **kwargs: Any) -> Any:
+        seen.append("hint")
+
+        return published(*args, **kwargs)
+
+    def counted_parse(*args: Any, **kwargs: Any) -> Any:
+        seen.append("parse")
+
+        return static(*args, **kwargs)
+
+    monkeypatch.setattr(_table, "_published_location", counted_hint)
+    monkeypatch.setattr(_table.StaticTable, "from_metadata", counted_parse)
+
+    with litelink.snapshot("s", archive=where, s3=s3) as view:
+        assert view.scan(include_archive=True).read_all().num_rows == frontier
+
+    monkeypatch.undo()
+    hints = seen.count("hint")
+    parses = seen.count("parse")
+
+    assert parses == 1, f"parsed the archive metadata {parses} times, not once"
+    # Two hint reads remain: `archive_shape`'s, and `open_archive`'s own
+    # create-versus-adopt decision, which is on the write path too and is not
+    # this function's to thread through.
+    assert hints <= 2, f"fetched version-hint.text {hints} times, not two"

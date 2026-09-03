@@ -154,14 +154,17 @@ The archive is an ordinary Iceberg table that publishes `version-hint.text` at e
 an engine pointed at the prefix resolves the current metadata itself. No catalog service, no
 local root, no litelink install:
 
-```sql
-INSTALL iceberg; LOAD iceberg;
-INSTALL httpfs; LOAD httpfs;
-CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+```python
+import duckdb
 
-SELECT count(*), max(litelink_offset)
-FROM iceberg_scan('s3://bucket/prefix/trades',
-                  version_name_format = '%s%s.metadata.json');
+con = duckdb.connect()
+con.execute("CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1');")
+
+table = con.execute("""
+    SELECT count(*), max(litelink_offset)
+    FROM iceberg_scan('s3://bucket/prefix/trades',
+                      version_name_format = '%s%s.metadata.json')
+""").arrow().read_all()
 ```
 
 Point it at the table DIRECTORY — `<archive>/<name>` — not at a metadata JSON.
@@ -169,10 +172,19 @@ Point it at the table DIRECTORY — `<archive>/<name>` — not at a metadata JSO
 while pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the format has to stop
 prepending the `v`. `credential_chain` is the ordinary AWS resolution — profile, instance
 metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
-`URL_STYLE 'path'` instead.
+`URL_STYLE 'path'` instead. No `INSTALL`/`LOAD` is needed — DuckDB autoloads `iceberg`, `avro`
+and `httpfs` when a query names them, and `just bootstrap` provisions them ahead of time so the
+first read is not a download.
 
 That is the same question the first snippet asks, and on a default snapshot it returns the same
 answer — both read the archive, one through litelink's union and one straight at the table.
+
+**Which to reach for.** A one-shot query in a script is cheaper this way: `snapshot` assembles a
+DuckDB connection, a scratch buffer and an adopted catalog before it can answer anything, and
+you exit before reusing any of it. Hold a snapshot open and the order reverses — measured on a
+200k-row archive, a bounded scan is 0.02 s against 0.40 s for a fresh DuckDB connection, because
+the connection and the loaded extensions are already there. Assemble once and scan many times,
+or use the query above.
 
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
 asks for what came after — which is how you poll the archive as it grows.
