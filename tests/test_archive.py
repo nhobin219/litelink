@@ -5060,7 +5060,10 @@ def test_an_archive_only_snapshot_refuses_a_log_that_is_all_buffer(
 
         assert log.archived_through() == 0, "the fixture must archive nothing"
 
-    with pytest.raises(ValueError, match="published no metadata"):
+    # No sidecar has run here, so there is no replica either — and the honest
+    # answer is that NOTHING off this machine can read the log yet, rather than
+    # that the name is wrong.
+    with pytest.raises(ValueError, match="can be read as a log called s"):
         litelink.snapshot("s", archive=where, s3=s3, include_wal=False)
 
 
@@ -5201,9 +5204,9 @@ def test_an_archive_only_snapshot_tells_a_slow_capture_from_a_typo(
     assert "the log exists" in str(slow.value)
 
     # Same bucket, a name nothing wrote. No replica, so no such log.
-    with pytest.raises(ValueError, match="names a log called typo") as typo:
+    with pytest.raises(ValueError, match="can be read as a log called typo") as typo:
         litelink.snapshot("typo", archive=where, s3=s3, include_wal=False)
 
-    assert "no WAL replica either" in str(typo.value)
+    assert "no WAL replica" in str(typo.value)
     # It names the resolved location, so the typo is visible rather than guessed at.
     assert f"{where}/typo/_wal" in str(typo.value)

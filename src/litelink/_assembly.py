@@ -365,9 +365,13 @@ def _archived_shape(
         # shape for the prefix itself.
         #
         # The WAL replica separates them. If one is there, the log exists, is
-        # replicated, and `include_wal=True` will genuinely work; if it is not,
-        # nothing at this prefix names this log. One LIST against a path this
-        # module already derives one way — `replica_uri` — rather than a second
+        # replicated, and `include_wal=True` will genuinely work. If it is not,
+        # NOTHING off this machine can read the log yet — not this path and not
+        # the WAL one — which is the honest thing to say, and it covers both a
+        # wrong prefix and a real log whose sidecar has not shipped. The
+        # earlier wording claimed a real log "would have the replica", which is
+        # only true once litestream has run. One LIST against a path this
+        # module already derives one way — `destination` — rather than a second
         # spelling of it.
         replicated = _has_replica(prefix, layout.name, options)
         if replicated:
@@ -380,12 +384,15 @@ def _archived_shape(
             )
         else:
             msg = (
-                f"nothing at {prefix} names a log called {layout.name}: it has "
-                f"published no archive metadata and has no WAL replica either. "
-                f"Check the prefix and the name — together they resolve to "
-                f"{destination(prefix, layout.name)}. A log that exists but has "
-                f"archived nothing yet would have the replica, and would be "
-                f"readable with include_wal=True."
+                f"nothing at {prefix} can be read as a log called "
+                f"{layout.name}: it has published no archive metadata, and "
+                f"there is no WAL replica at "
+                f"{destination(prefix, layout.name)} either — so "
+                f"include_wal=True has nothing to restore from and would fail "
+                f"too. Check the prefix and the name. If the log is real and "
+                f"simply young, its sidecar has not shipped yet: nothing off "
+                f"this machine can read it until either the sidecar ships or "
+                f"a sync pushes."
             )
 
         raise ValueError(msg)
