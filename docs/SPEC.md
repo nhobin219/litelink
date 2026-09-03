@@ -423,18 +423,25 @@ the log fails outright. See §3a's failover notes and `litelink.restore`.
 
 ## 3b. Reading a log from another machine
 
-`litelink.snapshot` assembles a **read-only view of a log running somewhere else**: the archive
-merged with a restored copy of the writer's `buffer.db`, so a reader sees data fresher than
-the archive alone — down to the replication lag rather than to the seal cadence. It is what
-§3a's replication buys on the read side, and it exists because the alternative readers had
-was the archive, which is `sync`-fresh at best.
+`litelink.snapshot` assembles a **read-only view of a log running somewhere else**, in one of
+two modes.
 
-**`include_wal=False` reads the archive alone**, skipping the WAL restore. It is a different
-view rather than a faster route to the same one: staleness becomes the archive frontier rather
-than the replication lag, the shape comes from a data file's Parquet footer rather than from
-the replica's `meta`, and the archive prefix comes from the caller rather than from the
-writer's own record of it. A log whose archive has published nothing is refused rather than
-served empty — that state is exactly when the buffer holds everything.
+**By default it reads the archive alone**, which is the mode that works on an ordinary log:
+`wal_replication` is opt-in and needs a sidecar, so most logs have no replica to restore and
+the merged read fails outright on them.
+
+**`include_wal=True` merges a restored copy of the writer's `buffer.db` with the archive**, so
+a reader sees data fresher than the archive alone — down to the replication lag rather than to
+the seal cadence. It is what §3a's replication buys on the read side, and it exists because the
+alternative readers had was the archive, which is `sync`-fresh at best.
+
+The two are different views rather than one being a faster route to the other, and the
+archive-only mode differs in three ways that are stated rather than discovered: staleness is
+the archive frontier rather than the replication lag; the shape comes from a data file's
+Parquet footer rather than from the replica's `meta`; and the archive prefix comes from the
+caller rather than from the writer's own record of it. A log whose archive has published
+nothing is refused rather than served empty — that state is exactly when the buffer holds
+everything, and it is the one case where only `include_wal=True` can serve the log.
 
 **It is `restore`'s assembly without the takeover.** `restore` burns `RESTORE_RESERVE`
 offsets to fence a machine that may still be writing (I9); a follower appends nothing, so
