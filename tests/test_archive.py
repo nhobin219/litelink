@@ -3912,7 +3912,9 @@ def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         got = follower.scan().read_all()
         offsets = got.column(OFFSET).to_pylist()
 
@@ -3972,7 +3974,9 @@ def test_a_follower_refuses_to_read_without_the_archive(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         # Refused, not absent. Unifying the two read-only shapes into one
         # `LogHandle` means the parameter has to exist for the local case,
         # where a hot read is local disk only (I5). This is the cost, and it
@@ -4035,7 +4039,9 @@ def test_a_follower_writes_nothing_the_primary_shares(
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-readonly"))
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         follower.scan().read_all()
         root = follower.root
 
@@ -4106,7 +4112,9 @@ def test_a_follower_writes_nothing_into_an_unpublished_archive(
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-unpublished"))
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         assert follower.scan().read_all().num_rows == 50
 
     assert sorted(fs.find(f"{bucket}/follow-unpublished")) == before, (
@@ -4163,7 +4171,9 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         # Warm both caches, which is what makes the naive detector unreachable.
         assert follower.scan().read_all().num_rows > 0
         assert follower.coverage().gap is None
@@ -4257,7 +4267,9 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
         log.maintain()
         log.sync()
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         served = follower.scan().read_all().column(OFFSET).to_pylist()
         assert served, "the fixture must serve rows for this to mean anything"
 
@@ -4350,7 +4362,11 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
     # The control first, so a failure here means the fixture is wrong rather
     # than the code: a non-empty buffer always reported this band correctly.
     with litelink.snapshot(
-        "s", archive=build("ctl", unsealed=40), s3=s3, binary=str(binary)
+        "s",
+        archive=build("ctl", unsealed=40),
+        s3=s3,
+        binary=str(binary),
+        include_wal=True,
     ) as control:
         served = control.scan().read_all().column(OFFSET).to_pylist()
         assert control.coverage().buffered is not None
@@ -4358,7 +4374,11 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
         assert control.end_offset() == max(served) + 1
 
     with litelink.snapshot(
-        "s", archive=build("empty", unsealed=0), s3=s3, binary=str(binary)
+        "s",
+        archive=build("empty", unsealed=0),
+        s3=s3,
+        binary=str(binary),
+        include_wal=True,
     ) as follower:
         served = follower.scan().read_all().column(OFFSET).to_pylist()
         coverage = follower.coverage()
@@ -4449,7 +4469,9 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
 
     monkeypatch.setattr(Reader, "_prepare_remote", sweeping)
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         # Warm every cache first, so the guard alone cannot be what fires.
         assert follower.scan().read_all().num_rows > 0
 
@@ -4639,7 +4661,9 @@ def test_a_follower_with_no_replica_says_which_two_things_it_could_be(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(FileNotFoundError) as caught:
-        litelink.snapshot("trades", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot(
+            "trades", archive=where, s3=s3, binary=str(binary), include_wal=True
+        )
 
     message = str(caught.value)
     assert "wal_replication off" in message, message
@@ -4649,7 +4673,9 @@ def test_a_follower_with_no_replica_says_which_two_things_it_could_be(
     # serves the log, so this error is specific to the missing replica rather
     # than to the setup. A sharper control than it used to be — the log that
     # exists was once refused too, for never having synced.
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as ok:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as ok:
         assert ok.scan().read_all().num_rows == 50
 
 
@@ -4679,7 +4705,9 @@ def test_an_unreachable_archive_is_not_reported_as_an_absent_replica(
     # exactly the absent-replica case, and would prove nothing here.
     absent = f"s3://litelink-no-such-bucket-{uuid.uuid4().hex[:12]}/p"
     with pytest.raises(RuntimeError, match="litestream restore failed"):
-        litelink.snapshot("s", archive=absent, s3=s3, binary=str(binary))
+        litelink.snapshot(
+            "s", archive=absent, s3=s3, binary=str(binary), include_wal=True
+        )
 
     assert not (tmp_path / "s").exists()
 
@@ -4766,7 +4794,9 @@ def test_a_log_whose_buffer_holds_everything_can_be_followed(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot(
+        "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+    ) as follower:
         got = follower.scan().read_all()
 
         assert got.num_rows == served == 400
@@ -4824,7 +4854,9 @@ def test_a_follower_refuses_a_log_whose_seals_were_discarded(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(ValueError, match="starts at offset"):
-        litelink.snapshot("s", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot(
+            "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+        )
 
 
 def test_a_follower_refuses_a_log_with_a_bulk_loaded_hole(
@@ -4875,7 +4907,9 @@ def test_a_follower_refuses_a_log_with_a_bulk_loaded_hole(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(ValueError, match="bulk-loaded straight to Parquet"):
-        litelink.snapshot("s", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot(
+            "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+        )
 
 
 def test_the_ingest_marker_catches_a_hole_the_extent_rows_no_longer_show(
@@ -4933,7 +4967,9 @@ def test_the_ingest_marker_catches_a_hole_the_extent_rows_no_longer_show(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(ValueError, match="bulk-loaded straight to Parquet"):
-        litelink.snapshot("s", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot(
+            "s", archive=where, s3=s3, binary=str(binary), include_wal=True
+        )
 
 
 def test_an_archive_only_snapshot_serves_what_the_archive_holds(
