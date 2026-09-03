@@ -51,7 +51,7 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
 litelink.open(root, name, *, s3=None)                    -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3=None)    -> LocalReadHandle
 litelink.restore(root, name, *, archive, s3=None, binary=None) -> WriteHandle
-litelink.follow(name, *, archive, s3=None, binary=None,
+litelink.snapshot(name, *, archive, s3=None, binary=None,
                 scratch_dir=None)                        -> RemoteReadHandle
 ```
 
@@ -69,7 +69,7 @@ methods raise. A non-literal `read_only` falls back to `LogHandle` and the calle
 
 ### The local/remote boundary is the constructor
 
-| | `open(root, name, read_only=True)` | `follow(name, archive=…)` |
+| | `open(root, name, read_only=True)` | `snapshot(name, archive=…)` |
 |---|---|---|
 | **type** | `LocalReadHandle` | `RemoteReadHandle` |
 | **what you pass** | a root **on this machine** | an **archive URI**, and no root |
@@ -91,7 +91,7 @@ with litelink.open("data", "trades", read_only=True) as r:
     r.write_replication_config()      # its replica key IS the primary's
 
 # On any other box: no root, an archive URI, and a WAL sidecar on the writer.
-with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as r:
+with litelink.snapshot("trades", archive="s3://bucket/prefix", s3=opts) as r:
     r.coverage()                      # Coverage(archive=(1, 1928), buffered=(1929, 2100), …)
     r.scan(where="side = 0")          # archive + replicated tail, merged
     r.write_replication_config()      # AttributeError — it does not have one
@@ -322,39 +322,83 @@ commit, and a pinned pointer serves one stale snapshot for ever. What this reade
 anything newer than the last `sync()`: rows still in the buffer or the local table are on the
 writing box alone, so its freshness lever is the sync interval.
 
-That last sentence used to say "rather than anything at the reader", which `litelink.follow` below
-makes false — with a WAL sidecar there *is* a lever at the reader.
+That last sentence used to say "rather than anything at the reader", which `litelink.snapshot`
+below makes false — with a WAL sidecar there *is* a lever at the reader.
 
 `tests/test_archive.py::test_the_archive_reads_as_a_directory_with_no_catalog_at_all` is that
 claim as a test — it captures through a live archive and asserts the DuckDB row count equals
 the writer's `archived_through()`.
 
-### Fresher than the archive: `litelink.follow`
-
-When the writer runs a WAL sidecar (`wal_replication`, §3a), a reader can do better than the
-last `sync()`. `litelink.follow` restores the writer's `buffer.db` from its replica, adopts the
-archive beside it, and merges the two — so freshness falls to the replication lag.
+### Reading a log on another machine: `litelink.snapshot`
 
 ```python
-litelink.follow(name, *, archive, s3=None, binary=None, scratch_dir=None) -> RemoteReadHandle
+litelink.snapshot(name, *, archive, s3=None, binary=None, scratch_dir=None,
+                  include_wal=True) -> RemoteReadHandle
 ```
 
+A point-in-time view of a log running somewhere else. **A snapshot, not a subscription**:
+refreshing means assembling another one.
+
+It was called `follow`, which promised a subscription it never provided — its docstring had to
+open by saying so. `litelink.follow` still works and emits a `DeprecationWarning`; it will be
+removed no earlier than 0.4.
+
+**Two modes, and the difference is bigger than the flag makes it look.**
+
+| | `include_wal=True` (default) | `include_wal=False` |
+|---|---|---|
+| what it reads | WAL replica **+** archive | archive alone |
+| fresh to | the replication lag | the archive frontier |
+| assembles in | seconds — see below | one catalog read |
+| needs litestream | yes | no |
+| a log with nothing archived | served from the buffer | **refused** |
+
+With `include_wal=True` the writer's `buffer.db` is restored from its replica, the archive is
+adopted beside it, and the two are merged — so freshness falls to the replication lag rather
+than to the seal cadence.
+
+**`include_wal=False` skips the restore entirely**, which is almost all of the cost. Measured
+against S3 at 60–75 ms RTT: a 1.9 MB buffer took **7.2 s**, of which transfer was ~0.2 s. The
+rest is one LIST plan plus ~20 serial GETs, and the chain length grows with the log's **age**
+rather than its size, because a slow stream accumulates LTX files on the sync interval however
+few rows it holds. The same handle assembled archive-only takes about a quarter of a second.
+
+Reach for it when the last few minutes do not matter — historical and analytical reads over a
+long window, where the freshness buys nothing and the 7 s is the whole bill.
+
+**Its staleness is the archive frontier, which is not "a few seconds".** `sync` holds back a
+trailing run still under `target_compact_size`, so on a quiet stream the frontier can lag
+indefinitely rather than by the sync interval. `coverage()` reports what it can actually serve.
+
+**It refuses a log whose archive has published nothing**, naming `include_wal=True`. That is
+the ordinary state of a slow capture, and it is exactly when the buffer holds everything — so
+an archive-only handle would serve zero rows. Returning an empty snapshot there is the one
+silent wrong answer this path could give.
+
+**The two modes learn the log's shape from different places**, which is worth knowing if you
+point one at the wrong prefix. With the WAL, the schema, sort order and archive location all
+come from the replica's `meta` — the writer's own copy, which survives a re-point. Without it,
+the schema comes from a data file's Parquet footer (the exact types the writer declared, not
+Iceberg's projection of them, which cannot tell `string` from `large_string`), and the location
+is whatever you passed.
+
 ```python
-with litelink.follow("trades", archive="s3://bucket/prefix", s3=opts) as reader:
+with litelink.snapshot("trades", archive="s3://bucket/prefix", s3=opts) as reader:
     reader.coverage()        # what it can serve, and where it cannot
     reader.end_offset()      # compare against the primary's to measure staleness
     reader.scan(where="side = 0")
     reader.sql("SELECT side, count(*) FROM log GROUP BY side")
 ```
 
-`archive` is where the *WAL replica* lives; the archive prefix itself comes from the replica's
-own `meta`.
+With `include_wal=True`, `archive` is where the *WAL replica* lives and the archive prefix
+itself comes from the replica's own `meta`. With `include_wal=False` there is no replica, so
+`archive` is the prefix.
 
-**A log that has published nothing can still be followed if its buffer holds all of it** — the
-ordinary state of a slow capture, where `wal_replication` makes a seal retain its rows. It is
-refused when rows left the buffer (its first offset sits above the log's) or bypassed it
-(`ingest` writes straight to Parquet and records `ingested_through`), because serving it then
-would silently omit those rows.
+**A log that has published nothing can still be read with `include_wal=True` if its buffer
+holds all of it** — the ordinary state of a slow capture, where `wal_replication` makes a seal
+retain its rows. Even then it is refused when rows left the buffer (its first offset sits above
+the log's) or bypassed it (`ingest` writes straight to Parquet and records `ingested_through`),
+because serving it would silently omit those rows.
 
 **This returns a `RemoteReadHandle`, a sibling of the `LocalReadHandle` that `open(..., read_only=True)` returns.** It holds the read
 collaborators — the replicated buffer, the local table, the archive handle, and the reader
@@ -585,7 +629,7 @@ without `wal_replication`, `wal_replication` without an archive, a `vacuum_free_
 **`vacuum_free_ratio` is about what READERS pay.** SQLite puts pages freed by a delete on a
 free list and never shrinks the file, so a buffer that seals and archives for months keeps
 every page it has ever needed. Locally that is invisible — the free list is reused — but
-litestream replicates the FILE, so every `follow` and every `restore` downloads and applies
+litestream replicates the FILE, so every `snapshot` and every `restore` downloads and applies
 the dead space. Measured on a 1-day-old capture: 457 MB holding 20,658 live rows with 92% of
 its pages free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
 

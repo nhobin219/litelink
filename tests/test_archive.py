@@ -3912,7 +3912,7 @@ def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         got = follower.scan().read_all()
         offsets = got.column(OFFSET).to_pylist()
 
@@ -3972,7 +3972,7 @@ def test_a_follower_refuses_to_read_without_the_archive(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Refused, not absent. Unifying the two read-only shapes into one
         # `LogHandle` means the parameter has to exist for the local case,
         # where a hot read is local disk only (I5). This is the cost, and it
@@ -4035,7 +4035,7 @@ def test_a_follower_writes_nothing_the_primary_shares(
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-readonly"))
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         follower.scan().read_all()
         root = follower.root
 
@@ -4106,7 +4106,7 @@ def test_a_follower_writes_nothing_into_an_unpublished_archive(
     fs = filesystem(s3)
     before = sorted(fs.find(f"{bucket}/follow-unpublished"))
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         assert follower.scan().read_all().num_rows == 50
 
     assert sorted(fs.find(f"{bucket}/follow-unpublished")) == before, (
@@ -4163,7 +4163,7 @@ def test_a_follower_whose_snapshot_was_swept_fails_on_both_paths(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Warm both caches, which is what makes the naive detector unreachable.
         assert follower.scan().read_all().num_rows > 0
         assert follower.coverage().gap is None
@@ -4257,7 +4257,7 @@ def test_a_follower_counts_the_archive_frontier_in_its_end_offset(
         log.maintain()
         log.sync()
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         served = follower.scan().read_all().column(OFFSET).to_pylist()
         assert served, "the fixture must serve rows for this to mean anything"
 
@@ -4349,7 +4349,7 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
 
     # The control first, so a failure here means the fixture is wrong rather
     # than the code: a non-empty buffer always reported this band correctly.
-    with litelink.follow(
+    with litelink.snapshot(
         "s", archive=build("ctl", unsealed=40), s3=s3, binary=str(binary)
     ) as control:
         served = control.scan().read_all().column(OFFSET).to_pylist()
@@ -4357,7 +4357,7 @@ def test_a_follower_with_an_empty_replica_reports_the_band_it_cannot_serve(
         assert control.coverage().gap is not None
         assert control.end_offset() == max(served) + 1
 
-    with litelink.follow(
+    with litelink.snapshot(
         "s", archive=build("empty", unsealed=0), s3=s3, binary=str(binary)
     ) as follower:
         served = follower.scan().read_all().column(OFFSET).to_pylist()
@@ -4449,7 +4449,7 @@ def test_a_follower_swept_inside_the_read_window_still_says_reassemble(
 
     monkeypatch.setattr(Reader, "_prepare_remote", sweeping)
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         # Warm every cache first, so the guard alone cannot be what fires.
         assert follower.scan().read_all().num_rows > 0
 
@@ -4634,7 +4634,7 @@ def test_a_follower_with_no_replica_says_which_two_things_it_could_be(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(FileNotFoundError) as caught:
-        litelink.follow("trades", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot("trades", archive=where, s3=s3, binary=str(binary))
 
     message = str(caught.value)
     assert "wal_replication off" in message, message
@@ -4644,7 +4644,7 @@ def test_a_follower_with_no_replica_says_which_two_things_it_could_be(
     # serves the log, so this error is specific to the missing replica rather
     # than to the setup. A sharper control than it used to be — the log that
     # exists was once refused too, for never having synced.
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as ok:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as ok:
         assert ok.scan().read_all().num_rows == 50
 
 
@@ -4674,7 +4674,7 @@ def test_an_unreachable_archive_is_not_reported_as_an_absent_replica(
     # exactly the absent-replica case, and would prove nothing here.
     absent = f"s3://litelink-no-such-bucket-{uuid.uuid4().hex[:12]}/p"
     with pytest.raises(RuntimeError, match="litestream restore failed"):
-        litelink.follow("s", archive=absent, s3=s3, binary=str(binary))
+        litelink.snapshot("s", archive=absent, s3=s3, binary=str(binary))
 
     assert not (tmp_path / "s").exists()
 
@@ -4761,7 +4761,7 @@ def test_a_log_whose_buffer_holds_everything_can_be_followed(
 
     _replicate(binary, replication, s3, where)
 
-    with litelink.follow("s", archive=where, s3=s3, binary=str(binary)) as follower:
+    with litelink.snapshot("s", archive=where, s3=s3, binary=str(binary)) as follower:
         got = follower.scan().read_all()
 
         assert got.num_rows == served == 400
@@ -4819,7 +4819,7 @@ def test_a_follower_refuses_a_log_whose_seals_were_discarded(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(ValueError, match="starts at offset"):
-        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot("s", archive=where, s3=s3, binary=str(binary))
 
 
 def test_a_follower_refuses_a_log_with_a_bulk_loaded_hole(
@@ -4870,7 +4870,7 @@ def test_a_follower_refuses_a_log_with_a_bulk_loaded_hole(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(ValueError, match="bulk-loaded straight to Parquet"):
-        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot("s", archive=where, s3=s3, binary=str(binary))
 
 
 def test_the_ingest_marker_catches_a_hole_the_extent_rows_no_longer_show(
@@ -4928,4 +4928,164 @@ def test_the_ingest_marker_catches_a_hole_the_extent_rows_no_longer_show(
     _replicate(binary, replication, s3, where)
 
     with pytest.raises(ValueError, match="bulk-loaded straight to Parquet"):
-        litelink.follow("s", archive=where, s3=s3, binary=str(binary))
+        litelink.snapshot("s", archive=where, s3=s3, binary=str(binary))
+
+
+def test_an_archive_only_snapshot_serves_what_the_archive_holds(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`include_wal=False` skips the restore, which per #59 is almost the whole
+    cost: a 1.9 MB buffer measured 7.2 s, of which transfer was ~0.2 s.
+
+    What it gives up is stated rather than hidden — the view is as of the
+    archive frontier, so the rows the writer has not pushed are absent, and
+    `coverage()` says so.
+    """
+    where = f"s3://{bucket}/archive-only"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=8 * 1024,
+        compact_min_files=2,
+    )
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        log.extend(rows(50))  # unpushed, and unreachable without the WAL
+        frontier = log.archived_through()
+
+    assert frontier > 0, "the fixture must archive something"
+
+    with litelink.snapshot("s", archive=where, s3=s3, include_wal=False) as view:
+        served = view.scan(include_archive=True).read_all()
+
+        assert served.num_rows == frontier
+        # Honest about the boundary rather than silently short.
+        assert view.coverage().archive == (1, frontier)
+        assert view.buffered_rows() == 0
+        # And no litestream ran: a replica would have brought rows with it.
+        assert view.end_offset() == frontier + 1
+
+
+def test_an_archive_only_snapshot_reports_the_schema_the_writer_declared(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """From a data file's Parquet footer, NOT from the Iceberg schema.
+
+    Iceberg has one string type, so `schema().as_arrow()` widens `string` to
+    `large_string` — and every other path a caller can see reports what was
+    declared, because the Parquet is written from the declared Arrow schema and
+    the footer carries it verbatim. That footer is what DuckDB reads, which is
+    why a local read and an archived read agree. Taking the schema from Iceberg
+    here would have made this the one handle whose `schema` disagreed with its
+    own `scan()`.
+
+    Asserted on a schema holding BOTH string widths, which is the only shape
+    that can tell the two sources apart.
+    """
+    declared = pa.schema(
+        [
+            pa.field("event_ts", pa.int64(), nullable=False),
+            pa.field("key", pa.string()),
+            pa.field("payload", pa.large_string()),
+            pa.field("count", pa.int32()),
+        ]
+    )
+    where = f"s3://{bucket}/footer-schema"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=8 * 1024,
+        compact_min_files=2,
+    )
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary,
+        "s",
+        schema=declared,
+        sort_by=("event_ts",),
+        config=config,
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend(
+            [
+                {"event_ts": i, "key": f"k{i % 7}", "payload": "x" * 96, "count": i}
+                for i in range(ROWS)
+            ]
+        )
+        log.seal_due()
+        log.maintain()
+        log.sync()
+
+    with litelink.snapshot("s", archive=where, s3=s3, include_wal=False) as view:
+        assert view.schema == declared, (
+            f"reported {view.schema} for a log declared {declared}"
+        )
+        assert view.sort_by == ("event_ts",)
+        # The handle and its own read must agree, which is the point.
+        served = view.scan(include_archive=True).read_all()
+        assert [f for f in served.schema if f.name != OFFSET] == list(declared)
+
+
+def test_an_archive_only_snapshot_refuses_a_log_that_is_all_buffer(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The one silent wrong answer this path could give.
+
+    An archive that has published nothing is the ordinary state of a slow
+    capture — nothing reaches `target_seal_size`, and with `wal_replication` a
+    seal retains its rows — so the buffer holds the whole log. `include_wal=True`
+    serves it. Archive-only would serve ZERO rows, and a reader who asked for a
+    snapshot and got an empty one has been told nothing went wrong.
+    """
+    where = f"s3://{bucket}/all-buffer"
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary,
+        "s",
+        schema=SCHEMA,
+        config=replace(LogConfig(), wal_replication=True),
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend(rows(50))
+
+        assert log.archived_through() == 0, "the fixture must archive nothing"
+
+    with pytest.raises(ValueError, match="published no metadata"):
+        litelink.snapshot("s", archive=where, s3=s3, include_wal=False)
+
+
+def test_follow_still_works_and_says_it_is_deprecated(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The old name is in `__all__` and in the published API, so it keeps
+    working — and says once, at the call site, that it will not for ever."""
+    where = f"s3://{bucket}/deprecated"
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=8 * 1024,
+        compact_min_files=2,
+    )
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        frontier = log.archived_through()
+
+    with pytest.warns(DeprecationWarning, match="use litelink.snapshot"):
+        view = litelink.follow("s", archive=where, s3=s3, include_wal=False)
+
+    with view:
+        assert view.scan(include_archive=True).read_all().num_rows == frontier

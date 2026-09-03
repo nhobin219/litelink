@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -31,7 +32,7 @@ from litelink._layout import Layout, validate_archive
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config, restore_buffer
-from litelink._table import LogTable, archive_extent
+from litelink._table import LogTable, archive_extent, archive_shape
 from litelink.log import (
     LocalReadHandle,
     LogConfig,
@@ -142,15 +143,53 @@ def open(  # noqa: A001
     return handle
 
 
-def follow(
+def snapshot(
     name: str,
     *,
     archive: str,
     s3: S3Options | None = None,
     binary: str | None = None,
     scratch_dir: PathLike[str] | str | None = None,
+    include_wal: bool = True,
 ) -> RemoteReadHandle:
-    """A read-only view of a log running somewhere else (§3b).
+    """A read-only view of a log running somewhere else, as of a moment (§3b).
+
+    **Named for what it is.** This was `follow`, and the name promised a
+    subscription it never provided — its own docstring had to open by saying
+    "a snapshot, not a subscription". A name a docstring has to walk back is
+    the wrong name. `follow` remains as a deprecated alias.
+
+    **`include_wal=False` reads the archive alone**, skipping the litestream
+    restore entirely: no replica, no scratch buffer, no subprocess. That is
+    almost all of the wall clock. Measured against S3 at 60-75 ms RTT: a 1.9 MB
+    buffer took 7.2 s to restore, of which transfer was ~0.2 s — the rest is one
+    LIST plan plus ~20 serial GETs, and the chain length grows with the log's
+    AGE rather than its size, because a slow stream accumulates LTX files on the
+    sync interval however few rows it holds.
+
+    It is not the same view, and the difference is larger than it sounds:
+
+    - **Staleness is bounded by the ARCHIVE FRONTIER, not by replication lag.**
+      `stable_prefix` holds back a trailing run still under the compaction
+      budget, so on a quiet stream the frontier can lag indefinitely rather
+      than by seconds.
+    - **The shape and the location come from different places.** With the WAL,
+      the schema, sort order and archive prefix are read from the replica's
+      `meta` — the writer's own copy, which survives a re-point. Without it,
+      the shape comes from the archive's Iceberg metadata and the location
+      comes from `archive=` and nothing checks it against what the writer
+      believes.
+    - **It refuses a log whose buffer holds everything.** An archive that has
+      published nothing serves no rows at all, and that is the ordinary state
+      of a slow capture. Returning an empty handle there would be the one
+      silent wrong answer this path can give, so it raises and names
+      `include_wal=True`.
+
+    Reach for it when the last few minutes do not matter: historical and
+    analytical reads over a long window, where 7 s per handle is the whole cost
+    and the freshness buys nothing.
+
+    A read-only view of a log running somewhere else (§3b).
 
     The archive merged with a replicated copy of the writer's buffer, so a
     reader sees data fresher than the archive alone — down to the replication
@@ -203,8 +242,12 @@ def follow(
     )
     try:
         layout = Layout(Path(owned.name), name)
-        _restore_replica(layout, archive, options, binary)
-        schema, sort_by, prefix = _followed_shape(layout)
+        if include_wal:
+            _restore_replica(layout, archive, options, binary)
+            schema, sort_by, prefix = _followed_shape(layout)
+        else:
+            schema, sort_by, prefix = _archived_shape(layout, archive, options)
+
         _assemble_follower(layout, schema, sort_by, prefix, options)
         table = LogTable.load(layout, readonly=True)
         buffer = Buffer.open(layout.buffer_db, schema, readonly=True)
@@ -228,6 +271,98 @@ def follow(
         raise
 
     return view
+
+
+def follow(
+    name: str,
+    *,
+    archive: str,
+    s3: S3Options | None = None,
+    binary: str | None = None,
+    scratch_dir: PathLike[str] | str | None = None,
+    include_wal: bool = True,
+) -> RemoteReadHandle:
+    """Deprecated alias for `snapshot`. Removed no earlier than 0.4.
+
+    The name promised a subscription this never provided — see `snapshot`,
+    whose docstring used to have to open by saying so.
+    """
+    warnings.warn(
+        "litelink.follow is deprecated and will be removed no earlier than "
+        "0.4; use litelink.snapshot, which is the same call. The old name "
+        "promised a subscription it never provided.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    return snapshot(
+        name,
+        archive=archive,
+        s3=s3,
+        binary=binary,
+        scratch_dir=scratch_dir,
+        include_wal=include_wal,
+    )
+
+
+def _archived_shape(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[pa.Schema, tuple[str, ...], str]:
+    """The log's shape from the ARCHIVE, for a snapshot with no replica.
+
+    The counterpart to `_followed_shape`, and deliberately not a drop-in for
+    it. That reads the writer's own `meta`, which is authoritative about both
+    the shape and where the archive is; this has neither, so the shape comes
+    from the archive's Iceberg metadata and the location is whatever the caller
+    passed. A caller pointed at a stale prefix gets that prefix's data, and
+    nothing here can tell.
+
+    **An archive that has published nothing is refused rather than served
+    empty.** `follow` allows it, because the replicated buffer may hold the
+    whole log — which is the ordinary state of a slow capture. Without the WAL
+    there is no buffer, so the same state serves zero rows, and a reader who
+    asked for a snapshot and got an empty one has been told nothing went wrong.
+    That is the one silent wrong answer this path can give.
+    """
+    shape = archive_shape(layout, prefix, options)
+    if shape is None:
+        msg = (
+            f"the archive at {prefix} has published no metadata, so an "
+            f"archive-only snapshot of {layout.name} would serve no rows. That "
+            f"is the ordinary state of a slow capture: nothing has reached "
+            f"target_seal_size, so the log is still in the writer's buffer. "
+            f"Use include_wal=True to read it from the replicated WAL."
+        )
+        raise ValueError(msg)
+
+    schema, sort_by = shape
+    # The reader wants a buffer to union with, and an archive-only snapshot has
+    # no rows for it. Created empty rather than skipped: every read leg is
+    # bounded by its neighbour's extent, and an absent buffer would be a second
+    # shape for `Reader` to handle rather than the empty one it already does.
+    #
+    # **It also has to carry the log's `meta`.** A replica arrives with it; a
+    # buffer this function creates does not, and `Archive` reads the prefix from
+    # there rather than from any argument — so without these the adoption finds
+    # no archive and the snapshot fails claiming the bucket holds nothing it can
+    # read. The three that matter are the schema, the sort order and the
+    # prefix; the config is written at its defaults so `handle.config` answers
+    # something rather than nothing, and nothing on a read path consults it.
+    layout.create()
+    buffer = Buffer.open(layout.buffer_db, schema)
+    try:
+        buffer.set_meta_all(
+            {
+                SCHEMA_KEY: schema.serialize().to_pybytes().hex(),
+                SORT_KEY: json.dumps(list(sort_by)),
+                ARCHIVE_KEY: prefix,
+                CONFIG_KEY: LogConfig().to_json(),
+            }
+        )
+    finally:
+        buffer.close()
+
+    return schema, sort_by, prefix
 
 
 def _options(s3: S3Options | None) -> S3Options:

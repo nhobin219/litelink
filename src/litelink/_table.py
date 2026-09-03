@@ -299,6 +299,67 @@ def archive_extent(
     return LogTable(None, layout, table, prefix).extent()  # ty: ignore
 
 
+def archive_shape(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[pa.Schema, tuple[str, ...]] | None:
+    """The archive's declared shape, read from the bucket alone (§3b).
+
+    What an archive-only snapshot needs and cannot get anywhere else. `follow`
+    reads the schema, the sort order and the archive's location from the
+    REPLICA's `meta`, which is authoritative — it is the writer's own copy, and
+    it survives a re-point. A snapshot that skips the WAL has no replica, so
+    the only thing left that knows the shape is the archive's own Iceberg
+    metadata, and the only thing that says where the archive is, is the caller.
+
+    That asymmetry is the reason `include_wal=False` is not simply a faster
+    path to the same answer, and `snapshot` says so.
+
+    `None` when the archive has no published hint — nothing pushed there, or
+    not a litelink archive. The caller cannot tell those apart and must not
+    guess: `archive_extent` draws the same line for the same reason.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    names = {f.field_id: f.name for f in table.schema().fields}
+    sort_by = tuple(names[f.source_id] for f in table.sort_order().fields)
+
+    # **From a DATA FILE's footer, not from the Iceberg schema**, and the
+    # difference is observable. Iceberg has one string type, so a `string`
+    # column comes back from `schema().as_arrow()` as `large_string` — while
+    # every other path a caller can see reports `string`, because the Parquet
+    # is written from the DECLARED Arrow schema and the footer carries it
+    # verbatim. That footer is what DuckDB reads, which is why a local read and
+    # an archived read agree today; taking the schema from Iceberg here would
+    # have made this the one path that disagreed with `scan()` on its own
+    # handle.
+    #
+    # One extra GET, against a path whose entire purpose is avoiding twenty.
+    # Read through the FileIO already built above rather than a second
+    # filesystem: `InputFile.open()` is seekable, which is all a footer needs.
+    for task in table.scan().plan_files():
+        with io.new_input(task.file.file_path).open() as data:
+            written = pq.read_schema(data)
+
+        return (
+            pa.schema([f for f in written if f.name != "litelink_offset"]),
+            sort_by,
+        )
+
+    # Published metadata naming no data file. Nothing can be served from it, so
+    # the schema is academic — but answering with Iceberg's projection would be
+    # the disagreement above, so it says so instead.
+    return pa.schema(
+        [f for f in table.schema().as_arrow() if f.name != "litelink_offset"]
+    ), sort_by
+
+
 def archive_columns(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[str, ...] | None:

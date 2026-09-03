@@ -39,7 +39,7 @@ where the reasoning lives.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from litelink._assembly import follow, new, open, restore  # noqa: A004
+from litelink._assembly import follow, new, open, restore, snapshot  # noqa: A004
 from litelink._preflight import Check, Report, preflight
 from litelink._s3 import S3Options
 from litelink.log import (
@@ -74,4 +74,5 @@ __all__ = [
     "open",
     "preflight",
     "restore",
+    "snapshot",
 ]

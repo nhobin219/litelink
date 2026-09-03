@@ -141,14 +141,14 @@ for `KEY_ID '…', SECRET '…'` to pass keys explicitly, and add
 seen and asks for what came after — add it to the projection to read incrementally.
 
 The snippet below asks that same question the other way. That read is only as fresh as the
-last `sync`; with a WAL sidecar running, `litelink.follow` does better — it restores the
+last `sync`; with a WAL sidecar running, `litelink.snapshot` does better — it restores the
 writer's buffer alongside the archive and merges them, so a reader sees down to the
 replication lag instead.
 
 ```python
 import litelink
 
-with litelink.follow("trades", archive="s3://bucket/prefix") as reader:
+with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
     print(reader.coverage())
     # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=True)
 
@@ -171,13 +171,21 @@ It cannot append — a read handle has no write surface at all, rather than one 
 and it is a **snapshot, not a subscription**: refreshing means assembling another one.
 `coverage()` is how it stays honest about what it can and cannot serve.
 
-**Assembling one is the expensive part, so hold onto it.** `follow` restores the writer's
-`buffer.db` from its replica before it can answer anything, and that dominates: measured
-against a 276k-row log, 22 s to assemble — 20 s of it the restore — and then 1.4 s per scan.
-Re-entering the `with` block per query pays the 22 s every time. Assemble once, scan many
-times, and re-assemble only when you want fresher data. The restore scales with the buffer
-file's SIZE rather than its row count, so a writer whose buffer has grown a large free list
-makes every follower slower.
+**Assembling one is the expensive part, so hold onto it.** Restoring the writer's `buffer.db`
+from its replica dominates: measured against a 276k-row log, 22 s to assemble — 20 s of it the
+restore — and then 1.4 s per scan. Re-entering the `with` block per query pays the 22 s every
+time. Assemble once, scan many times, and re-assemble only when you want fresher data. The
+restore scales with the buffer file's SIZE rather than its row count, so a writer whose buffer
+has grown a large free list makes every reader slower — `reclaim_buffer()` is what shrinks it.
+
+**If the last few minutes do not matter, skip the restore entirely.**
+`snapshot(..., include_wal=False)` reads the archive alone: no replica, no litestream, no
+subprocess. On the measurement above that is 22 s down to well under a second. What you give
+up is freshness — the view is as of the archive frontier, which on a quiet stream can lag
+indefinitely rather than by the sync interval, because `sync` holds back a trailing run under
+`target_compact_size`. It refuses outright on a log whose archive has published nothing, since
+that is precisely when the buffer holds everything and an archive-only read would serve zero
+rows.
 Details in [`docs/API.md`](docs/API.md).
 
 ## How it works
