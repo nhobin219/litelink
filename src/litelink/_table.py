@@ -299,6 +299,96 @@ def archive_extent(
     return LogTable(None, layout, table, prefix).extent()  # ty: ignore
 
 
+def archive_shape(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[pa.Schema, tuple[str, ...]] | None:
+    """The archive's declared shape, read from the bucket alone (§3b).
+
+    What an archive-only snapshot needs and cannot get anywhere else. `follow`
+    reads the schema, the sort order and the archive's location from the
+    REPLICA's `meta`, which is authoritative — it is the writer's own copy, and
+    it survives a re-point. A snapshot that skips the WAL has no replica, so
+    the only thing left that knows the shape is the archive's own Iceberg
+    metadata, and the only thing that says where the archive is, is the caller.
+
+    That asymmetry is the reason `include_wal=False` is not simply a faster
+    path to the same answer, and `snapshot` says so.
+
+    `None` when the archive has no published hint — nothing pushed there, or
+    not a litelink archive. The caller cannot tell those apart and must not
+    guess: `archive_extent` draws the same line for the same reason.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    names = {f.field_id: f.name for f in table.schema().fields}
+    sort_by = tuple(names[f.source_id] for f in table.sort_order().fields)
+
+    # **The COLUMN SET comes from Iceberg and the TYPES come from a data file's
+    # footer**, and both halves are load-bearing.
+    #
+    # Iceberg for the set, because its schema is versioned and current while a
+    # data file's is whatever was declared when that file was written. Files of
+    # both shapes land in ONE commit whenever rows were sealed-but-unsynced as
+    # `add_column` ran, and `plan_files()` promises no order — so a footer alone
+    # answered with the PRE-evolution column set and the snapshot served every
+    # row without the new column. Reproduced: 1,132 rows served without
+    # `region` while the archive durably held 600 rows carrying it, with the
+    # handle's own `schema` and `scan()` agreeing so nothing looked wrong.
+    #
+    # The footer for the types, because Iceberg has one string type: a `string`
+    # column comes back from `schema().as_arrow()` as `large_string`, while
+    # every other path a caller can see reports what was declared — the Parquet
+    # is written from the declared Arrow schema and the footer carries it
+    # verbatim. That footer is also what DuckDB reads, which is why a local read
+    # and an archived read agree.
+    #
+    # A column added AFTER the sampled file falls back to Iceberg's type, which
+    # differs only in string width. That is the residual, and it is bounded:
+    # never a missing column, only a wider one. `column_type` maps both widths
+    # identically, so even the fallback flows through the synthesised buffer's
+    # DDL without a seam.
+    #
+    # **Taking the footer unconditionally for a name BOTH authorities carry
+    # rests on `add_column` being the only reachable evolution.** `rename_column`
+    # and `drop_column` raise `NotImplementedError`, so a name they share was
+    # declared exactly once, with one type, and every writer — seal, ingest,
+    # compaction, `rewrite_archive` — wrote that spelling. `drop_column`'s own
+    # docstring already promises that re-adding a name creates a NEW field id;
+    # the day it is implemented, drop-then-re-add-with-a-different-type makes a
+    # sampled old footer's type win over the current one. Prefer Iceberg's type
+    # for a shared name then, or sample a file the current schema id wrote.
+    #
+    # One extra GET, against a path whose purpose is avoiding twenty. Read
+    # through the FileIO already built above rather than a second filesystem:
+    # `InputFile.open()` is seekable, which is all a footer needs.
+    written: dict[str, pa.DataType] = {}
+    for task in table.scan().plan_files():
+        with io.new_input(task.file.file_path).open() as data:
+            written = {field.name: field.type for field in pq.read_schema(data)}
+
+        break
+
+    return (
+        pa.schema(
+            [
+                pa.field(
+                    field.name, written.get(field.name, field.type), field.nullable
+                )
+                for field in table.schema().as_arrow()
+                if field.name != "litelink_offset"
+            ]
+        ),
+        sort_by,
+    )
+
+
 def archive_columns(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[str, ...] | None:

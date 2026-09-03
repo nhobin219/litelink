@@ -1336,7 +1336,7 @@ def test_every_entry_point_taking_an_archive_checks_its_shape(tmp_path: Path) ->
         litelink.restore(tmp_path / "restore", "s", archive=bad)
 
     with pytest.raises(ValueError, match="missing a slash"):
-        litelink.follow("s", archive=bad)
+        litelink.snapshot("s", archive=bad)
 
     # And nothing was created on the way to refusing. A shape error is decided
     # from the argument alone, so it must land before any directory does.

@@ -1,13 +1,13 @@
 """Building logs and readers.
 
 `log.py` owns what the handles *do*; this module owns how they
-come to exist. The split is why `litelink.follow` could return something that was
+come to exist. The split is why `litelink.snapshot` can return something that is
 not a `WriteHandle` and read as though it should — a classmethod names its receiver as
 the thing being built, and four of these build three different types.
 
 Every factory here builds its object's collaborators and hands them over
 complete. None of them takes a mode: `open` builds a writer, `reader` and
-`follow` build readers, and there is no flag that turns one into the other.
+`snapshot` build readers, and there is no flag that turns one into the other.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ from litelink._buffer import (
 from litelink._layout import Layout, validate_archive
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
-from litelink._replication import litestream_config, restore_buffer
-from litelink._table import LogTable, archive_extent
+from litelink._replication import destination, litestream_config, restore_buffer
+from litelink._table import LogTable, archive_extent, archive_shape
 from litelink.log import (
     LocalReadHandle,
     LogConfig,
@@ -104,7 +104,7 @@ def open(  # noqa: A001
 
     Reading sees the writer's commits as they land: `catalog.db` and
     `archive.db` live at the root and both processes read the same rows. That
-    is the difference from `follow`, which reads a replica captured at a point
+    is the difference from `snapshot`, which reads a replica captured at a point
     in time.
     """
     layout = Layout(Path(root), name)
@@ -142,15 +142,61 @@ def open(  # noqa: A001
     return handle
 
 
-def follow(
+def snapshot(
     name: str,
     *,
     archive: str,
     s3: S3Options | None = None,
     binary: str | None = None,
     scratch_dir: PathLike[str] | str | None = None,
+    include_wal: bool = False,
 ) -> RemoteReadHandle:
-    """A read-only view of a log running somewhere else (§3b).
+    """A read-only view of a log running somewhere else, as of a moment (§3b).
+
+    **Named for what it is.** This was `follow` before 0.3, and that name
+    promised a subscription it never provided — its own docstring had to open
+    by saying "a snapshot, not a subscription". A name a docstring has to walk
+    back is the wrong name, and it was removed rather than deprecated: the
+    library is days old and this release is its introduction, so an alias would
+    have been compatibility for nobody at the price of two names for one thing
+    in the first API anyone reads.
+
+    **Reads the archive alone by default**, skipping the litestream restore
+    entirely: no replica, no scratch buffer, no subprocess. That is almost all
+    of the wall clock, and it is the default because it is the mode that works
+    on an ordinary log — `wal_replication` is opt-in and needs a sidecar, so
+    most logs have no replica to restore, and `include_wal=True` fails outright
+    on those. Measured on a log with an archive and no replication:
+    `include_wal=True` raised in 0.10 s, `include_wal=False` served 3,870 rows. Measured against S3 at 60-75 ms RTT: a 1.9 MB
+    buffer took 7.2 s to restore, of which transfer was ~0.2 s — the rest is one
+    LIST plan plus ~20 serial GETs, and the chain length grows with the log's
+    AGE rather than its size, because a slow stream accumulates LTX files on the
+    sync interval however few rows it holds.
+
+    It is not the same view, and the difference is larger than it sounds:
+
+    - **Staleness is bounded by the ARCHIVE FRONTIER, not by replication lag.**
+      `stable_prefix` holds back a trailing run still under the compaction
+      budget, so on a quiet stream the frontier can lag indefinitely rather
+      than by seconds.
+    - **The shape and the location come from different places.** With the WAL,
+      the schema, sort order and archive prefix are read from the replica's
+      `meta` — the writer's own copy, which survives a re-point. Without it,
+      the shape comes from the archive's Iceberg metadata and the location
+      comes from `archive=` and nothing checks it against what the writer
+      believes.
+    - **It refuses a log whose buffer holds everything.** An archive that has
+      published nothing serves no rows at all, and that is the ordinary state
+      of a slow capture. Returning an empty handle there would be the one
+      silent wrong answer this path can give, so it raises and names
+      `include_wal=True`.
+
+    **`include_wal=True` merges the writer's replicated buffer**, so freshness
+    falls to the replication lag rather than to the seal cadence. It needs the
+    writer to be running `wal_replication` with a sidecar that has shipped, and
+    it pays the restore — reach for it when the last few minutes matter.
+
+    A read-only view of a log running somewhere else (§3b).
 
     The archive merged with a replicated copy of the writer's buffer, so a
     reader sees data fresher than the archive alone — down to the replication
@@ -203,8 +249,12 @@ def follow(
     )
     try:
         layout = Layout(Path(owned.name), name)
-        _restore_replica(layout, archive, options, binary)
-        schema, sort_by, prefix = _followed_shape(layout)
+        if include_wal:
+            _restore_replica(layout, archive, options, binary)
+            schema, sort_by, prefix = _followed_shape(layout)
+        else:
+            schema, sort_by, prefix = _archived_shape(layout, archive, options)
+
         _assemble_follower(layout, schema, sort_by, prefix, options)
         table = LogTable.load(layout, readonly=True)
         buffer = Buffer.open(layout.buffer_db, schema, readonly=True)
@@ -228,6 +278,128 @@ def follow(
         raise
 
     return view
+
+
+def _has_replica(prefix: str, name: str, options: S3Options) -> bool:
+    """Whether a WAL replica for `name` exists under `prefix`.
+
+    The one fact that separates "this log exists and has archived nothing yet"
+    from "nothing here is called that". Both look identical from the archive's
+    published metadata, and answering with the wrong one sends an operator with
+    a typo to `include_wal=True`, where litestream fails on something else.
+
+    Best effort by construction: an unreachable bucket, a missing one, or
+    credentials that cannot list all answer False, and False only ever
+    downgrades the message from "retry with include_wal=True" to "check the
+    prefix and the name" — which names both, so it stays actionable either way.
+    """
+    from pyarrow.fs import FileSelector
+
+    from litelink._s3 import filesystem
+
+    location = destination(prefix, name).removeprefix("s3://")
+    try:
+        found = filesystem(options).get_file_info(
+            FileSelector(location, allow_not_found=True, recursive=False)
+        )
+    except Exception:  # noqa: BLE001 — see the docstring: absence is the answer
+        return False
+
+    return bool(found)
+
+
+def _archived_shape(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[pa.Schema, tuple[str, ...], str]:
+    """The log's shape from the ARCHIVE, for a snapshot with no replica.
+
+    The counterpart to `_followed_shape`, and deliberately not a drop-in for
+    it. That reads the writer's own `meta`, which is authoritative about both
+    the shape and where the archive is; this has neither, so the shape comes
+    from the archive's Iceberg metadata and the location is whatever the caller
+    passed. A caller pointed at a stale prefix gets that prefix's data, and
+    nothing here can tell.
+
+    **An archive that has published nothing is refused rather than served
+    empty.** `follow` allows it, because the replicated buffer may hold the
+    whole log — which is the ordinary state of a slow capture. Without the WAL
+    there is no buffer, so the same state serves zero rows, and a reader who
+    asked for a snapshot and got an empty one has been told nothing went wrong.
+    That is the one silent wrong answer this path can give.
+    """
+    shape = archive_shape(layout, prefix, options)
+    if shape is None:
+        # **Two very different states look identical from the archive alone**,
+        # and saying the wrong one is worse than saying neither. "No published
+        # metadata" is the ordinary state of a slow capture — nothing has
+        # reached `target_seal_size`, so the log is still in the writer's
+        # buffer — AND it is what a mistyped prefix or a wrong `name` produces.
+        # A message that assumes the first tells someone with a typo that their
+        # log is a slow capture and sends them to `include_wal=True`, where
+        # litestream fails on something else entirely. #56 fixed exactly that
+        # shape for the prefix itself.
+        #
+        # The WAL replica separates them. If one is there, the log exists, is
+        # replicated, and `include_wal=True` will genuinely work. If it is not,
+        # NOTHING off this machine can read the log yet — not this path and not
+        # the WAL one — which is the honest thing to say, and it covers both a
+        # wrong prefix and a real log whose sidecar has not shipped. The
+        # earlier wording claimed a real log "would have the replica", which is
+        # only true once litestream has run. One LIST against a path this
+        # module already derives one way — `destination` — rather than a second
+        # spelling of it.
+        replicated = _has_replica(prefix, layout.name, options)
+        if replicated:
+            msg = (
+                f"the archive at {prefix} holds no data for {layout.name} yet, "
+                f"but its WAL replica is there — so the log exists and is "
+                f"still in the writer's buffer, which is the ordinary state of "
+                f"a slow capture before anything reaches target_seal_size. "
+                f"Retry with include_wal=True, which reads it from the replica."
+            )
+        else:
+            msg = (
+                f"nothing at {prefix} can be read as a log called "
+                f"{layout.name}: it has published no archive metadata, and "
+                f"there is no WAL replica at "
+                f"{destination(prefix, layout.name)} either — so "
+                f"include_wal=True has nothing to restore from and would fail "
+                f"too. Check the prefix and the name. If the log is real and "
+                f"simply young, its sidecar has not shipped yet: nothing off "
+                f"this machine can read it until either the sidecar ships or "
+                f"a sync pushes."
+            )
+
+        raise ValueError(msg)
+
+    schema, sort_by = shape
+    # The reader wants a buffer to union with, and an archive-only snapshot has
+    # no rows for it. Created empty rather than skipped: every read leg is
+    # bounded by its neighbour's extent, and an absent buffer would be a second
+    # shape for `Reader` to handle rather than the empty one it already does.
+    #
+    # **It also has to carry the log's `meta`.** A replica arrives with it; a
+    # buffer this function creates does not, and `Archive` reads the prefix from
+    # there rather than from any argument — so without these the adoption finds
+    # no archive and the snapshot fails claiming the bucket holds nothing it can
+    # read. The three that matter are the schema, the sort order and the
+    # prefix; the config is written at its defaults so `handle.config` answers
+    # something rather than nothing, and nothing on a read path consults it.
+    layout.create()
+    buffer = Buffer.open(layout.buffer_db, schema)
+    try:
+        buffer.set_meta_all(
+            {
+                SCHEMA_KEY: schema.serialize().to_pybytes().hex(),
+                SORT_KEY: json.dumps(list(sort_by)),
+                ARCHIVE_KEY: prefix,
+                CONFIG_KEY: LogConfig().to_json(),
+            }
+        )
+    finally:
+        buffer.close()
+
+    return schema, sort_by, prefix
 
 
 def _options(s3: S3Options | None) -> S3Options:
@@ -561,4 +733,4 @@ def restore(
     return WriteHandle.restore(root, name, archive=archive, s3=s3, binary=binary)
 
 
-__all__ = ["follow", "new", "open", "restore"]
+__all__ = ["new", "open", "restore", "snapshot"]

@@ -105,79 +105,78 @@ litelink emits the litestream config; your supervisor runs the binary. Full walk
 
 ## Reading it from another machine
 
-Everywhere else reads the archive, which is an ordinary Iceberg table publishing
-`version-hint.text` at every commit — so any engine resolves the current metadata itself,
-with no catalog service, no local root and no litelink install:
-
-```python
-import duckdb
-
-con = duckdb.connect()
-con.execute("""
-    CREATE OR REPLACE SECRET litelink_s3 (
-        TYPE s3, PROVIDER credential_chain, REGION 'us-east-1'
-    )
-""")
-
-table = con.execute("""
-    SELECT event_ts, price
-    FROM iceberg_scan('s3://bucket/prefix/trades',
-                      version_name_format = '%s%s.metadata.json')
-    WHERE price > 78000
-""").to_arrow_table()
-```
-
-Point it at the table DIRECTORY — `<archive>/<name>` — not at a metadata JSON: DuckDB reads
-`version-hint.text` itself, so the current snapshot needs no catalog and no pointer passed in.
-`version_name_format` is not optional. DuckDB defaults to the Hadoop `v%s%s.metadata.json`
-while pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the format has to stop
-prepending the `v`.
-
-`credential_chain` is the ordinary AWS resolution — profile, instance metadata, SSO. Swap it
-for `KEY_ID '…', SECRET '…'` to pass keys explicitly, and add
-`ENDPOINT 'host:port', USE_SSL false, URL_STYLE 'path'` for MinIO or rustfs.
-
-`litelink_offset` is monotonic and never reused, so a reader keeps the highest one it has
-seen and asks for what came after — add it to the projection to read incrementally.
-
-The snippet below asks that same question the other way. That read is only as fresh as the
-last `sync`; with a WAL sidecar running, `litelink.follow` does better — it restores the
-writer's buffer alongside the archive and merges them, so a reader sees down to the
-replication lag instead.
+`litelink.snapshot` is the way in. It resolves the archive's current metadata, handles
+credentials, and hands back a read handle:
 
 ```python
 import litelink
 
-with litelink.follow("trades", archive="s3://bucket/prefix") as reader:
-    print(reader.coverage())
-    # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=True)
-
-    table = reader.scan(
-        where="price > 78000", columns=["event_ts", "price"]
-    ).read_all()
+with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
+    reader.sql("SELECT count(*), max(litelink_offset) FROM log").read_all()
 ```
 
-`archive` is the prefix the logs sit under and `"trades"` is the log; the two are joined, so
-this reads `s3://bucket/prefix/trades/`. `scan` returns a `pa.RecordBatchReader` rather than a
-table — a full-window read is proportional to the data, so materialising it is yours to
-choose: `.read_all()` for the whole thing, or iterate the batches and never hold it at once.
-Credentials come from the environment; pass `s3=litelink.S3Options(endpoint=…)` to point
-somewhere that is not AWS.
+`archive` is the prefix the logs sit under and `"trades"` is the log, so this reads
+`s3://bucket/prefix/trades/`. Credentials come from the environment; pass
+`s3=litelink.S3Options(endpoint=…)` for somewhere that is not AWS. `sql` exposes the log as
+`log`; `scan(where=…, columns=…)` is the typed equivalent, and both return a
+`pa.RecordBatchReader` rather than a table, so materialising is yours to choose.
 
-Both snippets stay inside litelink's own dependencies — pyarrow and duckdb. Arrow converts to
-whatever you actually use from there.
+By default this reads the **archive alone** — no replica, no litestream, no subprocess — and
+assembles in well under a second. The view is as of the archive frontier, which on a quiet
+stream can lag indefinitely rather than by the sync interval, because `sync` holds back a
+trailing run under `target_compact_size`. `coverage()` reports what it can actually serve.
 
-It cannot append — a read handle has no write surface at all, rather than one that raises —
-and it is a **snapshot, not a subscription**: refreshing means assembling another one.
-`coverage()` is how it stays honest about what it can and cannot serve.
+**Pass `include_wal=True` when you want the freshest read there is.** With the writer running a
+WAL sidecar, its `buffer.db` is restored from the replica and merged with the archive, so you
+see down to the replication lag rather than to the last `sync`:
 
-**Assembling one is the expensive part, so hold onto it.** `follow` restores the writer's
-`buffer.db` from its replica before it can answer anything, and that dominates: measured
-against a 276k-row log, 22 s to assemble — 20 s of it the restore — and then 1.4 s per scan.
-Re-entering the `with` block per query pays the 22 s every time. Assemble once, scan many
-times, and re-assemble only when you want fresher data. The restore scales with the buffer
-file's SIZE rather than its row count, so a writer whose buffer has grown a large free list
-makes every follower slower.
+```python
+with litelink.snapshot("trades", archive="s3://bucket/prefix", include_wal=True) as reader:
+    print(reader.coverage())
+    # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=True)
+```
+
+It needs `wal_replication` on and a sidecar that has shipped; without a replica it raises,
+which is why it is not the default.
+
+That restore is the expensive part: measured against a 276k-row log, 22 s to assemble against
+1.4 s per scan — and it scales with the buffer FILE's size rather than its row count, so a
+writer whose buffer has grown a large free list makes every reader slower (`reclaim_buffer()`
+shrinks it). Assemble once and scan many times; re-entering the `with` block per query pays it
+every time.
+
+Either way it is a **snapshot, not a subscription** — refreshing means assembling another one —
+and it cannot append: a read handle has no write surface at all, rather than one that raises.
+
+### Or any Iceberg engine
+
+The archive is an ordinary Iceberg table that publishes `version-hint.text` at every commit, so
+an engine pointed at the prefix resolves the current metadata itself. No catalog service, no
+local root, no litelink install:
+
+```sql
+INSTALL iceberg; LOAD iceberg;
+INSTALL httpfs; LOAD httpfs;
+CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+
+SELECT count(*), max(litelink_offset)
+FROM iceberg_scan('s3://bucket/prefix/trades',
+                  version_name_format = '%s%s.metadata.json');
+```
+
+Point it at the table DIRECTORY — `<archive>/<name>` — not at a metadata JSON.
+**`version_name_format` is not optional**: DuckDB defaults to the Hadoop `v%s%s.metadata.json`
+while pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the format has to stop
+prepending the `v`. `credential_chain` is the ordinary AWS resolution — profile, instance
+metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
+`URL_STYLE 'path'` instead.
+
+That is the same question the first snippet asks, and on a default snapshot it returns the same
+answer — both read the archive, one through litelink's union and one straight at the table.
+
+`litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
+asks for what came after — which is how you poll the archive as it grows.
+
 Details in [`docs/API.md`](docs/API.md).
 
 ## How it works

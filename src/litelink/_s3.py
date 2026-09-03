@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
+from typing import Any
 
 # Read when an argument is not supplied. `AWS_ENDPOINT_URL` is the variable the
 # AWS SDKs and CLI already honour for an S3-compatible endpoint, so pointing at
@@ -79,3 +80,28 @@ class S3Options:
         }
 
         return {key: value for key, value in named.items() if value is not None}
+
+
+def filesystem(options: S3Options) -> Any:
+    """A pyarrow filesystem for the archive, from the same options as the log.
+
+    pyarrow rather than s3fs: `pyiceberg[pyarrow]` is already a runtime
+    dependency and s3fs is not, so a caller that needed it would fail on
+    exactly the installs that have an archive to reach.
+
+    Here rather than beside its first caller, because it now has two — the
+    migration tool and the snapshot path — and a second spelling of "build a
+    filesystem from these options" is a second place for the endpoint override
+    to be forgotten.
+    """
+    from pyarrow.fs import S3FileSystem
+
+    resolved = options.resolved()
+    named = {
+        "access_key": resolved.access_key,
+        "secret_key": resolved.secret_key,
+        "region": resolved.region,
+        "endpoint_override": resolved.endpoint,
+    }
+
+    return S3FileSystem(**{k: v for k, v in named.items() if v is not None})

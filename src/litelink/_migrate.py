@@ -320,23 +320,10 @@ def _split_catalog(
 
 
 def _s3_filesystem(options: S3Options) -> Any:
-    """A pyarrow filesystem for the archive, from the same options as the log.
+    """The archive's filesystem. Lives in `_s3` now — see there for why."""
+    from litelink._s3 import filesystem
 
-    pyarrow rather than s3fs: `pyiceberg[pyarrow]` is already a runtime
-    dependency and s3fs is not, so a migration that needed it would fail on
-    exactly the installs that have an archive to migrate.
-    """
-    from pyarrow.fs import S3FileSystem
-
-    resolved = options.resolved()
-    named = {
-        "access_key": resolved.access_key,
-        "secret_key": resolved.secret_key,
-        "region": resolved.region,
-        "endpoint_override": resolved.endpoint,
-    }
-
-    return S3FileSystem(**{k: v for k, v in named.items() if v is not None})
+    return filesystem(options)
 
 
 def _entries(directory: str, options: S3Options | None) -> list[str]:
