@@ -437,8 +437,9 @@ alternative readers had was the archive, which is `sync`-fresh at best.
 
 The two are different views rather than one being a faster route to the other, and the
 archive-only mode differs in three ways that are stated rather than discovered: staleness is
-the archive frontier rather than the replication lag; the shape comes from a data file's
-Parquet footer rather than from the replica's `meta`; and the archive prefix comes from the
+the archive frontier rather than the replication lag; the shape comes from the archive's Iceberg
+schema, with Arrow types taken from a data file's footer, rather than from the replica's
+`meta`; and the archive prefix comes from the
 caller rather than from the writer's own record of it. A log whose archive has published
 nothing is refused rather than served empty — that state is exactly when the buffer holds
 everything, and it is the one case where only `include_wal=True` can serve the log.

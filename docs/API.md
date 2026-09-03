@@ -384,9 +384,11 @@ silent wrong answer this path could give.
 **The two modes learn the log's shape from different places**, which is worth knowing if you
 point one at the wrong prefix. With the WAL, the schema, sort order and archive location all
 come from the replica's `meta` — the writer's own copy, which survives a re-point. Without it,
-the schema comes from a data file's Parquet footer (the exact types the writer declared, not
-Iceberg's projection of them, which cannot tell `string` from `large_string`), and the location
-is whatever you passed.
+the schema's column set comes from the archive's Iceberg schema — versioned and
+current, so a column added mid-stream is not lost — with the Arrow types taken from a data
+file's Parquet footer, which is the only place the declared types survive (Iceberg has one
+string type and cannot tell `string` from `large_string`). The location is whatever you
+passed.
 
 ```python
 with litelink.snapshot("trades", archive="s3://bucket/prefix", s3=opts) as reader:
