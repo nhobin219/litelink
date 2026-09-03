@@ -111,31 +111,33 @@ credentials, and hands back a read handle:
 ```python
 import litelink
 
-with litelink.snapshot("trades", archive="s3://bucket/prefix", include_wal=False) as reader:
-    table = reader.scan(
-        where="price > 78000", columns=["event_ts", "price"]
-    ).read_all()
+with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
+    reader.sql("SELECT count(*), max(litelink_offset) FROM log").read_all()
 ```
 
 `archive` is the prefix the logs sit under and `"trades"` is the log, so this reads
 `s3://bucket/prefix/trades/`. Credentials come from the environment; pass
-`s3=litelink.S3Options(endpoint=…)` for somewhere that is not AWS. `scan` returns a
+`s3=litelink.S3Options(endpoint=…)` for somewhere that is not AWS. `sql` exposes the log as
+`log`; `scan(where=…, columns=…)` is the typed equivalent, and both return a
 `pa.RecordBatchReader` rather than a table, so materialising is yours to choose.
 
-`include_wal=False` reads the archive alone — no replica, no litestream, no subprocess — and
-assembles in well under a second. The view is **as of the archive frontier**, which on a quiet
+By default this reads the **archive alone** — no replica, no litestream, no subprocess — and
+assembles in well under a second. The view is as of the archive frontier, which on a quiet
 stream can lag indefinitely rather than by the sync interval, because `sync` holds back a
 trailing run under `target_compact_size`. `coverage()` reports what it can actually serve.
 
-**Drop the flag when you want the freshest read there is.** With a WAL sidecar running, the
-writer's `buffer.db` is restored from its replica and merged with the archive, so you see down
-to the replication lag rather than to the last `sync`:
+**Pass `include_wal=True` when you want the freshest read there is.** With the writer running a
+WAL sidecar, its `buffer.db` is restored from the replica and merged with the archive, so you
+see down to the replication lag rather than to the last `sync`:
 
 ```python
-with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
+with litelink.snapshot("trades", archive="s3://bucket/prefix", include_wal=True) as reader:
     print(reader.coverage())
     # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=True)
 ```
+
+It needs `wal_replication` on and a sidecar that has shipped; without a replica it raises,
+which is why it is not the default.
 
 That restore is the expensive part: measured against a 276k-row log, 22 s to assemble against
 1.4 s per scan — and it scales with the buffer FILE's size rather than its row count, so a
@@ -168,6 +170,9 @@ while pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the format h
 prepending the `v`. `credential_chain` is the ordinary AWS resolution — profile, instance
 metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
 `URL_STYLE 'path'` instead.
+
+That is the same question the first snippet asks, and on a default snapshot it returns the same
+answer — both read the archive, one through litelink's union and one straight at the table.
 
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
 asks for what came after — which is how you poll the archive as it grows.

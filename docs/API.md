@@ -333,31 +333,37 @@ the writer's `archived_through()`.
 
 ```python
 litelink.snapshot(name, *, archive, s3=None, binary=None, scratch_dir=None,
-                  include_wal=True) -> RemoteReadHandle
+                  include_wal=False) -> RemoteReadHandle
 ```
 
 A point-in-time view of a log running somewhere else. **A snapshot, not a subscription**:
 refreshing means assembling another one.
 
-It was called `follow`, which promised a subscription it never provided — its docstring had to
-open by saying so. `litelink.follow` still works and emits a `DeprecationWarning`; it will be
-removed no earlier than 0.4.
+It was called `follow` before 0.3, which promised a subscription it never provided — its
+docstring had to open by saying so. The old name was removed rather than deprecated: the
+library was days old and 0.3 is its introduction, so an alias would have been compatibility for
+nobody at the price of two names for one thing.
 
 **Two modes, and the difference is bigger than the flag makes it look.**
 
-| | `include_wal=True` (default) | `include_wal=False` |
+| | `include_wal=False` (default) | `include_wal=True` |
 |---|---|---|
-| what it reads | WAL replica **+** archive | archive alone |
-| fresh to | the replication lag | the archive frontier |
-| assembles in | seconds — see below | one catalog read |
-| needs litestream | yes | no |
-| a log with nothing archived | served from the buffer | **refused** |
+| what it reads | archive alone | WAL replica **+** archive |
+| fresh to | the archive frontier | the replication lag |
+| assembles in | one catalog read | seconds — see below |
+| needs litestream | no | yes |
+| a log with nothing archived | **refused** | served from the buffer |
+
+**By default it reads the archive alone**, which is also the mode that works on an ordinary
+log: `wal_replication` is opt-in and needs a sidecar, so most logs have no replica to restore
+and `include_wal=True` fails outright on them. Measured on a log with an archive and no
+replication — `include_wal=True` raised in 0.10 s, the default served 3,870 rows.
 
 With `include_wal=True` the writer's `buffer.db` is restored from its replica, the archive is
 adopted beside it, and the two are merged — so freshness falls to the replication lag rather
 than to the seal cadence.
 
-**`include_wal=False` skips the restore entirely**, which is almost all of the cost. Measured
+**Skipping the restore** is almost all of the cost. Measured
 against S3 at 60–75 ms RTT: a 1.9 MB buffer took **7.2 s**, of which transfer was ~0.2 s. The
 rest is one LIST plan plus ~20 serial GETs, and the chain length grows with the log's **age**
 rather than its size, because a slow stream accumulates LTX files on the sync interval however
@@ -390,9 +396,8 @@ with litelink.snapshot("trades", archive="s3://bucket/prefix", s3=opts) as reade
     reader.sql("SELECT side, count(*) FROM log GROUP BY side")
 ```
 
-With `include_wal=True`, `archive` is where the *WAL replica* lives and the archive prefix
-itself comes from the replica's own `meta`. With `include_wal=False` there is no replica, so
-`archive` is the prefix.
+By default there is no replica, so `archive` is the prefix. With `include_wal=True` it is where
+the *WAL replica* lives, and the archive prefix itself comes from the replica's own `meta`.
 
 **A log that has published nothing can still be read with `include_wal=True` if its buffer
 holds all of it** — the ordinary state of a slow capture, where `wal_replication` makes a seal

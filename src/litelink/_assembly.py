@@ -1,20 +1,19 @@
 """Building logs and readers.
 
 `log.py` owns what the handles *do*; this module owns how they
-come to exist. The split is why `litelink.follow` could return something that was
+come to exist. The split is why `litelink.snapshot` can return something that is
 not a `WriteHandle` and read as though it should — a classmethod names its receiver as
 the thing being built, and four of these build three different types.
 
 Every factory here builds its object's collaborators and hands them over
 complete. None of them takes a mode: `open` builds a writer, `reader` and
-`follow` build readers, and there is no flag that turns one into the other.
+`snapshot` build readers, and there is no flag that turns one into the other.
 """
 
 from __future__ import annotations
 
 import json
 import tempfile
-import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -105,7 +104,7 @@ def open(  # noqa: A001
 
     Reading sees the writer's commits as they land: `catalog.db` and
     `archive.db` live at the root and both processes read the same rows. That
-    is the difference from `follow`, which reads a replica captured at a point
+    is the difference from `snapshot`, which reads a replica captured at a point
     in time.
     """
     layout = Layout(Path(root), name)
@@ -150,18 +149,25 @@ def snapshot(
     s3: S3Options | None = None,
     binary: str | None = None,
     scratch_dir: PathLike[str] | str | None = None,
-    include_wal: bool = True,
+    include_wal: bool = False,
 ) -> RemoteReadHandle:
     """A read-only view of a log running somewhere else, as of a moment (§3b).
 
-    **Named for what it is.** This was `follow`, and the name promised a
-    subscription it never provided — its own docstring had to open by saying
-    "a snapshot, not a subscription". A name a docstring has to walk back is
-    the wrong name. `follow` remains as a deprecated alias.
+    **Named for what it is.** This was `follow` before 0.3, and that name
+    promised a subscription it never provided — its own docstring had to open
+    by saying "a snapshot, not a subscription". A name a docstring has to walk
+    back is the wrong name, and it was removed rather than deprecated: the
+    library is days old and this release is its introduction, so an alias would
+    have been compatibility for nobody at the price of two names for one thing
+    in the first API anyone reads.
 
-    **`include_wal=False` reads the archive alone**, skipping the litestream
-    restore entirely: no replica, no scratch buffer, no subprocess. That is
-    almost all of the wall clock. Measured against S3 at 60-75 ms RTT: a 1.9 MB
+    **Reads the archive alone by default**, skipping the litestream restore
+    entirely: no replica, no scratch buffer, no subprocess. That is almost all
+    of the wall clock, and it is the default because it is the mode that works
+    on an ordinary log — `wal_replication` is opt-in and needs a sidecar, so
+    most logs have no replica to restore, and `include_wal=True` fails outright
+    on those. Measured on a log with an archive and no replication:
+    `include_wal=True` raised in 0.10 s, `include_wal=False` served 3,870 rows. Measured against S3 at 60-75 ms RTT: a 1.9 MB
     buffer took 7.2 s to restore, of which transfer was ~0.2 s — the rest is one
     LIST plan plus ~20 serial GETs, and the chain length grows with the log's
     AGE rather than its size, because a slow stream accumulates LTX files on the
@@ -185,9 +191,10 @@ def snapshot(
       silent wrong answer this path can give, so it raises and names
       `include_wal=True`.
 
-    Reach for it when the last few minutes do not matter: historical and
-    analytical reads over a long window, where 7 s per handle is the whole cost
-    and the freshness buys nothing.
+    **`include_wal=True` merges the writer's replicated buffer**, so freshness
+    falls to the replication lag rather than to the seal cadence. It needs the
+    writer to be running `wal_replication` with a sidecar that has shipped, and
+    it pays the restore — reach for it when the last few minutes matter.
 
     A read-only view of a log running somewhere else (§3b).
 
@@ -271,38 +278,6 @@ def snapshot(
         raise
 
     return view
-
-
-def follow(
-    name: str,
-    *,
-    archive: str,
-    s3: S3Options | None = None,
-    binary: str | None = None,
-    scratch_dir: PathLike[str] | str | None = None,
-    include_wal: bool = True,
-) -> RemoteReadHandle:
-    """Deprecated alias for `snapshot`. Removed no earlier than 0.4.
-
-    The name promised a subscription this never provided — see `snapshot`,
-    whose docstring used to have to open by saying so.
-    """
-    warnings.warn(
-        "litelink.follow is deprecated and will be removed no earlier than "
-        "0.4; use litelink.snapshot, which is the same call. The old name "
-        "promised a subscription it never provided.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-    return snapshot(
-        name,
-        archive=archive,
-        s3=s3,
-        binary=binary,
-        scratch_dir=scratch_dir,
-        include_wal=include_wal,
-    )
 
 
 def _has_replica(prefix: str, name: str, options: S3Options) -> bool:
@@ -758,4 +733,4 @@ def restore(
     return WriteHandle.restore(root, name, archive=archive, s3=s3, binary=binary)
 
 
-__all__ = ["follow", "new", "open", "restore"]
+__all__ = ["new", "open", "restore", "snapshot"]

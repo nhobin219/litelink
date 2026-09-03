@@ -27,7 +27,7 @@ pass:
   returns. It reads the log's own directory, sees the writer's commits as they
   land, and takes no ``archive`` argument because the log already records where
   its archive is.
-- ``follow`` wants an *archive URI* and no root. It restores the writer's
+- ``snapshot`` wants an *archive URI* and no root. It restores the writer's
   buffer from object storage into scratch space and merges it with the archive,
   so it reads a log running on another machine, as of a point in time.
 
@@ -39,7 +39,7 @@ where the reasoning lives.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from litelink._assembly import follow, new, open, restore, snapshot  # noqa: A004
+from litelink._assembly import new, open, restore, snapshot  # noqa: A004
 from litelink._preflight import Check, Report, preflight
 from litelink._s3 import S3Options
 from litelink.log import (
@@ -69,7 +69,6 @@ __all__ = [
     "S3Options",
     "WriteHandle",
     "__version__",
-    "follow",
     "new",
     "open",
     "preflight",

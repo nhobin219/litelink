@@ -4488,8 +4488,11 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
     """
     taken = set(inspect.signature(litelink.snapshot).parameters)
     assert taken == {"name", "archive", "s3", "binary", "scratch_dir", "include_wal"}
-    # The deprecated alias forwards the whole surface, or it is not an alias.
-    assert set(inspect.signature(litelink.follow).parameters) == taken
+    assert not hasattr(litelink, "follow"), (
+        "`follow` was removed in 0.3 rather than deprecated — the library was "
+        "days old and this was its introduction, so an alias would have been "
+        "compatibility for nobody at the price of two names for one thing"
+    )
     assert "root" not in taken, (
         "a caller-supplied root can land on a directory that already holds a "
         "live log, whose catalog.db and archive.db are shared by every log "
@@ -5065,35 +5068,6 @@ def test_an_archive_only_snapshot_refuses_a_log_that_is_all_buffer(
     # that the name is wrong.
     with pytest.raises(ValueError, match="can be read as a log called s"):
         litelink.snapshot("s", archive=where, s3=s3, include_wal=False)
-
-
-def test_follow_still_works_and_says_it_is_deprecated(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """The old name is in `__all__` and in the published API, so it keeps
-    working — and says once, at the call site, that it will not for ever."""
-    where = f"s3://{bucket}/deprecated"
-    config = replace(
-        LogConfig(),
-        target_seal_size=8 * 1024,
-        target_compact_size=8 * 1024,
-        compact_min_files=2,
-    )
-    primary = tmp_path / "primary"
-    with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
-    ) as log:
-        log.extend(rows(ROWS))
-        log.seal_due()
-        log.maintain()
-        log.sync()
-        frontier = log.archived_through()
-
-    with pytest.warns(DeprecationWarning, match="use litelink.snapshot"):
-        view = litelink.follow("s", archive=where, s3=s3, include_wal=False)
-
-    with view:
-        assert view.scan(include_archive=True).read_all().num_rows == frontier
 
 
 def test_an_archive_only_snapshot_keeps_a_column_added_mid_stream(

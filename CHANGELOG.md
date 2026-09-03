@@ -11,9 +11,10 @@ minor version carries breaking changes.
 
 ### Changed
 
-- **`litelink.follow` is renamed to `litelink.snapshot`** (breaking). The old
-  name remains as a deprecated alias emitting `DeprecationWarning`, and will be
-  removed no earlier than 0.4.
+- **`litelink.follow` is renamed to `litelink.snapshot`** (breaking), and the
+  old name is REMOVED rather than deprecated. The library is days old and this
+  release is its introduction, so an alias would have been compatibility for
+  nobody at the price of two names for one thing in the first API anyone reads.
 
   The name promised a subscription it never provided, and its own docstring had
   to open by saying so — "a snapshot, not a subscription". It also promised
@@ -23,8 +24,13 @@ minor version carries breaking changes.
 
 ### Added
 
-- **`snapshot(..., include_wal=False)` reads the archive alone**, skipping the
-  litestream restore — which is almost the entire cost of assembling a handle.
+- **`snapshot` reads the archive alone by default**, skipping the litestream
+  restore — which is almost the entire cost of assembling a handle, and which
+  is also the only mode that works on an ordinary log: `wal_replication` is
+  opt-in and needs a sidecar, so most logs have no replica and the merged read
+  fails outright on them. Measured on a log with an archive and no replication:
+  the merged read raised in 0.10 s, the archive-only read served 3,870 rows.
+  Pass `include_wal=True` for the merged view.
   Measured against S3 at 60–75 ms RTT: a 1.9 MB buffer took 7.2 s, of which
   transfer was ~0.2 s; the rest is one LIST plan plus ~20 serial GETs, and the
   chain grows with the log's *age* rather than its size. The same handle
