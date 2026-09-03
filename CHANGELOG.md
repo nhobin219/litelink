@@ -36,7 +36,10 @@ minor version carries breaking changes.
   rather than by the sync interval. And it **refuses a log whose archive has
   published nothing**, naming `include_wal=True`: that is the ordinary state of
   a slow capture and exactly when the buffer holds everything, so an
-  archive-only handle would serve zero rows.
+  archive-only handle would serve zero rows. The refusal distinguishes a slow
+  capture from a mistyped prefix or name by whether a WAL replica exists, so
+  the first is told to retry and the second is told what its arguments resolved
+  to.
 
   The schema it reports takes the **column set from the archive's Iceberg
   schema and the types from a data file's Parquet footer**. Iceberg's schema is

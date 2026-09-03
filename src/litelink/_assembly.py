@@ -31,7 +31,7 @@ from litelink._buffer import (
 from litelink._layout import Layout, validate_archive
 from litelink._maintenance import Maintenance
 from litelink._read import Reader, duckdb_connection
-from litelink._replication import litestream_config, restore_buffer
+from litelink._replication import destination, litestream_config, restore_buffer
 from litelink._table import LogTable, archive_extent, archive_shape
 from litelink.log import (
     LocalReadHandle,
@@ -305,6 +305,34 @@ def follow(
     )
 
 
+def _has_replica(prefix: str, name: str, options: S3Options) -> bool:
+    """Whether a WAL replica for `name` exists under `prefix`.
+
+    The one fact that separates "this log exists and has archived nothing yet"
+    from "nothing here is called that". Both look identical from the archive's
+    published metadata, and answering with the wrong one sends an operator with
+    a typo to `include_wal=True`, where litestream fails on something else.
+
+    Best effort by construction: an unreachable bucket, a missing one, or
+    credentials that cannot list all answer False, and False only ever
+    downgrades the message from "retry with include_wal=True" to "check the
+    prefix and the name" — which names both, so it stays actionable either way.
+    """
+    from pyarrow.fs import FileSelector
+
+    from litelink._s3 import filesystem
+
+    location = destination(prefix, name).removeprefix("s3://")
+    try:
+        found = filesystem(options).get_file_info(
+            FileSelector(location, allow_not_found=True, recursive=False)
+        )
+    except Exception:  # noqa: BLE001 — see the docstring: absence is the answer
+        return False
+
+    return bool(found)
+
+
 def _archived_shape(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[pa.Schema, tuple[str, ...], str]:
@@ -326,13 +354,40 @@ def _archived_shape(
     """
     shape = archive_shape(layout, prefix, options)
     if shape is None:
-        msg = (
-            f"the archive at {prefix} has published no metadata, so an "
-            f"archive-only snapshot of {layout.name} would serve no rows. That "
-            f"is the ordinary state of a slow capture: nothing has reached "
-            f"target_seal_size, so the log is still in the writer's buffer. "
-            f"Use include_wal=True to read it from the replicated WAL."
-        )
+        # **Two very different states look identical from the archive alone**,
+        # and saying the wrong one is worse than saying neither. "No published
+        # metadata" is the ordinary state of a slow capture — nothing has
+        # reached `target_seal_size`, so the log is still in the writer's
+        # buffer — AND it is what a mistyped prefix or a wrong `name` produces.
+        # A message that assumes the first tells someone with a typo that their
+        # log is a slow capture and sends them to `include_wal=True`, where
+        # litestream fails on something else entirely. #56 fixed exactly that
+        # shape for the prefix itself.
+        #
+        # The WAL replica separates them. If one is there, the log exists, is
+        # replicated, and `include_wal=True` will genuinely work; if it is not,
+        # nothing at this prefix names this log. One LIST against a path this
+        # module already derives one way — `replica_uri` — rather than a second
+        # spelling of it.
+        replicated = _has_replica(prefix, layout.name, options)
+        if replicated:
+            msg = (
+                f"the archive at {prefix} holds no data for {layout.name} yet, "
+                f"but its WAL replica is there — so the log exists and is "
+                f"still in the writer's buffer, which is the ordinary state of "
+                f"a slow capture before anything reaches target_seal_size. "
+                f"Retry with include_wal=True, which reads it from the replica."
+            )
+        else:
+            msg = (
+                f"nothing at {prefix} names a log called {layout.name}: it has "
+                f"published no archive metadata and has no WAL replica either. "
+                f"Check the prefix and the name — together they resolve to "
+                f"{destination(prefix, layout.name)}. A log that exists but has "
+                f"archived nothing yet would have the replica, and would be "
+                f"readable with include_wal=True."
+            )
+
         raise ValueError(msg)
 
     schema, sort_by = shape

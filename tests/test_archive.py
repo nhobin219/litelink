@@ -5159,3 +5159,51 @@ def test_an_archive_only_snapshot_keeps_a_column_added_mid_stream(
         assert served.num_rows == frontier
         # And the values are really there, not a null column bolted on.
         assert served.column("region").drop_null().length() > 0
+
+
+def test_an_archive_only_snapshot_tells_a_slow_capture_from_a_typo(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """ "No published metadata" is two very different states, and saying the
+    wrong one is worse than saying neither.
+
+    It is the ordinary state of a slow capture — nothing has reached
+    `target_seal_size` — AND it is what a mistyped prefix or a wrong `name`
+    produces. A message that assumes the first tells someone with a typo that
+    their log is a slow capture and sends them to `include_wal=True`, where
+    litestream then fails on something else. #56 fixed exactly that shape for
+    the prefix itself.
+
+    The WAL replica is what separates them: if one is there the log exists and
+    `include_wal=True` genuinely works.
+    """
+    where = f"s3://{bucket}/slow"
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary,
+        "s",
+        schema=SCHEMA,
+        config=replace(LogConfig(), wal_replication=True),
+        archive=where,
+        s3=s3,
+    ) as log:
+        log.extend(rows(50))
+
+        assert log.archived_through() == 0, "the fixture must archive nothing"
+
+    # The sidecar has shipped something, which is what says the log is real.
+    fs = filesystem(s3)
+    fs.pipe(f"{bucket}/slow/s/_wal/0000000000000001.ltx", b"x")
+
+    with pytest.raises(ValueError, match="Retry with include_wal=True") as slow:
+        litelink.snapshot("s", archive=where, s3=s3, include_wal=False)
+
+    assert "the log exists" in str(slow.value)
+
+    # Same bucket, a name nothing wrote. No replica, so no such log.
+    with pytest.raises(ValueError, match="names a log called typo") as typo:
+        litelink.snapshot("typo", archive=where, s3=s3, include_wal=False)
+
+    assert "no WAL replica either" in str(typo.value)
+    # It names the resolved location, so the typo is visible rather than guessed at.
+    assert f"{where}/typo/_wal" in str(typo.value)
