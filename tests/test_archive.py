@@ -5184,3 +5184,141 @@ def test_an_archive_only_snapshot_tells_a_slow_capture_from_a_typo(
     assert "no WAL replica" in str(typo.value)
     # It names the resolved location, so the typo is visible rather than guessed at.
     assert f"{where}/typo/_wal" in str(typo.value)
+
+
+def _clone_buffer(source: Path, target: Path) -> None:
+    """Copy a buffer the way an operator recovering one has to.
+
+    Through the backup API rather than `shutil.copy`: the buffer is in WAL
+    mode, so the `.db` file alone can be missing every recent write — a plain
+    copy of a busy log produced a file whose `meta` table did not exist yet.
+    """
+    src = sqlite3.connect(source)
+    dst = sqlite3.connect(target)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
+def test_restore_refuses_a_buffer_bound_to_another_archive(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`archive=` says where the replica came from; `meta` says which log it is.
+
+    They agree on the ordinary path by construction, so the divergence only
+    appears when the buffer arrives some other way — and hand-placing one is
+    the documented recovery for a log whose WAL was never replicated. Left
+    unchecked the mismatch is silent: the handle comes back attached to the
+    buffer's archive, reporting ITS frontier, while the rows under the archive
+    the caller actually named are invisible.
+
+    Both harms are asserted, because the second is the one an operator would
+    never think to look for: adoption runs `table(repair=True)`, which with no
+    published hint takes the CREATE branch and writes a fresh `metadata.json`
+    and `version-hint.text` into the OTHER bucket. A restore that refuses must
+    leave that archive untouched.
+    """
+    held = f"s3://{bucket}/held"
+    other = f"s3://{bucket}/other"
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+
+    # The archive the caller means, with rows actually in it.
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary, "s", schema=SCHEMA, config=config, archive=held, s3=s3
+    ) as log:
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        seeded = log.archived_through()
+
+    assert seeded > 0, "the archive was never published, so the case is not set up"
+
+    # A different log, bound to a different archive, whose buffer is the donor.
+    donor = tmp_path / "donor"
+    litelink.new(donor, "s", schema=SCHEMA, config=config, archive=other, s3=s3).close()
+
+    revived = tmp_path / "revived"
+    (revived / "s").mkdir(parents=True)
+    _clone_buffer(Layout(donor, "s").buffer_db, Layout(revived, "s").buffer_db)
+
+    with pytest.raises(ValueError, match="records archive=") as caught:
+        litelink.restore(revived, "s", archive=held, s3=s3)
+
+    # Both prefixes named: which one it found, and which one was asked for.
+    assert other in str(caught.value)
+    assert held in str(caught.value)
+
+    # And the archive it would have misbound to is untouched -- no lineage
+    # published into a bucket this call never had any business writing.
+    fs = filesystem(s3)
+    assert not fs.exists(f"{bucket}/other/s/metadata/version-hint.text"), (
+        "a refused restore still published a table into the buffer's archive"
+    )
+
+
+def test_restore_accepts_the_same_archive_written_with_a_trailing_slash(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """`s3://b/p/` and `s3://b/p` name one archive, and must not read as two.
+
+    The conflict check compares the argument against what `meta` recorded, and
+    a prefix is an ordinary string a caller types — so without normalising the
+    trailing slash the guard would refuse the very restore it exists to
+    protect, and the operator's escape from it is to guess at punctuation.
+    """
+    held = f"s3://{bucket}/slash"
+    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+
+    primary = tmp_path / "primary"
+    with litelink.new(
+        primary, "s", schema=SCHEMA, config=config, archive=held, s3=s3
+    ) as log:
+        log.extend(rows(800))
+        log.seal_due()
+        log.maintain()
+        log.sync()
+        seeded = log.archived_through()
+
+    assert seeded > 0, "the archive was never published, so the case is not set up"
+
+    revived = tmp_path / "revived"
+    (revived / "s").mkdir(parents=True)
+    _clone_buffer(Layout(primary, "s").buffer_db, Layout(revived, "s").buffer_db)
+
+    # The SAME archive, one trailing slash different. This must attach.
+    with litelink.restore(revived, "s", archive=held + "/", s3=s3) as revived_log:
+        assert revived_log.archived_through() == seeded
+        assert revived_log.scan(include_archive=True).read_all().num_rows > 0
+
+
+def test_restore_refuses_a_buffer_that_records_no_archive(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A buffer from a log that never had an archive cannot be attached to one.
+
+    It fails without this guard too — but at the very END, from
+    `write_replication_config`, which is after `LogTable.create`. That is the
+    commit point, so the caller gets an exception over a root that is now
+    openable, holds a local-only log, and that `restore` will not retry because
+    both databases exist. Asserted by checking the root is still RETRYABLE:
+    no table was created, which is the difference the guard buys.
+    """
+    donor = tmp_path / "donor"
+    litelink.new(donor, "s", schema=SCHEMA, archive=None).close()
+
+    revived = tmp_path / "revived"
+    (revived / "s").mkdir(parents=True)
+    _clone_buffer(Layout(donor, "s").buffer_db, Layout(revived, "s").buffer_db)
+
+    with pytest.raises(ValueError, match="records no archive") as caught:
+        litelink.restore(revived, "s", archive=f"s3://{bucket}/nowhere", s3=s3)
+
+    assert f"s3://{bucket}/nowhere" in str(caught.value)
+    # The commit point was never reached, so a corrected call can still run.
+    assert not LogTable.exists_for(Layout(revived, "s")), (
+        "restore built the log before refusing; the root is no longer retryable"
+    )
