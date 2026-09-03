@@ -5420,7 +5420,10 @@ def test_an_archive_only_snapshot_resolves_the_pointer_once(
     parses = seen.count("parse")
 
     assert parses == 1, f"parsed the archive metadata {parses} times, not once"
-    # Two hint reads remain: `archive_shape`'s, and `open_archive`'s own
-    # create-versus-adopt decision, which is on the write path too and is not
-    # this function's to thread through.
-    assert hints <= 2, f"fetched version-hint.text {hints} times, not two"
+    # EXACTLY two, not at most two, and the lower bound is the load-bearing
+    # half. The second read is `open_archive`'s own bucket-first check before
+    # `repair=True` — the guard that stops a reader taking the CREATE branch
+    # and publishing a lineage into the bucket the primary would then commit
+    # onto. A refactor that threaded the hint into adoption as well would
+    # satisfy `<= 2` while silently retiring that read.
+    assert hints == 2, f"fetched version-hint.text {hints} times, not two"

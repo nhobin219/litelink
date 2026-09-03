@@ -223,6 +223,7 @@ data/trades/                     s3://bucket/prefix/trades/
     data/                            data/
         *.parquet                        *.parquet
         compacted/*.parquet              compacted/*.parquet
+        ingested/*.parquet               ingested/*.parquet
     metadata/                        metadata/
         *.metadata.json                  *.metadata.json
         *.avro                           *.avro
