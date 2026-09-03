@@ -7,6 +7,46 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## 0.3.0 — 2026-09-03
+
+### Changed
+
+- **`litelink.follow` is renamed to `litelink.snapshot`** (breaking). The old
+  name remains as a deprecated alias emitting `DeprecationWarning`, and will be
+  removed no earlier than 0.4.
+
+  The name promised a subscription it never provided, and its own docstring had
+  to open by saying so — "a snapshot, not a subscription". It also promised
+  freshness specifically, which is what made the new flag impossible to add
+  under it: `snapshot` promises a point-in-time view without promising which
+  point, and both modes satisfy that.
+
+### Added
+
+- **`snapshot(..., include_wal=False)` reads the archive alone**, skipping the
+  litestream restore — which is almost the entire cost of assembling a handle.
+  Measured against S3 at 60–75 ms RTT: a 1.9 MB buffer took 7.2 s, of which
+  transfer was ~0.2 s; the rest is one LIST plan plus ~20 serial GETs, and the
+  chain grows with the log's *age* rather than its size. The same handle
+  archive-only assembles in about a quarter of a second.
+
+  It is a different view, not a faster route to the same one. **Staleness is the
+  archive frontier**, not the replication lag — `sync` holds back a trailing run
+  under `target_compact_size`, so a quiet stream's frontier lags indefinitely
+  rather than by the sync interval. And it **refuses a log whose archive has
+  published nothing**, naming `include_wal=True`: that is the ordinary state of
+  a slow capture and exactly when the buffer holds everything, so an
+  archive-only handle would serve zero rows.
+
+  The schema it reports takes the **column set from the archive's Iceberg
+  schema and the types from a data file's Parquet footer**. Iceberg's schema is
+  versioned and current; a data file's is whatever was declared when it was
+  written, and files of two shapes land in one commit whenever rows were
+  sealed-but-unsynced as `add_column` ran. The footer is the only place the
+  declared Arrow types survive, since Iceberg has one string type. One caveat:
+  `coverage()` on an archive-only handle reports `wal_replication=False`
+  whatever the writer's setting, because the archive does not record it.
+
 ## 0.2.3 — 2026-09-02
 
 ### Fixed

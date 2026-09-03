@@ -351,7 +351,19 @@ def archive_shape(
     #
     # A column added AFTER the sampled file falls back to Iceberg's type, which
     # differs only in string width. That is the residual, and it is bounded:
-    # never a missing column, only a wider one.
+    # never a missing column, only a wider one. `column_type` maps both widths
+    # identically, so even the fallback flows through the synthesised buffer's
+    # DDL without a seam.
+    #
+    # **Taking the footer unconditionally for a name BOTH authorities carry
+    # rests on `add_column` being the only reachable evolution.** `rename_column`
+    # and `drop_column` raise `NotImplementedError`, so a name they share was
+    # declared exactly once, with one type, and every writer — seal, ingest,
+    # compaction, `rewrite_archive` — wrote that spelling. `drop_column`'s own
+    # docstring already promises that re-adding a name creates a NEW field id;
+    # the day it is implemented, drop-then-re-add-with-a-different-type makes a
+    # sampled old footer's type win over the current one. Prefer Iceberg's type
+    # for a shared name then, or sample a file the current schema id wrote.
     #
     # One extra GET, against a path whose purpose is avoiding twenty. Read
     # through the FileIO already built above rather than a second filesystem:
