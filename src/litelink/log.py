@@ -1549,6 +1549,66 @@ class WriteHandle(LocalReadHandle):
             )
             raise FileNotFoundError(msg)
 
+        # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `archive`
+        # is a caller bug and has to be loud.
+        #
+        # `archive` names where the litestream replica is pulled FROM; the log
+        # attaches to whatever `meta` records, adopted ~60 lines below. On the
+        # ordinary path the two agree by construction — the replica under
+        # `archive` was written by the log that recorded it — which is why this
+        # went unnoticed. They diverge only when the buffer arrives some other
+        # way, and that is not an exotic case: hand-placing one is the
+        # documented recovery for a log whose WAL was never replicated, since
+        # `wal_replication=False` leaves no replica for `restore_buffer` to
+        # find.
+        #
+        # Left alone the divergence is SILENT and the handle comes back bound
+        # to the buffer's archive. Measured on 0.2.3: `restore(archive=A)` over
+        # a buffer recording B returned a working handle with
+        # `handle.archive == B`, `archived_through() == 0` and a
+        # `scan(include_archive=True)` of 0 rows, while A held 5,000 — and the
+        # adoption's `table(repair=True)` then took its CREATE branch and wrote
+        # a `metadata.json` and a `version-hint.text` into B, publishing a
+        # lineage over an archive the caller never named.
+        #
+        # Refused rather than honoured, and refused HERE: `archive` cannot be
+        # made to win without overwriting the one fact that says which log this
+        # is, and refusing before `forget_archive_entry` below means a
+        # conflicting call mutates neither bucket nor catalog.
+        #
+        # A buffer recording NO archive is refused by the same rule, and for a
+        # reason worth stating: it already fails, just far too late. Adoption
+        # finds no location, so the `RuntimeError` below is skipped; the log is
+        # built; and `write_replication_config` then raises at the very end
+        # because a log with no archive has nowhere to ship its WAL. That raise
+        # lands AFTER `LogTable.create`, which is the commit point — so the
+        # caller gets an exception over a root that is now openable, holds a
+        # local-only log, and which `restore` itself will not retry because
+        # both databases exist. Refusing up here turns that into the same
+        # early, retryable failure as the conflict case.
+        recorded = Buffer.peek_meta(layout.buffer_db, _ARCHIVE_KEY)
+        if (recorded or "").rstrip("/") != archive.rstrip("/"):
+            found = (
+                f"records archive={recorded!r}"
+                if recorded
+                else "records no archive, so it is not from an archived log"
+            )
+            fix = (
+                f"Pass archive={recorded!r}, or restore a buffer belonging to "
+                f"{archive!r}"
+                if recorded
+                else (
+                    f"restore cannot attach {archive!r} to it — a log's archive is "
+                    f"set when it is created, or later with set_archive"
+                )
+            )
+            msg = (
+                f"{layout.buffer_db.name} {found}, but restore was called with "
+                f"archive={archive!r}. The buffer is the authority on which log "
+                f"this is, so the two have to agree. {fix}"
+            )
+            raise ValueError(msg)
+
         # A stale entry, if an operator restored all three by hand. Not merely
         # unnecessary — actively destructive: `open_archive` consults
         # `version-hint.text` ONLY when the catalog has no row, so a stale row
