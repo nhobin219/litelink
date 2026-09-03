@@ -56,7 +56,10 @@ not a service, so this costs no daemon.
     catalog.db           the local Iceberg catalog               (one stream)
     archive.db           the archive's Iceberg catalog           (one stream)
     litestream.yml       the sidecar's config, if replicating    (§3a)
-    data/                sealed Parquet, and data/compacted/     (§4, §6)
+    data/                sealed Parquet                           (§4)
+        compacted/       merged by compaction, and rewrite_archive's
+                         re-cuts                                 (§6)
+        ingested/        written by bulk ingest, never buffered   (§13.4)
     metadata/            Iceberg metadata JSON and Avro
 ```
 

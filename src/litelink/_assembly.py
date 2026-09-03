@@ -249,13 +249,16 @@ def snapshot(
     )
     try:
         layout = Layout(Path(owned.name), name)
+        precomputed: tuple[tuple[int, int] | None] | None = None
         if include_wal:
             _restore_replica(layout, archive, options, binary)
             schema, sort_by, prefix = _followed_shape(layout)
         else:
-            schema, sort_by, prefix = _archived_shape(layout, archive, options)
+            schema, sort_by, prefix, precomputed = _archived_shape(
+                layout, archive, options
+            )
 
-        _assemble_follower(layout, schema, sort_by, prefix, options)
+        _assemble_follower(layout, schema, sort_by, prefix, options, precomputed)
         table = LogTable.load(layout, readonly=True)
         buffer = Buffer.open(layout.buffer_db, schema, readonly=True)
         try:
@@ -310,7 +313,7 @@ def _has_replica(prefix: str, name: str, options: S3Options) -> bool:
 
 def _archived_shape(
     layout: Layout, prefix: str, options: S3Options
-) -> tuple[pa.Schema, tuple[str, ...], str]:
+) -> tuple[pa.Schema, tuple[str, ...], str, tuple[tuple[int, int] | None]]:
     """The log's shape from the ARCHIVE, for a snapshot with no replica.
 
     The counterpart to `_followed_shape`, and deliberately not a drop-in for
@@ -327,8 +330,8 @@ def _archived_shape(
     asked for a snapshot and got an empty one has been told nothing went wrong.
     That is the one silent wrong answer this path can give.
     """
-    shape = archive_shape(layout, prefix, options)
-    if shape is None:
+    resolved = archive_shape(layout, prefix, options)
+    if resolved is None:
         # **Two very different states look identical from the archive alone**,
         # and saying the wrong one is worse than saying neither. "No published
         # metadata" is the ordinary state of a slow capture — nothing has
@@ -372,7 +375,7 @@ def _archived_shape(
 
         raise ValueError(msg)
 
-    schema, sort_by = shape
+    schema, sort_by, covered = resolved
     # The reader wants a buffer to union with, and an archive-only snapshot has
     # no rows for it. Created empty rather than skipped: every read leg is
     # bounded by its neighbour's extent, and an absent buffer would be a second
@@ -399,7 +402,10 @@ def _archived_shape(
     finally:
         buffer.close()
 
-    return schema, sort_by, prefix
+    # The extent travels with the shape rather than being fetched again — see
+    # `archive_shape`. Wrapped in a tuple so `None` can mean "the archive has
+    # published nothing" without colliding with "nobody resolved it yet".
+    return schema, sort_by, prefix, (covered,)
 
 
 def _options(s3: S3Options | None) -> S3Options:
@@ -601,6 +607,7 @@ def _assemble_follower(
     sort_by: tuple[str, ...],
     prefix: str,
     options: S3Options,
+    precomputed: tuple[tuple[int, int] | None] | None = None,
 ) -> None:
     """Adopt the archive and build the empty local table a reader expects.
 
@@ -623,7 +630,14 @@ def _assemble_follower(
     """
     import contextlib
 
-    covered = archive_extent(layout, prefix, options)
+    # Resolved already on the archive-only path, where `archive_shape` had the
+    # metadata open anyway. `None` here means nobody has looked; a `(value,)`
+    # carries an answer that may itself be `None`.
+    covered = (
+        archive_extent(layout, prefix, options)
+        if precomputed is None
+        else precomputed[0]
+    )
     if covered is None:
         # Nothing published, so the buffer is the only tier that can serve —
         # allowed exactly when it holds the whole log. That is the case a slow

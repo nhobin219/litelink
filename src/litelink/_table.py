@@ -301,7 +301,7 @@ def archive_extent(
 
 def archive_shape(
     layout: Layout, prefix: str, options: S3Options
-) -> tuple[pa.Schema, tuple[str, ...]] | None:
+) -> tuple[pa.Schema, tuple[str, ...], tuple[int, int] | None] | None:
     """The archive's declared shape, read from the bucket alone (§3b).
 
     What an archive-only snapshot needs and cannot get anywhere else. `follow`
@@ -313,6 +313,14 @@ def archive_shape(
 
     That asymmetry is the reason `include_wal=False` is not simply a faster
     path to the same answer, and `snapshot` says so.
+
+    **Returns the extent as well, because it costs nothing here and a second
+    call costs two round trips.** `archive_extent` does the identical first two
+    steps — resolve the hint, parse the metadata — and an archive-only snapshot
+    used to call both, so it fetched `version-hint.text` three times and parsed
+    `metadata.json` twice for one assembly. Against a bucket at 60-75 ms RTT
+    that is most of the assembly, and on a large archive the metadata is not
+    small. Measured before this: 3 hint GETs and 2 metadata parses.
 
     `None` when the archive has no published hint — nothing pushed there, or
     not a litelink archive. The caller cannot tell those apart and must not
@@ -386,6 +394,7 @@ def archive_shape(
             ]
         ),
         sort_by,
+        LogTable(None, layout, table, prefix).extent(),  # ty: ignore
     )
 
 
