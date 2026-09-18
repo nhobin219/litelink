@@ -7,6 +7,44 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## 0.3.1 — 2026-09-18
+
+### Changed
+
+- **Assembling an archive-only snapshot costs one fewer round trip.** It fetched
+  `version-hint.text` three times and parsed `metadata.json` twice for a single
+  assembly, because `archive_shape` and `archive_extent` do the identical first
+  two steps and the path called both. Now two fetches and one parse.
+  `archive_shape` returns the extent it already had open and the archive-only
+  path carries it through. On a local endpoint that is noise; against a bucket
+  at 60–75 ms RTT it is a round trip plus a redundant `metadata.json` transfer,
+  and on an archive with thousands of files that file is not small.
+
+  The remaining fetch is `open_archive`'s own bucket-first check before
+  `repair=True` — the guard that stops a reader taking the CREATE branch and
+  publishing a lineage into the bucket the primary would then commit onto. It
+  is on the write path too and is deliberately left alone.
+
+### Documentation
+
+- **`data/ingested/` appears in the layout.** Bulk ingest has written there
+  since 0.2.2 and neither the README's tree nor SPEC §2 said so, so the only way
+  to learn the directory existed was to list the bucket — which is how it was
+  found. Both now show it beside `compacted/`, and SPEC gives each its own line
+  with the pass that writes it, including that `compacted/` also holds
+  `rewrite_archive`'s re-cuts.
+
+- **The README says which read to reach for.** A one-shot query is cheaper
+  through a raw `iceberg_scan` than through `snapshot`, which assembles a DuckDB
+  connection, a scratch buffer and an adopted catalog before it can answer
+  anything. Hold a snapshot open and the order reverses: measured on a
+  200k-row archive, a bounded scan is 0.02 s against 0.40 s for a fresh DuckDB
+  connection. Both facts are now stated rather than left to be discovered.
+
+- The README's DuckDB example is Python rather than bare SQL, and drops
+  `INSTALL`/`LOAD` — DuckDB autoloads `iceberg`, `avro` and `httpfs` when a
+  query names them.
+
 ## 0.3.0 — 2026-09-03
 
 ### Changed
