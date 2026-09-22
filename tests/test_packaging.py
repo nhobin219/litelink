@@ -217,6 +217,40 @@ def test_the_s3_tier_is_not_silently_skipped() -> None:
         )
 
 
+def test_the_cold_box_job_is_not_cached() -> None:
+    """A restored uv cache can make a cold-box resolve fail against a version
+    that exists.
+
+    uv's cache includes INDEX METADATA, so `setup-uv` with `enable-cache` can
+    restore one written before a dependency's release. Every other job here
+    resolves from the lockfile and does not care. `packaging` is the only one
+    that asks the index, which is the whole question it exists to answer —
+    does a cold box resolve and run this — so a cache that answers it from
+    last week defeats the job.
+
+    Observed downstream rather than here: streamcast's equivalent job failed
+    with "No solution found" for `litelink>=0.4.0` while 0.4.0 was on PyPI,
+    on the same commit where an uncached job resolved it. Nothing this package
+    depends on moves fast enough to have triggered it locally, which is
+    precisely why it would have been missed.
+
+    Falsify by putting `enable-cache: true` back on the job.
+    """
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover - the failure this makes loud
+        pytest.fail("PyYAML is not installed. It is a dev dependency.")
+
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["packaging"]["steps"]
+    cached = [s for s in steps if "enable-cache" in str(s.get("with", ""))]
+
+    assert not cached, (
+        "the packaging job caches uv, so its resolve can be answered from an "
+        "index snapshot older than the versions it is meant to verify"
+    )
+
+
 def test_the_required_check_depends_on_every_job() -> None:
     """`ci-success` is the one required check, so a job missing from it is invisible.
 

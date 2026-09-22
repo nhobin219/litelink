@@ -26,9 +26,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # **No cache on this job, deliberately.** It is the only one that
+      # resolves from the INDEX rather than from the lockfile, and uv's cache
+      # includes index metadata — so a restored cache predating a release
+      # makes a resolve fail against a version that exists. Seen in streamcast,
+      # which depends on this package: CI failed with "No solution found" for
+      # `litelink>=0.4.0` while 0.4.0 was on PyPI, on the same commit an
+      # uncached job resolved it fine.
+      #
+      # It has not bitten here because nothing this depends on moves that
+      # fast, which is exactly why it would be missed. The job installs one
+      # wheel into one throwaway venv, so the cache saves little and costs the
+      # answer to the question the job exists to ask: does a COLD box resolve
+      # and run this.
       - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
 
       # A PLATFORM wheel, which is what a user on this OS installs. The pure
       # wheel is the fallback for platforms with no build, and it cannot carry
