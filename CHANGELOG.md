@@ -6,6 +6,38 @@ rather than restates it.
 
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
+## 0.4.0 — unreleased
+
+### Changed — breaking
+
+- **`include_archive` is a property of the handle, not an argument to each
+  read.** `open(root, name)` reads local files and the buffer;
+  `open(root, name, include_archive=True)` reads the archive too;
+  `log.with_archive()` derives a read-only view of an open handle without a
+  second SQLite connection or catalog load. `scan()` and `sql()` no longer
+  take the parameter.
+
+  It used to default to whether the archive was *load-bearing* — True exactly
+  when the local table held nothing and the archive held something — so the
+  same call read local files before an eviction pass and object storage after
+  it, with nothing at the call site saying so. A read that changes tier
+  changes its latency, its failure modes and its cost, and it should not do
+  that on a retention schedule.
+
+- **`RemoteReadHandle` takes no `include_archive` at all.** A snapshot is
+  assembled from an archive and its local table is empty by construction, so
+  `False` would name a handle that can read nothing. The request is now
+  unrepresentable rather than refused — which is what `Follower` had before
+  the two read-only shapes were unified.
+
+- A handle that cannot reach the archive and finds its local table empty still
+  **refuses** rather than serving the buffer alone. The message now names the
+  assembly argument instead of a read argument.
+
+**Migrating:** `log.scan(include_archive=True)` becomes
+`log.with_archive().scan()`, or open the handle with `include_archive=True`
+where every read wants the archive. `include_archive=False` was already the
+effective default for a log with local files; drop it.
 
 ## 0.3.1 — 2026-09-18
 

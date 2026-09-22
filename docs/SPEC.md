@@ -486,8 +486,9 @@ internal dispatch, and a staleness number answered by a writer's method.
 
 - **There is no `include_archive=False`.** A follower's local Iceberg table is empty by
   construction — `_assemble_follower` creates it that way — so reading without the archive
-  returns the replicated buffer alone: a fraction of the log, silently. As a subclass this
-  was a parameter that had to raise; wrapping deletes it.
+  returns the replicated buffer alone: a fraction of the log, silently. `RemoteReadHandle`
+  therefore sets `include_archive=True` at construction and takes no parameter for it: the
+  caller chose the archive when it called `snapshot`.
 - **There is no `write_replication_config`.** `litestream_config` keys each replica on the
   path *relative to the root*, so a follower with the same log name produces a key identical
   to the primary's. A sidecar run in a follower's root — which this project's own convention
@@ -1438,6 +1439,19 @@ fsync is 20-50 us against ~1 ms here.
 
 ### Full-stream read — all three tiers
 
+**Opt in at assembly, not per read.** `open(root, name)` reads local files and the buffer;
+`open(root, name, include_archive=True)` reads all three, and `log.with_archive()` derives a
+read-only view of an open handle without a second SQLite connection or catalog load. Which
+tiers a handle reads is fixed for its life, so two `scan()` calls on one handle can never
+disagree.
+
+It was derived from state once — the archive counted as load-bearing exactly when the local
+table held nothing and the archive held something — which meant the same call read local
+files before an eviction pass and object storage after it, with nothing at the call site
+saying so. A read that changes tier changes its latency, its failure modes and its cost; it
+should not do that on a retention schedule. A handle that cannot reach the archive and finds
+its local table empty **refuses** rather than serving the buffer alone.
+
 The archive overlaps the local window, so the tiers cannot simply be unioned. Bound each by
 its neighbour's **actual extent**, read at query time:
 
@@ -1459,7 +1473,8 @@ which matters, since two Iceberg commits cannot be made atomic with each other.
 
 Both `lo` and `hi` come from manifest column statistics; neither requires opening a data
 file. If the local table is empty (everything evicted), it drops out and the read becomes
-archive plus buffer bounded by the archive's max offset.
+archive plus buffer bounded by the archive's max offset — on a handle that reads the
+archive. On one that does not, the same state is a refusal.
 
 ### Historical read
 
@@ -1479,7 +1494,7 @@ knowledge of the local tier.
 
 | knob | governs | too low means |
 |---|---|---|
-| `local_retention` | how much history the local table keeps | hot reads fall through to the archive |
+| `local_retention` | how much history the local table keeps | hot reads refuse, or need `include_archive=True` |
 | `snapshot_retention` | how long expired snapshots survive | long scans hit deleted files |
 
 `local_retention` must exceed the longest hot-path lookback **with margin** — equal leaves

@@ -145,13 +145,16 @@ MAINTAINER = """
 # each exactly once. A seal, a compaction, an eviction or a sync landing
 # mid-query would show up here as a gap or a repeat.
 READER = """
-    log = litelink.open(ROOT, "s", read_only=True, s3=S3)
+    log = litelink.open(ROOT, "s", read_only=True, s3=S3, include_archive=True)
     samples, high = 0, 0
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
-        offsets = log.sql(
-            "SELECT * FROM log", include_archive=True
-        ).read_all().column("litelink_offset").to_pylist()
+        offsets = (
+            log.sql("SELECT * FROM log")
+            .read_all()
+            .column("litelink_offset")
+            .to_pylist()
+        )
         if offsets:
             assert len(set(offsets)) == len(offsets), "duplicate offsets"
             assert sorted(offsets) == list(range(1, max(offsets) + 1)), "gap"
@@ -221,7 +224,7 @@ def test_the_archive_actually_took_part(
         local = log.scan().read_all().num_rows
         assert local < ROWS, "eviction never removed anything from local disk"
 
-        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        merged = log.with_archive().sql("SELECT * FROM log").read_all()
         offsets = merged.column("litelink_offset").to_pylist()
         assert sorted(offsets) == list(range(1, ROWS + 1)), (
             "the union of the tiers must be the whole stream, exactly once"

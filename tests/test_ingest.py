@@ -545,7 +545,7 @@ def test_an_ingested_range_survives_the_whole_archive_cycle(
         assert log._archive.require().extent() is not None
         log.maintain()
 
-        assert log.scan(include_archive=True).read_all().num_rows == 3400
+        assert log.with_archive().scan().read_all().num_rows == 3400
         assert log.append(rows(1)[0]) == 3401
 
 

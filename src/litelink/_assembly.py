@@ -57,6 +57,7 @@ def open(  # noqa: A001
     *,
     read_only: Literal[False] = False,
     s3: S3Options | None = None,
+    include_archive: bool = False,
 ) -> WriteHandle: ...
 
 
@@ -67,6 +68,7 @@ def open(  # noqa: A001
     *,
     read_only: Literal[True],
     s3: S3Options | None = None,
+    include_archive: bool = False,
 ) -> LocalReadHandle: ...
 
 
@@ -76,6 +78,7 @@ def open(  # noqa: A001
     *,
     read_only: bool = False,
     s3: S3Options | None = None,
+    include_archive: bool = False,
 ) -> LogHandle:
     """Open an existing log, for writing or for reading beside its writer.
 
@@ -121,6 +124,7 @@ def open(  # noqa: A001
                 buffer=buffer,
                 archive=remote,
                 reader=reader,
+                include_archive=include_archive,
             )
 
         handle = WriteHandle(
@@ -131,6 +135,7 @@ def open(  # noqa: A001
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
             archive=remote,
+            include_archive=include_archive,
         )
     except BaseException:
         buffer.close()
@@ -719,6 +724,7 @@ def new(
     config: LogConfig | None = None,
     archive: str | None = None,
     s3: S3Options | None = None,
+    include_archive: bool = False,
     start_offset: int = 1,
 ) -> WriteHandle:
     """Create a log. See `litelink.new` for the shape it fixes and why."""
@@ -731,6 +737,7 @@ def new(
         archive=archive,
         s3=s3,
         start_offset=start_offset,
+        include_archive=include_archive,
     )
 
 
@@ -741,10 +748,18 @@ def restore(
     archive: str,
     s3: S3Options | None = None,
     binary: str | None = None,
+    include_archive: bool = False,
 ) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
     assigned. See `litelink.restore`."""
-    return WriteHandle.restore(root, name, archive=archive, s3=s3, binary=binary)
+    return WriteHandle.restore(
+        root,
+        name,
+        archive=archive,
+        s3=s3,
+        binary=binary,
+        include_archive=include_archive,
+    )
 
 
 __all__ = ["new", "open", "restore", "snapshot"]

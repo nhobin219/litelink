@@ -74,6 +74,20 @@ log.maintain()                                        # compact, evict, expire
 That is the whole API for local capture. A reader can open the same log alongside a live
 writer with `litelink.open("data", "trades", read_only=True)`.
 
+**A handle reads local files unless you say otherwise.** `include_archive=True` on the
+open (or `log.with_archive()`, which derives a read-only view of an open handle without a
+second connection) is what reaches object storage:
+
+```python
+log.scan(...)                       # local files and the buffer
+log.with_archive().scan(...)        # the whole history, including the archive
+```
+
+Which tiers a handle reads is fixed when it is built, so two reads on one handle cannot
+disagree, and a scan never starts touching the network because retention happened to run.
+A handle that cannot reach the archive and finds its local table empty refuses rather than
+returning the buffer alone.
+
 **Nothing else is required** — no producer, no credentials, no maintainer process, no
 container. Object storage, WAL replication and cross-machine reads are all opt-in, and each
 is one call.

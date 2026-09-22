@@ -361,20 +361,26 @@ class LogHandle:
     classes — a `WriteHandle` with a `readonly` flag guarding thirteen write methods,
     and a separate `Follower` — had to keep two answers to every question.
 
-    **What the follower used to encode as a type is derived here.** The
-    archive is load-bearing exactly when the local table holds nothing and the
-    archive is known to hold something: then it is the only place the archived
-    rows can come from, so reads must include it and a missing archive must
-    refuse rather than quietly serve the buffer alone. That is true of a
-    followed log, whose table is empty by construction, and equally true of a
-    local log that has evicted everything — a case the old split got wrong,
-    measured at 476 of 1,500 rows returned with no error. See
-    `_archive_required` for why the watermark is part of the test.
+    **Whether reads reach the archive is fixed when the handle is built, not
+    decided per read.** It was derived from state once — the archive counted
+    as load-bearing exactly when the local table held nothing and the archive
+    held something — which meant the same `scan()` call read local files
+    before an eviction pass and object storage after it, with nothing at the
+    call site saying so. A read that silently changes tier changes its
+    latency, its failure modes and its cost, and does it on a schedule the
+    caller does not control.
 
-    **One thing is NOT derived, and it is a real cost of unifying.**
-    `include_archive=False` was absent from `Follower` and is merely refused
-    here, because the parameter has to exist for the local case. Asking for it
-    where the archive is load-bearing raises instead of being unrepresentable.
+    So it is `include_archive` on the assembly call now: `open(root, name)`
+    reads local files, `open(root, name, include_archive=True)` reads the
+    archive too, and the answer cannot change between two reads on one
+    handle. `RemoteReadHandle` sets it unconditionally, because a snapshot
+    assembled from an archive has nothing else to read — the parameter is
+    absent there rather than present with one legal value, which is what
+    `Follower` had before the two were unified.
+
+    A handle that cannot reach the archive still REFUSES rather than serving
+    short: reading a log whose local table has emptied raises, naming the
+    assembly argument, instead of quietly returning the buffer alone.
     """
 
     def __init__(
@@ -385,14 +391,59 @@ class LogHandle:
         buffer: Buffer,
         archive: Archive,
         reader: Reader,
+        include_archive: bool = False,
     ) -> None:
         self._layout = layout
         self._table = table
         self._buffer = buffer
         self._archive = archive
         self._reader = reader
+        self._include_archive = include_archive
 
     # -- identity ----------------------------------------------------------
+
+    @property
+    def include_archive(self) -> bool:
+        """Whether reads on this handle reach the archive.
+
+        Fixed at assembly. Read it to know what a `scan` will cost before
+        running one — local files, or object storage.
+        """
+        return self._include_archive
+
+    def with_archive(self) -> LogHandle:
+        """A read-only view of this log whose reads DO reach the archive.
+
+        The same collaborators with a different policy: no I/O, no second
+        SQLite connection, no lock, no catalog load. It exists because the
+        alternative for a caller that is mostly local and occasionally needs
+        the full history is `open(root, name, read_only=True,
+        include_archive=True)`, which opens the buffer and loads the table
+        again to answer one query.
+
+            log.scan(...)                     # local files
+            log.with_archive().sql(...)       # the whole history
+
+        A view rather than a per-read flag, so the rule still holds: any one
+        handle reads the same tiers for its whole life, and which tiers is
+        visible at the call site. A handle that already reaches the archive
+        returns itself.
+
+        Read-only deliberately — `LogHandle`, not `WriteHandle`. Appending
+        through a view whose defining property is where it READS would be a
+        second way to write to a log that allows exactly one writer.
+        """
+        if self._include_archive:
+            return self
+
+        return LogHandle(
+            layout=self._layout,
+            table=self._table,
+            buffer=self._buffer,
+            archive=self._archive,
+            reader=self._reader,
+            include_archive=True,
+        )
 
     @property
     def root(self) -> Path:
@@ -443,7 +494,6 @@ class LogHandle:
         where: str | None = None,
         start_offset: int | None = None,
         end_offset: int | None = None,
-        include_archive: bool | None = None,
     ) -> pa.RecordBatchReader:
         """Read the log as one relation, newest data included.
 
@@ -452,10 +502,8 @@ class LogHandle:
         tiers overlap by design, so the bounds are what make each row appear
         exactly once.
 
-        `include_archive` defaults to whether the archive is load-bearing —
-        False for an ordinary local read, which keeps a hot read on local disk
-        (I5), and True when the local table holds nothing and the archive is
-        the only source of the archived rows.
+        Which tiers, and therefore whether this touches the network, is
+        `include_archive` on the handle — fixed at assembly, not per read.
 
         Always bound on a LEADING column of `sort_by`. §7 measures a
         non-leading predicate at 119 ms against 13 ms for the same predicate
@@ -472,26 +520,25 @@ class LogHandle:
                 where=where,
                 start_offset=start_offset,
                 end_offset=end_offset,
-            ),
-            include_archive=include_archive,
+            )
         )
 
-    def sql(
-        self, query: str, *, include_archive: bool | None = None
-    ) -> pa.RecordBatchReader:
+    def sql(self, query: str) -> pa.RecordBatchReader:
         """Run arbitrary DuckDB SQL against the log, exposed as `log`.
 
         The escape hatch for what `scan` cannot express. Quote
         `"litelink_offset"` — it is a DuckDB reserved word.
+
+        Reads the tiers this handle was assembled for; see `include_archive`.
         """
+        include_archive = self._include_archive
         required = self._archive_required()
-        if include_archive is None:
-            include_archive = required
-        elif not include_archive and required:
+        if not include_archive and required:
             msg = (
                 f"{self.root}/{self.name} holds no local files, so the archive is "
                 f"the only source of its archived rows — reading without it would "
-                f"return the buffer alone and silently omit them"
+                f"return the buffer alone and silently omit them. Reopen with "
+                f"`include_archive=True`, or read a `snapshot` of the archive."
             )
             raise ValueError(msg)
 
@@ -982,6 +1029,11 @@ class RemoteReadHandle(LogHandle):
             buffer=buffer,
             archive=archive,
             reader=reader,
+            # **Not a parameter here, and that is the point.** A snapshot is
+            # assembled from an archive and its local table is empty by
+            # construction, so `False` would name a handle that can read
+            # nothing. The caller chose the archive by calling `snapshot`.
+            include_archive=True,
         )
         # Always owned: `follow` builds into a directory it made, and removes
         # it on close. There is no way to follow into a caller's root.
@@ -1030,6 +1082,7 @@ class WriteHandle(LocalReadHandle):
         maintenance: Maintenance,
         config: LogConfig,
         archive: Archive,
+        include_archive: bool = False,
     ) -> None:
         super().__init__(
             layout=layout,
@@ -1037,6 +1090,7 @@ class WriteHandle(LocalReadHandle):
             buffer=buffer,
             archive=archive,
             reader=reader,
+            include_archive=include_archive,
         )
         # Set only by `restore`, and read only by `recovery()`. What a failover
         # recovered and what it skipped are facts about one operation, knowable
@@ -1083,6 +1137,7 @@ class WriteHandle(LocalReadHandle):
         archive: str | None = None,
         s3: S3Options | None = None,
         start_offset: int = 1,
+        include_archive: bool = False,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
 
@@ -1265,6 +1320,7 @@ class WriteHandle(LocalReadHandle):
             maintenance=Maintenance(table, buffer, layout, remote),
             config=settings,
             archive=remote,
+            include_archive=include_archive,
         )
 
     @classmethod
@@ -1274,6 +1330,7 @@ class WriteHandle(LocalReadHandle):
         name: str,
         *,
         s3: S3Options | None = None,
+        include_archive: bool = False,
     ) -> Self:
         """Open an existing log, and recover it.
 
@@ -1370,6 +1427,7 @@ class WriteHandle(LocalReadHandle):
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
             archive=remote,
+            include_archive=include_archive,
         )
         log.recover()
 
@@ -1405,6 +1463,7 @@ class WriteHandle(LocalReadHandle):
         archive: str,
         s3: S3Options | None = None,
         binary: str | None = None,
+        include_archive: bool = False,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 

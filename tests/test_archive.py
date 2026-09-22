@@ -154,9 +154,9 @@ def test_a_read_spans_archive_local_and_buffer(
         # 476 of 1,500. There is no correct local-only read of this state, so
         # asking for one is refused rather than answered short.
         with pytest.raises(ValueError, match="holds no local files"):
-            log.scan(include_archive=False)
+            log.scan()
 
-        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        merged = log.with_archive().sql("SELECT * FROM log").read_all()
         offsets = merged.column(OFFSET).to_pylist()
         assert sorted(offsets) == list(range(1, ROWS + 1)), (
             "every offset exactly once, no duplicate across tiers and no gap"
@@ -189,7 +189,7 @@ def test_a_hot_read_never_touches_the_archive(
         assert log.scan().read_all().num_rows == ROWS
 
         with pytest.raises(Exception, match=r".+"):
-            log.sql("SELECT * FROM log", include_archive=True).read_all()
+            log.with_archive().sql("SELECT * FROM log").read_all()
 
 
 def test_only_settled_files_reach_the_archive(
@@ -232,9 +232,10 @@ def test_hydrate_brings_evicted_files_back_to_local_disk(
     """§8: raising `local_retention` is an operation, not a config change.
 
     Everything is evicted first, so the local table holds only the unsealed
-    tail and a plain `scan()` cannot see the rest. After hydrating, the same
-    read — no `include_archive`, no network — returns the whole stream, which
-    is the point: the data is back on local disk, not merely reachable.
+    tail and a local handle cannot serve the rest at all — it refuses. After
+    hydrating, the same handle answers in full with no network and no archive
+    view, which is the point: the data is back on local disk rather than
+    merely reachable.
     """
     with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
@@ -243,8 +244,13 @@ def test_hydrate_brings_evicted_files_back_to_local_disk(
         log.maintain()
 
         assert log.table_extent() is None, "the fixture must evict something"
-        assert log.scan().read_all().num_rows == ROWS, (
-            "an emptied local tier must still serve every row, via the archive"
+        # Nothing local to serve, so a local handle refuses rather than
+        # answering with the buffer alone.
+        with pytest.raises(ValueError, match="holds no local files"):
+            log.scan()
+
+        assert log.with_archive().scan().read_all().num_rows == ROWS, (
+            "the rows are in the archive, and a view that reads it sees them"
         )
 
         log.hydrate(since=timedelta(hours=1))
@@ -345,7 +351,7 @@ def test_rewrite_archive_merges_files_left_undersized(
         assert after[0].lo == 1, "the range must still start where it did"
         assert after[-1].hi == max(f.hi for f in remote.data_files())
 
-        restored = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        restored = log.with_archive().sql("SELECT * FROM log").read_all()
         assert sorted(restored.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1))
 
         # Every row still carries the offset it was written with. The rewrite
@@ -546,7 +552,7 @@ def test_detaching_and_reattaching_keeps_the_archive(
         assert log.archived_through() == watermark, (
             "the same archive still holds the same range"
         )
-        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        merged = log.with_archive().sql("SELECT * FROM log").read_all()
         assert sorted(merged.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1)), (
             "every row must still be readable after a detach and reattach"
         )
@@ -707,7 +713,7 @@ def test_a_read_before_the_first_sync_simply_has_no_archive_leg(
         log.extend(rows(200))
         log.seal_due()
 
-        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        merged = log.with_archive().sql("SELECT * FROM log").read_all()
 
         assert merged.num_rows == 200
         assert _recorded_location(log._layout) is None, (
@@ -735,7 +741,7 @@ def test_a_repoint_leaves_reads_working(
         log.set_archive(f"s3://{bucket}/moved")
 
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
-        merged = reader.sql("SELECT * FROM log", include_archive=True).read_all()
+        merged = reader.with_archive().sql("SELECT * FROM log").read_all()
 
         assert merged.num_rows == ROWS, "a re-pointed log must still be readable"
 
@@ -790,7 +796,7 @@ def test_a_read_against_a_never_synced_archive_writes_nothing(
         log.seal_due()
         assert not log._layout.archive_db.exists()
 
-        merged = log.sql("SELECT * FROM log", include_archive=True).read_all()
+        merged = log.with_archive().sql("SELECT * FROM log").read_all()
 
         assert merged.num_rows == 200
         assert not log._layout.archive_db.exists(), (
@@ -964,7 +970,7 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
             )
             == settled
         ), "the archive's manifest says what it holds; recover from it"
-        assert log.scan(include_archive=True).read_all().num_rows == ROWS
+        assert log.with_archive().scan().read_all().num_rows == ROWS
 
 
 def test_the_backfill_sees_copies_another_process_pushed(
@@ -1383,7 +1389,7 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
         log.set_config(replace(config, target_compact_size=256 * 1024))
         log.rewrite_archive()
 
-        assert log.scan(include_archive=True).read_all().num_rows == total
+        assert log.with_archive().scan().read_all().num_rows == total
 
         # The superseded rows still sit in `extent`: `drain` removes them only
         # after the grace period, and until it does they still match the local
@@ -1409,9 +1415,10 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
         log.maintain()
         log.sync()
 
-        table = log.scan(include_archive=True).read_all()
+        table = log.with_archive().scan().read_all()
         offsets = (
-            log.scan(columns=["litelink_offset"], include_archive=True)
+            log.with_archive()
+            .scan(columns=["litelink_offset"])
             .read_all()
             .column(0)
             .to_pylist()
@@ -1459,12 +1466,12 @@ def test_a_stale_handle_cannot_repair_the_archive_it_was_pointed_away_from(
             writer.extend(rows(ROWS))
             writer.seal_due()
             writer.sync()
-            readable = writer.scan(include_archive=True).read_all().num_rows
+            readable = writer.with_archive().scan().read_all().num_rows
 
             # The documented ad-hoc operation, run from the stale handle.
             stale.rewrite_archive()
 
-            assert writer.scan(include_archive=True).read_all().num_rows == readable, (
+            assert writer.with_archive().scan().read_all().num_rows == readable, (
                 "a stale handle repaired the wrong archive and lost history"
             )
             assert stale._archive.uri == f"s3://{bucket}/second", (
@@ -1523,7 +1530,7 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
         assert after <= before, (
             f"the rewrite fragmented the archive: {before} files became {after}"
         )
-        assert log.scan(include_archive=True).read_all().num_rows == 2400
+        assert log.with_archive().scan().read_all().num_rows == 2400
 
 
 def test_compaction_while_detached_does_not_wedge_a_reattach(
@@ -1587,7 +1594,7 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
         log.maintain()
         log.sync()
 
-        assert log.scan(include_archive=True).read_all().num_rows == 2000
+        assert log.with_archive().scan().read_all().num_rows == 2000
 
 
 def test_expiring_the_archive_will_not_repair_it_without_a_claim(
@@ -1804,10 +1811,10 @@ def test_pointing_back_at_an_archive_restores_everything_it_held(
             log.maintain()
             log.sync()
 
-        assert log.scan(include_archive=True).read_all().num_rows == written
+        assert log.with_archive().scan().read_all().num_rows == written
 
         log.set_archive(f"s3://{bucket}/second")
-        moved = log.scan(include_archive=True).read_all().num_rows
+        moved = log.with_archive().scan().read_all().num_rows
 
         assert moved < written, "expected the evicted history to be out of reach"
 
@@ -1818,7 +1825,7 @@ def test_pointing_back_at_an_archive_restores_everything_it_held(
         # one must not.
         log.set_archive(first)
 
-        assert log.scan(include_archive=True).read_all().num_rows == written
+        assert log.with_archive().scan().read_all().num_rows == written
 
         # And it is genuinely the old table, not a new one that happens to
         # read: an empty table created over the objects would show no files at
@@ -1968,7 +1975,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         log.sync()
 
         assert not log._buffer.intents(log._archive.uri or ""), "intents not reconciled"
-        assert log.scan(include_archive=True).read_all().num_rows == 1200
+        assert log.with_archive().scan().read_all().num_rows == 1200
 
 
 def test_eviction_never_acts_on_an_intended_copy(
@@ -2150,7 +2157,7 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
             log.sync()
 
         before = log.archive_files()
-        readable = log.scan(include_archive=True).read_all().num_rows
+        readable = log.with_archive().scan().read_all().num_rows
 
         assert before > 1
 
@@ -2179,7 +2186,7 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
             Maintenance._discard_scratch = discard
 
         assert log.archive_files() == before, "committed without holding the claim"
-        assert log.scan(include_archive=True).read_all().num_rows == readable
+        assert log.with_archive().scan().read_all().num_rows == readable
 
 
 def test_a_rewrite_restamps_the_files_it_supersedes(
@@ -2298,7 +2305,7 @@ def test_replication_holds_sealed_rows_until_the_archive_has_them(
 
         assert released is not None
         assert released[0] > archived, "rows the archive holds were never released"
-        assert log.scan(include_archive=True).read_all().num_rows == 1200
+        assert log.with_archive().scan().read_all().num_rows == 1200
 
 
 def test_without_replication_a_seal_still_drops_its_rows(
@@ -2544,7 +2551,7 @@ def test_a_log_is_recovered_onto_another_machine(
         log.seal_due()
         archived = log.archived_through()
         replicated = log.end_offset() - 1
-        served = log.scan(include_archive=True).read_all().num_rows
+        served = log.with_archive().scan().read_all().num_rows
 
         assert archived < replicated, "nothing left unsynced, so the band is untested"
 
@@ -2587,7 +2594,7 @@ def test_a_log_is_recovered_onto_another_machine(
         # Every row is readable again — including the sealed-but-unsynced band,
         # which survives because a seal keeps its rows until the archive has
         # them when wal_replication is on.
-        assert revived.scan(include_archive=True).read_all().num_rows == served
+        assert revived.with_archive().scan().read_all().num_rows == served
         # The shape came from `meta`, not from the catalog that was not restored.
         assert revived.sort_by == ("event_ts",)  # noqa: SLF001
         assert revived.config.target_seal_size == 8 * 1024
@@ -2605,7 +2612,7 @@ def test_a_log_is_recovered_onto_another_machine(
         revived.maintain()
         revived.sync()
 
-        assert revived.scan(include_archive=True).read_all().num_rows == served + 1
+        assert revived.with_archive().scan().read_all().num_rows == served + 1
 
         # And this database describes a filesystem that exists. Every local
         # path it names is a file that is here — the dead machine's are gone.
@@ -2775,7 +2782,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
         revived.seal()
         revived.maintain()
 
-        offsets = revived.scan(include_archive=True).read_all().column(OFFSET)
+        offsets = revived.with_archive().scan().read_all().column(OFFSET)
 
         assert len(offsets) == len(set(offsets.to_pylist())), (
             "the interrupted seal was replayed on top of the recovered group"
@@ -2978,7 +2985,7 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
             "sync never got past the archive's frontier: the log is wedged"
         )
         # And eviction is not pinned at zero by a straddling local file.
-        assert revived.scan(include_archive=True).read_all().num_rows > 0
+        assert revived.with_archive().scan().read_all().num_rows > 0
 
 
 def test_a_restore_fence_clears_the_archive_and_not_just_the_replica(
@@ -3227,7 +3234,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
 
         # And it is resumable rather than a dead end.
         with litelink.restore(root, "s", archive=where, s3=s3) as revived:
-            assert revived.scan(include_archive=True).read_all().num_rows > 0
+            assert revived.with_archive().scan().read_all().num_rows > 0
 
 
 def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
@@ -3264,7 +3271,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
         log.seal_due()
         log.maintain()
         log.sync()
-        readable = log.scan(include_archive=True).read_all().num_rows
+        readable = log.with_archive().scan().read_all().num_rows
         replication = log.write_replication_config()
 
     # A replica has to exist, or `restore` fails at the download and never
@@ -3295,7 +3302,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     # still reads. Before this, `WriteHandle.open` answered "use new() to create one".
     assert LogTable.exists_for(Layout(tmp_path, "s"))
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reopened:
-        assert reopened.scan(include_archive=True).read_all().num_rows == readable
+        assert reopened.with_archive().scan().read_all().num_rows == readable
 
 
 def test_detaching_with_a_retention_floor_is_refused(
@@ -3330,7 +3337,7 @@ def test_detaching_with_a_retention_floor_is_refused(
     ) as log:
         log.extend(rows(600))
         log.seal_due()
-        readable = log.scan(include_archive=True).read_all().num_rows
+        readable = log.with_archive().scan().read_all().num_rows
 
         with pytest.raises(ValueError, match="refusing to detach"):
             log.set_archive(None)
@@ -3397,7 +3404,7 @@ def test_an_empty_archive_string_is_a_detach_and_is_refused_as_one(
     ) as log:
         log.extend(rows(600))
         log.seal_due()
-        readable = log.scan(include_archive=True).read_all().num_rows
+        readable = log.with_archive().scan().read_all().num_rows
 
         for spelling in ("", "/", "///"):
             with pytest.raises(ValueError, match="refusing to detach"):
@@ -3406,7 +3413,7 @@ def test_an_empty_archive_string_is_a_detach_and_is_refused_as_one(
         assert log.archive is not None, "detached through an empty spelling"
         log.maintain()
 
-        assert log.scan(include_archive=True).read_all().num_rows == readable
+        assert log.with_archive().scan().read_all().num_rows == readable
 
 
 def test_creating_a_log_with_an_empty_archive_is_a_local_only_log(
@@ -3549,7 +3556,12 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
         # A READER on the same log answers the other question, correctly —
         # checked BEFORE the append below, which would close the gap by
         # putting a row at the sequence.
-        with litelink.open(second, "s", read_only=True, s3=s3) as view:
+        # Restored from a replica, so the local table is empty and the rows
+        # are in the archive — a view that reads it is the only one that can
+        # answer "what can I serve".
+        with litelink.open(
+            second, "s", read_only=True, s3=s3, include_archive=True
+        ) as view:
             served = view.scan().read_all().column(OFFSET).to_pylist()
             assert view.end_offset() == max(served) + 1
             assert view.end_offset() < revived.end_offset(), (
@@ -3687,7 +3699,9 @@ def test_a_handle_that_read_an_empty_archive_still_sees_it_fill(
         # archive table, empty. That is the state that used to poison a handle.
         writer.sync()
 
-        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+        with litelink.open(
+            tmp_path, "s", read_only=True, s3=s3, include_archive=True
+        ) as reader:
             assert reader.scan().read_all().num_rows == 0
             assert reader.end_offset() >= 1
 
@@ -3706,8 +3720,8 @@ def test_a_handle_that_read_an_empty_archive_still_sees_it_fill(
                 f"{len(served)} of {ROWS} rows afterwards"
             )
 
-            # And the writer's own handle, which did the same.
-            assert writer.scan().read_all().num_rows == ROWS
+            # And the writer's own, through a view that reads the archive.
+            assert writer.with_archive().scan().read_all().num_rows == ROWS
 
 
 @pytest.mark.slow
@@ -3716,19 +3730,19 @@ def test_an_evicted_log_still_serves_every_row(
 ) -> None:
     """A default read must not go short because eviction emptied the table.
 
-    Eviction moves files out of the local table once the archive holds them
-    (I4). A log evicted dry therefore has its rows in exactly one place, and a
-    read that skips the archive returns the unsealed buffer alone — measured
-    before this fix, 476 of 1,500 rows, with no error at all.
+        Eviction moves files out of the local table once the archive holds them
+        (I4). A log evicted dry therefore has its rows in exactly one place, and a
+        read that skips the archive returns the unsealed buffer alone — measured
+        before this fix, 476 of 1,500 rows, with no error at all.
 
-    `include_archive` defaults to whether the archive is load-bearing rather
-    than to False, and it is load-bearing exactly when the local table holds
-    nothing and the archive is known to hold something. I5 still holds where it
-    means anything: "a hot read is local disk only" protects a read that HAS
-    local disk to serve, and this one has none.
+    The guarantee is that it is never answered SHORT. Which tiers a handle
+        reads is fixed when it is built, so a local handle with nothing local to
+        serve refuses, and an archive-reading one answers in full. What must not
+        happen — and did, before there was a check — is the quiet middle: a read
+        that returns the buffer's share and calls it the log.
 
-    Falsify by returning False unconditionally from `_archive_required`: the
-    row count drops to the buffer's share.
+        Falsify by deleting the refusal in `sql`: the row count drops to the
+        buffer's share with no error at all.
     """
     with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
@@ -3739,19 +3753,21 @@ def test_an_evicted_log_still_serves_every_row(
         assert log.table_extent() is None, "the fixture must evict the tier dry"
         assert log.archived_through() > 0
 
-        served = log.scan().read_all().column(OFFSET).to_pylist()
+        served = log.with_archive().scan().read_all().column(OFFSET).to_pylist()
         assert sorted(served) == list(range(1, ROWS + 1)), (
             f"an evicted log served {len(served)} of {ROWS} rows"
         )
 
-        # And a reader on the same root agrees, because it is the same object.
-        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
+        # A reader on the same root agrees, opened the same way.
+        with litelink.open(
+            tmp_path, "s", read_only=True, s3=s3, include_archive=True
+        ) as view:
             assert view.scan().read_all().num_rows == ROWS
 
-        # Asking for local-only is refused rather than answered short: there
+        # And a local-only handle refuses rather than answering short: there
         # is no correct local-only read of a log with no local files.
         with pytest.raises(ValueError, match="holds no local files"):
-            log.scan(include_archive=False)
+            log.scan()
 
 
 @pytest.mark.slow
@@ -3787,7 +3803,7 @@ def test_an_evicted_log_serves_everything_across_a_re_point(
         log.maintain()
 
         assert log.table_extent() is None, "the fixture must evict the tier dry"
-        assert log.scan().read_all().num_rows == ROWS
+        assert log.with_archive().scan().read_all().num_rows == ROWS
 
         # The floor comes off first, which detaching requires: an evict-on-upload
         # policy presupposes an archive to upload to.
@@ -3798,13 +3814,15 @@ def test_an_evicted_log_serves_everything_across_a_re_point(
             "the fixture must reproduce the zeroed watermark a re-point leaves"
         )
 
-        served = log.scan().read_all().column(OFFSET).to_pylist()
+        served = log.with_archive().scan().read_all().column(OFFSET).to_pylist()
         assert sorted(served) == list(range(1, ROWS + 1)), (
             f"served {len(served)} of {ROWS} after a re-point, before any sync"
         )
 
-        # And a separate reader process agrees, since it derives the same way.
-        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
+        # And a separate reader process agrees, opened the same way.
+        with litelink.open(
+            tmp_path, "s", read_only=True, s3=s3, include_archive=True
+        ) as view:
             assert view.scan().read_all().num_rows == ROWS
             assert view.coverage().gap is None
 
@@ -3858,7 +3876,7 @@ def test_coverage_counts_the_local_tier_between_archive_and_buffer(
         # The claim under test: it serves every offset it declines to call a
         # gap, contiguously, including the whole band the old arithmetic
         # reported as unservable.
-        served = log.scan(include_archive=True).read_all().column(OFFSET).to_pylist()
+        served = log.with_archive().scan().read_all().column(OFFSET).to_pylist()
         assert sorted(served) == list(range(1, max(served) + 1))
         assert max(served) >= table[1]
         assert set(range(archived + 1, table[1] + 1)) <= set(served), (
@@ -3908,7 +3926,7 @@ def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
         assert frontier is not None
         # The tail the archive cannot have.
         primary.extend(rows(100))
-        served = primary.scan(include_archive=True).read_all().num_rows
+        served = primary.with_archive().scan().read_all().num_rows
         replication = primary.write_replication_config()
 
     _replicate(binary, replication, s3, where)
@@ -3932,19 +3950,23 @@ def test_a_follower_serves_the_archive_merged_with_the_replicated_tail(
 
 
 @pytest.mark.slow
-def test_a_follower_refuses_to_read_without_the_archive(
+def test_a_follower_cannot_be_asked_to_skip_the_archive(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """`include_archive=False` has no coherent meaning on a follower.
+    """Unrepresentable, not refused.
 
-    `WriteHandle.scan` and `WriteHandle.sql` default it to False, which is safe for an ordinary
-    log because its local table holds the sealed history. A follower's local
-    table is EMPTY by construction, so that default returns the replicated
-    buffer alone — measured at 308 of 800 rows, silently. Refused on both entry
-    points; overriding only `scan` would leave `sql` serving the tail.
+    A follower's local table is EMPTY by construction, so a local-only read
+    would return the replicated buffer alone — measured at 308 of 800 rows,
+    silently. That used to be a parameter on every read that had to raise, on
+    both `scan` and `sql`, because overriding one would leave the other
+    serving the tail.
 
-    Falsify by returning a plain `WriteHandle` from `follow`: `scan()` with no
-    arguments drops every archived row and raises nothing.
+    `include_archive` is a property of the handle now, set by
+    `RemoteReadHandle` itself, so there is nothing to refuse: the request
+    cannot be spelled.
+
+    Falsify by giving `scan`/`sql` the parameter back, or by dropping
+    `include_archive=True` from `RemoteReadHandle.__init__`.
     """
     binary = Path(__file__).resolve().parent.parent / ".bin" / "litestream"
     if not os.access(binary, os.X_OK):
@@ -3978,17 +4000,16 @@ def test_a_follower_refuses_to_read_without_the_archive(
     with litelink.snapshot(
         "s", archive=where, s3=s3, binary=str(binary), include_wal=True
     ) as follower:
-        # Refused, not absent. Unifying the two read-only shapes into one
-        # `LogHandle` means the parameter has to exist for the local case,
-        # where a hot read is local disk only (I5). This is the cost, and it
-        # is named in `LogHandle`'s docstring: a followed log's table is empty
-        # by construction, so asking to skip the archive raises.
-        for call in (
-            lambda: follower.scan(include_archive=False),
-            lambda: follower.sql("SELECT 1 FROM log", include_archive=False),
-        ):
-            with pytest.raises(ValueError, match="holds no local files"):
-                call()
+        # Absent from both entry points, not merely rejected by them.
+        for read in (follower.scan, follower.sql):
+            assert "include_archive" not in inspect.signature(read).parameters, (
+                f"{read.__name__} takes include_archive; a follower must not "
+                f"be askable to skip the archive"
+            )
+
+        # And the handle answers for itself which tiers it reads.
+        assert follower.include_archive is True
+        assert follower.with_archive() is follower
 
         assert follower.scan().read_all().num_rows > 0
 
@@ -4577,6 +4598,8 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         # read
         "scan",
         "sql",
+        "include_archive",
+        "with_archive",
         # observe
         "coverage",
         "end_offset",
@@ -4612,7 +4635,17 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
     # a follower that holds a `WriteHandle` inevitably asks it questions it answers for
     # a writer, and routes reads through dispatch it cannot intercept.
     taken = set(inspect.signature(LogHandle.__init__).parameters) - {"self"}
-    assert taken == {"layout", "table", "buffer", "archive", "reader"}
+    # `include_archive` among them: which tiers a handle reads is decided when
+    # it is built, not per read, so it arrives the same way its collaborators
+    # do. `RemoteReadHandle` fixes it True and takes no parameter for it.
+    assert taken == {
+        "layout",
+        "table",
+        "buffer",
+        "archive",
+        "reader",
+        "include_archive",
+    }
     assert "log" not in taken, (
         "a handle that holds a WriteHandle asks it questions it answers for a "
         "writer, and routes reads through dispatch it cannot intercept — two "
@@ -5004,7 +5037,7 @@ def test_an_archive_only_snapshot_serves_what_the_archive_holds(
     assert frontier > 0, "the fixture must archive something"
 
     with litelink.snapshot("s", archive=where, s3=s3, include_wal=False) as view:
-        served = view.scan(include_archive=True).read_all()
+        served = view.with_archive().scan().read_all()
 
         assert served.num_rows == frontier
         # Honest about the boundary rather than silently short.
@@ -5071,7 +5104,7 @@ def test_an_archive_only_snapshot_reports_the_schema_the_writer_declared(
         )
         assert view.sort_by == ("event_ts",)
         # The handle and its own read must agree, which is the point.
-        served = view.scan(include_archive=True).read_all()
+        served = view.with_archive().scan().read_all()
         assert [f for f in served.schema if f.name != OFFSET] == list(declared)
 
 
@@ -5167,7 +5200,7 @@ def test_an_archive_only_snapshot_keeps_a_column_added_mid_stream(
 
     with litelink.snapshot("s", archive=where, s3=s3, include_wal=False) as view:
         assert [f.name for f in view.schema] == expected
-        served = view.scan(include_archive=True).read_all()
+        served = view.with_archive().scan().read_all()
 
         assert [f.name for f in served.schema if f.name != OFFSET] == expected
         assert served.num_rows == frontier
@@ -5329,7 +5362,7 @@ def test_restore_accepts_the_same_archive_written_with_a_trailing_slash(
     # The SAME archive, one trailing slash different. This must attach.
     with litelink.restore(revived, "s", archive=held + "/", s3=s3) as revived_log:
         assert revived_log.archived_through() == seeded
-        assert revived_log.scan(include_archive=True).read_all().num_rows > 0
+        assert revived_log.with_archive().scan().read_all().num_rows > 0
 
 
 def test_restore_refuses_a_buffer_that_records_no_archive(
@@ -5413,7 +5446,7 @@ def test_an_archive_only_snapshot_resolves_the_pointer_once(
     monkeypatch.setattr(_table.StaticTable, "from_metadata", counted_parse)
 
     with litelink.snapshot("s", archive=where, s3=s3) as view:
-        assert view.scan(include_archive=True).read_all().num_rows == frontier
+        assert view.with_archive().scan().read_all().num_rows == frontier
 
     monkeypatch.undo()
     hints = seen.count("hint")

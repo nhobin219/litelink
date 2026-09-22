@@ -373,7 +373,7 @@ def test_the_archive_metadata_moves_and_stays_readable(
 
     with litelink.open(tmp_path, "s", s3=s3) as reopened:
         assert reopened.archived_through() == archived
-        assert reopened.scan(include_archive=True).read_all().num_rows == 400
+        assert reopened.with_archive().scan().read_all().num_rows == 400
 
     connection = duckdb.connect()
     load_extension(connection, "iceberg", remote=False)
@@ -559,7 +559,7 @@ def test_migrating_one_stream_leaves_a_siblings_archive_intact(
     )
     assert not _entries(sibling, s3), "and is drained once it does move"
     with litelink.open(tmp_path, "quotes", s3=s3) as log:
-        assert log.scan(include_archive=True).read_all().num_rows == 400
+        assert log.with_archive().scan().read_all().num_rows == 400
 
 
 def test_an_archive_without_credentials_is_refused(tmp_path: Path) -> None:
