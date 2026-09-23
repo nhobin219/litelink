@@ -6,6 +6,17 @@ rather than restates it.
 
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
+## 0.4.1 — 2026-09-23
+
+### Fixed
+
+- **`restore(include_archive=True)` was accepted and ignored.** It built its
+  handle with a bare `cls.open(...)`, so the argument went nowhere. It matters
+  most exactly there: a restored log's local table is EMPTY by construction,
+  which is the one case where a local-only read has nothing to serve — `sql`
+  refuses rather than answering short, so the dropped argument surfaced as a
+  failed read rather than a quiet one.
+
 ## 0.4.0 — 2026-09-22
 
 ### Changed — breaking

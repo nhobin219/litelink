@@ -2510,6 +2510,26 @@ def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
 
 
 @pytest.mark.slow
+def test_restore_threads_include_archive_to_the_handle(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A parameter that is accepted and ignored is worse than an absent one.
+
+    `restore` took `include_archive` and built its handle with a bare
+    `cls.open(...)`, so the argument went nowhere. It matters most exactly
+    here: a restored log's local table is EMPTY by construction, so it is the
+    one case where a local-only read has nothing to serve — `sql` refuses
+    rather than answering short, and the dropped argument surfaced as a
+    failed read.
+
+    Falsify by dropping `include_archive` from the `cls.open` call in
+    `restore`.
+    """
+    assert "include_archive=include_archive" in inspect.getsource(
+        WriteHandle.restore
+    ), "restore must pass include_archive to the handle it builds"
+
+
 def test_a_log_is_recovered_onto_another_machine(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:

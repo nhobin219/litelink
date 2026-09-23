@@ -1836,7 +1836,12 @@ class WriteHandle(LocalReadHandle):
 
             raise
 
-        log = cls.open(layout.root, name, s3=options)
+        # `include_archive` through, or the parameter is accepted and
+        # ignored. A restored log's local table is EMPTY by construction, so
+        # it is the one case where reading without the archive returns the
+        # buffer alone — which `sql` refuses rather than serves, meaning the
+        # dropped argument surfaced as a failed read rather than a quiet one.
+        log = cls.open(layout.root, name, s3=options, include_archive=include_archive)
 
         # REWRITTEN, now that the policy is back. The config above had to be
         # written before `buffer.db` existed — that is the chicken-and-egg this
