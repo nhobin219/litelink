@@ -13,23 +13,11 @@
 
 `append()` returns once the row is durable, and a query a moment later sees it.
 
-## Introduction
-
 litelink is an open-source **embedded storage engine**: what DuckDB is to queries, litelink is
 to the durable write path. It runs inside your process, with no server, daemon or catalog
 service, and the files it writes are the product. They're Iceberg v2 tables on local disk and
 in object storage: the Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg
 engine, reads, with no export step in between.
-
-|  | DuckDB | litelink |
-|---|---|---|
-| runs | in your process | in your process |
-| without | a server, daemon or cluster | a server, daemon or catalog service |
-| owns | the query | the durable write path |
-| speaks | SQL over Parquet and Arrow | Iceberg v2, on disk and in object storage |
-
-It's built for the thing every capture pipeline hand-rolls badly: getting a stream of
-observations onto disk durably, into well-sized Parquet, and eventually into object storage.
 
 ```
 SQLite buffer          durable on commit. unsealed rows only.
@@ -41,22 +29,128 @@ local Iceberg table    a rolling window. reads land here.
 remote Iceberg table   full history, on S3.
 ```
 
-Reads span all three tiers and the catalog is a SQLite file rather than a service, so **no
-read on the hot path touches the network.** Every other machine reads the archive instead,
-with any Iceberg engine and nothing from litelink.
+|  | DuckDB | litelink |
+|---|---|---|
+| runs | in your process | in your process |
+| without | a server, daemon or cluster | a server, daemon or catalog service |
+| owns | the query | the durable write path |
+| speaks | SQL over Parquet and Arrow | Iceberg v2, on disk and in object storage |
 
-It exists because doing this by hand goes wrong the same way every time: one production
-capture system had 125,884 objects, 62.5% of them under 16 KiB, Parquet files at 2 rows each,
-a compaction routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
+It's built for the thing every capture pipeline hand-rolls badly: getting a stream of
+observations onto disk durably, into well-sized Parquet, and eventually into object storage.
+Doing that by hand goes wrong the same way every time: one production capture system had
+125,884 objects, 62.5% of them under 16 KiB, Parquet files at 2 rows each, a compaction
+routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
 
 **Status: early.** All three tiers work, and a log survives losing its machine. Read
 [what it is not](#what-it-is-not) and [not implemented yet](#not-implemented-yet) first.
 
-## Quick start
+## The Parquet is the product
+
+The usual shape is a write path in one system and an analytical store in another, with a job
+copying between them. Here they are one store with tiers: rows land in the SQLite buffer,
+seal into Parquet behind it, and reads span both, so **no read on the hot path touches the
+network**. Every other machine reads the archive, with litelink or with nothing from it:
+
+```python
+import duckdb
+import litelink
+
+# Written, durable on return.
+log = litelink.open("data", "trades")
+log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
+            "price": 78501.62, "amount": 0.0076})
+
+# Read on the same box, across the buffer and the local table.
+log.sql("SELECT count(*), max(price) FROM log").read_all()
+
+# Read from another box, over the archive — no local root, no catalog service.
+with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
+    reader.scan(where="price > 78000").read_all()
+
+# Or with any Iceberg engine, and litelink not installed at all.
+duckdb.sql("""
+    SELECT count(*), max(price)
+    FROM iceberg_scan('s3://bucket/prefix/trades',
+                      version_name_format = '%s%s.metadata.json')
+""")
+```
+
+## How it works
+
+- **Iceberg is used, not reimplemented.** Manifests, per-file column statistics, schema with
+  field IDs, and atomic snapshot commits all come from it.
+- **The library owns exactly one column**, `litelink_offset` — monotonic, never reused. It is
+  the boundary mechanism between tiers. Everything else is the caller's schema.
+- **Parts are sealed once and never rewritten.** Rewriting a growing partition costs ~144x
+  write amplification and buys nothing, because the local WAL already made the row durable.
+- **Read boundaries come from committed table state**, never from a stored flag — so no seal
+  window can double-count or drop.
+- **Sizing is two targets, not one.** A seal wants to be small, because the buffer is what a
+  hot read scans; a file wants to be large, because per-file overhead dominates scans and
+  uploads. Compaction bridges them, on local disk, at 8× the seal size by default.
+
+Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead. The reasoning
+and the measurements are in [`docs/SPEC.md`](docs/SPEC.md); `just bench` reruns them on your
+hardware.
+
+## Install
 
 ```bash
 pip install litelink        # or: uv add litelink
 ```
+
+**Nothing else is required** — no producer, no credentials, no maintainer process, no
+container. Object storage, WAL replication and cross-machine reads are all opt-in, and each
+is one call.
+
+Wheels for Linux and macOS on x86-64 and arm64 carry a checksum-verified litestream and the
+DuckDB extensions litelink loads, so a box with no egress still reads, writes and restores.
+That costs ~124 MB. Run `python -m litelink` to check a machine before you rely on it; see
+[`docs/RUNTIME.md`](docs/RUNTIME.md) for anywhere else.
+
+## API
+
+```python
+litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
+             s3=None, include_archive=False, start_offset=1)     -> WriteHandle
+litelink.open(root, name, *, s3=None, include_archive=False)       -> WriteHandle
+litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
+litelink.snapshot(name, *, archive, s3=None, include_wal=False, ...) -> RemoteReadHandle
+litelink.restore(root, name, *, archive, s3=None, ...)             -> WriteHandle
+litelink.validate_row(schema, row)                                 # raises as append would
+litelink.preflight(...)                                            # what python -m litelink runs
+
+# Every handle reads:
+    log.scan(*, columns=None, where=None, start_offset=None, end_offset=None)
+    log.sql(query)                                  # the log is `log`; both stream Arrow
+    log.with_archive() · log.column_statistics(*, tier=None) · log.coverage()
+    log.end_offset() · buffered_rows() · table_rows() · table_files() · archived_through()
+    log.schema · sort_by · config · archive
+
+# A WriteHandle also writes:
+    log.append(row) -> int                          # durable on return
+    log.extend(rows) -> list[int]                   # ONE transaction, one fsync
+    log.ingest(table_or_reader)                     # Arrow straight to Parquet
+    log.seal_due() · log.maintain()                 # seal; compact, evict, expire
+    log.sync(*, push_unsettled=False)               # push to the archive
+    log.set_config(...) · set_archive(...) · set_sort_by(..., rewrite=True) · add_column(...)
+```
+
+The deliberate choices:
+
+- **Handles, not logs.** A read handle has no write methods at all, rather than ones that
+  raise, and `open(..., read_only=True)` is typed so misuse is caught before it runs.
+- **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and archive
+  live in the log, so nothing at the call site can disagree with what is on disk.
+- **The library owns no thread.** Nothing seals unless you call `seal_due()` or `maintain()`;
+  your loop is the schedule.
+- **Which tiers a handle reads is fixed when it is built.** A scan never starts touching the
+  network because retention happened to run.
+
+Full reference in [`docs/API.md`](docs/API.md).
+
+## Writing
 
 ```python
 import litelink
@@ -69,23 +163,24 @@ schema = pa.schema([
     pa.field("amount", pa.float64()),
 ])
 
-# new() takes the shape, fixed at creation. open() takes none of it — schema,
-# sort order, config and archive all come from the log itself.
 log = litelink.new("data", "trades", schema=schema, sort_by=("event_ts",))
 
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076})     # durable on return
-
-# extend() commits the whole group in ONE transaction — one fsync for the batch,
-# not one per row. That call size is the write throughput lever.
-log.extend(group_of_rows)
-
-recent = log.scan(where="event_ts > 1787772776000000").read_all()
+log.extend(group_of_rows)                             # the throughput lever
 log.maintain()                                        # compact, evict, expire
 ```
 
-That is the whole API for local capture. A reader can open the same log alongside a live
-writer with `litelink.open("data", "trades", read_only=True)`.
+`extend()` commits the whole group in one transaction, so it is one fsync for the batch
+rather than one per row, and that call size is the write-throughput lever. Loading history is
+`ingest()`, which writes Arrow straight to Parquet.
+
+## Reading
+
+`sql` exposes the log as `log`; `scan(where=…, columns=…)` is the typed equivalent, and both
+return a `pa.RecordBatchReader` rather than a table, so materialising is yours to choose. A
+reader can open the same log alongside a live writer with
+`litelink.open("data", "trades", read_only=True)`.
 
 **A handle reads local files unless you say otherwise.** `include_archive=True` on the
 open (or `log.with_archive()`, which derives a read-only view of an open handle without a
@@ -96,41 +191,11 @@ log.scan(...)                       # local files and the buffer
 log.with_archive().scan(...)        # the whole history, including the archive
 ```
 
-Which tiers a handle reads is fixed when it is built, so two reads on one handle cannot
-disagree, and a scan never starts touching the network because retention happened to run.
 A handle that cannot reach the archive and finds its local table empty refuses rather than
-returning the buffer alone.
+returning the buffer alone. `column_statistics()` gives every column's bounds and
+counts from the manifests, without opening a data file.
 
-**Nothing else is required** — no producer, no credentials, no maintainer process, no
-container. Object storage, WAL replication and cross-machine reads are all opt-in, and each
-is one call.
-
-Wheels for Linux and macOS on x86-64 and arm64 carry a checksum-verified litestream and the
-DuckDB extensions litelink loads, so a box with no egress still reads, writes and restores.
-That costs ~124 MB. Run `python -m litelink` to check a machine before you rely on it; see
-[`docs/RUNTIME.md`](docs/RUNTIME.md) for anywhere else.
-
-## Demos
-
-Clone the repo for these; `just bootstrap` sets up the toolchain.
-
-```bash
-just demo-websocket    # a live public feed, one process, ~30 seconds
-just demo-capture      # a synthetic feed, driven as hard as you like
-just demo-maintain     # in another terminal: seal, compact, evict, expire
-just rustfs            # object storage in a container, to add the archive tier
-just demo-replicate    # ship the SQLite WAL, to survive losing the machine
-```
-
-Credentials are never written to the log directory — the library reads them from the
-environment through the ordinary AWS chain, so a profile, instance metadata or SSO all work
-untouched. `litelink.restore(root, name, archive=...)` rebuilds a log on another box,
-reserving an offset window so nothing the dead machine served is reissued.
-
-litelink emits the litestream config; your supervisor runs the binary. Full walkthrough in
-[`examples/`](examples/) and [`docs/RUNTIME.md`](docs/RUNTIME.md).
-
-## Reading it from another machine
+## Reading from another machine
 
 `litelink.snapshot` is the way in. It resolves the archive's current metadata, handles
 credentials, and hands back a read handle:
@@ -144,9 +209,7 @@ with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
 
 `archive` is the prefix the logs sit under and `"trades"` is the log, so this reads
 `s3://bucket/prefix/trades/`. Credentials come from the environment; pass
-`s3=litelink.S3Options(endpoint=…)` for somewhere that is not AWS. `sql` exposes the log as
-`log`; `scan(where=…, columns=…)` is the typed equivalent, and both return a
-`pa.RecordBatchReader` rather than a table, so materialising is yours to choose.
+`s3=litelink.S3Options(endpoint=…)` for somewhere that is not AWS.
 
 By default this reads the **archive alone** — no replica, no litestream, no subprocess — and
 assembles in well under a second. The view is as of the archive frontier, which on a quiet
@@ -203,9 +266,6 @@ metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
 and `httpfs` when a query names them, and `just bootstrap` provisions them ahead of time so the
 first read is not a download.
 
-That is the same question the first snippet asks, and on a default snapshot it returns the same
-answer — both read the archive, one through litelink's union and one straight at the table.
-
 **Which to reach for.** A one-shot query in a script is cheaper this way: `snapshot` assembles a
 DuckDB connection, a scratch buffer and an adopted catalog before it can answer anything, and
 you exit before reusing any of it. Hold a snapshot open and the order reverses — measured on a
@@ -216,27 +276,40 @@ or use the query above.
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
 asks for what came after — which is how you poll the archive as it grows.
 
-Details in [`docs/API.md`](docs/API.md).
+## Versioned data
 
-## How it works
+A log can also hold versioned data the way many databases' storage does: append every version
+of a record, and a delete as a tombstone, and `litelink_offset` (monotonic and never reused)
+orders them, so the current state is one query:
 
-- **Iceberg is used, not reimplemented.** Manifests, per-file column statistics, schema with
-  field IDs, and atomic snapshot commits all come from it.
-- **The library owns exactly one column**, `litelink_offset` — monotonic, never reused. It is
-  the boundary mechanism between tiers. Everything else is the caller's schema.
-- **Parts are sealed once and never rewritten.** Rewriting a growing partition costs ~144x
-  write amplification and buys nothing, because the local WAL already made the row durable.
-- **Read boundaries come from committed table state**, never from a stored flag — so no seal
-  window can double-count or drop.
-- **Sizing is two targets, not one.** A seal wants to be small, because the buffer is what a
-  hot read scans; a file wants to be large, because per-file overhead dominates scans and
-  uploads. Compaction bridges them, on local disk, at 8× the seal size by default.
+```sql
+SELECT * FROM log
+QUALIFY row_number() OVER (PARTITION BY account ORDER BY "litelink_offset" DESC) = 1
+```
 
-Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead. The reasoning
-and the measurements are in [`docs/SPEC.md`](docs/SPEC.md); `just bench` reruns them on your
-hardware.
+What it doesn't do is the rest of MVCC. Nothing merges versions on read or drops superseded
+ones at compaction, and there is no index, so that query is a scan.
 
-### On disk
+## Demos and recovery
+
+```bash
+just demo-websocket    # a live public feed, one process, ~30 seconds
+just demo-capture      # a synthetic feed, driven as hard as you like
+just demo-maintain     # in another terminal: seal, compact, evict, expire
+just rustfs            # object storage in a container, to add the archive tier
+just demo-replicate    # ship the SQLite WAL, to survive losing the machine
+```
+
+Clone the repo for these; `just bootstrap` sets up the toolchain. Credentials are never
+written to the log directory — the library reads them from the environment through the
+ordinary AWS chain, so a profile, instance metadata or SSO all work untouched.
+`litelink.restore(root, name, archive=...)` rebuilds a log on another box, reserving an offset
+window so nothing the dead machine served is reissued.
+
+litelink emits the litestream config; your supervisor runs the binary. Full walkthrough in
+[`examples/`](examples/) and [`docs/RUNTIME.md`](docs/RUNTIME.md).
+
+## On disk
 
 One directory per stream, holding everything that stream owns — and the archive prefix
 mirrors it, so a stream can be copied, replicated or deleted whole in either tier:
@@ -264,29 +337,32 @@ Upgrading a log written by 0.1.0: see [Migrating from 0.1](docs/RUNTIME.md#migra
 
 ## What it is not
 
-**Not an OLTP or key-value store.** It is append-only, with no update or delete, and a point
-lookup is ~1,600x slower than an indexed row store, because there is no index to look up: a
-lookup scans, pruned only by min/max statistics, which are tight on `sort_by`'s leading column
-and loose elsewhere. Indexes are [not implemented yet](#not-implemented-yet). It is a local,
-in-process, real-time analytics store: freshness is sub-second *with* durability, but
-"real-time" means fresh, not point-lookup fast.
+- **Not an OLTP or key-value store.** It is append-only, with no update or delete, and a point
+  lookup is ~1,600x slower than an indexed row store, because there is no index to look up: a
+  lookup scans, pruned only by min/max statistics, which are tight on `sort_by`'s leading column
+  and loose elsewhere. Indexes are [not implemented yet](#not-implemented-yet). It is a local,
+  in-process, real-time analytics store: freshness is sub-second *with* durability, but
+  "real-time" means fresh, not point-lookup fast.
 
-**Not an unbounded local archive.** A seal's cost tracks what the table's metadata holds, so
-a log that never runs `maintain()` and never evicts gets slower on the write path over time.
-`maintain()` arrests the larger factor; a retention bounds the rest. Numbers and the
-reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
+- **Not an unbounded local archive.** A seal's cost tracks what the table's metadata holds, so
+  a log that never runs `maintain()` and never evicts gets slower on the write path over time.
+  `maintain()` arrests the larger factor; a retention bounds the rest. Numbers and the
+  reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet
 
-**Indexes for point lookups.** A lookup by key scans the tiers, pruned only by min/max
-statistics, so finding one row costs a scan rather than a seek — least on `sort_by`'s leading
-column, where the statistics are tight.
+- **Indexes for point lookups.** A lookup by key scans the tiers, pruned only by min/max
+  statistics, so finding one row costs a scan rather than a seek — least on `sort_by`'s leading
+  column, where the statistics are tight.
 
-**Schema evolution** is half built: `add_column` works, `rename_column` and `drop_column`
-raise `NotImplementedError`. **Blob fields** — large payloads that bypass the buffer — are
-specified and unbuilt; `binary` columns are carried, for ids and other small values rather
-than payloads. Payload encoding and local-disk backpressure are open. See
-[`docs/SPEC.md`](docs/SPEC.md) §9, §15 and §13.
+- **Schema evolution** is half built: `add_column` works, `rename_column` and `drop_column`
+  raise `NotImplementedError` ([SPEC](docs/SPEC.md) §9).
+
+- **Blob fields** — large payloads that bypass the buffer — are specified and unbuilt;
+  `binary` columns are carried, for ids and other small values rather than payloads
+  ([SPEC](docs/SPEC.md) §15).
+
+- **Payload encoding and local-disk backpressure** are open ([SPEC](docs/SPEC.md) §13).
 
 ## Documentation
 
