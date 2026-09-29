@@ -402,29 +402,6 @@ def test_a_value_the_schema_cannot_hold_costs_no_offsets(tmp_path: Path) -> None
         assert log._table.extent() is None
 
 
-def test_a_uint64_past_the_signed_range_costs_no_offsets(tmp_path: Path) -> None:
-    """The one value that is valid ARROW and still cannot be carried.
-
-    2**63 is an ordinary `uint64`, so the schema check and the cast both pass
-    it. It fails in pyiceberg's statistics, which encode the column as a signed
-    `long` — and that is after the reserve and after the write, so the load
-    used to die with a bare `argument out of range` and a permanent hole.
-
-    Falsify by removing the `_refuse_out_of_range` call from `_ingest_chunks`:
-    the error names no column and `end_offset()` moves to 3.
-    """
-    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("u", pa.uint64())])
-    source = pa.table({"event_ts": [1, 2], "u": pa.array([0, 2**63], type=pa.uint64())})
-    with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match=f"'u' cannot hold {2**63}"):
-            log.ingest(source)
-
-        assert log.end_offset() == 1
-        assert log._table.extent() is None
-
-        assert log.ingest(source.slice(0, 1)) == (1, 1), "the log still loads"
-
-
 # -- ingest: what a failure leaves behind (I2) ---------------------------------
 
 

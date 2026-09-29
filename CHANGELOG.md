@@ -8,24 +8,19 @@ This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 ## Unreleased
 
-### Added
-
-- **`uint64` columns**, for values in `[0, 2**63 - 1]`. Iceberg has no unsigned
-  types, so the archive holds a signed `long` and any engine reading it
-  directly sees `BIGINT`; litelink reads the column back as `uint64`. The top
-  half is refused, at `append` and at `ingest`, with the column named: no layer
-  can hold it — SQLite refuses the integer and pyiceberg's statistics cannot
-  encode it. Covers OpenTelemetry's `uint64` nanosecond timestamps until 2262.
-  The other unsigned widths stay refused. Part of #79.
-
-  `uint64` is the first carried type whose Arrow values can fall outside what
-  the column holds, so `ingest` now range-checks each chunk before it reserves:
-  a refused load leaves no offset hole and no file.
-
 ### Changed
 
-- **Temporal columns are refused as a decision, not pending work.** Time is
-  epoch nanoseconds in an `int64`; the refusal now says so and why (SPEC §13.8).
+- **Timestamps are int64 epochs, by policy.** The temporal Arrow types are
+  refused as a decision rather than pending work, and the refusal now says so
+  instead of "untested". OpenTelemetry's timestamps are `int64` nanosecond
+  columns, good until `2262-04-11T23:47:16.854775807Z` (SPEC §13.8, #79).
+
+### Fixed
+
+- **An integer outside int64 is refused naming its column.** It used to escape
+  as the SQLite driver's `OverflowError: Python int too large to convert to
+  SQLite INTEGER`, which said neither which column nor what the limit was —
+  and for a nanosecond timestamp that limit is a date in 2262.
 
 ## 0.4.1 — 2026-09-23
 

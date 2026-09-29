@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 CARRIED = [
     pa.int32(),
     pa.int64(),
-    pa.uint64(),
     pa.float32(),
     pa.float64(),
     pa.bool_(),
@@ -45,7 +44,6 @@ def test_carried_types_map_through_every_layer(type_: pa.DataType) -> None:
 SAMPLE: dict[str, object] = {
     "int32": 7,
     "int64": 7,
-    "uint64": 2**63 - 1,
     "float": 1.5,
     "double": 1.5,
     "bool": True,
@@ -73,14 +71,15 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
 @pytest.mark.parametrize(
     ("type_", "reason"),
     [
-        (pa.uint8(), "unsigned"),
         (pa.uint32(), "unsigned"),
+        (pa.uint64(), "unsigned"),
         (pa.int8(), "widens"),
         (pa.int16(), "widens"),
         (pa.binary(), "not supported yet"),
         (pa.large_binary(), "not supported yet"),
-        (pa.timestamp("us"), "epoch nanoseconds in an int64"),
-        (pa.timestamp("ns", tz="UTC"), "epoch nanoseconds in an int64"),
+        (pa.timestamp("us"), "store time as an int64 epoch"),
+        (pa.timestamp("ns", tz="UTC"), "store time as an int64 epoch"),
+        (pa.date32(), "store time as an int64 epoch"),
         (pa.decimal128(10, 2), "not yet supported"),
         (pa.list_(pa.int64()), "not yet supported"),
     ],
@@ -104,7 +103,7 @@ def test_a_log_refuses_an_uncarryable_column_at_creation(tmp_path: Path) -> None
 
 
 def test_validate_schema_names_the_offending_column() -> None:
-    schema = pa.schema([pa.field("ok", pa.int64()), pa.field("bad", pa.uint32())])
+    schema = pa.schema([pa.field("ok", pa.int64()), pa.field("bad", pa.uint64())])
 
     with pytest.raises(TypeError, match="column 'bad'"):
         validate_schema(schema)
@@ -186,8 +185,6 @@ EXTREMES: list[tuple[str, pa.DataType, object]] = [
     ("int64 min", pa.int64(), -(2**63)),
     ("int32 max", pa.int32(), 2**31 - 1),
     ("int32 min", pa.int32(), -(2**31)),
-    ("uint64 max carried", pa.uint64(), 2**63 - 1),
-    ("uint64 zero", pa.uint64(), 0),
     ("float64 denormal", pa.float64(), 5e-324),
     ("float64 inf", pa.float64(), float("inf")),
     ("float64 -inf", pa.float64(), float("-inf")),
@@ -250,57 +247,29 @@ def test_nan_is_refused_rather_than_silently_nulled(tmp_path: Path) -> None:
         assert log.scan().read_all()["c"].to_pylist() == [float("inf"), None]
 
 
-@pytest.mark.parametrize("value", [2**63, 2**64 - 1, -1], ids=str)
-def test_a_uint64_outside_the_carried_half_is_refused_at_append(
+@pytest.mark.parametrize("value", [2**63, 2**64 - 1, -(2**63) - 1], ids=str)
+def test_an_integer_outside_int64_is_refused_naming_its_column(
     tmp_path: Path, value: int
 ) -> None:
-    """Named, and with nothing written — not a bare driver error.
+    """Timestamps are int64 epochs by policy, so this limit is a date: 2262.
 
-    Iceberg stores `uint64` as a signed `long`, so only `[0, 2**63 - 1]` has a
-    home. Above it, Python's driver refuses the int before SQLite sees it and
-    raises `OverflowError: Python int too large to convert to SQLite INTEGER`,
-    which names no column; below zero, the CHECK refuses it.
+    Python's driver refuses the int before SQLite sees it, so no CHECK runs and
+    the bare error — `Python int too large to convert to SQLite INTEGER` — names
+    no column. An OTel `uint64` passed through unconverted is the likely way to
+    reach it.
 
     Falsify by removing `OverflowError` from the `except` in `_insert`: the
-    upper two cases raise the driver's message instead of this one.
+    driver's message comes back instead of this one.
     """
-    schema = pa.schema(
-        [pa.field("event_ts", pa.int64()), pa.field("counter", pa.uint64())]
-    )
+    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("t_ns", pa.int64())])
 
     with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="'counter' cannot hold"):
-            log.extend(
-                [{"event_ts": 1, "counter": 1}, {"event_ts": 2, "counter": value}]
-            )
+        with pytest.raises(ValueError, match="'t_ns' cannot hold.*2262-04-11"):
+            log.extend([{"event_ts": 1, "t_ns": 1}, {"event_ts": 2, "t_ns": value}])
 
         assert log.end_offset() == 1, "the whole batch rolled back"
 
-        log.append({"event_ts": 3, "counter": 2**63 - 1})
+        # The documented ceiling itself is a legal value, through a seal.
+        log.append({"event_ts": 3, "t_ns": 2**63 - 1})
         log.seal()
-        assert log.scan().read_all()["counter"].to_pylist() == [2**63 - 1]
-
-
-def test_a_uint64_comes_back_uint64_and_filters_as_a_number(tmp_path: Path) -> None:
-    """The table leg reads Iceberg's `long` as BIGINT; the caller sees `uint64`.
-
-    The edge cast restores the declaration, so a read spanning both tiers is
-    one type, and a predicate compares numbers, not bit patterns.
-    """
-    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("u", pa.uint64())])
-
-    with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        log.extend([{"event_ts": 1, "u": 2**63 - 1}, {"event_ts": 2, "u": 7}])
-        log.seal()
-        log.append({"event_ts": 3, "u": 2**62 + 1})
-
-        both = log.scan().read_all()
-        assert both.schema.field("u").type == pa.uint64()
-        assert both["u"].to_pylist() == [2**63 - 1, 7, 2**62 + 1]
-        assert log.scan(where=f"u > {2**62}").read_all()["u"].to_pylist() == [
-            2**63 - 1,
-            2**62 + 1,
-        ]
-
-    with litelink.open(tmp_path, "s") as reopened:
-        assert reopened.scan().read_all().schema.field("u").type == pa.uint64()
+        assert log.scan().read_all()["t_ns"].to_pylist() == [2**63 - 1]

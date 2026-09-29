@@ -8,10 +8,9 @@ DuckDB casts were separate maps that had to agree by hand. They did not: a
 first read with `KeyError: 'uint32'`, having already made the data durable.
 
 The set is deliberately conservative. Iceberg narrows silently where it cannot
-represent a type — `int8` and `int16` become `int32`, and the unsigned types
-become *signed* — so rather than pass those through, they are refused with the
-reason. `uint64` is the one exception, carried in the half of its range a
-signed `long` holds: see `_UINT64`.
+represent a type — `int8` and `int16` become `int32`, and `uint32`/`uint64`
+become *signed* `int32`/`int64`, which loses the top half of the range — so
+rather than pass those through, they are refused with the reason.
 
 `binary` is absent for a different reason, and a temporary one: the read path
 pushes its boundary predicate into SQLite, which is 14x faster and is what
@@ -65,9 +64,9 @@ class ColumnType(NamedTuple):
     bounds: tuple[float, float] | None
     """The range a value must fall in, or None if the type cannot overflow.
 
-    Only `int32`, `uint64` and `float32` have one, which is what keeps this
-    affordable: a schema of int64s, float64s and strings has no bounded column
-    at all and the check is one truthiness test per row.
+    Only `int32` and `float32` have one, which is what keeps this affordable:
+    a schema of int64s, float64s and strings has no bounded column at all and
+    the check is one truthiness test per row.
 
     The two failure modes differ and both are silent at append. An int32 given
     2**40 is stored by SQLite unchanged and then wedges EVERY scan
@@ -127,16 +126,6 @@ _STR = frozenset({str, _NONE})
 _BOOL = frozenset({bool, _NONE})
 
 _INT32 = (-(2**31), 2**31 - 1)
-# `uint64` is stored as Iceberg's signed `long`, and only this half of its range
-# survives. The Parquet file keeps the unsigned annotation, so litelink reads a
-# `uint64` back, while any engine reading the archive directly sees `BIGINT` —
-# the same value, and ordered the same, because nothing negative is admitted.
-#
-# The top half has no home on any layer, measured: SQLite refuses a Python int
-# past 2**63 - 1 at the insert, and pyiceberg's statistics fail on one with
-# `argument out of range` while committing a file. Carrying it bit-for-bit as a
-# negative `long` would make every external read and every min/max prune wrong.
-_UINT64 = (0, 2**63 - 1)
 # The largest finite float32. A float64 above it becomes `inf` on the way in.
 _FLOAT32 = (-3.4028235e38, 3.4028235e38)
 
@@ -158,17 +147,6 @@ _SUPPORTED: tuple[tuple[Callable[[pa.DataType], bool], ColumnType], ...] = (
         pa.types.is_int64,
         ColumnType(
             "INTEGER", "BIGINT", _INT, _is_int, None, None, variable_length=False
-        ),
-    ),
-    # `BIGINT`, not `UBIGINT`, on the buffer leg, to match the table leg,
-    # which reads the Iceberg `long` as BIGINT. Mixing the two works — DuckDB
-    # widens the union to HUGEINT and the edge cast narrows it back — but
-    # every `sql()` expression the edge cast does not name, `max(u)` included,
-    # would then come back 128 bits wide. The edge cast restores `uint64`.
-    (
-        pa.types.is_uint64,
-        ColumnType(
-            "INTEGER", "BIGINT", _INT, _is_int, _UINT64, None, variable_length=False
         ),
     ),
     (
@@ -198,7 +176,7 @@ _REASONS: tuple[tuple[Callable[[pa.DataType], bool], str], ...] = (
     (
         pa.types.is_unsigned_integer,
         "Iceberg has no unsigned types, so this becomes signed and loses the "
-        "top half of its range. Declare int64, or uint64 for values below 2**63.",
+        "top half of its range. Declare int64.",
     ),
     (
         lambda t: pa.types.is_int8(t) or pa.types.is_int16(t),
@@ -214,9 +192,9 @@ _REASONS: tuple[tuple[Callable[[pa.DataType], bool], str], ...] = (
     ),
     (
         pa.types.is_temporal,
-        "not supported: store epoch nanoseconds in an int64. Iceberg v2 has no "
-        "nanosecond type, so a time type here would truncate to microseconds "
-        "and bound the column to years 1-9999. See SPEC §13.8.",
+        "not supported, by policy: store time as an int64 epoch — nanoseconds "
+        "for OpenTelemetry — which is the same value in the table, in a JSON "
+        "frame and in a subtraction. See SPEC §13.8.",
     ),
     (
         lambda t: pa.types.is_nested(t) or pa.types.is_decimal(t),
