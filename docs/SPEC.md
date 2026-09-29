@@ -2394,10 +2394,11 @@ The consequence worth planning for is that local disk holds roughly
    websocket, where today the choice is to parse every field into a column or keep the frame as
    text. Variant is the third option: store the frame, address into it, let the engine prune.
 
-   **Nanosecond timestamps.** Temporal columns are refused today because their round trip
-   through SQLite's storage classes is untested, and `timestamp[ns]` pyiceberg rejected
-   outright. The examples carry epoch nanoseconds in an `int64` as a result — honest, and it
-   loses the type. v3 has the types and pyiceberg already models them.
+   **Time has no column type, by design.** How to represent it is the application's choice —
+   an `int64` epoch is the usual one, a string works too — so the temporal Arrow types are
+   refused rather than pending (#79). A native type was measured and rejected: `timestamp[ns]`
+   is refused by pyiceberg on v2, and `timestamp[us]` truncates nanoseconds and fails every
+   seal past year 9999, because pyiceberg's manifest statistics go through Python's `datetime`.
 
    **Default column values**, which would make §9's add-a-column less lossy: an older file
    could read a declared default rather than null.

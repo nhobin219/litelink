@@ -77,7 +77,7 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
         (pa.int16(), "widens"),
         (pa.binary(), "not supported yet"),
         (pa.large_binary(), "not supported yet"),
-        (pa.timestamp("us"), "not yet supported"),
+        (pa.timestamp("us"), "Represent time as a column type that is"),
         (pa.decimal128(10, 2), "not yet supported"),
         (pa.list_(pa.int64()), "not yet supported"),
     ],

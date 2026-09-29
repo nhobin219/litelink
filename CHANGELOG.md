@@ -6,6 +6,14 @@ rather than restates it.
 
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
+## Unreleased
+
+### Changed
+
+- The temporal Arrow types are refused as a decision rather than pending work:
+  how to represent time is the application's choice, and the refusal suggests
+  an `int64` epoch or a string (SPEC §13.8, #79).
+
 ## 0.4.1 — 2026-09-23
 
 ### Fixed

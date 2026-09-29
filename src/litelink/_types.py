@@ -192,8 +192,8 @@ _REASONS: tuple[tuple[Callable[[pa.DataType], bool], str], ...] = (
     ),
     (
         pa.types.is_temporal,
-        "not yet supported: the buffer stores these as integers and the "
-        "round trip through SQLite is untested. Store epoch integers.",
+        "not supported. Represent time as a column type that is — an int64 "
+        "epoch is the usual choice, a string works too. See SPEC §13.8.",
     ),
     (
         lambda t: pa.types.is_nested(t) or pa.types.is_decimal(t),
