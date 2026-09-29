@@ -218,6 +218,29 @@ The rules are the buffer's own: the check inserts into a private in-memory copy 
 buffer table and rolls back. Building that copy costs ~260 µs once per schema, after which a
 row costs ~4 µs.
 
+### Column types
+
+| Arrow type | append this |
+|---|---|
+| `int32`, `int64` | `int` |
+| `float32`, `float64` | `float`, or an `int` it holds exactly |
+| `bool` | `bool` |
+| `string`, `large_string` | `str` |
+| `binary`, `fixed_size_binary(n)` | `bytes` — exactly `n` of them for a fixed width |
+| `struct<…>` | a mapping of declared field names; an absent field is null |
+| `map<K, V>` | a mapping, or a sequence of `(key, value)` pairs; keys are strings or integers |
+| `list<T>` | a `list` or `tuple` |
+
+Nested types nest in each other. Anything else is refused at `new` with the reason — unsigned
+integers, time types, `large_binary`, `large_list` and unions among them. Iceberg has no union,
+so a variant value such as OTel's `AnyValue` is a struct with one nullable field per variant.
+
+A nested value is checked in Python against its declared type, since SQLite cannot see inside
+one, and stored as JSON: about 30 µs per row for an OTel body and a four-entry attribute map,
+paid only by schemas that have nested columns. Fields inside one carry no file-level
+statistics — pyiceberg records none — so an attribute you filter on often belongs in a
+top-level column, where it prunes.
+
 ### Bulk loading: `ingest`
 
 ```python

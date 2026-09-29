@@ -22,6 +22,11 @@ SCHEMA = pa.schema(
         pa.field("f32", pa.float32()),
         pa.field("b", pa.bool_()),
         pa.field("s", pa.string()),
+        pa.field("tid", pa.binary(16)),
+        pa.field(
+            "attrs", pa.map_(pa.string(), pa.struct([pa.field("x", pa.binary())]))
+        ),
+        pa.field("tags", pa.list_(pa.string())),
     ]
 )
 
@@ -59,6 +64,13 @@ ROWS: list[tuple[str, dict[str, object]]] = [
     ("1 into bool", {**BASE, "b": 1}),
     ("int into string", {**BASE, "s": 12345}),
     ("StrEnum into string", {**BASE, "s": Side.BUY}),
+    ("trace id", {**BASE, "tid": bytes(16)}),
+    ("short trace id", {**BASE, "tid": bytes(15)}),
+    ("nested", {**BASE, "attrs": {"k": {"x": b"\x00"}}, "tags": ["a"]}),
+    ("unknown struct key", {**BASE, "attrs": {"k": {"x": b"", "y": 1}}}),
+    ("wrong nested leaf", {**BASE, "attrs": {"k": {"x": "text"}}}),
+    ("wrong list item", {**BASE, "tags": ["a", 1]}),
+    ("nested fine, other column bad", {**BASE, "attrs": {}, "i32": 2**31}),
 ]
 
 
@@ -83,8 +95,8 @@ def test_validate_row_answers_exactly_as_append_does(
     share fails here.
 
     Falsify by deleting the `_row_bytes` call from `RowProbe.check` (the NaN
-    rows diverge) or the unknown-column test (the unknown and misspelled rows
-    diverge).
+    rows diverge), the unknown-column test (the unknown and misspelled rows
+    diverge), or the nested encode (the three bad nested rows diverge).
     """
     with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
         appended = _outcome(lambda: log.append(row))

@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
-from litelink._types import column_type
+from litelink._types import Nested, NestedValueError, column_type
 
 # Where the log records its settings. It lives here because this object owns
 # `meta`, and `meta` is the one place the policy exists.
@@ -181,7 +181,17 @@ def _column_ddl(name: str, field: pa.Field) -> str:
                 f" OR ({real})"
             )
         )
+    elif kind.sqlite == "BLOB":
+        # `length` of a blob is its byte count, which is what makes the width
+        # of a `fixed_size_binary` enforceable here: a 15-byte trace id is
+        # refused at the insert rather than failing the seal's Parquet write.
+        test = f"typeof({q}) = 'blob'"
+        if kind.width is not None:
+            test += f" AND length({q}) = {kind.width:d}"
     else:
+        # A nested column is TEXT too — its JSON, which `Nested.encode` has
+        # already checked against the declared type, since no CHECK can see
+        # inside it.
         test = (
             f"typeof({q}) = 'integer'"
             if kind.sqlite == "INTEGER"
@@ -248,6 +258,7 @@ class Shape:
     accepts: tuple[Callable[[object], bool], ...]
     ranged: tuple[tuple[int, float, float], ...]
     exact_ints: tuple[tuple[int, int], ...]
+    nested: tuple[tuple[int, str, Nested], ...]
 
     @property
     def table(self) -> pa.Schema:
@@ -303,6 +314,13 @@ class Shape:
                 (i, *bounds)
                 for i in range(len(columns))
                 if (bounds := column_type(schema.field(i).type).bounds) is not None
+            ),
+            # Like `ranged`: empty for a schema with no nested column, so the
+            # write path pays one truthiness test per row for the feature.
+            nested=tuple(
+                (i, columns[i], nested)
+                for i in range(len(columns))
+                if (nested := column_type(schema.field(i).type).nested) is not None
             ),
         )
 
@@ -844,6 +862,7 @@ class Buffer:
             target_rows = config.target_seal_rows or _NO_ROW_LIMIT
             row_bytes = _row_bytes
             columns = shape.columns
+            nested = shape.nested
             # Bound out here like `row_bytes` above, for the same reason: this
             # runs per row.
             # The ONE question SQLite cannot be asked. The insert names the
@@ -881,6 +900,9 @@ class Buffer:
                 if (len(row) != width or None in values) and not declared(row):
                     _reject_unknown(row, shape)
 
+                if nested:
+                    values = _encode_nested(values, nested)
+
                 try:
                     cursor.execute(sql, values)
                 except sqlite3.IntegrityError as exc:
@@ -901,7 +923,7 @@ class Buffer:
                 if group.start_offset is None:
                     group.start_offset = offset
 
-                group.bytes += row_bytes(row, columns)
+                group.bytes += row_bytes(values, columns)
                 # Whichever is reached FIRST. Both are ceilings on one file —
                 # bytes bound memory, rows bound the read latency §7 sizes for
                 # — so the tighter one wins, which is the opposite of how
@@ -1393,6 +1415,10 @@ class Buffer:
         cost roughly as much again as building it: every column paid the
         conversion pass, including the ones already in the right type.
         """
+        nested = column_type(declared).nested
+        if nested is not None:
+            values = tuple(None if v is None else nested.decode(str(v)) for v in values)
+
         try:
             return pa.array(values, type=declared)
         except (pa.ArrowInvalid, pa.ArrowTypeError):
@@ -2497,7 +2523,7 @@ class Buffer:
                 extra.close()
 
 
-def _row_bytes(row: Mapping[str, object], columns: tuple[str, ...]) -> int:
+def _row_bytes(values: tuple[object, ...], columns: tuple[str, ...]) -> int:
     """Approximate bytes for one row, and refuse what SQLite cannot store.
 
     `columns` is passed rather than read, because this runs once per row.
@@ -2513,8 +2539,7 @@ def _row_bytes(row: Mapping[str, object], columns: tuple[str, ...]) -> int:
     declines what it cannot carry faithfully rather than changing it.
     """
     total = 8
-    for name in columns:
-        value = row.get(name)
+    for name, value in zip(columns, values, strict=True):
         if isinstance(value, bytes | bytearray | memoryview):
             total += len(value)
         elif isinstance(value, str):
@@ -2533,6 +2558,28 @@ def _row_bytes(row: Mapping[str, object], columns: tuple[str, ...]) -> int:
             total += 8
 
     return total
+
+
+def _encode_nested(
+    values: tuple[object, ...], nested: tuple[tuple[int, str, Nested], ...]
+) -> tuple[object, ...]:
+    """Check each nested value against its declared type, and store its JSON.
+
+    Here rather than in a CHECK because SQLite cannot see inside one; see
+    `Nested`. None passes through untouched, so `NOT NULL` and
+    `_reject_missing` answer for a nested column exactly as for any other.
+    """
+    stored = list(values)
+    for i, name, codec in nested:
+        value = stored[i]
+        if value is not None:
+            try:
+                stored[i] = codec.encode(value)
+            except NestedValueError as exc:
+                msg = f"column {name!r} cannot hold this value {exc}"
+                raise ValueError(msg) from None
+
+    return tuple(stored)
 
 
 def _reject_unknown(row: Mapping[str, object], shape: Shape) -> None:
@@ -2762,6 +2809,9 @@ class RowProbe:
         ) and not shape.known.issuperset(row):
             _reject_unknown(row, shape)
 
+        if shape.nested:
+            values = _encode_nested(values, shape.nested)
+
         with self._lock:
             self._con.execute(_BEGIN)
             try:
@@ -2770,6 +2820,6 @@ class RowProbe:
                 except sqlite3.IntegrityError as exc:
                     _explain(row, values, shape, exc)
 
-                _row_bytes(row, shape.columns)
+                _row_bytes(values, shape.columns)
             finally:
                 self._con.execute("ROLLBACK")

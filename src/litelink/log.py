@@ -4474,6 +4474,13 @@ def validate(
         msg = f"sort_by names columns not in the schema: {missing}"
         raise ValueError(msg)
 
+    # A file sorted by a struct, map or list has no order an engine can prune
+    # on, and neither Iceberg's sort order nor Arrow's sort accepts one.
+    nested = [c for c in sort_by if column_type(schema.field(c).type).nested]
+    if nested:
+        msg = f"sort_by cannot name a struct, map or list column: {nested}"
+        raise ValueError(msg)
+
     if config.snapshot_retention < timedelta(0):
         # The same sign slip, one field over. Expiry computes
         # `now - snapshot_retention`, so a negative one puts the cutoff in the

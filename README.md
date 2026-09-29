@@ -264,8 +264,9 @@ reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 ## Not implemented yet
 
 **Schema evolution** is half built: `add_column` works, `rename_column` and `drop_column`
-raise `NotImplementedError`. **Blob fields** are specified and unbuilt — `binary` columns are
-refused outright. Payload encoding, local-disk backpressure and bulk ingest are open. See
+raise `NotImplementedError`. **Blob fields** — large payloads that bypass the buffer — are
+specified and unbuilt; small `binary` columns are carried. Payload encoding, local-disk
+backpressure and bulk ingest are open. See
 [`docs/SPEC.md`](docs/SPEC.md) §9, §15 and §13.
 
 ## Documentation

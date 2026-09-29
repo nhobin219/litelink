@@ -5480,3 +5480,41 @@ def test_an_archive_only_snapshot_resolves_the_pointer_once(
     # onto. A refactor that threaded the hint into adoption as well would
     # satisfy `<= 2` while silently retiring that read.
     assert hints == 2, f"fetched version-hint.text {hints} times, not two"
+
+
+def test_an_otel_log_reads_back_exactly_from_the_archive(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Binary and nested columns through sync, a snapshot, and plain DuckDB.
+
+    A snapshot rebuilds the schema from a data file's Parquet footer, so this is
+    where a fixed width or a nested type would come back reshaped if anything
+    on the way lost it. And the archive is read by engines with no litelink at
+    all, which is where the map has to be addressable as a map (#79).
+    """
+    from tests.test_types import OTEL, otel_row
+
+    where = f"s3://{bucket}/otel"
+    rows = [otel_row(n) for n in range(1, 41)]
+    config = LogConfig(target_seal_rows=10, compact_min_files=2)
+    with litelink.new(
+        tmp_path, "s", schema=OTEL, sort_by=("ts",), config=config, archive=where, s3=s3
+    ) as log:
+        log.extend(rows)
+        log.seal()
+        log.maintain()
+        log.sync(push_unsettled=True)
+        assert log.archived_through() == 40
+
+    expected = pa.Table.from_pylist(rows, schema=OTEL).to_pylist()
+    with litelink.snapshot("s", archive=where, s3=s3) as view:
+        assert view.schema == OTEL
+        assert view.scan().read_all().drop([OFFSET]).to_pylist() == expected
+
+    con = duckdb.connect()
+    con.execute(secret_sql(s3))
+    counted = con.execute(
+        f"SELECT count(*), max(attributes['attempt'].i) FROM iceberg_scan('{where}/s',"
+        " version_name_format = '%s%s.metadata.json')"
+    ).fetchall()
+    assert counted == [(40, 40)]
