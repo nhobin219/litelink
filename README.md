@@ -7,16 +7,29 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
 [![Iceberg](https://img.shields.io/badge/Apache%20Iceberg-v2-4B8BBE)](https://iceberg.apache.org/)
 
-# Durable append-only capture into Iceberg tables
+# An embedded storage engine for append-only data
 
-**Embedded and local-first.**
+**In your process like DuckDB, and what it writes is an Iceberg table.**
+
+`append()` returns once the row is durable, and a query a moment later sees it.
 
 ## Introduction
 
-litelink is a Python library for the thing every capture pipeline hand-rolls badly: getting a
-stream of observations onto disk durably, into well-sized Parquet, and eventually into object
-storage — without a daemon, a broker, or a catalog service. `append()` returns once the row is
-durable, and a query a moment later sees it.
+litelink is an open-source **embedded storage engine**: what DuckDB is to queries, litelink is
+to the durable write path. It runs inside your process, with no server, daemon or catalog
+service, and the files it writes are the product. They're Iceberg v2 tables on local disk and
+in object storage: the Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg
+engine, reads, with no export step in between.
+
+|  | DuckDB | litelink |
+|---|---|---|
+| runs | in your process | in your process |
+| without | a server, daemon or cluster | a server, daemon or catalog service |
+| owns | the query | the durable write path |
+| speaks | SQL over Parquet and Arrow | Iceberg v2, on disk and in object storage |
+
+It's built for the thing every capture pipeline hand-rolls badly: getting a stream of
+observations onto disk durably, into well-sized Parquet, and eventually into object storage.
 
 ```
 SQLite buffer          durable on commit. unsealed rows only.
@@ -251,10 +264,12 @@ Upgrading a log written by 0.1.0: see [Migrating from 0.1](docs/RUNTIME.md#migra
 
 ## What it is not
 
-**Not an OLTP or key-value store.** A point lookup is ~1,600x slower than an indexed row
-store, and no configuration closes that gap. It is a local, in-process, real-time analytics
-store: freshness is sub-second *with* durability, but "real-time" means fresh, not
-point-lookup fast.
+**Not an OLTP or key-value store.** It is append-only, with no update or delete, and a point
+lookup is ~1,600x slower than an indexed row store, because there is no index to look up: a
+lookup scans, pruned only by min/max statistics, which are tight on `sort_by`'s leading column
+and loose elsewhere. Indexes are [not implemented yet](#not-implemented-yet). It is a local,
+in-process, real-time analytics store: freshness is sub-second *with* durability, but
+"real-time" means fresh, not point-lookup fast.
 
 **Not an unbounded local archive.** A seal's cost tracks what the table's metadata holds, so
 a log that never runs `maintain()` and never evicts gets slower on the write path over time.
@@ -263,11 +278,14 @@ reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet
 
+**Indexes for point lookups.** A lookup by key scans the tiers, pruned only by min/max
+statistics, so finding one row costs a scan rather than a seek — least on `sort_by`'s leading
+column, where the statistics are tight.
+
 **Schema evolution** is half built: `add_column` works, `rename_column` and `drop_column`
 raise `NotImplementedError`. **Blob fields** — large payloads that bypass the buffer — are
 specified and unbuilt; `binary` columns are carried, for ids and other small values rather
-than payloads. Payload encoding, local-disk
-backpressure and bulk ingest are open. See
+than payloads. Payload encoding and local-disk backpressure are open. See
 [`docs/SPEC.md`](docs/SPEC.md) §9, §15 and §13.
 
 ## Documentation
