@@ -15,7 +15,9 @@ minor version carries breaking changes.
   attributes as `AnyValue` structs, array values (#79). Nested values are
   checked against the declared type at `append` — an unknown struct field is
   refused where Arrow would drop it — and read back exactly from the buffer,
-  the local table, the archive and any engine reading it directly.
+  the local table, the archive and any engine reading it directly. `binary`
+  is for small values such as ids — its bytes go through the buffer — and not
+  a substitute for §15's blob fields, which are what large payloads need.
 - **`litelink.validate_row(schema, row)`** checks a row without appending it,
   raising exactly what `append` would — same exception, same message — with no
   log required (#77).

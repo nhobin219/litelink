@@ -12,9 +12,10 @@ represent a type — `int8` and `int16` become `int32`, and `uint32`/`uint64`
 become *signed* `int32`/`int64`, which loses the top half of the range — so
 rather than pass those through, they are refused with the reason.
 
-`binary` and `fixed_size_binary(n)` are carried as SQLite blobs — the size of
-a trace id, not a payload; §15's blob fields, which bypass the buffer, are
-still where large binary belongs.
+`binary` and `fixed_size_binary(n)` are carried as SQLite blobs, for values the
+size of a trace id — NOT payloads. Their bytes go through the buffer, the WAL
+replica and every hot read like any other value; frames and point clouds are
+§15's blob fields, which bypass the buffer and are not built yet (SPEC §15).
 
 `struct`, `map` and `list` are carried as JSON text, because SQLite has no
 nested type and so no CHECK can see inside one. Their values are checked in

@@ -2495,6 +2495,20 @@ Beyond §10:
 **Extension to capture storage v1.0.** Support for payloads too large to sit comfortably in
 the SQLite buffer: sensor frames, point clouds, raw response bodies.
 
+**A blob field is not a `binary` column, and the difference is size.** An ordinary `binary`
+or `fixed_size_binary(n)` column is carried today (#79) and travels like any other value:
+into SQLite at `synchronous=FULL`, out through the WAL sidecar, into the Arrow conversion
+every hot read makes of the buffered tail, and against `target_seal_size`. That is right for
+identifiers, hashes and small encoded values — a trace id is 16 bytes. It is wrong for a
+payload. A 5 MB point cloud in a `binary` column is fsynced through the buffer, shipped whole
+by the replica, materialised by every scan that reaches the buffer, and cuts a file of one or
+two rows at the default 8 MiB seal target. A blob field exists to avoid exactly that: its
+bytes never enter SQLite (§15.3) and meet the table only at seal.
+
+Blob fields are unbuilt, so a payload that size does not belong in a log yet. Where the line
+falls between the two is §15.12's open small-blob threshold — around 1 MB, below which the
+staging path costs more than it saves.
+
 ---
 
 ## 15.1 The model
