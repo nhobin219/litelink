@@ -6,7 +6,7 @@ rather than restates it.
 
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
-## Unreleased
+## 0.5.0 — 2026-09-29
 
 ### Changed — breaking
 
@@ -29,6 +29,17 @@ minor version carries breaking changes.
   information is None rather than a narrower bound; strings, bytes and nested
   columns carry no bounds, and a float's `nan_count` is 0, since no write path
   admits NaN.
+- **`binary`, `fixed_size_binary(n)`, `struct`, `map` and `list` columns**, which
+  is what an OpenTelemetry log record needs: trace and span ids, the body and
+  attributes as `AnyValue` structs, array values (#79). Nested values are
+  checked against the declared type at `append` — an unknown struct field is
+  refused where Arrow would drop it — and read back exactly from the buffer,
+  the local table, the archive and any engine reading it directly. `binary`
+  is for small values such as ids — its bytes go through the buffer — and not
+  a substitute for §15's blob fields, which are what large payloads need.
+- **`litelink.validate_row(schema, row)`** checks a row without appending it,
+  raising exactly what `append` would — same exception, same message — with no
+  log required (#77).
 
 ### Changed
 
