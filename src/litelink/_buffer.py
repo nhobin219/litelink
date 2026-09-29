@@ -188,8 +188,13 @@ def _column_ddl(name: str, field: pa.Field) -> str:
             else (f"typeof({q}) = 'text'")
         )
         if kind.bounds is not None:
+            # Integers, spelled exactly. `:.0f` goes through a float, which is
+            # exact for int32's bounds and not for `uint64`'s: 2**63 - 1
+            # renders as 9223372036854775808, a REAL literal one past the
+            # bound. Harmless there only because SQLite cannot store that
+            # integer anyway — a bound nobody has to reason about is better.
             lo, hi = kind.bounds
-            test += f" AND {q} BETWEEN {lo:.0f} AND {hi:.0f}"
+            test += f" AND {q} BETWEEN {int(lo):d} AND {int(hi):d}"
 
     parts = [f"{q} ANY"]
     if not field.nullable:
@@ -911,7 +916,11 @@ class Buffer:
 
                 try:
                     cursor.execute(sql, values)
-                except sqlite3.IntegrityError as exc:
+                # `OverflowError` is the driver refusing a Python int past
+                # 2**63 - 1 before SQLite sees it, so no CHECK ever runs. On a
+                # `uint64` column that is the top half of the declared range,
+                # and it deserves the column's name as much as a CHECK does.
+                except (sqlite3.IntegrityError, OverflowError) as exc:
                     # SQLite is the gate; this only turns its answer into one
                     # a caller can act on. `CHECK constraint failed: key` does
                     # not say what was wrong with the value, or which value.
@@ -1075,7 +1084,7 @@ class Buffer:
         row: Mapping[str, object],
         values: tuple[object, ...],
         shape: Shape,
-        exc: sqlite3.IntegrityError,
+        exc: sqlite3.IntegrityError | OverflowError,
     ) -> None:
         """Turn a constraint failure into the refusal a caller can act on.
 

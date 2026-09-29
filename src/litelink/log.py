@@ -201,6 +201,47 @@ def _refuse_foreign_schema(incoming: pa.Schema, declared: pa.Schema) -> None:
         raise ValueError(msg) from exc
 
 
+def _refuse_out_of_range(rows: pa.Table, shape: Shape) -> None:
+    """Refuse a chunk holding a value its column cannot carry through a seal.
+
+    `append` gets this from the buffer's CHECK, and a bulk load never touches
+    the buffer, so it is asked here instead — per chunk, before the chunk
+    reserves anything. A `uint64` of 2**63 is a valid Arrow value that
+    pyiceberg's statistics cannot encode as a `long`, so without this the load
+    dies in the commit with a bare `argument out of range`, naming no column,
+    after its range has already been reserved and its file written.
+
+    Floating columns are skipped rather than checked. An Arrow float32 cannot
+    exceed its own range, and the one value past the bound it CAN hold is an
+    infinity, which is legal (`_INFINITE` in the buffer).
+
+    `group_by([]).aggregate` rather than `pyarrow.compute`, for the reason
+    `_verify` gives: a Table method is visible to the type checker, a
+    registry-generated kernel is not.
+    """
+    bounded = [
+        (shape.columns[i], lo, hi)
+        for i, lo, hi in shape.ranged
+        if not pa.types.is_floating(shape.schema.field(i).type)
+    ]
+    if not bounded:
+        return
+
+    extremes = rows.group_by([]).aggregate(
+        [(name, how) for name, _, _ in bounded for how in ("min", "max")]
+    )
+    for name, lo, hi in bounded:
+        for how in ("min", "max"):
+            value = extremes[f"{name}_{how}"][0].as_py()
+            if value is not None and not lo <= value <= hi:
+                msg = (
+                    f"column {name!r} cannot hold {value!r}: it is declared "
+                    f"{shape.schema.field(name).type}, whose range is "
+                    f"({int(lo):d}, {int(hi):d}). Nothing from this chunk was reserved"
+                )
+                raise ValueError(msg)
+
+
 def _chunks(
     reader: pa.RecordBatchReader, size: int, row_cap: int | None
 ) -> Iterator[pa.Table]:
@@ -2753,6 +2794,9 @@ class WriteHandle(LocalReadHandle):
         try:
             for chunk in _chunks(reader, config.compact_size, config.compact_rows):
                 rows = chunk.select(shape.columns).cast(shape.schema)
+                # Before the reservation, which is what makes a refusal here
+                # free: after it, the chunk's offsets are a permanent hole.
+                _refuse_out_of_range(rows, shape)
                 lo, hi = self._buffer.reserve(rows.num_rows)
                 # BEFORE the file is written, for I2's reason applied to a
                 # follower: a crash between here and the commit must leave the

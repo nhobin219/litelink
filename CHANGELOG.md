@@ -6,6 +6,27 @@ rather than restates it.
 
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
+## Unreleased
+
+### Added
+
+- **`uint64` columns**, for values in `[0, 2**63 - 1]`. Iceberg has no unsigned
+  types, so the archive holds a signed `long` and any engine reading it
+  directly sees `BIGINT`; litelink reads the column back as `uint64`. The top
+  half is refused, at `append` and at `ingest`, with the column named: no layer
+  can hold it — SQLite refuses the integer and pyiceberg's statistics cannot
+  encode it. Covers OpenTelemetry's `uint64` nanosecond timestamps until 2262.
+  The other unsigned widths stay refused. Part of #79.
+
+  `uint64` is the first carried type whose Arrow values can fall outside what
+  the column holds, so `ingest` now range-checks each chunk before it reserves:
+  a refused load leaves no offset hole and no file.
+
+### Changed
+
+- **Temporal columns are refused as a decision, not pending work.** Time is
+  epoch nanoseconds in an `int64`; the refusal now says so and why (SPEC §13.8).
+
 ## 0.4.1 — 2026-09-23
 
 ### Fixed
