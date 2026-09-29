@@ -164,8 +164,8 @@ def test_add_column_refuses_what_could_never_have_been_declared(
         with pytest.raises(ValueError, match="I11"):
             log.add_column("litelink_offset", pa.int64())
 
-        with pytest.raises(TypeError):
-            log.add_column("bad", pa.list_(pa.int64()))
+        with pytest.raises(TypeError, match="unsigned"):
+            log.add_column("bad", pa.uint32())
 
         with pytest.raises(ValueError, match="already exists"):
             log.add_column("key", pa.string())

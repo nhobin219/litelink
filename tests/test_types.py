@@ -8,12 +8,14 @@ were separate and disagreed.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pytest
 
 import litelink
+from litelink import LogConfig
 from litelink._types import column_type, validate_schema
 
 if TYPE_CHECKING:
@@ -27,6 +29,11 @@ CARRIED = [
     pa.bool_(),
     pa.string(),
     pa.large_string(),
+    pa.binary(),
+    pa.binary(16),
+    pa.struct([pa.field("a", pa.int64()), pa.field("b", pa.string())]),
+    pa.map_(pa.string(), pa.int64()),
+    pa.list_(pa.string()),
 ]
 
 
@@ -49,7 +56,22 @@ SAMPLE: dict[str, object] = {
     "bool": True,
     "string": "x",
     "large_string": "unicode ☃, and a quote'''s worth of trouble",
+    "binary": b"\x00\xffbytes",
+    "fixed_size_binary[16]": bytes(range(16)),
+    "struct<a: int64, b: string>": {"a": 7, "b": "x"},
+    "map<string, int64>": {"k": 1, "j": 2},
+    "list<item: string>": ["a", "b"],
 }
+
+
+def _as_read(values: list[object], type_: pa.DataType) -> list[object]:
+    """What a read hands back for `values` appended to a `type_` column.
+
+    Not `values` itself: a map is appended as a dict and read back as a list of
+    pairs. Building the expectation through Arrow at the declared type is
+    right for every column rather than a special case for one.
+    """
+    return pa.array(values, type=type_).to_pylist()
 
 
 @pytest.mark.parametrize("type_", CARRIED, ids=str)
@@ -61,11 +83,12 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
 
     with litelink.new(root, "s", schema=schema, sort_by=("event_ts",)) as log:
         log.extend([{"event_ts": 1, "c": sample}, {"event_ts": 2, "c": None}])
-        assert log.scan().read_all()["c"].to_pylist() == [sample, None], "from buffer"
+        expected = _as_read([sample, None], type_)
+        assert log.scan().read_all()["c"].to_pylist() == expected, "from buffer"
 
         log.seal()
 
-        assert log.scan().read_all()["c"].to_pylist() == [sample, None], "from table"
+        assert log.scan().read_all()["c"].to_pylist() == expected, "from table"
 
 
 @pytest.mark.parametrize(
@@ -75,11 +98,18 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
         (pa.uint64(), "unsigned"),
         (pa.int8(), "widens"),
         (pa.int16(), "widens"),
-        (pa.binary(), "not supported yet"),
-        (pa.large_binary(), "not supported yet"),
+        (pa.large_binary(), "declare binary"),
+        (pa.large_list(pa.int64()), "declare list"),
+        (pa.dense_union([pa.field("a", pa.int64())]), "no union type"),
+        (pa.struct([]), "at least one field"),
+        (pa.map_(pa.float64(), pa.string()), "map keys must be"),
+        (pa.list_(pa.uint32()), "unsigned"),
+        (
+            pa.struct([pa.field("a", pa.int64()), pa.field("a", pa.string())]),
+            "duplicate",
+        ),
         (pa.timestamp("us"), "Represent time as a column type that is"),
         (pa.decimal128(10, 2), "not yet supported"),
-        (pa.list_(pa.int64()), "not yet supported"),
     ],
     ids=str,
 )
@@ -193,6 +223,22 @@ EXTREMES: list[tuple[str, pa.DataType, object]] = [
     ("astral plane", pa.string(), "🛩️ ☃ Ω"),
     ("100 KB string", pa.string(), "x" * 100_000),
     ("bool false", pa.bool_(), False),
+    ("empty binary", pa.binary(), b""),
+    ("every byte value", pa.binary(), bytes(range(256))),
+    ("fixed all 0xff", pa.binary(8), b"\xff" * 8),
+    ("empty map", pa.map_(pa.string(), pa.string()), {}),
+    ("empty list", pa.list_(pa.int64()), []),
+    ("list of nulls", pa.list_(pa.int64()), [None, None]),
+    ("struct of nulls", pa.struct([pa.field("a", pa.int64())]), {"a": None}),
+    ("int64 limits nested", pa.list_(pa.int64()), [2**63 - 1, -(2**63)]),
+    ("infinities nested", pa.list_(pa.float64()), [float("inf"), float("-inf")]),
+    ("int keys", pa.map_(pa.int32(), pa.binary()), {-(2**31): b"", 7: b"\x00"}),
+    ("quotes in a key", pa.map_(pa.string(), pa.string()), {'a"b\\': "\n"}),
+    (
+        "three levels",
+        pa.struct([pa.field("m", pa.map_(pa.string(), pa.list_(pa.binary(4))))]),
+        {"m": {"k": [b"abcd", None]}},
+    ),
 ]
 
 
@@ -213,12 +259,13 @@ def test_extreme_values_survive_the_round_trip(
 
     with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
         log.append({"event_ts": 1, "c": value})
+        expected = _as_read([value], type_)
 
-        assert log.scan().read_all()["c"].to_pylist() == [value], "from the buffer"
+        assert log.scan().read_all()["c"].to_pylist() == expected, "from the buffer"
 
         log.seal()
 
-        assert log.scan().read_all()["c"].to_pylist() == [value], "from the table"
+        assert log.scan().read_all()["c"].to_pylist() == expected, "from the table"
 
 
 def test_nan_is_refused_rather_than_silently_nulled(tmp_path: Path) -> None:
@@ -243,3 +290,192 @@ def test_nan_is_refused_rather_than_silently_nulled(tmp_path: Path) -> None:
         log.append({"event_ts": 2, "c": None})
 
         assert log.scan().read_all()["c"].to_pylist() == [float("inf"), None]
+
+
+# -- binary and nested columns, for OpenTelemetry logs (#79) -------------------
+
+ANY_VALUE = pa.struct(
+    [
+        pa.field("s", pa.string()),
+        pa.field("b", pa.bool_()),
+        pa.field("i", pa.int64()),
+        pa.field("d", pa.float64()),
+        pa.field("x", pa.binary()),
+    ]
+)
+"""OTel's AnyValue, one nullable field per variant: Iceberg has no union."""
+
+OTEL = pa.schema(
+    [
+        pa.field("ts", pa.int64(), nullable=False),
+        pa.field("severity", pa.int32()),
+        pa.field("body", ANY_VALUE),
+        pa.field("attributes", pa.map_(pa.string(), ANY_VALUE)),
+        pa.field("trace_id", pa.binary(16)),
+        pa.field("span_id", pa.binary(8)),
+        pa.field("tags", pa.list_(pa.string())),
+    ]
+)
+
+
+def otel_row(n: int) -> dict[str, object]:
+    return {
+        "ts": n,
+        "severity": 9,
+        "body": {"s": f"message {n}"},
+        "attributes": {
+            "service.name": {"s": "api"},
+            "attempt": {"i": n},
+            "raw": {"x": bytes([n % 256, 0, 255])},
+            "ratio": {"d": n / 3},
+        },
+        "trace_id": n.to_bytes(16, "big"),
+        "span_id": n.to_bytes(8, "big"),
+        "tags": ["a", f"t{n}"],
+    }
+
+
+def _read_back(log: litelink.LogHandle) -> list[dict[str, object]]:
+    return log.scan().read_all().drop(["litelink_offset"]).to_pylist()
+
+
+def _expected(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return pa.Table.from_pylist(rows, schema=OTEL).to_pylist()
+
+
+def test_an_otel_log_round_trips_through_every_local_path(tmp_path: Path) -> None:
+    """The shape #79 exists for, through buffer, seal, compaction and reopen.
+
+    Exact at every step, and the nested parts stay queryable as what they are:
+    a struct field and a map entry in a predicate, a trace id compared as bytes.
+    """
+    config = LogConfig(target_seal_rows=10, compact_min_files=2)
+    rows = [otel_row(n) for n in range(1, 26)]
+
+    with litelink.new(
+        tmp_path, "s", schema=OTEL, sort_by=("ts",), config=config
+    ) as log:
+        log.extend(rows[:5])
+        assert _read_back(log) == _expected(rows[:5]), "from the buffer"
+
+        log.seal()
+        log.extend(rows[5:])
+        assert _read_back(log) == _expected(rows), "across table and buffer"
+
+        assert log.scan(where="body.s = 'message 7'").read_all().num_rows == 1
+        at = log.sql("SELECT attributes['attempt'].i AS n FROM log WHERE ts = 20")
+        assert at.read_all().to_pylist() == [{"n": 20}]
+        wanted = (3).to_bytes(16, "big").hex()
+        by_id = log.sql(f"SELECT ts FROM log WHERE trace_id = from_hex('{wanted}')")
+        assert by_id.read_all().to_pylist() == [{"ts": 3}]
+
+        log.seal()
+        log.maintain()
+        assert log.table_files() == 1, "compaction merged nested files"
+        assert _read_back(log) == _expected(rows), "after compaction"
+
+    with litelink.open(tmp_path, "s") as reopened:
+        assert _read_back(reopened) == _expected(rows), "after reopen"
+
+        reopened.add_column("resource", pa.map_(pa.string(), pa.string()))
+        reopened.append({**otel_row(26), "resource": {"host.name": "h1"}})
+        reopened.seal()
+        added = reopened.scan(where="ts = 26").read_all()["resource"].to_pylist()
+        assert added == [[("host.name", "h1")]]
+
+        loaded = pa.Table.from_pylist(
+            [{**otel_row(n), "resource": None} for n in (27, 28)],
+            schema=reopened.schema,
+        )
+        assert reopened.ingest(loaded) == (27, 28)
+        assert reopened.scan().read_all().num_rows == 28
+
+
+REFUSED_NESTED: list[tuple[str, dict[str, object], str]] = [
+    ("unknown struct key", {"body": {"s": "x", "zz": 1}}, "does not have: \\['zz'\\]"),
+    ("wrong leaf type", {"attributes": {"k": {"x": "text"}}}, r"\['k'\]\.x: 'text'"),
+    ("int64 overflow in a map", {"attributes": {"k": {"i": 2**64}}}, r"\['k'\]\.i"),
+    ("inexact int into double", {"body": {"d": 2**60}}, "exactly only up to"),
+    ("bool into int", {"body": {"i": True}}, "not a valid int64"),
+    ("duplicate map key", {"attributes": [("a", {}), ("a", {})]}, "duplicate map key"),
+    ("None map key", {"attributes": {None: {"s": "x"}}}, "cannot be None"),
+    ("not a pair", {"attributes": [("a",)]}, "not a \\(key, value\\) pair"),
+    ("str where a list goes", {"tags": "ab"}, "not a valid list"),
+    ("wrong list item", {"tags": ["a", 3]}, r"\[1\]: 3"),
+    ("scalar where a struct goes", {"body": "text"}, "not a valid struct"),
+    ("short trace id", {"trace_id": b"x" * 15}, "fixed_size_binary\\[16\\]"),
+    ("str where bytes go", {"span_id": "0102030405060708"}, "fixed_size_binary\\[8\\]"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "change", "match"),
+    REFUSED_NESTED,
+    ids=[label for label, _, _ in REFUSED_NESTED],
+)
+def test_a_nested_or_binary_value_the_column_cannot_hold_is_refused(
+    tmp_path: Path, label: str, change: dict[str, object], match: str
+) -> None:
+    """Refused at append, naming the column and the path inside it.
+
+    SQLite cannot see inside a nested value and Arrow would accept several of
+    these — it drops an unknown struct key without a word — so without the
+    check each is either a row acknowledged and silently changed, or one that
+    fails the seal for ever.
+
+    Falsify by making `Nested.encode` skip `self._encode`: every nested row
+    here is then accepted.
+    """
+    with litelink.new(tmp_path, "s", schema=OTEL, sort_by=("ts",)) as log:
+        with pytest.raises(ValueError, match=match):
+            log.extend([otel_row(1), {**otel_row(2), **change}])
+
+        assert log.end_offset() == 1, "the whole batch rolled back"
+
+        log.append(otel_row(3))
+        log.seal()
+        assert _read_back(log) == _expected([otel_row(3)])
+
+
+def test_nan_survives_inside_a_nested_column(tmp_path: Path) -> None:
+    """Unlike a top-level float, which SQLite would turn into NULL.
+
+    A nested value is stored as JSON text, which carries NaN exactly, so
+    refusing it here would decline something the log can hold.
+    """
+    schema = pa.schema(
+        [pa.field("ts", pa.int64()), pa.field("v", pa.list_(pa.float64()))]
+    )
+
+    with litelink.new(tmp_path, "s", schema=schema, sort_by=("ts",)) as log:
+        log.append({"ts": 1, "v": [float("nan"), 1.0]})
+        log.seal()
+
+        (value,) = log.scan().read_all()["v"].to_pylist()
+        assert math.isnan(value[0])
+        assert value[1] == 1.0
+
+
+def test_a_nested_value_counts_its_stored_size_toward_the_seal(tmp_path: Path) -> None:
+    """The seal cut is by bytes, so a nested value must count as what it is.
+
+    Measured from the stored JSON. Counting the Python object — a dict, a fixed
+    8 bytes — would let a buffer of large attribute maps grow far past
+    `target_seal_size` before the appender cut a file.
+
+    Falsify by measuring the raw row again in `_row_bytes`: nothing is queued.
+    """
+    schema = pa.schema(
+        [pa.field("ts", pa.int64()), pa.field("m", pa.map_(pa.string(), pa.string()))]
+    )
+    config = LogConfig(target_seal_size=4096)
+
+    with litelink.new(tmp_path, "s", schema=schema, config=config) as log:
+        log.extend([{"ts": i, "m": {"k": "x" * 1000}} for i in range(8)])
+
+        assert log.seal_due() is not None, "8 KB of maps crossed a 4 KB target"
+
+
+def test_sort_by_cannot_name_a_nested_column(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="sort_by cannot name"):
+        litelink.new(tmp_path, "s", schema=OTEL, sort_by=("attributes",))
