@@ -192,9 +192,8 @@ _REASONS: tuple[tuple[Callable[[pa.DataType], bool], str], ...] = (
     ),
     (
         pa.types.is_temporal,
-        "not supported, by policy: store time as an int64 epoch — nanoseconds "
-        "for OpenTelemetry — which is the same value in the table, in a JSON "
-        "frame and in a subtraction. See SPEC §13.8.",
+        "not supported. Represent time as a column type that is — an int64 "
+        "epoch is the usual choice, a string works too. See SPEC §13.8.",
     ),
     (
         lambda t: pa.types.is_nested(t) or pa.types.is_decimal(t),

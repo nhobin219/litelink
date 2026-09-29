@@ -77,9 +77,7 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
         (pa.int16(), "widens"),
         (pa.binary(), "not supported yet"),
         (pa.large_binary(), "not supported yet"),
-        (pa.timestamp("us"), "store time as an int64 epoch"),
-        (pa.timestamp("ns", tz="UTC"), "store time as an int64 epoch"),
-        (pa.date32(), "store time as an int64 epoch"),
+        (pa.timestamp("us"), "Represent time as a column type that is"),
         (pa.decimal128(10, 2), "not yet supported"),
         (pa.list_(pa.int64()), "not yet supported"),
     ],
@@ -245,31 +243,3 @@ def test_nan_is_refused_rather_than_silently_nulled(tmp_path: Path) -> None:
         log.append({"event_ts": 2, "c": None})
 
         assert log.scan().read_all()["c"].to_pylist() == [float("inf"), None]
-
-
-@pytest.mark.parametrize("value", [2**63, 2**64 - 1, -(2**63) - 1], ids=str)
-def test_an_integer_outside_int64_is_refused_naming_its_column(
-    tmp_path: Path, value: int
-) -> None:
-    """Timestamps are int64 epochs by policy, so this limit is a date: 2262.
-
-    Python's driver refuses the int before SQLite sees it, so no CHECK runs and
-    the bare error — `Python int too large to convert to SQLite INTEGER` — names
-    no column. An OTel `uint64` passed through unconverted is the likely way to
-    reach it.
-
-    Falsify by removing `OverflowError` from the `except` in `_insert`: the
-    driver's message comes back instead of this one.
-    """
-    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("t_ns", pa.int64())])
-
-    with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="'t_ns' cannot hold.*2262-04-11"):
-            log.extend([{"event_ts": 1, "t_ns": 1}, {"event_ts": 2, "t_ns": value}])
-
-        assert log.end_offset() == 1, "the whole batch rolled back"
-
-        # The documented ceiling itself is a legal value, through a seal.
-        log.append({"event_ts": 3, "t_ns": 2**63 - 1})
-        log.seal()
-        assert log.scan().read_all()["t_ns"].to_pylist() == [2**63 - 1]

@@ -203,10 +203,6 @@ An append does no work beyond its own insert. It does not measure the buffer, de
 to seal, or delete anything — it records where the next file should be cut, in the same
 transaction, and returns.
 
-**Time is an `int64` epoch column**, and the temporal Arrow types are refused (SPEC §13.8).
-Nanoseconds hold up to `2262-04-11T23:47:16.854775807Z`, the top of int64; a value past it is
-refused naming the column, rather than with the SQLite driver's bare `OverflowError`.
-
 ### Bulk loading: `ingest`
 
 ```python

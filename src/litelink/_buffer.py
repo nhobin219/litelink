@@ -82,11 +82,6 @@ _CONTAINS = frozenset.__contains__
 # to catch is a FINITE value that would silently become one.
 _INFINITE = (float("inf"), float("-inf"))
 
-# What SQLite stores an integer in, and so the ceiling of every integer column.
-# Timestamps are int64 epochs by policy (SPEC §13.8), which makes the top of this
-# the last instant a nanosecond column can hold: 2262-04-11T23:47:16.854775807Z.
-_INT64 = (-(2**63), 2**63 - 1)
-
 # IMMEDIATE, never a bare BEGIN. Every transaction here writes, and several read
 # first — an append reads the open `extent` row before inserting anything.
 # A deferred transaction that reads first takes a read snapshot, and if another
@@ -916,12 +911,7 @@ class Buffer:
 
                 try:
                     cursor.execute(sql, values)
-                # `OverflowError` is the driver refusing a Python int outside
-                # int64 before SQLite sees it, so no CHECK runs and the message
-                # names no column. For nanosecond timestamps that is a date
-                # past 2262 — or an unconverted `uint64` from OTel — and it
-                # deserves the column's name as much as a CHECK failure does.
-                except (sqlite3.IntegrityError, OverflowError) as exc:
+                except sqlite3.IntegrityError as exc:
                     # SQLite is the gate; this only turns its answer into one
                     # a caller can act on. `CHECK constraint failed: key` does
                     # not say what was wrong with the value, or which value.
@@ -1085,7 +1075,7 @@ class Buffer:
         row: Mapping[str, object],
         values: tuple[object, ...],
         shape: Shape,
-        exc: sqlite3.IntegrityError | OverflowError,
+        exc: sqlite3.IntegrityError,
     ) -> None:
         """Turn a constraint failure into the refusal a caller can act on.
 
@@ -1129,31 +1119,7 @@ class Buffer:
             if value is not None and not lo <= value <= hi and value not in _INFINITE:
                 self._reject_range(row, i, value)
 
-        if isinstance(exc, OverflowError):
-            self._reject_int64(values, shape)
-
         raise exc
-
-    @staticmethod
-    def _reject_int64(values: tuple[object, ...], shape: Shape) -> None:
-        """An integer outside int64, which no column here can store.
-
-        Every column type with a narrower integer range is caught above, by
-        its own bound; this is what is left — an int64 column given a value
-        past it. Named in epoch nanoseconds because that is how this surfaces
-        in practice: time is an int64 epoch by policy, and 2**63 nanoseconds
-        is a date, not an abstraction.
-        """
-        lo, hi = _INT64
-        for name, value in zip(shape.columns, values, strict=True):
-            if isinstance(value, int) and not lo <= value <= hi:
-                msg = (
-                    f"column {name!r} cannot hold {value!r}: integers are stored "
-                    f"as int64, whose range is [{lo}, {hi}]. As an epoch in "
-                    "nanoseconds, the last instant that holds is "
-                    "2262-04-11T23:47:16.854775807Z"
-                )
-                raise ValueError(msg)
 
     def _check_types(
         self, row: Mapping[str, object], values: tuple[object, ...]

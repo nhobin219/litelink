@@ -2394,23 +2394,11 @@ The consequence worth planning for is that local disk holds roughly
    websocket, where today the choice is to parse every field into a column or keep the frame as
    text. Variant is the third option: store the frame, address into it, let the engine prune.
 
-   **Timestamps are int64 epochs, by policy.** There is no timestamp type to wait for. An
-   integer epoch is the same value in the table, in a JSON frame and in a subtraction, with no
-   conversion between them and nothing truncated; OpenTelemetry's `Timestamp` and
-   `ObservedTimestamp` are `int64` nanosecond columns (#79). The temporal Arrow types are
-   refused, and the refusal says so.
-
-   The alternatives were measured before settling it. `timestamp[ns]` pyiceberg rejects
-   outright on v2. `timestamp[us]` round-trips exactly, but it would truncate OTel's
-   nanoseconds, and it bounds a column to years 1–9999, because pyiceberg builds manifest
-   statistics through Python's `datetime` — a value past that range was accepted by `append`
-   and then failed every seal. A time zone adds nothing an epoch does not already say.
-
-   **The ceiling is int64's.** The last instant an epoch-nanosecond column holds is
-   `2262-04-11T23:47:16.854775807Z` (`2**63 - 1` ns); microseconds reach year 294,247. An
-   integer past it is refused at `append`, naming the column. OTel carries these fields as
-   `uint64`, so an exporter converts; every real timestamp is below `2**63`. What `int64`
-   loses is the type — no engine displays the column as a time without a cast.
+   **Time has no column type, by design.** How to represent it is the application's choice —
+   an `int64` epoch is the usual one, a string works too — so the temporal Arrow types are
+   refused rather than pending (#79). A native type was measured and rejected: `timestamp[ns]`
+   is refused by pyiceberg on v2, and `timestamp[us]` truncates nanoseconds and fails every
+   seal past year 9999, because pyiceberg's manifest statistics go through Python's `datetime`.
 
    **Default column values**, which would make §9's add-a-column less lossy: an older file
    could read a declared default rather than null.

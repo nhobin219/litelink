@@ -10,17 +10,9 @@ minor version carries breaking changes.
 
 ### Changed
 
-- **Timestamps are int64 epochs, by policy.** The temporal Arrow types are
-  refused as a decision rather than pending work, and the refusal now says so
-  instead of "untested". OpenTelemetry's timestamps are `int64` nanosecond
-  columns, good until `2262-04-11T23:47:16.854775807Z` (SPEC §13.8, #79).
-
-### Fixed
-
-- **An integer outside int64 is refused naming its column.** It used to escape
-  as the SQLite driver's `OverflowError: Python int too large to convert to
-  SQLite INTEGER`, which said neither which column nor what the limit was —
-  and for a nanosecond timestamp that limit is a date in 2262.
+- The temporal Arrow types are refused as a decision rather than pending work:
+  how to represent time is the application's choice, and the refusal suggests
+  an `int64` epoch or a string (SPEC §13.8, #79).
 
 ## 0.4.1 — 2026-09-23
 
