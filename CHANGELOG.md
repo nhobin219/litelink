@@ -10,17 +10,14 @@ minor version carries breaking changes.
 
 ### Added
 
-- **`binary`, `fixed_size_binary(n)`, `struct`, `map` and `list` columns**, which
-  is what an OpenTelemetry log record needs: trace and span ids, the body and
-  attributes as `AnyValue` structs, array values (#79). Nested values are
-  checked against the declared type at `append` — an unknown struct field is
-  refused where Arrow would drop it — and read back exactly from the buffer,
-  the local table, the archive and any engine reading it directly. `binary`
-  is for small values such as ids — its bytes go through the buffer — and not
-  a substitute for §15's blob fields, which are what large payloads need.
-- **`litelink.validate_row(schema, row)`** checks a row without appending it,
-  raising exactly what `append` would — same exception, same message — with no
-  log required (#77).
+- **`LogHandle.column_statistics(tier=None)`**: every column's min, max, null
+  and value counts, with record and file counts, from what the Iceberg
+  manifests already hold — no data file opened, nothing new written (#85). The
+  default is the whole log, each row counted once across the local table, the
+  archive and the buffer; `"local"` or `"archive"` asks for one tier. Missing
+  information is None rather than a narrower bound: float bounds exclude NaN
+  and carry no NaN count, and strings, bytes and nested columns carry no
+  bounds.
 
 ### Changed
 

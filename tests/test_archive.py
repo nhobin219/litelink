@@ -4629,6 +4629,7 @@ def test_a_follower_delegates_the_whole_read_signature() -> None:
         "table_extent",
         "archived_through",
         "archive_files",
+        "column_statistics",
         # identity
         "root",
         "name",
@@ -5518,3 +5519,68 @@ def test_an_otel_log_reads_back_exactly_from_the_archive(
         " version_name_format = '%s%s.metadata.json')"
     ).fetchall()
     assert counted == [(40, 40)]
+
+
+def test_statistics_from_the_archive_cover_what_eviction_dropped(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Why the default is the whole log (#85): the local rollup is missing every
+    evicted range, the archive's lacks what is still buffered, and the whole
+    log is both, each row once.
+
+    The same archive answer from a snapshot handle, which is how a reader on
+    another box sees the log.
+    """
+    tail = 37
+    with archived_log(
+        tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal()
+        log.sync(push_unsettled=True)
+        log.maintain()
+        log.extend(
+            {"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(tail)
+        )
+
+        local = log.column_statistics(tier="local")
+        archive = log.column_statistics(tier="archive")
+        whole = log.column_statistics()
+
+        assert archive.record_count == ROWS
+        assert archive.file_count == log.archive_files()
+        assert (archive[OFFSET].min, archive[OFFSET].max) == (1, ROWS)
+        assert (archive["event_ts"].min, archive["event_ts"].max) == (0, ROWS - 1)
+
+        assert local.record_count is not None
+        assert 0 < local.record_count < ROWS, "the fixture must evict part of it"
+        assert local[OFFSET].min > 1, "the local rollup lacks the evicted range"
+
+        everything = log.with_archive().scan().read_all()
+        assert whole.record_count == everything.num_rows == ROWS + tail
+        assert (whole[OFFSET].min, whole[OFFSET].max) == (1, ROWS + tail)
+        assert (whole["event_ts"].min, whole["event_ts"].max) == (0, ROWS + tail - 1)
+        assert whole["key"].null_count == 0
+
+    with litelink.snapshot("s", archive=f"s3://{bucket}/prefix", s3=s3) as view:
+        assert view.column_statistics(tier="archive") == archive
+
+
+def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """With `wal_replication` a seal leaves its rows in the buffer, so the
+    buffer and the files both hold them; the whole log counts each once.
+    """
+    with archived_log(tmp_path, bucket, s3, wal_replication=True) as log:
+        log.extend(rows(500))
+        log.seal()
+
+        assert log._buffer.count_above(0) == 500, "the fixture must keep sealed rows"
+        assert log.buffered_rows() == 0
+        assert log.table_rows() == 500
+
+        whole = log.column_statistics()
+        assert whole.record_count == 500
+        assert whole["event_ts"].null_count == 0
+        assert (whole[OFFSET].min, whole[OFFSET].max) == (1, 500)

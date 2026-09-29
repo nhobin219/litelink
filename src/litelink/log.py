@@ -56,6 +56,7 @@ from litelink._maintenance import (
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config, restore_buffer
 from litelink._s3 import S3Options
+from litelink._statistics import Tier, TierStatistics, rollup, whole_log
 from litelink._table import (
     LogTable,
     archive_columns,
@@ -689,6 +690,63 @@ class LogHandle:
             # caller handling "the snapshot was swept" should not have to
             # handle it twice.
             raise self._swept(exc) from exc
+
+    def column_statistics(self, *, tier: Tier | None = None) -> TierStatistics:
+        """Per-column min, max and counts, opening no data file.
+
+        `tier=None`, the default, is the whole log: the local table, what the
+        archive holds beyond it, and the buffer, each row taken from one place
+        — see `_statistics.whole_log` for how, and for the one layout whose
+        counts it cannot separate. `"local"` and `"archive"` are one tier's
+        current snapshot alone, and neither includes the buffer.
+
+        Files are rolled up from their Iceberg manifests; buffered rows, which
+        no file holds yet, are counted directly. A consumer prunes on this, so
+        missing information is None rather than a narrower bound — see
+        `ColumnStatistics` for exactly when, including why a float's bounds say
+        nothing about NaN and why strings carry none.
+        """
+        if tier == "local":
+            self._table.reload()
+
+            return rollup("local", *self._table.live_files())
+
+        if tier == "archive":
+            archive = self._archive.table()
+            if archive is None:
+                msg = f"log {self.name!r} has no archive to take statistics from"
+                raise ValueError(msg)
+
+            try:
+                archive.reload()
+
+                return rollup("archive", *archive.live_files())
+            except FileNotFoundError as exc:
+                raise self._swept(exc) from exc
+
+        if tier is not None:
+            msg = f"tier must be 'local', 'archive' or None, not {tier!r}"
+            raise ValueError(msg)
+
+        # The order a read resolves its legs in, and for the same reason. The
+        # buffer FIRST: a seal lands its file and then deletes the rows, so a
+        # row it moves afterwards is in the local snapshot taken next. The
+        # archive LAST: eviction follows registration (I4), so an archive
+        # snapshot taken after the local one holds everything the local one
+        # has already given up.
+        buffered = self._buffer.rows_above(None)
+        self._table.reload()
+        local = self._table.live_files()
+        remote = None
+        archive = self._archive.table()
+        if archive is not None:
+            try:
+                archive.reload()
+                remote = archive.live_files()
+            except FileNotFoundError as exc:
+                raise self._swept(exc) from exc
+
+        return whole_log((OFFSET, *self.schema.names), local, remote, buffered)
 
     def coverage(self) -> Coverage:
         """What this reader can serve, and where it cannot.

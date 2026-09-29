@@ -111,7 +111,7 @@ Each row is what that class **adds** to the one above it. A test pins every set 
 | | |
 |---|---|
 | **`LogHandle`** — read | `scan` · `sql` |
-| **`LogHandle`** — observe | `end_offset` · `buffered_rows` · `table_rows` · `table_files` · `table_extent` · `archived_through` · `archive_files` · `coverage` |
+| **`LogHandle`** — observe | `end_offset` · `buffered_rows` · `table_rows` · `table_files` · `table_extent` · `archived_through` · `archive_files` · `coverage` · `column_statistics` |
 | **`LogHandle`** — identity | `root` · `name` · `config` · `schema` · `sort_by` · `archive` |
 | **`LogHandle`** — lifecycle | `close` · context manager |
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
@@ -601,6 +601,41 @@ so the number an operator alarms on cannot fail during an object-storage outage.
 `archived_through()` against `end_offset()` is
 the sync lag, which is the number to alarm on: eviction may never precede registration (I4),
 so a stalled sync stalls eviction, and the local file count grows until seals feel it.
+
+### Per-column statistics: `column_statistics`
+
+```python
+log.column_statistics(*, tier=None) -> TierStatistics   # tier: None | "local" | "archive"
+stats.record_count, stats.file_count
+stats["price"]    # ColumnStatistics(min, max, null_count, value_count, nan_count)
+```
+
+Every column's bounds and counts, computed when asked from what Iceberg already keeps in its
+manifests, so no data file is opened and nothing extra is written or synced.
+
+**`tier=None`, the default, is the whole log**: the local table, what the archive holds beyond
+it, and the buffer. The tiers overlap by design, so each row is counted from one place, as a
+read takes it. The one layout whose rows can't be separated is an archive file straddling the
+local boundary, which only `rewrite_archive` produces; its bounds still hold, and every count
+comes back `None` rather than doubled. Buffered rows are counted from the rows themselves.
+
+`"local"` and `"archive"` are one tier's current snapshot alone, without the buffer.
+Eviction drops files from the local table, so `"local"` lacks every evicted range. A
+`snapshot` handle answers all three.
+
+A consumer prunes on this, so missing information is `None`, never a narrower bound:
+
+- **`min`/`max`** are None when any file with rows in the column has no bound, unless its
+  null count proves the column is entirely NULL there. That covers a column added after some
+  files were written.
+- **They exclude NaN**, as Iceberg's bounds do, and a data file's `nan_count` is None because
+  nothing records it: files are registered from Parquet footers, which keep no NaN count. So
+  a float's bounds say nothing about NaN. Only `ingest` can put a NaN in a top-level float;
+  `append` refuses one.
+- **Only numeric and `bool` columns have bounds.** Iceberg truncates string and binary bounds
+  to 16 bytes, so they are not values. Nested columns keep no statistics of their own.
+- **Counts are sums, and None when any file lacks the count.** `value_count` includes NULLs,
+  as Iceberg defines it.
 
 ## Configuration
 
