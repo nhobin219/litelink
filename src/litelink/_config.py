@@ -51,7 +51,8 @@ class LogConfig:
     # exceed a byte-based memory limit, so it loses the race to the OOM killer
     # in exactly the situation the bound exists to prevent.
     #
-    # UNCOMPRESSED bytes, in memory — not the size of the file that results.
+    # UNCOMPRESSED bytes, in memory — the Arrow table's `nbytes`, not the size
+    # of the file that results.
     # Deliberate, and the one thing to understand before setting it. A file
     # holding 8 MiB of rows lands at 8 MiB on disk if they are incompressible
     # and under 1 MiB if they repeat, so on-disk size is an OUTPUT here, never
