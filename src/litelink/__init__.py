@@ -50,6 +50,7 @@ from litelink.log import (
     RemoteReadHandle,
     Row,
     WriteHandle,
+    validate_row,
 )
 
 try:
@@ -74,4 +75,5 @@ __all__ = [
     "preflight",
     "restore",
     "snapshot",
+    "validate_row",
 ]

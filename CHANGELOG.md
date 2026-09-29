@@ -8,6 +8,12 @@ This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 ## Unreleased
 
+### Added
+
+- **`litelink.validate_row(schema, row)`** checks a row without appending it,
+  raising exactly what `append` would — same exception, same message — with no
+  log required (#77).
+
 ### Changed
 
 - The temporal Arrow types are refused as a decision rather than pending work:

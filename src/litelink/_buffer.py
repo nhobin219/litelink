@@ -202,6 +202,33 @@ def _column_ddl(name: str, field: pa.Field) -> str:
     return " ".join(parts)
 
 
+def _buffer_ddl(shape: Shape) -> str:
+    """The `buffer` table: where I17 is enforced, for a log and for `RowProbe`.
+
+    One function because it is one set of rules. `validate_row` promises the
+    answer `append` would give, and that holds by construction only while
+    both tables come from here.
+    """
+    columns = ",\n  ".join(
+        _column_ddl(name, shape.schema.field(name)) for name in shape.columns
+    )
+    # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
+    # at every seal, and a rowid alias would reissue offsets already
+    # committed to Iceberg once the table empties, silently corrupting every
+    # tier boundary in §7 (I9, §2).
+    # STRICT is what makes `ANY` mean "store this value exactly as
+    # given" rather than "no declared affinity". It is not itself the
+    # gate — a STRICT column of a declared type CONVERTS a wrong value
+    # rather than refusing it — so every column is `ANY` and carries its
+    # own CHECK. See `_column_ddl`, which is where I17 actually lives.
+    return f"""
+        CREATE TABLE IF NOT EXISTS buffer (
+          "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,
+          {columns}
+        ) STRICT
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Shape:
     """The declared schema, and everything the write path derives from it.
@@ -541,25 +568,7 @@ class Buffer:
         # `_fallback`, not `shape()`: this runs before the `meta` table it
         # would read exists, and the schema handed to the constructor is the
         # right source anyway — this call is what brings the table into being.
-        shape = self._fallback
-        columns = ",\n  ".join(
-            _column_ddl(name, shape.schema.field(name)) for name in shape.columns
-        )
-        # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
-        # at every seal, and a rowid alias would reissue offsets already
-        # committed to Iceberg once the table empties, silently corrupting every
-        # tier boundary in §7 (I9, §2).
-        # STRICT is what makes `ANY` mean "store this value exactly as
-        # given" rather than "no declared affinity". It is not itself the
-        # gate — a STRICT column of a declared type CONVERTS a wrong value
-        # rather than refusing it — so every column is `ANY` and carries its
-        # own CHECK. See `_column_ddl`, which is where I17 actually lives.
-        self._con.execute(f"""
-            CREATE TABLE IF NOT EXISTS buffer (
-              "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,
-              {columns}
-            ) STRICT
-        """)
+        self._con.execute(_buffer_ddl(self._fallback))
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS sealing (
               start_offset INTEGER, end_offset INTEGER, rel_path TEXT
@@ -793,7 +802,8 @@ class Buffer:
 
         return int(row[0])
 
-    def _row_bytes(self, row: Mapping[str, object], columns: tuple[str, ...]) -> int:
+    @staticmethod
+    def _row_bytes(row: Mapping[str, object], columns: tuple[str, ...]) -> int:
         """Approximate bytes for one row, and refuse what SQLite cannot store.
 
         `columns` is passed rather than read, because this runs once per row.
@@ -907,7 +917,7 @@ class Buffer:
                 # `None in values` is one C-level pass, against a set test
                 # that hashes every key in the row.
                 if (len(row) != width or None in values) and not declared(row):
-                    self._reject_unknown(row)
+                    self._reject_unknown(row, shape)
 
                 try:
                     cursor.execute(sql, values)
@@ -919,7 +929,7 @@ class Buffer:
                     # Reached only on the way to raising, so it costs nothing
                     # in the ordinary case — and the `try` itself is free,
                     # CPython having zero-cost exceptions since 3.11.
-                    self._explain(row, values, shape, exc)
+                    Buffer._explain(row, values, shape, exc)
 
                 # lastrowid is the assigned offset, available inside the open
                 # transaction and before the row is visible to anyone else.
@@ -1004,7 +1014,8 @@ class Buffer:
             ),
         )
 
-    def _reject_unknown(self, row: Mapping[str, object]) -> None:
+    @staticmethod
+    def _reject_unknown(row: Mapping[str, object], shape: Shape) -> None:
         """A row naming a column this log does not have (I17).
 
         Off the hot path: `_insert` calls this only once the subset test has
@@ -1022,7 +1033,6 @@ class Buffer:
         raises on it for ever while appends keep working — measured. Refusing
         here is what keeps a rejectable row from wedging the log.
         """
-        shape = self.shape()
         unknown = sorted(set(row) - shape.known)
         msg = (
             f"row names columns this log does not have: {unknown}. "
@@ -1030,8 +1040,9 @@ class Buffer:
         )
         raise ValueError(msg)
 
+    @staticmethod
     def _reject_missing(
-        self, row: Mapping[str, object], values: tuple[object, ...]
+        row: Mapping[str, object], values: tuple[object, ...], shape: Shape
     ) -> None:
         """A row leaving a non-nullable column NULL (I17).
 
@@ -1052,7 +1063,6 @@ class Buffer:
         key is usually a caller that forgot, an explicit None is usually a
         caller that meant it and needs the column declared nullable instead.
         """
-        shape = self.shape()
         columns = shape.columns
         offending = sorted(columns[i] for i in shape.required if values[i] is None)
         absent = [c for c in offending if c not in row]
@@ -1070,8 +1080,8 @@ class Buffer:
         )
         raise ValueError(msg)
 
+    @staticmethod
     def _explain(
-        self,
         row: Mapping[str, object],
         values: tuple[object, ...],
         shape: Shape,
@@ -1089,9 +1099,9 @@ class Buffer:
         diagnosis is worse than a terse one.
         """
         if any(values[i] is None for i in shape.required):
-            self._reject_missing(row, values)
+            Buffer._reject_missing(row, values, shape)
 
-        self._check_types(row, values)
+        Buffer._check_types(row, values, shape)
 
         for i, limit in shape.exact_ints:
             value = values[i]
@@ -1117,12 +1127,13 @@ class Buffer:
         for i, lo, hi in shape.ranged:
             value = cast("float | None", values[i])
             if value is not None and not lo <= value <= hi and value not in _INFINITE:
-                self._reject_range(row, i, value)
+                Buffer._reject_range(row, i, value, shape)
 
         raise exc
 
+    @staticmethod
     def _check_types(
-        self, row: Mapping[str, object], values: tuple[object, ...]
+        row: Mapping[str, object], values: tuple[object, ...], shape: Shape
     ) -> None:
         """Decide a row the fast type gate could not pass (I17).
 
@@ -1141,7 +1152,6 @@ class Buffer:
         what is read back is not what was appended and no error is raised
         anywhere.
         """
-        shape = self.shape()
         columns, accepts = shape.columns, shape.accepts
         bad = [
             (columns[i], value)
@@ -1162,8 +1172,9 @@ class Buffer:
         )
         raise ValueError(msg)
 
+    @staticmethod
     def _reject_range(
-        self, row: Mapping[str, object], index: int, value: object
+        row: Mapping[str, object], index: int, value: object, shape: Shape
     ) -> None:
         """A value of the right type whose MAGNITUDE the column cannot hold.
 
@@ -1176,7 +1187,6 @@ class Buffer:
         exactly, so passing one is a statement rather than an overflow. What is
         refused is a FINITE value that would silently become infinite.
         """
-        shape = self.shape()
         name = shape.columns[index]
         msg = (
             f"column {name!r} cannot hold {value!r}: it is declared "
@@ -2711,3 +2721,55 @@ class Buffer:
         for extra in (self._reader, self._sealer):
             if extra is not self._con:
                 extra.close()
+
+
+class RowProbe:
+    """The buffer's acceptance rules, with no log behind them (#77).
+
+    A private in-memory `buffer` table built by `_buffer_ddl`, so its CHECKs
+    are the log's own rather than a Python restatement of them, and a check
+    that inserts and rolls back. Everything SQLite cannot be asked is asked in
+    the same order `_insert` asks it, through the same helpers — so the answer
+    and the message are what `append` would give.
+
+    That order is repeated rather than shared: `_insert`'s loop is inlined for
+    throughput, and routing it through a helper cost 19 points against raw
+    SQLite. `test_validate_row_answers_exactly_as_append_does` is what holds
+    the two together.
+    """
+
+    def __init__(self, schema: pa.Schema) -> None:
+        self._shape = Shape.of(schema)
+        # Nothing touches disk, so nothing here needs `synchronous` or WAL.
+        # One connection shared across threads, serialised by the lock below:
+        # a probe is cached per schema and reached from whichever thread asks.
+        self._con = sqlite3.connect(
+            ":memory:", isolation_level=None, check_same_thread=False
+        )
+        self._con.execute(_buffer_ddl(self._shape))
+        names = ", ".join(f'"{c}"' for c in self._shape.columns)
+        placeholders = ", ".join("?" * len(self._shape.columns))
+        self._sql = f"INSERT INTO buffer ({names}) VALUES ({placeholders})"
+        self._lock = threading.Lock()
+
+    def check(self, row: Mapping[str, object]) -> None:
+        """Raise what `append([row])` would raise, or return if it would pass."""
+        shape = self._shape
+        Buffer._reject_offset(row)
+        values = tuple(row.get(c) for c in shape.columns)
+        if (
+            len(row) != len(shape.columns) or None in values
+        ) and not shape.known.issuperset(row):
+            Buffer._reject_unknown(row, shape)
+
+        with self._lock:
+            self._con.execute(_BEGIN)
+            try:
+                try:
+                    self._con.execute(self._sql, values)
+                except sqlite3.IntegrityError as exc:
+                    Buffer._explain(row, values, shape, exc)
+
+                Buffer._row_bytes(row, shape.columns)
+            finally:
+                self._con.execute("ROLLBACK")
