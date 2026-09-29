@@ -712,9 +712,9 @@ declarations correct and the files not.
 ### LogConfig
 
 ```python
-target_seal_size      int             = 8 MiB    uncompressed bytes per SEAL
+target_seal_size      int             = 8 MiB    uncompressed (Arrow) bytes per SEAL
 target_seal_rows      int | None      = None     the other ceiling; whichever is hit FIRST
-target_compact_size   int | None      = None     bytes per FILE (None = 8x the seal)
+target_compact_size   int | None      = None     uncompressed (Arrow) bytes per FILE (None = 8x the seal)
 target_compact_rows   int | None      = None     rows per compacted file (None = 8x)
 local_retention       timedelta|None  = None     local window by TIME (None keeps everything)
 local_rows            int | None      = None     local window by ROWS — a floor, not a ceiling

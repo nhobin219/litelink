@@ -1135,10 +1135,13 @@ works because sealed files already cover contiguous, non-overlapping ranges: pic
 files that together hold less than `target_compact_size`, and their combined range is itself
 contiguous.
 
-**Sizing is in uncompressed bytes, never in file size on disk.** `target_compact_size` bounds
-what a file HOLDS — the appender's own byte count for the rows that went into it — and that
-number is carried per file from the seal that measured it, added up across a merge, and dropped
-when the file is unlinked. It cannot be recovered from the file afterwards: on data compressing
+**Sizing is in uncompressed bytes, never in file size on disk.** The unit is the Arrow table's
+`nbytes` — what a reader pays to hold the rows in memory, since every read hands them back as
+Arrow. `target_compact_size` bounds what a file HOLDS in that unit: the appender's estimate
+for the rows that went into it, which models the Arrow layout and stays at or a little above
+`nbytes` (#84), or `nbytes` itself for a file `ingest` wrote. That number is carried per file
+from the seal that measured it, added up across a merge, and dropped when the file is
+unlinked. It cannot be recovered from the file afterwards: on data compressing
 8:1 a file holding a full target is an eighth of it on disk, so a rule reading sizes off disk
 merges eight already-full files into one holding eight times the memory the target allows —
 and, since `sync` refuses anything compaction may still rewrite, archives nothing at all in the
@@ -1713,10 +1716,10 @@ of them is chosen.
 target_seal_rows       max rows per SEAL                  (the other ceiling; the seal cuts at
                                                           whichever is reached FIRST. None =
                                                           no row limit)
-target_compact_size    uncompressed bytes per FILE        (what compaction converts sealed
+target_compact_size    Arrow bytes per FILE               (what compaction converts sealed
                                                           files INTO. None = 8x the seal)
 target_compact_rows    max rows per compacted file        (None = 8x target_seal_rows)
-target_seal_size       uncompressed bytes per SEAL        (size it for READ latency and for
+target_seal_size       Arrow bytes per SEAL               (size it for READ latency and for
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
                                                           whatever compression achieved)
