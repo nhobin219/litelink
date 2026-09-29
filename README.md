@@ -13,11 +13,11 @@
 
 `append()` returns once the row is durable, and a query a moment later sees it.
 
-litelink is an open-source **embedded storage engine**: what DuckDB is to queries, litelink is
-to the durable write path. It runs inside your process, with no server, daemon or catalog
-service, and the files it writes are the product. They're Iceberg v2 tables on local disk and
-in object storage: the Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg
-engine, reads, with no export step in between.
+litelink is an open-source **embedded storage engine**: what DuckDB is to query execution,
+litelink is to the durable write path. It runs inside your process, with no server, daemon or
+catalog service, and the files it writes are the product. They're Iceberg v2 tables on local
+disk and in object storage: the Parquet a row is sealed into is the Parquet DuckDB, or any
+other Iceberg engine, reads, with no export step in between.
 
 ```
 SQLite buffer          durable on commit. unsealed rows only.
