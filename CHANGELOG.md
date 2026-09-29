@@ -6,6 +6,19 @@ rather than restates it.
 
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
+## Unreleased
+
+### Fixed
+
+- **The seal-size estimate undercounted by up to 3×** for sparse, short-string
+  and numeric nested schemas, sealing files well past `target_seal_size` and
+  telling compaction they held less than they did (#84). It now models the
+  Arrow table a seal builds — a slot for every value, null or not, string and
+  list offsets, narrow widths, and nested values as Arrow holds them rather than
+  their JSON — and stays between 1.00× and 1.11× of Arrow's `nbytes` across
+  the issue's row shapes. The per-row work is about 5× cheaper, since only
+  string, binary and float columns are visited.
+
 ## 0.5.0 — 2026-09-29
 
 ### Changed — breaking

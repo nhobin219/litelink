@@ -24,7 +24,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
-from litelink._types import NON_FINITE, Nested, NestedValueError, column_type
+from litelink._types import (
+    NON_FINITE,
+    Nested,
+    NestedValueError,
+    column_type,
+    slot_bits,
+)
 
 # Where the log records its settings. It lives here because this object owns
 # `meta`, and `meta` is the one place the policy exists.
@@ -258,6 +264,7 @@ class Shape:
     ranged: tuple[tuple[int, float, float], ...]
     exact_ints: tuple[tuple[int, int], ...]
     nested: tuple[tuple[int, str, Nested], ...]
+    measure: Callable[[tuple[object, ...]], int]
 
     @property
     def table(self) -> pa.Schema:
@@ -321,6 +328,7 @@ class Shape:
                 for i in range(len(columns))
                 if (nested := column_type(schema.field(i).type).nested) is not None
             ),
+            measure=_measurer(schema),
         )
 
 
@@ -723,10 +731,10 @@ class Buffer:
     # table being appended to — and what makes it impossible for the count and
     # the rows to disagree after a crash.
     #
-    # Approximate on purpose. SQLite stores an integer in 1-8 bytes and
-    # `octet_length` reports its TEXT width, so neither side of this is exact.
-    # It is a policy trigger, not an accounting record; being within a few
-    # percent of the true size is what `target_seal_size` actually needs.
+    # Measured in the Arrow table's bytes, never below them and within 1.11x
+    # across #84's grid of row shapes — see `_measurer`. It is a policy
+    # trigger and compaction's sense of how full a file is, so an undercount
+    # is the harmful direction: it seals files past the target.
 
     def table_columns(self) -> tuple[str, ...]:
         """The buffer table's ACTUAL columns, asked of SQLite.
@@ -802,22 +810,29 @@ class Buffer:
             )
 
     def _measure_from(self, floor: int) -> int:
+        """The open group's bytes, recounted from the rows it holds.
+
+        Through the appender's own `measure`, not a SQL sum, so a reopened log
+        cannot disagree with the one that wrote it. Runs once per open and only
+        when no open group exists, so reading the rows costs nothing that
+        matters. A nested value is stored as JSON and measured as its decoded
+        value, the same shape `append` measured.
+        """
         shape = self.shape()
-        terms = ["8"]  # offset
-        for name in shape.columns:
-            terms.append(
-                f'coalesce(octet_length("{name}"), 0)'
-                if column_type(shape.schema.field(name).type).variable_length
-                else "8"
-            )
+        names = ", ".join(f'"{c}"' for c in shape.columns)
+        total = 0
+        for values in self._con.execute(
+            f'SELECT {names} FROM buffer WHERE "litelink_offset" >= ?', (floor,)
+        ):
+            total += shape.measure(values)
+            bits = 0
+            for i, _, codec in shape.nested:
+                if values[i] is not None:
+                    bits += codec.variable_bits(codec.decode(values[i]))
 
-        row = self._con.execute(
-            f"SELECT coalesce(sum({' + '.join(terms)}), 0) FROM buffer"
-            ' WHERE "litelink_offset" >= ?',
-            (floor,),
-        ).fetchone()
+            total += -(-bits // 8)
 
-        return int(row[0])
+        return total
 
     # -- write ------------------------------------------------------------
 
@@ -859,7 +874,7 @@ class Buffer:
             # A row cap of None becomes one nothing reaches, which keeps the
             # inner test a comparison rather than a branch on None.
             target_rows = config.target_seal_rows or _NO_ROW_LIMIT
-            row_bytes = _row_bytes
+            measure = shape.measure
             columns = shape.columns
             nested = shape.nested
             # Bound out here like `row_bytes` above, for the same reason: this
@@ -899,8 +914,9 @@ class Buffer:
                 if (len(row) != width or None in values) and not declared(row):
                     _reject_unknown(row, shape)
 
+                extra = 0
                 if nested:
-                    values = _encode_nested(values, nested)
+                    values, extra = _encode_nested(values, nested)
 
                 try:
                     cursor.execute(sql, values)
@@ -922,7 +938,7 @@ class Buffer:
                 if group.start_offset is None:
                     group.start_offset = offset
 
-                group.bytes += row_bytes(values, columns)
+                group.bytes += measure(values) + extra
                 # Whichever is reached FIRST. Both are ceilings on one file —
                 # bytes bound memory, rows bound the read latency §7 sizes for
                 # — so the tighter one wins, which is the opposite of how
@@ -2522,50 +2538,79 @@ class Buffer:
                 extra.close()
 
 
-def _row_bytes(values: tuple[object, ...], columns: tuple[str, ...]) -> int:
-    """Approximate bytes for one row, and refuse what SQLite cannot store.
+def _measurer(schema: pa.Schema) -> Callable[[tuple[object, ...]], int]:
+    """One row's size in the Arrow table a seal builds, compiled per schema (#84).
 
-    `columns` is passed rather than read, because this runs once per row.
-    Reading it here would mean a keyed `meta` read and a lock acquisition
-    for every appended row — which is exactly what happened when this took
-    it from a property, and it made the test suite eight times slower.
+    That is the currency `target_seal_size` and every `extent.bytes` are
+    stated in, and compaction sizes merges by it, so it must not undercount.
+    It used to count 8 for any non-string value and 0 for a null, which is
+    right only for wide 64-bit rows: a sparse schema — where Arrow still gives
+    each null its slot — measured a third of its real size, so seals came out
+    three times the target.
 
-    The NaN check lives here because this loop already visits every value,
-    so it costs a comparison rather than a pass. SQLite has no NaN — it
-    stores one as NULL, verified — so a float column would take a NaN and
-    return a null, silently, with no error anywhere. That is the same
-    failure `_types` refuses whole types for, one level down: the library
-    declines what it cannot carry faithfully rather than changing it.
+    Most of it depends only on the schema, so it is computed here once: every
+    column's slot and validity bit, `slot_bits`, whether or not the value is
+    null. Per row, only a string's UTF-8 length and a blob's length are added —
+    fewer columns visited than before, not more. A nested value's variable
+    part is measured where it is encoded, see `_encode_nested`.
+
+    The NaN test rides here because this runs for every row after the insert:
+    a NaN is stored by SQLite as NULL, so no CHECK sees it in a nullable
+    column, and only float columns are visited for it.
     """
-    total = 8
-    for name, value in zip(columns, values, strict=True):
-        if isinstance(value, bytes | bytearray | memoryview):
-            total += len(value)
-        elif isinstance(value, str):
-            total += len(value.encode())
-        elif value is not None:
-            # `!=` on itself is the NaN test that needs no import and does
-            # not trip over ints, bools or Decimals. Only NaN is left to catch
-            # here: the CHECK refuses ±inf, and a NaN in a non-nullable column
-            # fails NOT NULL first and reaches `_explain`.
-            if isinstance(value, float) and value != value:
-                _reject_non_finite(name, value)
+    fixed_bits = 64 + sum(slot_bits(field.type) for field in schema)
+    fixed = -(-fixed_bits // 8)
+    names = schema.names
+    text = tuple(
+        i
+        for i, field in enumerate(schema)
+        if pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
+    )
+    blobs = tuple(i for i, field in enumerate(schema) if pa.types.is_binary(field.type))
+    floats = tuple(
+        (i, names[i])
+        for i, field in enumerate(schema)
+        if pa.types.is_floating(field.type)
+    )
 
-            total += 8
+    def measure(values: tuple[object, ...]) -> int:
+        total = fixed
+        for i in text:
+            value = values[i]
+            if value is not None:
+                total += len(value.encode())  # ty: ignore[unresolved-attribute]
 
-    return total
+        for i in blobs:
+            value = values[i]
+            if value is not None:
+                total += len(value)  # ty: ignore[invalid-argument-type]
+
+        for i, name in floats:
+            value = values[i]
+            # `!=` on itself is the NaN test, false for None and for an int.
+            if value != value:
+                _reject_non_finite(name, value)  # ty: ignore[invalid-argument-type]
+
+        return total
+
+    return measure
 
 
 def _encode_nested(
     values: tuple[object, ...], nested: tuple[tuple[int, str, Nested], ...]
-) -> tuple[object, ...]:
+) -> tuple[tuple[object, ...], int]:
     """Check each nested value against its declared type, and store its JSON.
 
     Here rather than in a CHECK because SQLite cannot see inside one; see
     `Nested`. None passes through untouched, so `NOT NULL` and
     `_reject_missing` answer for a nested column exactly as for any other.
+
+    Also returns the nested values' variable Arrow bytes, measured on the
+    values rather than the JSON they become; the fixed slots are already in
+    the schema's `measure`.
     """
     stored = list(values)
+    bits = 0
     for i, name, codec in nested:
         value = stored[i]
         if value is not None:
@@ -2575,7 +2620,9 @@ def _encode_nested(
                 msg = f"column {name!r} cannot hold this value {exc}"
                 raise ValueError(msg) from None
 
-    return tuple(stored)
+            bits += codec.variable_bits(value)
+
+    return tuple(stored), -(-bits // 8)
 
 
 def _reject_unknown(row: Mapping[str, object], shape: Shape) -> None:
@@ -2816,7 +2863,7 @@ class RowProbe:
             _reject_unknown(row, shape)
 
         if shape.nested:
-            values = _encode_nested(values, shape.nested)
+            values, _ = _encode_nested(values, shape.nested)
 
         with self._lock:
             self._con.execute(_BEGIN)
@@ -2826,6 +2873,6 @@ class RowProbe:
                 except sqlite3.IntegrityError as exc:
                     _explain(row, values, shape, exc)
 
-                _row_bytes(values, shape.columns)
+                shape.measure(values)
             finally:
                 self._con.execute("ROLLBACK")

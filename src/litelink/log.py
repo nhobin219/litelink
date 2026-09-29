@@ -2955,12 +2955,9 @@ class WriteHandle(LocalReadHandle):
             # never its size on disk, which on data that compresses 8:1 would
             # have compaction merge eight already-full files into one.
             #
-            # Arrow's own accounting rather than the appender's sum. The two
-            # differ in the third digit and not in kind: Arrow adds four bytes
-            # per string for its offsets and a validity bit per value, and
-            # counts a narrow fixed-width column at its real width where the
-            # buffer's SQL counts eight. It is measured, O(1), and visible to a
-            # static checker, which `pyarrow.compute` is not — see `_verify`.
+            # Arrow's own accounting rather than the appender's estimate,
+            # which models the same layout and stays at or a little above it
+            # (#84). This one is measured and O(1), because the table is here.
             #
             # Recorded AFTER the commit: a crash between the two leaves the
             # size unknown, and unknown reads as full, which is the direction
