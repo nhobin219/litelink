@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
     import pyarrow as pa
     from pyiceberg.io import FileIO
+    from pyiceberg.manifest import DataFile as IcebergDataFile
+    from pyiceberg.schema import Schema
     from pyiceberg.table import Table
     from pyiceberg.table.snapshots import Snapshot
 
@@ -1084,6 +1086,28 @@ class LogTable:
                 )
 
         return None if not lows else (min(lows), max(highs))
+
+    def live_files(self) -> tuple[Schema, list[IcebergDataFile]]:
+        """The current snapshot's schema and live data files, with metrics.
+
+        Read together under the lock, so a column rollup's record count, file
+        count and every column come from one snapshot and cannot disagree.
+        """
+        with self._lock:
+            snapshot = self._table.current_snapshot()
+            entries = (
+                []
+                if snapshot is None
+                else [
+                    entry.data_file
+                    for manifest in snapshot.manifests(self._table.io)
+                    for entry in manifest.fetch_manifest_entry(
+                        self._table.io, discard_deleted=True
+                    )
+                ]
+            )
+
+            return self._table.schema(), entries
 
     def file_paths(self) -> set[str]:
         return {f.path for f in self.data_files()}

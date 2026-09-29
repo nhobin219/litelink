@@ -42,6 +42,7 @@ from importlib.metadata import PackageNotFoundError, version
 from litelink._assembly import new, open, restore, snapshot  # noqa: A004
 from litelink._preflight import Check, Report, preflight
 from litelink._s3 import S3Options
+from litelink._statistics import ColumnStatistics, Tier, TierStatistics
 from litelink.log import (
     Coverage,
     LocalReadHandle,
@@ -60,6 +61,7 @@ except PackageNotFoundError:  # a source tree that was never installed
 
 __all__ = [
     "Check",
+    "ColumnStatistics",
     "Coverage",
     "LocalReadHandle",
     "LogConfig",
@@ -68,6 +70,8 @@ __all__ = [
     "Report",
     "Row",
     "S3Options",
+    "Tier",
+    "TierStatistics",
     "WriteHandle",
     "__version__",
     "new",
