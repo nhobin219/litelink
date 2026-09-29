@@ -243,6 +243,25 @@ column and the path inside it. NaN because readers disagree about it (Iceberg's 
 statistics leave it out, so whether a query sees it depends on what shares its file), ±inf
 because JSON, the wire above, has none. Represent a missing value as None.
 
+An application that must keep NaN or ±inf can carry them beside the number. One way, not a
+rule — the representation is the application's to choose:
+
+```python
+schema = pa.schema([
+    pa.field("reading", pa.float64()),          # the finite values; prunable
+    pa.field("reading_special", pa.string()),   # "nan" | "inf" | "-inf", else None
+])
+
+log.append({"reading": 123.456, "reading_special": None})
+log.append({"reading": None, "reading_special": "inf"})
+```
+
+Two top-level columns rather than a struct, because fields inside a struct carry no file-level
+statistics and `reading` would stop pruning; where the float is already nested, as in OTel's
+`AnyValue`, a struct field loses nothing. Spelled as Python's `repr` spells them, so
+`float(reading_special)` reads one back. litelink does not enforce the pairing — nothing stops
+a row from setting both or neither — so that invariant is the application's.
+
 Nested types nest in each other. Anything else is refused at `new` with the reason — unsigned
 integers, time types, `large_binary`, `large_list` and unions among them. Iceberg has no union,
 so a variant value such as OTel's `AnyValue` is a struct with one nullable field per variant.
