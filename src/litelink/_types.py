@@ -28,7 +28,7 @@ import base64
 import functools
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pyarrow as pa
@@ -370,11 +370,21 @@ class Nested:
         self.type = type_
         self._encode = _encoder(type_, "")
         self._decode = _decoder(type_)
+        self._size = size_bits(type_)
         self.duckdb = _duckdb(type_)
 
     def encode(self, value: object) -> str:
         """Check `value` against the type and return what the buffer stores."""
         return _JSON.encode(self._encode(value))
+
+    def variable_bits(self, value: object) -> int:
+        """The Arrow bits of a non-null value beyond the column's fixed slot.
+
+        Measured on the value itself, not its JSON: the JSON repeats field
+        names and spells a small integer in one character where Arrow holds
+        eight bytes, so its length undercounted a `list<int64>` threefold.
+        """
+        return 0 if self._size is None else self._size(value)
 
     def decode(self, text: str) -> object:
         """What the buffer stored, as the value `pa.array` builds the type from."""
@@ -739,3 +749,121 @@ def _duckdb(type_: pa.DataType) -> str:
         return f"{_duckdb(type_.value_type)}[]"
 
     return column_type(type_).duckdb
+
+
+# -- Arrow size ---------------------------------------------------------------
+#
+# What a value costs in the Arrow table a seal builds, which is the currency
+# `target_seal_size` and every `extent.bytes` are stated in (#84). In bits,
+# because a bool and a validity bit are one each. Never below Arrow's own
+# `nbytes`, and close to it: a slot is counted whether or not the value is
+# null — Arrow allocates it either way — and a validity bit is counted for
+# every column, where Arrow allocates the bitmap only when a column holds a
+# null.
+
+
+def slot_bits(type_: pa.DataType) -> int:
+    """The bits one value of `type_` occupies before anything variable.
+
+    A struct's children are part of its slot: Arrow gives every child a slot
+    under every struct, null ones included. A list or map is only its offset;
+    its items are variable, see `size_bits`.
+    """
+    validity = 1
+    if pa.types.is_boolean(type_):
+        return 1 + validity
+
+    if pa.types.is_fixed_size_binary(type_):
+        return 8 * type_.byte_width + validity
+
+    if pa.types.is_integer(type_) or pa.types.is_floating(type_):
+        return type_.bit_width + validity
+
+    if pa.types.is_large_string(type_) or pa.types.is_large_binary(type_):
+        return 64 + validity
+
+    if pa.types.is_string(type_) or pa.types.is_binary(type_):
+        return 32 + validity
+
+    if pa.types.is_struct(type_):
+        return validity + sum(
+            slot_bits(type_.field(i).type) for i in range(type_.num_fields)
+        )
+
+    if pa.types.is_list(type_) or pa.types.is_map(type_):
+        return 32 + validity
+
+    msg = f"no Arrow size model for {type_}"
+    raise TypeError(msg)
+
+
+def size_bits(type_: pa.DataType) -> Callable[[Any], int] | None:
+    """The variable bits of a non-null value, or None if `type_` has none.
+
+    Built once per type, like `_encoder`. Takes a value as `append` does — a
+    map as a mapping or as pairs, bytes as bytes — which is also the shape
+    `Nested.decode` returns, so the recount on open measures the same way.
+    """
+    if pa.types.is_string(type_) or pa.types.is_large_string(type_):
+        return lambda value: 8 * len(value.encode())
+
+    if pa.types.is_binary(type_) or pa.types.is_large_binary(type_):
+        return lambda value: 8 * len(value)
+
+    if pa.types.is_struct(type_):
+        parts = [
+            (type_.field(i).name, sized)
+            for i in range(type_.num_fields)
+            if (sized := size_bits(type_.field(i).type)) is not None
+        ]
+        if not parts:
+            return None
+
+        def struct_bits(value: Mapping[str, Any]) -> int:
+            total = 0
+            for name, sized in parts:
+                item = value.get(name)
+                if item is not None:
+                    total += sized(item)
+
+            return total
+
+        return struct_bits
+
+    if pa.types.is_list(type_):
+        slot = slot_bits(type_.value_type)
+        sized_item = size_bits(type_.value_type)
+
+        def list_bits(value: Sequence[Any]) -> int:
+            total = slot * len(value)
+            if sized_item is not None:
+                for item in value:
+                    if item is not None:
+                        total += sized_item(item)
+
+            return total
+
+        return list_bits
+
+    if pa.types.is_map(type_):
+        # An entry is a struct of key and value: both slots and its own bit.
+        entry = slot_bits(type_.key_type) + slot_bits(type_.item_type) + 1
+        sized_key = size_bits(type_.key_type)
+        sized_value = size_bits(type_.item_type)
+
+        def map_bits(value: Any) -> int:
+            pairs = value.items() if isinstance(value, Mapping) else value
+            total = 0
+            for key, item in pairs:
+                total += entry
+                if sized_key is not None:
+                    total += sized_key(key)
+
+                if sized_value is not None and item is not None:
+                    total += sized_value(item)
+
+            return total
+
+        return map_bits
+
+    return None
