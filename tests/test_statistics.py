@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import random
 from typing import TYPE_CHECKING, Any
 
@@ -42,7 +41,7 @@ def _value(rng: random.Random, type_: pa.DataType) -> object:
         return rng.randint(-(2**31), 2**31 - 1)
 
     if pa.types.is_floating(type_):
-        return rng.choice([rng.uniform(-1e6, 1e6), float("inf"), float("-inf"), 0.0])
+        return rng.choice([rng.uniform(-1e6, 1e6), 0.0, -0.0])
 
     if pa.types.is_boolean(type_):
         return rng.random() < 0.5
@@ -51,11 +50,11 @@ def _value(rng: random.Random, type_: pa.DataType) -> object:
 
 
 def _random_log(root: Path, seed: int) -> litelink.WriteHandle:
-    """Several sealed files, then a bulk load carrying NaN, then a late column.
+    """Several sealed files, then a bulk load, then a late column.
 
     Every rule the rollup has is reached: a file where a column is all NULL
-    (the whole batch leaves `i32` empty), a float file whose bounds exclude a
-    NaN, and files that predate `late` entirely.
+    (the whole batch leaves `i32` empty), a file written by `ingest`, and files
+    that predate `late` entirely.
     """
     rng = random.Random(seed)
     config = LogConfig(target_seal_rows=rng.randint(3, 12))
@@ -79,7 +78,7 @@ def _random_log(root: Path, seed: int) -> litelink.WriteHandle:
         log.seal()
 
     loaded = [
-        {"k": key + 1, "f64": float("nan"), "f32": None},
+        {"k": key + 1, "f64": rng.uniform(-1e6, 1e6), "f32": None},
         {"k": key + 2, "f64": rng.uniform(-1e6, 1e6), "f32": 2.5},
     ]
     log.ingest(pa.Table.from_pylist(loaded, schema=SCHEMA))
@@ -96,9 +95,9 @@ def _random_log(root: Path, seed: int) -> litelink.WriteHandle:
 def test_the_rollup_agrees_with_the_data(tmp_path: Path, seed: int) -> None:
     """Equal to what reading the data gives, wherever it states a value.
 
-    `min`/`max` exclude NaN, as Iceberg's bounds do, and a stated count is
-    exact. None is the only permitted answer other than the truth — and a
-    column present in every file, with a bound in each, must not get it.
+    A stated bound or count is exact. None is the only permitted answer other
+    than the truth — and a column present in every file, with a bound in each,
+    must not get it.
     """
     with _random_log(tmp_path, seed) as log:
         assert log.buffered_rows() == 0
@@ -119,11 +118,7 @@ def test_the_rollup_agrees_with_the_data(tmp_path: Path, seed: int) -> None:
             if column.value_count is not None:
                 assert column.value_count == len(values), name
 
-            present = [
-                v
-                for v in values
-                if v is not None and not (isinstance(v, float) and math.isnan(v))
-            ]
+            present = [v for v in values if v is not None]
             if column.min is not None:
                 assert name in BOUNDED
                 assert (column.min, column.max) == (min(present), max(present)), name
@@ -141,7 +136,8 @@ def test_the_rollup_agrees_with_the_data(tmp_path: Path, seed: int) -> None:
         assert stats["s"].min is None, "string bounds are truncated, so none"
         assert stats["late"].null_count is None, "older files predate the column"
         assert stats["late"].min is None
-        assert stats["f64"].nan_count is None, "nothing records NaN counts"
+        assert stats["f64"].nan_count == 0, "no write path admits NaN (#87)"
+        assert stats["f32"].nan_count == 0
         assert stats["i32"].nan_count is None, "only floats have one"
 
         # The whole log: the same files plus rows no seal has written yet.
@@ -174,11 +170,7 @@ def _assert_agrees(stats: litelink.TierStatistics, data: pa.Table) -> None:
         if column.value_count is not None:
             assert column.value_count == len(values), name
 
-        present = [
-            v
-            for v in values
-            if v is not None and not (isinstance(v, float) and math.isnan(v))
-        ]
+        present = [v for v in values if v is not None]
         if column.min is not None:
             assert (column.min, column.max) == (min(present), max(present)), name
 

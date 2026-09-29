@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
-from litelink._types import Nested, NestedValueError, column_type
+from litelink._types import NON_FINITE, Nested, NestedValueError, column_type
 
 # Where the log records its settings. It lives here because this object owns
 # `meta`, and `meta` is the one place the policy exists.
@@ -78,9 +79,6 @@ _MAX_TAIL_CHUNKS = 32
 # per-column scan in C.
 _CONTAINS = frozenset.__contains__
 
-# An explicitly infinite value is a legal float32 — what the range check exists
-# to catch is a FINITE value that would silently become one.
-_INFINITE = (float("inf"), float("-inf"))
 
 # IMMEDIATE, never a bare BEGIN. Every transaction here writes, and several read
 # first — an append reads the open `extent` row before inserting anything.
@@ -165,13 +163,14 @@ def _column_ddl(name: str, field: pa.Field) -> str:
         # `abs(-(2**63))` overflows in SQLite, which has no positive
         # counterpart for the most-negative int64, and raised
         # `OperationalError` out of the CHECK instead of a refusal.
+        #
+        # Finite only (#87): `9e999` is how SQL spells infinity, so `< 9e999`
+        # refuses ±inf here, at the insert. NaN never reaches a CHECK — SQLite
+        # stores it as NULL — and `_row_bytes` and `_explain` refuse it instead.
         exact = kind.exact_int
-        real = f"typeof({q}) = 'real'"
-        if kind.bounds is not None:
-            # `9e999` is how SQL spells infinity. An explicitly infinite value
-            # is legal and stays legal — a float32 holds it exactly, so
-            # passing one is a statement, not an overflow.
-            real += f" AND (abs({q}) <= {kind.bounds[1]!r} OR abs({q}) = 9e999)"
+        limit = "9e999" if kind.bounds is None else f"{kind.bounds[1]!r}"
+        comparison = "<" if kind.bounds is None else "<="
+        real = f"typeof({q}) = 'real' AND abs({q}) {comparison} {limit}"
 
         test = (
             real
@@ -2546,14 +2545,11 @@ def _row_bytes(values: tuple[object, ...], columns: tuple[str, ...]) -> int:
             total += len(value.encode())
         elif value is not None:
             # `!=` on itself is the NaN test that needs no import and does
-            # not trip over ints, bools or Decimals.
+            # not trip over ints, bools or Decimals. Only NaN is left to catch
+            # here: the CHECK refuses ±inf, and a NaN in a non-nullable column
+            # fails NOT NULL first and reaches `_explain`.
             if isinstance(value, float) and value != value:
-                msg = (
-                    f"column {name!r}: SQLite stores NaN as NULL, so the value "
-                    "would come back null rather than NaN. Use None if that is "
-                    "what you mean."
-                )
-                raise ValueError(msg)
+                _reject_non_finite(name, value)
 
             total += 8
 
@@ -2665,6 +2661,13 @@ def _explain(
     explanation for a constraint this does not know about — a wrong
     diagnosis is worse than a terse one.
     """
+    # First, and by value rather than by column type: SQLite stores a NaN as
+    # NULL, so in a non-nullable column it fails NOT NULL and would otherwise
+    # surface as a bare `NOT NULL constraint failed` that names no value.
+    for name, value in zip(shape.columns, values, strict=True):
+        if isinstance(value, float) and not math.isfinite(value):
+            _reject_non_finite(name, value)
+
     if any(values[i] is None for i in shape.required):
         _reject_missing(row, values, shape)
 
@@ -2693,7 +2696,7 @@ def _explain(
 
     for i, lo, hi in shape.ranged:
         value = cast("float | None", values[i])
-        if value is not None and not lo <= value <= hi and value not in _INFINITE:
+        if value is not None and not lo <= value <= hi:
             _reject_range(row, i, value, shape)
 
     raise exc
@@ -2740,6 +2743,12 @@ def _check_types(
     raise ValueError(msg)
 
 
+def _reject_non_finite(name: str, value: float) -> None:
+    """NaN or ±inf, refused on every write path (#87); see `NON_FINITE`."""
+    msg = f"column {name!r} cannot hold {value!r}: {NON_FINITE}"
+    raise ValueError(msg)
+
+
 def _reject_range(
     row: Mapping[str, object], index: int, value: object, shape: Shape
 ) -> None:
@@ -2748,11 +2757,8 @@ def _reject_range(
     Off the hot path, like the other refusals. The two cases it covers fail
     differently and neither says anything at append: an int32 given 2**40
     is stored by SQLite unchanged and then makes every scan raise, while a
-    float32 given 1e300 reads back as `inf` with no error at all.
-
-    An explicit infinity is allowed through — a float32 represents `inf`
-    exactly, so passing one is a statement rather than an overflow. What is
-    refused is a FINITE value that would silently become infinite.
+    float32 given 1e300 reads back as `inf` with no error at all. An infinity
+    itself never reaches here; `_explain` refuses it first.
     """
     name = shape.columns[index]
     msg = (

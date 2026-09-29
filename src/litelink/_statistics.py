@@ -13,11 +13,10 @@ a stored rollup would be a second home for a fact the manifests already hold.
 
 What pyiceberg records for litelink's files, measured, decides most of it:
 
-- **No NaN counts, ever.** Files are registered with `add_files`, whose
-  metrics come from Parquet footers, and Parquet keeps no NaN count. NaN is
-  still excluded from the bounds — a file holding `[NaN, 1.0]` reports
-  `1.0..1.0` — so `nan_count` is None and a float's bounds say nothing about
-  NaN. Only `ingest` can put one in a top-level float; `append` refuses it.
+- **No NaN counts in the manifests.** Files are registered with `add_files`,
+  whose metrics come from Parquet footers, and Parquet keeps none. It does not
+  matter: every write path refuses NaN and ±inf (#87), so a float column's
+  `nan_count` is 0 by construction and its bounds are over every value.
 - **No usable bounds for strings or bytes.** They are truncated to 16, the
   string upper bound incremented past any real value (`zzz…{`), and a binary
   value of 0xff bytes loses its upper bound altogether. Bounds are reported for
@@ -66,12 +65,12 @@ class ColumnStatistics:
     `min`/`max` are the column's own Python type, and None when any file with
     rows in it has no bound — unless its null count proves the column is all
     NULL there — or when the type keeps no exact bounds (strings, bytes,
-    nested). They exclude NaN, which Iceberg's bounds never include.
+    nested).
 
     The counts are sums, and None when any file lacks the count: a column added
     after a file was written has none in that file. As Iceberg defines it,
-    `value_count` includes NULLs. `nan_count` is None for anything but a float,
-    and for floats in a data file, since nothing records it.
+    `value_count` includes NULLs. `nan_count` is 0 for a float — no write path
+    admits NaN (#87) — and None for anything else.
     """
 
     # `Any` rather than `object`: the type is the column's, so a caller must be
@@ -124,6 +123,8 @@ class _Column:
         self.unknown = not self.bounded
         self.nulls: int | None = 0
         self.values: int | None = 0
+        # 0 by construction, not read from the manifests, which never hold a
+        # NaN count: every write path refuses NaN (#87).
         self.nans: int | None = 0 if self.floating else None
 
     def add(self, data_file: DataFile) -> None:
@@ -134,10 +135,6 @@ class _Column:
         self.values = (
             None if self.values is None or values is None else self.values + values
         )
-        if self.floating:
-            nans = (data_file.nan_value_counts or {}).get(field_id)
-            self.nans = None if self.nans is None or nans is None else self.nans + nans
-
         if self.unknown or data_file.record_count == 0:
             return
 
@@ -145,9 +142,8 @@ class _Column:
         high = (data_file.upper_bounds or {}).get(field_id)
         if low is None or high is None:
             # Nothing to fold only if the counts PROVE there is nothing: every
-            # row NULL. A float whose only values are NaN has no bound and is
-            # not all NULL, and a column added after this file was written has
-            # no counts here at all — both leave the bounds unknown.
+            # row NULL. A column added after this file was written has no
+            # counts here at all, which leaves the bounds unknown.
             if nulls is None or nulls != data_file.record_count:
                 self.unknown = True
 
@@ -322,8 +318,7 @@ def _from_rows(rows: pa.Table) -> TierStatistics:
             max=high,
             null_count=rows.column(name).null_count,
             value_count=rows.num_rows,
-            # `append` refuses a top-level NaN — SQLite would store it as NULL —
-            # so a buffered float holds none, exactly.
+            # No write path admits NaN (#87).
             nan_count=0 if pa.types.is_floating(field.type) else None,
         )
 

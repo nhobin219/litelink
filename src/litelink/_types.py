@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import functools
 import json
+import math
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -77,7 +78,8 @@ class ColumnType(NamedTuple):
     The two failure modes differ and both are silent at append. An int32 given
     2**40 is stored by SQLite unchanged and then wedges EVERY scan
     (`Integer value ... not in range`). A float32 given 1e300 is worse — it
-    reads back as `inf`, with no error anywhere.
+    reads back as `inf`, with no error anywhere, and a log holds only finite
+    floats (#87).
 
     `int64` is deliberately absent. SQLite refuses an out-of-range integer
     itself, at the insert, inside the transaction and with no offset consumed;
@@ -295,10 +297,27 @@ def validate_schema(schema: pa.Schema) -> None:
             raise TypeError(msg) from None
 
 
+# -- non-finite floats --------------------------------------------------------
+
+NON_FINITE = "a log holds only finite floats, never NaN or ±inf"
+"""Why every write path refuses NaN and ±inf (#87), said the same way on each.
+
+NaN: SQLite stores it as NULL, and readers disagree about it — DuckDB ranks it
+above every float in a row it reads, while Iceberg's file bounds and Parquet's
+row-group statistics leave it out, so whether a stored NaN is read at all
+depends on what else shares its file. ±inf round-trips, but the layer above
+is JSON, which has no infinity: streamcast's socket delivers one as null while
+catch-up from the archive delivers `inf`. With both gone, every float column's
+statistics are prunable, and `column_statistics` reports `nan_count = 0`.
+"""
+
+
 # -- nested columns -----------------------------------------------------------
 
 _INT64 = (-(2**63), 2**63 - 1)
-_JSON = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False, allow_nan=True)
+# `allow_nan=False` is a backstop: `_encode_float` refuses a non-finite value
+# first, with the path to it, so this would only fire if that were bypassed.
+_JSON = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 _MAP_KEYS = (pa.types.is_string, pa.types.is_large_string, pa.types.is_integer)
 
 
@@ -338,7 +357,7 @@ class Nested:
 
     **Why JSON.** It is compact, SQLite and every engine can read it, and it
     round-trips through Python exactly: floats print shortest-repr, integers
-    are unbounded, NaN and infinities survive. Bytes cannot be JSON, so they
+    are unbounded. Bytes cannot be JSON, so they
     are base64; a map is a list of `[key, value]` pairs, so the declared order
     survives. The decode walk exists only for those two, and a subtree that
     holds neither is handed to Arrow as `json.loads` returns it.
@@ -449,11 +468,10 @@ def _encode_float(
 ) -> Callable[[object], object]:
     def encode(value: object) -> object:
         if isinstance(value, float):
-            # NaN and the infinities are legal here, unlike a top-level float
-            # column: JSON text carries them exactly, where SQLite stores a
-            # NaN as NULL. What is refused is a FINITE value that the declared
-            # width would turn into an infinity.
-            if limit is not None and abs(value) > limit and abs(value) != float("inf"):
+            if not math.isfinite(value):
+                raise NestedValueError(f"{value!r} is not finite; {NON_FINITE}")
+
+            if limit is not None and abs(value) > limit:
                 msg = f"{value!r} overflows {name}"
                 raise NestedValueError(msg)
 
