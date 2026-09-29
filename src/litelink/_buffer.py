@@ -202,6 +202,33 @@ def _column_ddl(name: str, field: pa.Field) -> str:
     return " ".join(parts)
 
 
+def _buffer_ddl(shape: Shape) -> str:
+    """The `buffer` table: where I17 is enforced, for a log and for `RowProbe`.
+
+    One function because it is one set of rules. `validate_row` promises the
+    answer `append` would give, and that holds by construction only while
+    both tables come from here.
+    """
+    columns = ",\n  ".join(
+        _column_ddl(name, shape.schema.field(name)) for name in shape.columns
+    )
+    # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
+    # at every seal, and a rowid alias would reissue offsets already
+    # committed to Iceberg once the table empties, silently corrupting every
+    # tier boundary in §7 (I9, §2).
+    # STRICT is what makes `ANY` mean "store this value exactly as
+    # given" rather than "no declared affinity". It is not itself the
+    # gate — a STRICT column of a declared type CONVERTS a wrong value
+    # rather than refusing it — so every column is `ANY` and carries its
+    # own CHECK. See `_column_ddl`, which is where I17 actually lives.
+    return f"""
+        CREATE TABLE IF NOT EXISTS buffer (
+          "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,
+          {columns}
+        ) STRICT
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Shape:
     """The declared schema, and everything the write path derives from it.
@@ -541,25 +568,7 @@ class Buffer:
         # `_fallback`, not `shape()`: this runs before the `meta` table it
         # would read exists, and the schema handed to the constructor is the
         # right source anyway — this call is what brings the table into being.
-        shape = self._fallback
-        columns = ",\n  ".join(
-            _column_ddl(name, shape.schema.field(name)) for name in shape.columns
-        )
-        # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
-        # at every seal, and a rowid alias would reissue offsets already
-        # committed to Iceberg once the table empties, silently corrupting every
-        # tier boundary in §7 (I9, §2).
-        # STRICT is what makes `ANY` mean "store this value exactly as
-        # given" rather than "no declared affinity". It is not itself the
-        # gate — a STRICT column of a declared type CONVERTS a wrong value
-        # rather than refusing it — so every column is `ANY` and carries its
-        # own CHECK. See `_column_ddl`, which is where I17 actually lives.
-        self._con.execute(f"""
-            CREATE TABLE IF NOT EXISTS buffer (
-              "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,
-              {columns}
-            ) STRICT
-        """)
+        self._con.execute(_buffer_ddl(self._fallback))
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS sealing (
               start_offset INTEGER, end_offset INTEGER, rel_path TEXT
@@ -793,43 +802,6 @@ class Buffer:
 
         return int(row[0])
 
-    def _row_bytes(self, row: Mapping[str, object], columns: tuple[str, ...]) -> int:
-        """Approximate bytes for one row, and refuse what SQLite cannot store.
-
-        `columns` is passed rather than read, because this runs once per row.
-        Reading it here would mean a keyed `meta` read and a lock acquisition
-        for every appended row — which is exactly what happened when this took
-        it from a property, and it made the test suite eight times slower.
-
-        The NaN check lives here because this loop already visits every value,
-        so it costs a comparison rather than a pass. SQLite has no NaN — it
-        stores one as NULL, verified — so a float column would take a NaN and
-        return a null, silently, with no error anywhere. That is the same
-        failure `_types` refuses whole types for, one level down: the library
-        declines what it cannot carry faithfully rather than changing it.
-        """
-        total = 8
-        for name in columns:
-            value = row.get(name)
-            if isinstance(value, bytes | bytearray | memoryview):
-                total += len(value)
-            elif isinstance(value, str):
-                total += len(value.encode())
-            elif value is not None:
-                # `!=` on itself is the NaN test that needs no import and does
-                # not trip over ints, bools or Decimals.
-                if isinstance(value, float) and value != value:
-                    msg = (
-                        f"column {name!r}: SQLite stores NaN as NULL, so the value "
-                        "would come back null rather than NaN. Use None if that is "
-                        "what you mean."
-                    )
-                    raise ValueError(msg)
-
-                total += 8
-
-        return total
-
     # -- write ------------------------------------------------------------
 
     def append(self, rows: Iterable[Mapping[str, object]]) -> list[int]:
@@ -870,7 +842,7 @@ class Buffer:
             # A row cap of None becomes one nothing reaches, which keeps the
             # inner test a comparison rather than a branch on None.
             target_rows = config.target_seal_rows or _NO_ROW_LIMIT
-            row_bytes = self._row_bytes
+            row_bytes = _row_bytes
             columns = shape.columns
             # Bound out here like `row_bytes` above, for the same reason: this
             # runs per row.
@@ -886,7 +858,7 @@ class Buffer:
                 # the generic one. `litelink_offset` is in `_known`, so the
                 # subset test passes it through to here either way; the order
                 # is what decides which error the caller reads.
-                self._reject_offset(row)
+                _reject_offset(row)
 
                 values = tuple(row.get(c) for c in columns)
                 # The unknown-column test, skipped when the row proves it
@@ -907,7 +879,7 @@ class Buffer:
                 # `None in values` is one C-level pass, against a set test
                 # that hashes every key in the row.
                 if (len(row) != width or None in values) and not declared(row):
-                    self._reject_unknown(row)
+                    _reject_unknown(row, shape)
 
                 try:
                     cursor.execute(sql, values)
@@ -919,7 +891,7 @@ class Buffer:
                     # Reached only on the way to raising, so it costs nothing
                     # in the ordinary case — and the `try` itself is free,
                     # CPython having zero-cost exceptions since 3.11.
-                    self._explain(row, values, shape, exc)
+                    _explain(row, values, shape, exc)
 
                 # lastrowid is the assigned offset, available inside the open
                 # transaction and before the row is visible to anyone else.
@@ -1003,194 +975,6 @@ class Buffer:
                 group.group_id,
             ),
         )
-
-    def _reject_unknown(self, row: Mapping[str, object]) -> None:
-        """A row naming a column this log does not have (I17).
-
-        Off the hot path: `_insert` calls this only once the subset test has
-        already failed, so building the sorted difference costs nothing in the
-        ordinary case.
-
-        **Nothing below catches this.** The insert is built as
-        `tuple(row.get(c) for c in columns)` — it enumerates the SCHEMA's
-        columns, never the row's keys — so an unknown key is dropped before any
-        SQL exists and neither SQLite nor pyarrow ever sees it. `append`
-        returned an offset for a row it had silently truncated.
-
-        The checks that DO exist fire at the wrong time. A value pyarrow cannot
-        cast is stored, `append` succeeds, and then every scan and every seal
-        raises on it for ever while appends keep working — measured. Refusing
-        here is what keeps a rejectable row from wedging the log.
-        """
-        shape = self.shape()
-        unknown = sorted(set(row) - shape.known)
-        msg = (
-            f"row names columns this log does not have: {unknown}. "
-            f"Declared: {sorted(shape.columns)}"
-        )
-        raise ValueError(msg)
-
-    def _reject_missing(
-        self, row: Mapping[str, object], values: tuple[object, ...]
-    ) -> None:
-        """A row leaving a non-nullable column NULL (I17).
-
-        Off the hot path, like `_reject_unknown`: reached only on the way to
-        raising, so it can afford to name every offending column instead of
-        the first one found.
-
-        The sibling of the unknown-name case, and the same wedge from the
-        other side. That one is a key the log does not have; this one is a key
-        the log requires and did not get. Both end as a NULL nothing below
-        catches — `add_files` null-fills an optional field missing from a
-        file, and the scan cast is where it finally raises, long after the
-        offset was handed out.
-
-        Absent and explicitly-None are one refusal because they are one bug:
-        `row.get` cannot tell them apart and neither can the scan that fails
-        later. The message separates them because the fix differs — a missing
-        key is usually a caller that forgot, an explicit None is usually a
-        caller that meant it and needs the column declared nullable instead.
-        """
-        shape = self.shape()
-        columns = shape.columns
-        offending = sorted(columns[i] for i in shape.required if values[i] is None)
-        absent = [c for c in offending if c not in row]
-        supplied = [c for c in offending if c in row]
-        detail = ""
-        if absent:
-            detail += f" Absent from the row: {absent}."
-
-        if supplied:
-            detail += f" Supplied as None: {supplied}."
-
-        msg = (
-            f"row leaves non-nullable columns NULL: {offending}.{detail} "
-            "Declare the column nullable if None is a legal value for it."
-        )
-        raise ValueError(msg)
-
-    def _explain(
-        self,
-        row: Mapping[str, object],
-        values: tuple[object, ...],
-        shape: Shape,
-        exc: sqlite3.IntegrityError,
-    ) -> None:
-        """Turn a constraint failure into the refusal a caller can act on.
-
-        The checks below used to run per row, ahead of the insert, and cost
-        11% of the write path between them. They say exactly the same things;
-        they just say them after SQLite has already decided, which is why they
-        are now free. Each raises if it recognises the failure.
-
-        Re-raises the original if none of them does, rather than inventing an
-        explanation for a constraint this does not know about — a wrong
-        diagnosis is worse than a terse one.
-        """
-        if any(values[i] is None for i in shape.required):
-            self._reject_missing(row, values)
-
-        self._check_types(row, values)
-
-        for i, limit in shape.exact_ints:
-            value = values[i]
-            # `isinstance`, not `type(...) is`: an `IntEnum` member is an int
-            # and reaches the same CHECK, and missing it here means the caller
-            # gets a bare `CHECK constraint failed` instead of this message.
-            # `bool` needs no exclusion — True and False are always in range.
-            if isinstance(value, int) and not -limit <= value <= limit:
-                name = shape.columns[i]
-                # The bound is the range in which EVERY integer is exact, not
-                # a claim about this one: 2**60 converts exactly and is still
-                # refused, because a SQL CHECK cannot ask "is this particular
-                # integer representable". So the message does not say the
-                # conversion would be lossy — it says how to ask for it.
-                msg = (
-                    f"column {name!r} cannot hold the integer {value!r}: it is "
-                    f"declared {shape.schema.field(name).type}, which holds every "
-                    f"integer exactly only up to {limit}. Pass it as a float to "
-                    "store it as one"
-                )
-                raise ValueError(msg)
-
-        for i, lo, hi in shape.ranged:
-            value = cast("float | None", values[i])
-            if value is not None and not lo <= value <= hi and value not in _INFINITE:
-                self._reject_range(row, i, value)
-
-        raise exc
-
-    def _check_types(
-        self, row: Mapping[str, object], values: tuple[object, ...]
-    ) -> None:
-        """Decide a row the fast type gate could not pass (I17).
-
-        Reached only when some value is not the exact type its column carries,
-        which a correct row never is. So this can afford to ask the definitive
-        question per column and to name every column that fails.
-
-        **Nothing below catches these, and what does catches them too late.**
-        SQLite has no column types, only affinities, so it stores whatever it
-        is given. The declared schema is not consulted again until the value is
-        read back — and by then `append` has returned an offset. Two outcomes,
-        both measured: a value Arrow cannot parse (`"x"` into an int64) makes
-        EVERY scan raise, including scans of rows written before it, while
-        appends keep succeeding; and a value it can parse but not preserve
-        (`1.5` into an int64, `12345` into a string) is silently rewritten, so
-        what is read back is not what was appended and no error is raised
-        anywhere.
-        """
-        shape = self.shape()
-        columns, accepts = shape.columns, shape.accepts
-        bad = [
-            (columns[i], value)
-            for i, value in enumerate(values)
-            if value is not None and not accepts[i](value)
-        ]
-        if not bad:
-            return
-
-        detail = ", ".join(
-            f"{name}={value!r} ({type(value).__name__}, declared "
-            f"{shape.schema.field(name).type})"
-            for name, value in bad
-        )
-        msg = (
-            f"row has values of the wrong type: {detail}. SQLite would store "
-            "them as given and the mismatch would not surface until a read"
-        )
-        raise ValueError(msg)
-
-    def _reject_range(
-        self, row: Mapping[str, object], index: int, value: object
-    ) -> None:
-        """A value of the right type whose MAGNITUDE the column cannot hold.
-
-        Off the hot path, like the other refusals. The two cases it covers fail
-        differently and neither says anything at append: an int32 given 2**40
-        is stored by SQLite unchanged and then makes every scan raise, while a
-        float32 given 1e300 reads back as `inf` with no error at all.
-
-        An explicit infinity is allowed through — a float32 represents `inf`
-        exactly, so passing one is a statement rather than an overflow. What is
-        refused is a FINITE value that would silently become infinite.
-        """
-        shape = self.shape()
-        name = shape.columns[index]
-        msg = (
-            f"column {name!r} cannot hold {value!r}: it is declared "
-            f"{shape.schema.field(name).type}, whose range is "
-            f"{shape.ranged[[i for i, *_ in shape.ranged].index(index)][1:]}"
-        )
-        raise ValueError(msg)
-
-    @staticmethod
-    def _reject_offset(row: Mapping[str, object]) -> None:
-        """I11: `offset` is assigned by the library, never accepted."""
-        if "litelink_offset" in row:
-            msg = "`offset` is assigned by the library and cannot be supplied (I11)"
-            raise ValueError(msg)
 
     # -- read -------------------------------------------------------------
 
@@ -2711,3 +2495,281 @@ class Buffer:
         for extra in (self._reader, self._sealer):
             if extra is not self._con:
                 extra.close()
+
+
+def _row_bytes(row: Mapping[str, object], columns: tuple[str, ...]) -> int:
+    """Approximate bytes for one row, and refuse what SQLite cannot store.
+
+    `columns` is passed rather than read, because this runs once per row.
+    Reading it here would mean a keyed `meta` read and a lock acquisition
+    for every appended row — which is exactly what happened when this took
+    it from a property, and it made the test suite eight times slower.
+
+    The NaN check lives here because this loop already visits every value,
+    so it costs a comparison rather than a pass. SQLite has no NaN — it
+    stores one as NULL, verified — so a float column would take a NaN and
+    return a null, silently, with no error anywhere. That is the same
+    failure `_types` refuses whole types for, one level down: the library
+    declines what it cannot carry faithfully rather than changing it.
+    """
+    total = 8
+    for name in columns:
+        value = row.get(name)
+        if isinstance(value, bytes | bytearray | memoryview):
+            total += len(value)
+        elif isinstance(value, str):
+            total += len(value.encode())
+        elif value is not None:
+            # `!=` on itself is the NaN test that needs no import and does
+            # not trip over ints, bools or Decimals.
+            if isinstance(value, float) and value != value:
+                msg = (
+                    f"column {name!r}: SQLite stores NaN as NULL, so the value "
+                    "would come back null rather than NaN. Use None if that is "
+                    "what you mean."
+                )
+                raise ValueError(msg)
+
+            total += 8
+
+    return total
+
+
+def _reject_unknown(row: Mapping[str, object], shape: Shape) -> None:
+    """A row naming a column this log does not have (I17).
+
+    Off the hot path: `_insert` calls this only once the subset test has
+    already failed, so building the sorted difference costs nothing in the
+    ordinary case.
+
+    **Nothing below catches this.** The insert is built as
+    `tuple(row.get(c) for c in columns)` — it enumerates the SCHEMA's
+    columns, never the row's keys — so an unknown key is dropped before any
+    SQL exists and neither SQLite nor pyarrow ever sees it. `append`
+    returned an offset for a row it had silently truncated.
+
+    The checks that DO exist fire at the wrong time. A value pyarrow cannot
+    cast is stored, `append` succeeds, and then every scan and every seal
+    raises on it for ever while appends keep working — measured. Refusing
+    here is what keeps a rejectable row from wedging the log.
+    """
+    unknown = sorted(set(row) - shape.known)
+    msg = (
+        f"row names columns this log does not have: {unknown}. "
+        f"Declared: {sorted(shape.columns)}"
+    )
+    raise ValueError(msg)
+
+
+def _reject_missing(
+    row: Mapping[str, object], values: tuple[object, ...], shape: Shape
+) -> None:
+    """A row leaving a non-nullable column NULL (I17).
+
+    Off the hot path, like `_reject_unknown`: reached only on the way to
+    raising, so it can afford to name every offending column instead of
+    the first one found.
+
+    The sibling of the unknown-name case, and the same wedge from the
+    other side. That one is a key the log does not have; this one is a key
+    the log requires and did not get. Both end as a NULL nothing below
+    catches — `add_files` null-fills an optional field missing from a
+    file, and the scan cast is where it finally raises, long after the
+    offset was handed out.
+
+    Absent and explicitly-None are one refusal because they are one bug:
+    `row.get` cannot tell them apart and neither can the scan that fails
+    later. The message separates them because the fix differs — a missing
+    key is usually a caller that forgot, an explicit None is usually a
+    caller that meant it and needs the column declared nullable instead.
+    """
+    columns = shape.columns
+    offending = sorted(columns[i] for i in shape.required if values[i] is None)
+    absent = [c for c in offending if c not in row]
+    supplied = [c for c in offending if c in row]
+    detail = ""
+    if absent:
+        detail += f" Absent from the row: {absent}."
+
+    if supplied:
+        detail += f" Supplied as None: {supplied}."
+
+    msg = (
+        f"row leaves non-nullable columns NULL: {offending}.{detail} "
+        "Declare the column nullable if None is a legal value for it."
+    )
+    raise ValueError(msg)
+
+
+def _explain(
+    row: Mapping[str, object],
+    values: tuple[object, ...],
+    shape: Shape,
+    exc: sqlite3.IntegrityError,
+) -> None:
+    """Turn a constraint failure into the refusal a caller can act on.
+
+    The checks below used to run per row, ahead of the insert, and cost
+    11% of the write path between them. They say exactly the same things;
+    they just say them after SQLite has already decided, which is why they
+    are now free. Each raises if it recognises the failure.
+
+    Re-raises the original if none of them does, rather than inventing an
+    explanation for a constraint this does not know about — a wrong
+    diagnosis is worse than a terse one.
+    """
+    if any(values[i] is None for i in shape.required):
+        _reject_missing(row, values, shape)
+
+    _check_types(row, values, shape)
+
+    for i, limit in shape.exact_ints:
+        value = values[i]
+        # `isinstance`, not `type(...) is`: an `IntEnum` member is an int
+        # and reaches the same CHECK, and missing it here means the caller
+        # gets a bare `CHECK constraint failed` instead of this message.
+        # `bool` needs no exclusion — True and False are always in range.
+        if isinstance(value, int) and not -limit <= value <= limit:
+            name = shape.columns[i]
+            # The bound is the range in which EVERY integer is exact, not
+            # a claim about this one: 2**60 converts exactly and is still
+            # refused, because a SQL CHECK cannot ask "is this particular
+            # integer representable". So the message does not say the
+            # conversion would be lossy — it says how to ask for it.
+            msg = (
+                f"column {name!r} cannot hold the integer {value!r}: it is "
+                f"declared {shape.schema.field(name).type}, which holds every "
+                f"integer exactly only up to {limit}. Pass it as a float to "
+                "store it as one"
+            )
+            raise ValueError(msg)
+
+    for i, lo, hi in shape.ranged:
+        value = cast("float | None", values[i])
+        if value is not None and not lo <= value <= hi and value not in _INFINITE:
+            _reject_range(row, i, value, shape)
+
+    raise exc
+
+
+def _check_types(
+    row: Mapping[str, object], values: tuple[object, ...], shape: Shape
+) -> None:
+    """Decide a row the fast type gate could not pass (I17).
+
+    Reached only when some value is not the exact type its column carries,
+    which a correct row never is. So this can afford to ask the definitive
+    question per column and to name every column that fails.
+
+    **Nothing below catches these, and what does catches them too late.**
+    SQLite has no column types, only affinities, so it stores whatever it
+    is given. The declared schema is not consulted again until the value is
+    read back — and by then `append` has returned an offset. Two outcomes,
+    both measured: a value Arrow cannot parse (`"x"` into an int64) makes
+    EVERY scan raise, including scans of rows written before it, while
+    appends keep succeeding; and a value it can parse but not preserve
+    (`1.5` into an int64, `12345` into a string) is silently rewritten, so
+    what is read back is not what was appended and no error is raised
+    anywhere.
+    """
+    columns, accepts = shape.columns, shape.accepts
+    bad = [
+        (columns[i], value)
+        for i, value in enumerate(values)
+        if value is not None and not accepts[i](value)
+    ]
+    if not bad:
+        return
+
+    detail = ", ".join(
+        f"{name}={value!r} ({type(value).__name__}, declared "
+        f"{shape.schema.field(name).type})"
+        for name, value in bad
+    )
+    msg = (
+        f"row has values of the wrong type: {detail}. SQLite would store "
+        "them as given and the mismatch would not surface until a read"
+    )
+    raise ValueError(msg)
+
+
+def _reject_range(
+    row: Mapping[str, object], index: int, value: object, shape: Shape
+) -> None:
+    """A value of the right type whose MAGNITUDE the column cannot hold.
+
+    Off the hot path, like the other refusals. The two cases it covers fail
+    differently and neither says anything at append: an int32 given 2**40
+    is stored by SQLite unchanged and then makes every scan raise, while a
+    float32 given 1e300 reads back as `inf` with no error at all.
+
+    An explicit infinity is allowed through — a float32 represents `inf`
+    exactly, so passing one is a statement rather than an overflow. What is
+    refused is a FINITE value that would silently become infinite.
+    """
+    name = shape.columns[index]
+    msg = (
+        f"column {name!r} cannot hold {value!r}: it is declared "
+        f"{shape.schema.field(name).type}, whose range is "
+        f"{shape.ranged[[i for i, *_ in shape.ranged].index(index)][1:]}"
+    )
+    raise ValueError(msg)
+
+
+def _reject_offset(row: Mapping[str, object]) -> None:
+    """I11: `offset` is assigned by the library, never accepted."""
+    if "litelink_offset" in row:
+        msg = "`offset` is assigned by the library and cannot be supplied (I11)"
+        raise ValueError(msg)
+
+
+class RowProbe:
+    """The buffer's acceptance rules, with no log behind them (#77).
+
+    A private in-memory `buffer` table built by `_buffer_ddl`, so its CHECKs
+    are the log's own rather than a Python restatement of them, and a check
+    that inserts and rolls back. Everything SQLite cannot be asked is asked in
+    the same order `_insert` asks it, through the same helpers — so the answer
+    and the message are what `append` would give.
+
+    That order is repeated rather than shared: `_insert`'s loop is inlined for
+    throughput, and routing it through a helper cost 19 points against raw
+    SQLite. `test_validate_row_answers_exactly_as_append_does` is what holds
+    the two together.
+    """
+
+    def __init__(self, schema: pa.Schema) -> None:
+        self._shape = Shape.of(schema)
+        # Nothing touches disk, so nothing here needs `synchronous` or WAL.
+        # One connection shared across threads, serialised by the lock below:
+        # a probe is cached per schema and reached from whichever thread asks.
+        self._con = sqlite3.connect(
+            ":memory:", isolation_level=None, check_same_thread=False
+        )
+        self._con.execute(_buffer_ddl(self._shape))
+        names = ", ".join(f'"{c}"' for c in self._shape.columns)
+        placeholders = ", ".join("?" * len(self._shape.columns))
+        self._sql = f"INSERT INTO buffer ({names}) VALUES ({placeholders})"
+        self._lock = threading.Lock()
+
+    def check(self, row: Mapping[str, object]) -> None:
+        """Raise what `append([row])` would raise, or return if it would pass."""
+        shape = self._shape
+        _reject_offset(row)
+        values = tuple(row.get(c) for c in shape.columns)
+        if (
+            len(row) != len(shape.columns) or None in values
+        ) and not shape.known.issuperset(row):
+            _reject_unknown(row, shape)
+
+        with self._lock:
+            self._con.execute(_BEGIN)
+            try:
+                try:
+                    self._con.execute(self._sql, values)
+                except sqlite3.IntegrityError as exc:
+                    _explain(row, values, shape, exc)
+
+                _row_bytes(row, shape.columns)
+            finally:
+                self._con.execute("ROLLBACK")

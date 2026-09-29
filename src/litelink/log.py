@@ -17,6 +17,7 @@ raise.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import random
 import tempfile
@@ -39,6 +40,7 @@ from litelink._buffer import (
     SORT_KEY,
     START_OFFSET_KEY,
     Buffer,
+    RowProbe,
     Shape,
 )
 from litelink._claim import EVERYTHING, Claim, new_owner
@@ -4390,6 +4392,32 @@ def _intent(name: str, type_: pa.DataType) -> str:
             "type": pa.schema([pa.field(name, type_)]).serialize().to_pybytes().hex(),
         }
     )
+
+
+def validate_row(schema: pa.Schema, row: Row) -> None:
+    """Check a row against a schema without appending it (#77).
+
+    Raises exactly what `append(row)` on a log of this schema would raise —
+    the same exception and the same message, naming the offending column — and
+    returns None for a row it would accept. No log is needed and nothing is
+    written, so a caller that only sometimes has a log can hold every row to
+    one rule and attach a log later without a change in what is accepted.
+
+    `schema` is the caller's columns, as `new` takes them and `LogHandle.schema`
+    returns them. One `new` would refuse is refused here the same way, since
+    no row could ever be appended under it.
+    """
+    _probe(schema).check(row)
+
+
+@functools.lru_cache(maxsize=64)
+def _probe(schema: pa.Schema) -> RowProbe:
+    """One probe per schema, kept. Building one — `Shape.of` and a CREATE
+    TABLE — measured ~260 us, against ~4 us to check a row on one that exists,
+    and a caller validating per message asks the same schema every time."""
+    validate(schema, (), LogConfig(), None)
+
+    return RowProbe(schema)
 
 
 def application_schema(schema: pa.Schema) -> pa.Schema:

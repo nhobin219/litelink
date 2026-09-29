@@ -203,6 +203,21 @@ An append does no work beyond its own insert. It does not measure the buffer, de
 to seal, or delete anything — it records where the next file should be cut, in the same
 transaction, and returns.
 
+### Checking a row without appending it: `validate_row`
+
+```python
+litelink.validate_row(schema: pa.Schema, row: Row) -> None
+```
+
+Raises exactly what `append(row)` on a log of that schema would raise — the same exception
+and the same message, naming the column — and returns `None` for a row it would accept. It
+needs no log and writes nothing, so a caller that only sometimes has a log holds every row to
+the same rule either way. Pass the schema `new` took, or `log.schema` for an existing log.
+
+The rules are the buffer's own: the check inserts into a private in-memory copy of the
+buffer table and rolls back. Building that copy costs ~260 µs once per schema, after which a
+row costs ~4 µs.
+
 ### Bulk loading: `ingest`
 
 ```python
