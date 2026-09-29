@@ -128,6 +128,12 @@ ignore = ["E501"]
 
 [tool.ruff.format]
 
+# `pyarrow.compute` builds its kernels from a registry when it is imported, so
+# no static checker can see `pc.is_finite` or `pc.all`. Typed as Any here, once,
+# rather than suppressed at every call; the rest of pyarrow stays checked.
+[tool.ty.analysis]
+replace-imports-with-any = ["pyarrow.compute"]
+
 # pyiceberg's LiteralPredicate takes (term, literal) at runtime — verified —
 # but ty resolves a different __init__ through the expression hierarchy and
 # reports every construction as missing its arguments. Scoped to the one module

@@ -223,7 +223,7 @@ row costs ~4 µs.
 | Arrow type | append this |
 |---|---|
 | `int32`, `int64` | `int` |
-| `float32`, `float64` | `float`, or an `int` it holds exactly |
+| `float32`, `float64` | a finite `float`, or an `int` it holds exactly — never NaN or ±inf |
 | `bool` | `bool` |
 | `string`, `large_string` | `str` |
 | `binary`, `fixed_size_binary(n)` | `bytes` — exactly `n` of them for a fixed width. Small values only, see below |
@@ -236,6 +236,12 @@ Its bytes go through the buffer like any other value: fsynced into SQLite, shipp
 sidecar, converted by every hot read, and counted against `target_seal_size`, so one large
 value makes a file of a row or two. Frames, point clouds and response bodies are what SPEC §15's
 blob fields are for, which bypass the buffer; they are specified and not yet built.
+
+**A log holds only finite floats.** NaN and ±inf are refused on every write path — `append`,
+`extend`, `ingest` and `validate_row`, top-level and nested, float32 and float64 — naming the
+column and the path inside it. NaN because readers disagree about it (Iceberg's and Parquet's
+statistics leave it out, so whether a query sees it depends on what shares its file), ±inf
+because JSON, the wire above, has none. Represent a missing value as None.
 
 Nested types nest in each other. Anything else is refused at `new` with the reason — unsigned
 integers, time types, `large_binary`, `large_list` and unions among them. Iceberg has no union,
@@ -628,10 +634,8 @@ A consumer prunes on this, so missing information is `None`, never a narrower bo
 - **`min`/`max`** are None when any file with rows in the column has no bound, unless its
   null count proves the column is entirely NULL there. That covers a column added after some
   files were written.
-- **They exclude NaN**, as Iceberg's bounds do, and a data file's `nan_count` is None because
-  nothing records it: files are registered from Parquet footers, which keep no NaN count. So
-  a float's bounds say nothing about NaN. Only `ingest` can put a NaN in a top-level float;
-  `append` refuses one.
+- **`nan_count` is 0 for every float column.** No write path admits NaN, so a float's bounds
+  are over every value it holds and are safe to prune on in both directions.
 - **Only numeric and `bool` columns have bounds.** Iceberg truncates string and binary bounds
   to 16 bytes, so they are not values. Nested columns keep no statistics of their own.
 - **Counts are sums, and None when any file lacks the count.** `value_count` includes NULLs,

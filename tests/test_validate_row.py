@@ -27,6 +27,7 @@ SCHEMA = pa.schema(
             "attrs", pa.map_(pa.string(), pa.struct([pa.field("x", pa.binary())]))
         ),
         pa.field("tags", pa.list_(pa.string())),
+        pa.field("vals", pa.list_(pa.float64())),
     ]
 )
 
@@ -56,6 +57,8 @@ ROWS: list[tuple[str, dict[str, object]]] = [
     ("int32 overflow", {**BASE, "i32": 2**31}),
     ("float32 overflow", {**BASE, "f32": 1e39}),
     ("float32 inf", {**BASE, "f32": float("inf")}),
+    ("float32 -inf", {**BASE, "f32": float("-inf")}),
+    ("float64 inf, non-nullable", {**BASE, "f64": float("inf")}),
     ("int into float64", {**BASE, "f64": 5}),
     ("inexact int into float64", {**BASE, "f64": 2**53 + 1}),
     ("NaN, nullable", {**BASE, "f32": float("nan")}),
@@ -71,6 +74,9 @@ ROWS: list[tuple[str, dict[str, object]]] = [
     ("wrong nested leaf", {**BASE, "attrs": {"k": {"x": "text"}}}),
     ("wrong list item", {**BASE, "tags": ["a", 1]}),
     ("nested fine, other column bad", {**BASE, "attrs": {}, "i32": 2**31}),
+    ("NaN in a nested list", {**BASE, "vals": [1.0, float("nan")]}),
+    ("inf in a nested list", {**BASE, "vals": [float("inf")]}),
+    ("-inf in a nested list", {**BASE, "vals": [float("-inf")]}),
 ]
 
 

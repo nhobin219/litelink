@@ -980,29 +980,26 @@ def test_append_refuses_a_value_the_column_cannot_hold(tmp_path: Path) -> None:
         assert log.scan().read_all().num_rows == 20
 
 
-def test_append_accepts_the_exact_bounds_and_an_explicit_infinity(
-    tmp_path: Path,
-) -> None:
-    """The check is a range, not a smaller one, and `inf` is a real float32.
+def test_append_accepts_the_exact_bounds(tmp_path: Path) -> None:
+    """The check is a range, not a smaller one: its ends are legal values.
 
-    A float32 represents infinity exactly, so passing one is a statement rather
-    than an overflow. What is refused is a FINITE value that would silently
-    become infinite. Falsify by dropping the `_INFINITE` clause: the explicit
-    infinities below are then refused.
+    The largest finite float32 is the bound; an infinity is not, since no
+    write path admits one (#87).
     """
+    largest = 3.4028234663852886e38
     log = litelink.new(tmp_path, "s", schema=RANGED)
     with log:
         log.append({"event_ts": 1, "n32": 2**31 - 1})
         log.append({"event_ts": 2, "n32": -(2**31)})
-        log.append({"event_ts": 3, "f32": float("inf")})
-        log.append({"event_ts": 4, "f32": float("-inf")})
+        log.append({"event_ts": 3, "f32": largest})
+        log.append({"event_ts": 4, "f32": -largest})
         # A column that CAN overflow but was not supplied is not a range fault.
         log.append({"event_ts": 5})
 
         table = log.scan().read_all()
 
         assert table.column("n32").to_pylist()[:2] == [2**31 - 1, -(2**31)]
-        assert table.column("f32").to_pylist()[2:4] == [float("inf"), float("-inf")]
+        assert table.column("f32").to_pylist()[2:4] == [largest, -largest]
 
 
 def test_extend_refuses_the_batch_without_writing_any_of_it(

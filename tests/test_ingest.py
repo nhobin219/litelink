@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -730,3 +731,84 @@ def test_a_load_pushes_the_undersized_seals_beneath_it_too(
         _, hi2 = log.ingest(table(50, start=hi), sync=False) or (0, 0)
 
         assert log.archived_through() < hi2
+
+
+NON_FINITE_LOADS = [
+    ("float32 NaN", pa.float32(), float("nan"), "x", None),
+    ("float64 inf", pa.float64(), float("inf"), "x", None),
+    ("float64 -inf", pa.float64(), float("-inf"), "x", None),
+    (
+        "struct field",
+        pa.struct([pa.field("d", pa.float64())]),
+        {"d": float("nan")},
+        "x",
+        "x.d",
+    ),
+    ("list item", pa.list_(pa.float32()), [1.0, float("inf")], "x", "x[]"),
+    (
+        "map value in a struct",
+        pa.struct([pa.field("m", pa.map_(pa.string(), pa.float64()))]),
+        {"m": [("k", float("-inf"))]},
+        "x",
+        "x.m[]",
+    ),
+]
+
+
+@pytest.mark.parametrize("as_reader", [False, True], ids=["table", "reader"])
+@pytest.mark.parametrize(
+    ("label", "type_", "value", "column", "path"),
+    NON_FINITE_LOADS,
+    ids=[case[0] for case in NON_FINITE_LOADS],
+)
+def test_a_bulk_load_holding_a_non_finite_float_costs_no_offsets(
+    tmp_path: Path,
+    label: str,
+    type_: pa.DataType,
+    value: object,
+    column: str,
+    path: str | None,
+    as_reader: bool,
+) -> None:
+    """`ingest` meets neither the CHECK nor the encoder, so it asks (#87).
+
+    Per chunk and before the reservation, so a refused load leaves no hole,
+    naming the column and — for a nested one — where inside it.
+
+    Falsify by removing the `_refuse_non_finite` call from `_ingest_chunks`:
+    each load is accepted.
+    """
+    schema = pa.schema([pa.field("k", pa.int64()), pa.field("x", type_)])
+    source = pa.Table.from_pylist(
+        [{"k": 1, "x": None}, {"k": 2, "x": value}], schema=schema
+    )
+    load = source.to_reader() if as_reader else source
+    where = "" if path is None else f" at {re.escape(path)}"
+
+    with litelink.new(tmp_path, "s", schema=schema, sort_by=("k",)) as log:
+        with pytest.raises(
+            ValueError,
+            match=rf"column '{column}' cannot hold .*{where}: a log holds only finite floats",
+        ):
+            log.ingest(load)
+
+        assert log.end_offset() == 1
+        assert log._table.extent() is None
+
+
+def test_a_nan_under_a_null_struct_is_not_a_stored_value(tmp_path: Path) -> None:
+    """A struct child's slot under a NULL parent is not part of the row.
+
+    Checked through `StructArray.flatten()`, which folds the parent's validity
+    in; reading the raw child would refuse a legitimate load.
+    """
+    type_ = pa.struct([pa.field("d", pa.float64())])
+    schema = pa.schema([pa.field("k", pa.int64()), pa.field("x", type_)])
+    hidden = pa.StructArray.from_arrays(
+        [pa.array([float("nan")])], names=["d"], mask=pa.array([True])
+    )
+    source = pa.Table.from_arrays([pa.array([1], pa.int64()), hidden], schema=schema)
+
+    with litelink.new(tmp_path, "s", schema=schema, sort_by=("k",)) as log:
+        assert log.ingest(source) == (1, 1)
+        assert log.scan().read_all()["x"].to_pylist() == [None]

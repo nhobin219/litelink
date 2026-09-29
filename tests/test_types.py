@@ -8,7 +8,6 @@ were separate and disagreed.
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -214,8 +213,6 @@ EXTREMES: list[tuple[str, pa.DataType, object]] = [
     ("int32 max", pa.int32(), 2**31 - 1),
     ("int32 min", pa.int32(), -(2**31)),
     ("float64 denormal", pa.float64(), 5e-324),
-    ("float64 inf", pa.float64(), float("inf")),
-    ("float64 -inf", pa.float64(), float("-inf")),
     ("float32 max", pa.float32(), 3.4028234663852886e38),
     ("empty string", pa.string(), ""),
     ("nul byte in string", pa.string(), "a\x00b"),
@@ -231,7 +228,11 @@ EXTREMES: list[tuple[str, pa.DataType, object]] = [
     ("list of nulls", pa.list_(pa.int64()), [None, None]),
     ("struct of nulls", pa.struct([pa.field("a", pa.int64())]), {"a": None}),
     ("int64 limits nested", pa.list_(pa.int64()), [2**63 - 1, -(2**63)]),
-    ("infinities nested", pa.list_(pa.float64()), [float("inf"), float("-inf")]),
+    (
+        "largest finite doubles nested",
+        pa.list_(pa.float64()),
+        [1.7976931348623157e308, -5e-324],
+    ),
     ("int keys", pa.map_(pa.int32(), pa.binary()), {-(2**31): b"", 7: b"\x00"}),
     ("quotes in a key", pa.map_(pa.string(), pa.string()), {'a"b\\': "\n"}),
     (
@@ -268,28 +269,40 @@ def test_extreme_values_survive_the_round_trip(
         assert log.scan().read_all()["c"].to_pylist() == expected, "from the table"
 
 
-def test_nan_is_refused_rather_than_silently_nulled(tmp_path: Path) -> None:
-    """SQLite has no NaN — it stores one as NULL.
+@pytest.mark.parametrize("nullable", [True, False], ids=["nullable", "required"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")], ids=str)
+@pytest.mark.parametrize("type_", [pa.float32(), pa.float64()], ids=str)
+def test_a_non_finite_float_is_refused_naming_its_column(
+    tmp_path: Path, type_: pa.DataType, value: float, nullable: bool
+) -> None:
+    """A log holds only finite floats (#87), and says so naming the column.
 
-    Verified directly: `INSERT` a NaN into a REAL column and `typeof` reports
-    null. So a float column would accept a NaN and return a null, with nothing
-    raised anywhere. Infinity is unaffected and round-trips, which is what makes
-    the NaN case easy to miss.
+    Three different mechanisms reach the one refusal. ±inf fails the float
+    CHECK. NaN never reaches a CHECK — SQLite stores it as NULL — so in a
+    nullable column the post-insert test catches it, and in a required one it
+    fails NOT NULL and `_explain` recognises it, where it used to escape as a
+    bare `NOT NULL constraint failed`.
 
-    Refused for the same reason `_types` refuses whole types it cannot carry:
-    changing a value silently is worse than declining it.
+    Falsify by restoring `OR abs(x) = 9e999` to the float32 CHECK (its inf
+    cases pass), or by removing the non-finite test from `_explain` (the
+    required NaN cases raise SQLite's message instead).
     """
-    schema = pa.schema([pa.field("event_ts", pa.int64()), pa.field("c", pa.float64())])
+    schema = pa.schema(
+        [pa.field("event_ts", pa.int64()), pa.field("c", type_, nullable=nullable)]
+    )
 
     with litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="NaN"):
-            log.append({"event_ts": 1, "c": float("nan")})
+        with pytest.raises(
+            ValueError,
+            match=r"column 'c' cannot hold (nan|inf|-inf): a log holds only finite floats",
+        ):
+            log.extend([{"event_ts": 1, "c": 1.0}, {"event_ts": 2, "c": value}])
 
-        # Nothing was written, and the log still works.
-        log.append({"event_ts": 1, "c": float("inf")})
-        log.append({"event_ts": 2, "c": None})
+        assert log.end_offset() == 1, "the whole batch rolled back"
 
-        assert log.scan().read_all()["c"].to_pylist() == [float("inf"), None]
+        log.append({"event_ts": 3, "c": 2.5})
+        log.seal()
+        assert log.scan().read_all()["c"].to_pylist() == [2.5]
 
 
 # -- binary and nested columns, for OpenTelemetry logs (#79) -------------------
@@ -405,6 +418,17 @@ REFUSED_NESTED: list[tuple[str, dict[str, object], str]] = [
     ("scalar where a struct goes", {"body": "text"}, "not a valid struct"),
     ("short trace id", {"trace_id": b"x" * 15}, "fixed_size_binary\\[16\\]"),
     ("str where bytes go", {"span_id": "0102030405060708"}, "fixed_size_binary\\[8\\]"),
+    ("NaN in a struct", {"body": {"d": float("nan")}}, "at d: nan is not finite"),
+    (
+        "inf in a map value",
+        {"attributes": {"k": {"d": float("inf")}}},
+        r"\['k'\]\.d: inf",
+    ),
+    (
+        "-inf in a map value",
+        {"attributes": {"k": {"d": float("-inf")}}},
+        "-inf is not finite",
+    ),
 ]
 
 
@@ -435,25 +459,6 @@ def test_a_nested_or_binary_value_the_column_cannot_hold_is_refused(
         log.append(otel_row(3))
         log.seal()
         assert _read_back(log) == _expected([otel_row(3)])
-
-
-def test_nan_survives_inside_a_nested_column(tmp_path: Path) -> None:
-    """Unlike a top-level float, which SQLite would turn into NULL.
-
-    A nested value is stored as JSON text, which carries NaN exactly, so
-    refusing it here would decline something the log can hold.
-    """
-    schema = pa.schema(
-        [pa.field("ts", pa.int64()), pa.field("v", pa.list_(pa.float64()))]
-    )
-
-    with litelink.new(tmp_path, "s", schema=schema, sort_by=("ts",)) as log:
-        log.append({"ts": 1, "v": [float("nan"), 1.0]})
-        log.seal()
-
-        (value,) = log.scan().read_all()["v"].to_pylist()
-        assert math.isnan(value[0])
-        assert value[1] == 1.0
 
 
 def test_a_nested_value_counts_its_stored_size_toward_the_seal(tmp_path: Path) -> None:

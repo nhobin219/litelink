@@ -8,6 +8,17 @@ This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 ## Unreleased
 
+### Changed — breaking
+
+- **A log holds only finite floats.** NaN and ±inf are refused on every write
+  path — `append`, `extend`, `ingest` and `validate_row`, top-level and nested,
+  float32 and float64 — naming the column and the path inside it (#87). A
+  top-level NaN was already refused; ±inf was accepted, and so was NaN nested
+  in a struct, list or map or loaded through `ingest`. `column_statistics()`
+  now reports `nan_count = 0` for every float column, so float bounds are
+  prunable. A NaN in a required column used to raise SQLite's bare `NOT NULL
+  constraint failed`; it now says what it is.
+
 ### Added
 
 - **`LogHandle.column_statistics(tier=None)`**: every column's min, max, null
@@ -15,9 +26,9 @@ minor version carries breaking changes.
   manifests already hold — no data file opened, nothing new written (#85). The
   default is the whole log, each row counted once across the local table, the
   archive and the buffer; `"local"` or `"archive"` asks for one tier. Missing
-  information is None rather than a narrower bound: float bounds exclude NaN
-  and carry no NaN count, and strings, bytes and nested columns carry no
-  bounds.
+  information is None rather than a narrower bound; strings, bytes and nested
+  columns carry no bounds, and a float's `nan_count` is 0, since no write path
+  admits NaN.
 
 ### Changed
 
