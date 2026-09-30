@@ -314,10 +314,18 @@ from manifest statistics at query time (§7, I3). The tiers overlap by design; t
 what make each row appear exactly once.
 
 **Which tiers a query reads is decided per query, and the caller never names one** (#90).
-Every query reads the buffer and the local table. The archive is read only when a file of it
-below the local table could hold a row the query matches — decided from per-file column bounds
-that `sync` records in `buffer.db`, so the decision is local and a read bounded inside the
-local window never touches the network (I5).
+Every query reads the buffer. The local table and the archive are read only when their row in
+the log's **tier manifest** — `<root>/<name>/<name>.manifest.parquet` — says they could hold a
+row the query matches. The manifest is on local disk, so the decision never touches the
+network, and a read bounded inside the local window stays there (I5).
+
+The manifest is the format streamcast uses for its sealed logs (streamcast#27), with `tier`
+in place of `log`: one row per tier, one struct of `min`, `max`, `null_count`, `value_count`
+and `nan_count` per integer, float and boolean column, plus `start_offset`, `end_offset` and
+`record_count`. The `archive` row describes what the archive holds **below** the local table
+— what eviction moved there — because that is the range a read's archive leg covers; the
+whole archive's bounds would include its copy of the local window and send every hot query
+to the network. The pruning itself is public as `litelink.manifest.prune`.
 
 It reads the query's WHERE, and narrows on one shape only: a single `SELECT … FROM log`, no
 joins, CTEs, set operations or subqueries, with comparisons (`=`, `<`, `<=`, `>`, `>=`,
@@ -331,10 +339,10 @@ builds that shape, with `start_offset`/`end_offset` as offset comparisons.
 predicate rather than the handle, so the same unbounded query reads the archive once eviction
 has moved its rows there. A bounded hot query stays local however much has been evicted.
 
-The bounds are recorded before each `sync` registers its files, taken again from the
-archive's manifests after `rewrite_archive`, a re-point and a `restore`, and backfilled at
-`open` for a log written before they existed. Until they are known for the archive the log
-points at, every query reads the archive.
+A tier's row is widened before any commit that adds rows to it — every local `register`, and
+eviction for the archive — and narrowed only where nothing can have widened it since. It is
+recomputed from the Iceberg manifests at the first `sync`, on a re-point, at `restore`, and at
+`open` for a log written before the manifest existed. A tier with no row is read.
 
 `sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. Both return a
 streaming reader rather than a table: a full-window read with a 400-byte payload column is

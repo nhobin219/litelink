@@ -20,7 +20,7 @@ import pyarrow as pa
 from litelink._config import LogConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping
     from pathlib import Path
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
@@ -64,11 +64,6 @@ INTENT_KEY = "schema_intent"
 # empty leaves the log high with nothing below it, positionally identical to a
 # reserve. The recorded value is the only thing that separates the two.
 START_OFFSET_KEY = "start_offset"
-
-# Which archive the `archive_bounds` rows are complete for, and a counter a
-# reader keys its decoded copy on. See `stage_archive_bounds`.
-ARCHIVE_BOUNDS_FOR = "archive_bounds_for"
-ARCHIVE_BOUNDS_GENERATION = "archive_bounds_generation"
 
 # Stands in for "no row limit" so the per-row check stays one comparison. Far
 # above any row count a buffer sized for read latency could reach.
@@ -684,20 +679,6 @@ class Buffer:
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
-        # Each archive file's per-column bounds, which is what lets a read
-        # decide from local disk whether the archive could hold a matching row
-        # (#90). `bounds` is `_prune.encode`'s JSON, keyed by column name.
-        #
-        # Its own table rather than columns on `extent`: those rows are bounded
-        # by the local window and describe copies, where this has to describe
-        # the whole archive — its history below the window is exactly the part
-        # a read decides whether to fetch.
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS archive_bounds (
-              rel_path TEXT PRIMARY KEY,
-              bounds   TEXT NOT NULL
-            )
-        """)
         # Who owns which operation, across processes (§13.6). A Python lock
         # cannot say anything about a process that is no longer running, and
         # recovery has to know whether an interrupted operation was ours.
@@ -2120,114 +2101,6 @@ class Buffer:
                 "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                 (key, value),
             )
-
-    # -- archive bounds (#90) ----------------------------------------------
-    #
-    # What a read consults to skip the archive, so the direction that is safe
-    # is OVERSTATING: a row for a file the archive does not hold costs a read
-    # that finds nothing, and a missing row for one it does hold loses that
-    # file's rows from every answer that skips the archive. Every write here is
-    # arranged around that. `stage` runs before the register that lands the
-    # files, so a crash between them leaves rows the archive lacks; `replace`
-    # is the one write that narrows, and it takes its rows from the archive's
-    # own manifests under the maintenance claim, which every archive commit
-    # also holds.
-    #
-    # `ARCHIVE_BOUNDS_FOR` names the archive the rows are complete for. A read
-    # trusts them only while it names the archive the log points at: absent on
-    # a log written before this existed, and reset by a re-point, both of which
-    # read as "unknown" and so read the archive.
-
-    def stage_archive_bounds(self, rows: Sequence[tuple[str, str]]) -> None:
-        """Record bounds for files about to be registered in the archive."""
-        with self._transaction():
-            self._con.executemany(
-                "INSERT INTO archive_bounds (rel_path, bounds) VALUES (?, ?)"
-                " ON CONFLICT(rel_path) DO UPDATE SET bounds = excluded.bounds",
-                list(rows),
-            )
-            self._bump_bounds()
-
-    def replace_archive_bounds(
-        self, archive_key: str, archive: str, rows: Sequence[tuple[str, str]]
-    ) -> bool:
-        """Make the rows exactly `rows`, and complete for `archive`.
-
-        Compare-and-set against where the log points, in the same transaction,
-        for `set_meta_if`'s reason: a re-point landing between reading the
-        archive and writing this would otherwise mark one archive's files
-        complete for another. Returns whether it wrote.
-        """
-        with self._transaction():
-            row = self._con.execute(
-                "SELECT v FROM meta WHERE k = ?", (archive_key,)
-            ).fetchone()
-            if ((row[0] if row is not None else None) or None) != archive:
-                return False
-
-            self._con.execute("DELETE FROM archive_bounds")
-            self._con.executemany(
-                "INSERT INTO archive_bounds (rel_path, bounds) VALUES (?, ?)",
-                list(rows),
-            )
-            self._con.execute(
-                "INSERT INTO meta (k, v) VALUES (?, ?)"
-                " ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                (ARCHIVE_BOUNDS_FOR, archive),
-            )
-            self._bump_bounds()
-
-            return True
-
-    def archive_bounds_version(self) -> tuple[str | None, str | None]:
-        """`(archive the bounds are complete for, generation)`, in one read.
-
-        `(None, None)` on a buffer that has no such rows yet — including one
-        opened read-only before any writer of this version created the table,
-        which is unknown rather than empty.
-        """
-        with self._lock:
-            rows = dict(
-                self._con.execute(
-                    "SELECT k, v FROM meta WHERE k IN (?, ?)",
-                    (ARCHIVE_BOUNDS_FOR, ARCHIVE_BOUNDS_GENERATION),
-                ).fetchall()
-            )
-
-        return (
-            rows.get(ARCHIVE_BOUNDS_FOR) or None,
-            rows.get(ARCHIVE_BOUNDS_GENERATION),
-        )
-
-    def archive_bounds(self) -> tuple[str | None, str | None, list[str]]:
-        """The version and every file's bounds, from ONE statement.
-
-        One statement is one snapshot, so the generation returned is never
-        older than the rows — a cache keyed on it can be stale only in the
-        direction of reloading.
-        """
-        try:
-            with self._lock:
-                rows = self._con.execute(
-                    "SELECT (SELECT v FROM meta WHERE k = ?),"
-                    " (SELECT v FROM meta WHERE k = ?), b.bounds"
-                    " FROM (SELECT 1) LEFT JOIN archive_bounds b",
-                    (ARCHIVE_BOUNDS_FOR, ARCHIVE_BOUNDS_GENERATION),
-                ).fetchall()
-        except sqlite3.OperationalError:
-            return None, None, []
-
-        archive, generation = rows[0][0] or None, rows[0][1]
-
-        return archive, generation, [r[2] for r in rows if r[2] is not None]
-
-    def _bump_bounds(self) -> None:
-        """Inside the caller's transaction: a new generation for the cache."""
-        self._con.execute(
-            "INSERT INTO meta (k, v) VALUES (?, '1')"
-            " ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
-            (ARCHIVE_BOUNDS_GENERATION,),
-        )
 
     # -- compaction bookkeeping -------------------------------------------
 

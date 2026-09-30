@@ -1,34 +1,34 @@
-"""Which tiers a query reads, decided from bounds kept locally (#90).
+"""Which tiers a query reads, decided from the log's tier manifest (#90).
 
-Two halves. The condition itself — DuckDB's parse of a query turned into a test
-on per-file bounds — needs no object storage and is checked directly. The rest
-runs against a real archive, because the claims are about when the network is
-and is not touched, and about the rows that come back either way.
+Two halves. Turning a query into manifest terms — DuckDB's parse, and each
+constant converted the way DuckDB compares it — needs no object storage and is
+checked directly. The rest runs against a real archive, because the claims are
+about when the network is and is not touched, and about the rows that come
+back either way.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from datetime import timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import litelink
-from litelink._buffer import ARCHIVE_BOUNDS_FOR, Buffer
 from litelink._layout import Layout
-from litelink._prune import (
-    BOUNDS_REL,
-    condition,
-    integer_columns,
-    relation,
-    stats_columns,
-)
+from litelink._prune import terms
 from litelink._read import Reader
+from litelink._table import LogTable
+from litelink._tiers import ARCHIVE, LOCAL, TierManifest
 from litelink.log import OFFSET
+from litelink.manifest import build, prune
 from tests.test_archive import ROWS, archived_log, rows
+from tests.test_manifest import row
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -36,176 +36,122 @@ if TYPE_CHECKING:
     from litelink import WriteHandle
     from litelink._s3 import S3Options
 
-BOUNDED = pa.schema(
+SCHEMA = pa.schema(
     [
         pa.field(OFFSET, pa.int64()),
         pa.field("side", pa.int32()),
         pa.field("price", pa.float64()),
+        pa.field("ratio", pa.float32()),
+        pa.field("flag", pa.bool_()),
         pa.field("sym", pa.string()),
     ]
 )
 
 
-def could_match(query: str, *stored: str) -> list[bool]:
-    """Per stored file, whether `query` could match a row of it."""
-    connection = duckdb.connect()
-    narrowed = condition(
-        connection, query, stats_columns(BOUNDED), integer_columns(BOUNDED)
-    )
-    if narrowed is None:
-        return [True] * len(stored)
-
-    connection.register(BOUNDS_REL, relation(BOUNDED, stored))
-
-    return [
-        bool(v)
-        for (v,) in connection.execute(
-            f"SELECT {narrowed.sql()} FROM {BOUNDS_REL}"
-        ).fetchall()
-    ]
+def of(where: str, query: str = "SELECT * FROM log WHERE {}") -> tuple:
+    return terms(duckdb.connect(), query.format(where), SCHEMA)
 
 
-def test_a_constant_binds_the_way_the_query_binds_it() -> None:
-    """`side > 5.5` against an int column whose maximum is 6 could match.
+def test_comparisons_become_terms() -> None:
+    assert of("side > 1 AND price <= 2.5") == (("side", ">", 1), ("price", "<=", 2.5))
+    assert of("5 < side") == (("side", ">", 5),)
+    assert of("side BETWEEN 1 AND 3") == (("side", ">=", 1), ("side", "<=", 3))
+    assert of("side IN (1, 3)") == (("side", "in", [1, 3]),)
+    assert of('"litelink_offset" >= 10') == ((OFFSET, ">=", 10),)
+    assert of("l.side = 2", "SELECT * FROM log l WHERE {}") == (("side", "==", 2),)
+    assert of("flag = true") == (("flag", "==", True),)
 
-    DuckDB compares an integer column to 5.5 as a DOUBLE. Casting the constant
-    to the column's type instead rounds it to 6, and `6 > 6` is false — a file
-    holding `side = 6` would then be skipped by a query that matches it.
 
-    Falsify by rendering the constant as `CAST((K) AS <column type>)` in
-    `_prune._test`: the first file reads as unable to match.
-    """
-    files = ('{"side": [0, 6]}', '{"side": [0, 5]}')
-
-    assert could_match("SELECT * FROM log WHERE side > 5.5", *files) == [True, False]
-    assert could_match("SELECT * FROM log WHERE 5.5 < side", *files) == [True, False]
-    assert could_match("SELECT * FROM log WHERE side >= 6", *files) == [True, False]
-    assert could_match("SELECT * FROM log WHERE side = 6", *files) == [True, False]
+def test_an_integer_against_a_decimal_is_kept_exact() -> None:
+    assert of("side > 5.5") == (("side", ">", Decimal("5.5")),)
 
 
 @pytest.mark.parametrize(
-    ("query", "expected"),
+    "where",
     [
-        ("SELECT * FROM log WHERE price > 9.3", [False, True]),
-        ("SELECT * FROM log WHERE price < 1.5", [False, True]),
-        ("SELECT * FROM log WHERE price <= 1.5", [True, True]),
-        ("SELECT * FROM log WHERE price BETWEEN 9.3 AND 10", [False, True]),
-        ("SELECT * FROM log WHERE price BETWEEN 2 AND 3", [True, True]),
-        ("SELECT * FROM log WHERE price IN (0.5, 12)", [False, True]),
-        ("SELECT * FROM log l WHERE l.price > 9.3 AND side = 1", [False, True]),
-        ('SELECT * FROM log WHERE "litelink_offset" >= 11', [False, True]),
-        # Neither narrows: the string column keeps no bound, and an OR is not
-        # a conjunction of tests.
-        ("SELECT * FROM log WHERE sym = 'x'", [True, True]),
-        ("SELECT * FROM log WHERE price > 9.3 OR side = 0", [True, True]),
+        "side > 1 OR price > 2",  # an OR is not a conjunction of tests
+        "sym = 'x'",  # strings keep no usable bound
+        "side > 1.5::DOUBLE",  # a DOUBLE: DuckDB compares in floating point
+        "side > '3'",  # nor a string an integer column casts
+        "price > epoch(now())",  # evaluated a moment before the query
+        "side > price",  # not a constant
     ],
 )
-def test_each_file_is_tested_on_its_own_bounds(
-    query: str, expected: list[bool]
-) -> None:
-    """The first file is fully bounded; the second knows only its offsets.
-
-    A column with no stored bound is NULL in the relation, and reads as "could
-    match" — the second file must never be ruled out by a column it has no
-    bound for.
-    """
-    files = (
-        '{"litelink_offset": [1, 10], "price": [1.5, 9.25], "side": [0, 1]}',
-        '{"litelink_offset": [11, 20]}',
-    )
-
-    assert could_match(query, *files) == expected
+def test_what_cannot_be_decided_exactly_is_dropped(where: str) -> None:
+    assert of(where) == ()
 
 
 @pytest.mark.parametrize(
     "query",
     [
-        # A second reference to `log` would see the rows pruned for the first.
+        # A second reference to `log` would see the tiers skipped for the first.
         "SELECT * FROM log WHERE price > (SELECT max(price) FROM log)",
         "SELECT * FROM log a JOIN log b USING (side) WHERE a.price > 100",
         "SELECT (SELECT count(*) FROM log) FROM log WHERE price > 100",
         "WITH t AS (SELECT * FROM log) SELECT * FROM t WHERE price > 100",
         "SELECT * FROM log WHERE price > 100 UNION ALL SELECT * FROM log",
-        # Evaluated a moment before the query it decides for.
-        "SELECT * FROM log WHERE price > epoch(now())",
         "SELECT * FROM log; SELECT * FROM log WHERE price > 100",
         "not sql at all",
     ],
 )
 def test_only_a_plain_select_over_log_is_narrowed(query: str) -> None:
     """Every other shape reads every tier — correct, and only slower."""
-    assert condition(duckdb.connect(), query, stats_columns(BOUNDED)) is None
+    assert terms(duckdb.connect(), query, SCHEMA) == ()
 
 
 @pytest.mark.parametrize(
-    "where",
+    ("column", "where", "stored"),
     [
-        "side > 1",
-        "side >= 1",
-        "side < 1",
-        "1 < side",
-        "side = 1",
-        "side BETWEEN 1 AND 3",
-        "side IN (0, 7)",
-        "side > -1 AND litelink_offset < 15",
-        "litelink_offset = 20",
-        "side > 9999999999",
+        # FLOAT against 0.1 compares as FLOAT: a stored 0.1f is not > 0.1.
+        ("ratio", "ratio > 0.1", 0.1),
+        ("ratio", "ratio <= 0.1", 0.1),
+        # DOUBLE against a decimal compares as DOUBLE.
+        ("price", "price <= 0.1", 0.1),
+        ("price", "price > 0.1", 0.1),
+        # An integer against a decimal compares exactly.
+        ("side", "side > 5.5", 6),
+        ("side", "side < 5.5", 6),
+        ("side", "side = 2", 2),
     ],
 )
-def test_the_integer_shortcut_agrees_with_duckdb(where: str) -> None:
-    """Integer comparisons are decided in pyarrow, everything else in DuckDB.
+def test_a_value_is_what_duckdb_compares_against(
+    column: str, where: str, stored: object
+) -> None:
+    """The pruner compares in Python, so it must agree with DuckDB exactly.
 
-    The shortcut exists for speed and is only sound if it cannot disagree, so
-    each file is decided both ways — one file at a time, so a wrong answer on
-    any file shows. The files cover a match, a miss, and bounds that are
-    unknown.
+    One stored value, as both its min and max: the unit is kept exactly when
+    DuckDB returns the row.
 
-    Falsify by filling a NULL term with False in `holds_for_any`: a file with
-    no bound for the column is then ruled out, where DuckDB keeps it.
+    Falsify by dropping the CAST to FLOAT in `_prune._value`: `ratio <= 0.1`
+    prunes a unit DuckDB returns a row from.
     """
-    stored = (
-        '{"litelink_offset": [1, 10], "side": [0, 1]}',
-        '{"litelink_offset": [11, 20], "side": [5, 9]}',
-        '{"litelink_offset": [21, 30]}',
-        '{"side": [2, 2]}',
-    )
+    table = pa.table({column: pa.array([stored], type=SCHEMA.field(column).type)})
     connection = duckdb.connect()
-    narrowed = condition(
-        connection,
-        f"SELECT * FROM log WHERE {where}",
-        stats_columns(BOUNDED),
-        integer_columns(BOUNDED),
-    )
-    assert narrowed is not None
-    assert narrowed.exact, "every constant here is an integer literal"
+    connection.register("arrow_log", table)
+    connection.execute("CREATE TABLE log AS SELECT * FROM arrow_log")
+    returned = connection.execute(f"SELECT count(*) FROM log WHERE {where}").fetchone()
+    assert returned is not None
 
-    for one in stored:
-        bounds = relation(BOUNDED, [one])
-        connection.register(BOUNDS_REL, bounds)
-        row = connection.execute(
-            f"SELECT {narrowed.sql()} FROM {BOUNDS_REL}"
-        ).fetchone()
-        assert row is not None
-        assert narrowed.holds_for_any(bounds) == bool(row[0]), one
+    found = terms(duckdb.connect(), f"SELECT * FROM log WHERE {where}", SCHEMA)
+    assert found, "the case must narrow"
+    kept = prune(build([row("unit", 1, table)]), ["unit"], found)
+
+    assert (kept == ["unit"]) == bool(returned[0]), (found, returned)
 
 
-def test_a_cast_or_a_fraction_is_left_to_duckdb() -> None:
-    """Only a bare integer literal against an integer column is exact."""
-    columns = stats_columns(BOUNDED)
-    integers = integer_columns(BOUNDED)
-    connection = duckdb.connect()
+def test_the_manifest_is_a_parquet_file_beside_the_log(tmp_path: Path) -> None:
+    """`<name>.manifest.parquet`, readable by anything that reads Parquet."""
+    schema = pa.schema([pa.field("x", pa.int64())])
+    with litelink.new(tmp_path, "trades", schema=schema) as log:
+        log.extend({"x": i} for i in range(10))
+        log.seal()
 
-    def exact(where: str) -> bool:
-        narrowed = condition(
-            connection, f"SELECT * FROM log WHERE {where}", columns, integers
-        )
-        assert narrowed is not None
-        return narrowed.exact
+    table = pq.read_table(tmp_path / "trades" / "trades.manifest.parquet")
+    found = {r["tier"]: r for r in table.to_pylist()}
 
-    assert exact("side > 5")
-    assert not exact("side > 5.5")
-    assert not exact("side > CAST(5 AS DOUBLE)")
-    assert not exact("price > 5"), "an integer against a float column"
+    assert found[LOCAL]["x"]["min"] == 0
+    assert found[LOCAL]["x"]["max"] == 9
+    assert found[ARCHIVE]["record_count"] == 0, "no archive: known empty"
 
 
 # -- against a real archive ---------------------------------------------------
@@ -249,6 +195,13 @@ class Remote:
         monkeypatch.setattr(Reader, "_prepare_remote", counted)
 
 
+def rows_of(tmp_path: Path) -> dict[str, dict]:
+    table = TierManifest(Layout(tmp_path, "s")).load()
+    assert table is not None
+
+    return {r["tier"]: r for r in table.to_pylist()}
+
+
 @pytest.mark.s3
 def test_a_read_inside_the_local_window_never_touches_the_archive(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
@@ -256,12 +209,12 @@ def test_a_read_inside_the_local_window_never_touches_the_archive(
     """I5 under per-query selection: bounded above what eviction took, local.
 
     The archive holds every row, so each of these COULD be answered from it —
-    what keeps them local is the stored bounds saying no archived file below
-    the local table matches. Refused rather than counted, so a regression
-    fails at the read that reached out.
+    what keeps them local is the archive's tier row, which describes only what
+    eviction moved there. Refused rather than counted, so a regression fails
+    at the read that reached out.
 
-    Falsify by returning True from `Reader._archive_could_match`: every read
-    here raises.
+    Falsify by returning `(True, True)` from `Reader._tiers`: every read here
+    raises.
     """
     with evicted(tmp_path, bucket, s3) as log:
         extent = log.table_extent()
@@ -305,15 +258,15 @@ def test_a_pruned_read_returns_what_reading_every_tier_returns(
 ) -> None:
     """Pruning may only ever skip a tier that contributes nothing.
 
-    Each query run twice — as decided, and with the archive forced in — and
-    the answers compared. The queries straddle the local boundary, sit wholly
-    on either side of it, and include the shapes that must not be narrowed at
+    Each query run twice — as decided, and with every tier forced in — and the
+    answers compared. The queries straddle the local boundary, sit wholly on
+    either side of it, and include the shapes that must not be narrowed at
     all: a subquery and a self-join over `log` would see the pruned rows too.
 
-    Falsify by swapping `lo` and `hi` in `_prune._COMPARE`: the reads bounded
-    below the local window skip the archive and come back short. Or by
-    dropping the subquery check in `_prune.condition`: the scalar subquery
-    counts only the local rows.
+    Falsify by swapping `low` and `high` in `manifest._compare`'s `<` and `>`
+    rules: reads bounded on one side of the local window skip the tier on the
+    other and come back short. Or by dropping the subquery check in
+    `_prune._terms`: the scalar subquery counts only the local rows.
     """
     with evicted(tmp_path, bucket, s3) as log:
         extent = log.table_extent()
@@ -343,7 +296,7 @@ def test_a_pruned_read_returns_what_reading_every_tier_returns(
         ]
         decided = [log.sql(q).read_all().column(0).to_pylist() for q in queries]
 
-        monkeypatch.setattr(Reader, "_archive_could_match", lambda *_: True)
+        monkeypatch.setattr(Reader, "_tiers", lambda *_: (True, True))
         forced = [log.sql(q).read_all().column(0).to_pylist() for q in queries]
 
     assert decided == forced
@@ -351,130 +304,139 @@ def test_a_pruned_read_returns_what_reading_every_tier_returns(
 
 
 @pytest.mark.s3
-def test_every_file_the_archive_holds_has_stored_bounds(
+def test_the_tier_rows_describe_what_each_tier_holds(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """After any number of pushes, the stored rows are the archive's files.
+    """After sync and eviction: the local row covers the local table, and the
+    archive row covers what eviction moved below it — not the whole archive.
 
-    Staged before each register, so a file the archive holds without a row —
-    the state that loses rows from a pruned read — cannot arise from a crash
-    between the two. Checked against the archive's own manifests.
-
-    Falsify by deleting the `stage_archive_bounds` call in `_push`: the files
-    of every push after the first are missing.
+    Falsify by removing the `widen(ARCHIVE, …)` in `Maintenance.evict`: the
+    archive row never grows past what the first sync computed.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
-        for _ in range(3):
-            log.extend(rows(ROWS // 4))
-            log.seal()
-            log.sync(push_unsettled=True)
+    with evicted(tmp_path, bucket, s3) as log:
+        extent = log.table_extent()
+        assert extent is not None
+        found = rows_of(tmp_path)
 
-        archive = log._archive.require()  # noqa: SLF001
-        archive.reload()
-        held = {f.file_path for f in archive.live_files()[1]}
-        stored = {
-            path
-            for (path,) in log._buffer._con.execute(  # noqa: SLF001
-                "SELECT rel_path FROM archive_bounds"
-            )
-        }
-        complete_for = log._buffer.archive_bounds_version()[0]  # noqa: SLF001
+        archive = found[ARCHIVE]
+        assert archive[OFFSET]["min"] == 1
+        assert archive[OFFSET]["max"] >= extent[0] - 1, "covers every evicted row"
+        assert archive["event_ts"]["max"] < ROWS - 1, "not the archive's local copies"
 
-        assert len(held) > 3, "the fixture must push several files"
-        assert held <= stored
-        assert complete_for == log.archive
+        local = found[LOCAL]
+        assert local[OFFSET]["min"] <= extent[0]
+        assert local[OFFSET]["max"] >= extent[1]
 
 
 @pytest.mark.s3
-def test_a_log_without_stored_bounds_reads_the_archive_until_backfilled(
+def test_every_register_widens_the_local_row_before_it_commits(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A log written before bounds existed: correct at once, local after `open`.
+    """The ordering the local row's soundness rests on.
 
-    Forged by deleting what an older build never wrote. A reader cannot trust
-    what is not there, so it reads the archive for every query; the writer's
-    next `open` backfills from the manifests, and the same hot read is local
-    again.
+    At the moment each register commits, the local row must already cover the
+    file — a reader that resolves the table just after would otherwise skip
+    the local tier for rows only it holds.
 
-    Falsify by removing `_backfill_archive_bounds` from `WriteHandle.open`:
-    the last read reaches the archive.
+    Falsify by moving the `before_add` call in `LogTable.register` after
+    `self._commit(add)`.
+    """
+    covered: list[int] = []
+    original = LogTable._commit  # noqa: SLF001
+
+    def commit(table: LogTable, operation):  # noqa: ANN001, ANN202
+        if table.before_add is not None:
+            covered.append(rows_of(tmp_path)[LOCAL][OFFSET]["max"] or 0)
+
+        return original(table, operation)
+
+    with archived_log(tmp_path, bucket, s3) as log:
+        monkeypatch.setattr(LogTable, "_commit", commit)
+        for step in range(3):
+            log.extend(rows(ROWS // 4))
+            log.seal()
+            committed = log.table_extent()
+            assert committed is not None
+            assert covered, "no local commit was observed"
+            assert covered[-1] >= committed[1], (
+                f"seal {step} committed ahead of its row"
+            )
+
+
+@pytest.mark.s3
+def test_a_log_without_a_manifest_reads_every_tier_until_backfilled(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A log written before the manifest existed: correct at once, local after
+    the writer's next `open`.
+
+    Forged by deleting the file. A reader cannot trust what is not there, so
+    it reads the archive for every query; the writer's `open` backfills from
+    the manifests, and the same hot read is local again.
+
+    Falsify by removing `_backfill_manifest` from `litelink.open`: the last
+    read reaches the archive.
     """
     with evicted(tmp_path, bucket, s3) as log:
         extent = log.table_extent()
         assert extent is not None
         low = extent[0]
 
-    buffer_db = Layout(tmp_path, "s").buffer_db
-    with sqlite3.connect(buffer_db) as forged:
-        forged.execute("DELETE FROM archive_bounds")
-        forged.execute("DELETE FROM meta WHERE k = ?", (ARCHIVE_BOUNDS_FOR,))
+    manifest = TierManifest(Layout(tmp_path, "s"))
+    manifest.path.unlink()
 
     remote = Remote(monkeypatch, refuse=False)
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         assert reader.scan(start_offset=low).read_all().num_rows == ROWS - low + 1
-        assert remote.calls == 1, "unknown bounds must read the archive"
+        assert remote.calls == 1, "no manifest must read the archive"
 
     with litelink.open(tmp_path, "s", s3=s3) as writer:
-        assert Buffer.peek_meta(buffer_db, ARCHIVE_BOUNDS_FOR) == writer.archive
+        assert manifest.has(LOCAL)
+        assert manifest.has(ARCHIVE)
         assert writer.scan(start_offset=low).read_all().num_rows == ROWS - low + 1
         assert remote.calls == 1, "backfilled, the hot read is local again"
 
 
 @pytest.mark.s3
-def test_repointing_forgets_the_bounds_and_records_the_new_archives(
+def test_repointing_forgets_the_archive_row(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Bounds describe one archive; a move must not carry them to another.
+    """A row describes one archive; a move must not carry it to another.
 
-    Pointed away and back, the rows each time are the files of the archive
-    the log now names — none at the fresh prefix, and the original's again on
-    return. Pointed at one that cannot be read, they are complete for nothing.
+    Pointed at a fresh prefix, the row is recomputed there: nothing below the
+    local table. Pointed back, the original's again. Pointed at one that
+    cannot be read, the row is gone — and reads include that archive.
 
-    Falsify by dropping `ARCHIVE_BOUNDS_FOR` from `_repoint`'s reset: the
-    unreadable prefix is trusted with the old archive's files.
+    Falsify by removing the `drop(ARCHIVE)` in `_repoint`: the unreadable
+    prefix keeps the old archive's row.
     """
     with evicted(tmp_path, bucket, s3) as log:
         original = log.archive
         assert original is not None
 
-        def stored() -> tuple[str | None, int]:
-            complete_for = log._buffer.archive_bounds_version()[0]  # noqa: SLF001
-            (count,) = log._buffer._con.execute(  # noqa: SLF001
-                "SELECT count(*) FROM archive_bounds"
-            ).fetchone()
-            return complete_for, count
-
-        before = stored()
-        assert before[0] == original
-        assert before[1] == log.archive_files() > 0
+        before = rows_of(tmp_path)[ARCHIVE]
+        assert before["record_count"] > 0
 
         log.set_archive(f"s3://{bucket}/elsewhere")
-        assert stored() == (f"s3://{bucket}/elsewhere", 0)
+        assert rows_of(tmp_path)[ARCHIVE]["record_count"] == 0
 
         log.set_archive(original)
-        assert stored() == before
+        assert rows_of(tmp_path)[ARCHIVE][OFFSET] == before[OFFSET]
         assert log.scan().read_all().num_rows == ROWS
 
-        # Where the new archive cannot be read, nothing replaces the old
-        # rows — so the move itself has to be what stops them being trusted.
         log.set_archive(f"s3://{bucket}-nonexistent/prefix")
-        assert stored()[0] is None
+        assert ARCHIVE not in rows_of(tmp_path)
 
 
 @pytest.mark.s3
-def test_a_restore_takes_its_bounds_from_the_archive_not_the_replica(
+def test_a_restore_computes_both_rows_from_what_it_rebuilt(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The replica lags the archive, and its bounds lag with it.
+    """After a failover the local table is empty and the archive is all of
+    history, so the archive row must cover every archived offset.
 
-    The restored log's local table is empty, so every archive file sits below
-    it — a file pushed after the replica shipped, missing from its bounds,
-    would be skipped by any read those bounds rule out, and its rows are then
-    in no tier the read looks at.
-
-    Falsify by removing the reset before `_backfill_archive_bounds` in
-    `restore`: the replica's bounds are kept, and the read of the late rows
-    comes back empty.
+    Falsify by removing `_backfill_manifest` from `restore`: the rows are
+    dropped and nothing computes them.
     """
     where = f"s3://{bucket}/prefix"
     primary = tmp_path / "primary"
@@ -483,7 +445,6 @@ def test_a_restore_takes_its_bounds_from_the_archive_not_the_replica(
         log.seal()
         log.sync(push_unsettled=True)
 
-        # The replica, as of now.
         second = tmp_path / "second"
         (second / "s").mkdir(parents=True)
         source = sqlite3.connect(Layout(primary, "s").buffer_db)
@@ -492,18 +453,16 @@ def test_a_restore_takes_its_bounds_from_the_archive_not_the_replica(
         source.close()
         copy.close()
 
-        # Pushed after it shipped.
         log.extend(
             {"event_ts": ROWS + i, "key": "late", "payload": "z"} for i in range(50)
         )
         log.seal()
         log.sync(push_unsettled=True)
-        held = log.archive_files()
+        archived = log.archived_through()
 
     with litelink.restore(second, "s", archive=where, s3=s3) as revived:
-        (stored,) = revived._buffer._con.execute(  # noqa: SLF001
-            "SELECT count(*) FROM archive_bounds"
-        ).fetchone()
-        assert stored == held
+        found = rows_of(second)
+        assert found[ARCHIVE][OFFSET]["max"] == archived
+        assert found[LOCAL]["record_count"] == 0
         late = revived.scan(where=f"event_ts >= {ROWS}").read_all()
         assert late.num_rows == 50

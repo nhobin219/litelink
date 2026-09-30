@@ -340,6 +340,10 @@ class LogTable:
         table: Table,
         warehouse: str | None = None,
     ) -> None:
+        # Called with the paths of every `register`, before its commit. The
+        # writer sets it on the LOCAL table to widen the tier manifest's row
+        # (#90); the archive table and a reader's leave it None.
+        self.before_add: Callable[[Sequence[str]], None] | None = None
         """Take the loaded table. `create` and `load` are what load it.
 
         Assigning only, so that a caller holding a `Table` from anywhere — a
@@ -1302,6 +1306,10 @@ class LogTable:
         deletion, or it is a file on disk that nothing records.
         """
         added = True
+        if self.before_add is not None:
+            # Before the commit, and once rather than per attempt: the tier
+            # manifest's row must never claim less than the table (#90).
+            self.before_add(paths)
 
         def add() -> None:
             nonlocal added
@@ -1453,8 +1461,3 @@ class LogTable:
 def _local(path: object) -> str:
     """Iceberg records `file://` URIs; the filesystem wants plain paths."""
     return str(path).removeprefix("file://")
-
-
-# The same, for the one caller outside this module: matching a file's manifest
-# entry to the `DataFile` built from it.
-local_path = _local

@@ -185,8 +185,9 @@ reader can open the same log alongside a live writer with
 
 **litelink decides which tiers a query reads.** Every query reads the buffer and the local
 table; the archive is read only when some archived file below the local table could hold a
-matching row. That is decided from each archive file's column bounds, which `sync` records in
-`buffer.db`, so the decision itself never touches the network:
+matching row. That is decided from the log's tier manifest, `<name>.manifest.parquet` beside
+it, which holds each tier's per-column bounds, so the decision itself never touches the
+network:
 
 ```python
 log.scan(where="event_ts > 1787772000000000")   # recent: local disk only

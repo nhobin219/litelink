@@ -16,22 +16,16 @@ import duckdb
 import pyarrow as pa
 
 from litelink._archive import Archive
-from litelink._prune import (
-    BOUNDS_REL,
-    Atom,
-    Condition,
-    condition,
-    integer_columns,
-    relation,
-    stats_columns,
-)
+from litelink._prune import terms
 from litelink._s3 import S3Options
+from litelink._tiers import ARCHIVE, KEY, LOCAL, TIERS, TierManifest
 from litelink._types import column_type
+from litelink.manifest import prune
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from litelink._buffer import Buffer, Shape
+    from litelink._buffer import Buffer
     from litelink._layout import Layout
     from litelink._table import LogTable
 
@@ -268,12 +262,9 @@ class Reader:
         # object rather than leaving the reader holding a stale one.
         self._archive = archive
         self._remote_ready = False
-        # The stored archive bounds, decoded: `(generation, shape, table)`.
-        # Keyed on the generation `buffer.db` bumps at every change and on the
-        # shape the table was typed from, so it is rebuilt exactly when either
-        # moves — decoding a large archive's rows per query would cost more
-        # than the scan it is deciding about.
-        self._bounds: tuple[str | None, Shape, pa.Table] | None = None
+        # Which tiers a query needs, per tier (#90). Read from disk per query;
+        # it re-parses only when the file changed.
+        self._manifest = TierManifest(layout)
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -336,11 +327,11 @@ class Reader:
     def query(self, sql: str) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
 
-        **Which tiers it reads is decided here, per query.** The buffer and the
-        local table always; the archive only when its stored bounds say some
-        file below the local table could hold a row `sql` matches — see
-        `_archive_could_match`. So a query bounded inside the local window
-        never touches the network, and one that asks for history reads it.
+        **Which tiers it reads is decided here, per query.** The buffer always;
+        the local table and the archive only when the log's tier manifest says
+        they could hold a row `sql` matches — see `_tiers`. So a query bounded
+        inside the local window never touches the network, and one that asks
+        for history reads it.
 
         The relation is rebuilt per call and cannot be held across calls.
         Resolving the table per query is §7's rule, not an optimisation: every
@@ -370,6 +361,12 @@ class Reader:
         # The floor here only bounds how much is read — §7's point about a
         # deferred delete not inflating a query. It is not the boundary; that
         # is decided after, against a snapshot that cannot then move.
+        # The manifest BEFORE anything is resolved, and again after. A row is
+        # widened before the commit that adds to its tier and narrowed after
+        # the commit that removes from it, so the copy read first covers a
+        # removal this read may predate and the copy read last covers an
+        # addition it may include. A tier is skipped only if both say so.
+        before = self._manifest.load()
         self._table.reload()
         floor = self._table.extent()
         tail = self._buffer.rows_above(None if floor is None else floor[1])
@@ -398,116 +395,52 @@ class Reader:
         # After, it cannot happen. I4 means nothing is evicted before it is
         # registered, so an archive snapshot taken later than the local one
         # holds everything the local one has given up.
-        remote = (
-            self._prepare_remote(cursor)
-            if self._archive_could_match(cursor, sql, extent)
-            else None
-        )
+        local, archive = self._tiers(cursor, sql, before, self._manifest.load())
+        remote = self._prepare_remote(cursor) if archive else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
         # over an already-registered relation is cheap.
         cursor.execute(
             f"CREATE OR REPLACE TEMP VIEW {VIEW} AS "
-            f"{self._union(location, extent, remote)}"
+            f"{self._union(location, extent, remote, local=local)}"
         )
         reader = cursor.execute(sql).to_arrow_reader()
 
         return _cast_to(reader, self._schema)
 
-    def _archive_could_match(
+    def _tiers(
         self,
         cursor: duckdb.DuckDBPyConnection,
         sql: str,
-        extent: tuple[int, int] | None,
-    ) -> bool:
-        """Whether the archive leg could contribute a row to `sql` (#90).
+        before: pa.Table | None,
+        after: pa.Table | None,
+    ) -> tuple[bool, bool]:
+        """`(local, archive)`: which of the two tiers `sql` needs (#90).
 
-        Decided from `buffer.db` alone. The archive leg reads only offsets
-        below the local table's (`_union`), so a file entirely at or above
-        `extent[0]` is out whatever the query says; the rest are tested against
-        `sql`'s WHERE by `_prune.condition`. True when anything is unknown —
-        bounds not yet recorded for this archive, a query the condition cannot
-        narrow, a comparison DuckDB will not bind — because reading the archive
-        when it holds nothing costs a round trip, and skipping it when it holds
-        something costs rows.
+        Decided from the tier manifest alone, so the decision itself never
+        touches the network. A tier is skipped only when BOTH copies of the
+        manifest rule it out — see `query` — and a tier with no row, a query
+        `_prune.terms` cannot narrow, or a log with no manifest yet, reads it.
         """
-        archive = self._archive.uri
-        if archive is None:
-            return False
+        configured = self._archive.configured()
+        if before is None and after is None:
+            return True, configured
 
-        shape = self._buffer.shape()
-        schema = shape.table
-        bounds = self._stored_bounds(archive, shape)
-        if bounds is None:
-            return True
+        found = terms(cursor, sql, self._schema)
+        kept = set(prune(before, TIERS, found, key=KEY)) | set(
+            prune(after, TIERS, found, key=KEY)
+        )
 
-        if bounds.num_rows == 0:
-            return False
-
-        columns = stats_columns(schema)
-        narrowed = condition(cursor, sql, columns, integer_columns(schema))
-        tests = Condition(()) if narrowed is None else narrowed
-        if extent is not None:
-            # The archive leg reads only below the local table's first offset.
-            low = int(extent[0])
-            tests = tests.also(((Atom(f"lo_{columns[OFFSET]}", "<", str(low), low),),))
-
-        if not tests.terms:
-            return True
-
-        if tests.exact:
-            # Integers against integers, where no engine can disagree — and
-            # the common case, since `scan` bounds on offsets and a leading
-            # sort column is usually an integer timestamp.
-            return tests.holds_for_any(bounds)
-
-        cursor.register(BOUNDS_REL, bounds)
-        try:
-            row = cursor.execute(
-                f"SELECT EXISTS (SELECT 1 FROM {BOUNDS_REL} WHERE {tests.sql()})"
-            ).fetchone()
-        except duckdb.Error:
-            # A comparison the real query would also refuse to bind. Let it
-            # refuse there, with its own message.
-            return True
-        finally:
-            cursor.unregister(BOUNDS_REL)
-
-        return row is None or bool(row[0])
-
-    def _stored_bounds(self, archive: str, shape: Shape) -> pa.Table | None:
-        """The archive's file bounds as a relation, or None when not known.
-
-        Not known means `buffer.db` does not hold them complete for THIS
-        archive: a log written before they existed and not yet backfilled, or
-        one re-pointed since.
-        """
-        complete_for, generation = self._buffer.archive_bounds_version()
-        if complete_for != archive:
-            return None
-
-        # Keyed on the `Shape` by identity: `shape()` hands back the same object
-        # until the stored schema changes. Its `.table` is built per access, so
-        # keying on that missed every time and decoded the bounds per query.
-        cached = self._bounds
-        if cached is not None and cached[0] == generation and cached[1] is shape:
-            return cached[2]
-
-        complete_for, generation, stored = self._buffer.archive_bounds()
-        if complete_for != archive:
-            return None
-
-        table = relation(shape.table, stored)
-        self._bounds = (generation, shape, table)
-
-        return table
+        return LOCAL in kept, configured and ARCHIVE in kept
 
     def _union(
         self,
         location: str,
         extent: tuple[int, int] | None,
         remote: tuple[str, tuple[int, int]] | None = None,
+        *,
+        local: bool = True,
     ) -> str:
         """The hot read: the local table, plus the buffer above its extent.
 
@@ -561,7 +494,12 @@ class Reader:
                 f' WHERE "{OFFSET}" < {extent[0]}'
             )
 
-        legs.append(f"SELECT {projection} FROM iceberg_scan('{location}')")
+        if local:
+            # Skipped when the tier manifest rules the local table out. Its
+            # extent still bounds the other two legs, so they cover exactly
+            # what they would have beside it.
+            legs.append(f"SELECT {projection} FROM iceberg_scan('{location}')")
+
         # The buffer bound is applied here as well as pushed into SQLite. The
         # registered tail was read against an earlier floor, so it can still
         # hold rows this snapshot has since taken ownership of; without this

@@ -127,7 +127,7 @@ def open(  # noqa: A001
         raise
 
     handle.recover()
-    handle._backfill_archive_bounds()  # noqa: SLF001
+    handle._backfill_manifest()  # noqa: SLF001
 
     return handle
 

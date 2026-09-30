@@ -23,6 +23,8 @@ from litelink._archive import Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import write_parquet
+from litelink._statistics import rollup
+from litelink._tiers import ARCHIVE, TierManifest
 
 # Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
 # `WriteHandle`'s private business, because eviction decides deletions from it.
@@ -263,6 +265,7 @@ class Maintenance:
         self._buffer = buffer
         self._layout = layout
         self._archive = archive
+        self._tiers = TierManifest(layout)
         # Read once per eviction pass rather than once per file. Cleared at the
         # top of `evict`, so a pass never decides from what a previous one saw.
         self._age_cache: dict[str, int] | None = None
@@ -836,8 +839,34 @@ class Maintenance:
             # expiry drops the snapshots naming it, nothing can name it again.
             checkpoint(removal.renew)
             dropped = [f.path for f in files if f.hi <= boundary]
+            if self._archive.configured():
+                # The archive's tier row describes what it holds below the
+                # local table, and these rows are about to be exactly that —
+                # so it grows BEFORE they leave, or a read between the two
+                # would skip the archive for rows no local file still has.
+                schema, live = self._table.live_files()
+                leaving = set(dropped)
+                self._tiers.widen(
+                    ARCHIVE,
+                    self._buffer.shape().table,
+                    rollup(
+                        None,
+                        schema,
+                        [
+                            f
+                            for f in live
+                            if str(f.file_path).removeprefix("file://") in leaving
+                        ],
+                    ),
+                )
+
             self._enqueue(dropped)
             self._table.evict_through(boundary)
+            # And the local row narrows AFTER, by what can be narrowed while
+            # a seal commits beside this: see `TierManifest.evicted`.
+            self._tiers.evicted(
+                boundary, sum(f.rows for f in files if f.hi <= boundary)
+            )
             # Re-dated to the commit, like every other supersession. Eviction
             # needs it without any failure at all: `hydrate` re-registers a
             # file under the very path the queue still holds, drain's veto then

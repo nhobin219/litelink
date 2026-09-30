@@ -35,7 +35,6 @@ from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import (
-    ARCHIVE_BOUNDS_FOR,
     INTENT_KEY,
     SCHEMA_KEY,
     SORT_KEY,
@@ -54,18 +53,22 @@ from litelink._maintenance import (
     checkpoint,
     stable_prefix,
 )
-from litelink._prune import encode as encode_bounds
-from litelink._prune import file_bounds
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import litestream_config, restore_buffer
 from litelink._s3 import S3Options
-from litelink._statistics import Tier, TierStatistics, rollup, whole_log
+from litelink._statistics import Tier, TierStatistics, _offsets, rollup, whole_log
 from litelink._table import (
     LogTable,
     archive_columns,
     archive_extent,
     forget_archive_entry,
-    local_path,
+)
+from litelink._tiers import (
+    ARCHIVE,
+    LOCAL,
+    TierManifest,
+    empty,
+    footer_statistics,
 )
 from litelink._types import NON_FINITE, column_type, validate_schema
 
@@ -1068,6 +1071,10 @@ class WriteHandle(LocalReadHandle):
         # trace once the sequence has moved, and the recovered count is
         # indistinguishable from ordinary buffered rows a second later.
         self._restored_from: _Recovery | None = None
+        # The tier manifest (#90), and the hook that keeps its local row ahead
+        # of the table: every register that adds rows widens it first.
+        self._tiers = TierManifest(layout)
+        table.before_add = self._widen_local
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
         # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
@@ -1275,7 +1282,7 @@ class WriteHandle(LocalReadHandle):
         # construction rather than having one pushed into it afterwards.
         remote = Archive(layout, buffer, s3)
 
-        return cls(
+        log = cls(
             layout=layout,
             table=table,
             buffer=buffer,
@@ -1290,6 +1297,17 @@ class WriteHandle(LocalReadHandle):
             config=settings,
             archive=remote,
         )
+
+        # Both tiers are known exactly at birth: the local table is empty, and
+        # so is the archive beyond it — unless there IS an archive, which the
+        # check above may have been unable to reach. Its row then waits for
+        # the first sync.
+        table_schema_ = buffer.shape().table
+        log._tiers.replace(LOCAL, table_schema_, empty(table_schema_))
+        if archive is None:
+            log._tiers.replace(ARCHIVE, table_schema_, empty(table_schema_))
+
+        return log
 
     @classmethod
     def open(
@@ -1396,7 +1414,7 @@ class WriteHandle(LocalReadHandle):
             archive=remote,
         )
         log.recover()
-        log._backfill_archive_bounds()
+        log._backfill_manifest()
 
         return log
 
@@ -1804,14 +1822,14 @@ class WriteHandle(LocalReadHandle):
 
         log = cls.open(layout.root, name, s3=options)
 
-        # The bounds came back with the replica, and a replica lags: files
-        # pushed after it shipped are in the archive and not in these rows.
-        # This log's local table is empty, so every archive file is below it
-        # and a missing one is rows a read would skip. Forgotten, then taken
-        # again from the archive's own manifests; if that cannot run, reads
-        # include the archive until a sync can.
-        log._buffer.set_meta(ARCHIVE_BOUNDS_FOR, "")
-        log._backfill_archive_bounds()
+        # Both tier rows taken afresh. The local table was rebuilt empty and
+        # every archive file now sits below it, so nothing a manifest said
+        # before the failover describes either tier. If the archive cannot be
+        # read now, its row stays missing and every query reads it until a
+        # sync can compute one.
+        log._tiers.drop(LOCAL)
+        log._tiers.drop(ARCHIVE)
+        log._backfill_manifest()
 
         # REWRITTEN, now that the policy is back. The config above had to be
         # written before `buffer.db` existed — that is the chicken-and-egg this
@@ -2198,14 +2216,19 @@ class WriteHandle(LocalReadHandle):
         # it, and nothing but a sync refreshes it — so a maintainer re-asserting
         # the archive it already has would read its own staleness as a move and
         # zero the watermarks of a bucket that holds the data.
-        # The bounds reads skip the archive on describe the OLD archive, so a
-        # move leaves them complete for nothing — in the same transaction, or
-        # a crash between would have reads trust one archive's files for
-        # another's.
+        # The archive's tier row describes the archive being left, so a move
+        # forgets it BEFORE the log points anywhere new: forgotten first, a
+        # read can only include the archive, never trust the old one's row
+        # for the new one. A restatement keeps it — the shipped writer calls
+        # this on every restart. Compared against the durable location, which
+        # nothing else can move while this holds the claim.
+        if (self._archive.location() or None) != normalised:
+            self._tiers.drop(ARCHIVE)
+
         self._buffer.set_meta_moved(
             _ARCHIVE_KEY,
             normalised or "",
-            {Maintenance.ARCHIVED_KEY: "0", ARCHIVE_BOUNDS_FOR: ""},
+            {Maintenance.ARCHIVED_KEY: "0"},
         )
 
         # Reaches the maintainer and the reader because all three hold this
@@ -2226,11 +2249,16 @@ class WriteHandle(LocalReadHandle):
         if self._archive.configured():
             with contextlib.suppress(Exception):
                 repaired = self._archive.table(repair=True)
-                # And the new archive's bounds, while the claim is held, so
+                # And the new archive's tier row, while the claim is held, so
                 # reads stop fetching it for every query. Best effort like the
                 # repair: the first sync does it otherwise.
-                if repaired is not None:
-                    self._record_archive_bounds(repaired, normalised)
+                if repaired is not None and not self._tiers.has(ARCHIVE):
+                    self._record_archive_row(repaired)
+
+        if not self._archive.configured() and not self._tiers.has(ARCHIVE):
+            # Detached: no archive leg is read, and a later attach drops this.
+            schema = self._buffer.shape().table
+            self._tiers.replace(ARCHIVE, schema, empty(schema))
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, re-clustering every file the local table owns.
@@ -3539,12 +3567,13 @@ class WriteHandle(LocalReadHandle):
         # against an archive that has since grown past it.
         archive.reload()
 
-        # Bounds complete for THIS archive before anything is pushed into it.
-        # A log written before they existed, or re-pointed since, has none a
-        # read can trust — and reads the archive for every query until this
-        # runs. Once per archive: afterwards each push stages its own below.
-        if self._buffer.archive_bounds_version()[0] != pinned:
-            self._record_archive_bounds(archive, pinned)
+        # The archive's tier row, if nothing has computed one yet: a log
+        # configured with an archive at `new`, one written before the manifest
+        # existed, one re-pointed where the archive could not be read. Until
+        # then every query reads the archive. A push adds only copies of local
+        # rows, so it never changes this row itself — eviction does.
+        if not self._tiers.has(ARCHIVE):
+            self._record_archive_row(archive)
 
         covered = archive.extent()
         floor = 0 if covered is None else covered[1]
@@ -3755,17 +3784,6 @@ class WriteHandle(LocalReadHandle):
             # writes the log's rows somewhere nothing will look for them again.
             raise _repointed_mid_push()
 
-        # BEFORE the register, which is the polarity reads need. A read skips
-        # the archive when no stored bound could match, so a file the archive
-        # holds without a row here loses its rows from every such answer;
-        # a row for a file that never landed only costs a read that finds
-        # nothing. Staged first, a crash anywhere around the commit leaves the
-        # second. Taken from the LOCAL manifests — the archive's copy is the
-        # same Parquet file, so its footer statistics are identical.
-        self._buffer.stage_archive_bounds(
-            self._staged_bounds(archive, [(f, p) for f, p in uploaded])
-        )
-
         if not archive.register(
             [archive.uri(rel_path) for _, rel_path in uploaded],
             sealed_through=last.hi + 1,
@@ -3831,63 +3849,55 @@ class WriteHandle(LocalReadHandle):
         if not self._discard_on_seal():
             self._buffer.release_archived(last.hi)
 
-    def _staged_bounds(
-        self, archive: LogTable, uploaded: Sequence[tuple[DataFile, str]]
-    ) -> list[tuple[str, str]]:
-        """Each uploaded file's bounds, under the path the archive will hold it at.
+    def _widen_local(self, paths: Sequence[str]) -> None:
+        """Widen the local tier's row by files about to be registered.
 
-        A file missing from the local manifests — nothing should remove one
-        under the claim this runs inside — still gets its offset range, which
-        every file has, and nothing else: an unknown column reads as "could
-        match", never as a narrower bound.
+        `LogTable.register` calls this BEFORE its commit, for every file that
+        adds rows to the local table — a seal, a load, a hydrate, a recovered
+        seal — so the row never claims less than the table a reader resolves.
+        From the files' own footers, which is what `add_files` reads too.
         """
-        schema, live = self._table.live_files()
-        by_path = {local_path(f.file_path): f for f in live}
-        staged = []
-        for data_file, rel_path in uploaded:
-            found = by_path.get(data_file.path)
-            bounds = (
-                file_bounds(schema, found)
-                if found is not None
-                else {OFFSET: [data_file.lo, data_file.hi]}
-            )
-            staged.append((archive.uri(rel_path), encode_bounds(bounds)))
+        schema = self._buffer.shape().table
+        self._tiers.widen(LOCAL, schema, footer_statistics(paths, schema))
 
-        return staged
+    def _record_archive_row(self, archive: LogTable) -> None:
+        """The archive's tier row, exactly, from its manifests.
 
-    def _record_archive_bounds(self, archive: LogTable, pinned: str | None) -> None:
-        """Replace the stored bounds with what the archive's manifests say.
+        Its files reaching below the local table — the range the archive leg
+        of a read covers. A file straddling the local table's first offset is
+        included whole, so its bounds overstate; that is the safe direction.
 
-        The one write that can NARROW them, so it runs only under the
-        maintenance claim — which every archive commit also holds, so no push
-        can stage a file between this reading the manifests and replacing the
-        rows. A metadata walk of the whole archive: no data file is opened, and
-        it runs once per archive rather than per sync.
+        Narrows, so only under the whole-log maintenance claim: eviction, the
+        one thing that widens this row, cannot run beside it, and nothing
+        else moves the local table's floor down.
         """
-        if pinned is None:
-            return
-
         archive.reload()
         schema, files = archive.live_files()
-        self._buffer.replace_archive_bounds(
-            _ARCHIVE_KEY,
-            pinned,
-            [(f.file_path, encode_bounds(file_bounds(schema, f))) for f in files],
+        self._table.reload()
+        extent = self._table.extent()
+        below = [
+            f for f in files if extent is None or _offsets(schema, f)[0] < extent[0]
+        ]
+        self._tiers.replace(
+            ARCHIVE, self._buffer.shape().table, rollup(None, schema, below)
         )
 
-    def _backfill_archive_bounds(self) -> None:
-        """Record the archive's bounds if they are not already known, best effort.
+    def _backfill_manifest(self) -> None:
+        """Compute whichever tier rows the manifest lacks, best effort.
 
-        Called at open, so a log written before bounds existed stops reading
-        the archive for every query without waiting for a sync. Best effort in
-        every direction: with the claim held elsewhere, the holder's next
-        `sync` backfills; with the archive unreachable or never pushed to,
-        reads go on including it, which is correct and only slower. An archive
-        this process has no catalog entry for is not opened at all
-        (`repair=False`), so a log that has never synced touches no network.
+        At open, so a log written before the manifest existed stops reading
+        every tier for every query. Under the whole-log claim, which no seal
+        can hold beside — so the local row taken here cannot miss a file a
+        concurrent seal was about to commit. If the claim is held elsewhere,
+        the holder's next `sync` computes the archive's row, and the next open
+        the local one; until then those tiers are simply read.
+
+        The archive's row reads its manifests, so it needs the network. An
+        archive this process has no catalog entry for is not opened at all
+        (`table()` answers None offline), so a log that has never synced
+        touches no network here.
         """
-        pinned = self._archive.uri
-        if pinned is None or self._buffer.archive_bounds_version()[0] == pinned:
+        if self._tiers.has(LOCAL) and self._tiers.has(ARCHIVE):
             return
 
         lease = self._lease(MAINTAIN_ROLE)
@@ -3895,13 +3905,24 @@ class WriteHandle(LocalReadHandle):
             return
 
         try:
-            archive = self._archive.table()
-            if archive is not None:
-                self._record_archive_bounds(archive, pinned)
+            schema = self._buffer.shape().table
+            if not self._tiers.has(LOCAL):
+                self._table.reload()
+                self._tiers.replace(
+                    LOCAL, schema, rollup(None, *self._table.live_files())
+                )
+
+            if not self._tiers.has(ARCHIVE):
+                if not self._archive.configured():
+                    self._tiers.replace(ARCHIVE, schema, empty(schema))
+                else:
+                    archive = self._archive.table()
+                    if archive is not None:
+                        self._record_archive_row(archive)
         except Exception:  # noqa: BLE001
             # Unreachable is the ordinary case this tolerates — a box whose
-            # credentials arrive after the log is opened. Nothing was written:
-            # `replace_archive_bounds` is one transaction, and it is last.
+            # credentials arrive after the log is opened. A row not written is
+            # a tier that is read, which is correct and only slower.
             pass
         finally:
             lease.release()
@@ -4072,12 +4093,6 @@ class WriteHandle(LocalReadHandle):
 
         try:
             self._maintenance.rewrite_archive(lease.renew, lease.owner)
-            # Re-cut files hold the same rows, so the stored bounds stayed a
-            # superset through the swap; this makes them exact again. Under the
-            # same claim, for `_record_archive_bounds`'s reason.
-            archive = self._archive.table()
-            if archive is not None:
-                self._record_archive_bounds(archive, self._archive.uri)
         finally:
             lease.release()
 

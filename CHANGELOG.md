@@ -21,21 +21,26 @@ minor version carries breaking changes.
   last `sync` are readable on the primary alone. The WAL replica stays, for
   `restore`.
 - **litelink decides which tiers a query reads; `include_archive` and
-  `with_archive()` are removed** (#90). Every query reads the buffer and the
-  local table, and reads the archive only when an archived file below the
-  local table could hold a matching row. That is decided from per-file column
-  bounds `sync` records in `buffer.db`, so a query bounded inside the local
-  window never touches the network, and an unbounded one reads the whole log
-  without the caller naming a tier. This reverses 0.4.0's tiers-fixed-at-
-  assembly rule: a query's latency now follows its predicates rather than its
-  handle. Only a single `SELECT … FROM log` with AND-ed column-to-constant
-  comparisons is narrowed; anything else reads the archive.
+  `with_archive()` are removed** (#90). Every query reads the buffer, and
+  reads the local table and the archive only when their row in the log's tier
+  manifest — `<name>.manifest.parquet`, streamcast's per-log manifest format
+  with `tier` as its key — could hold a matching row. The manifest is local,
+  so a query bounded inside the local window never touches the network, and
+  an unbounded one reads the whole log without the caller naming a tier. This
+  reverses 0.4.0's tiers-fixed-at-assembly rule: a query's latency now follows
+  its predicates rather than its handle. Only a single `SELECT … FROM log`
+  with AND-ed column-to-literal comparisons is narrowed; anything else reads
+  every tier.
 
-  Existing logs are backfilled from the archive's manifests at the writer's
-  next `open` (or first `sync`); until then every query reads the archive,
-  which is correct and only slower. **Upgrade every process on a log
-  together:** a maintainer still on 0.5 would push files without recording
-  their bounds, and a read on the new version could then skip them.
+  Existing logs get their manifest at the writer's next `open` (the archive's
+  row at the first `sync` if the archive cannot be read then); until then
+  every tier is read, which is correct and only slower. **Upgrade every
+  process on a log together:** a maintainer still on 0.5 would evict without
+  widening the archive's row, and a read on the new version could then skip
+  rows eviction had just moved there.
+- **`litelink.manifest`**: the statistics manifest and its pruning, public, so
+  streamcast uses the same implementation for its sealed logs (`build`,
+  `extend`, `prune`, with the key column a parameter).
 
 ## 0.5.1 — 2026-09-29
 

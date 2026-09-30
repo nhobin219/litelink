@@ -161,12 +161,12 @@ def test_a_hot_read_never_touches_the_archive(
 
     Part of the log is evicted, so the archive holds rows local disk does not.
     Then the credentials point at a dead endpoint: a read bounded inside the
-    local window must still be served, because the stored bounds say no
-    archived file below the local table matches it — and a read that reaches
-    into the evicted history must FAIL rather than come back short.
+    local window must still be served, because the archive's tier row says
+    nothing below the local table matches it — and a read that reaches into
+    the evicted history must FAIL rather than come back short.
 
-    Falsify by returning True from `Reader._archive_could_match`: the bounded
-    read raises. Or False: the unbounded one returns the local rows alone.
+    Falsify by returning `(True, True)` from `Reader._tiers`: the bounded read
+    raises. Or `(True, False)`: the unbounded one returns the local rows alone.
     """
     with archived_log(
         tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000
@@ -3665,8 +3665,8 @@ def test_an_evicted_log_still_serves_every_row(
     With nothing local, every archived file is below the local table, so any
     read that could match one reads the archive.
 
-    Falsify by returning False from `Reader._archive_could_match`: the row
-    count drops to the buffer's share with no error at all.
+    Falsify by returning `(True, False)` from `Reader._tiers`: the row count
+    drops to the buffer's share with no error at all.
     """
     with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
