@@ -6,6 +6,21 @@ rather than restates it.
 
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
+
+## Unreleased
+
+### Changed — breaking
+
+- **litelink reads on the primary only: `snapshot` and `RemoteReadHandle` are
+  removed**, in both modes — archive-only and `include_wal=True` (#90). Every
+  handle is built from a root on the machine that holds the log, and still
+  reads the buffer, the local table and, when asked, the archive. Another
+  machine reads the archive with any Iceberg engine, as it already could
+  without litelink installed: `iceberg_scan('<archive>/<name>',
+  version_name_format = '%s%s.metadata.json')` in DuckDB. Rows newer than the
+  last `sync` are readable on the primary alone. The WAL replica stays, for
+  `restore`.
+
 ## 0.5.1 — 2026-09-29
 
 ### Fixed

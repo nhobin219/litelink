@@ -4,7 +4,7 @@
 tier beyond local disk needs something the Python package cannot carry by
 itself, and each one goes missing quietly in its own way:
 
-- litestream is not needed until a `restore` or a `follow`, which is to say it
+- litestream is not needed until a `restore`, which is to say it
   is not needed until the worst possible moment to discover it is absent. And
   `which litestream` succeeding in a terminal proves nothing about the systemd
   user unit that will actually run the restore, because user units do not
@@ -121,8 +121,8 @@ def _litestream() -> Check:
             "litestream",
             ok=False,
             detail=(
-                "not found on PATH and not bundled. Needed by restore() and "
-                "follow(). The platform wheels ship it; see "
+                "not found on PATH and not bundled. Needed by restore(). The "
+                "platform wheels ship it; see "
                 "https://litestream.io/install to supply it yourself"
             ),
         )
@@ -192,7 +192,7 @@ def _extension(name: str, *, required: bool) -> Check:
 def _archive(prefix: str, name: str, s3: S3Options | None) -> Check:
     """Can this machine READ that archive with the credentials it has?
 
-    Through `archive_extent`, which is the same call `new` and `follow` make,
+    Through `archive_extent`, which is the same call `new` and `restore` make,
     so this checks what they will actually do rather than something adjacent.
     It reads the published hint from the bucket alone — no `archive.db`, no
     catalog — and it separates the two answers an operator needs told apart:

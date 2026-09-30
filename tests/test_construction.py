@@ -1316,16 +1316,15 @@ def test_a_well_formed_archive_uri_is_accepted() -> None:
 
 
 def test_every_entry_point_taking_an_archive_checks_its_shape(tmp_path: Path) -> None:
-    """`new` reaches it through `validate`; `restore` and `follow` do not.
+    """`new` reaches it through `validate`; `restore` does not.
 
-    Neither of those takes a schema or a config, so neither calls `validate` —
-    and both hand the string straight to the litestream config writer. They
-    need the check of their own, and the point of asserting all three together
-    is that adding a fourth entry point without one is visible here.
+    `restore` takes no schema or config, so it never calls `validate` — and it
+    hands the string straight to the litestream config writer. It needs the
+    check of its own, and asserting both together makes a third entry point
+    without one visible here.
 
-    Falsify by removing either explicit `validate_archive` call: the `restore`
-    or `follow` case raises RuntimeError from the subprocess instead, after
-    creating a root or a scratch directory.
+    Falsify by removing `restore`'s explicit `validate_archive` call: it raises
+    RuntimeError from the subprocess instead, after creating a root.
     """
     bad = "s3:/bucket/prefix"
 
@@ -1334,9 +1333,6 @@ def test_every_entry_point_taking_an_archive_checks_its_shape(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="missing a slash"):
         litelink.restore(tmp_path / "restore", "s", archive=bad)
-
-    with pytest.raises(ValueError, match="missing a slash"):
-        litelink.snapshot("s", archive=bad)
 
     # And nothing was created on the way to refusing. A shape error is decided
     # from the argument alone, so it must land before any directory does.
