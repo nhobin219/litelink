@@ -7,27 +7,33 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
 [![Iceberg](https://img.shields.io/badge/Apache%20Iceberg-v2-4B8BBE)](https://iceberg.apache.org/)
 
-# An embedded storage engine for append-only data
+# An embedded Iceberg storage engine for append-only data
 
-**In your process like DuckDB, and what it writes is an Iceberg table.**
-
-`append()` returns once the row is durable, and a query a moment later sees it.
-
-litelink is an open-source **embedded storage engine**: what DuckDB is to query execution,
-litelink is to the durable write path. It runs inside your process, with no server, daemon or
-catalog service, and the files it writes are the product. They're Iceberg v2 tables on local
-disk and in object storage: the Parquet a row is sealed into is the Parquet DuckDB, or any
-other Iceberg engine, reads, with no export step in between.
+litelink takes high-throughput transactional appends and turns them into well-sized Iceberg
+tables, on local disk and in object storage. `append()` commits to a SQLite buffer and returns
+once the row is durable. Behind it, the library seals rows into sorted Parquet, compacts small
+files up to a target size, pushes settled files to an Iceberg archive on S3, and evicts from
+local disk what the archive already holds. Through all of it the log stays one queryable
+unit: a read sees every row exactly once, whichever tier holds it, and maintenance runs beside
+appends rather than in front of them, so no pass blocks appends for its length or shows a
+reader a half-finished state.
 
 ```
-SQLite buffer          durable on commit. unsealed rows only.
-      │  seal at target_seal_size
-      ▼
-local Iceberg table    a rolling window. reads land here.
-      │  sync: upload data files, register into the archive
-      ▼
-remote Iceberg table   full history, on S3.
+append() ──► SQLite buffer          durable on commit
+                   │  seal: sorted Parquet at target_seal_size
+                   ▼
+             local Iceberg table    compacted to target size, evicted once archived
+                   │  sync: upload, register
+                   ▼
+             archive Iceberg table  full history, on S3
+
+scan() / sql() ──► one relation across all three tiers, each row once
 ```
+
+It runs inside your process, like DuckDB, with no server, daemon or catalog service: what
+DuckDB is to query execution, litelink is to the durable write path. The files it writes are
+the product. The Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg
+engine, reads, with no export step in between.
 
 |  | DuckDB | litelink |
 |---|---|---|
@@ -50,7 +56,7 @@ routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
 The usual shape is a write path in one system and an analytical store in another, with a job
 copying between them. Here they are one store with tiers: rows land in the SQLite buffer,
 seal into Parquet behind it, and reads span both, so **no read on the hot path touches the
-network**. Every other machine reads the archive, with litelink or with nothing from it:
+network**. Every other machine reads the archive with any Iceberg engine:
 
 ```python
 import duckdb
