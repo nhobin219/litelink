@@ -700,7 +700,7 @@ def test_the_archive_read_falls_back_to_the_aws_credential_chain() -> None:
     On an ordinary AWS host the credentials are in a profile, in instance
     metadata, or behind SSO — never in the arguments. pyiceberg and s3fs
     resolve those themselves, so writes worked; DuckDB got a secret with no
-    keys, treated it as anonymous, and answered every `include_archive` read
+    keys, treated it as anonymous, and answered every read of the archive
     with 403. Against rustfs it never appeared, because a local endpoint always
     has explicit keys to pass.
     """

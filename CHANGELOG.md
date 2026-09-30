@@ -20,6 +20,22 @@ minor version carries breaking changes.
   version_name_format = '%s%s.metadata.json')` in DuckDB. Rows newer than the
   last `sync` are readable on the primary alone. The WAL replica stays, for
   `restore`.
+- **litelink decides which tiers a query reads; `include_archive` and
+  `with_archive()` are removed** (#90). Every query reads the buffer and the
+  local table, and reads the archive only when an archived file below the
+  local table could hold a matching row. That is decided from per-file column
+  bounds `sync` records in `buffer.db`, so a query bounded inside the local
+  window never touches the network, and an unbounded one reads the whole log
+  without the caller naming a tier. This reverses 0.4.0's tiers-fixed-at-
+  assembly rule: a query's latency now follows its predicates rather than its
+  handle. Only a single `SELECT … FROM log` with AND-ed column-to-constant
+  comparisons is narrowed; anything else reads the archive.
+
+  Existing logs are backfilled from the archive's manifests at the writer's
+  next `open` (or first `sync`); until then every query reads the archive,
+  which is correct and only slower. **Upgrade every process on a log
+  together:** a maintainer still on 0.5 would push files without recording
+  their bounds, and a read on the new version could then skip them.
 
 ## 0.5.1 — 2026-09-29
 

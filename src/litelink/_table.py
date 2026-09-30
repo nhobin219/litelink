@@ -547,7 +547,7 @@ class LogTable:
             if not repair:
                 # Only a caller holding the maintenance lease may fix it.
                 # Dropping and recreating is a mutation of shared state, and it
-                # was reachable from any `include_archive` read — two processes
+                # was reachable from any read of the archive — two processes
                 # cold-opening after a re-point would both find the mismatch,
                 # and the second's drop could land after the first had already
                 # created, uploaded and committed, taking the live entry with
@@ -576,7 +576,7 @@ class LogTable:
             if not repair:
                 # Absent, not wrong. A log configured with an archive that
                 # nothing has pushed to yet is an ordinary state, and a reader
-                # asking for `include_archive` before the first sync should get
+                # that needs the archive before the first sync should get
                 # a union without that leg — not an error, and not a table
                 # created as a side effect of reading.
                 msg = f"no archive table at {prefix!r} yet"
@@ -1453,3 +1453,8 @@ class LogTable:
 def _local(path: object) -> str:
     """Iceberg records `file://` URIs; the filesystem wants plain paths."""
     return str(path).removeprefix("file://")
+
+
+# The same, for the one caller outside this module: matching a file's manifest
+# entry to the `DataFile` built from it.
+local_path = _local

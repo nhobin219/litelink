@@ -11,6 +11,12 @@ these metrics into the manifests at every commit, so nothing new is written
 and nothing has to be kept in step with seals, compaction, eviction or sync —
 a stored rollup would be a second home for a fact the manifests already hold.
 
+The one exception is deliberate and lives elsewhere: `buffer.db` keeps each
+ARCHIVE file's bounds (`_prune`), because deciding whether a query needs the
+archive must not cost the network round trip it exists to avoid. This module
+still reads the manifests, so it answers from what the archive says rather
+than from that copy.
+
 What pyiceberg records for litelink's files, measured, decides most of it:
 
 - **No NaN counts in the manifests.** Files are registered with `add_files`,

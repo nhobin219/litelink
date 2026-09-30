@@ -1353,18 +1353,38 @@ fsync is 20-50 us against ~1 ms here.
 
 ### Full-stream read — all three tiers
 
-**Opt in at assembly, not per read.** `open(root, name)` reads local files and the buffer;
-`open(root, name, include_archive=True)` reads all three, and `log.with_archive()` derives a
-read-only view of an open handle without a second SQLite connection or catalog load. Which
-tiers a handle reads is fixed for its life, so two `scan()` calls on one handle can never
-disagree.
+**Decided per query, from bounds kept locally (#90).** Every query reads the buffer and the
+local table. The archive leg is added only when some archive file whose offsets reach below
+the local table's `lo` could hold a row the query matches. Each archive file's per-column
+min/max is held in `buffer.db` (`archive_bounds`), so the decision reads local disk and I5
+holds for any query bounded inside the local window.
 
-It was derived from state once — the archive counted as load-bearing exactly when the local
-table held nothing and the archive held something — which meant the same call read local
-files before an eviction pass and object storage after it, with nothing at the call site
-saying so. A read that changes tier changes its latency, its failure modes and its cost; it
-should not do that on a retention schedule. A handle that cannot reach the archive and finds
-its local table empty **refuses** rather than serving the buffer alone.
+The query's WHERE becomes a test on those bounds — `col > K` is `max(col) > K`, `col < K` is
+`min(col) < K`, `col = K` both — evaluated by DuckDB over a relation typed exactly as the
+log's columns, so each comparison binds with the coercions the real predicate would.
+When every comparison is an integer column against a bare integer literal — offsets, and the
+usual integer timestamp — it is decided in pyarrow instead, where integer comparison leaves
+nothing to disagree about: measured at about 0.02 ms against 0.8 ms for a DuckDB statement,
+which was a fifth of a hot read.
+Everything not understood widens the answer: a conjunct that is not a column compared with a
+constant is dropped, any query that is not a single SELECT over `log` alone reads the
+archive, and an unknown bound compares as NULL and counts as a match. A subquery or join over
+`log` would see the pruned relation, which is why those shapes are never narrowed.
+
+The rows' safe direction is overstating. `sync` stages a file's bounds before the register
+that lands it, so a crash leaves a row for a file the archive lacks — a wasted read — never
+the reverse. The one write that narrows replaces the rows with the archive's own manifests,
+under the maintenance claim every archive commit also holds: after `rewrite_archive`, on a
+re-point, at `restore`, and as a backfill at `open` and on the first `sync` for a log written
+before the table existed. A meta row names the archive the rows are complete for; until it
+names the one the log points at, every query reads the archive.
+
+This reverses 0.4.0, which fixed a handle's tiers at assembly (`include_archive`,
+`with_archive()`) so that a read would not start touching the network because eviction ran.
+That rule bought predictability at the price of the caller naming a tier and a handle
+without the archive answering short. Now a query's latency follows its predicates: a bounded
+hot query stays local, and an unbounded one reads history because the whole log is the right
+answer to it.
 
 The archive overlaps the local window, so the tiers cannot simply be unioned. Bound each by
 its neighbour's **actual extent**, read at query time:
@@ -1408,7 +1428,7 @@ knowledge of the local tier.
 
 | knob | governs | too low means |
 |---|---|---|
-| `local_retention` | how much history the local table keeps | hot reads refuse, or need `include_archive=True` |
+| `local_retention` | how much history the local table keeps | hot reads reach the archive |
 | `snapshot_retention` | how long expired snapshots survive | long scans hit deleted files |
 
 `local_retention` must exceed the longest hot-path lookback **with margin** — equal leaves

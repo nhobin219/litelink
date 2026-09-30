@@ -74,8 +74,8 @@ Iceberg engine; see [Reading from another machine](#reading-from-another-machine
 # On the writer's box: a live second view. No archive argument — the log
 # already records where its archive is, and reads come off local disk.
 with litelink.open("data", "trades", read_only=True) as r:
-    r.scan(where="side = 0")          # local: buffer + local Iceberg table
-    r.with_archive().scan()           # the whole history, including the archive
+    r.scan(start_offset=r.end_offset() - 100)   # recent: local disk only
+    r.scan()                          # the whole history, including the archive
     r.coverage()                      # what each tier holds
     r.write_replication_config()      # its replica key IS the primary's
 ```
@@ -305,17 +305,36 @@ re-cut by `rewrite_archive`.
 
 ```python
 log.scan(*, columns=None, where=None, start_offset=None,
-         end_offset=None, include_archive=None) -> pa.RecordBatchReader
-log.sql(query, *, include_archive=False) -> pa.RecordBatchReader
+         end_offset=None) -> pa.RecordBatchReader
+log.sql(query) -> pa.RecordBatchReader
 ```
 
 `scan` unions the tiers and bounds each by its neighbour's committed offset extent, resolved
 from manifest statistics at query time (§7, I3). The tiers overlap by design; the bounds are
 what make each row appear exactly once.
 
-**`include_archive` defaults to `None`, meaning "decide from the tiers".** That resolves to
-False whenever the local table holds files, because a hot read is local disk only and must stay
-that way (I5). Opting in is opting into network I/O.
+**Which tiers a query reads is decided per query, and the caller never names one** (#90).
+Every query reads the buffer and the local table. The archive is read only when a file of it
+below the local table could hold a row the query matches — decided from per-file column bounds
+that `sync` records in `buffer.db`, so the decision is local and a read bounded inside the
+local window never touches the network (I5).
+
+It reads the query's WHERE, and narrows on one shape only: a single `SELECT … FROM log`, no
+joins, CTEs, set operations or subqueries, with comparisons (`=`, `<`, `<=`, `>`, `>=`,
+`BETWEEN`, `IN`) between a column and a constant, AND-ed together. Integer, float and boolean
+columns have bounds; strings, bytes and nested columns do not. Any other part of the WHERE
+constrains nothing, and any other shape reads the archive — correct, and only slower. `scan`
+builds that shape, with `start_offset`/`end_offset` as offset comparisons.
+
+**This reverses 0.4.0**, which fixed the tiers at assembly with `include_archive` and
+`with_archive()`. Both are gone. The trade is stated plainly: latency now follows the
+predicate rather than the handle, so the same unbounded query reads the archive once eviction
+has moved its rows there. A bounded hot query stays local however much has been evicted.
+
+The bounds are recorded before each `sync` registers its files, taken again from the
+archive's manifests after `rewrite_archive`, a re-point and a `restore`, and backfilled at
+`open` for a log written before they existed. Until they are known for the archive the log
+points at, every query reads the archive.
 
 `sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. Both return a
 streaming reader rather than a table: a full-window read with a 400-byte payload column is

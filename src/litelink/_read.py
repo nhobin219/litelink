@@ -16,13 +16,22 @@ import duckdb
 import pyarrow as pa
 
 from litelink._archive import Archive
+from litelink._prune import (
+    BOUNDS_REL,
+    Atom,
+    Condition,
+    condition,
+    integer_columns,
+    relation,
+    stats_columns,
+)
 from litelink._s3 import S3Options
 from litelink._types import column_type
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from litelink._buffer import Buffer
+    from litelink._buffer import Buffer, Shape
     from litelink._layout import Layout
     from litelink._table import LogTable
 
@@ -42,7 +51,7 @@ def secret_sql(options: S3Options) -> str:
 
     Separate from the query path so it can be tested without object storage —
     the fault it exists to prevent only appeared against real AWS, where writes
-    worked and every `include_archive` read came back 403.
+    worked and every read of the archive came back 403.
     """
     parts = ["TYPE s3"]
     if options.access_key is not None and options.secret_key is not None:
@@ -254,11 +263,17 @@ class Reader:
         self._buffer = buffer
         self._connect_to = connect
         # The shared archive object, not a table handle: it opens the table on
-        # first use, so a reader that never passes `include_archive` never
+        # first use, so a reader whose queries the archive cannot answer never
         # touches the network (I5), and `Log.set_archive` re-points this same
         # object rather than leaving the reader holding a stale one.
         self._archive = archive
         self._remote_ready = False
+        # The stored archive bounds, decoded: `(generation, shape, table)`.
+        # Keyed on the generation `buffer.db` bumps at every change and on the
+        # shape the table was typed from, so it is rebuilt exactly when either
+        # moves — decoding a large archive's rows per query would cost more
+        # than the scan it is deciding about.
+        self._bounds: tuple[str | None, Shape, pa.Table] | None = None
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -309,8 +324,8 @@ class Reader:
 
         if not self._remote_ready:
             # Once per connection. `httpfs` is not in the local read path, so a
-            # log that never opts in never pays for it — §7's rule that a hot
-            # read is offline.
+            # log whose queries never need the archive never pays for it — §7's
+            # rule that a hot read is offline.
             load_extension(self._connect(), "httpfs", remote=True)
             self._remote_ready = True
 
@@ -318,8 +333,14 @@ class Reader:
 
         return location, covered
 
-    def query(self, sql: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
+    def query(self, sql: str) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
+
+        **Which tiers it reads is decided here, per query.** The buffer and the
+        local table always; the archive only when its stored bounds say some
+        file below the local table could hold a row `sql` matches — see
+        `_archive_could_match`. So a query bounded inside the local window
+        never touches the network, and one that asks for history reads it.
 
         The relation is rebuilt per call and cannot be held across calls.
         Resolving the table per query is §7's rule, not an optimisation: every
@@ -377,7 +398,11 @@ class Reader:
         # After, it cannot happen. I4 means nothing is evicted before it is
         # registered, so an archive snapshot taken later than the local one
         # holds everything the local one has given up.
-        remote = self._prepare_remote(cursor) if include_archive else None
+        remote = (
+            self._prepare_remote(cursor)
+            if self._archive_could_match(cursor, sql, extent)
+            else None
+        )
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
@@ -389,6 +414,94 @@ class Reader:
         reader = cursor.execute(sql).to_arrow_reader()
 
         return _cast_to(reader, self._schema)
+
+    def _archive_could_match(
+        self,
+        cursor: duckdb.DuckDBPyConnection,
+        sql: str,
+        extent: tuple[int, int] | None,
+    ) -> bool:
+        """Whether the archive leg could contribute a row to `sql` (#90).
+
+        Decided from `buffer.db` alone. The archive leg reads only offsets
+        below the local table's (`_union`), so a file entirely at or above
+        `extent[0]` is out whatever the query says; the rest are tested against
+        `sql`'s WHERE by `_prune.condition`. True when anything is unknown —
+        bounds not yet recorded for this archive, a query the condition cannot
+        narrow, a comparison DuckDB will not bind — because reading the archive
+        when it holds nothing costs a round trip, and skipping it when it holds
+        something costs rows.
+        """
+        archive = self._archive.uri
+        if archive is None:
+            return False
+
+        shape = self._buffer.shape()
+        schema = shape.table
+        bounds = self._stored_bounds(archive, shape)
+        if bounds is None:
+            return True
+
+        if bounds.num_rows == 0:
+            return False
+
+        columns = stats_columns(schema)
+        narrowed = condition(cursor, sql, columns, integer_columns(schema))
+        tests = Condition(()) if narrowed is None else narrowed
+        if extent is not None:
+            # The archive leg reads only below the local table's first offset.
+            low = int(extent[0])
+            tests = tests.also(((Atom(f"lo_{columns[OFFSET]}", "<", str(low), low),),))
+
+        if not tests.terms:
+            return True
+
+        if tests.exact:
+            # Integers against integers, where no engine can disagree — and
+            # the common case, since `scan` bounds on offsets and a leading
+            # sort column is usually an integer timestamp.
+            return tests.holds_for_any(bounds)
+
+        cursor.register(BOUNDS_REL, bounds)
+        try:
+            row = cursor.execute(
+                f"SELECT EXISTS (SELECT 1 FROM {BOUNDS_REL} WHERE {tests.sql()})"
+            ).fetchone()
+        except duckdb.Error:
+            # A comparison the real query would also refuse to bind. Let it
+            # refuse there, with its own message.
+            return True
+        finally:
+            cursor.unregister(BOUNDS_REL)
+
+        return row is None or bool(row[0])
+
+    def _stored_bounds(self, archive: str, shape: Shape) -> pa.Table | None:
+        """The archive's file bounds as a relation, or None when not known.
+
+        Not known means `buffer.db` does not hold them complete for THIS
+        archive: a log written before they existed and not yet backfilled, or
+        one re-pointed since.
+        """
+        complete_for, generation = self._buffer.archive_bounds_version()
+        if complete_for != archive:
+            return None
+
+        # Keyed on the `Shape` by identity: `shape()` hands back the same object
+        # until the stored schema changes. Its `.table` is built per access, so
+        # keying on that missed every time and decoded the bounds per query.
+        cached = self._bounds
+        if cached is not None and cached[0] == generation and cached[1] is shape:
+            return cached[2]
+
+        complete_for, generation, stored = self._buffer.archive_bounds()
+        if complete_for != archive:
+            return None
+
+        table = relation(shape.table, stored)
+        self._bounds = (generation, shape, table)
+
+        return table
 
     def _union(
         self,

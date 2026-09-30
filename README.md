@@ -109,8 +109,8 @@ That costs ~124 MB. Run `python -m litelink` to check a machine before you rely 
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
-             s3=None, include_archive=False, start_offset=1)     -> WriteHandle
-litelink.open(root, name, *, s3=None, include_archive=False)       -> WriteHandle
+             s3=None, start_offset=1)                            -> WriteHandle
+litelink.open(root, name, *, s3=None)                              -> WriteHandle
 litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
 litelink.restore(root, name, *, archive, s3=None, ...)             -> WriteHandle
 litelink.validate_row(schema, row)                                 # raises as append would
@@ -119,7 +119,7 @@ litelink.preflight(...)                                            # what python
 # Every handle reads:
     log.scan(*, columns=None, where=None, start_offset=None, end_offset=None)
     log.sql(query)                                  # the log is `log`; both stream Arrow
-    log.with_archive() · log.column_statistics(*, tier=None) · log.coverage()
+    log.column_statistics(*, tier=None) · log.coverage()
     log.end_offset() · buffered_rows() · table_rows() · table_files() · archived_through()
     log.schema · sort_by · config · archive
 
@@ -177,18 +177,23 @@ return a `pa.RecordBatchReader` rather than a table, so materialising is yours t
 reader can open the same log alongside a live writer with
 `litelink.open("data", "trades", read_only=True)`.
 
-**A handle reads local files unless you say otherwise.** `include_archive=True` on the
-open (or `log.with_archive()`, which derives a read-only view of an open handle without a
-second connection) is what reaches object storage:
+**litelink decides which tiers a query reads.** Every query reads the buffer and the local
+table; the archive is read only when some archived file below the local table could hold a
+matching row. That is decided from each archive file's column bounds, which `sync` records in
+`buffer.db`, so the decision itself never touches the network:
 
 ```python
-log.scan(...)                       # local files and the buffer
-log.with_archive().scan(...)        # the whole history, including the archive
+log.scan(where="event_ts > 1787772000000000")   # recent: local disk only
+log.scan(where="event_ts < 1700000000000000")   # history: reads the archive too
+log.scan()                                      # the whole log
 ```
 
-A handle that cannot reach the archive and finds its local table empty refuses rather than
-returning the buffer alone. `column_statistics()` gives every column's bounds and
-counts from the manifests, without opening a data file.
+So a query's latency follows its predicates. Bound it on a leading column of `sort_by` and a
+recent window stays local; leave it unbounded and it reads every tier, because the whole log
+is the right answer. Anything the decision cannot read — an OR, a subquery, a comparison with
+something other than a constant — reads the archive rather than risk skipping a row.
+`column_statistics()` gives every column's bounds and counts from the manifests, without
+opening a data file.
 
 ## Reading from another machine
 

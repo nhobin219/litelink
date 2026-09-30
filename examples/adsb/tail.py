@@ -82,7 +82,7 @@ class ScanCost:
         started = time.monotonic()
         # `read_all`, not a count: a count is answered from statistics without
         # opening a data file, which would measure the wrong thing entirely.
-        source = log.with_archive() if archived else log
+        source = log if archived else log
         self.rows = source.scan().read_all().num_rows
         self.seconds = time.monotonic() - started
 

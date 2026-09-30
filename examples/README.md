@@ -88,9 +88,9 @@ chain, so a profile, instance metadata or SSO all work untouched. That is delibe
 credentials never enter `LogConfig`, because a log directory gets copied, backed up and
 attached elsewhere, and a key inside it travels with all of that.
 
-The reader needs the same environment, since `include_archive=True` reaches object
-storage. Without it, `scan()` still works — it is local disk only, which is what makes a
-hot read a hot read.
+The reader needs the same environment whenever a query reaches back into the archive. A
+query bounded inside the local window reads local disk only and needs no credentials, which
+is what makes a hot read a hot read.
 
 ## Continuous RPO
 
