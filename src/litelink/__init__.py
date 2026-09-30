@@ -34,7 +34,9 @@ where the reasoning lives.
 
 from importlib.metadata import PackageNotFoundError, version
 
+from litelink import manifest
 from litelink._assembly import new, open, restore  # noqa: A004
+from litelink._buffer import RetiredError
 from litelink._preflight import Check, Report, preflight
 from litelink._s3 import S3Options
 from litelink._statistics import ColumnStatistics, Tier, TierStatistics
@@ -61,12 +63,14 @@ __all__ = [
     "LogConfig",
     "LogHandle",
     "Report",
+    "RetiredError",
     "Row",
     "S3Options",
     "Tier",
     "TierStatistics",
     "WriteHandle",
     "__version__",
+    "manifest",
     "new",
     "open",
     "preflight",

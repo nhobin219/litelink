@@ -1,4 +1,4 @@
-"""Which tiers a query reads, decided from the log's tier manifest (#90).
+"""Which tiers a query reads, decided from the tier statistics (#90).
 
 Two halves. Turning a query into manifest terms — DuckDB's parse, and each
 constant converted the way DuckDB compares it — needs no object storage and is
@@ -16,16 +16,15 @@ from typing import TYPE_CHECKING
 
 import duckdb
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 import litelink
 from litelink._layout import Layout
 from litelink._prune import terms
 from litelink._read import Reader
-from litelink._table import LogTable
-from litelink._tiers import ARCHIVE, LOCAL, TierManifest
-from litelink.log import OFFSET
+from litelink._statistics import TierStatistics
+from litelink._tiers import ArchiveTier
+from litelink.log import OFFSET, LogHandle
 from litelink.manifest import build, prune
 from tests.test_archive import ROWS, archived_log, rows
 from tests.test_manifest import row
@@ -139,19 +138,49 @@ def test_a_value_is_what_duckdb_compares_against(
     assert (kept == ["unit"]) == bool(returned[0]), (found, returned)
 
 
-def test_the_manifest_is_a_parquet_file_beside_the_log(tmp_path: Path) -> None:
-    """`<name>.manifest.parquet`, readable by anything that reads Parquet."""
+def test_a_log_without_an_archive_knows_the_archive_holds_nothing(
+    tmp_path: Path,
+) -> None:
+    """Known empty from birth, so no query ever includes a leg it cannot read."""
+    schema = pa.schema([pa.field("x", pa.int64())])
+    with litelink.new(tmp_path, "trades", schema=schema) as log:
+        found = log._tiers.load()  # noqa: SLF001
+
+    assert found is not None
+    assert found.record_count == 0
+
+
+def test_local_statistics_are_of_the_snapshot_a_read_resolved(
+    tmp_path: Path,
+) -> None:
+    """The local row comes from the snapshot being scanned, or not at all.
+
+    A read holding an older pointer gets None — "read the local tier" —
+    rather than a newer snapshot's rollup, which could leave out rows the
+    older snapshot still serves.
+
+    Falsify by dropping the pointer check in `LogTable.statistics_at`: the
+    stale pointer gets the newer rollup.
+    """
     schema = pa.schema([pa.field("x", pa.int64())])
     with litelink.new(tmp_path, "trades", schema=schema) as log:
         log.extend({"x": i} for i in range(10))
         log.seal()
+        table = log._table  # noqa: SLF001
+        table.reload()
+        first = table.metadata_location
+        before = table.statistics_at(first)
+        assert before is not None
+        assert before["x"].max == 9
 
-    table = pq.read_table(tmp_path / "trades" / "trades.manifest.parquet")
-    found = {r["tier"]: r for r in table.to_pylist()}
+        log.extend({"x": i} for i in range(10, 20))
+        log.seal()
+        table.reload()
 
-    assert found[LOCAL]["x"]["min"] == 0
-    assert found[LOCAL]["x"]["max"] == 9
-    assert found[ARCHIVE]["record_count"] == 0, "no archive: known empty"
+        assert table.statistics_at(first) is None
+        after = table.statistics_at(table.metadata_location)
+        assert after is not None
+        assert after["x"].max == 19
 
 
 # -- against a real archive ---------------------------------------------------
@@ -195,11 +224,9 @@ class Remote:
         monkeypatch.setattr(Reader, "_prepare_remote", counted)
 
 
-def rows_of(tmp_path: Path) -> dict[str, dict]:
-    table = TierManifest(Layout(tmp_path, "s")).load()
-    assert table is not None
-
-    return {r["tier"]: r for r in table.to_pylist()}
+def archive_row(log: LogHandle) -> TierStatistics | None:
+    """The archive's stored tier row, as statistics — or None."""
+    return ArchiveTier(log._buffer).load()  # noqa: SLF001
 
 
 @pytest.mark.s3
@@ -304,75 +331,35 @@ def test_a_pruned_read_returns_what_reading_every_tier_returns(
 
 
 @pytest.mark.s3
-def test_the_tier_rows_describe_what_each_tier_holds(
+def test_the_archive_row_describes_what_eviction_moved_below_the_local_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """After sync and eviction: the local row covers the local table, and the
-    archive row covers what eviction moved below it — not the whole archive.
+    """Every evicted offset, and not the archive's copy of the local window.
 
-    Falsify by removing the `widen(ARCHIVE, …)` in `Maintenance.evict`: the
-    archive row never grows past what the first sync computed.
+    Falsify by removing the `widen` in `Maintenance.evict`: the archive row
+    stays as the first sync computed it, before anything was evicted.
     """
     with evicted(tmp_path, bucket, s3) as log:
         extent = log.table_extent()
         assert extent is not None
-        found = rows_of(tmp_path)
+        found = archive_row(log)
+        assert found is not None
 
-        archive = found[ARCHIVE]
-        assert archive[OFFSET]["min"] == 1
-        assert archive[OFFSET]["max"] >= extent[0] - 1, "covers every evicted row"
-        assert archive["event_ts"]["max"] < ROWS - 1, "not the archive's local copies"
-
-        local = found[LOCAL]
-        assert local[OFFSET]["min"] <= extent[0]
-        assert local[OFFSET]["max"] >= extent[1]
+        assert found[OFFSET].min == 1
+        assert found[OFFSET].max >= extent[0] - 1, "covers every evicted row"
+        assert found["event_ts"].max < ROWS - 1, "not the archive's local copies"
 
 
 @pytest.mark.s3
-def test_every_register_widens_the_local_row_before_it_commits(
+def test_a_log_without_an_archive_row_reads_the_archive_until_backfilled(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The ordering the local row's soundness rests on.
+    """A log written before the row existed: correct at once, local after the
+    writer's next `open`.
 
-    At the moment each register commits, the local row must already cover the
-    file — a reader that resolves the table just after would otherwise skip
-    the local tier for rows only it holds.
-
-    Falsify by moving the `before_add` call in `LogTable.register` after
-    `self._commit(add)`.
-    """
-    covered: list[int] = []
-    original = LogTable._commit  # noqa: SLF001
-
-    def commit(table: LogTable, operation):  # noqa: ANN001, ANN202
-        if table.before_add is not None:
-            covered.append(rows_of(tmp_path)[LOCAL][OFFSET]["max"] or 0)
-
-        return original(table, operation)
-
-    with archived_log(tmp_path, bucket, s3) as log:
-        monkeypatch.setattr(LogTable, "_commit", commit)
-        for step in range(3):
-            log.extend(rows(ROWS // 4))
-            log.seal()
-            committed = log.table_extent()
-            assert committed is not None
-            assert covered, "no local commit was observed"
-            assert covered[-1] >= committed[1], (
-                f"seal {step} committed ahead of its row"
-            )
-
-
-@pytest.mark.s3
-def test_a_log_without_a_manifest_reads_every_tier_until_backfilled(
-    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A log written before the manifest existed: correct at once, local after
-    the writer's next `open`.
-
-    Forged by deleting the file. A reader cannot trust what is not there, so
-    it reads the archive for every query; the writer's `open` backfills from
-    the manifests, and the same hot read is local again.
+    Forged by deleting the row. A reader cannot trust what is not there, so it
+    reads the archive for every query; the writer's `open` backfills from the
+    archive's manifests, and the same hot read is local again.
 
     Falsify by removing `_backfill_manifest` from `litelink.open`: the last
     read reaches the archive.
@@ -382,8 +369,8 @@ def test_a_log_without_a_manifest_reads_every_tier_until_backfilled(
         assert extent is not None
         low = extent[0]
 
-    manifest = TierManifest(Layout(tmp_path, "s"))
-    manifest.path.unlink()
+    with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
+        forged.execute("DELETE FROM meta WHERE k = 'archive_tier'")
 
     remote = Remote(monkeypatch, refuse=False)
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
@@ -391,8 +378,7 @@ def test_a_log_without_a_manifest_reads_every_tier_until_backfilled(
         assert remote.calls == 1, "no manifest must read the archive"
 
     with litelink.open(tmp_path, "s", s3=s3) as writer:
-        assert manifest.has(LOCAL)
-        assert manifest.has(ARCHIVE)
+        assert writer._tiers.has()  # noqa: SLF001
         assert writer.scan(start_offset=low).read_all().num_rows == ROWS - low + 1
         assert remote.calls == 1, "backfilled, the hot read is local again"
 
@@ -414,29 +400,32 @@ def test_repointing_forgets_the_archive_row(
         original = log.archive
         assert original is not None
 
-        before = rows_of(tmp_path)[ARCHIVE]
-        assert before["record_count"] > 0
+        before = archive_row(log)
+        assert before is not None and before.record_count
 
         log.set_archive(f"s3://{bucket}/elsewhere")
-        assert rows_of(tmp_path)[ARCHIVE]["record_count"] == 0
+        fresh = archive_row(log)
+        assert fresh is not None and fresh.record_count == 0
 
         log.set_archive(original)
-        assert rows_of(tmp_path)[ARCHIVE][OFFSET] == before[OFFSET]
+        again = archive_row(log)
+        assert again is not None and again[OFFSET] == before[OFFSET]
         assert log.scan().read_all().num_rows == ROWS
 
         log.set_archive(f"s3://{bucket}-nonexistent/prefix")
-        assert ARCHIVE not in rows_of(tmp_path)
+        assert archive_row(log) is None
 
 
 @pytest.mark.s3
-def test_a_restore_computes_both_rows_from_what_it_rebuilt(
+def test_a_restore_computes_the_archive_row_from_the_archive(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """After a failover the local table is empty and the archive is all of
-    history, so the archive row must cover every archived offset.
+    history, so the archive row must cover every archived offset — taken from
+    the archive, not from the replica's copy, which lags it.
 
-    Falsify by removing `_backfill_manifest` from `restore`: the rows are
-    dropped and nothing computes them.
+    Falsify by removing `_backfill_manifest` from `restore`: the row is
+    dropped and nothing computes it.
     """
     where = f"s3://{bucket}/prefix"
     primary = tmp_path / "primary"
@@ -461,8 +450,8 @@ def test_a_restore_computes_both_rows_from_what_it_rebuilt(
         archived = log.archived_through()
 
     with litelink.restore(second, "s", archive=where, s3=s3) as revived:
-        found = rows_of(second)
-        assert found[ARCHIVE][OFFSET]["max"] == archived
-        assert found[LOCAL]["record_count"] == 0
+        found = archive_row(revived)
+        assert found is not None
+        assert found[OFFSET].max == archived
         late = revived.scan(where=f"event_ts >= {ROWS}").read_all()
         assert late.num_rows == 50

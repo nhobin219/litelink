@@ -7,6 +7,7 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import json
 import random
 import sqlite3
 import threading
@@ -28,6 +29,7 @@ from pyiceberg.transforms import IdentityTransform
 from litelink._fs import fsync
 from litelink._predicates import offset_at_or_below, offset_between
 from litelink._s3 import S3Options
+from litelink._statistics import TierStatistics, rollup
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -301,6 +303,30 @@ def archive_extent(
     return LogTable(None, layout, table, prefix).extent()  # ty: ignore
 
 
+# The archive table property `retire()` sets: JSON `{"through": …, "at": …}`.
+RETIRED_PROPERTY = "litelink.retired"
+
+
+def archive_retired(
+    layout: Layout, prefix: str, options: S3Options
+) -> dict[str, object] | None:
+    """The retirement the archive at `prefix` records, read from the bucket alone.
+
+    Like `archive_extent`: the published pointer, then the metadata it names,
+    with no catalog involved — so `restore` can ask before it builds anything.
+    None when the archive has no hint or records no retirement.
+    """
+    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    raw = table.properties.get(RETIRED_PROPERTY)
+
+    return None if raw is None else json.loads(raw)
+
+
 def archive_columns(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[str, ...] | None:
@@ -340,10 +366,6 @@ class LogTable:
         table: Table,
         warehouse: str | None = None,
     ) -> None:
-        # Called with the paths of every `register`, before its commit. The
-        # writer sets it on the LOCAL table to widen the tier manifest's row
-        # (#90); the archive table and a reader's leave it None.
-        self.before_add: Callable[[Sequence[str]], None] | None = None
         """Take the loaded table. `create` and `load` are what load it.
 
         Assigning only, so that a caller holding a `Table` from anywhere — a
@@ -392,6 +414,11 @@ class LogTable:
         # list, and a `maintain` pass asks three times over.
         self._files_at: str | None = None
         self._files: list[DataFile] = []
+        # Every column's rollup, for tier selection (#90), against the same
+        # pointer — so the statistics a read decides on are the snapshot it
+        # reads, and are computed once per commit rather than per query.
+        self._statistics_at: str | None = None
+        self._statistics: TierStatistics | None = None
         self._file_count = 0
         self._record_count = 0
 
@@ -992,6 +1019,24 @@ class LogTable:
 
         return None if not lows else (min(lows), max(highs))
 
+    def statistics_at(self, location: str) -> TierStatistics | None:
+        """Every column's rollup over the snapshot at `location`, or None.
+
+        None when the table has moved past `location`: the statistics a read
+        decides on must be of the snapshot it reads, and a caller holding an
+        older pointer gets "unknown" rather than a newer snapshot's rollup.
+        Unknown includes the tier, which is the safe answer.
+        """
+        with self._lock:
+            if self.metadata_location != location:
+                return None
+
+            if self._statistics_at != location:
+                self._statistics = rollup("local", *self.live_files())
+                self._statistics_at = location
+
+            return self._statistics
+
     def live_files(self) -> tuple[Schema, list[IcebergDataFile]]:
         """The current snapshot's schema and live data files, with metrics.
 
@@ -1306,10 +1351,6 @@ class LogTable:
         deletion, or it is a file on disk that nothing records.
         """
         added = True
-        if self.before_add is not None:
-            # Before the commit, and once rather than per attempt: the tier
-            # manifest's row must never claim less than the table (#90).
-            self.before_add(paths)
 
         def add() -> None:
             nonlocal added
@@ -1452,6 +1493,10 @@ class LogTable:
             return
 
         self._commit(lambda: self._set_properties(missing))
+
+    def set_properties(self, properties: dict[str, str]) -> None:
+        """Commit table properties, publishing the pointer like any commit."""
+        self._commit(lambda: self._set_properties(properties))
 
     def _set_properties(self, properties: dict[str, str]) -> None:
         with self._table.transaction() as transaction:

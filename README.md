@@ -125,7 +125,7 @@ litelink.preflight(...)                                            # what python
 # Every handle reads:
     log.scan(*, columns=None, where=None, start_offset=None, end_offset=None)
     log.sql(query)                                  # the log is `log`; both stream Arrow
-    log.column_statistics(*, tier=None) · log.coverage()
+    log.column_statistics(*, tier=None) · log.coverage()   # tier: local|archive|buffer|None
     log.end_offset() · buffered_rows() · table_rows() · table_files() · archived_through()
     log.schema · sort_by · config · archive
 
@@ -135,6 +135,7 @@ litelink.preflight(...)                                            # what python
     log.ingest(table_or_reader)                     # Arrow straight to Parquet
     log.seal_due() · log.maintain()                 # seal; compact, evict, expire
     log.sync(*, push_unsettled=False)               # push to the archive
+    log.retire()                                    # end the log: all archived, none local
     log.set_config(...) · set_archive(...) · set_sort_by(..., rewrite=True) · add_column(...)
 ```
 
@@ -185,9 +186,9 @@ reader can open the same log alongside a live writer with
 
 **litelink decides which tiers a query reads.** Every query reads the buffer and the local
 table; the archive is read only when some archived file below the local table could hold a
-matching row. That is decided from the log's tier manifest, `<name>.manifest.parquet` beside
-it, which holds each tier's per-column bounds, so the decision itself never touches the
-network:
+matching row. That is decided from per-column bounds for each tier — the local table's from
+its own Iceberg manifests, the archive's kept in `buffer.db` — so the decision itself never
+touches the network:
 
 ```python
 log.scan(where="event_ts > 1787772000000000")   # recent: local disk only
@@ -199,8 +200,13 @@ So a query's latency follows its predicates. Bound it on a leading column of `so
 recent window stays local; leave it unbounded and it reads every tier, because the whole log
 is the right answer. Anything the decision cannot read — an OR, a subquery, a comparison with
 something other than a constant — reads the archive rather than risk skipping a row.
-`column_statistics()` gives every column's bounds and counts from the manifests, without
-opening a data file.
+`column_statistics(tier=…)` gives every column's bounds and counts without opening a data
+file, per tier (`"local"`, `"archive"` below it, `"buffer"`) or for the whole log.
+
+**`retire()` ends a log for good.** It pushes every row to the archive, empties the local
+table, and records the retirement in `buffer.db` and on the archive table. After that the log
+opens for reading only, and `append`, a writer `open` and `restore` all refuse, naming the
+offset the next log should start at.
 
 ## Reading from another machine
 

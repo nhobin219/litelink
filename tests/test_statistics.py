@@ -257,19 +257,31 @@ def test_the_tier_must_be_named_and_the_archive_must_exist(tmp_path: Path) -> No
         with pytest.raises(ValueError, match="no archive"):
             log.column_statistics(tier="archive")
 
-        with pytest.raises(ValueError, match="'local', 'archive' or None"):
-            log.column_statistics(tier="buffer")  # ty: ignore[invalid-argument-type]
+        with pytest.raises(ValueError, match="'local', 'archive', 'buffer' or None"):
+            log.column_statistics(tier="nearline")  # ty: ignore[invalid-argument-type]
 
 
-def test_the_buffer_is_not_in_either_tier(tmp_path: Path) -> None:
-    """Buffered rows have no bounds until a seal writes them."""
+def test_buffered_rows_are_their_own_tier(tmp_path: Path) -> None:
+    """Buffered rows are in `"buffer"`, not in `"local"`, until a seal writes
+    them — and the three tiers add up to the whole log. The case where a seal
+    KEEPS its rows in the buffer needs an archive; see
+    `test_the_statistics_tiers_partition_the_log`.
+    """
     with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
-        log.append({"k": 1})
+        log.extend({"k": i} for i in range(10))
+        log.seal()
+        log.extend({"k": i} for i in range(10, 13))
 
-        stats = log.column_statistics(tier="local")
+        local = log.column_statistics(tier="local")
+        buffered = log.column_statistics(tier="buffer")
+        whole = log.column_statistics()
 
-        assert (stats.record_count, stats.file_count) == (0, 0)
-        assert stats["k"].min is None
+        assert (local.record_count, local["k"].max) == (10, 9)
+        assert buffered.tier == "buffer"
+        assert (buffered.record_count, buffered["k"].min) == (3, 10)
+        assert local.record_count is not None
+        assert buffered.record_count is not None
+        assert whole.record_count == local.record_count + buffered.record_count
 
 
 _WITH_OFFSET = Schema(

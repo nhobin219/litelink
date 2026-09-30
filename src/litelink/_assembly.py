@@ -100,6 +100,13 @@ def open(  # noqa: A001
     table, schema = _existing(layout, name, readonly=read_only)
     buffer = Buffer.open(layout.buffer_db, schema, readonly=read_only)
     try:
+        # A retired log opens for reading only. One still RETIRING opens as a
+        # writer, so `retire()` can be called again to finish it — its buffer
+        # takes no rows meanwhile.
+        retired = buffer.retired()
+        if not read_only and retired is not None and retired.get("state") == "retired":
+            raise buffer.retired_error()
+
         config = _validated_shape(layout, buffer, name)
         remote = Archive(layout, buffer, s3)
         reader = Reader(layout, table, buffer, duckdb_connection, archive=remote)

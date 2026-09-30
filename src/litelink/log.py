@@ -36,10 +36,12 @@ from pyiceberg.exceptions import TableAlreadyExistsError
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import (
     INTENT_KEY,
+    RETIRED_KEY,
     SCHEMA_KEY,
     SORT_KEY,
     START_OFFSET_KEY,
     Buffer,
+    RetiredError,
     RowProbe,
     Shape,
 )
@@ -54,22 +56,29 @@ from litelink._maintenance import (
     stable_prefix,
 )
 from litelink._read import Reader, duckdb_connection
-from litelink._replication import litestream_config, restore_buffer
+from litelink._replication import flush, litestream_config, restore_buffer
 from litelink._s3 import S3Options
-from litelink._statistics import Tier, TierStatistics, _offsets, rollup, whole_log
+from litelink._statistics import (
+    Tier,
+    TierStatistics,
+    _from_rows,
+    _offsets,
+    above,
+    below_local,
+    local_span,
+    rollup,
+    uncounted,
+    whole_log,
+)
 from litelink._table import (
+    RETIRED_PROPERTY,
     LogTable,
     archive_columns,
     archive_extent,
+    archive_retired,
     forget_archive_entry,
 )
-from litelink._tiers import (
-    ARCHIVE,
-    LOCAL,
-    TierManifest,
-    empty,
-    footer_statistics,
-)
+from litelink._tiers import ArchiveTier, empty
 from litelink._types import NON_FINITE, column_type, validate_schema
 
 if TYPE_CHECKING:
@@ -339,6 +348,11 @@ def _foreign_archive(archive: str) -> ValueError:
         f"that log here use litelink.restore; to start a new one, point at an unused "
         f"prefix"
     )
+
+
+def _now() -> str:
+    """A timestamp for a marker a person will read."""
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _repointed_mid_push() -> RuntimeError:
@@ -687,39 +701,44 @@ class LogHandle:
     def column_statistics(self, *, tier: Tier | None = None) -> TierStatistics:
         """Per-column min, max and counts, opening no data file.
 
-        `tier=None`, the default, is the whole log: the local table, what the
-        archive holds beyond it, and the buffer, each row taken from one place
-        — see `_statistics.whole_log` for how, and for the one layout whose
-        counts it cannot separate. `"local"` and `"archive"` are one tier's
-        current snapshot alone, and neither includes the buffer.
+        The tiers partition the log — each row counted in exactly one — and
+        together they are `tier=None`, the whole log:
+
+        - `"local"`: the local Iceberg table's current snapshot.
+        - `"archive"`: what the archive holds BELOW the local table, the rows
+          eviction moved there. Not the archive's copy of the local window,
+          which `"local"` already counts. Read from the archive's manifests,
+          so it asks the network. A log with nothing local (retired, or
+          evicted dry) has the whole archive here.
+        - `"buffer"`: the buffered rows above every file, counted from the
+          rows themselves.
 
         Files are rolled up from their Iceberg manifests; buffered rows, which
         no file holds yet, are counted directly. A consumer prunes on this, so
         missing information is None rather than a narrower bound — see
         `ColumnStatistics` for exactly when, including why a float's bounds say
-        nothing about NaN and why strings carry none.
+        nothing about NaN and why strings carry none. An archive file that
+        straddles the local range (only `rewrite_archive` cuts one) makes
+        every count None in `"archive"` and in the whole log: its bounds hold,
+        but its rows cannot be counted once without opening it.
         """
-        if tier == "local":
-            self._table.reload()
-
-            return rollup("local", *self._table.live_files())
-
-        if tier == "archive":
-            archive = self._archive.table()
-            if archive is None:
-                msg = f"log {self.name!r} has no archive to take statistics from"
-                raise ValueError(msg)
-
-            try:
-                archive.reload()
-
-                return rollup("archive", *archive.live_files())
-            except FileNotFoundError as exc:
-                raise self._swept(exc) from exc
-
-        if tier is not None:
-            msg = f"tier must be 'local', 'archive' or None, not {tier!r}"
+        if tier is not None and tier not in ("local", "archive", "buffer"):
+            msg = f"tier must be 'local', 'archive', 'buffer' or None, not {tier!r}"
             raise ValueError(msg)
+
+        if tier == "local":
+            # Through the cache routing uses, so the same snapshot is rolled
+            # up once whichever asks first.
+            self._table.reload()
+            location = self._table.metadata_location
+            found = self._table.statistics_at(location)
+            if found is None:
+                # The table moved between the reload and the ask: roll up the
+                # snapshot it is at now.
+                self._table.reload()
+                return rollup("local", *self._table.live_files())
+
+            return found
 
         # The order a read resolves its legs in, and for the same reason. The
         # buffer FIRST: a seal lands its file and then deletes the rows, so a
@@ -729,7 +748,15 @@ class LogHandle:
         # has already given up.
         buffered = self._buffer.rows_above(None)
         self._table.reload()
-        local = self._table.live_files()
+        local_schema, local_files = self._table.live_files()
+        span = local_span(local_schema, local_files)
+
+        if tier == "buffer" and (span is not None or not self._archive.configured()):
+            # With local files, nothing in the archive reaches above them, so
+            # the buffer's part needs no network read.
+            ceiling = 0 if span is None else span[1]
+            return self._retier("buffer", _from_rows(above(buffered, ceiling)))
+
         remote = None
         archive = self._archive.table()
         if archive is not None:
@@ -739,7 +766,40 @@ class LogHandle:
             except FileNotFoundError as exc:
                 raise self._swept(exc) from exc
 
-        return whole_log((OFFSET, *self.schema.names), local, remote, buffered)
+        if tier is None:
+            return whole_log(
+                (OFFSET, *self.schema.names),
+                (local_schema, local_files),
+                remote,
+                buffered,
+            )
+
+        beyond: list = []
+        straddles = False
+        ceiling = 0 if span is None else span[1]
+        if remote is not None:
+            beyond, straddles = below_local(span, remote[0], remote[1])
+            ceiling = max([ceiling, *(_offsets(remote[0], f)[1] for f in beyond)])
+
+        if tier == "buffer":
+            return self._retier("buffer", _from_rows(above(buffered, ceiling)))
+
+        if remote is None:
+            msg = f"log {self.name!r} has no archive to take statistics from"
+            raise ValueError(msg)
+
+        found = rollup("archive", remote[0], beyond)
+
+        return uncounted(found) if straddles else found
+
+    @staticmethod
+    def _retier(tier: Tier, statistics: TierStatistics) -> TierStatistics:
+        return TierStatistics(
+            tier=tier,
+            record_count=statistics.record_count,
+            file_count=statistics.file_count,
+            columns=statistics.columns,
+        )
 
     def coverage(self) -> Coverage:
         """What this reader can serve, and where it cannot.
@@ -1071,10 +1131,9 @@ class WriteHandle(LocalReadHandle):
         # trace once the sequence has moved, and the recovered count is
         # indistinguishable from ordinary buffered rows a second later.
         self._restored_from: _Recovery | None = None
-        # The tier manifest (#90), and the hook that keeps its local row ahead
-        # of the table: every register that adds rows widens it first.
-        self._tiers = TierManifest(layout)
-        table.before_add = self._widen_local
+        # The tier manifest (#90): the archive's row, which eviction widens
+        # and a rollup under the whole-log claim replaces.
+        self._tiers = ArchiveTier(buffer)
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
         # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
@@ -1298,14 +1357,12 @@ class WriteHandle(LocalReadHandle):
             archive=remote,
         )
 
-        # Both tiers are known exactly at birth: the local table is empty, and
-        # so is the archive beyond it — unless there IS an archive, which the
-        # check above may have been unable to reach. Its row then waits for
-        # the first sync.
-        table_schema_ = buffer.shape().table
-        log._tiers.replace(LOCAL, table_schema_, empty(table_schema_))
+        # With no archive there is nothing below the local table, known at
+        # birth. With one, the check above may have been unable to reach it,
+        # so its row waits for the first sync.
         if archive is None:
-            log._tiers.replace(ARCHIVE, table_schema_, empty(table_schema_))
+            table_schema_ = buffer.shape().table
+            log._tiers.replace(table_schema_, empty(table_schema_))
 
         return log
 
@@ -1661,6 +1718,20 @@ class WriteHandle(LocalReadHandle):
         # instead of 1061. The next sync then commits onto that lineage and
         # republishes the hint over it, destroying the pointer this recovery
         # depends on. Dropped so adoption is the only path.
+        # Retired logs are not taken over. Both records are asked, because each
+        # can be missing where the other is not: the replica's marker ships
+        # only when the sidecar does, and a log retired before the archive
+        # property existed has only the marker.
+        marker = Buffer.peek_meta(layout.buffer_db, RETIRED_KEY)
+        if marker is not None:
+            raise RetiredError.of(json.loads(marker), name)
+
+        recorded_retirement = archive_retired(layout, archive, options)
+        if recorded_retirement is not None:
+            raise RetiredError.of(
+                {"state": "retired", "archive": archive, **recorded_retirement}, name
+            )
+
         forget_archive_entry(layout)
 
         # The shape comes from `meta`, which the restored buffer carries: the
@@ -1822,13 +1893,11 @@ class WriteHandle(LocalReadHandle):
 
         log = cls.open(layout.root, name, s3=options)
 
-        # Both tier rows taken afresh. The local table was rebuilt empty and
+        # The archive's row taken afresh. The local table was rebuilt empty and
         # every archive file now sits below it, so nothing a manifest said
-        # before the failover describes either tier. If the archive cannot be
-        # read now, its row stays missing and every query reads it until a
-        # sync can compute one.
-        log._tiers.drop(LOCAL)
-        log._tiers.drop(ARCHIVE)
+        # before the failover describes it. If the archive cannot be read now,
+        # the row stays missing and every query reads it until a sync can.
+        log._tiers.drop()
         log._backfill_manifest()
 
         # REWRITTEN, now that the policy is back. The config above had to be
@@ -2223,7 +2292,7 @@ class WriteHandle(LocalReadHandle):
         # this on every restart. Compared against the durable location, which
         # nothing else can move while this holds the claim.
         if (self._archive.location() or None) != normalised:
-            self._tiers.drop(ARCHIVE)
+            self._tiers.drop()
 
         self._buffer.set_meta_moved(
             _ARCHIVE_KEY,
@@ -2252,13 +2321,13 @@ class WriteHandle(LocalReadHandle):
                 # And the new archive's tier row, while the claim is held, so
                 # reads stop fetching it for every query. Best effort like the
                 # repair: the first sync does it otherwise.
-                if repaired is not None and not self._tiers.has(ARCHIVE):
+                if repaired is not None and not self._tiers.has():
                     self._record_archive_row(repaired)
 
-        if not self._archive.configured() and not self._tiers.has(ARCHIVE):
+        if not self._archive.configured() and not self._tiers.has():
             # Detached: no archive leg is read, and a later attach drops this.
             schema = self._buffer.shape().table
-            self._tiers.replace(ARCHIVE, schema, empty(schema))
+            self._tiers.replace(schema, empty(schema))
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, re-clustering every file the local table owns.
@@ -2609,6 +2678,11 @@ class WriteHandle(LocalReadHandle):
         Returns None for a source with no rows, which is the one answer a range
         cannot express.
         """
+        # Asked here as well as by the buffer's trigger: a load writes Parquet
+        # straight into the table and never inserts a buffer row.
+        if self._buffer.retired() is not None:
+            raise self._buffer.retired_error()
+
         shape = self._buffer.shape()
         reader = source.to_reader() if isinstance(source, pa.Table) else source
         _refuse_foreign_schema(reader.schema, shape.schema)
@@ -3572,7 +3646,7 @@ class WriteHandle(LocalReadHandle):
         # existed, one re-pointed where the archive could not be read. Until
         # then every query reads the archive. A push adds only copies of local
         # rows, so it never changes this row itself — eviction does.
-        if not self._tiers.has(ARCHIVE):
+        if not self._tiers.has():
             self._record_archive_row(archive)
 
         covered = archive.extent()
@@ -3849,17 +3923,6 @@ class WriteHandle(LocalReadHandle):
         if not self._discard_on_seal():
             self._buffer.release_archived(last.hi)
 
-    def _widen_local(self, paths: Sequence[str]) -> None:
-        """Widen the local tier's row by files about to be registered.
-
-        `LogTable.register` calls this BEFORE its commit, for every file that
-        adds rows to the local table — a seal, a load, a hydrate, a recovered
-        seal — so the row never claims less than the table a reader resolves.
-        From the files' own footers, which is what `add_files` reads too.
-        """
-        schema = self._buffer.shape().table
-        self._tiers.widen(LOCAL, schema, footer_statistics(paths, schema))
-
     def _record_archive_row(self, archive: LogTable) -> None:
         """The archive's tier row, exactly, from its manifests.
 
@@ -3878,26 +3941,22 @@ class WriteHandle(LocalReadHandle):
         below = [
             f for f in files if extent is None or _offsets(schema, f)[0] < extent[0]
         ]
-        self._tiers.replace(
-            ARCHIVE, self._buffer.shape().table, rollup(None, schema, below)
-        )
+        self._tiers.replace(self._buffer.shape().table, rollup(None, schema, below))
 
     def _backfill_manifest(self) -> None:
-        """Compute whichever tier rows the manifest lacks, best effort.
+        """Compute the archive's tier row if the manifest lacks it, best effort.
 
-        At open, so a log written before the manifest existed stops reading
-        every tier for every query. Under the whole-log claim, which no seal
-        can hold beside — so the local row taken here cannot miss a file a
-        concurrent seal was about to commit. If the claim is held elsewhere,
-        the holder's next `sync` computes the archive's row, and the next open
-        the local one; until then those tiers are simply read.
+        At open, so a log written before the manifest existed stops reading the
+        archive for every query. Under the whole-log claim, which eviction
+        cannot hold beside. If the claim is held elsewhere, the holder's next
+        `sync` computes the row; until then the archive is simply read.
 
-        The archive's row reads its manifests, so it needs the network. An
-        archive this process has no catalog entry for is not opened at all
-        (`table()` answers None offline), so a log that has never synced
-        touches no network here.
+        It reads the archive's manifests, so it needs the network. An archive
+        this process has no catalog entry for is not opened at all (`table()`
+        answers None offline), so a log that has never synced touches no
+        network here.
         """
-        if self._tiers.has(LOCAL) and self._tiers.has(ARCHIVE):
+        if self._tiers.has():
             return
 
         lease = self._lease(MAINTAIN_ROLE)
@@ -3905,20 +3964,13 @@ class WriteHandle(LocalReadHandle):
             return
 
         try:
-            schema = self._buffer.shape().table
-            if not self._tiers.has(LOCAL):
-                self._table.reload()
-                self._tiers.replace(
-                    LOCAL, schema, rollup(None, *self._table.live_files())
-                )
-
-            if not self._tiers.has(ARCHIVE):
-                if not self._archive.configured():
-                    self._tiers.replace(ARCHIVE, schema, empty(schema))
-                else:
-                    archive = self._archive.table()
-                    if archive is not None:
-                        self._record_archive_row(archive)
+            if not self._archive.configured():
+                schema = self._buffer.shape().table
+                self._tiers.replace(schema, empty(schema))
+            else:
+                archive = self._archive.table()
+                if archive is not None:
+                    self._record_archive_row(archive)
         except Exception:  # noqa: BLE001
             # Unreachable is the ordinary case this tolerates — a box whose
             # credentials arrive after the log is opened. A row not written is
@@ -4095,6 +4147,106 @@ class WriteHandle(LocalReadHandle):
             self._maintenance.rewrite_archive(lease.renew, lease.owner)
         finally:
             lease.release()
+
+    def retire(self) -> None:
+        """End this log for good: every row to the archive, nothing left local.
+
+        After it, the log takes no rows — from this handle, from a writer that
+        opened before it ran, or from anything that `open`s or `restore`s it —
+        and each refusal says when it retired and at which offset, so the next
+        log can start at the one after. Reads still work: `open(...,
+        read_only=True)` reads the archive, and so does any Iceberg engine.
+        `hydrate` still works too, for a retired log someone replays often.
+
+        Steps, each safe to re-run — a crash leaves the log `retiring`, and
+        calling this again finishes it:
+
+        1. mark it retiring in `meta`, and flush the WAL replica. From this
+           commit no append lands (the buffer's trigger), so nothing can
+           arrive after the final push;
+        2. seal everything buffered;
+        3. `sync(push_unsettled=True)`, which also releases the rows a
+           `wal_replication` seal was holding;
+        4. evict the whole local table, and check nothing is left local;
+        5. record the retirement on the archive table (`litelink.retired`), so
+           `restore` refuses whatever a replica says;
+        6. mark it retired in `meta`, and flush the WAL replica again.
+
+        Needs an archive: emptying the local table of a local-only log would
+        delete the only copy.
+
+        **The flush asks the running sidecar; it never starts one.** Two
+        litestream processes replicating one database is corruption, so with
+        `wal_replication` on and no sidecar answering on its control socket,
+        this raises and says to regenerate the config — a config from before
+        the socket existed is the usual cause.
+        """
+        if not self._archive.configured():
+            msg = (
+                "retire() needs an archive: it empties the local table, which "
+                "on a local-only log is the only copy of its rows"
+            )
+            raise ValueError(msg)
+
+        marker = self._buffer.retired()
+        if marker is not None and marker.get("state") == "retired":
+            return
+
+        archive_uri = self._archive.uri
+        if marker is None:
+            self._buffer.set_meta(
+                RETIRED_KEY, json.dumps({"state": "retiring", "at": _now()})
+            )
+
+        self._flush_replica()
+
+        while self.buffered_rows():
+            self.seal()
+            self.await_seal()
+
+        self.sync(push_unsettled=True)
+        self._maintenance.evict(everything=True)
+
+        self._table.reload()
+        if self._table.extent() is not None or self._buffer.extent() is not None:
+            msg = (
+                f"retire() could not empty {self.root}/{self.name}: local files or "
+                "buffered rows remain that the archive does not hold yet. It stays "
+                "retiring and takes no rows; call retire() again once sync can "
+                "reach the archive"
+            )
+            raise RuntimeError(msg)
+
+        archive = self._archive.require()
+        archive.reload()
+        covered = archive.extent()
+        through = None if covered is None else covered[1]
+        at = _now()
+        claim = self._claim_settings()
+        try:
+            archive.set_properties(
+                {RETIRED_PROPERTY: json.dumps({"through": through, "at": at})}
+            )
+        finally:
+            claim.release()
+
+        self._buffer.set_meta(
+            RETIRED_KEY,
+            json.dumps(
+                {
+                    "state": "retired",
+                    "at": at,
+                    "through": through,
+                    "archive": archive_uri,
+                }
+            ),
+        )
+        self._flush_replica()
+
+    def _flush_replica(self) -> None:
+        """Ship `buffer.db` to its WAL replica now, when one is being kept."""
+        if self.config.wal_replication:
+            flush(self._layout)
 
     def hydrate(self, since: timedelta) -> None:
         """Re-register archived files into the local table (§8).

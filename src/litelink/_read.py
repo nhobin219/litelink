@@ -18,9 +18,9 @@ import pyarrow as pa
 from litelink._archive import Archive
 from litelink._prune import terms
 from litelink._s3 import S3Options
-from litelink._tiers import ARCHIVE, KEY, LOCAL, TIERS, TierManifest
+from litelink._tiers import ARCHIVE, KEY, LOCAL, TIERS, ArchiveTier, row
 from litelink._types import column_type
-from litelink.manifest import prune
+from litelink.manifest import build, prune
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -264,7 +264,7 @@ class Reader:
         self._remote_ready = False
         # Which tiers a query needs, per tier (#90). Read from disk per query;
         # it re-parses only when the file changed.
-        self._manifest = TierManifest(layout)
+        self._archive_tier = ArchiveTier(buffer)
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -361,12 +361,6 @@ class Reader:
         # The floor here only bounds how much is read — §7's point about a
         # deferred delete not inflating a query. It is not the boundary; that
         # is decided after, against a snapshot that cannot then move.
-        # The manifest BEFORE anything is resolved, and again after. A row is
-        # widened before the commit that adds to its tier and narrowed after
-        # the commit that removes from it, so the copy read first covers a
-        # removal this read may predate and the copy read last covers an
-        # addition it may include. A tier is skipped only if both say so.
-        before = self._manifest.load()
         self._table.reload()
         floor = self._table.extent()
         tail = self._buffer.rows_above(None if floor is None else floor[1])
@@ -395,7 +389,7 @@ class Reader:
         # After, it cannot happen. I4 means nothing is evicted before it is
         # registered, so an archive snapshot taken later than the local one
         # holds everything the local one has given up.
-        local, archive = self._tiers(cursor, sql, before, self._manifest.load())
+        local, archive = self._tiers(cursor, sql, location, extent)
         remote = self._prepare_remote(cursor) if archive else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
@@ -413,24 +407,35 @@ class Reader:
         self,
         cursor: duckdb.DuckDBPyConnection,
         sql: str,
-        before: pa.Table | None,
-        after: pa.Table | None,
+        location: str,
+        extent: tuple[int, int] | None,
     ) -> tuple[bool, bool]:
         """`(local, archive)`: which of the two tiers `sql` needs (#90).
 
-        Decided from the tier manifest alone, so the decision itself never
-        touches the network. A tier is skipped only when BOTH copies of the
-        manifest rule it out — see `query` — and a tier with no row, a query
-        `_prune.terms` cannot narrow, or a log with no manifest yet, reads it.
+        The local tier's row is the rollup of the snapshot this read resolved
+        (`location`), so the decision and the data are one version. The
+        archive's is the row in `buffer.db`, read AFTER that snapshot: eviction
+        widens it before the commit that moves rows below the local table, so
+        a row read later covers everything the resolved snapshot has given up.
+        Neither touches the network.
+
+        A tier with no row, or a query `_prune.terms` cannot narrow, is read —
+        except a tier known to hold no rows, which no query needs.
         """
         configured = self._archive.configured()
-        if before is None and after is None:
-            return True, configured
-
         found = terms(cursor, sql, self._schema)
-        kept = set(prune(before, TIERS, found, key=KEY)) | set(
-            prune(after, TIERS, found, key=KEY)
-        )
+        rows = []
+        archive = self._archive_tier.load()
+        if archive is not None:
+            rows.append(row(ARCHIVE, self._schema, archive))
+
+        if extent is not None:
+            local = self._table.statistics_at(location)
+            if local is not None:
+                rows.append(row(LOCAL, self._schema, local))
+
+        table = build(rows, key=KEY) if rows else None
+        kept = prune(table, TIERS, found, key=KEY)
 
         return LOCAL in kept, configured and ARCHIVE in kept
 

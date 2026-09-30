@@ -30,8 +30,11 @@ put each log in its own root, or write that config by hand.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -128,7 +131,16 @@ def litestream_config(
     bucket, _, prefix = target.removeprefix("s3://").rstrip("/").partition("/")
     resolved = s3.resolved()
 
-    lines = ["dbs:"]
+    # The sidecar's control socket, which is how `retire()` asks it to ship
+    # NOW and waits until it has (`flush`). Asking the running sidecar is the
+    # only way: a second litestream process replicating the same database is
+    # the corruption litestream warns about.
+    lines = [
+        "socket:",
+        "  enabled: true",
+        f"  path: {control_socket(layout)}",
+        "dbs:",
+    ]
     for database in layout.databases:
         # Keyed by the path relative to the STREAM's directory, which is where
         # all three databases now live, so the replica path is
@@ -171,6 +183,83 @@ def litestream_config(
             ]
 
     return "\n".join(lines) + "\n"
+
+
+def control_socket(layout: Layout) -> Path:
+    """Where a log's sidecar listens for control commands.
+
+    In the temp directory, keyed by a hash of the log's directory, rather than
+    inside it: a Unix socket path is limited to about 104 bytes, and a log's
+    own directory is routinely longer than that. Derived from the layout alone,
+    so the config and `flush` agree without either recording it.
+    """
+    digest = hashlib.sha256(str(layout.directory).encode()).hexdigest()[:16]
+
+    return Path(tempfile.gettempdir()) / f"litelink-{digest}.sock"
+
+
+def flush(layout: Layout, binary: str | None = None, timeout: int = 60) -> None:
+    """Ship `buffer.db` to its replica now, and return once the replica has it.
+
+    `litestream sync -wait` through the running sidecar's control socket:
+    measured on 0.5.16 against rustfs with the periodic sync at 1 h, a restore
+    before it had none of 5 new rows, the command returned in 29 ms, and a
+    restore after it had all 5. It is a CLIENT of the sidecar — it opens no
+    database and writes no replica — so it never makes a second writer.
+
+    Raises when the sidecar does not answer, rather than starting a litestream
+    of its own: this cannot tell "no sidecar" from "a sidecar started from a
+    config without the socket", and guessing wrong in the second case is two
+    processes replicating one database.
+    """
+    socket = control_socket(layout)
+    command = [
+        litestream_binary(binary),
+        "sync",
+        "-wait",
+        "-json",
+        "-timeout",
+        str(timeout),
+        "-socket",
+        str(socket),
+        str(layout.buffer_db),
+    ]
+    try:
+        done = subprocess.run(  # noqa: S603
+            command, check=True, capture_output=True, timeout=timeout + 10
+        )
+    except FileNotFoundError:
+        msg = "litestream was not found, and flushing the WAL replica needs it"
+        raise RuntimeError(msg) from None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = getattr(exc, "stderr", b"") or b""
+        msg = (
+            f"could not flush {layout.buffer_db.name} to its WAL replica through "
+            f"the sidecar's control socket at {socket}: "
+            f"{detail.decode(errors='replace').strip() or exc}. Regenerate the "
+            "litestream config with write_replication_config() and restart the "
+            "sidecar — a config from before litelink 0.6 has no control socket"
+        )
+        raise RuntimeError(msg) from exc
+
+    try:
+        report = json.loads(done.stdout)
+    except ValueError as exc:
+        msg = f"litestream sync returned something other than JSON: {done.stdout!r}"
+        raise RuntimeError(msg) from exc
+
+    # Integers in 0.5.16's `-json` output, checked rather than assumed.
+    shipped, current = report.get("replica_txid"), report.get("txid")
+    if (
+        not isinstance(shipped, int)
+        or not isinstance(current, int)
+        or shipped < current
+    ):
+        msg = (
+            f"the WAL replica of {layout.buffer_db.name} is at transaction "
+            f"{shipped} after a flush, behind the database's {current}"
+        )
+        raise RuntimeError(msg)
 
 
 def litestream_binary(override: str | None = None) -> str:

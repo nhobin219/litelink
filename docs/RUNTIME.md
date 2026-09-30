@@ -260,9 +260,11 @@ identical terms.
 
 ## Reading
 
-Reads never touch the network and never block the writer. A scan unions two legs in
-DuckDB — the Iceberg table, and the buffer's unsealed tail above the table's committed
-extent — so a row appears exactly once even though the tiers overlap by design.
+Reads never block the writer, and a read bounded inside the local window never touches the
+network. A scan unions up to three legs in DuckDB — the archive below the local table, the
+local Iceberg table, and the buffer's unsealed tail above its committed extent — so a row
+appears exactly once even though the tiers overlap by design. Which of the first two a query
+needs is decided per query from local statistics (#90; SPEC §7).
 
 **DuckDB does not open the buffer database.** It used to, via
 `ATTACH … (TYPE sqlite)`, and that silently corrupted it: DuckDB's sqlite extension
@@ -651,6 +653,15 @@ It stays in the set for the SAME-machine case, where it saves a round trip — a
 deliberately does NOT restore it, because a stale copy wins over the bucket's own pointer.
 See "Failing over". `archive.db` is created on first use, so a log that has never opened its archive has
 none to restore, and a restore procedure has to tolerate that.
+
+**The config enables the sidecar's control socket.** `retire()` asks the running sidecar to
+ship now and waits for it (`litestream sync -wait`), so a restore from the replica sees the
+retirement. It asks rather than running a litestream of its own, because two processes
+replicating one database is corruption. The socket sits in the temp directory, named from a
+hash of the log's directory — a Unix socket path is limited to about 104 bytes, and a log's
+directory is often longer. **A config written before 0.6 has no socket**: regenerate it with
+`write_replication_config()` and restart the sidecar, or `retire()` on a replicating log
+refuses and says so.
 
 **The endpoint goes in the config, the credentials do not.** litestream reads keys from the
 environment, so the generated file is safe to commit and copy — the same reason `S3Options`

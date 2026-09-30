@@ -4104,42 +4104,79 @@ def test_an_otel_log_reads_back_exactly_from_the_archive(
     assert counted == [(40, 40)]
 
 
-def test_statistics_from_the_archive_cover_what_eviction_dropped(
+def test_the_statistics_tiers_partition_the_log(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Why the default is the whole log (#85): the local rollup is missing every
-    evicted range, the archive's lacks what is still buffered, and the whole
-    log is both, each row once.
+    """Each row in exactly one tier, and the three together are the whole log.
+
+    `"archive"` is what eviction moved below the local table, not the
+    archive's copy of the local window, which `"local"` already counts; the
+    buffer is what no file holds yet. Their counts add up to `tier=None` and to
+    what a scan returns.
+
+    With `wal_replication`, a seal keeps its rows in the buffer until the
+    archive has them, so the last batch here is in both the local table and
+    the buffer — and must be counted once.
+
+    Falsify by rolling up every archive file for `"archive"` (dropping the
+    `below_local` split): its count is the whole archive. Or by counting the
+    buffer without the ceiling: the held batch is counted twice. Either way the
+    three tiers add up to more than the log.
     """
     tail = 37
+    held = 23
     with archived_log(
-        tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000
+        tmp_path,
+        bucket,
+        s3,
+        local_retention=timedelta(0),
+        local_rows=1000,
+        wal_replication=True,
     ) as log:
         log.extend(rows(ROWS))
         log.seal()
         log.sync(push_unsettled=True)
         log.maintain()
         log.extend(
-            {"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(tail)
+            {"event_ts": ROWS + i, "key": "h", "payload": "y"} for i in range(held)
+        )
+        log.seal()
+        assert log._buffer.extent() is not None, "the seal must keep its rows"  # noqa: SLF001
+        log.extend(
+            {"event_ts": ROWS + held + i, "key": "t", "payload": "y"}
+            for i in range(tail)
         )
 
         local = log.column_statistics(tier="local")
         archive = log.column_statistics(tier="archive")
+        buffered = log.column_statistics(tier="buffer")
         whole = log.column_statistics()
-
-        assert archive.record_count == ROWS
-        assert archive.file_count == log.archive_files()
-        assert (archive[OFFSET].min, archive[OFFSET].max) == (1, ROWS)
-        assert (archive["event_ts"].min, archive["event_ts"].max) == (0, ROWS - 1)
+        extent = log.table_extent()
+        assert extent is not None
 
         assert local.record_count is not None
         assert 0 < local.record_count < ROWS, "the fixture must evict part of it"
-        assert local[OFFSET].min > 1, "the local rollup lacks the evicted range"
+        assert (local[OFFSET].min, local[OFFSET].max) == extent
+
+        assert archive.tier == "archive"
+        assert (archive[OFFSET].min, archive[OFFSET].max) == (1, extent[0] - 1)
+        assert archive["event_ts"].max == extent[0] - 2
+
+        assert buffered.record_count == tail
+        assert buffered[OFFSET].min == ROWS + held + 1
 
         everything = log.scan().read_all()
-        assert whole.record_count == everything.num_rows == ROWS + tail
-        assert (whole[OFFSET].min, whole[OFFSET].max) == (1, ROWS + tail)
-        assert (whole["event_ts"].min, whole["event_ts"].max) == (0, ROWS + tail - 1)
+        assert archive.record_count is not None
+        assert buffered.record_count is not None
+        assert (
+            local.record_count + archive.record_count + buffered.record_count
+            == whole.record_count
+            == everything.num_rows
+            == ROWS + held + tail
+        )
+        last = ROWS + held + tail
+        assert (whole[OFFSET].min, whole[OFFSET].max) == (1, last)
+        assert (whole["event_ts"].min, whole["event_ts"].max) == (0, last - 1)
         assert whole["key"].null_count == 0
 
 

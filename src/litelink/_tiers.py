@@ -1,56 +1,50 @@
-"""The log's tier manifest: `<name>.manifest.parquet`, one row per tier (#90).
+"""The archive's tier row: what a read consults to skip the archive (#90).
 
-The file `litelink.manifest` describes, with `tier` as its key and two rows:
+A read decides per query which tiers it needs, with `litelink.manifest.prune`
+over two rows keyed by `tier`:
 
-- **`local`** — the local Iceberg table.
+- **`local`** — the local Iceberg table, rolled up from the snapshot the read
+  resolved (`LogTable.statistics_at`). Its statistics are Iceberg's own, on
+  local disk, so nothing is stored for it.
 - **`archive`** — what the archive holds BELOW the local table: the rows
-  eviction dropped. Not the whole archive, whose copies of the local window
+  eviction moved there. Not the whole archive, whose copy of the local window
   would put its maximum timestamp at "a few minutes ago" and send every hot
   query to the network. The archive leg of a read covers exactly this range —
   offsets under the local table's first — so this is the row that decides it.
 
-The buffer has no row, as a stream's live log has none: it is always read.
+The archive's row is the one stored, in `buffer.db`, because its statistics
+otherwise live in the archive's manifests on S3 and the decision must not
+cost the round trip it exists to avoid. Eviction is the last moment those rows'
+statistics are on local disk, and it usually runs in another process than the
+reader, so the row is written by the writer side and read by everyone.
 
-**Overstating is the safe direction, and every write is ordered for it.** A
-row that claims more than its tier holds costs a read that finds nothing; one
-that claims less loses rows from every read that skips the tier. So a row is
-WIDENED before the commit that adds rows to its tier, and narrowed only after
-the commit that removes them — and only where no concurrent commit can have
-widened it in between (see `WriteHandle` and `Maintenance.evict`). A reader
-loads the file before and after resolving the tiers, and skips a tier only
-when both copies rule it out, so neither ordering can catch it mid-change.
+**Overstating is the safe direction.** A row that claims more than the archive
+holds below the local table costs a read that finds nothing; one that claims
+less loses rows. So eviction WIDENS the row before the commit that moves rows
+below the local table, and the one write that narrows — an exact rollup from
+the archive's manifests — runs only under the whole-log maintenance claim,
+where eviction cannot run beside it. `sync` and `rewrite_archive` never change
+it: one adds copies of rows the local table still holds, the other re-cuts
+rows the archive already has.
 
 **A missing row means "no statistics", and nothing turns it into a row but an
 exact rollup.** Widening a row that is not there would describe only the rows
-being added, so it does nothing; the tier is read until something computes the
-whole of it.
-
-Rewritten whole under an exclusive lock, and replaced by rename, so a reader
-sees one version or the next. Readers take no lock.
+being added, so it does nothing; the archive is read until something computes
+the whole of it.
 """
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
-import os
+import json
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 
-from litelink._statistics import (
-    ColumnStatistics,
-    TierStatistics,
-    _merge,
-)
-from litelink.manifest import Row, columns, extend, without
+from litelink._statistics import ColumnStatistics, TierStatistics, _merge
+from litelink.manifest import Row, columns
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
-    from pathlib import Path
-
-    from litelink._layout import Layout
+    from litelink._buffer import Buffer
 
 LOCAL = "local"
 ARCHIVE = "archive"
@@ -62,150 +56,100 @@ OFFSET = "litelink_offset"
 KEY = "tier"
 
 
-class TierManifest:
-    """The manifest file of one log: load it, and change one row at a time."""
+class ArchiveTier:
+    """The archive's tier row, kept in `buffer.db`."""
 
-    def __init__(self, layout: Layout) -> None:
-        self._path = layout.directory / f"{layout.name}.manifest.parquet"
-        self._lock = layout.directory / f"{layout.name}.manifest.lock"
-        # `(stat key, table)` — a reader stats the file per query and parses
-        # it only when it changed.
-        self._cache: tuple[tuple[int, int, int], pa.Table] | None = None
+    def __init__(self, buffer: Buffer) -> None:
+        self._buffer = buffer
+        # `(generation, decoded)` — a reader asks per query, and decodes only
+        # when a write has moved the generation on.
+        self._cache: tuple[str | None, TierStatistics | None] | None = None
 
-    @property
-    def path(self) -> Path:
-        return self._path
-
-    # -- reading ---------------------------------------------------------
-
-    def load(self) -> pa.Table | None:
-        """The current manifest, or None if the log has none yet."""
-        try:
-            stat = self._path.stat()
-        except FileNotFoundError:
-            return None
-
-        key = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    def load(self) -> TierStatistics | None:
+        """The row, or None when the log has none yet."""
+        generation, raw = self._buffer.archive_tier()
         cached = self._cache
-        if cached is not None and cached[0] == key:
+        if cached is not None and cached[0] == generation and generation is not None:
             return cached[1]
 
-        try:
-            table = pq.read_table(self._path)
-        except FileNotFoundError:
-            return None
+        decoded = None if raw is None else decode(raw)
+        self._cache = (generation, decoded)
 
-        self._cache = (key, table)
+        return decoded
 
-        return table
+    def has(self) -> bool:
+        return self._buffer.archive_tier()[1] is not None
 
-    def has(self, tier: str) -> bool:
-        manifest = self.load()
+    def replace(self, schema: pa.Schema, statistics: TierStatistics) -> None:
+        """Make the row exactly `statistics` — the one write that narrows.
 
-        return manifest is not None and tier in manifest[KEY].to_pylist()
-
-    # -- writing ---------------------------------------------------------
-
-    def replace(self, tier: str, schema: pa.Schema, statistics: TierStatistics) -> None:
-        """Make `tier`'s row exactly `statistics` — the one write that narrows.
-
-        Only for a caller that knows no commit can have widened the row since
-        `statistics` was taken.
+        Only under the whole-log claim, where eviction cannot widen it between
+        `statistics` being taken and this landing.
         """
-        with self._exclusive() as current:
-            self._save(extend(current, _row(tier, schema, statistics), key=KEY))
+        encoded = encode(schema, statistics)
+        self._buffer.update_archive_tier(lambda _: encoded)
 
-    def widen(self, tier: str, schema: pa.Schema, statistics: TierStatistics) -> None:
-        """Add `statistics` to `tier`'s row, before the commit that adds them.
+    def widen(self, schema: pa.Schema, statistics: TierStatistics) -> None:
+        """Add `statistics` to the row, before the commit that evicts them.
 
         A missing row stays missing: it is "no statistics", and a row made of
-        only the rows being added would claim the tier holds nothing else.
+        only the rows being added would claim the archive holds nothing else.
         """
-        with self._exclusive() as current:
+
+        def change(current: str | None) -> str | None:
             if current is None:
-                return
+                return None
 
-            held = _statistics(current, tier)
-            if held is None:
-                return
+            return encode(schema, _union(schema, decode(current), statistics))
 
-            merged = _union(schema, held, statistics)
-            self._save(extend(current, _row(tier, schema, merged), key=KEY))
+        self._buffer.update_archive_tier(change)
 
-    def evicted(self, boundary: int, removed: int) -> None:
-        """After eviction removed every local row at or below `boundary`.
-
-        Narrows the local row by what can be narrowed while seals run
-        concurrently: the offset floor rises past `boundary`, since whatever a
-        seal adds sits above it, and `removed` rows come off the count. The
-        other columns keep their bounds — a seal may already have widened them
-        for a file this pass cannot see.
-        """
-        with self._exclusive() as current:
-            held = None if current is None else _statistics(current, LOCAL)
-            if current is None or held is None:
-                return
-
-            columns_ = dict(held.columns)
-            offsets = columns_.get(OFFSET)
-            if offsets is not None and offsets.min is not None:
-                columns_[OFFSET] = ColumnStatistics(
-                    min=max(offsets.min, boundary + 1),
-                    max=offsets.max,
-                    null_count=offsets.null_count,
-                    value_count=offsets.value_count,
-                    nan_count=offsets.nan_count,
-                )
-
-            count = held.record_count
-            narrowed = TierStatistics(
-                tier=None,
-                record_count=None if count is None else max(count - removed, 0),
-                file_count=held.file_count,
-                columns=columns_,
-            )
-            schema = _schema_of(current)
-            self._save(extend(current, _row(LOCAL, schema, narrowed), key=KEY))
-
-    def drop(self, tier: str) -> None:
-        """Forget `tier`'s row, so reads include the tier until it is rebuilt."""
-        with self._exclusive() as current:
-            if current is not None:
-                self._save(without(current, tier, key=KEY))
-
-    @contextlib.contextmanager
-    def _exclusive(self) -> Iterator[pa.Table | None]:
-        """The current manifest, read under the lock every writer takes.
-
-        Across processes, because the sealer and the maintainer usually are
-        separate ones: each rewrites the whole file, and two interleaved
-        read-modify-writes would each drop the other's change.
-        """
-        self._lock.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock.open("a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                try:
-                    current = pq.read_table(self._path)
-                except FileNotFoundError:
-                    current = None
-
-                yield current
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-
-    def _save(self, manifest: pa.Table) -> None:
-        """Replace the file atomically, durable before the rename."""
-        staging = self._path.with_name(self._path.name + ".tmp")
-        with staging.open("wb") as sink:
-            pq.write_table(manifest, sink)
-            sink.flush()
-            os.fsync(sink.fileno())
-
-        staging.replace(self._path)
+    def drop(self) -> None:
+        """Forget the row, so reads include the archive until it is rebuilt."""
+        self._buffer.update_archive_tier(lambda _: None)
 
 
-def _row(tier: str, schema: pa.Schema, statistics: TierStatistics) -> Row:
+def encode(schema: pa.Schema, statistics: TierStatistics) -> str:
+    """The stored form: the prunable columns' bounds and counts, as JSON.
+
+    JSON round-trips every prunable type exactly — Python writes a float as its
+    shortest repr, which reads back as the same double.
+    """
+    kinds = columns([schema])
+    return json.dumps(
+        {
+            "record_count": statistics.record_count,
+            "columns": {
+                name: [
+                    column.min,
+                    column.max,
+                    column.null_count,
+                    column.value_count,
+                    column.nan_count,
+                ]
+                for name, column in statistics.columns.items()
+                if name in kinds
+            },
+        },
+        sort_keys=True,
+    )
+
+
+def decode(raw: str) -> TierStatistics:
+    stored: dict[str, Any] = json.loads(raw)
+    return TierStatistics(
+        tier=None,
+        record_count=stored.get("record_count"),
+        file_count=0,
+        columns={
+            name: ColumnStatistics(*values)
+            for name, values in stored.get("columns", {}).items()
+        },
+    )
+
+
+def row(tier: str, schema: pa.Schema, statistics: TierStatistics) -> Row:
+    """`statistics` as a manifest row, offsets taken from its own bounds."""
     lo, end = offsets(statistics)
 
     return Row(tier, lo, end, schema, statistics)
@@ -221,50 +165,6 @@ def offsets(statistics: TierStatistics) -> tuple[int, int]:
         return 0, 0
 
     return int(column.min), int(column.max) + 1
-
-
-def _statistics(manifest: pa.Table, tier: str) -> TierStatistics | None:
-    """A row read back as statistics, or None if the tier has no row."""
-    for row in manifest.to_pylist():
-        if row[KEY] != tier:
-            continue
-
-        found: dict[str, ColumnStatistics] = {}
-        for field in manifest.schema:
-            if not pa.types.is_struct(field.type):
-                continue
-
-            value: dict[str, Any] | None = row[field.name]
-            if value is None:
-                continue
-
-            found[field.name] = ColumnStatistics(
-                min=value.get("min"),
-                max=value.get("max"),
-                null_count=value.get("null_count"),
-                value_count=value.get("value_count"),
-                nan_count=value.get("nan_count"),
-            )
-
-        return TierStatistics(
-            tier=None,
-            record_count=row["record_count"],
-            file_count=0,
-            columns=found,
-        )
-
-    return None
-
-
-def _schema_of(manifest: pa.Table) -> pa.Schema:
-    """The declared columns a manifest's structs describe, as a schema."""
-    return pa.schema(
-        [
-            pa.field(field.name, field.type.field("min").type)
-            for field in manifest.schema
-            if pa.types.is_struct(field.type)
-        ]
-    )
 
 
 def _union(
@@ -285,67 +185,5 @@ def empty(schema: pa.Schema) -> TierStatistics:
                 None, None, 0, 0, 0 if pa.types.is_floating(kind) else None
             )
             for name, kind in columns([schema]).items()
-        },
-    )
-
-
-def footer_statistics(paths: Iterable[str], schema: pa.Schema) -> TierStatistics:
-    """Statistics for Parquet files not yet in any table, from their footers.
-
-    What `add_files` itself reads to fill the Iceberg manifest, taken before
-    the commit so a tier's row can be widened first. Only the prunable
-    columns; a row group without a bound for a column that is not all NULL
-    makes that column unknown, and unknown never prunes.
-    """
-    kinds = columns([schema])
-    lows: dict[str, Any] = {}
-    highs: dict[str, Any] = {}
-    unknown: set[str] = set()
-    nulls = dict.fromkeys(kinds, 0)
-    values = dict.fromkeys(kinds, 0)
-    records = 0
-    files = 0
-    for path in paths:
-        files += 1
-        metadata = pq.ParquetFile(path).metadata
-        records += metadata.num_rows
-        indices = {
-            metadata.schema.column(i).path: i for i in range(metadata.num_columns)
-        }
-        for group in range(metadata.num_row_groups):
-            row_group = metadata.row_group(group)
-            if row_group.num_rows == 0:
-                continue
-
-            for name in kinds:
-                index = indices.get(name)
-                stats = None if index is None else row_group.column(index).statistics
-                if stats is None:
-                    unknown.add(name)
-                    continue
-
-                nulls[name] += stats.null_count or 0
-                values[name] += row_group.num_rows
-                if stats.has_min_max:
-                    low, high = stats.min, stats.max
-                    lows[name] = low if name not in lows else min(lows[name], low)
-                    highs[name] = high if name not in highs else max(highs[name], high)
-                elif stats.null_count != row_group.num_rows:
-                    unknown.add(name)
-
-    return TierStatistics(
-        tier=None,
-        record_count=records,
-        file_count=files,
-        columns={
-            name: ColumnStatistics(
-                min=None if name in unknown else lows.get(name),
-                max=None if name in unknown else highs.get(name),
-                null_count=None if name in unknown else nulls[name],
-                value_count=None if name in unknown else values[name],
-                # No write path admits NaN (#87).
-                nan_count=0 if pa.types.is_floating(kind) else None,
-            )
-            for name, kind in kinds.items()
         },
     )

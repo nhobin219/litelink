@@ -1353,39 +1353,42 @@ fsync is 20-50 us against ~1 ms here.
 
 ### Full-stream read — all three tiers
 
-**Decided per query, from the tier manifest (#90).** Every query reads the buffer. The local
-leg and the archive leg are added only when their tier's row in `<name>.manifest.parquet`
-could hold a row the query matches. The file is on local disk, so the decision reads no
-network and I5 holds for any query bounded inside the local window.
+**Decided per query, from per-tier statistics (#90).** Every query reads the buffer. The
+local leg and the archive leg are added only when their tier's statistics could hold a row the
+query matches. Neither source is on the network, so I5 holds for any query bounded inside the
+local window:
 
-It is streamcast's per-log manifest (streamcast#27) with `tier` as its key, and the pruning is
-the same function, `litelink.manifest.prune`: `col > K` can match when `max(col) > K`,
-`col < K` when `min(col) < K`, `col = K` when K is within both, and anything it cannot decide
-— an unknown bound, a column the tier lacks, an operator not on the list — includes. A tier
-known to hold no rows is excluded. The query's WHERE becomes those terms through DuckDB's own
-parser: only a single SELECT over `log` alone is narrowed, and only its AND-ed comparisons
-between a column and a literal. A subquery or join over `log` would see the pruned relation,
-so those shapes read every tier. Each literal is converted the way DuckDB compares it against
-that column — to FLOAT for a float32 column, to DOUBLE for a float64 one, kept exact for an
-integer column — because the pruner compares in Python and must agree with the engine.
+- **Local:** the rollup of the snapshot the read resolved, from the local table's own Iceberg
+  manifests (`LogTable.statistics_at`), cached per process against the metadata pointer. A read
+  pinned to an older pointer gets no row, which includes the tier. Nothing is stored, so
+  nothing expires with a snapshot.
+- **Archive:** a row in `buffer.db` describing what the archive holds **below** the local
+  table. The archive leg reads only offsets under the local table's `lo`, and the archive's
+  copy of the local window would put its maximum timestamp at "minutes ago" and send every hot
+  query to the network. Stored because its statistics otherwise live on S3, and eviction —
+  usually in another process — is the last moment they are on local disk.
 
-**The `archive` row is what the archive holds below the local table**, not the whole archive.
-The archive leg reads only offsets under the local table's `lo`, and the archive's copy of the
-local window would put its maximum timestamp at "minutes ago" and send every hot query to the
-network. So `sync`, which only adds copies of local rows, never changes it; eviction widens it
-by the rows it moves, before its commit.
+The two rows are streamcast's per-log manifest format (streamcast#27) with `tier` as the key,
+and the decision is the same function, `litelink.manifest.prune`: `col > K` can match when
+`max(col) > K`, `col < K` when `min(col) < K`, `col = K` when K is within both, and anything
+it cannot decide — an unknown bound, a column the tier lacks, an operator not on the list —
+includes. A tier known to hold no rows is excluded. The query's WHERE becomes those terms
+through DuckDB's own parser: only a single SELECT over `log` alone is narrowed, and only its
+AND-ed comparisons between a column and a literal. A subquery or join over `log` would see
+the pruned relation, so those shapes read every tier. Each literal is converted the way DuckDB
+compares it against that column — to FLOAT for a float32 column, to DOUBLE for a float64 one,
+kept exact for an integer column — because the pruner compares in Python and must agree with
+the engine.
 
-**Overstating is the safe direction, and every write is ordered for it.** A tier's row is
-widened before the commit that adds rows to it — every local `register`, from the files'
-Parquet footers, and every eviction for the archive — and narrowed only after the commit that
-removes them, and only as far as a concurrent commit cannot have widened it: eviction raises
-the local row's offset floor and lowers its count, and leaves the other bounds alone because a
-seal may already have widened them for a file the pass cannot see. Exact rollups from the
-Iceberg manifests replace a row only under the whole-log maintenance claim, which no seal can
-hold beside. A reader loads the file before resolving the tiers and again after, and skips a
-tier only when both copies rule it out, so neither ordering catches it mid-change. The file is
-rewritten whole under a lock and replaced by rename. A tier with no row is read; a log written
-before the manifest existed has one computed at the writer's next `open`.
+**The archive row changes when the local floor moves, not when the archive does.** Eviction
+widens it by the rows it moves, from their local manifest statistics, before its commit — so a
+read resolving the new, higher floor finds the row already covering what went below it. `sync`
+adds only copies of rows the local table still holds and `rewrite_archive` re-cuts rows the
+archive has, so neither touches it; hydrate lowers the floor and leaves it overstating, which
+is safe. The one write that narrows is an exact rollup from the archive's manifests, run only
+under the whole-log maintenance claim, which eviction cannot hold beside: at the first `sync`,
+on a re-point (which drops the row first), at `restore`, and at `open` for a log written before
+the row existed. With no row, the archive is read.
 
 This reverses 0.4.0, which fixed a handle's tiers at assembly (`include_archive`,
 `with_archive()`) so that a read would not start touching the network because eviction ran.

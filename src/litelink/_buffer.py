@@ -13,6 +13,7 @@ import math
 import sqlite3
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pyarrow as pa
@@ -21,7 +22,6 @@ from litelink._config import LogConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Mapping
-    from pathlib import Path
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import (
@@ -64,6 +64,46 @@ INTENT_KEY = "schema_intent"
 # empty leaves the log high with nothing below it, positionally identical to a
 # reserve. The recorded value is the only thing that separates the two.
 START_OFFSET_KEY = "start_offset"
+
+# The archive's tier row (#90): what the archive holds below the local table, as
+# JSON, and a counter a reader keys its decoded copy on. See `_tiers`.
+ARCHIVE_TIER_KEY = "archive_tier"
+ARCHIVE_TIER_GENERATION = "archive_tier_generation"
+
+# Set by `retire()`, and what the buffer's trigger refuses appends on. JSON:
+# `{"state": "retiring" | "retired", "at": …, "through": …, "archive": …}`.
+RETIRED_KEY = "retired"
+
+# What the trigger raises with, so the append path can tell its refusal from a
+# CHECK constraint's and explain it.
+RETIRED_REFUSAL = "litelink: this log is retired"
+
+
+class RetiredError(RuntimeError):
+    """The log was retired (`WriteHandle.retire`), or is being retired.
+
+    Raised by anything that would add rows to it or bring it back as a writer.
+    Its rows are all in the archive, which reads still reach.
+    """
+
+    @classmethod
+    def of(cls, marker: Mapping[str, object], name: str) -> RetiredError:
+        if marker.get("state") == "retiring":
+            return cls(
+                f"log {name!r} is being retired, so it takes no more rows. Call "
+                "retire() on a writer to finish it; a crash left it part-way"
+            )
+
+        through = marker.get("through")
+        after = f"after offset {through}" if through is not None else "holding no rows"
+        nxt = "" if through is None else f" at start_offset={int(str(through)) + 1}"
+        return cls(
+            f"log {name!r} was retired at {marker.get('at', '?')} {after}; its rows "
+            f"are in the archive at {marker.get('archive', '?')}. Read it with "
+            f"open(..., read_only=True) or any Iceberg engine, and write to a new "
+            f"log{nxt}"
+        )
+
 
 # Stands in for "no row limit" so the per-row check stays one comparison. Far
 # above any row count a buffer sized for read latency could reach.
@@ -679,6 +719,15 @@ class Buffer:
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
+        # A retired log takes no rows, from any process — including a writer
+        # that opened before `retire()` ran and never looks at `meta` again. In
+        # SQLite rather than in `append`, so it costs the write path nothing it
+        # would notice and no handle can be stale about it.
+        self._con.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS refuse_retired BEFORE INSERT ON buffer
+            WHEN (SELECT v FROM meta WHERE k = '{RETIRED_KEY}') IS NOT NULL
+            BEGIN SELECT RAISE(ABORT, '{RETIRED_REFUSAL}'); END
+        """)
         # Who owns which operation, across processes (§13.6). A Python lock
         # cannot say anything about a process that is no longer running, and
         # recovery has to know whether an interrupted operation was ours.
@@ -914,6 +963,9 @@ class Buffer:
                 try:
                     cursor.execute(sql, values)
                 except sqlite3.IntegrityError as exc:
+                    if RETIRED_REFUSAL in str(exc):
+                        raise self.retired_error() from None
+
                     # SQLite is the gate; this only turns its answer into one
                     # a caller can act on. `CHECK constraint failed: key` does
                     # not say what was wrong with the value, or which value.
@@ -2101,6 +2153,69 @@ class Buffer:
                 "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                 (key, value),
             )
+
+    # -- the archive's tier row (#90) -------------------------------------
+
+    def archive_tier(self) -> tuple[str | None, str | None]:
+        """`(generation, row)` in one statement, so the two cannot disagree.
+
+        `row` is `_tiers`' JSON, or None when the log has none yet — which a
+        read takes as "the archive could hold anything".
+        """
+        with self._lock:
+            found = dict(
+                self._con.execute(
+                    "SELECT k, v FROM meta WHERE k IN (?, ?)",
+                    (ARCHIVE_TIER_KEY, ARCHIVE_TIER_GENERATION),
+                ).fetchall()
+            )
+
+        return found.get(ARCHIVE_TIER_GENERATION), found.get(ARCHIVE_TIER_KEY)
+
+    def update_archive_tier(self, change: Callable[[str | None], str | None]) -> None:
+        """Replace the row with `change(current)`, in one write transaction.
+
+        The read and the write in one transaction, so two writers cannot each
+        drop the other's change. None removes the row. The generation moves on
+        every call, so a reader's decoded copy is never kept past a write.
+        """
+        with self._transaction():
+            row = self._con.execute(
+                "SELECT v FROM meta WHERE k = ?", (ARCHIVE_TIER_KEY,)
+            ).fetchone()
+            updated = change(None if row is None else str(row[0]))
+            if updated is None:
+                self._con.execute("DELETE FROM meta WHERE k = ?", (ARCHIVE_TIER_KEY,))
+            else:
+                self._con.execute(
+                    "INSERT INTO meta (k, v) VALUES (?, ?)"
+                    " ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    (ARCHIVE_TIER_KEY, updated),
+                )
+
+            self._con.execute(
+                "INSERT INTO meta (k, v) VALUES (?, '1')"
+                " ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
+                (ARCHIVE_TIER_GENERATION,),
+            )
+
+    # -- retirement -------------------------------------------------------
+
+    def retired(self) -> dict[str, object] | None:
+        """The retirement marker, or None for a live log."""
+        raw = self.get_meta(RETIRED_KEY)
+
+        return None if raw is None else json.loads(raw)
+
+    def retired_error(self) -> RetiredError:
+        """The refusal for anything that would add rows to a retired log."""
+        return RetiredError.of(self.retired() or {"state": "retired"}, self._name())
+
+    def _name(self) -> str:
+        """The log's name, for messages: the directory `buffer.db` sits in."""
+        row = self._con.execute("PRAGMA database_list").fetchone()
+
+        return Path(str(row[2])).parent.name if row is not None else "this log"
 
     # -- compaction bookkeeping -------------------------------------------
 
