@@ -89,9 +89,9 @@ The sharing bought nothing: every query against those catalogs is keyed by
 `(catalog, namespace, table)` and nothing has ever read across streams. It cost three
 things. Replication had to be one sidecar per *root*, because a sidecar per log would have
 run two litestream instances against one `catalog.db` — which litestream forbids — so a
-root with several streams needed a config written by hand. `follow` had to drop its `root`
-parameter, since a caller-supplied directory could collide with a live log's shared
-catalogs. And one corrupt catalog took every stream under the root with it.
+root with several streams needed a config written by hand. `follow` (since removed, §3b) had to
+drop its `root` parameter, since a caller-supplied directory could collide with a live log's
+shared catalogs. And one corrupt catalog took every stream under the root with it.
 
 Contention was *not* among the costs, which is worth stating because it is the first thing
 assumed: two streams sealing concurrently against one shared `catalog.db` measured a
@@ -426,114 +426,25 @@ the log fails outright. See §3a's failover notes and `litelink.restore`.
 
 ## 3b. Reading a log from another machine
 
-`litelink.snapshot` assembles a **read-only view of a log running somewhere else**, in one of
-two modes.
+**litelink reads on the primary.** Every handle is built from a root on the machine that holds
+the log — the writer, or a `LocalReadHandle` beside it — and reads the buffer, the local table
+and, when asked, the archive from there. Off that host, the archive is the interface: an
+ordinary Iceberg table that publishes `version-hint.text` at every commit, so any engine
+pointed at `<archive>/<name>` resolves its current metadata with no catalog service and no
+litelink install (API.md, "Reading from another machine").
 
-**By default it reads the archive alone**, which is the mode that works on an ordinary log:
-`wal_replication` is opt-in and needs a sidecar, so most logs have no replica to restore and
-the merged read fails outright on them.
+What such a reader cannot see is anything newer than the last `sync`: rows in the buffer or
+the local table are on the primary alone. `litelink_offset` makes polling safe — it is
+monotonic and never reused, so a reader keeps the highest one it has seen and asks for what
+came after.
 
-**`include_wal=True` merges a restored copy of the writer's `buffer.db` with the archive**, so
-a reader sees data fresher than the archive alone — down to the replication lag rather than to
-the seal cadence. It is what §3a's replication buys on the read side, and it exists because the
-alternative readers had was the archive, which is `sync`-fresh at best.
-
-The two are different views rather than one being a faster route to the other, and the
-archive-only mode differs in three ways that are stated rather than discovered: staleness is
-the archive frontier rather than the replication lag; the shape comes from the archive's Iceberg
-schema, with Arrow types taken from a data file's footer, rather than from the replica's
-`meta`; and the archive prefix comes from the
-caller rather than from the writer's own record of it. A log whose archive has published
-nothing is refused rather than served empty — that state is exactly when the buffer holds
-everything, and it is the one case where only `include_wal=True` can serve the log.
-
-**It is `restore`'s assembly without the takeover.** `restore` burns `RESTORE_RESERVE`
-offsets to fence a machine that may still be writing (I9); a follower appends nothing, so
-there is nothing to fence and it reserves none. It opens read-only, which is also what keeps
-`recover()` from finishing a seal the primary owns.
-
-**A snapshot, not a subscription.** litestream restores to a point in time, so refreshing
-means assembling another one. That is why the root is always a temporary directory the
-follower owns and removes on close: it is scaffolding for one read session, not a durable
-artefact. There is deliberately no `root` parameter — a caller-supplied one could land on a
-directory that already held a live log and leave a stale `archive.db` to win over the
-bucket's own hint. That was reachable only through the argument, so removing it was cheaper
-than guarding it.
-
-It once carried a second reason, which the per-stream layout has since removed: a supplied
-root could collide with a live log's `catalog.db` and `archive.db`, because those were
-shared by every log under a root. They are per-stream now (§2), so only the stale-hint
-hazard remains — and it is sufficient on its own. The archive metadata is pinned at assembly for the same reason — and because
-`previous-versions-max: 10` keeps ten previous versions beside the current one, so the
-**eleventh further archive commit** deletes the metadata object a follower is holding, **with
-no time component at all**. Archive commits are the ones that count — `sync`, `rewrite_archive`
-and archive expiry — not a local `maintain()`, which moves nothing in the bucket. A primary
-syncing steadily can still sweep a follower in seconds. Every read therefore re-reads that pointer and refuses with "reassemble" rather
-than serving from a snapshot that is gone.
-
-**Following returns a `RemoteReadHandle`, a sibling of the `LocalReadHandle` that
-`open(read_only=True)` returns.** The
-decomposition is `WriteHandle = LocalReadHandle + writes`, so `snapshot` builds the buffer, the local
-table, the archive handle and the `Reader` directly and hands them over. What makes it a
-follower is state: an empty local table beside an archive that holds rows, which is the same
-condition a fully evicted local log meets and gets the same treatment for. Two earlier shapes were wrong in the same direction: subclassing `WriteHandle` published
-a write surface that only raised, and wrapping a whole `WriteHandle` hid that surface while still
-constructing the writer machinery and then reaching past it. Both bugs review found on this
-class came from that seam — a read that lost its error translation to the wrapped object's
-internal dispatch, and a staleness number answered by a writer's method.
-
-**Two things are then unrepresentable rather than refused:**
-
-- **There is no `include_archive=False`.** A follower's local Iceberg table is empty by
-  construction — `_assemble_follower` creates it that way — so reading without the archive
-  returns the replicated buffer alone: a fraction of the log, silently. `RemoteReadHandle`
-  therefore sets `include_archive=True` at construction and takes no parameter for it: the
-  caller chose the archive when it called `snapshot`.
-- **There is no `write_replication_config`.** `litestream_config` keys each replica on the
-  path *relative to the root*, so a follower with the same log name produces a key identical
-  to the primary's. A sidecar run in a follower's root — which this project's own convention
-  says to do — would ship the follower's stripped scratch copy over the primary's only
-  off-box record of its unsealed rows. `_restore_replica` keeps the config it needs in a
-  temporary directory of its own for the same reason.
-
-**`coverage()` reports, it does not adjudicate.** A follower is assembled from two tiers and
-cannot ask the primary anything, so the failure to avoid is silence, not incompleteness. It
-returns the archive extent, the buffered extent, the gap between them if any, and whether
-the followed log declared `wal_replication`.
-
-**A gap is not necessarily loss**, and nothing local can tell the two apart. The gap this
-reports sits above the archive's frontier and below the next thing the replica knows of —
-the buffer's first offset when it holds rows, and the sequence's end when it does not. A
-range there is either a band the buffer lost, since rows sealed while `wal_replication` was
-off are discarded at seal and gone, or a `litelink.restore` fence, which burns 2**20 offsets in
-exactly that position.
-
-**The empty-buffer case is why the bound is not simply the buffer's first offset.** An
-archived log with replication off discards each seal's rows and they reach the archive only
-at the next `sync`; a follower assembled in that window — the ordinary way an operator
-adopts following — has an empty buffer and a sequence far above the archive. Comparing
-against the buffer alone reported such a follower gap-free while it served a fraction of the
-log. `sqlite_sequence` closes it, because it counts every offset ever assigned and never
-lowers. From a replica the two are indistinguishable:
-the fence "leaves no trace once the sequence has moved" (§13.4). A caller who knows whether
-their log has failed over can read a gap that this cannot, so it reports the gap and lets
-them.
-
-A `start_offset` reserve is NOT one of the possibilities, and an earlier draft of this
-section wrongly said it was. That reserve lies below the archive's low end, and nothing here
-compares against it — so it never surfaces as a gap at all.
-
-An earlier design refused to open on a gap. It was wrong for exactly this reason: it refused
-every followed log that had ever failed over, on a million offsets that never existed.
-
-**It serves the buffer alone only when the buffer is the whole log.** With no published
-archive there is one tier, and a follower may use it exactly when it can prove nothing is
-missing from it. Rows LEAVE the buffer by prefix delete (`finish_seal(discard=True)`,
-`release_archived`), which raises its first offset above `start_offset` — or, when the delete
-empties it, raises the next offset it would issue; rows BYPASS it only
-through `ingest`, which raises nothing and so records `ingested_through` at reservation time.
-Either signal refuses. Otherwise the reader would be silently missing rows — the one failure
-this must not have.
+There used to be a litelink reader for this, `snapshot` (`follow` before 0.3), which returned a
+`RemoteReadHandle`: an archive-only view, or with `include_wal=True` a litestream restore of the
+writer's `buffer.db` merged with the archive. It was removed (#90). It rebuilt, on every read
+host, a restore and an adopted catalog that an Iceberg engine does not need, and it carried a
+class of states the primary never meets — a buffer missing rows a seal discarded, pinned
+metadata swept by later commits, gaps no replica could explain — each with its own refusal.
+Freshness past the last `sync` is the primary's to serve; a WAL replica is for failover (§3a).
 
 ## 4. Seal
 

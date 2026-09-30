@@ -13,23 +13,18 @@ of it. Every handle can read, and each subclass only adds:
 .. code-block:: text
 
     LogHandle                    identity, read, observe, close
-    ├── LocalReadHandle          + the replication config surface
-    │   └── WriteHandle          + append, seal, maintain, sync, ...
-    └── RemoteReadHandle         + owns the scratch root it was built in
+    └── LocalReadHandle          + the replication config surface
+        └── WriteHandle          + append, seal, maintain, sync, ...
 
 Nothing inherits a method it has to refuse. Annotate ``LogHandle`` when you do
 not care which you were given.
 
-**The local/remote boundary is the constructor you call**, not an argument you
-pass:
-
-- ``open`` wants a *root on this machine*, and ``read_only=`` picks the type it
-  returns. It reads the log's own directory, sees the writer's commits as they
-  land, and takes no ``archive`` argument because the log already records where
-  its archive is.
-- ``snapshot`` wants an *archive URI* and no root. It restores the writer's
-  buffer from object storage into scratch space and merges it with the archive,
-  so it reads a log running on another machine, as of a point in time.
+**Every handle is on the primary**, the host that holds the log's directory.
+``open`` wants a *root on this machine*, and ``read_only=`` picks the type it
+returns; it reads the buffer, the local table and the archive, and sees the
+writer's commits as they land. Another machine reads the archive with any
+Iceberg engine — it is plain Iceberg, published through ``version-hint.text``
+— rather than through litelink (#90).
 
 ``Row`` and ``S3Options`` are exported because both appear in public
 signatures, and a type a caller has to name has to be importable. ``S3Options``
@@ -39,7 +34,7 @@ where the reasoning lives.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from litelink._assembly import new, open, restore, snapshot  # noqa: A004
+from litelink._assembly import new, open, restore  # noqa: A004
 from litelink._preflight import Check, Report, preflight
 from litelink._s3 import S3Options
 from litelink._statistics import ColumnStatistics, Tier, TierStatistics
@@ -48,7 +43,6 @@ from litelink.log import (
     LocalReadHandle,
     LogConfig,
     LogHandle,
-    RemoteReadHandle,
     Row,
     WriteHandle,
     validate_row,
@@ -66,7 +60,6 @@ __all__ = [
     "LocalReadHandle",
     "LogConfig",
     "LogHandle",
-    "RemoteReadHandle",
     "Report",
     "Row",
     "S3Options",
@@ -78,6 +71,5 @@ __all__ = [
     "open",
     "preflight",
     "restore",
-    "snapshot",
     "validate_row",
 ]

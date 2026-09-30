@@ -20,7 +20,6 @@ import contextlib
 import functools
 import json
 import random
-import tempfile
 import threading
 import time
 import uuid
@@ -411,13 +410,11 @@ class Coverage:
 class LogHandle:
     """Everything you can ask a log without writing to it.
 
-    One type for both read-only cases, because they differ in STATE and not in
-    kind. A reader on the writer's box shares the log's directory and sees its
-    local Iceberg table fill; a reader assembled by `follow` has a restored
-    replica of the buffer and a local table that is empty and stays empty.
-    Nothing else about them differs, and an earlier design that made them two
-    classes — a `WriteHandle` with a `readonly` flag guarding thirteen write methods,
-    and a separate `Follower` — had to keep two answers to every question.
+    Every handle is on the primary, the host that holds the log's directory:
+    it reads the buffer, the local table and — when asked — the archive, and
+    sees the writer's commits as they land. Reading a log from another machine
+    is any Iceberg engine over its archive, not a litelink handle (#90); the
+    `follow`/`snapshot` readers that once did it are gone.
 
     **Whether reads reach the archive is fixed when the handle is built, not
     decided per read.** It was derived from state once — the archive counted
@@ -431,10 +428,7 @@ class LogHandle:
     So it is `include_archive` on the assembly call now: `open(root, name)`
     reads local files, `open(root, name, include_archive=True)` reads the
     archive too, and the answer cannot change between two reads on one
-    handle. `RemoteReadHandle` sets it unconditionally, because a snapshot
-    assembled from an archive has nothing else to read — the parameter is
-    absent there rather than present with one legal value, which is what
-    `Follower` had before the two were unified.
+    handle.
 
     A handle that cannot reach the archive still REFUSES rather than serving
     short: reading a log whose local table has emptied raises, naming the
@@ -645,14 +639,14 @@ class LogHandle:
         local table holds whatever the buffer has sealed. That keeps this a
         cheap SQLite read on the writer's own log.
 
-        With an empty local table it is not authoritative, and this is where a
-        followed log bit. `next_offset` reads a sequence its own docstring
+        With an empty local table — a log evicted dry — it is not authoritative,
+        and this is where a replica-restored reader once bit. `next_offset` reads a sequence its own docstring
         calls "the highest value ever assigned and never lowers", so it keeps
         counting rows the replica no longer carries: a seal taken while
         `_discard_on_seal()` was true deletes its rows and they reach the
         archive only at the next `sync`. In between they are in neither tier.
 
-        Measured on a followed log in that window: it served 864 rows and
+        Measured on such a reader in that window: it served 864 rows and
         reported 1,501, and a caller using this as a resume cursor skipped 636
         rows permanently once the primary synced. Over-reporting loses data;
         under-reporting only re-delivers. So the answer is taken from the
@@ -717,9 +711,7 @@ class LogHandle:
 
         The log's own cached watermark, not a network read — the same `meta`
         row eviction consults so it can ask a keyed read instead of a round
-        trip. On a followed log that row came from the replica, so it describes
-        what the PRIMARY had pushed as of the snapshot; `coverage()` is the one
-        that asks the bucket.
+        trip. `coverage()` is the one that asks the bucket.
         """
         recorded = self._buffer.get_meta(Maintenance.ARCHIVED_KEY)
 
@@ -839,8 +831,8 @@ class LogHandle:
         gap: tuple[int, int] | None = None
         if archive is not None:
             self._table.reload()
-            # ALL THREE TIERS. This arrived for a followed log, whose local
-            # table is empty by construction, so "archive frontier to the
+            # ALL THREE TIERS. This arrived for a replica-restored reader,
+            # whose local table was empty by construction, so "archive frontier to the
             # buffer's first offset" described everything it could serve. A
             # local log has a third tier in between, and leaving it out
             # reported every offset sealed-but-not-yet-synced as unservable —
@@ -868,9 +860,6 @@ class LogHandle:
 
     def close(self) -> None:
         """Release the reader's connection and the buffer's. Nothing else.
-
-        `RemoteReadHandle` extends this to remove the scratch root it owns —
-        extends rather than replaces, adding a step rather than changing one.
 
         It is one of two overrides in the hierarchy. The other is
         `WriteHandle.end_offset`, which answers a genuinely different question
@@ -973,22 +962,16 @@ class LogHandle:
     def _archive_extent(self) -> tuple[int, int] | None:
         """The archive's extent, forcing a real re-read, or None if unreachable.
 
-        **The re-read is not optional.** On a followed log the adopted metadata
-        is pinned, and both caches short-circuit: `Archive.table` on a live
-        handle and `LogTable.extent` on an unchanged `metadata_location`. So
-        without `reload()` this is an in-memory replay that never touches the
-        network — and `coverage()` would go on reporting a healthy, gap-free
-        reader against a snapshot the primary had already swept, which is the
-        honesty guarantee lying.
+        **The re-read is not optional.** Both caches short-circuit —
+        `Archive.table` on a live handle and `LogTable.extent` on an unchanged
+        `metadata_location` — so without `reload()` a long-lived reader would
+        answer from the pointer it last saw, and `coverage()` would report an
+        archive another process has since committed past.
 
-        The archive carries `previous-versions-max: 10` — ten previous versions
-        beside the current one — so the ELEVENTH further archive commit deletes
-        a pinned object, with no time component at all. Archive commits are
-        what count: `sync`, `rewrite_archive`, archive expiry. A local
-        `maintain()` moves nothing in the bucket.
-
-        On a log whose own writer owns the archive this cannot bite: `sync`
-        moves the `archive.db` row, so the re-read finds the current pointer.
+        The archive carries `previous-versions-max: 10`, so a pointer eleven
+        archive commits old names deleted metadata. That is `_swept`: on the
+        primary it is a race with a concurrent `sync`, and retrying reads the
+        current pointer.
         """
         try:
             adopted = self._archive.table(repair=False)
@@ -1014,7 +997,8 @@ class LogHandle:
             msg = (
                 f"{self.root}/{self.name} can no longer reach its archive, and it "
                 f"holds no local files — reading on would omit every archived row. "
-                f"Reassemble with `follow`"
+                f"Check that the archive is reachable (credentials, endpoint) and "
+                f"retry"
             )
             raise RuntimeError(msg)
 
@@ -1022,9 +1006,9 @@ class LogHandle:
 
     def _swept(self, exc: FileNotFoundError) -> RuntimeError:
         return RuntimeError(
-            f"this reader's archive snapshot has been swept — the writer has "
-            f"committed past it ({exc}). A followed log is a snapshot, not a "
-            f"subscription: reassemble with `follow`"
+            f"the archive moved on while this read was resolving it — another "
+            f"process committed past the pointer it held ({exc}). Retry: the next "
+            f"read resolves the current pointer"
         )
 
 
@@ -1038,16 +1022,11 @@ class LocalReadHandle(LogHandle):
     and replace the writer's in-flight seal. `examples/adsb/replicate.py` did
     that for one commit.
 
-    A `RemoteReadHandle` does not have these at all, rather than refusing
-    them: `litestream_config` keys each replica on the path RELATIVE to the
-    root, so a followed log would emit the PRIMARY's key and a sidecar run
-    there would ship its scratch copy over the primary's only off-box record
-    of its unsealed rows. A local handle shares the primary's root and name,
-    so the key it emits IS the primary's own correct one.
+    A local handle shares the primary's root and name, so the replica key it
+    emits IS the primary's own correct one.
 
     Sees the writer's commits as they land: `catalog.db` and `archive.db` live
-    at the root and both processes read the same rows. That is the difference
-    from following, which reads a replica captured at a point in time.
+    in the stream's directory and both processes read the same rows.
     """
 
     @property
@@ -1071,14 +1050,8 @@ class LocalReadHandle(LogHandle):
         commit, because this surface was on `WriteHandle` alone and the example had to
         reach for a writer to get at it.
 
-        **Absent on a followed log**, which is why `RemoteReadHandle` is a
-        sibling of this class rather than a child: `litestream_config` keys
-        each replica on the path relative to the root, so a follower with the
-        same log name emits a key identical to the primary's, and a sidecar
-        run there ships the follower's stripped scratch copy over the
-        primary's only off-box record of its unsealed rows. A local handle
-        shares the primary's root and name, so the key it emits IS the
-        primary's own correct one.
+        A local handle shares the primary's root and name, so the key it emits
+        IS the primary's own correct one.
 
         This used to be a runtime refusal on one shared class. Moving it here
         made the guard unnecessary — there is nothing to call.
@@ -1109,65 +1082,6 @@ class LocalReadHandle(LogHandle):
         destination.write_text(self.replication_config())
 
         return destination
-
-
-class RemoteReadHandle(LogHandle):
-    """A read-only handle to a log running somewhere else, from `follow` (§3b).
-
-    Adds ownership of the scratch directory it was assembled into, and nothing
-    else — every difference in how it READS is derived from its state by
-    `LogHandle`, because its local Iceberg table is empty and its archive
-    holds rows. A local handle to a fully evicted log meets the same two
-    conditions and is treated the same way, correctly.
-
-    It is a SIBLING of `LocalReadHandle` rather than a child so that the
-    replication surface is absent rather than refused. See there for why that
-    matters.
-
-    **A snapshot, not a subscription.** litestream restores to a point in
-    time, so refreshing means assembling another one.
-    """
-
-    def __init__(
-        self,
-        *,
-        layout: Layout,
-        table: LogTable,
-        buffer: Buffer,
-        archive: Archive,
-        reader: Reader,
-        owned: tempfile.TemporaryDirectory[str],
-    ) -> None:
-        super().__init__(
-            layout=layout,
-            table=table,
-            buffer=buffer,
-            archive=archive,
-            reader=reader,
-            # **Not a parameter here, and that is the point.** A snapshot is
-            # assembled from an archive and its local table is empty by
-            # construction, so `False` would name a handle that can read
-            # nothing. The caller chose the archive by calling `snapshot`.
-            include_archive=True,
-        )
-        # Always owned: `follow` builds into a directory it made, and removes
-        # it on close. There is no way to follow into a caller's root.
-        self._owned_root: tempfile.TemporaryDirectory[str] | None = owned
-
-    def close(self) -> None:
-        """Release the handles, then remove the scratch root.
-
-        Nulled first so a second close is a no-op rather than a second
-        `cleanup()`, and in a `finally` so a failing close still removes the
-        directory — it holds a restored copy of the primary's buffer, which is
-        not small on a log whose sync is behind.
-        """
-        try:
-            super().close()
-        finally:
-            owned, self._owned_root = self._owned_root, None
-            if owned is not None:
-                owned.cleanup()
 
 
 class WriteHandle(LocalReadHandle):
@@ -1713,8 +1627,8 @@ class WriteHandle(LocalReadHandle):
             restore_buffer(config_path, layout.buffer_db, options, binary)
 
         if not layout.buffer_db.exists():
-            # Both readings, for `follow`'s reason: nothing in the arguments
-            # separates them. See `_assembly._restore_replica`.
+            # Both readings: nothing in the arguments separates a log that
+            # never replicated from `name`/`archive` naming no log at all.
             msg = (
                 f"no replica of {layout.buffer_db.name} under {archive} — there is "
                 f"nothing to restore. A log with wal_replication off has no off-box "
@@ -2528,8 +2442,7 @@ class WriteHandle(LocalReadHandle):
         **A writer answers a different question than a reader, and inheriting
         the reader's answer was wrong twice.** `LogHandle.end_offset` reports
         the offset after the last row THAT HANDLE CAN SERVE, which is what a
-        follower needs and what a reader assembled from two tiers can honestly
-        claim. A writer is asked where its next row will land, and only
+        reader assembled from several tiers can honestly claim. A writer is asked where its next row will land, and only
         `sqlite_sequence` knows that — it is the thing that assigns it.
 
         The two coincide on a healthy log and diverge exactly where the local
@@ -2872,12 +2785,6 @@ class WriteHandle(LocalReadHandle):
                 # after it, the chunk's offsets are a permanent hole.
                 _refuse_non_finite(rows)
                 lo, hi = self._buffer.reserve(rows.num_rows)
-                # BEFORE the file is written, for I2's reason applied to a
-                # follower: a crash between here and the commit must leave the
-                # marker covering MORE than reached disk, never less. Rows that
-                # bypass the buffer are invisible to a follower otherwise —
-                # they raise no first offset and leave no row it can trust.
-                self._buffer.note_ingested(hi)
                 rows = rows.add_column(
                     0, offset_field, pa.array(range(lo, hi + 1), type=pa.int64())
                 )
@@ -4030,8 +3937,8 @@ class WriteHandle(LocalReadHandle):
         SQLite puts pages freed by a DELETE on a free list and never shrinks the
         file, so a buffer that seals and archives for months keeps every page it
         has ever needed. Locally that is invisible — the free list is reused —
-        and it is the READERS who pay, because litestream replicates the FILE:
-        every `follow` and every `restore` downloads and applies the dead space.
+        and it is FAILOVER that pays, because litestream replicates the FILE:
+        every `restore` downloads and applies the dead space.
         Measured on a 1-day-old capture, 457 MB holding 20,658 live rows with
         92% of its pages free, restoring in 12.5 s against 0.8 s vacuumed.
 

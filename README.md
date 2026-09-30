@@ -64,11 +64,7 @@ log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
 # Read on the same box, across the buffer and the local table.
 log.sql("SELECT count(*), max(price) FROM log").read_all()
 
-# Read from another box, over the archive — no local root, no catalog service.
-with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
-    reader.scan(where="price > 78000").read_all()
-
-# Or with any Iceberg engine, and litelink not installed at all.
+# Read from another box with any Iceberg engine, and litelink not installed at all.
 duckdb.sql("""
     SELECT count(*), max(price)
     FROM iceberg_scan('s3://bucket/prefix/trades',
@@ -116,7 +112,6 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
              s3=None, include_archive=False, start_offset=1)     -> WriteHandle
 litelink.open(root, name, *, s3=None, include_archive=False)       -> WriteHandle
 litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
-litelink.snapshot(name, *, archive, s3=None, include_wal=False, ...) -> RemoteReadHandle
 litelink.restore(root, name, *, archive, s3=None, ...)             -> WriteHandle
 litelink.validate_row(schema, row)                                 # raises as append would
 litelink.preflight(...)                                            # what python -m litelink runs
@@ -197,52 +192,10 @@ counts from the manifests, without opening a data file.
 
 ## Reading from another machine
 
-`litelink.snapshot` is the way in. It resolves the archive's current metadata, handles
-credentials, and hands back a read handle:
-
-```python
-import litelink
-
-with litelink.snapshot("trades", archive="s3://bucket/prefix") as reader:
-    reader.sql("SELECT count(*), max(litelink_offset) FROM log").read_all()
-```
-
-`archive` is the prefix the logs sit under and `"trades"` is the log, so this reads
-`s3://bucket/prefix/trades/`. Credentials come from the environment; pass
-`s3=litelink.S3Options(endpoint=…)` for somewhere that is not AWS.
-
-By default this reads the **archive alone** — no replica, no litestream, no subprocess — and
-assembles in well under a second. The view is as of the archive frontier, which on a quiet
-stream can lag indefinitely rather than by the sync interval, because `sync` holds back a
-trailing run under `target_compact_size`. `coverage()` reports what it can actually serve.
-
-**Pass `include_wal=True` when you want the freshest read there is.** With the writer running a
-WAL sidecar, its `buffer.db` is restored from the replica and merged with the archive, so you
-see down to the replication lag rather than to the last `sync`:
-
-```python
-with litelink.snapshot("trades", archive="s3://bucket/prefix", include_wal=True) as reader:
-    print(reader.coverage())
-    # Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=True)
-```
-
-It needs `wal_replication` on and a sidecar that has shipped; without a replica it raises,
-which is why it is not the default.
-
-That restore is the expensive part: measured against a 276k-row log, 22 s to assemble against
-1.4 s per scan — and it scales with the buffer FILE's size rather than its row count, so a
-writer whose buffer has grown a large free list makes every reader slower (`reclaim_buffer()`
-shrinks it). Assemble once and scan many times; re-entering the `with` block per query pays it
-every time.
-
-Either way it is a **snapshot, not a subscription** — refreshing means assembling another one —
-and it cannot append: a read handle has no write surface at all, rather than one that raises.
-
-### Or any Iceberg engine
-
-The archive is an ordinary Iceberg table that publishes `version-hint.text` at every commit, so
-an engine pointed at the prefix resolves the current metadata itself. No catalog service, no
-local root, no litelink install:
+litelink reads on the primary: every handle is on the host that holds the log's root. Off that
+host, the archive **is** the interface. It is an ordinary Iceberg table that publishes
+`version-hint.text` at every commit, so an engine pointed at the prefix resolves the current
+metadata itself. No catalog service, no local root, no litelink install:
 
 ```python
 import duckdb
@@ -266,12 +219,10 @@ metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
 and `httpfs` when a query names them, and `just bootstrap` provisions them ahead of time so the
 first read is not a download.
 
-**Which to reach for.** A one-shot query in a script is cheaper this way: `snapshot` assembles a
-DuckDB connection, a scratch buffer and an adopted catalog before it can answer anything, and
-you exit before reusing any of it. Hold a snapshot open and the order reverses — measured on a
-200k-row archive, a bounded scan is 0.02 s against 0.40 s for a fresh DuckDB connection, because
-the connection and the loaded extensions are already there. Assemble once and scan many times,
-or use the query above.
+It reads what the archive holds, which on a quiet stream can lag the writer indefinitely
+rather than by the sync interval, because `sync` holds back a trailing run under
+`target_compact_size`. Rows still in the primary's buffer or local table are only readable on
+the primary.
 
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
 asks for what came after — which is how you poll the archive as it grows.

@@ -215,8 +215,8 @@ def restore_buffer(
     **`-if-replica-exists`, so an ABSENT replica is not an error.** It exits 0
     and writes nothing, which leaves the caller's `destination.exists()` check
     to say what happened — and that check is the whole point, because "there is
-    no replica here" is the answer a follower and a restore both need to
-    explain in their own words. Without the flag litestream exits 1 on absence
+    no replica here" is the answer a restore needs to explain in its own
+    words. Without the flag litestream exits 1 on absence
     and the RuntimeError below fires first, so both callers' explanatory
     messages were unreachable and a mistyped log name surfaced as
 

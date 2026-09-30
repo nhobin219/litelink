@@ -35,15 +35,12 @@ Every handle can read. Each subclass only **adds**:
 ```
 LogHandle                    identity · read · observe · close        ← annotate this
 ├── LocalReadHandle          + databases · replication_config · write_replication_config
-│   └── WriteHandle          + append · seal · maintain · sync · set_* · add_column
-└── RemoteReadHandle         + owns and removes the scratch root it was built in
+    └── WriteHandle          + append · seal · maintain · sync · set_* · add_column
 ```
 
 **Nothing inherits a method it has to refuse**, which is the property two earlier shapes kept
 failing. A `Follower` subclassing a writable log carried `append`, `seal` and `sync` that only
-raised; a `read_only` flag did the same to thirteen methods. A followed log here simply has no
-`replication_config`, because `RemoteReadHandle` is a *sibling* of `LocalReadHandle` rather
-than a child.
+raised; a `read_only` flag did the same to thirteen methods.
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
@@ -51,8 +48,6 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
 litelink.open(root, name, *, s3=None)                    -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3=None)    -> LocalReadHandle
 litelink.restore(root, name, *, archive, s3=None, binary=None) -> WriteHandle
-litelink.snapshot(name, *, archive, s3=None, binary=None,
-                scratch_dir=None)                        -> RemoteReadHandle
 ```
 
 **`open` is overloaded on the `read_only` literal**, so the type you get is static:
@@ -67,42 +62,27 @@ depending on the mode literal. The difference from the flag this replaced is tha
 returns a class with **no write methods at all**, rather than one class whose thirteen write
 methods raise. A non-literal `read_only` falls back to `LogHandle` and the caller narrows.
 
-### The local/remote boundary is the constructor
+### Every handle is on the primary
 
-| | `open(root, name, read_only=True)` | `snapshot(name, archive=…)` |
-|---|---|---|
-| **type** | `LocalReadHandle` | `RemoteReadHandle` |
-| **what you pass** | a root **on this machine** | an **archive URI**, and no root |
-| **where the data is** | the log's own directory | object storage + a restored replica |
-| **the buffer** | the writer's live `buffer.db` | a litestream restore of it |
-| **the local Iceberg table** | the writer's, filling as it seals | created **empty**, never filled |
-| **freshness** | live — sees commits as they land | a **snapshot**, as of the restore |
-| **refreshing** | nothing to do | assemble another one |
-| **archive** | optional; a hot read is local disk (I5) | **load-bearing** — see below |
-| **replication config** | yes — the key it emits is the primary's own | **absent** — would emit the primary's key |
-| **root lifetime** | yours | a scratch dir, removed on `close` |
+A handle needs a root **on this machine**: the log's own directory, its live `buffer.db`, and
+its local Iceberg table filling as it seals. The archive is read from there too, when a scan
+asks for it. There is no handle for a log running somewhere else — `snapshot` and its
+`RemoteReadHandle` were removed (#90). Another machine reads the archive with any
+Iceberg engine; see [Reading from another machine](#reading-from-another-machine).
 
 ```python
 # On the writer's box: a live second view. No archive argument — the log
 # already records where its archive is, and reads come off local disk.
 with litelink.open("data", "trades", read_only=True) as r:
     r.scan(where="side = 0")          # local: buffer + local Iceberg table
-    r.end_offset()                    # local while the table has files
+    r.with_archive().scan()           # the whole history, including the archive
+    r.coverage()                      # what each tier holds
     r.write_replication_config()      # its replica key IS the primary's
-
-# On any other box: no root, an archive URI, and a WAL sidecar on the writer.
-with litelink.snapshot("trades", archive="s3://bucket/prefix", s3=opts) as r:
-    r.coverage()                      # Coverage(archive=(1, 1928), buffered=(1929, 2100), …)
-    r.scan(where="side = 0")          # archive + replicated tail, merged
-    r.write_replication_config()      # AttributeError — it does not have one
 ```
 
-**What differs between them is state, not capability.** Whether the archive is load-bearing,
-whether a pinned snapshot can be swept, what `end_offset` may trust — all of it is derived
-from the tiers by `LogHandle` and written once, so it cannot drift between the two. A followed
-log includes the archive automatically and refuses to serve without it because its local table
-is empty and its archive holds rows; **a local handle to a fully evicted log meets the same
-two conditions and is treated the same way**, correctly, which it was not before.
+A local handle to a fully evicted log — its local table empty and its archive holding rows —
+includes the archive automatically and refuses to serve without it, because reading without
+it would return the buffer alone: a fraction of the log, silently.
 
 ## The whole surface
 
@@ -115,7 +95,6 @@ Each row is what that class **adds** to the one above it. A test pins every set 
 | **`LogHandle`** — identity | `root` · `name` · `config` · `schema` · `sort_by` · `archive` |
 | **`LogHandle`** — lifecycle | `close` · context manager |
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
-| **`+ RemoteReadHandle`** | owns and removes its scratch root |
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal_due` · `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `maintain` · `compact` · `evict` · `expire` |
@@ -391,143 +370,10 @@ commit, and a pinned pointer serves one stale snapshot for ever. What this reade
 anything newer than the last `sync()`: rows still in the buffer or the local table are on the
 writing box alone, so its freshness lever is the sync interval.
 
-That last sentence used to say "rather than anything at the reader", which `litelink.snapshot`
-below makes false — with a WAL sidecar there *is* a lever at the reader.
-
 `tests/test_archive.py::test_the_archive_reads_as_a_directory_with_no_catalog_at_all` is that
 claim as a test — it captures through a live archive and asserts the DuckDB row count equals
 the writer's `archived_through()`.
 
-### Reading a log on another machine: `litelink.snapshot`
-
-```python
-litelink.snapshot(name, *, archive, s3=None, binary=None, scratch_dir=None,
-                  include_wal=False) -> RemoteReadHandle
-```
-
-A point-in-time view of a log running somewhere else. **A snapshot, not a subscription**:
-refreshing means assembling another one.
-
-It was called `follow` before 0.3, which promised a subscription it never provided — its
-docstring had to open by saying so. The old name was removed rather than deprecated: the
-library was days old and 0.3 is its introduction, so an alias would have been compatibility for
-nobody at the price of two names for one thing.
-
-**Two modes, and the difference is bigger than the flag makes it look.**
-
-| | `include_wal=False` (default) | `include_wal=True` |
-|---|---|---|
-| what it reads | archive alone | WAL replica **+** archive |
-| fresh to | the archive frontier | the replication lag |
-| assembles in | one catalog read | seconds — see below |
-| needs litestream | no | yes |
-| a log with nothing archived | **refused** | served from the buffer |
-
-**By default it reads the archive alone**, which is also the mode that works on an ordinary
-log: `wal_replication` is opt-in and needs a sidecar, so most logs have no replica to restore
-and `include_wal=True` fails outright on them. Measured on a log with an archive and no
-replication — `include_wal=True` raised in 0.10 s, the default served 3,870 rows.
-
-With `include_wal=True` the writer's `buffer.db` is restored from its replica, the archive is
-adopted beside it, and the two are merged — so freshness falls to the replication lag rather
-than to the seal cadence.
-
-**Skipping the restore** is almost all of the cost. Measured
-against S3 at 60–75 ms RTT: a 1.9 MB buffer took **7.2 s**, of which transfer was ~0.2 s. The
-rest is one LIST plan plus ~20 serial GETs, and the chain length grows with the log's **age**
-rather than its size, because a slow stream accumulates LTX files on the sync interval however
-few rows it holds. The same handle assembled archive-only takes about a quarter of a second.
-
-Reach for it when the last few minutes do not matter — historical and analytical reads over a
-long window, where the freshness buys nothing and the 7 s is the whole bill.
-
-**Its staleness is the archive frontier, which is not "a few seconds".** `sync` holds back a
-trailing run still under `target_compact_size`, so on a quiet stream the frontier can lag
-indefinitely rather than by the sync interval. `coverage()` reports what it can actually serve.
-
-**It refuses a log whose archive has published nothing**, naming `include_wal=True`. That is
-the ordinary state of a slow capture, and it is exactly when the buffer holds everything — so
-an archive-only handle would serve zero rows. Returning an empty snapshot there is the one
-silent wrong answer this path could give.
-
-**The two modes learn the log's shape from different places**, which is worth knowing if you
-point one at the wrong prefix. With the WAL, the schema, sort order and archive location all
-come from the replica's `meta` — the writer's own copy, which survives a re-point. Without it,
-the schema's column set comes from the archive's Iceberg schema — versioned and
-current, so a column added mid-stream is not lost — with the Arrow types taken from a data
-file's Parquet footer, which is the only place the declared types survive (Iceberg has one
-string type and cannot tell `string` from `large_string`). The location is whatever you
-passed.
-
-```python
-with litelink.snapshot("trades", archive="s3://bucket/prefix", s3=opts) as reader:
-    reader.coverage()        # what it can serve, and where it cannot
-    reader.end_offset()      # compare against the primary's to measure staleness
-    reader.scan(where="side = 0")
-    reader.sql("SELECT side, count(*) FROM log GROUP BY side")
-```
-
-By default there is no replica, so `archive` is the prefix. With `include_wal=True` it is where
-the *WAL replica* lives, and the archive prefix itself comes from the replica's own `meta`.
-
-**A log that has published nothing can still be read with `include_wal=True` if its buffer
-holds all of it** — the ordinary state of a slow capture, where `wal_replication` makes a seal
-retain its rows. Even then it is refused when rows left the buffer (its first offset sits above
-the log's) or bypassed it (`ingest` writes straight to Parquet and records `ingested_through`),
-because serving it would silently omit those rows.
-
-**This returns a `RemoteReadHandle`, a sibling of the `LocalReadHandle` that `open(..., read_only=True)` returns.** It holds the read
-collaborators — the replicated buffer, the local table, the archive handle, and the reader
-over them — so `append`, `seal`, `sync`, `compact` and `evict` are *absent* rather than
-raising: the writer machinery is not built at all.
-
-What makes it behave as a follower is state, not type. Its local table is empty by
-construction and its archive holds rows, so the archive is load-bearing: reads include it
-automatically, and `include_archive=False` is **refused** rather than answered short. A local
-reader in the same state — a fully evicted log — gets the same treatment, correctly.
-
-`replication_config`, `write_replication_config` and `databases` live on
-**`LocalReadHandle`**, not on the base: generating a sidecar config is exactly what you do
-beside a live writer, and a local handle shares the primary's root and name so the key it
-emits is the primary's own correct one. A followed log does not have them at all — it raises
-`AttributeError`, because `RemoteReadHandle` is a sibling rather than a child.
-
-That split is the point. `litestream_config` keys each replica on the path relative to the
-root, so a follower emitting one would name the **primary's** key, and a sidecar run there
-would ship its scratch copy over the primary's only off-box record of its unsealed rows.
-
-**A snapshot, not a subscription.** litestream restores to a point in time, so refreshing means
-assembling another follower — exit the block and reopen. The root is always a temporary
-directory the follower owns and deletes on close; there is no `root` parameter, because
-aiming a follow at a caller's directory could land it on a root that already held a live log
-and could leave a stale `archive.db` that wins over the bucket's own hint. (It once also
-risked colliding with a live log's shared catalogs; those are per-stream since 0.2, so the
-stale-hint hazard is the whole of it now.) `scratch_dir` places the temporary
-one somewhere other than `/tmp`, which is often memory-backed and which the restored buffer
-can outgrow.
-
-Reads refuse rather than lie once the primary has committed past the pinned snapshot. The
-archive keeps `previous-versions-max: 10` — ten previous versions beside the current one — so
-the **eleventh further archive commit** is enough, and **there is no time component**. Archive
-commits are `sync`, `rewrite_archive` and archive expiry; a local `maintain()` moves nothing in
-the bucket. A primary syncing steadily can sweep a follower in seconds. The error says to
-reassemble.
-
-```python
-Coverage(archive=(1, 1928), buffered=(1929, 2100), gap=None, wal_replication=True)
-```
-
-`coverage()` reports; it does not adjudicate. A follower cannot ask the primary anything, so the
-failure it avoids is silence. The gap it reports sits above the archive's frontier and below
-the next thing the replica knows of — the buffer's first offset when it holds rows, the
-sequence's end when it does not, so an empty replica still reports the band it cannot serve.
-**A gap there is not necessarily loss**:
-it is either rows the buffer discarded at seal with replication off, or a `litelink.restore` fence,
-which burns 2**20 offsets in exactly that position — and nothing local tells the two apart. A
-caller who knows whether their log has failed over can read a gap that this cannot.
-
-A `start_offset` reserve never appears here: it lies below the archive's low end, which this
-does not compare against.
 
 ## Sealing
 
@@ -613,11 +459,10 @@ log.archive_files() -> int
 ```
 
 All local and none of them opens a data file, with one exception: on a **read** handle whose
-local table holds nothing while its archive holds rows — a followed log, or a local one
-evicted dry — `end_offset()` and `coverage()` read the archive's metadata, because the
-buffer's sequence is not authoritative there. `sqlite_sequence` never lowers, so it keeps
-counting rows a seal discarded, and taking it at face value made a followed log claim 1,501
-while serving 864.
+local table holds nothing while its archive holds rows — a log evicted dry —
+`end_offset()` and `coverage()` read the archive's metadata, because the buffer's sequence is
+not authoritative there: `sqlite_sequence` never lowers, so it keeps counting rows a seal
+moved out of the buffer.
 
 **A `WriteHandle` never does this.** It overrides `end_offset()` to read `sqlite_sequence`
 alone, because a writer is asked where its next row will land rather than what it can serve —

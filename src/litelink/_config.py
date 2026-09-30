@@ -223,13 +223,14 @@ class LogConfig:
     # this setting is for the deployments that would rather it happened on the
     # ordinary pass.
     #
-    # **What it buys is paid by READERS, not by this process.** SQLite never
+    # **What it buys is paid by FAILOVER, not by this process.** SQLite never
     # returns freed pages to the OS, and litestream replicates the FILE — so a
-    # log that seals and archives for months makes every `follow` and every
-    # `restore` download and apply its dead space. Measured on a 1-day-old
-    # capture: 457 MB holding 20,658 live rows, 92% of its pages free, restoring
-    # in 12.5 s against 0.8 s for the same content vacuumed. A writer with no
-    # off-box readers can leave this None for ever and lose nothing but disk.
+    # log that seals and archives for months makes every `restore` download and
+    # apply its dead space. Measured on a 1-day-old capture: 457 MB holding
+    # 20,658 live rows, 92% of its pages free, restoring in 12.5 s against 0.8 s
+    # for the same content vacuumed. A log without `wal_replication` is never
+    # restored from a replica, so it can leave this None for ever and lose
+    # nothing but disk.
     #
     # 0.5 is the value to reach for. The win scales with what is RECLAIMED and
     # the cost with what is KEPT, so the trade only improves above it, and a
