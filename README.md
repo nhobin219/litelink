@@ -15,7 +15,7 @@ once the row is durable. Behind it, the library seals rows into sorted Parquet, 
 files up to a target size, pushes settled files to an Iceberg archive on S3, and evicts from
 local disk what the archive already holds. Through all of it the log stays one queryable
 unit: a read sees every row exactly once, whichever tier holds it, and maintenance runs beside
-appends rather than in front of them, so no pass blocks appends for its length or shows a
+appends rather than in front of them, so no pass blocks appends for its duration or shows a
 reader a half-finished state.
 
 ```
