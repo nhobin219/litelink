@@ -42,6 +42,7 @@ def test_it_is_public_and_loads_the_iceberg_read_path() -> None:
     on an extension it never uses.
     """
     assert "duckdb_connection" in litelink.__all__
+    assert "install_s3_secret" in litelink.__all__
     assert "ExtensionMissing" in litelink.__all__
 
     connection = litelink.duckdb_connection()
@@ -73,21 +74,106 @@ def test_remote_loads_httpfs_and_the_secret_from_the_options() -> None:
     assert "eu-west-2" in found["litelink_s3"]
 
 
-def test_remote_without_options_reads_the_environment(
-    monkeypatch: pytest.MonkeyPatch,
+def aws_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, credentials: bool
 ) -> None:
-    """With no `s3`, credentials come from where every AWS tool looks — the
-    environment, then the credential chain — as the log's own read path does.
+    """An AWS environment this test controls, whatever the machine has.
 
-    Falsify by requiring `s3` when `remote=True`: this raises.
+    The credential chain reads keys from the environment, a credentials file,
+    a config file and instance metadata. Each is pinned here: no keys, files of
+    our own, metadata off. With `credentials`, the credentials file holds a
+    profile the chain finds; without, there is nothing anywhere — which is CI,
+    and where the chain secret first failed (#109 review).
     """
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_ENDPOINT_URL",
+        "AWS_REGION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    empty = tmp_path / "aws-config"
+    empty.write_text("")
+    keys = tmp_path / "aws-credentials"
+    keys.write_text(
+        "[default]\naws_access_key_id = AKIDEXAMPLE\n"
+        "aws_secret_access_key = SECRETEXAMPLE\n"
+        if credentials
+        else ""
+    )
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(empty))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(keys))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+
+def test_remote_without_options_reads_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no `s3`, the endpoint and region come from the environment and the
+    keys from the credential chain — here a profile in a credentials file — as
+    the log's own read path does. The chain secret refreshes itself.
+
+    Falsify by requiring `s3` when `remote=True`, or by dropping `REFRESH auto`
+    from `secret_sql`: this raises, or the refresh assertion fails.
+    """
+    aws_environment(monkeypatch, tmp_path, credentials=True)
     monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9123")
     monkeypatch.setenv("AWS_REGION", "ap-south-1")
     connection = litelink.duckdb_connection(remote=True)
 
     found = secrets(connection)["litelink_s3"]
+    assert "provider=credential_chain" in found
     assert "127.0.0.1:9123" in found
     assert "ap-south-1" in found
+    assert "'refresh': auto" in found
+
+
+def test_no_credentials_anywhere_names_the_fix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """DuckDB refuses a credential chain that finds nothing, with an error
+    that names its chain and not the remedy. The caller gets the remedy.
+
+    Falsify by letting the `duckdb.Error` from `create_secret` through: the
+    raw "Secret Validation Failure" reaches the caller.
+    """
+    aws_environment(monkeypatch, tmp_path, credentials=False)
+
+    with pytest.raises(RuntimeError, match="no S3 credentials were found") as caught:
+        litelink.duckdb_connection(remote=True)
+
+    assert "AWS_ACCESS_KEY_ID" in str(caught.value)
+    assert isinstance(caught.value.__cause__, duckdb.Error)
+
+
+def test_a_secret_installed_on_a_connection_reaches_its_cursors() -> None:
+    """`install_s3_secret` on a connection litelink did not build — a shared
+    database handing out cursors — replaces the secret for every cursor, as
+    rotated keys need.
+
+    Built with autoloading off, so `httpfs` arrives only through the explicit
+    load — DuckDB would otherwise fetch it from its own home on first use, and
+    not from litelink's bundle. Falsify by dropping the `httpfs` load from
+    `install_s3_secret`: the first call raises.
+    """
+    connection = duckdb.connect(config={"autoload_known_extensions": False})
+    first = litelink.S3Options(
+        endpoint="http://127.0.0.1:9001", access_key="a", secret_key="a"
+    )
+    second = litelink.S3Options(
+        endpoint="http://127.0.0.1:9002", access_key="b", secret_key="b"
+    )
+    litelink.install_s3_secret(connection, first)
+    cursor = connection.cursor()
+    assert "127.0.0.1:9001" in secrets(cursor)["litelink_s3"]
+
+    litelink.install_s3_secret(connection, second)
+
+    assert "127.0.0.1:9002" in secrets(cursor)["litelink_s3"]
+    assert "httpfs" in loaded(connection)
 
 
 def test_options_without_remote_are_refused() -> None:

@@ -72,7 +72,12 @@ def secret_sql(options: S3Options) -> str:
         # `credential_chain` is DuckDB's equivalent of that resolution. The
         # else-branch rather than the default, because an explicit key must
         # still win — see `S3Options.resolved`.
+        #
+        # `REFRESH auto`, because the chain resolves its credentials when the
+        # secret is CREATED, and a long-lived connection would otherwise keep
+        # presenting an STS token after it expires (#108).
         parts.append("PROVIDER credential_chain")
+        parts.append("REFRESH auto")
 
     if options.region is not None:
         parts.append(f"REGION '{options.region}'")
@@ -224,6 +229,51 @@ def load_extension(
         raise ExtensionMissing(msg) from exc
 
 
+def create_secret(target: duckdb.DuckDBPyConnection, options: S3Options) -> None:
+    """Create or replace the S3 secret on `target`, from resolved `options`.
+
+    A credential chain that finds nothing is refused by DuckDB at creation, with
+    `Secret Validation Failure: … Credential Chain: 'config'` — true, and no use
+    to someone who does not know which chain or what it wanted. Raised instead
+    as an error naming the three ways to supply credentials, DuckDB's kept as
+    the cause.
+    """
+    try:
+        target.execute(secret_sql(options))
+    except duckdb.Error as exc:
+        if options.access_key is not None and options.secret_key is not None:
+            raise
+
+        msg = (
+            "no S3 credentials were found for reading a published table on S3. "
+            "Pass them explicitly (S3Options(access_key=..., secret_key=...)), "
+            "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or configure an "
+            f"AWS profile this machine can use. DuckDB said: {exc}"
+        )
+        raise RuntimeError(msg) from exc
+
+
+def install_s3_secret(
+    connection: duckdb.DuckDBPyConnection, s3: S3Options | None = None
+) -> None:
+    """Load `httpfs` and create or replace the S3 secret on `connection`.
+
+    What `duckdb_connection(remote=True)` does after loading the read path, for
+    a connection litelink did not build — one shared database handing out
+    cursors, say — and for credentials that have changed since. Credentials come
+    from `s3`, or with none given from the environment and then the AWS
+    credential chain. A chain secret refreshes itself (`REFRESH auto`), so an
+    expiring STS token is not a reason to call this; rotated explicit keys are.
+
+    Secrets belong to the database, not the cursor, so one call covers every
+    cursor of `connection`. Raises `ExtensionMissing` if `httpfs` is not
+    provisioned, and `RuntimeError`, naming the fix, if no credentials are
+    found.
+    """
+    load_extension(connection, "httpfs", remote=True)
+    create_secret(connection, (s3 or S3Options()).resolved())
+
+
 def duckdb_connection(
     s3: S3Options | None = None, *, remote: bool = False
 ) -> duckdb.DuckDBPyConnection:
@@ -235,18 +285,19 @@ def duckdb_connection(
     network read. A missing one raises `ExtensionMissing`, saying how to
     provision it.
 
-    `remote=True` also loads `httpfs` and creates the S3 secret, from `s3` or,
-    with none given, from the environment (`S3Options()`), which falls back to
-    the AWS credential chain. That is what reading a published table on S3 from
-    another machine needs:
+    `remote=True` also runs `install_s3_secret`: `httpfs`, and the S3 secret
+    from `s3` or, with none given, from the environment and then the AWS
+    credential chain. A machine with no credentials at all raises
+    `RuntimeError` naming the fix. That is what reading a published table on S3
+    from another machine needs:
 
         con = litelink.duckdb_connection(remote=True)
         con.sql("SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/trades',"
                 " version_name_format = '%s%s.metadata.json')")
 
     `s3` without `remote=True` is refused rather than ignored: credentials
-    nobody installs read as anonymous, and that fails as a 403 at the first
-    query rather than here.
+    nobody installs are a connection with no secret, which reads S3 as
+    anonymous and fails as a 403 at the first query rather than here.
 
     A new connection per call, which the caller owns. Building one costs about
     half a second, nearly all of it `LOAD iceberg` (#102), so hold on to it.
@@ -269,8 +320,7 @@ def duckdb_connection(
     # cost: two SQLite libraries in one process is silent corruption, not a
     # slow path.
     if remote:
-        load_extension(connection, "httpfs", remote=True)
-        connection.execute(secret_sql((s3 or S3Options()).resolved()))
+        install_s3_secret(connection, s3)
 
     return connection
 
@@ -360,7 +410,7 @@ class Reader:
             load_extension(self._connect(), "httpfs", remote=True)
             self._remote_ready = True
 
-        cursor.execute(secret_sql(self._published.s3.resolved()))
+        create_secret(cursor, self._published.s3.resolved())
 
         return location, covered
 

@@ -670,6 +670,8 @@ def test_the_published_read_falls_back_to_the_aws_credential_chain() -> None:
     rendered = secret_sql(S3Options(region="us-west-1"))
 
     assert "PROVIDER credential_chain" in rendered
+    # Resolved at creation, so a long-lived connection must refresh it (#108).
+    assert "REFRESH auto" in rendered
     assert "KEY_ID" not in rendered
     assert "REGION 'us-west-1'" in rendered
 

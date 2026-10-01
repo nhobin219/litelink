@@ -15,9 +15,19 @@ minor version carries breaking changes.
   connection provisioned to read a published table on another machine
   (#108). It loads `avro` and `iceberg` from the extensions litelink bundles;
   `remote=True` also loads `httpfs` and creates the S3 secret. A missing
-  extension raises the now-public `litelink.ExtensionMissing`. It replaces
-  reaching into `litelink._read` for `duckdb_connection`, `load_extension` and
-  `secret_sql`.
+  extension raises the now-public `litelink.ExtensionMissing`, and a machine
+  with no S3 credentials raises an error naming how to supply them rather than
+  DuckDB's "Secret Validation Failure". It replaces reaching into
+  `litelink._read` for `duckdb_connection`, `load_extension` and `secret_sql`.
+- **`litelink.install_s3_secret(connection, s3=None)`**: the S3 half on its
+  own, for a connection litelink did not build (one database handing out
+  cursors) and for rotated keys.
+
+### Changed
+
+- **A credential-chain S3 secret is created with `REFRESH auto`**, so a
+  long-lived connection keeps working past an STS token's expiry. This applies
+  to the log's own reader as well.
 
 ## 0.6.0 — 2026-10-01
 

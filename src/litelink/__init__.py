@@ -49,7 +49,7 @@ from litelink._handle import (
     validate_row,
 )
 from litelink._preflight import Check, Report, preflight
-from litelink._read import ExtensionMissing, duckdb_connection
+from litelink._read import ExtensionMissing, duckdb_connection, install_s3_secret
 from litelink._s3 import S3Options
 from litelink._statistics import ColumnStatistics, Tier, TierStatistics
 
@@ -76,6 +76,7 @@ __all__ = [
     "WriteHandle",
     "__version__",
     "duckdb_connection",
+    "install_s3_secret",
     "manifest",
     "new",
     "open",
