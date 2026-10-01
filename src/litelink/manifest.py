@@ -1,8 +1,8 @@
 """Statistics manifests: one row of per-column bounds per unit, and pruning on them.
 
 A manifest is a Parquet table with one row per unit a reader might skip — a
-tier of one log in litelink (`staging`, `published`), a sealed log of a stream in
-streamcast — and one struct column per prunable column:
+tier of one log in litelink (`staging`, `published`), a sealed log of a stream
+in streamcast — and one struct column per prunable column:
 
     tier       start_offset  end_offset  record_count  price                     side
     staging    3001          4001        1000          {min, max, null_count, …} {min, max, …}
@@ -71,11 +71,11 @@ terms — dropping a conjunct can only include more, never fewer.
 class Row(NamedTuple):
     """One unit's row: its name, offsets, declared columns and statistics.
 
-    `end_offset` is exclusive, as it is on every extent in litelink, and None
-    for a unit still growing — the buffer, a stream's live log — which is then
-    never skipped for a term above it. `schema`
-    is what decides each struct column's type, so a column with no statistics
-    in this unit still gets a typed NULL rather than none at all.
+    `end_offset` is exclusive, as it is on every offset range in litelink, and
+    None for a unit still growing — the buffer, a stream's live log — which is
+    then never skipped for a term above it. `schema` is what decides each
+    struct column's type, so a column with no statistics in this unit still
+    gets a typed NULL rather than none at all.
     """
 
     name: str

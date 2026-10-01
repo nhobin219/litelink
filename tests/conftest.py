@@ -48,7 +48,7 @@ def filesystem(s3: S3Options):  # noqa: ANN201  — s3fs is an optional import
         "s3fs",
         reason=(
             "s3fs is missing — it is a dev dependency used by the test "
-            "fixtures, not by litelink. Run `uv publish`."
+            "fixtures, not by litelink. Run `uv sync`."
         ),
     )
 

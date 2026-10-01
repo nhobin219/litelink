@@ -1,8 +1,8 @@
 """Local storage reclamation: compact, evict, expire, drain (SPEC §6, §8, §12).
 
 Separate from the write path because it shares nothing with it but the tables it
-reads, and separate from `WriteHandle` because it is the half of the library with no
-opinion about appends.
+reads, and separate from `WriteHandle` because it is the half of the library
+with no opinion about appends.
 
 The four run in order and none is useful alone. Compaction alone INCREASES
 storage, since superseded files stay referenced until their snapshots expire.
@@ -65,9 +65,9 @@ def runs(
 
     The one definition of what compaction considers a run, because two
     collaborators act on it and they must not disagree: `compact` merges these
-    groups, and `publish` refuses to published table a file that appears in one, since a
-    file pushed and then merged locally leaves the published table holding rows that
-    have been rewritten underneath it.
+    groups, and `publish` refuses to push a file that appears in one, since a
+    file pushed and then merged in staging leaves the published table holding
+    rows that have been rewritten underneath it.
 
     Sizes come from `memory` — what each file holds uncompressed, as the
     appender counted it — and the budget is `target_compact_size`, which is
@@ -127,14 +127,14 @@ def stable_prefix(
 ) -> int:
     """How many leading files compaction will never touch again.
 
-    What `publish` needs to know, asked directly. It used to ask a proxy question
-    — "is this file at least half the target?" — and measure it on disk, which
-    fails outright on compressible data: a 64 KiB buffer of repetitive rows
-    seals to under 8 KiB, so no file ever reached half of 64 KiB, `publish` pushed
-    nothing, and the published table stayed empty with nothing to indicate why.
-    Compaction's own rule has no such blind spot, and it is the rule that
-    actually matters, since the only reason to hold a file back is that
-    compaction might rewrite it.
+    What `publish` needs to know, asked directly. It used to ask a proxy
+    question — "is this file at least half the target?" — and measure it on
+    disk, which fails outright on compressible data: a 64 KiB buffer of
+    repetitive rows seals to under 8 KiB, so no file ever reached half of 64
+    KiB, `publish` pushed nothing, and the published table stayed empty with
+    nothing to indicate why. Compaction's own rule has no such blind spot, and
+    it is the rule that actually matters, since the only reason to hold a file
+    back is that compaction might rewrite it.
 
     Two things disqualify a file. It sits in a run compaction would merge right
     now; or it sits in the trailing run, which is under budget and so still has
@@ -146,8 +146,8 @@ def stable_prefix(
     target and always will be — its neighbours are too big to merge with, so
     compaction will not touch it and waiting achieves nothing. Holding it was
     the old behaviour and it meant a single explicit `seal()` blocked the
-    published table permanently: everything after it is newer, so the watermark never
-    advanced again and I4 then pinned local disk too. Not "later" — never.
+    published table permanently: everything after it is newer, so the watermark
+    never advanced again and I4 then pinned local disk too. Not "later" — never.
     """
     limit = rows or _NO_ROW_LIMIT
     settled = 0
@@ -194,10 +194,10 @@ def _both(
 def _covered(ranges: Sequence[tuple[int, int]], start: int, end: int) -> bool:
     """Whether `[start, end)` sits entirely inside `ranges`, which are sorted.
 
-    A walk rather than a set membership test, because the published table's cuts need
-    not line up with anyone else's. Adjacent published files join — offsets are
-    contiguous, so `[1, 151)` and `[151, 301)` together hold `[101, 201)` even
-    though neither holds it alone — and a gap ends the answer.
+    A walk rather than a set membership test, because the published table's cuts
+    need not line up with anyone else's. Adjacent published files join — offsets
+    are contiguous, so `[1, 151)` and `[151, 301)` together hold `[101, 201)`
+    even though neither holds it alone — and a gap ends the answer.
     """
     if end <= start:
         # An empty range is held by anything, vacuously. Unreachable from I4,
@@ -220,10 +220,12 @@ def _covered(ranges: Sequence[tuple[int, int]], start: int, end: int) -> bool:
 
 
 def is_remote(path: str) -> bool:
-    """Whether a queued deletion names an object rather than a local file.
+    """Whether a queued deletion names a published file rather than a staging
+    one.
 
-    The queue holds root-relative names for local files and full URIs for
-    remote ones, and a URI is the only thing that can carry a scheme — a
+    The queue holds root-relative names for staging files and full URIs for
+    published ones — `file://` too, when the published table is a local
+    directory (#98) — and a URI is the only thing that can carry a scheme: a
     relative path never contains "://". One queue for both, because the grace
     period, the reference veto and the ordering that makes them safe are
     identical either side of the network.
@@ -241,8 +243,9 @@ def _undersized_from(
     reproduce them; everything after has to move regardless of its own size,
     because the shortfall ahead of it shifts every boundary behind it.
 
-    A file whose size was never recorded counts as full, so a published table whose
-    local extents were lost is left alone rather than rewritten on a guess.
+    A file whose size was never recorded counts as full, so a published table
+    whose `extent` rows were lost is left alone rather than rewritten on a
+    guess.
     """
     for index, data_file in enumerate(run):
         if held.get(data_file.path, target) < target:
@@ -320,14 +323,15 @@ class Maintenance:
     PUBLISHED_THROUGH_KEY = "published_through"
 
     def published_through(self) -> int:
-        """Highest offset the published table is known to hold, 0 if none (§5, I4).
+        """Highest offset the published table is known to hold, 0 if none (§5,
+        I4).
 
         A prefix, always: files cover contiguous non-overlapping ranges (§4)
         and `publish` pushes them in order, so one integer describes it.
 
-        Cached in `meta` rather than read from the published table, so eviction can ask
-        a keyed read instead of a network round trip to find out what it may
-        drop.
+        Cached in `meta` rather than read from the published table, so eviction
+        can ask a keyed read instead of a network round trip to find out what it
+        may drop.
         """
         recorded = self._buffer.get_meta(self.PUBLISHED_THROUGH_KEY)
 
@@ -339,27 +343,28 @@ class Maintenance:
         """The `end` of the longest prefix of `files` the published table holds
         (§4a), or 0 when it holds none of it.
 
-        I4 asked of segments. A file is the published table's business if the published table
-        holds THAT FILE'S ROWS, which `publish` wrote down when it pushed it. The
-        walk stops at the first file not fully held, so the answer stays a
-        prefix — which is what eviction needs, since it removes one.
+        I4 asked of segments. A file is the published table's business if the
+        published table holds THAT FILE'S ROWS, which `publish` wrote down when
+        it pushed it. The walk stops at the first file not fully held, so the
+        answer stays a prefix — which is what eviction needs, since it removes
+        one.
 
         **Coverage, not equality.** The two tiers cut the same rows into files
-        independently, and asking whether a local range EQUALS a published one
+        independently, and asking whether a staging range EQUALS a published one
         was wrong the moment they could differ. `rewrite_published` re-cuts the
-        published table to different boundaries by design — that is its entire job —
-        and every local file then matched nothing, for ever: eviction clamped
-        to zero and stopped, and compaction stopped seeing published files as
-        the published table's business and merged across its extent. Neither heals,
-        because nothing ever re-cuts the published table back.
+        published table to different boundaries by design — that is its entire
+        job — and every staging file then matched nothing, for ever: eviction
+        clamped to zero and stopped, and compaction stopped seeing published
+        files as the published table's business and merged across its span.
+        Neither heals, because nothing ever re-cuts the published table back.
 
         Exact rather than conservative in both directions, and that is the
-        point. A watermark had to be raised before a register to cover the
-        crash between the two, so it named ranges the published table might not hold,
-        and it had to be reset when the log was re-pointed, so it went
-        backwards past ranges the published table did hold. Neither is expressible
-        here: the row is written when the copy exists, and it names the bucket
-        it went to.
+        point. A watermark had to be raised before a register to cover the crash
+        between the two, so it named ranges the published table might not hold,
+        and it had to be reset when the log was re-pointed, so it went backwards
+        past ranges the published table did hold. Neither is expressible here:
+        the row is written when the copy exists, and it names the bucket it went
+        to.
         """
         ordered = sorted(files, key=lambda f: f.start)
         if not ordered:
@@ -383,8 +388,8 @@ class Maintenance:
         Real work on the happy path. Not repair — the cut is exact and there is
         no timer to cut early, so every file a seal writes already holds what
         it should — but conversion: `target_compact_size` defaults to eight
-        times `target_seal_size`, so eight sealed files become one, published table or
-        no published table. It also picks up the deliberate exceptions: an explicit
+        times `target_seal_size`, so eight sealed files become one, before they
+        are published. It also picks up the deliberate exceptions: an explicit
         `seal()`, which cuts short by definition, and a change to
         `target_compact_size`, which leaves existing files sized for the old
         value. A no-op only where the two targets are set equal.
@@ -402,31 +407,33 @@ class Maintenance:
         # FRESH table, committing evicted data back into the log.
         self._table.reload()
 
-        # Published files are never inputs. A merge spanning the published table's
-        # extent either duplicates the rows already pushed or strands the ones
-        # above them, and skipping them makes that unreachable. They are a
+        # Published files are never inputs. A merge spanning the published
+        # table's span either duplicates the rows already pushed or strands the
+        # ones above them, and skipping them makes that unreachable. They are a
         # prefix, so dropping them cannot break adjacency.
         #
         # Asked per file (§4a). It also keeps the two tiers' ranges aligned:
-        # a file the published table holds is never rewritten locally, so the local
-        # range and the published range stay the same range, which is what lets
-        # `published_prefix` match them at all.
+        # a file the published table holds is never rewritten in staging, so
+        # the staging range and the published range stay the same range, which
+        # is what lets `published_prefix` match them at all.
         local = self._table.data_files()
-        # Asked of ANY published table, and asked even when none is configured. A
-        # merge across a range some published table holds makes a local file whose
-        # boundaries line up with nothing there — and nothing re-cuts a LOCAL
-        # straddler, so re-attaching that published table stalls the log for good:
-        # eviction pins below the straddler and every push is refused. Four
-        # legitimate operations reach it — detach, raise the target, maintain,
-        # re-attach — with no warning at any step.
+        # Asked of ANY published table, not only the one the log points at
+        # now. A merge across a range some published table holds makes a
+        # staging file whose boundaries line up with nothing there — and
+        # nothing re-cuts a STAGING straddler, so pointing back at that
+        # published table stalls the log for good: eviction pins below the
+        # straddler and every push is refused. Four legitimate operations reach
+        # it — point away, raise the target, maintain, point back — with no
+        # warning at any step.
         #
         # Skipping them is not free, and the earlier claim that it was — "a
         # file with a published copy is already at the target" — is false the
         # moment the target is RAISED after the copy was made, which is the
         # scenario this exists for. What it costs is that such a file stays at
-        # the size it was published at; `rewrite_published` is the tool for that.
-        # What it buys is that no merge can ever straddle a range a published table
-        # holds. `_push` applies the same exclusion, or the two deadlock.
+        # the size it was published at; `rewrite_published` is the tool for
+        # that. What it buys is that no merge can ever straddle a range a
+        # published table holds. `_push` applies the same exclusion, or the two
+        # deadlock.
         published = self.published_prefix(local, None, include_intents=True)
         pending = [f for f in local if f.end > published]
 
@@ -445,9 +452,9 @@ class Maintenance:
         `DataFile` carries.
 
         Covers both tiers, because both are measured the same way and the
-        published table's entries are the local ones carried across the push. A local
-        file is recorded root-relative and named absolutely by the table; a
-        remote one is recorded and named by the same URI.
+        published table's entries are the staging ones carried across the push.
+        A staging file is recorded root-relative and named absolutely by the
+        table; a published one is recorded and named by the same URI.
         """
         return {
             key if is_remote(key) else str(self._layout.absolute(key)): size
@@ -470,12 +477,13 @@ class Maintenance:
     ) -> None:
         """Replace one run of adjacent files with a single merged one.
 
-        Both tiers, one path. A local compaction and a published rewrite differ
-        only in which table they commit to and whether the output is uploaded
-        afterwards; everything that makes either safe — the claim before the
-        file exists, re-sorting, verification, queueing the sources before the
-        commit that supersedes them, carrying their measured sizes onto the
-        output — is identical, and was identical when it was written twice.
+        Both tiers, one path. A staging compaction and a published rewrite
+        differ only in which table they commit to and whether the output is
+        uploaded afterwards; everything that makes either safe — the claim
+        before the file exists, re-sorting, verification, queueing the sources
+        before the commit that supersedes them, carrying their measured sizes
+        onto the output — is identical, and was identical when it was written
+        twice.
         """
         start, end = run[0].start, run[-1].end
         # Unique per attempt. See `compaction_path`: a fixed name made a
@@ -485,9 +493,9 @@ class Maintenance:
         # Claimed before the file exists, exactly as a seal claims its path
         # (I2). One that dies between the write and the commit is then
         # recoverable by name, instead of being a file nobody can identify
-        # without listing — which for the published table would be a paginated LIST
-        # over object storage, the thing this design refuses. Claimed as the
-        # TARGET, so recovery knows which tier to remove it from.
+        # without listing — which for a remote published table would be a
+        # paginated LIST over object storage, the thing this design refuses.
+        # Claimed as the TARGET, so recovery knows which tier to remove it from.
         # The range claimed before a byte is written, and the two are one
         # question: may this merge run, and is the record of it live work or a
         # dead process's leavings. A claim answers both (§4a) — and the check
@@ -522,17 +530,18 @@ class Maintenance:
 
         # The published premise too, not only the inputs' liveness. The run was
         # grouped at pass start against the watermark as it was then, and a
-        # publish that ran since — under a policy whose grouping settles a partial
-        # prefix of this run — can have pushed part of it. Merging what is left
-        # commits a LOCAL file straddling the published table's extent, and nothing
-        # re-cuts a local straddler: `rewrite_published` works the other side.
+        # publish pass that ran since — under a policy whose grouping settles a
+        # partial prefix of this run — can have pushed part of it. Merging what
+        # is left commits a STAGING file straddling the published table's span,
+        # and nothing re-cuts a staging straddler: `rewrite_published` works the
+        # other side.
         #
-        # The published read DURABLY here, not from this object's memory. A
-        # compaction pass holds no pass-level claim — only per-run ones — so a
-        # `set_published` is free between two runs of one pass, and the shipped
-        # writer calls it on every restart. Answered from pass-start memory,
-        # this guard would report "no published table" for the rest of a pass that now
-        # has one, and skip itself entirely.
+        # The published ranges read DURABLY here, not from this object's
+        # memory. A compaction pass holds no pass-level claim — only per-run
+        # ones — so a `set_published` is free between two runs of one pass, and
+        # the shipped writer calls it on every restart. Answered from pass-start
+        # memory, this guard once reported "no archive" for the rest of a pass
+        # that had since been given one, and skipped itself entirely.
         # From then on every push is refused by `_refuse_straddle`, the
         # watermark never advances again, and eviction pins on it.
         if table is self._table:
@@ -585,8 +594,8 @@ class Maintenance:
 
         # Written locally either way, because Parquet is written to a file and
         # the alternative is holding a second copy of the run in memory. For
-        # the published table it is a staging copy under the name it will have
-        # remotely, uploaded and then removed.
+        # the published table it is a scratch copy under the name it will have
+        # there, uploaded and then removed.
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         write_parquet(merged, dest, self.config.compression)
@@ -689,7 +698,7 @@ class Maintenance:
             # dense — true of a rollback's occasional gap, and false the moment
             # anything reserves a range. A restore skips 2**20 offsets to keep
             # I9 (§3a), so the subtraction would put the boundary 2**20 above
-            # every local file, and the first `maintain()` after a failover
+            # every staging file, and the first `maintain()` after a failover
             # would evict the whole staging window, clamped only by I4. The
             # comment here used to say the arithmetic errs toward retaining
             # MORE, which is the safe direction for a floor; across a large
@@ -710,7 +719,7 @@ class Maintenance:
 
                 kept += data_file.rows
             else:
-                # Every local file is inside the window: keep all of them.
+                # Every staging file is inside the window: keep all of them.
                 limits.append(0)
 
         return min(limits) if limits else 0
@@ -718,9 +727,9 @@ class Maintenance:
     def evict(self, *, everything: bool = False) -> None:
         """Drop files older than `staging_retention` from the staging table (§8).
 
-        `everything` drops every file the published table holds, whatever the policy —
-        what `retire()` ends with. I4 still clamps it: a file the published table has
-        not registered stays.
+        `everything` drops every file the published table holds, whatever the
+        policy — what `retire()` ends with. I4 still clamps it: a file the
+        published table has not registered stays.
 
         Age comes from `extent.named_at` — the log's own record of when the
         file was named — falling back to the Iceberg snapshot that added it
@@ -729,8 +738,8 @@ class Maintenance:
         bug that silently stopped reclaiming anything, because expiry retires
         the snapshot the age was being read from.
 
-        Never deletion: every log has a published table (#98), and I4 keeps a file
-        until it holds it.
+        Never deletion: every log has a published table (#98), and I4 keeps a
+        file until it holds it.
         """
         # The POLICY re-read first, because it decides everything below. Read
         # again under the claim as well: this one only decides whether there is
@@ -770,8 +779,8 @@ class Maintenance:
         #
         # Claimed on the UNCLAMPED boundary, which only ever falls from here —
         # so this covers a superset of what is removed. Claiming the clamped
-        # range would mean reading the published table's premise outside the claim,
-        # which is the defect below.
+        # range would mean reading the published table's premise outside the
+        # claim, which is the defect below.
         removal = self._buffer.claim("evict", 0, boundary, new_owner())
         if not removal.acquire():
             return
@@ -784,37 +793,38 @@ class Maintenance:
         # window is not narrow: `set_published` is documented as something the
         # shipped writer calls on every restart, and it takes the whole log,
         # which is free precisely while this holds nothing. Attaching a
-        # published table between the read and the acquire left this deleting the only
-        # copy of every aged row the new published table was configured to receive, and
-        # publish can never push them afterwards because they have left the table.
-        # Re-pointing left it evicting on a clamp earned by the OLD published table,
-        # whose rows the read path no longer scans.
+        # published table between the read and the acquire left this deleting
+        # the only copy of every aged row the new published table was
+        # configured to receive, and publish can never push them afterwards
+        # because they have left the table. Re-pointing left it evicting on a
+        # clamp earned by the OLD published table, whose rows the read path no
+        # longer scans.
         self._table.reload()
         self._age_cache = None
         files = self._table.data_files()
         if not everything:
             boundary = min(boundary, self._retention_boundary())
 
-        # I4: a file the published table still lacks must not leave the staging table,
-        # because with a published table configured the local copy stops being the
-        # only one only once publish says so. Clamped rather than skipped, so a
-        # publish that is arbitrarily far behind delays eviction instead of
-        # stopping it — §5's "lazy, restartable" applies here too.
+        # I4: a file the published table still lacks must not leave the
+        # staging table, because the staging copy stops being the only one
+        # only once publish says so. Clamped rather than skipped, so a publish
+        # that is arbitrarily far behind delays eviction instead of stopping
+        # it — §5's "lazy, restartable" applies here too.
         boundary = min(
             boundary,
-            # I4 asks whether the published table HAS it, so intents are excluded:
-            # deleting the only local copy on the strength of an intended
-            # one is the loss this whole record exists to prevent.
+            # I4 asks whether the published table HAS it, so intents are
+            # excluded: deleting the only staging copy on the strength of an
+            # intended one is the loss this whole record exists to prevent.
             self.published_prefix(files, self._published.uri, include_intents=False),
         )
 
         # Snapped DOWN to a file boundary, against the list as it is now. The
-        # age limit is already one — some file's `hi` — and so is the published table
-        # clamp, but the row floor is arbitrary and lands mid-file on most
-        # passes. A mid-file boundary is not a smaller eviction:
-        # `evict_below` filters by row, so pyiceberg rewrites the straddling
-        # file copy-on-write at a path this library never learns. That breaks
-        # the rule the whole deletion design rests on — every file's path is in
+        # age limit is already one — some file's `end` — and so is the published
+        # table clamp, but the row floor is arbitrary and lands mid-file on most
+        # passes. A mid-file boundary is not a smaller eviction: `evict_below`
+        # filters by row, so pyiceberg rewrites the straddling file
+        # copy-on-write at a path this library never learns. That breaks the
+        # rule the whole deletion design rests on — every file's path is in
         # SQLite before the file exists (I2) — and leaves the superseded
         # original out of the queue, so once expiry drops the snapshots naming
         # it, nothing can name it again.
@@ -827,7 +837,7 @@ class Maintenance:
         # Everything the boundary REMOVES, not just what looked old enough to
         # trigger it. A compaction output has a fresh snapshot age, so it never
         # appears in `stale` — but its offsets can sit below a stale file's
-        # `hi`, so the boundary drops it too. Queueing only `stale` left it
+        # `end`, so the boundary drops it too. Queueing only `stale` left it
         # removed from the table and named by nothing.
         try:
             # Still ours? The merge path asks this immediately before its
@@ -847,9 +857,9 @@ class Maintenance:
             checkpoint(removal.renew)
             dropped = [f.path for f in files if f.end <= boundary]
             # The published table's tier row describes what it holds below the
-            # staging table, and these rows are about to be exactly that —
-            # so it grows BEFORE they leave, or a read between the two
-            # would skip the published table for rows no local file still has.
+            # staging table, and these rows are about to be exactly that — so it
+            # grows BEFORE they leave, or a read between the two would skip the
+            # published table for rows no staging file still has.
             schema, live = self._table.live_files()
             leaving = set(dropped)
             self._tiers.widen(
@@ -886,16 +896,18 @@ class Maintenance:
         heartbeat: Callable[[], bool] | None = None,
         owner: str | None = None,
     ) -> None:
-        """Re-cut undersized published files to `target_compact_size` (§6, ad-hoc).
+        """Re-cut undersized published files to `target_compact_size` (§6,
+        ad-hoc).
 
-        Not part of `maintain`, and not expected to be needed. The published table is
-        well-sized by construction: `publish` pushes only what compaction has
-        finished with, so nothing undersized reaches it in normal operation.
-        Two deliberate acts break that. An explicit `seal()` can strand a small
-        file between larger ones, where compaction can never merge it and
-        `publish` pushes it rather than blocking the watermark for ever. And
-        changing `target_compact_size` leaves history sized for the old value,
-        since the published table is immutable and a size change applies to the future.
+        Not part of `maintain`, and not expected to be needed. The published
+        table is well-sized by construction: `publish` pushes only what
+        compaction has finished with, so nothing undersized reaches it in normal
+        operation. Two deliberate acts break that. An explicit `seal()` can
+        strand a small file between larger ones, where compaction can never
+        merge it and `publish` pushes it rather than blocking the watermark for
+        ever. And changing `target_compact_size` leaves history sized for the
+        old value, since the published table is immutable and a size change
+        applies to the future.
 
         **It re-ingests rather than merging.** The rows from the first
         badly-sized file onwards are appended to a scratch `Buffer` and sealed
@@ -904,17 +916,18 @@ class Maintenance:
         as of ways to be wrong: a merge can only combine whole files, so it
         lands near the target and leaves the remainder undersized, while the
         appender cuts on the row that crosses and hits it exactly. Sizing the
-        published table by a second rule that approximates the first is how this came
-        to compare compressed bytes against a memory bound in the first place.
+        published table by a second rule that approximates the first is how this
+        came to compare compressed bytes against a memory bound in the first
+        place.
 
         The scratch buffer stays small. Sealing deletes the rows it took, so it
         holds roughly one file at a time however long the range is, and it is
         removed at the end either way.
 
         It is also opened without durability, because everything in it is
-        derived from the published table and the published table is still there until the final
-        commit. Rows arrive one source file per transaction rather than one per
-        row, for the same reason.
+        derived from the published table and the published table is still there
+        until the final commit. Rows arrive one source file per transaction
+        rather than one per row, for the same reason.
 
         One commit swaps the whole range. Committing each new file as it is
         written would have each commit delete a sub-range of a file the next
@@ -938,7 +951,7 @@ class Maintenance:
             # rewriting it alone would produce the same file again.
             return
 
-        # Queued BEFORE the commit that supersedes them, exactly as a local
+        # Queued BEFORE the commit that supersedes them, exactly as a staging
         # compaction queues its sources, and safe for the same reason: `drain`
         # refuses to delete anything the table still references, so an entry
         # made for a commit that never lands simply never comes due.
@@ -953,9 +966,9 @@ class Maintenance:
         regardless of its own size, because the shortfall ahead of it shifts
         every boundary behind it.
 
-        A file whose size was never recorded counts as full, so a published table
-        whose local extents were lost is left alone rather than rewritten on a
-        guess about what it holds.
+        A file whose size was never recorded counts as full, so a published
+        table whose `extent` rows were lost is left alone rather than rewritten
+        on a guess about what it holds.
 
         **A file spanning a gap in the offset space is excluded outright**, and
         so is everything after it. `_recut` re-appends rows through a scratch
@@ -964,19 +977,19 @@ class Maintenance:
         data. `_recut` asserts against that, so before this exclusion a single
         gapped file made every later `rewrite_published` raise: after a failover
         reserves 2**20 offsets (§3a) the first sealed file spans the hole, and
-        being the published table's first file it was in every candidate run for the
-        life of the log. One un-rewritable file is the honest cost of the
+        being the published table's first file it was in every candidate run for
+        the life of the log. One un-rewritable file is the honest cost of the
         reserve; an unusable repair tool is not.
         """
         held = self.memory()
         target = self.config.compact_size
 
         # By dense SEGMENT, and an earlier version got this wrong in the
-        # ordering that actually occurs. It tested density before size per
-        # file and returned `files[index:]` from the first undersized one —
-        # which still CONTAINS any gapped file after it. That is the normal
-        # shape: the published table's tail file before a failover is undersized, and
-        # the reserve's gapped file lands after it. Measured, `rewrite_published`
+        # ordering that actually occurs. It tested density before size per file
+        # and returned `files[index:]` from the first undersized one — which
+        # still CONTAINS any gapped file after it. That is the normal shape: the
+        # published table's tail file before a failover is undersized, and the
+        # reserve's gapped file lands after it. Measured, `rewrite_published`
         # went on raising for the life of every restored log.
         #
         # A gap bounds a segment at both ends: a file with one inside it, and a
@@ -1018,11 +1031,12 @@ class Maintenance:
     ) -> None:
         """Append `stale` back through a buffer and seal it out again."""
         start, end = stale[0].start, stale[-1].end
-        # Not durable, deliberately. Every row in here came from the published table
-        # and is still in the published table until the single commit at the end, so a
-        # crash costs a re-run rather than data — and this does one transaction
-        # per source file plus a few per sealed one, every one of which would
-        # otherwise fsync for a guarantee nothing here depends on.
+        # Not durable, deliberately. Every row in here came from the published
+        # table and is still in the published table until the single commit at
+        # the end, so a crash costs a re-run rather than data — and this does
+        # one transaction per source file plus a few per sealed one, every one
+        # of which would otherwise fsync for a guarantee nothing here depends
+        # on.
         # Removed BEFORE opening, not only after. SQLite's AUTOINCREMENT
         # assigns `max(largest existing rowid, seq) + 1`, so seeding the
         # counter DOWN is silently ignored when rows already sit above it —
@@ -1031,9 +1045,9 @@ class Maintenance:
         # in this database and no claim to recover by, so the next run would
         # re-append every row at shifted offsets, hold each one twice, pass the
         # row-count guard (which counts only what this run read), and commit
-        # files whose offsets carry the wrong rows. Durable published table corruption
-        # with every check green. It is derived state; starting from nothing is
-        # always correct.
+        # files whose offsets carry the wrong rows. Durable published table
+        # corruption with every check green. It is derived state; starting from
+        # nothing is always correct.
         self._discard_scratch()
         scratch = Buffer.open(
             self._layout.rewrite_db,
@@ -1047,11 +1061,12 @@ class Maintenance:
         # re-cutting to — which is the entire point of the operation.
         # BOTH targets mapped, not only the size. The scratch cuts at whichever
         # ceiling comes first, so carrying the live seal ROW cap made a rewrite
-        # cut its outputs at the seal's row limit while the published table holds files
-        # sized to the compact one — eight times more files than it started
-        # with, each still undersized by bytes, so the next `rewrite_published`
-        # flags the same tail again and the operation never converges. It is
-        # meant to merge undersized published files; that inverted it.
+        # cut its outputs at the seal's row limit while the published table
+        # holds files sized to the compact one — eight times more files than it
+        # started with, each still undersized by bytes, so the next
+        # `rewrite_published` flags the same tail again and the operation never
+        # converges. It is meant to merge undersized published files; that
+        # inverted it.
         config = self.config
         scratch.set_meta(
             CONFIG_KEY,
@@ -1202,10 +1217,10 @@ class Maintenance:
             held = scratch.group_bytes(end)
             # INTENDED before the object is written, and only recorded once
             # `replace_range` has committed. Until then these files are not the
-            # published table's, so a row saying they are would let eviction drop the
-            # local copies of rows the published table does not yet hold. The intent
-            # says the opposite thing to the opposite reader: compaction must
-            # not merge across them, because it is about to.
+            # published table's, so a row saying they are would let eviction
+            # drop the staging copies of rows the published table does not yet
+            # hold. The intent says the opposite thing to the opposite reader:
+            # compaction must not merge across them, because it is about to.
             self._buffer.intend_file(published.uri(rel_path), start, end, held)
             published.put(dest, rel_path)
             dest.unlink(missing_ok=True)
@@ -1213,7 +1228,7 @@ class Maintenance:
 
             scratch.finish_seal(end, rel_path)
             # Carried in memory, not read back from the intent: a rival publish
-            # that took over a lapsed claim may drop these rows while this
+            # pass that took over a lapsed claim may drop these rows while this
             # rewrite is still running, and a confirm that depended on them
             # would silently record the default size instead — which for the
             # deliberately undersized tail means `_badly_sized` treats it as
@@ -1293,15 +1308,16 @@ class Maintenance:
         self.drain()
 
     def _expire_published(self, cutoff: datetime) -> None:
-        """The same expiry on the published table, when a rewrite has left work there.
+        """The same expiry on the published table, when a rewrite has left work
+        there.
 
-        Only then. `publish` adds files and never supersedes one, so a published table
-        that has only ever been published has nothing an old snapshot is keeping
-        alive, and expiring it every pass would spend a remote catalog commit
-        to discover that. `rewrite_published` is the one thing that supersedes a
-        published file, and it is also the only thing that puts a remote entry
-        in the deletion queue — so a queue with one in it is the exact signal
-        that the published table has garbage to release.
+        Only then. `publish` adds files and never supersedes one, so a published
+        table that has only ever been published has nothing an old snapshot is
+        keeping alive, and expiring it every pass would spend a remote catalog
+        commit to discover that. `rewrite_published` is the one thing that
+        supersedes a published file, and it is also the only thing that puts a
+        published entry in the deletion queue — so a queue with one in it is the
+        exact signal that the published table has garbage to release.
 
         Without this the queue never drains: `drain` refuses to delete a file
         any snapshot still references, and until the snapshot that named it
@@ -1310,20 +1326,20 @@ class Maintenance:
         if not any(is_remote(p) for p in self._buffer.queued_deletions()):
             return
 
-        # CLAIMED, because what follows opens the published table with `repair` on.
-        # Expiry is exempt from claims on the grounds that it is a metadata
+        # CLAIMED, because what follows opens the published table with `repair`
+        # on. Expiry is exempt from claims on the grounds that it is a metadata
         # commit CAS orders — true of the snapshot expiry, and not true of a
         # repairing open, which DROPS a catalog entry naming another prefix and
         # creates a table in its place. That privilege belongs to a claim
         # holder: two of them at once collide on the first attempt, because
-        # pyiceberg writes the metadata object before inserting the catalog
-        # row, and the loser raises a bare `Exception` the shipped maintainer
-        # does not catch. Worse, a claimless drop can land after a claim holder
-        # has already created and registered, taking the live entry with it.
+        # pyiceberg writes the metadata object before inserting the catalog row,
+        # and the loser raises a bare `Exception` the shipped maintainer does
+        # not catch. Worse, a claimless drop can land after a claim holder has
+        # already created and registered, taking the live entry with it.
         #
-        # Rounds nine and ten fixed WHICH published table a repairing open targets.
-        # This is the other half — who is entitled to repair one — and this
-        # call site inherited expiry's exemption without it applying.
+        # Rounds nine and ten fixed WHICH published table a repairing open
+        # targets. This is the other half — who is entitled to repair one — and
+        # this call site inherited expiry's exemption without it applying.
         sweep = self._buffer.claim("expire-published", 0, EVERYTHING, new_owner())
         if not sweep.acquire():
             return
@@ -1334,7 +1350,8 @@ class Maintenance:
             sweep.release()
 
     def _expire_published_claimed(self, cutoff: datetime, sweep: Claim) -> None:
-        """The published half of expiry, with the claim held. See `_expire_published`."""
+        """The published half of expiry, with the claim held. See
+        `_expire_published`."""
         published = self._published.table(repair=True)
         if published is None:
             return
@@ -1387,14 +1404,15 @@ class Maintenance:
             # Reloaded first. This veto is the last thing standing between the
             # deletion queue and an unrecoverable mistake, and asked of a handle
             # that predates another process's commit it reports a live file as
-            # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
+            # unreferenced. Every other cost in this pass dwarfs a catalog
+            # resolve.
             self._table.reload()
             referenced = self._table.referenced_paths()
             # Only if the queue holds a published object, so an ordinary drain
-            # opens nothing. `rewrite_published` is what puts them here, and it is
-            # an operation somebody ran on purpose. A published object is named
-            # by its URI — `file://` for a local published table — so "remote" here
-            # means "the published table's", wherever it is.
+            # opens nothing. `rewrite_published` is what puts them here, and it
+            # is an operation somebody ran on purpose. A published object is
+            # named by its URI — `file://` for a local published table — so
+            # "remote" here means "the published table's", wherever it is.
             remote = (
                 self._published.table(repair=True)
                 if any(is_remote(p) for p in due)
@@ -1407,24 +1425,26 @@ class Maintenance:
                     if remote is None or rel_path in remote_referenced:
                         continue
 
-                    # Only objects belonging to the published table this log is pointed at.
-                    # A queued remote path names the published table it was superseded in,
-                    # and the veto above asks the CURRENT one — so after a
-                    # re-point, entries left by a rewrite on the old published table would
-                    # be checked against a new published table that references nothing and
-                    # deleted from the old bucket, where they may still be live and
-                    # may be the only copy of rows already evicted locally.
+                    # Only objects belonging to the published table this log is
+                    # pointed at. A queued remote path names the published table
+                    # it was superseded in, and the veto above asks the CURRENT
+                    # one — so after a re-point, entries left by a rewrite on
+                    # the old published table would be checked against a new
+                    # published table that references nothing and deleted from
+                    # the old bucket, where they may still be live and may be
+                    # the only copy of rows already evicted from staging.
                     #
                     # Left queued rather than forgotten: they are somebody's to
-                    # resolve, and the log that owns that published table is the one that
-                    # can say whether they are dead. A stranded queue row is a
-                    # bounded cost; deleting live data in a bucket this log no
-                    # longer understands is not.
+                    # resolve, and the log that owns that published table is the
+                    # one that can say whether they are dead. A stranded queue
+                    # row is a bounded cost; deleting live data in a bucket this
+                    # log no longer understands is not.
                     #
-                    # Normalised, because the configured URI may carry a trailing
-                    # slash while every queued path is built from it stripped. The
-                    # mismatch would classify this log's OWN objects as another
-                    # published table's and wedge the remote queue permanently.
+                    # Normalised, because the configured URI may carry a
+                    # trailing slash while every queued path is built from it
+                    # stripped. The mismatch would classify this log's OWN
+                    # objects as another published table's and wedge the remote
+                    # queue permanently.
                     if not rel_path.startswith(
                         f"{(self._published.uri or '').rstrip('/')}/"
                     ):
@@ -1438,21 +1458,22 @@ class Maintenance:
                 path = self._layout.absolute(rel_path)
                 if str(path) in referenced:
                     # A compaction can re-register a path the queue still holds.
-                    # Deleting a referenced file is unrecoverable, so the check is
-                    # worth its cost even though the grace period should preclude it.
+                    # Deleting a referenced file is unrecoverable, so the check
+                    # is worth its cost even though the grace period should
+                    # preclude it.
                     continue
 
                 # Still ours, asked before EVERY deletion rather than once at
                 # the top. The unlink is this pass's commit, and §4a's rule
                 # applies to it like any other: holding a claim is asked again
-                # at the commit. It matters here because everything slow in
-                # this pass sits between the veto being read and the deletions
-                # — opening the published table, walking its manifests, and one remote
-                # round trip per queued object, measured at ~650 ms each. Past
-                # the TTL, a `hydrate` may lawfully take the whole log, register
-                # a file under the very name still queued here, and release;
-                # this would then unlink it against a stale veto and leave the
-                # staging table pointing at a file that is not there.
+                # at the commit. It matters here because everything slow in this
+                # pass sits between the veto being read and the deletions —
+                # opening the published table, walking its manifests, and one
+                # remote round trip per queued object, measured at ~650 ms each.
+                # Past the TTL, a `hydrate` may lawfully take the whole log,
+                # register a file under the very name still queued here, and
+                # release; this would then unlink it against a stale veto and
+                # leave the staging table pointing at a file that is not there.
                 #
                 # Entries left behind cost nothing: they stay due.
                 checkpoint(sweep.renew)
@@ -1468,10 +1489,10 @@ class Maintenance:
     def _key(self, path: str) -> str:
         """How a file is named in SQLite, whichever tier it is in.
 
-        Local files root-relative, so a log directory stays movable; remote
+        Staging files root-relative, so a log directory stays movable; published
         ones by the full URI, which is already absolute and has no root to be
         relative to. One rule, used by the deletion queue, the extent table and
-        the compaction claim alike, so `_is_remote` can tell them apart again
+        the compaction claim alike, so `is_remote` can tell them apart again
         wherever one of those is read back.
         """
         return path if is_remote(path) else self._layout.relative(path)
@@ -1501,7 +1522,7 @@ class Maintenance:
 def _verify(merged: pa.Table, run: list[DataFile], start: int, end: int) -> None:
     """§6 step 3, as far as it can be taken.
 
-    Row count and the offset extent are checked exactly; both are what the
+    Row count and the offset range are checked exactly; both are what the
     overwrite's safety argument rests on. Per-column min/max is NOT checked and
     cannot be by equality: Iceberg truncates string and binary bounds, so a
     source bound is a prefix rather than a value and would compare unequal to a

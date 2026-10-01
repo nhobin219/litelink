@@ -1,7 +1,7 @@
-"""The staging table, and the pyiceberg calls that reach it.
+"""The staging and published tables, and the pyiceberg calls that reach them.
 
 Everything that knows pyiceberg's shape lives here, so the rest of the library
-deals in offsets, paths and extents. Several methods exist only because
+deals in offsets, paths and offset ranges. Several methods exist only because
 pyiceberg's own behaviour needed working around — each says which.
 """
 
@@ -46,10 +46,6 @@ if TYPE_CHECKING:
 
     from litelink._layout import Layout
 
-# Iceberg keeps every metadata.json ever written unless told otherwise, which on
-# a stream that seals every few minutes is a file per seal, forever. These bound
-# it to the current version plus a few for rollback. Manifests are NOT covered —
-# see `expire_snapshots`.
 # Bounded: a commit that keeps losing is contention worth surfacing, not
 # something to retry forever behind a caller's back.
 # Eight, not five. Every loser of a CAS reloads and re-commits, so under real
@@ -63,6 +59,10 @@ _COMMIT_ATTEMPTS = 8
 # several committers land on different milliseconds.
 _COMMIT_BACKOFF_MS = 20
 
+# Iceberg keeps every metadata.json ever written unless told otherwise, which on
+# a stream that seals every few minutes is a file per seal, forever. The first
+# two bound it to the current version plus a few for rollback. Manifests are
+# NOT covered — see `expire_snapshots`.
 METADATA_PROPERTIES = {
     "write.metadata.delete-after-commit.enabled": "true",
     "write.metadata.previous-versions-max": "10",
@@ -147,7 +147,8 @@ class PublishedAbsent(LookupError):
 
 
 def _recorded_location(layout: Layout) -> str | None:
-    """Where the published table's catalog entry says its metadata is, without a read.
+    """Where the published table's catalog entry says its metadata is, without
+    a read.
 
     Straight out of the catalog's own SQLite file, because the question — does
     this entry belong to the prefix being opened? — has to be answerable when
@@ -157,12 +158,12 @@ def _recorded_location(layout: Layout) -> str | None:
 
     None means there is definitely no entry — the catalog was readable and had
     no row. Callers distinguish that from "cannot tell", so the two must not be
-    conflated: the empty string is used below as a third value meaning "carry
-    on and let pyiceberg decide". `LookupError` means the question could not be answered, which is
-    NOT the same thing: answering None there sends the caller down the create
-    path against an entry that still exists, and every open of that log then
-    fails on a unique constraint. A log nobody can open, from a query that was
-    only ever an optimisation.
+    conflated: the empty string is used below as a third value meaning "carry on
+    and let pyiceberg decide". `LookupError` means the question could not be
+    answered, which is NOT the same thing: answering None there sends the caller
+    down the create path against an entry that still exists, and every open of
+    that log then fails on a unique constraint. A log nobody can open, from a
+    query that was only ever an optimisation.
 
     The schema is pyiceberg's, not ours: table `iceberg_tables`, keyed by
     catalog name, namespace and table name. Verified against a real catalog
@@ -190,13 +191,13 @@ def _recorded_location(layout: Layout) -> str | None:
     return None if row is None or row[0] is None else str(row[0])
 
 
-# Where a published table says which of its metadata JSONs is current, written beside
-# them at every commit. `SqlCatalog` keeps that pointer in the catalog rather
-# than in the warehouse (§7), so without this the local `published.db` is the
-# ONLY thing that names the published table's current metadata — and `open_published`
-# says what that costs: a re-point drops the row, and "a drop that is not
-# followed by a create destroys the only record of where the PREVIOUS
-# published table's metadata is."
+# Where a published table says which of its metadata JSONs is current, written
+# beside them at every commit. `SqlCatalog` keeps that pointer in the catalog
+# rather than in the warehouse (§7), so without this the local `published.db` is
+# the ONLY thing that names the published table's current metadata — and
+# `open_published` says what that costs: a re-point drops the row, and "a drop
+# that is not followed by a create destroys the only record of where the
+# PREVIOUS published table's metadata is."
 #
 # The name is the one DuckDB's iceberg extension looks for, so a reader can
 # scan the directory rather than being handed a pointer:
@@ -228,10 +229,11 @@ def _hint_for(metadata_location: str) -> tuple[str, str]:
 
 
 def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
-    """What the published table at `prefix` says its current metadata is, or None.
+    """What the published table at `prefix` says its current metadata is, or
+    None.
 
-    Read from the bucket, which is the point: it answers for a published table this
-    log has no catalog row for. The directory is reconstructed from the layout
+    Read from the bucket, which is the point: it answers for a published table
+    this log has no catalog row for. The directory is reconstructed from the layout
     — `{prefix}/{name}/metadata` — rather than from a table handle, because
     there is no handle yet; that is the situation.
 
@@ -271,8 +273,8 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
 def forget_published_entry(layout: Layout) -> bool:
     """Drop the published table's catalog row, so the next open must ADOPT.
 
-    For a restore: a row that survived onto this machine describes a published table
-    as it was when the replica was taken, and `open_published` reads
+    For a restore: a row that survived onto this machine describes a published
+    table as it was when the replica was taken, and `open_published` reads
     `version-hint.text` only when there is no row. A stale row therefore wins
     over the bucket's own pointer, silently and in the losing direction.
 
@@ -306,18 +308,20 @@ def forget_published_entry(layout: Layout) -> bool:
 def published_span(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[int, int] | None:
-    """`[start, end)` of the published table at `prefix`, read from the bucket alone.
+    """`[start, end)` of the published table at `prefix`, read from the bucket
+    alone.
 
-    Answers "what does that published table hold" WITHOUT touching `published.db`, which
-    is what makes it usable as a pre-flight check. The catalog row is keyed by
-    table id, so while a log is pointed at one published table the row names that one —
-    `open_published` on a different prefix therefore either raises on the boundary
-    check or, with `repair=True`, drops the row as a side effect of a read.
+    Answers "what does that published table hold" WITHOUT touching
+    `published.db`, which is what makes it usable as a pre-flight check. The
+    catalog row is keyed by table id, so while a log is pointed at one
+    published table the row names that one — `open_published` on a different
+    prefix therefore either raises on the boundary check or, with
+    `repair=True`, drops the row as a side effect of a read.
 
-    Two objects instead: the published pointer, then the metadata it names.
-    `None` when the published table has no hint, which covers both "nothing has been
-    pushed there" and "it is not a litelink published table". A hint that cannot be
-    READ raises instead, because `_published_location` no longer conflates the
+    Two objects instead: the version hint, then the metadata it names. `None`
+    when the published table has no hint, which covers both "nothing has been
+    pushed there" and "it is not a litelink published table". A hint that
+    cannot be READ raises instead, because `_published_location` no longer conflates the
     two — the caller decides whether a bad minute in object storage is fatal,
     and `_refuse_published_ahead` treats it as "cannot tell" and passes.
     """
@@ -338,9 +342,10 @@ RETIRED_PROPERTY = "litelink.retired"
 def published_retired(
     layout: Layout, prefix: str, options: S3Options
 ) -> dict[str, object] | None:
-    """The retirement the published table at `prefix` records, read from the bucket alone.
+    """The retirement the published table at `prefix` records, read from the
+    bucket alone.
 
-    Like `published_span`: the published pointer, then the metadata it names,
+    Like `published_span`: the version hint, then the metadata it names,
     with no catalog involved — so `restore` can ask before it builds anything.
     None when the published table has no hint or records no retirement.
     """
@@ -358,16 +363,17 @@ def published_retired(
 def published_columns(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[str, ...] | None:
-    """The column names of the published table at `prefix`, read from the bucket alone.
+    """The column names of the published table at `prefix`, read from the
+    bucket alone.
 
     The sibling of `published_span` and for the same reason: a pre-flight
-    check has to ask about a published table this log is not pointed at yet, and
-    `open_published` on a different prefix either raises on the boundary check
-    or drops a catalog row as a side effect.
+    check has to ask about a published table this log is not pointed at yet,
+    and `open_published` on a different prefix either raises on the boundary
+    check or drops a catalog row as a side effect.
 
-    `None` when the published table has no published hint, which covers both "nothing
-    has been pushed there" and "not a litelink published table" — neither of which the
-    caller can conclude anything from.
+    `None` when the published table has no version hint, which covers both
+    "nothing has been pushed there" and "not a litelink published table" —
+    neither of which the caller can conclude anything from.
     """
     io = load_file_io(options.resolved().catalog_properties(), prefix)
     location = _published_location(io, layout, prefix)
@@ -380,7 +386,8 @@ def published_columns(
 
 
 class LogTable:
-    """The staging table for one log.
+    """One of a log's Iceberg tables: the staging table, or — through
+    `open_published` — the published one.
 
     Holds a pyiceberg `Table`, which is a snapshot-in-time view, and reloads it
     whenever the current state matters. §7 is explicit that a cached pointer
@@ -412,18 +419,19 @@ class LogTable:
         # snapshot the NEXT caller sees.
         self._lock = threading.RLock()
         self._table = table
-        # Where this table's files live. The local one derives it from the
-        # layout; the published table is told, because its prefix is the caller's.
+        # Where this table's files live. The staging table derives it from the
+        # layout; the published table is told, because its prefix is the
+        # caller's.
         self._warehouse = warehouse or layout.warehouse_uri
         # Which of the two this is, and the only thing that turns on it: the
-        # ARCHIVE publishes a pointer to its own metadata, because it is the
-        # one whose catalog can be lost or pointed away from. The staging table's
-        # catalog sits in the same directory as its warehouse — lose one and
-        # you have lost the other, so a hint beside it would answer a question
-        # nobody can be in a position to ask.
+        # PUBLISHED table writes a pointer to its own metadata, because it is
+        # the one whose catalog can be lost or pointed away from. The staging
+        # table's catalog sits in the same directory as its warehouse — lose
+        # one and you have lost the other, so a hint beside it would answer a
+        # question nobody can be in a position to ask.
         self._is_published = warehouse is not None
         # Snapshot-derived facts, cached against the metadata pointer. See
-        # `extent`. The file count rides along because reading the manifests
+        # `span`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
         # materialising every file's metadata.
         # Two caches, both keyed by the metadata pointer, because they come from
@@ -514,13 +522,13 @@ class LogTable:
         *,
         repair: bool = False,
     ) -> LogTable:
-        """The remote table, created on first use (§5).
+        """The published table, created on first use (§5).
 
-        Its catalog is a SQLite file beside the local one and its warehouse is
-        the object-store prefix — §2's two-catalog shape. Created lazily rather
-        than at `litelink.new`, because a log may be configured with a published table long
-        before anything is pushed to it and creating a remote table costs a
-        round trip a local-only run should never pay.
+        Its catalog is a SQLite file beside the staging one and its warehouse
+        is the published prefix — §2's two-catalog shape. Created lazily rather
+        than at `litelink.new`, because a log has a published table long before
+        anything is pushed to it, and creating a remote one costs a round trip
+        a log that never publishes should not pay.
 
         The schema is the staging table's, so the two cannot drift: one declared
         shape, and the published table is the same rows later.
@@ -530,33 +538,35 @@ class LogTable:
         whose metadata still lives in the old bucket. So it is checked against
         the prefix asked for, and replaced when it does not match.
 
-        Checked HERE rather than dropped when the published table is re-pointed, which
-        is what this did first. Re-pointing is three durable writes — the URI,
-        the watermark, the catalog entry — and a crash between any two leaves
-        them disagreeing; no ordering avoids it, because the damage differs in
-        each direction. A check at open is a repair that runs every time, so a
-        half-finished re-point corrects itself.
+        Checked HERE rather than dropped when the published table is re-pointed,
+        which is what this did first. Re-pointing is three durable writes — the
+        URI, the watermark, the catalog entry — and a crash between any two
+        leaves them disagreeing; no ordering avoids it, because the damage
+        differs in each direction. A check at open is a repair that runs every
+        time, so a half-finished re-point corrects itself.
 
-        It is also what keeps detach-and-reattach working. Dropping the entry
-        eagerly meant pointing back at a published table that still held data built a
-        fresh empty table over it, and rows already evicted locally were then
-        reachable from nowhere.
+        It is also what keeps pointing away and back working. Dropping the
+        entry eagerly meant pointing back at a published table that still held
+        data built a fresh empty table over it, and rows already evicted from
+        staging were then reachable from nowhere.
 
         Adopting a published table that holds data but has no entry here IS
-        supported, and is what makes a re-point reversible. The published table names
-        its own current metadata in `version-hint.text` beside it, written at
+        supported, and is what makes a re-point reversible. The published table
+        names its own current metadata in `version-hint.text` beside it, written at
         every commit, so a prefix with no catalog row is registered from that
         rather than created empty over the top of it.
 
         **Only a repairing caller adopts.** `register_table` is a write to
         `published.db`, and a reader promised to make none — so a reader still
-        gets `PublishedAbsent` here and sees the published table once a maintenance pass
-        has adopted it. Same rule as the drop above, for the same reason.
+        gets `PublishedAbsent` here and sees the published table once a
+        maintenance pass has adopted it. Same rule as the drop above, for the
+        same reason.
         """
         # Asked BEFORE the catalog is constructed, because constructing one
-        # creates its tables in `published.db` and registering the namespace adds
-        # a row — writes, from a path that promised to make none. A reader
-        # against a published table never published to should touch nothing at all.
+        # creates its tables in `published.db` and registering the namespace
+        # adds a row — writes, from a path that promised to make none. A reader
+        # against a published table never published to should touch nothing at
+        # all.
         boundary = prefix.rstrip("/") + "/"
         if not repair:
             try:
@@ -580,13 +590,13 @@ class LogTable:
 
         # Read OFFLINE, before deciding anything. Whether the entry belongs to
         # this prefix is answerable from the local catalog row, and asking it
-        # that way is what separates "this names another published table" from "this
-        # names ours and object storage is having a bad minute".
+        # that way is what separates "this names another published table" from
+        # "this names ours and object storage is having a bad minute".
         #
         # On a separator, not a bare prefix: `s3://b/one` is a prefix of
         # `s3://b/one-more` as a string, so a plain `startswith` accepts a
-        # SIBLING published table's entry as this one's, and the log then reads and
-        # writes into the neighbour it was pointed away from.
+        # SIBLING published table's entry as this one's, and the log then reads
+        # and writes into the neighbour it was pointed away from.
         try:
             recorded = _recorded_location(layout)
         except LookupError:
@@ -594,9 +604,9 @@ class LogTable:
             # or says there is none. Slower than the offline read, and it must
             # still answer the SAME question — returning the loaded table here
             # skipped the prefix check entirely, so a process that hit a locked
-            # catalog adopted the published table it had been pointed away from and
-            # read, pushed and reconciled its watermark from it for the rest of
-            # its life.
+            # catalog adopted the published table it had been pointed away from
+            # and read, pushed and reconciled its watermark from it for the rest
+            # of its life.
             try:
                 recorded = catalog.load_table(layout.table_id).metadata_location
             except NoSuchTableError:
@@ -606,31 +616,31 @@ class LogTable:
         # back. See below.
         displaced: str | None = None
         if recorded is not None and not recorded.startswith(boundary):
-            # Another published table's table, found by table id. No read of the old
-            # bucket is needed to know this, which matters when the published table
-            # being left has already been taken away.
+            # Another prefix's table, found by table id. No read of the old
+            # bucket is needed to know this, which matters when the published
+            # table being left has already been taken away.
             if not repair:
                 # Only a caller holding the maintenance lease may fix it.
                 # Dropping and recreating is a mutation of shared state, and it
-                # was reachable from any read of the published table — two processes
-                # cold-opening after a re-point would both find the mismatch,
-                # and the second's drop could land after the first had already
-                # created, uploaded and committed, taking the live entry with
-                # it. A reader that cannot fix it must not pretend it can.
+                # was reachable from any read of the published table — two
+                # processes cold-opening after a re-point would both find the
+                # mismatch, and the second's drop could land after the first had
+                # already created, uploaded and committed, taking the live entry
+                # with it. A reader that cannot fix it must not pretend it can.
                 msg = (
                     f"the published catalog names {recorded!r}, which is not "
                     f"under {prefix!r} — a maintenance pass repairs this"
                 )
                 raise ValueError(msg)
 
-            # The entry goes; the objects do not, because detaching a
-            # published table is not deleting one. Held onto, though: the create below
-            # can fail — the new prefix may not exist yet, which this design
-            # explicitly allows — and a half-done move that leaves NEITHER
-            # entry is worse than not moving.
+            # The entry goes; the objects do not, because pointing away from a
+            # published table is not deleting one. Held onto, though: the create
+            # below can fail — the new prefix may not exist yet, which this
+            # design explicitly allows — and a half-done move that leaves
+            # NEITHER entry is worse than not moving.
             #
-            # It is no longer the only record of where the previous published table's
-            # metadata is. It was, and that is what made a roll-back build an
+            # It is no longer the only record of where the previous published
+            # table's metadata is. It was, and that is what made a roll-back build an
             # empty table over unreachable data; `version-hint.text` in the
             # bucket is that record now, and it survives this drop because it
             # is not here.
@@ -639,20 +649,20 @@ class LogTable:
 
         if recorded is None:
             if not repair:
-                # Absent, not wrong. A log configured with a published table that
-                # nothing has pushed to yet is an ordinary state, and a reader
-                # that needs the published table before the first publish should get
-                # a union without that leg — not an error, and not a table
-                # created as a side effect of reading.
+                # Absent, not wrong. A published table that nothing has pushed
+                # to yet is an ordinary state, and a reader that needs the
+                # published table before the first publish should get a union
+                # without that leg — not an error, and not a table created as a
+                # side effect of reading.
                 msg = f"no published table at {prefix!r} yet"
                 raise PublishedAbsent(msg)
 
             # ADOPT BEFORE CREATING. This is what makes re-attaching to a
-            # published table expressible, which `open_published` used to say plainly it
-            # was not: "Adopting a published table that holds data but has no entry
-            # here is a different operation and is NOT supported: this creates
-            # an empty table at the prefix rather than discovering what is
-            # already there."
+            # published table expressible, which `open_published` used to say
+            # plainly it was not: "Adopting an archive that holds data but has
+            # no entry here is a different operation and is NOT supported: this
+            # creates an empty table at the prefix rather than discovering what
+            # is already there."
             #
             # Discovering it is what `version-hint.text` is for. No listing is
             # involved — that is one GET of a known key, not the paginated walk
@@ -671,8 +681,8 @@ class LogTable:
                         properties=METADATA_PROPERTIES,
                     )
                 else:
-                    # Deliberately unguarded, like the load below. A hint
-                    # naming metadata that cannot be read is a broken published table,
+                    # Deliberately unguarded, like the load below. A hint naming
+                    # metadata that cannot be read is a broken published table,
                     # and the fallback available here — create an empty table —
                     # is the single worst response to it: it writes over data
                     # that is still there, having just been told where it is.
@@ -680,8 +690,8 @@ class LogTable:
             except Exception:
                 if displaced is not None:
                     # Put the old entry back. The repair is meant to move the
-                    # log from one published table to another, and a half-done move
-                    # that leaves NEITHER is the one outcome worse than not
+                    # log from one published table to another, and a half-done
+                    # move that leaves NEITHER is the one outcome worse than not
                     # moving at all.
                     catalog.register_table(layout.table_id, displaced)
 
@@ -695,24 +705,24 @@ class LogTable:
             # real error and skipping the rollback the comment promises.
             if published is None:
                 opened = cls(catalog, layout, table, prefix)
-                # DECLARED, like the staging table's (§4). The published table is the
-                # same rows later and is clustered the same way, so a table
-                # that does not say so is lying about itself to every reader
-                # that is not this library — and `sort_by` was therefore
+                # DECLARED, like the staging table's (§4). The published table
+                # is the same rows later and is clustered the same way, so a
+                # table that does not say so is lying about itself to every
+                # reader that is not this library — and `sort_by` was therefore
                 # unanswerable from the published table alone.
                 if sort_by:
                     opened.set_sort_order(sort_by)
 
-                # So a freshly created published table names its own metadata from the
-                # start, rather than only from its first commit.
+                # So a freshly created published table names its own metadata
+                # from the start, rather than only from its first commit.
                 opened.publish_pointer()
                 table = opened._table  # the declaration's commit reloaded it
         else:
             # Deliberately unguarded. Catching everything here and rebuilding
             # meant a 503, a timeout or an expired token read as "there is no
             # table" — and the repair then dropped the only pointer to a live
-            # published table and wrote an empty table over it, while the watermark
-            # still promised eviction that those rows were safe. A failed read
+            # published table and wrote an empty table over it, while the
+            # watermark still promised eviction that those rows were safe. A failed read
             # of OUR OWN metadata is an error, not an absence.
             table = catalog.load_table(layout.table_id)
 
@@ -720,18 +730,20 @@ class LogTable:
 
     @staticmethod
     def forget(layout: Layout) -> None:
-        """Drop this log's local catalog row, leaving the root unopenable.
+        """Drop this log's staging catalog row, leaving the root unopenable.
 
         `create` is two commits and only the first makes a root openable, so a
-        failure in the second needs undoing — see `litelink.restore`. The objects it
-        may have written stay: a metadata JSON nothing references is inert, and
-        the alternative is deleting files on a path already handling a failure.
+        failure in the second needs undoing — see `litelink.restore`. The
+        objects it may have written stay: a metadata JSON nothing references is
+        inert, and the alternative is deleting files on a path already handling
+        a failure.
         """
         LogTable._catalog_for(layout).drop_table(layout.table_id)
 
     @staticmethod
     def exists_for(layout: Layout) -> bool:
-        """Whether the LOCAL catalog holds a table for this log.
+        """Whether the staging catalog (`catalog.db`) holds a table for this
+        log.
 
         Not whether `catalog.db` is there. It is per-stream since 0.2, so its
         presence does say this log exists — but its ABSENCE has two meanings,
@@ -739,18 +751,18 @@ class LogTable:
         is still at the root. That case raises rather than answering False, for
         the reason spelled out below.
 
-        Read straight out of the catalog's own SQLite, like
-        `_recorded_location` and for the same reason — the question has to be
-        answerable without loading the table, whose metadata may not exist yet.
-        **Raises `LookupError` when it cannot tell**, which is the same refusal
+        Read straight out of the catalog's own SQLite, like `_recorded_location`
+        and for the same reason — the question has to be answerable without
+        loading the table, whose metadata may not exist yet. **Raises
+        `LookupError` when it cannot tell**, which is the same refusal
         `_recorded_location` makes and for a sharper reason. `catalog.db` runs
         in `journal_mode=delete` with no busy timeout on this connection, so a
         read landing in another process's commit window returns `SQLITE_BUSY`.
-        Answering False there tells `litelink.restore` it is resuming an interrupted
-        restore when it is looking at a LIVE log — and the resume path then
-        reserves 2**20 offsets on it, deletes every `extent` row including
-        queued cuts, wipes `sealing` and `claim`, drops the published catalog
-        row, and deletes buffered rows below the frontier.
+        Answering False there tells `litelink.restore` it is resuming an
+        interrupted restore when it is looking at a LIVE log — and the resume
+        path then reserves 2**20 offsets on it, deletes every `extent` row
+        including queued cuts, wipes `sealing` and `claim`, drops the published
+        catalog row, and deletes buffered rows below the frontier.
         """
         if layout.is_legacy():
             # A LIVE pre-0.2 log. False here is the destructive answer: it
@@ -838,9 +850,9 @@ class LogTable:
         snapshot order: a slow load of an older snapshot finishing last
         installs it, and the handle goes backwards.
 
-        A reader then straddles the regression. `_query` resolves a floor from
-        the newer snapshot, reads the buffer tail above it, and resolves again
-        — landing on the older one. Its table leg scans the older snapshot
+        A reader then straddles the regression. `Reader.query` resolves a floor
+        from the newer snapshot, reads the buffer tail above it, and resolves
+        again — landing on the older one. Its table leg scans the older snapshot
         while its buffer leg holds only rows above the newer boundary, so
         everything in between is in neither: rows silently missing from the
         answer, which is the failure this whole read path is arranged to make
@@ -873,9 +885,9 @@ class LogTable:
     # -- reads from statistics --------------------------------------------
 
     def data_files(self) -> list[DataFile]:
-        """Current data files with their offset extents, ordered by offset.
+        """Current data files with their offset ranges, ordered by offset.
 
-        Extents come from manifest column statistics, so no data file is
+        Ranges come from manifest column statistics, so no data file is
         opened — which is what makes the tier boundary cheap enough for §7 to
         derive it on every read.
         """
@@ -921,7 +933,7 @@ class LogTable:
         """`[start, end)` over the current snapshot — §7's tier boundary.
 
         Cached against `metadata_location`, which is the version pointer: an
-        unchanged pointer is the same snapshot, so the extent cannot have moved.
+        unchanged pointer is the same snapshot, so the span cannot have moved.
         This does not weaken §7's "resolve per query, never pin" — the resolve
         still happens, at ~0.5 ms, and is what decides whether the cache stands.
 
@@ -1078,11 +1090,11 @@ class LogTable:
         """How this table names a file: a plain path for the staging table, the
         full URI for the published table.
 
-        The published table's files are URIs even when it is a local directory (#98).
-        Everything that records a file tells the two tiers apart by the scheme
-        — the deletion queue above all, where a published file keyed like a
-        local one would be unlinked once the staging table stopped naming it,
-        while the published table still did.
+        The published table's files are URIs even when it is a local directory
+        (#98). Everything that records a file tells the two tiers apart by the
+        scheme — the deletion queue above all, where a published file keyed
+        like a staging one would be unlinked once the staging table stopped
+        naming it, while the published table still did.
         """
         return str(path) if self._is_published else _plain(path)
 
@@ -1194,13 +1206,14 @@ class LogTable:
                 time.sleep(random.uniform(0, _COMMIT_BACKOFF_MS * (2**attempt)) / 1000)
                 self.reload()
                 # Refreshed, so check it is still the same table. The catalog
-                # row is keyed by table id, not by identity, and a `set_published`
-                # racing a slow register replaces what that row names — so the
-                # reload silently re-binds this operation to the NEW published table
-                # and the retry commits paths that live in the old bucket. The
-                # new published table's manifests would then reference objects the
-                # re-point retired, and the next publish's reconcile would launder
-                # that extent into the watermark eviction acts on.
+                # row is keyed by table id, not by identity, and a
+                # `set_published` racing a slow register replaces what that row
+                # names — so the reload silently re-binds this operation to the
+                # NEW published table and the retry commits paths that live in
+                # the old bucket. The new published table's manifests would then
+                # reference objects the re-point retired, and the next publish's
+                # reconcile would launder that span into the watermark eviction
+                # acts on.
                 self._verify_identity()
             else:
                 self.reload()
@@ -1240,13 +1253,13 @@ class LogTable:
         """Upload a local file into this table's warehouse (§5 step 1).
 
         Through pyiceberg's own FileIO rather than a second S3 client, so the
-        credentials and endpoint that reach the published table are the ones the
-        catalog was built with — one place to configure, and no way for an
+        credentials and endpoint that reach the published table are the ones
+        the catalog was built with — one place to configure, and no way for an
         upload to land somewhere the table cannot then read.
 
         Overwrites. The name carries a per-attempt token, so a repeat is the
-        same publish replaying the same file, and finishing it is what makes the
-        pass restartable.
+        same publish pass replaying the same file, and finishing it is what
+        makes the pass restartable.
         """
         destination = self.uri(rel_path)
         with source.open("rb") as reading:
@@ -1261,16 +1274,16 @@ class LogTable:
 
         Called after every published commit, so the bucket always names its own
         current metadata. Two things need that and neither can get it from
-        `published.db`: re-attaching to a published table this log was pointed away from
-        (the catalog row is gone — that is what re-pointing does), and reading
-        the published table from anywhere that is not this machine.
+        `published.db`: re-attaching to a published table this log was pointed
+        away from (the catalog row is gone — that is what re-pointing does),
+        and reading the published table from anywhere that is not this machine.
 
         **Best effort, and it has to be.** The commit has already landed; the
-        table is correct whether or not this succeeds. Raising here would turn
-        a published table that took the commit into a failed publish and send the caller into a retry
-        of work that is done. A hint that fails to write is a hint that still
-        names the previous metadata — behind, never wrong, and corrected by the
-        next commit.
+        table is correct whether or not this succeeds. Raising here would turn a
+        published table that took the commit into a failed publish and send the
+        caller into a retry of work that is done. A hint that fails to write is
+        a hint that still names the previous metadata — behind, never wrong, and
+        corrected by the next commit.
 
         Written AFTER the commit, never as part of it. A hint published from
         inside an attempt would name metadata that a CAS retry then superseded,
@@ -1292,17 +1305,17 @@ class LogTable:
                 writing.write(version.encode())
         except Exception:
             # Deliberately swallowed, and deliberately not logged from a
-            # library. The next commit rewrites it; a publish that raised here
-            # would be reporting a failure that did not happen.
+            # library. The next commit rewrites it; a publish pass that raised
+            # here would be reporting a failure that did not happen.
             return
 
     def fetch(self, path: str, destination: Path) -> None:
         """Download a file out of this table's warehouse. Inverse of `put`.
 
         Through the catalog's own FileIO for the same reason `put` is: the
-        credentials that reach the published table are the ones the table was opened
-        with, so there is no second client to configure and no way to read from
-        somewhere the table does not point.
+        credentials that reach the published table are the ones the table was
+        opened with, so there is no second client to configure and no way to
+        read from somewhere the table does not point.
 
         Whole-file, not streamed. These are `target_compact_size` files, the
         same amount compaction holds in memory to write one, and the caller is
@@ -1353,7 +1366,8 @@ class LogTable:
         `end` is the exclusive end of the range these files cover, and passing
         it makes the commit a no-op if the range is already in the table —
         here, or published through `published_through` (the last offset the
-        published table holds). That is what closes the race two owners can otherwise win.
+        published table holds). That is what closes the race two owners can
+        otherwise win.
 
         Iceberg already serialises them: both compare-and-swap against the same
         pointer, one moves it, the other raises `CommitFailedException`. What
@@ -1379,9 +1393,8 @@ class LogTable:
         twenty. One commit per file made `publish` take 83 s over sixteen files
         and starved the sealer that shared its thread.
 
-
-        Returns whether the file was added. False means the range was already
-        covered, so this file is redundant — and the caller has to queue it for
+        Returns whether the files were added. False means the range was already
+        covered, so these files are redundant — and the caller has to queue it for
         deletion, or it is a file on disk that nothing records.
         """
         added = True
@@ -1406,13 +1419,13 @@ class LogTable:
 
         The last line of defence, and the only one that cannot be reasoned
         around. `_covers` declines a range entirely covered, which makes a
-        replayed push harmless — but a range that starts inside the extent and
+        replayed push harmless — but a range that starts inside the span and
         ends beyond it is admitted, and those rows are then in two files at
         once, in the immutable tier, with nothing able to repair it.
 
         Everything upstream is arranged so this cannot arise: compaction skips
-        files the published table holds, so a merge never straddles its extent. That
-        argument has a gap, and it is narrow enough to have survived several
+        files the published table holds, so a merge never straddles its span.
+        That argument has a gap, and it is narrow enough to have survived several
         reviews — a crash between a register and the row recording it, then a
         compaction-config change before the next publish backfills, regroups
         pushed-but-unrecorded files into a mergeable run. The upstream fix for
@@ -1422,30 +1435,30 @@ class LogTable:
         The test is `start < covered[1]`, with no lower bound, and the missing
         lower bound is the point. `covered[0] <= start` was there first and was a
         hole rather than a safety condition: it exempted exactly the range that
-        starts BELOW the extent and spans past it, engulfing the whole thing —
+        starts BELOW the span and reaches past it, engulfing the whole thing —
         every published offset in two files at once, which is the worst version
         of what this exists to stop, not an excused one.
 
         Nothing legitimate is refused. `publish` pushes only files above the
         published table's span, so a batch whose first file starts below
         `covered[1]` necessarily contains `covered[1] - 1` — the last row of the
-        published table's top file, a real published row — and is a genuine overlap
-        however it is shaped. Whole-batch replays are excused earlier, by
-        `_covers`.
+        published table's top file, a real published row — and is a genuine
+        overlap however it is shaped. Whole-batch replays are excused earlier,
+        by `_covers`.
 
         Refusing costs a stall, and the stall is worse than this used to say.
         The straddling file never lands, the watermark stops, eviction pins
-        below it, and **nothing re-cuts a local straddler**: `rewrite_published`
-        works the other side, and no tool does this one. The refusal is still
-        right — a loud permanent stall beats a silent permanent duplication —
-        but calling it recoverable was wrong, and the operator's only route
-        today is to lower the compaction target so the straddler is left alone,
-        or to start a fresh published prefix.
+        below it, and **nothing re-cuts a staging straddler**:
+        `rewrite_published` works the other side, and no tool does this one. The
+        refusal is still right — a loud permanent stall beats a silent permanent
+        duplication — but calling it recoverable was wrong, and the operator's
+        only route today is to lower the compaction target so the straddler is
+        left alone, or to start a fresh published prefix.
 
         Reaching it at all takes a crash between a register and the rows
-        recording it, and then a compaction-target change before the next publish
-        backfills those rows from the published table's manifest. SPEC §4a records the
-        window and what would close it.
+        recording it, and then a compaction-target change before the next
+        publish backfills those rows from the published table's manifest. SPEC
+        §4a records the window and what would close it.
         """
         if start is None:
             return
@@ -1463,15 +1476,15 @@ class LogTable:
         """Whether the table already holds everything below `end`.
 
         Data files cover contiguous, non-overlapping offset ranges (§4), so the
-        extent's upper bound answers this on its own.
+        span's end answers this on its own.
 
         An EMPTY table answers False, which is why `register` also consults the
         published watermark. A writer stalled between renewing its lease and
         registering, while another owner sealed the same range, published it and
         evicted the table to nothing, would otherwise resume and re-add its
-        stale file — and a staging table holding only [100, 199] under a published table
-        holding [0, 999] serves 200-999 from no leg at all, until eviction
-        drops it again up to `staging_retention` later.
+        stale file — and a staging table holding only [100, 200) under a
+        published table holding [0, 1000) serves 200-999 from no leg at all,
+        until eviction drops it again up to `staging_retention` later.
         """
         span = self.span()
 

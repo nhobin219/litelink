@@ -8,9 +8,12 @@ import litelink
 from litelink import LogConfig, LogHandle, Row, S3Options, WriteHandle, __version__
 ```
 
-Those are the exports. The handles are the whole object model — there is no session, no client, no
-catalog handle to hold. A log is a directory under a root, named at `litelink.new` and opened by
-that name for ever after.
+Those are the names most code takes; `litelink` also exports `new`, `open`, `restore`,
+`validate_row`, `preflight`, `LocalReadHandle`, `Coverage`, `RetiredError`, `OFFSET`, the
+statistics types (`ColumnStatistics`, `TierStatistics`, `Tier`), the preflight report types
+(`Check`, `Report`) and the `manifest` module. The handles are the whole object model — there
+is no session, no client, no catalog handle to hold. A log is a directory under a root, named
+at `litelink.new` and opened by that name for ever after.
 
 **`Row` and `S3Options` are exported because public signatures name them**, and a type a
 caller has to name has to be importable. `Row` is `Mapping[str, object]`, what `append` and
@@ -77,16 +80,17 @@ with litelink.open("data", "trades", read_only=True) as r:
     r.scan(start_offset=r.end_offset() - 100)   # recent: local disk only
     r.scan()                          # the whole history, including the published table
     r.coverage()                      # what each tier holds
-    r.write_replication_config()      # its replica key IS the primary's
+    r.write_replication_config()      # its replica key IS the primary's (s3:// logs only)
 ```
 
-A local handle to a fully evicted log — its staging table empty and its published table holding rows —
-includes the published table automatically and refuses to serve without it, because reading without
-it would return the buffer alone: a fraction of the log, silently.
+On a fully evicted log — its staging table empty and its published table holding rows — any
+query that reaches below the buffer reads the published table, since nothing else holds those
+rows. `published=False` there returns the buffer alone, which is what it asks for.
 
 ## The whole surface
 
-Each row is what that class **adds** to the one above it. A test pins every set exactly.
+Each row is what that class **adds** to the one above it. A test pins the `LogHandle` and
+`LocalReadHandle` sets exactly.
 
 | | |
 |---|---|
@@ -97,7 +101,7 @@ Each row is what that class **adds** to the one above it. A test pins every set 
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal_due` · `seal` · `await_seal` |
-| **`+ WriteHandle`** — maintain | `maintain` · `compact` · `evict` · `expire` |
+| **`+ WriteHandle`** — maintain | `maintain` · `compact` · `evict` · `expire` · `reclaim_buffer` |
 | **`+ WriteHandle`** — published table | `publish` · `hydrate` · `rewrite_published` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` · `set_published` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
@@ -139,7 +143,7 @@ on disk. `new` raises `FileExistsError` if a log is already there, and `ValueErr
 published table it is pointed at holds data this log has no record of pushing — that published table belongs
 to another log.
 
-`start_offset` is set here and only here too, and leaves `[1, start_offset - 1]` unassigned
+`start_offset` is set here and only here too, and leaves `[1, start_offset)` unassigned
 for ever. It aligns a log's offsets with a sequence something else owns, and reserves room a
 later backfill can fill (§13). There is deliberately no way to re-seed a log afterwards: the
 guard that would refuse it reads the offsets currently BUFFERED, which a seal empties, so it
@@ -276,7 +280,7 @@ log.ingest(source: pa.Table | pa.RecordBatchReader, *,
 Writes Parquet directly and never puts the rows through SQLite. Returns the offsets it
 assigned as `[start, end)`, or `None` for a source with no rows.
 
-**It pushes its own output to the published table when one is configured**, compacting first, and
+**It pushes its own output to the published table**, compacting first, and
 `publish=False` opts out. Those rows never enter the buffer, so WAL replication cannot carry them
 and the published table is their only second copy — while an ordinary `publish` holds a load's short last
 file back behind `stable_prefix` for a merge a quiet stream never earns. If the push fails the
@@ -304,8 +308,9 @@ That is a fact about scope, and it is stated rather than enforced: `ingest` runs
 reads the same flag and the next seal would drop the buffer's copy of everything already
 captured.
 
-**The published table is a loaded range's only second copy.** Compare `published_through()` against the
-`hi` this returns; until they meet, the corpus you loaded from is the range's second copy.
+**The published table is a loaded range's only second copy.** When the push did not run, compare
+`published_through()` against the `end - 1` this returns; until they meet, the corpus you
+loaded from is the range's second copy.
 `publish` lags the tail on purpose — it holds back a trailing run still under
 `target_compact_size` — and the run settles once roughly another
 `target_compact_size` of rows sits above it, whether from capture or from the
@@ -393,8 +398,8 @@ Other machines do not use this API at all — see below.
 ## Reading from another machine
 
 The API above is the *writer's* read: local disk, all three tiers, no network. Every other
-machine reads the published table instead, and needs nothing from litelink to do it. The published table is an
-ordinary Iceberg table that publishes `version-hint.text` at every commit, so an engine pointed
+machine reads the published table instead — on S3, since a local one is on the writer's disk —
+and needs nothing from litelink to do it. The published table is an ordinary Iceberg table that publishes `version-hint.text` at every commit, so an engine pointed
 at the prefix resolves the current metadata itself — no catalog service, no `published.db`, no
 local root, no litelink install.
 
@@ -490,8 +495,10 @@ log.hydrate(since) -> None            # since: timedelta
 log.rewrite_published() -> None
 ```
 
-`publish` uploads data files, registers them into the published table, replicates compactions, and
-records the watermark (§5). `push_unsettled=True` also pushes the trailing run that
+`publish` uploads the staging files compaction is finished with, registers them into the
+published table in one commit, and records the watermark (§5). Compactions are never
+replicated: a file is pushed once it is settled, and compaction will not merge what the
+published table holds. `push_unsettled=True` also pushes the trailing run that
 `stable_prefix` holds back for compaction — everything unpublished, not a subset, because the
 push walks a prefix and the watermark it records must stay contiguous. Use it to close a bulk
 load's tail on a log that has gone quiet; the cost is undersized objects the published table keeps
@@ -505,8 +512,9 @@ depends on it**. All three raise `RuntimeError` when another owner holds the cla
 `<root>/<name>/published`. The pipeline is the same either way — a local-only log publishes,
 evicts and retires exactly like one on S3, and any Iceberg engine reads its table through
 `version-hint.text`. Its cost is disk: the local published table keeps everything, until truncation
-lands (a follow-up). `wal_replication`, `restore` and `hydrate` need a remote one: the WAL
-replica exists to get rows off the machine, and a local published table is on this disk already.
+lands (a follow-up). `wal_replication`, `replication_config()`, `restore` and `hydrate` need
+a remote one: the WAL replica exists to get rows off the machine, and a local published table
+is on this disk already.
 
 `hydrate(since)` re-registers published files back into the staging table. Raising
 `staging_retention` is an operation rather than a config change: without this, a raised setting
@@ -594,8 +602,8 @@ evicted dry — still gets the whole published table.
 A consumer prunes on this, so missing information is `None`, never a narrower bound:
 
 - **`min`/`max`** are None when any file with rows in the column has no bound, unless its
-  null count proves the column is entirely NULL there. That covers a column added after some
-  files were written.
+  null count proves the column is entirely NULL there. That covers a column a 0.5 `add_column`
+  added after some files were written.
 - **`nan_count` is 0 for every float column.** No write path admits NaN, so a float's bounds
   are over every value it holds and are safe to prune on in both directions.
 - **Only numeric and `bool` columns have bounds.** Iceberg truncates string and binary bounds
@@ -619,7 +627,7 @@ Afterwards:
 | `append`, `extend`, `ingest` | `RetiredError`, naming when it retired, its last offset and the `start_offset` for the next log |
 | `open(root, name)` | `RetiredError`, the same message |
 | `open(root, name, read_only=True)` | allowed; reads come from the published table |
-| `restore(...)` | `RetiredError`, from the published property or the replica's closed buffer |
+| `restore(...)` | `RetiredError`, from the published table's `litelink.retired` or the replica's closed buffer |
 | `hydrate(since)` | allowed; it adds no rows, only brings files back to local disk |
 | `column_statistics(tier="published")` | the whole log |
 
@@ -684,7 +692,7 @@ and `rewrite=False` raises `ValueError` naming the cost you have not accepted. I
 the maintenance claim, because a rewrite *is* a compaction.
 
 **It does not re-cluster the published prefix.** A local rewrite there would commit a file
-straddling the published table's extent, and nothing re-cuts a local straddler — so on a published log a
+straddling the published table's extent, and nothing re-cuts a local straddler — so a
 re-sort changes the declarations and rewrites only what `publish` has not yet taken. Published
 data keeps the clustering it was written with, which is §6's "sealed once and never
 rewritten" applied to history. `rewrite_published` is not the other half: it re-ingests from
@@ -720,18 +728,17 @@ construction: `compact_min_files` below 2, a compact size below the seal size, `
 without `wal_replication`, `wal_replication` without an s3:// published table, a `vacuum_free_ratio` outside
 `[0, 1]`, and a `compression` this build cannot write are each refused.
 
-**`vacuum_free_ratio` is about what READERS pay.** SQLite puts pages freed by a delete on a
+**`vacuum_free_ratio` is about what a RESTORE pays.** SQLite puts pages freed by a delete on a
 free list and never shrinks the file, so a buffer that seals and publishes for months keeps
 every page it has ever needed. Locally that is invisible — the free list is reused — but
-litestream replicates the FILE, so every `snapshot` and every `restore` downloads and applies
-the dead space. Measured on a 1-day-old capture: 457 MB holding 20,658 live rows with 92% of
-its pages free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
+litestream replicates the FILE, so every `restore` downloads and applies the dead space.
+Measured on a 1-day-old capture: 457 MB holding 20,658 live rows with 92% of its pages free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
 
 Set it and `maintain` reclaims once the free list reaches that share of the file;
 `WriteHandle.reclaim_buffer()` does it on demand. **Off by default, because the cost lands on
 the write path**: `VACUUM` takes an exclusive lock and stalls appends for as long as the live
 data takes to copy — 0.3 s at 35 MB — and only the deployment knows whether its arrival rate
-can absorb that. A writer with no off-box readers can leave it None for ever and lose nothing
+can absorb that. A writer with no WAL replica can leave it None for ever and lose nothing
 but disk. 0.5 is the value to reach for: the win scales with what is reclaimed and the cost
 with what is kept, so the trade only improves above it.
 
@@ -767,8 +774,11 @@ WriteHandle.replication_config_for(root, name, published, s3=None, retention=Non
 ```
 
 litelink does not run the sidecar — it says what the config has to name. `databases` is the
-set that carries the log's state: `buffer.db`, `catalog.db`, `published.db`. Omitting one is
-silently wrong, which is why this is generated rather than written by hand.
+set that carries the log's state: `buffer.db`, `catalog.db`, `published.db` (`archive.db` on a
+log written before 0.6). Omitting one is silently wrong, which is why this is generated rather
+than written by hand. `replication_config()` and `write_replication_config()` raise
+`ValueError` on a log whose published table is local: there is nowhere off the machine to ship
+the WAL.
 
 `replication_config_for` is the classmethod form, for a log that does not exist here yet —
 which is the chicken-and-egg a restore has to solve.
@@ -843,8 +853,9 @@ readable; one it left mid-change is refused with the release that can finish it 
 ## Rules that cut across
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
-`append`, `seal`, `seal_due`, `maintain`, `compact`, `evict`, `expire`, `publish`, `hydrate`,
-`rewrite_published`, `set_config`, `set_published` and `set_sort_by` are absent from `LogHandle`.
+`append`, `ingest`, `seal`, `seal_due`, `await_seal`, `maintain`, `compact`, `evict`, `expire`,
+`publish`, `hydrate`, `rewrite_published`, `retire`, `set_config`, `set_published` and
+`set_sort_by` are absent from `LogHandle`.
 Everything observational and both read paths are there.
 
 This is the difference from the older `Log.open(read_only=True)`, which returned ONE class
@@ -857,8 +868,8 @@ with overloads, and so does this, so the misuse is caught before it runs.
 intended topology; multiple machines write separate logs and readers union.
 
 **The claim decides who does the work, not the caller.** `maintain`, its three passes, `publish`,
-`hydrate`, `rewrite_published` and the two setters all coordinate through rows in SQLite, so a
-second caller is refused with `RuntimeError` rather than duplicating the work — and that holds
+`hydrate`, `rewrite_published`, `retire` and the three setters all coordinate through rows in
+SQLite, so a second caller is refused with `RuntimeError` rather than duplicating the work — and that holds
 between threads and between processes on identical terms.
 
 **Nothing runs on a timer.** Size ceilings are enforced synchronously inside the append

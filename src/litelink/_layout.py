@@ -132,7 +132,8 @@ class Layout:
 
     @property
     def default_published(self) -> str:
-        """Where a log with no remote published table publishes: a local directory (#98).
+        """Where a log with no remote published table publishes: a local
+        directory (#98).
 
         Computed rather than stored, so `meta` records only a location the
         caller chose, and an empty row — what a log written before #98 holds —
@@ -144,10 +145,10 @@ class Layout:
     def published_table_location(self, prefix: str) -> str:
         """The same, in the published prefix.
 
-        A data file keeps its root-relative name in the published table — `LogTable`
-        maps `<name>/data/...` to `<prefix>/<name>/data/...` — so the remote
-        table's location has to be `<prefix>/<name>` for its metadata to sit
-        beside its data the way the local one now does.
+        A data file keeps its root-relative name in the published table —
+        `LogTable` maps `<name>/data/...` to `<prefix>/<name>/data/...` — so
+        the published table's location has to be `<prefix>/<name>` for its
+        metadata to sit beside its data the way the staging table's now does.
         """
         return f"{prefix.rstrip('/')}/{self.name}"
 
@@ -177,17 +178,18 @@ class Layout:
 
     @property
     def published_db(self) -> Path:
-        """The published catalog, kept beside the local one (§2).
+        """The published catalog, kept beside the staging one (§2).
 
-        A local SQLite file describing a warehouse on object storage. It is
-        replicated like the others — but it is deliberately NOT restored onto
-        another machine. Its paths are `s3://` and so machine-independent, yet
-        it is TIME-dependent, and a stale copy is worse than none:
-        `open_published` consults `version-hint.text` only when the catalog has
-        no row, so a stale row wins over the bucket's own pointer and the
-        published reads short, silently. See `litelink.restore`.
+        A local SQLite file describing the published warehouse, on object
+        storage or in a local directory. It is replicated like the others — but
+        it is deliberately NOT restored onto another machine. A remote one's
+        paths are `s3://` and so machine-independent, yet it is TIME-dependent,
+        and a stale copy is worse than none: `open_published` consults
+        `version-hint.text` only when the catalog has no row, so a stale row
+        wins over the bucket's own pointer and published reads come back
+        short, silently. See `litelink.restore`.
 
-        `published.db` for a log written before #98 that has one, so an old log
+        `archive.db` for a log written before #98 that has one, so an old log
         opens unchanged; `published.db` for every other.
         """
         legacy = self.directory / "archive.db"
@@ -207,8 +209,8 @@ class Layout:
 
         What a WAL-shipping sidecar has to replicate. All three, not just the
         buffer: the buffer holds rows no Parquet file has yet, `catalog.db`
-        holds which files the staging table is made of, and `published.db` holds
-        the same for the published table.
+        holds which files the staging table is made of, and `published.db`
+        holds the same for the published table.
 
         That last one used to be justified as the only thing able to name the
         objects in S3. It is not, since the published table publishes
@@ -216,9 +218,9 @@ class Layout:
         it saves a round trip, and a failover deliberately does not restore it
         because a stale copy wins over the bucket's own pointer.
 
-        The rewrite scratch is excluded. It is derived from the published table and
-        deleted at the end of the operation that makes it, so replicating it
-        would ship a temporary file to object storage to no purpose.
+        The rewrite scratch is excluded. It is derived from the published table
+        and deleted at the end of the operation that makes it, so replicating
+        it would ship a temporary file to object storage to no purpose.
 
         Listed here rather than assembled by a caller, because which files
         matter is exactly what this class knows and nothing else should have to
@@ -270,12 +272,12 @@ class Layout:
         NOT need to be derivable: `compacting` records it before the file
         exists, so recovery reads the name rather than recomputing it.
 
-        Uniqueness is the point. A deterministic `{start}-{end}` meant a compaction
-        whose inputs were themselves a previous compaction of the same range
-        wrote to the path it was reading — `set_sort_by(rewrite=True)` after
-        any compaction truncated the live, table-referenced file, and a crash
-        mid-write destroyed the only copy of those rows. It also meant two
-        owners racing the role wrote one file. A seal can overwrite in place
+        Uniqueness is the point. A deterministic `{start}-{end}` meant a
+        compaction whose inputs were themselves a previous compaction of the
+        same range wrote to the path it was reading — `set_sort_by(rewrite=True)`
+        after any compaction truncated the live, table-referenced file, and a
+        crash mid-write destroyed the only copy of those rows. It also meant
+        two owners racing the role wrote one file. A seal can overwrite in place
         because its source is the buffer, which is still there; a compaction's
         source is the file it is replacing.
         """
@@ -309,8 +311,8 @@ class Layout:
 
 
 # The schemes a published prefix may carry. Not a general URI parser: a remote
-# published table is object storage, everything downstream builds `s3://` paths from
-# it, and `litestream_config` emits a `type: s3` replica. A local one is a
+# published table is object storage, everything downstream builds `s3://` paths
+# from it, and `litestream_config` emits a `type: s3` replica. A local one is a
 # directory, and every log has one — the default, under the log's own
 # directory, when no remote published table is given (#98).
 S3_SCHEME = "s3://"

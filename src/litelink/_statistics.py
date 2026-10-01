@@ -11,11 +11,11 @@ these metrics into the manifests at every commit, so nothing new is written
 and nothing has to be kept in step with seals, compaction, eviction or publish —
 a stored rollup would be a second home for a fact the manifests already hold.
 
-The one exception is deliberate and lives elsewhere: `buffer.db` keeps each
-PUBLISHED file's bounds (`_prune`), because deciding whether a query needs the
-published table must not cost the network round trip it exists to avoid. This module
-still reads the manifests, so it answers from what the published table says rather
-than from that copy.
+The one exception is deliberate and lives elsewhere: `buffer.db` keeps the
+PUBLISHED tier's statistics (`_tiers`), because deciding whether a query needs
+the published table must not cost the network round trip it exists to avoid.
+This module still reads the manifests, so it answers from what the published
+table says rather than from that copy.
 
 What pyiceberg records for litelink's files, measured, decides most of it:
 
@@ -220,7 +220,8 @@ def file_span(schema: Schema, data_file: DataFile) -> tuple[int, int]:
 
 
 def staging_span(schema: Schema, files: Sequence[DataFile]) -> tuple[int, int] | None:
-    """The `[start, end)` the local files cover, or None when there are none."""
+    """The `[start, end)` the staging files cover, or None when there are
+    none."""
     covered = [file_span(schema, data_file) for data_file in files]
     if not covered:
         return None
@@ -231,13 +232,13 @@ def staging_span(schema: Schema, files: Sequence[DataFile]) -> tuple[int, int] |
 def below_staging(
     span: tuple[int, int] | None, schema: Schema, files: Sequence[DataFile]
 ) -> tuple[list[DataFile], bool]:
-    """The published files holding rows outside the local range, and whether any
-    of them straddles it.
+    """The published files holding rows outside the staging range, and whether
+    any of them straddles it.
 
-    What eviction moved out of the staging table, and so what a read's published
-    leg covers. A file that straddles the range — only `rewrite_published` can
-    cut one — is included whole: its bounds overstate, but its rows cannot be
-    split from the local copies without opening it.
+    What eviction moved out of the staging table, and so what a read's
+    published leg covers. A file that straddles the range — only
+    `rewrite_published` can cut one — is included whole: its bounds overstate,
+    but its rows cannot be split from the staging copies without opening it.
     """
     beyond = []
     straddles = False
@@ -263,9 +264,9 @@ def rows_at_or_after(buffered: pa.Table, start: int) -> pa.Table:
 def uncounted(statistics: TierStatistics) -> TierStatistics:
     """`statistics` with every count unknown, bounds kept.
 
-    For a part that includes a straddling file, whose rows are partly local
-    too: a bound over rows held twice is still a bound, but no count can be
-    taken without double counting.
+    For a part that includes a straddling file, whose rows are partly in
+    staging too: a bound over rows held twice is still a bound, but no count
+    can be taken without double counting.
     """
     return TierStatistics(
         tier=statistics.tier,
@@ -284,26 +285,27 @@ def whole_log(
     published: tuple[Schema, list[DataFile]] | None,
     buffered: pa.Table,
 ) -> TierStatistics:
-    """The entire log: local files, the published table beyond them, and the buffer.
+    """The entire log: staging files, the published table beyond them, and the
+    buffer.
 
-    The tiers overlap by design (I3) — the published table keeps what local still
-    holds, and with `wal_replication` a seal keeps its rows in the buffer — so
-    this takes each row from one place, as a read does, and the three parts
-    are exactly what `column_statistics` reports for `"staging"`, `"published"`
-    and `"buffer"`:
+    The tiers overlap by design (I3) — the published table keeps what staging
+    still holds, and with `wal_replication` a seal keeps its rows in the buffer
+    — so this takes each row from one place, as a read does, and the three
+    parts are exactly what `column_statistics` reports for `"staging"`,
+    `"published"` and `"buffer"`:
 
-    - every **local** file;
-    - every **published table** file outside the local offset range, which is what
-      eviction dropped locally;
+    - every **staging** file;
+    - every **published** file outside the staging offset range, which is what
+      eviction dropped from staging;
     - every **buffered** row above all of those files, counted from the rows
       themselves, exactly.
 
-    One case cannot be split: a published file straddling the local range, which
-    only `rewrite_published` re-cutting the published table can produce. Its rows are
-    partly local too, so its bounds still hold — a bound over rows the log
-    holds twice is a bound over rows it holds — but no count can be taken
-    without double counting, and every count, `record_count` included, comes
-    out None rather than wrong.
+    One case cannot be split: a published file straddling the staging range,
+    which only `rewrite_published` re-cutting the published table can produce.
+    Its rows are partly in staging too, so its bounds still hold — a bound over
+    rows the log holds twice is a bound over rows it holds — but no count can
+    be taken without double counting, and every count, `record_count`
+    included, comes out None rather than wrong.
     """
     local_schema, local_files = local
     parts = [rollup(None, local_schema, local_files)]
@@ -318,8 +320,8 @@ def whole_log(
         ceiling = max([ceiling, *(file_span(published_schema, f)[1] for f in beyond)])
 
     # Above every file, rather than above the staging table alone: with the
-    # staging table evicted dry the published table is the boundary, and a seal that
-    # keeps its rows leaves them here too.
+    # staging table evicted dry the published table is the boundary, and a seal
+    # that keeps its rows leaves them here too.
     parts.append(_from_rows(rows_at_or_after(buffered, ceiling)))
 
     merged = _merge(names, parts)

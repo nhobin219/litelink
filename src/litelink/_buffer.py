@@ -45,8 +45,8 @@ OFFSET = "litelink_offset"
 
 # Where the log records its declared schema. Beside `CONFIG_KEY` and for the
 # same reason: this object owns `meta`, and `meta` is the one place the schema
-# exists. It used to live in `_handle.py`, which meant the module that OWNS the row
-# could not read it without importing the module that names it.
+# exists. It used to live in `_handle.py`, which meant the module that OWNS the
+# row could not read it without importing the module that names it.
 SCHEMA_KEY = "arrow_schema"
 
 # Where a log records the offset it was created to start at, or nothing if it
@@ -80,8 +80,9 @@ def _metadata_sequence(version: str) -> int:
     return int(prefix) if prefix.isdigit() else -1
 
 
-# The key the published table's location is recorded under — `_published.PUBLISHED_KEY`,
-# spelled here because that module imports this one.
+# The key the published table's location is recorded under —
+# `_published.PUBLISHED_KEY`, spelled here because that module imports this
+# one.
 PUBLISHED_META_KEY = "published"
 
 # Names a log written before #98 stored, under the name each now has. Every
@@ -182,7 +183,7 @@ _CONTAINS = frozenset.__contains__
 _BEGIN = "BEGIN IMMEDIATE"
 
 # Dead space below this is not worth an exclusive lock, whatever the ratio
-# says: a young log crosses any ratio on its first published pass, and reclaiming
+# says: a young log crosses any ratio on its first publish pass, and reclaiming
 # a few hundred KB there costs a write stall to save a rounding error on the
 # wire. Not configurable, because it is not a policy — it is the point below
 # which the policy cannot pay for itself. Sized to stay invisible against the
@@ -353,11 +354,11 @@ class Shape:
     def table(self) -> pa.Schema:
         """The caller's columns with `offset` in front — the TABLE's schema.
 
-        Here rather than in `_handle.py` so the published table can ask the buffer for it
-        without importing the module that owns the log. It is the shape
-        `create_table` is handed, and a published table born from a stale copy of it
-        is the one holder that cannot be repaired afterwards: nothing in
-        `src/` ever re-declares an existing table.
+        Here rather than in `_handle.py` so the published table can ask the
+        buffer for it without importing the module that owns the log. It is the
+        shape `create_table` is handed, and a published table born from a stale
+        copy of it is the one holder that cannot be repaired afterwards: nothing
+        in `src/` ever re-declares an existing table.
         """
         return pa.schema([pa.field(OFFSET, pa.int64(), nullable=False), *self.schema])
 
@@ -493,9 +494,9 @@ class Buffer:
         self._sealer = sealer
         # What `shape()` falls back to when `meta` has no schema row yet. Two
         # callers need that and both would otherwise fail at construction:
-        # `_create` runs inside `Buffer.open` BEFORE `litelink.new` writes the row,
-        # and the scratch buffer a published rewrite cuts through is handed a
-        # schema directly and only ever has `CONFIG_KEY` written into it.
+        # `_create` runs inside `Buffer.open` BEFORE `litelink.new` writes the
+        # row, and the scratch buffer a published rewrite cuts through is handed
+        # a schema directly and only ever has `CONFIG_KEY` written into it.
         #
         # A fallback, not the value. Everything reads `shape()`, so a schema
         # change reaches every holder without anyone remembering to refresh —
@@ -603,10 +604,10 @@ class Buffer:
     ) -> Buffer:
         """Connect, configure, and create the tables. Then hand them to `cls`.
 
-        The I/O half, kept out of `__init__` for the same reason `litelink.open` is
-        kept out of `Log.__init__`: a constructor that opens files cannot be
-        handed a substitute, and a test that wants one should not have to
-        monkeypatch its way in.
+        The I/O half, kept out of `__init__` for the same reason `litelink.open`
+        is kept out of `WriteHandle.__init__`: a constructor that opens files
+        cannot be handed a substitute, and a test that wants one should not have
+        to monkeypatch its way in.
 
         A readonly buffer opens the same file through SQLite's `mode=ro` URI so
         the handle cannot write even by mistake, and creates nothing. WAL allows
@@ -614,11 +615,11 @@ class Buffer:
 
         `durable=False` is for a buffer whose contents are derived from
         something that still exists — the scratch buffer a published rewrite
-        re-cuts through, whose every row came from the published table and is still
-        there until the rewrite's final commit. A crash costs a re-run rather
-        than data, so the fsync per commit is paying for a guarantee nothing
-        depends on. Never for a log's own buffer: there, the fsync IS the
-        product (§3).
+        re-cuts through, whose every row came from the published table and is
+        still there until the rewrite's final commit. A crash costs a re-run
+        rather than data, so the fsync per commit is paying for a guarantee
+        nothing depends on. Never for a log's own buffer: there, the fsync IS
+        the product (§3).
         """
         if readonly:
             con = cls._connect_readonly(path)
@@ -750,23 +751,24 @@ class Buffer:
             CREATE INDEX IF NOT EXISTS extent_unsealed ON extent (group_id)
             WHERE rel_path IS NULL
         """)
-        # I4 per segment (§4a) reads the published copies covering what the staging
-        # table still holds. Without this the lookup is a scan of one row per
-        # file ever published, which grows without limit — the local file count
-        # does not.
+        # I4 per segment (§4a) reads the published copies covering what the
+        # staging table still holds. Without this the lookup is a scan of one
+        # row per file ever published, which grows without limit — the staging
+        # file count does not.
         self._con.execute("""
             CREATE INDEX IF NOT EXISTS extent_published ON extent (start_offset)
             WHERE rel_path IS NOT NULL
         """)
         # Its pre-#98 name, which an old log carries: one index, not two.
         self._con.execute("DROP INDEX IF EXISTS extent_archived")
-        # A copy that was INTENDED, beside `extent`'s copies that exist. The
-        # two are read by collaborators whose safe directions are opposite:
-        # compaction must not merge across a range some published table may hold, so it
-        # is safe when coverage is OVERSTATED; eviction must not delete the only
-        # copy, so it is safe only when coverage is UNDERSTATED. One record
-        # cannot be both, and collapsing them into one is what left a crash
-        # between a register and the rows recording it able to wedge the log.
+        # A copy that was INTENDED, beside `extent`'s copies that exist. The two
+        # are read by collaborators whose safe directions are opposite:
+        # compaction must not merge across a range some published table may
+        # hold, so it is safe when coverage is OVERSTATED; eviction must not
+        # delete the only copy, so it is safe only when coverage is UNDERSTATED.
+        # One record cannot be both, and collapsing them into one is what left a
+        # crash between a register and the rows recording it able to wedge the
+        # log.
         #
         # A separate table rather than a column on `extent`, because a build
         # that predates this has no idea it exists — so its eviction query is
@@ -789,8 +791,10 @@ class Buffer:
         # dense and monotonic across every tier, so a tier's `[start, end)` is
         # a fact about where it sits in the log rather than a statistic — and
         # it prunes on its own, as streamcast prunes whole logs by offset
-        # (streamcast#32). Only the published table is stored: the staging tier's come
-        # from its Iceberg snapshot and the buffer's from its rows.
+        # (streamcast#32). Three tiers can have a row: the published table's,
+        # which is what lets a read skip it (`_tiers`); the staging table's, a
+        # cache of one version's rollup; and the buffer's, written only when
+        # `retire()` closes it (see `close_buffer`).
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS tier_offsets (
               tier         TEXT PRIMARY KEY,
@@ -799,11 +803,12 @@ class Buffer:
             )
         """)
         # `version` is which version of the table a row describes — the path of
-        # its Iceberg metadata file — and only the LOCAL row has one: it is a
+        # its Iceberg metadata file — and only the STAGING row has one: it is a
         # cache of one version's rollup, valid for exactly that version. The
-        # published table's row has none, because it is kept a superset of what the
-        # published table holds below the staging table at every moment (eviction widens
-        # it before its commit), whatever version the published table is at.
+        # published table's row has none, because it is kept a superset of what
+        # the published table holds below the staging table at every moment
+        # (eviction widens it before its commit), whatever version the
+        # published table is at.
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS tier_statistics (
               tier       TEXT PRIMARY KEY,
@@ -1343,9 +1348,10 @@ class Buffer:
     def group_bytes(self, end: int) -> int:
         """What the extent ending at `end` holds, before a file claims it.
 
-        Read out so it can be recorded against the published table's copy: the scratch
-        buffer measured these rows exactly as the appender would have, and that
-        count is the whole reason the rewrite goes through a buffer at all.
+        Read out so it can be recorded against the published table's copy: the
+        scratch buffer measured these rows exactly as the appender would have,
+        and that count is the whole reason the rewrite goes through a buffer at
+        all.
         """
         with self._lock:
             row = self._con.execute(
@@ -1361,16 +1367,17 @@ class Buffer:
         **Bounded at BOTH ends, and the lower one is load-bearing.** A seal used
         to be able to take everything below its cut, because `finish_seal`
         deleted those rows immediately: the buffer's minimum was always the next
-        group's start. Once the delete is deferred until the published table holds the
-        range (§3a), that stops being true — and an unbounded read then writes
-        every row from the published frontier upward into the new file.
+        group's start. Once the delete is deferred until the published table
+        holds the range (§3a), that stops being true — and an unbounded read
+        then writes every row from the published frontier upward into the new
+        file.
 
-        Nothing catches that at seal time. The local `register` passes no `start`,
-        so `_refuse_straddle` returns early; what fails is later and elsewhere.
-        The manifest's own ranges stop being non-overlapping (§4, §6), the local
-        leg of a read is an unfiltered `iceberg_scan` so every overlapped row
-        comes back twice, the next `publish` refuses the straddle for ever, and
-        compaction's row-count verification fails.
+        Nothing catches that at seal time. The staging `register` passes no
+        `start`, so `_refuse_straddle` returns early; what fails is later and
+        elsewhere. The manifest's own ranges stop being non-overlapping (§4,
+        §6), the staging leg of a read is an unfiltered `iceberg_scan` so every
+        overlapped row comes back twice, the next `publish` refuses the straddle
+        for ever, and compaction's row-count verification fails.
 
         `start` costs nothing to supply: `pending_group` and `pending_seal` both
         already carry it, and both call sites already unpack it.
@@ -1626,9 +1633,9 @@ class Buffer:
         same end, and `finish_seal` then hits the `rel_path` UNIQUE after the
         Iceberg commit has already landed.
 
-        Unreachable until `litelink.restore` began releasing published rows out from
-        under a knowingly-stale group (§3a), which is one transaction away from
-        the reseed that fixes it.
+        Unreachable until `litelink.restore` began releasing published rows out
+        from under a knowingly-stale group (§3a), which is one transaction away
+        from the reseed that fixes it.
 
         Harmless to race — the predicate matches nothing once another caller
         has closed it.
@@ -1695,12 +1702,12 @@ class Buffer:
         between that commit and this call is safe in both directions.
 
         **`discard=False` keeps them, and that is I4 one tier up.** A seal moves
-        rows from SQLite into a Parquet file that no sidecar replicates, so
-        with WAL shipping on, deleting here removes the only off-box copy of a
-        range the published table does not have yet — and the machine dying in that
-        window loses them, silently, from the middle of the offset space
-        (§3a). The caller passes False when replication is on and something is
-        owed to a published table; `release_below` is what removes them afterwards.
+        rows from SQLite into a Parquet file that no sidecar replicates, so with
+        WAL shipping on, deleting here removes the only off-box copy of a range
+        the published table does not have yet — and the machine dying in that
+        window loses them, silently, from the middle of the offset space (§3a).
+        The caller passes False when replication is on and something is owed to
+        the published table; `release_below` is what removes them afterwards.
 
         Only the CALLER can decide that, which is why it is a parameter rather
         than a check here: this object knows nothing about published tables.
@@ -1750,17 +1757,17 @@ class Buffer:
     def file_bytes(self) -> dict[str, int]:
         """What every known data file holds in memory, keyed by location.
 
-        Root-relative for local files, so a log directory stays movable; the
+        Root-relative for staging files, so a log directory stays movable; the
         full URI for published ones, which have no root to be relative to. A
         named extent is a file; an unnamed one is still buffered.
 
-        All of it at once: the callers are compaction, publish and the published table
+        All of it at once: the callers are compaction, publish and the published
         rewrite, all of which walk the whole file list, and one indexed read
         beats a query per file.
 
         A file missing from this is not an error. It means the log has files
         this database never recorded — one written by a version that did not
-        keep them, or a published table whose local extents were lost — and the
+        keep them, or a published table whose `extent` rows were lost — and the
         callers treat an unknown size as "full", so an unmeasured file is never
         merged on a guess about what it holds.
         """
@@ -1797,12 +1804,12 @@ class Buffer:
     def record_file(self, rel_path: str, start: int, end: int, held: int) -> None:
         """Record a second file holding an extent the log already has.
 
-        What `publish` calls when it pushes: the published table's copy covers the same
-        offsets and holds the same bytes, so it gets its own row under its own
-        URI rather than a measurement of its own. It could not be measured
-        again anyway — nothing recoverable from a Parquet file is the
-        appender's count of what those rows cost in memory, and the local row
-        goes when the local file is unlinked.
+        What `publish` calls when it pushes: the published table's copy covers
+        the same offsets and holds the same bytes, so it gets its own row under
+        its own URI rather than a measurement of its own. It could not be
+        measured again anyway — nothing recoverable from a Parquet file is the
+        appender's count of what those rows cost in memory, and the staging row
+        goes when the staging file is unlinked.
 
         This is why the mapping lives here. Iceberg has no per-file field to
         hang it on: v2's data-file metadata is a fixed set — column sizes,
@@ -1835,9 +1842,9 @@ class Buffer:
         The register that follows can land while the row recording it does not,
         and compaction decides what it may merge from those rows — so without
         this, a compaction-target change before the next publish regroups the
-        pushed-but-unrecorded files and commits a local file straddling the
-        published table's extent. Nothing re-cuts a local straddler, so every later
-        push is refused and the log stops advancing.
+        pushed-but-unrecorded files and commits a staging file straddling the
+        published table's span. Nothing re-cuts a staging straddler, so every
+        later push is refused and the log stops advancing.
 
         An UPSERT, and the difference is not cosmetic: a holder that stalled
         past its TTL and resumed can intend a path the owner that took over is
@@ -1860,9 +1867,9 @@ class Buffer:
         """Intended copies under `prefix`: `(rel_path, start, end, bytes)`.
 
         Unbounded by offset, deliberately. Reconciliation drops an intent the
-        published table's manifest does not name, and one below the staging window has to
-        be reachable to be dropped — bounding this read would leave those rows
-        beyond judgement for ever.
+        published table's manifest does not name, and one below the staging
+        window has to be reachable to be dropped — bounding this read would
+        leave those rows beyond judgement for ever.
         """
         boundary = prefix.rstrip("/") + "/"
         with self._lock:
@@ -1879,11 +1886,13 @@ class Buffer:
     def published_records(
         self, prefix: str, floor: int
     ) -> list[tuple[str, int, int, int]]:
-        """Landed copies under `prefix`, keyed by PATH: `(rel_path, start, end, bytes)`.
+        """Landed copies under `prefix`, keyed by PATH: `(rel_path, start, end,
+        bytes)`.
 
         Reconciliation matches by path, and `published_ranges` answers in bare
         offsets — so it cannot serve. Bounded by `floor` like the manifest walk
-        beside it, or it grows with the published table and runs on every publish.
+        beside it, or it grows with the published table and runs on every
+        publish pass.
         """
         boundary = prefix.rstrip("/") + "/"
         with self._lock:
@@ -1914,8 +1923,8 @@ class Buffer:
         That keeps the number in the same currency as the seal that first
         measured it, however many rewrites later — which is the whole reason it
         is carried rather than derived from whatever the merged file compresses
-        to. It is also what lets the published rewrite build its extents with the
-        same arithmetic a local compaction uses.
+        to. It is also what lets the published rewrite build its extents with
+        the same arithmetic a staging compaction uses.
         """
         paths = list(sources)
         if not paths:
@@ -1979,30 +1988,30 @@ class Buffer:
         """Offset ranges a published table holds or is about to, under `prefix`.
 
         `include_intents` is keyword-only and has no default, so every caller
-        states which question it is asking. Compaction asks whether ANY published table
-        might hold a range, and is safe overstating it; eviction asks whether
-        one DOES, and is safe only understating. Getting that backwards at one
-        call site would be silent, which is the whole reason this parameter is
-        awkward to pass.
+        states which question it is asking. Compaction asks whether ANY
+        published table might hold a range, and is safe overstating it; eviction
+        asks whether one DOES, and is safe only understating. Getting that
+        backwards at one call site would be silent, which is the whole reason
+        this parameter is awkward to pass.
 
         I4 asked of segments rather than of a watermark (§4a). `publish` records
-        where each pushed file's copy went, so the published table's contents are
-        already durable here per file — a watermark summarising them is a
+        where each pushed file's copy went, so the published table's contents
+        are already durable here per file — a watermark summarising them is a
         second copy of the same fact, and the only boundary in the log that can
         move backwards.
 
-        Bounded by `floor` rather than by the prefix alone: the published table grows
-        without limit and this only ever asks about ranges the staging table
-        still holds, which compaction bounds. The prefix match is applied in
-        Python because SQLite's `LIKE` would not use the index that `floor`
+        Bounded by `floor` rather than by the prefix alone: the published table
+        grows without limit and this only ever asks about ranges the staging
+        table still holds, which compaction bounds. The prefix match is applied
+        in Python because SQLite's `LIKE` would not use the index that `floor`
         selects on.
         """
-        # `None` means ANY published table, not the configured one. Two questions ask
-        # this and they are not the same question. I4 asks whether THIS published table
-        # holds a file, because it authorises a deletion. Compaction asks
-        # whether ANY published table does, because it decides whether merging could
-        # create a range no published table's cuts line up with — and detaching does
-        # not make those copies stop existing.
+        # `None` means ANY published table, not the configured one. Two
+        # questions ask this and they are not the same question. I4 asks whether
+        # THIS published table holds a file, because it authorises a deletion.
+        # Compaction asks whether ANY published table does, because it decides
+        # whether merging could create a range no published table's cuts line up
+        # with — and pointing away does not make those copies stop existing.
         boundary = None if prefix is None else prefix.rstrip("/") + "/"
         # ONE statement, so one snapshot. Read as two, the tables are two
         # separate WAL reads and a `record_file` committing between them moves
@@ -2038,14 +2047,15 @@ class Buffer:
         The question "is this a change?" is answered against the durable value,
         inside the transaction that acts on the answer. Asked of a process's
         memory instead, both answers are wrong in a two-process deployment,
-        because nothing refreshes that memory except a publish:
+        because nothing refreshes that memory except a publish pass:
 
-        * memory stale, argument current — re-asserting the published table the log
-          already has reads as a move and zeroes the watermarks of a bucket
+        * memory stale, argument current — re-asserting the published table the
+          log already has reads as a move and zeroes the watermarks of a bucket
           that genuinely holds the data;
-        * memory stale, argument stale — re-pointing BACK to a published table reads
-          as a restatement, and the log keeps the other published table's watermark
-          over a bucket whose extent is lower. Eviction believes it (I4).
+        * memory stale, argument stale — re-pointing BACK to a published table
+          reads as a restatement, and the log keeps the other published table's
+          watermark over a bucket whose span is lower. Eviction believes it
+          (I4).
 
         Returns whether it was a move.
         """
@@ -2063,10 +2073,11 @@ class Buffer:
         Compare-and-set, in ONE write transaction, for the guards that decide
         whether a fact still belongs to the log it was computed for. Read and
         write as separate statements, the check is only ever a statement about
-        the past: `publish` re-reads which published table it is pushing to before
-        recording a watermark, and a `set_published` landing between the read and
-        the write leaves the log pointed at the NEW published table holding the OLD
-        one's extent — which eviction believes (I4) and nothing ever lowers.
+        the past: `publish` re-reads which published table it is pushing to
+        before recording a watermark, and a `set_published` landing between the
+        read and the write leaves the log pointed at the NEW published table
+        holding the OLD one's watermark — which eviction believes (I4) and
+        nothing ever lowers.
 
         The lease does not close that window, because the window opens when the
         lease has already lapsed: a push that spent longer than the TTL in S3
@@ -2127,10 +2138,10 @@ class Buffer:
         There is exactly one copy of this, and it is the `meta` row. Everything
         that decides from the policy reads it here, so nothing can hold a stale
         one — which is the failure this replaces: the policy used to live in
-        `WriteHandle`, in `Maintenance` and, derived, in this object's seal target, all
-        kept in step by `set_config` writing each. A refresh call had to sit
-        wherever a decision was made, and a design needing N of those is always
-        one short somewhere, because nothing says where N is.
+        `WriteHandle`, in `Maintenance` and, derived, in this object's seal
+        target, all kept in step by `set_config` writing each. A refresh call
+        had to sit wherever a decision was made, and a design needing N of those
+        is always one short somewhere, because nothing says where N is.
 
         The PARSE is cached, keyed on the raw value. Reading the row costs
         1.8 us and decoding it costs far more, so the cache is what makes this
@@ -2160,8 +2171,8 @@ class Buffer:
         """The declared clustering, read from the log rather than remembered.
 
         The rule `config` follows, for the reason `config` follows it (§4a).
-        This used to live in four places — `meta`, `WriteHandle`, `Maintenance` and
-        `Published` — kept in step by `set_sort_by` writing each. That is a
+        This used to live in four places — `meta`, `WriteHandle`, `Maintenance`
+        and `Published` — kept in step by `set_sort_by` writing each. That is a
         fan-out, and a fan-out is only correct in the process that ran it: a
         maintainer already open elsewhere went on sorting by the key IT opened
         with while both tables declared the new one, and compaction, the pass
@@ -2193,11 +2204,11 @@ class Buffer:
     def set_meta_all(self, pairs: Mapping[str, str]) -> None:
         """Write several `meta` values in ONE transaction.
 
-        For facts that are only true together. Re-pointing a published table writes
-        where it is and resets the two watermarks that describe the previous
-        one, and as separate autocommit statements a crash lands between them:
-        either order leaves a log whose parts disagree, and both disagreements
-        have cost a defect. One transaction has no between.
+        For facts that are only true together. Re-pointing a published table
+        writes where it is and resets the two watermarks that describe the
+        previous one, and as separate autocommit statements a crash lands
+        between them: either order leaves a log whose parts disagree, and both
+        disagreements have cost a defect. One transaction has no between.
         """
         with self._transaction():
             _write_meta(self._con, pairs)
@@ -2211,7 +2222,8 @@ class Buffer:
     def tiers(
         self,
     ) -> tuple[str | None, dict[str, tuple[tuple[int, int], str, str | None]]]:
-        """`(generation, {tier: ((start, end), statistics, version)})`, in ONE statement.
+        """`(generation, {tier: ((start, end), statistics, version)})`, in ONE
+        statement.
 
         What a read consults per query: every stored tier row and the counter
         that says whether any changed since, so a reader decodes only after a
@@ -2253,7 +2265,8 @@ class Buffer:
             [tuple[int, int] | None, str | None], tuple[tuple[int, int], str] | None
         ],
     ) -> None:
-        """Replace a tier's row with `change(offsets, statistics)`, in one transaction.
+        """Replace a tier's row with `change(offsets, statistics)`, in one
+        transaction.
 
         The read and the write together, so two writers cannot each drop the
         other's change. None removes the row. The generation moves on every
@@ -2289,12 +2302,13 @@ class Buffer:
     def store_staging_statistics(
         self, version: str, offsets: tuple[int, int], statistics: str
     ) -> bool:
-        """Store the staging tier's rollup for `version`, unless a newer one is stored.
+        """Store the staging tier's rollup for `version`, unless a newer one is
+        stored.
 
         Written by whichever process committed `version`, after the commit — the
-        local row is a cache, stamped with the version it describes, so a reader
-        uses it only for exactly that version and a late or missing write can
-        cost a recompute but never a wrong answer.
+        staging row is a cache, stamped with the version it describes, so a
+        reader uses it only for exactly that version and a late or missing write
+        can cost a recompute but never a wrong answer.
 
         **Forward only**, compared in the same transaction as the write. Two
         commits' stores can land in either order, and an older one arriving last
@@ -2421,7 +2435,7 @@ class Buffer:
 
         Only ever rises — rows arrive above it and leave as a prefix — so a
         value read a moment early is still a lower bound on every row a later
-        read can find here. One B-tree edge seek; see `extent`.
+        read can find here. One B-tree edge seek; see `span`.
         """
         with self._lock:
             row = self._con.execute(
@@ -2568,11 +2582,11 @@ class Buffer:
         name down first.
         """
         # Inserted, never replacing what is already there. Clearing first
-        # destroyed the claims of an operation that had CRASHED — a published table
-        # rewrite accumulates one per uploaded object, and recovery only runs
-        # at `open`, so a long-lived maintainer starting its next merge wiped
-        # them and left those objects referenced by nothing. Each operation
-        # clears its own.
+        # destroyed the claims of an operation that had CRASHED — a published
+        # rewrite accumulates one per uploaded object, and recovery only runs at
+        # `open`, so a long-lived maintainer starting its next merge wiped them
+        # and left those objects referenced by nothing. Each operation clears
+        # its own.
         with self._lock:
             self._con.execute(
                 "INSERT INTO compacting (start_offset, end_offset, rel_path)"
@@ -2715,8 +2729,8 @@ class Buffer:
         - **`extent` rows naming LOCAL files** go. They name Parquet on the
           machine that died, so `file_bytes` — and through it `memory`, which
           sizes merges — would describe files nothing can open. Rows naming
-          PUBLISHED copies stay: that is the coverage I4 acts on, and it is still
-          true.
+          PUBLISHED copies stay: that is the coverage I4 acts on, and it is
+          still true.
 
           Narrower than it first looks, and worth saying so: compaction decides
           what to merge from the Iceberg table's `data_files`, not from these
@@ -2800,7 +2814,8 @@ class Buffer:
         left the buffer changes nothing. This drops the stale row first.
 
         For the restore path, where the group was seeded from a replica's view
-        of the published table and the published table has since moved on: see `litelink.restore`.
+        of the published table and the published table has since moved on: see
+        `litelink.restore`.
         """
         with self._transaction():
             self._con.execute(
@@ -2814,19 +2829,19 @@ class Buffer:
         Returns how many.
 
         The other half of `finish_seal(discard=False)`: those rows stayed
-        because the published table did not have them yet, and this is what notices
-        that it does.
+        because the published table did not have them yet, and this is what
+        notices that it does.
 
-        Bounded by the PUBLISHED table's frontier, never by the seal's. That is the
-        whole point — the seal moves rows to a file nothing replicates, and
+        Bounded by the PUBLISHED table's frontier, never by the seal's. That is
+        the whole point — the seal moves rows to a file nothing replicates, and
         only the published table makes them safe off-box.
 
-        Idempotent, and it has to be. Driven from the published table's own extent at
-        the start of a pass rather than from the tail of a push, because a push
-        has three early returns before its watermark: a crash between the
-        register and this call would otherwise leave the rows held, and the
-        next pass — finding nothing left to push — would return before reaching
-        it. On a log that has gone quiet, for ever.
+        Idempotent, and it has to be. Driven from the published table's own span
+        at the start of a pass rather than from the tail of a push, because a
+        push has three early returns before its watermark: a crash between the
+        register and this call would otherwise leave the rows held, and the next
+        pass — finding nothing left to push — would return before reaching it.
+        On a log that has gone quiet, for ever.
         """
         with self._lock, self._con:
             cursor = self._con.execute(
@@ -2868,13 +2883,13 @@ class Buffer:
 
         **Offsets are untouched, which is the property that matters (I9).**
         `litelink_offset` is an explicit `INTEGER PRIMARY KEY`, so it is column
-        data rather than an implicit rowid SQLite may renumber: values keep their
-        gaps and are never rewritten. `sqlite_sequence` survives too, including
-        across a VACUUM of a FULLY DRAINED buffer — the ordinary state after
-        `release_below` on a log the published table has caught up with, and the case
-        that would matter: were that counter lost, AUTOINCREMENT would restart
-        at 1 and reissue offsets the published table already holds. Verified both
-        directly.
+        data rather than an implicit rowid SQLite may renumber: values keep
+        their gaps and are never rewritten. `sqlite_sequence` survives too,
+        including across a VACUUM of a FULLY DRAINED buffer — the ordinary state
+        after `release_below` on a log the published table has caught up with,
+        and the case that would matter: were that counter lost, AUTOINCREMENT
+        would restart at 1 and reissue offsets the published table already
+        holds. Verified both directly.
 
         Not in `_transaction`: SQLite refuses `VACUUM` inside one. The lock is
         still held, so no append interleaves.

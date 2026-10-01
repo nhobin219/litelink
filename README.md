@@ -66,7 +66,7 @@ log = litelink.open("data", "trades")
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076})
 
-# Read on the same box, across the buffer and the staging table.
+# Read on the same box, across whichever tiers could hold a match.
 log.sql("SELECT count(*), max(price) FROM log").read_all()
 
 # Read the published table with any Iceberg engine, and litelink not installed at all —
@@ -106,8 +106,8 @@ pip install litelink        # or: uv add litelink
 ```
 
 **Nothing else is required** — no producer, no credentials, no maintainer process, no
-container. Object storage, WAL replication and cross-machine reads are all opt-in, and each
-is one call.
+container. Object storage and WAL replication are opt-in, and each is one setting; another
+machine reads the published table with no litelink at all.
 
 Wheels for Linux and macOS on x86-64 and arm64 carry a checksum-verified litestream and the
 DuckDB extensions litelink loads, so a box with no egress still reads, writes and restores.
@@ -128,7 +128,7 @@ litelink.preflight(...)                                            # what python
 # Every handle reads:
     log.scan(*, columns=None, where=None, start_offset=None, end_offset=None, published=True)
     log.sql(query, *, published=True)                 # the log is `log`; both stream Arrow
-    log.column_statistics(*, tier=None) · log.coverage(*, published=True)   # tier: local|published|buffer|None
+    log.column_statistics(*, tier=None) · log.coverage(*, published=True)   # tier: staging|published|buffer|None
     log.end_offset() · buffered_rows() · staging_rows() · staging_files() · published_through()
     log.schema · sort_by · config · published
 
@@ -137,7 +137,7 @@ litelink.preflight(...)                                            # what python
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
     log.ingest(table_or_reader)                     # Arrow straight to Parquet
     log.seal_due() · log.maintain()                 # seal; compact, evict, expire
-    log.publish(*, push_unsettled=False)               # push to the published table
+    log.publish(*, push_unsettled=False)            # push to the published table
     log.retire()                                    # end the log: all published, none local
     log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
 ```
@@ -150,8 +150,8 @@ The deliberate choices:
   live in the log, so nothing at the call site can disagree with what is on disk.
 - **The library owns no thread.** Nothing seals unless you call `seal_due()` or `maintain()`;
   your loop is the schedule.
-- **Which tiers a handle reads is fixed when it is built.** A scan never starts touching the
-  network because retention happened to run.
+- **Which tiers a query reads is decided per query**, from its predicates. A query bounded
+  inside the staging window never touches the network, however much has been evicted.
 
 Full reference in [`docs/API.md`](docs/API.md).
 
@@ -187,33 +187,33 @@ return a `pa.RecordBatchReader` rather than a table, so materialising is yours t
 reader can open the same log alongside a live writer with
 `litelink.open("data", "trades", read_only=True)`.
 
-**litelink decides which tiers a query reads.** Every query reads the buffer and the staging
-table; the published table is read only when some published file below the staging table could hold a
-matching row. That is decided from per-column bounds for each tier — the staging table's from
-its own Iceberg manifests, the published table's kept in `buffer.db` — so the decision itself never
-touches the network:
+**litelink decides which tiers a query reads.** Every query reads the buffer; the staging table
+and the published table are read only when they could hold a matching row — for the published
+table, a file below the staging table. That is decided from per-column bounds for each tier —
+the staging table's from its own Iceberg manifests, the published table's kept in `buffer.db` —
+so the decision itself never touches the network:
 
 ```python
 log.scan(where="event_ts > 1787772000000000")   # recent: local disk only
 log.scan(where="event_ts < 1700000000000000")   # history: reads the published table too
 log.scan()                                      # the whole log
-log.scan(published=False)                         # local disk only, whatever it asks
+log.scan(published=False)                       # local disk only, whatever it asks
 ```
 
 So a query's latency follows its predicates. Bound it on a leading column of `sort_by` and a
 recent window stays local; leave it unbounded and it reads every tier, because the whole log
 is the right answer. Anything the decision cannot read — an OR, a subquery, a comparison with
-something other than a constant — reads the published table rather than risk skipping a row. The
-buffer keeps no column statistics, so only an offset bound (`scan(start_offset=…,
+something other than a constant — reads the published table rather than risk skipping a
+row. The buffer keeps no column statistics, so only an offset bound (`scan(start_offset=…,
 end_offset=…)`) can skip it.
 `column_statistics(tier=…)` gives every column's bounds and counts without opening a data
 file, per tier (`"staging"`, `"published"` below it, `"buffer"`) or for the whole log.
 
-**`retire()` ends a log for good.** It pushes every row to the published table, empties the staging
-table, and records the retirement by giving the buffer an end and marking the published table.
-After that the log
-opens for reading only, and `append`, a writer `open` and `restore` all refuse, naming the
-offset the next log should start at.
+**`retire()` ends a log for good.** It pushes every row to the published table, empties the
+staging table and the buffer, and records the retirement by giving the buffer an end and
+marking the published table. After that the log opens for reading only, and `append`,
+`ingest`, a writer `open` and `restore` all refuse, naming the offset the next log should
+start at.
 
 ## Reading from another machine
 
@@ -271,16 +271,16 @@ ones at compaction, and there is no index, so that query is a scan.
 ```bash
 just demo-websocket    # a live public feed, one process, ~30 seconds
 just demo-capture      # a synthetic feed, driven as hard as you like
-just demo-maintain     # in another terminal: seal, compact, evict, expire
-just rustfs            # object storage in a container, to add the published tier
+just demo-maintain     # in another terminal: seal, compact, publish, evict
+just rustfs            # object storage in a container, to publish to S3
 just demo-replicate    # ship the SQLite WAL, to survive losing the machine
 ```
 
 Clone the repo for these; `just bootstrap` sets up the toolchain. Credentials are never
 written to the log directory — the library reads them from the environment through the
 ordinary AWS chain, so a profile, instance metadata or SSO all work untouched.
-`litelink.restore(root, name, published=...)` rebuilds a log on another box, reserving an offset
-window so nothing the dead machine served is reissued.
+`litelink.restore(root, name, published="s3://...")` rebuilds a log on another box, reserving an
+offset window so nothing the dead machine served is reissued.
 
 litelink emits the litestream config; your supervisor runs the binary. Full walkthrough in
 [`examples/`](examples/) and [`docs/RUNTIME.md`](docs/RUNTIME.md).
@@ -307,9 +307,12 @@ data/trades/                     s3://bucket/prefix/trades/
 ```
 
 Data files sit under the table's own location, so the path an engine reads
-(`s3://bucket/prefix/trades`) is the directory that holds both halves of the table.
+(`s3://bucket/prefix/trades`) is the directory that holds both halves of the table. A log with
+no S3 published table keeps the same table on local disk, at `data/trades/published/trades/`,
+with no `_wal/`. A log written before 0.6 keeps `archive.db` where a new one has `published.db`.
 
-Upgrading a log written by 0.1.0: see [Migrating from 0.1](docs/RUNTIME.md#migrating-from-01).
+Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
+[Migrating from 0.1](docs/RUNTIME.md#migrating-from-01).
 
 ## What it is not
 
@@ -327,8 +330,8 @@ Upgrading a log written by 0.1.0: see [Migrating from 0.1](docs/RUNTIME.md#migra
 
 - **Not an unbounded staging table.** A seal's cost tracks what the table's metadata holds, so
   a log that never runs `maintain()` and never evicts gets slower on the write path over time.
-  `maintain()` arrests the larger factor; a retention bounds the rest. Numbers and the
-  reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
+  `maintain()` arrests the larger factor; a retention, with `publish()` running, bounds the
+  rest. Numbers and the reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet
 

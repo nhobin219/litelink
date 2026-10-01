@@ -8,7 +8,7 @@ By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 ## Setup
 
 ```bash
-just bootstrap          # uv sync + git hooks + DuckDB extensions
+just bootstrap          # uv sync + git hooks + DuckDB extensions + litestream
 just check              # lint + format-check + typecheck + tests, exactly what CI runs
 ```
 
@@ -85,12 +85,14 @@ throughput, say so in the commit with the figures rather than leaving it to be d
 
 ## Documentation
 
-Three places, and a change usually touches one:
+Four places, and a change usually touches one:
 
 - [`docs/SPEC.md`](docs/SPEC.md) — the design and its reasoning, by section (§). Behaviour
   changes belong here, in the section that claimed the old behaviour.
 - [`docs/RUNTIME.md`](docs/RUNTIME.md) — how the pieces run: threads, processes, what crosses
   between them.
+- [`docs/API.md`](docs/API.md) — every public call. A test pins the handle surface to the
+  table it prints, so adding or removing a public method means updating it.
 - [`README.md`](README.md) — the front door. What it is, how to start, what it is not.
 
 A PR that changes what the library does and leaves the spec describing the old behaviour will
