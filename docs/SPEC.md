@@ -13,7 +13,7 @@ SQLite buffer          durable on commit. unsealed rows only.
       ▼
 staging table          a rolling WINDOW of recent data.
       │                SqlCatalog on SQLite, file:// warehouse
-      │  publish: upload data files, register into the published
+      │  publish: upload data files, register into the published table
       ▼
 published table        the full HISTORY. S3, or a local directory.
 ```
@@ -62,13 +62,15 @@ not a service, so this costs no daemon.
                          re-cuts                                 (§6)
         ingested/        written by bulk ingest, never buffered   (§13.4)
     metadata/            Iceberg metadata JSON and Avro
+    published/           the published prefix, when not on S3    (§5)
 ```
 
-and in the published prefix, mirroring it:
+and in the published prefix — `s3://…`, or `<root>/<name>/published` by default —
+mirroring it:
 
 ```
 <prefix>/<name>/
-    _wal/                LTX segments, one directory per database  (§3a)
+    _wal/                LTX segments, one directory per database  (§3a; S3 only)
         buffer.db/  catalog.db/  published.db/
     data/                the same Parquet, same relative path
     metadata/            Iceberg metadata, plus version-hint.text  (§3b)
@@ -108,7 +110,7 @@ times, because §8 derives a file's age from the snapshot that added it. Data fi
 neither moved nor rewritten: they were always at `<root>/<name>/data`.
 
 A root holding several streams moves one stream at a time, and four things stay shared until
-the last of them has: `catalog.db`, `published.db`, the root `litestream.yml` — which names
+the last of them has: `catalog.db`, `archive.db`, the root `litestream.yml` — which names
 every stream's buffer — and `<prefix>/_wal`. Each is kept while any stream still resolves
 through it, and the old sidecar keeps running, because an unmigrated stream's layout has not
 changed. Dropping the old replica is a separate pass per stream, refused while any stream in
@@ -133,10 +135,14 @@ CREATE TABLE sealing (                -- in-flight seal intent; at most one row
 );
 
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+
+-- and, each in the section that needs it:
+--   extent, extent_intent, compacting, pending_delete, claim   (§4a, §6)
+--   tier_offsets, tier_statistics                               (§7)
 ```
 
-That is the entire hand-written catalog. File paths, row counts, byte sizes, per-column
-min/max, visibility and schema all live in Iceberg.
+That is the entire hand-written catalog. Row counts, per-column min/max and visibility live
+in Iceberg; `tier_statistics` keeps rollups of them for routing reads (§7).
 
 **NOTE — `litelink_offset` must never be reused.** Iceberg's sequence numbers are per *snapshot*,
 not per row, and do not exist for buffer rows, so they cannot serve as the tier boundary.
@@ -144,7 +150,7 @@ The writer assigns `litelink_offset`; Iceberg then computes its min/max as ordin
 statistics, which is what §7 reads.
 
 A bare `INTEGER PRIMARY KEY` is a rowid alias assigned as `max(rowid)+1` — and buffer rows
-are **deleted once something off-box holds them** — at the seal, or at the publish with
+are **deleted once something off-box holds them** — at the seal, or by `publish` with
 `wal_replication` (§3a). Once the table empties, the next insert reuses offsets
 already committed to Iceberg, silently destroying monotonicity and corrupting every
 boundary read.
@@ -256,8 +262,8 @@ predicates use `event_ts`; both prune from Iceberg statistics like any other col
 **Catalogs:**
 
 ```python
-local  = SqlCatalog("local",  uri=f"sqlite:///{root}/{name}/catalog.db", warehouse=f"file://{root}")
-remote = SqlCatalog("remote", uri=f"sqlite:///{root}/{name}/published.db", warehouse=s3_prefix)
+staging   = SqlCatalog("staging",   uri=f"sqlite:///{root}/{name}/catalog.db",   warehouse=f"file://{root}")
+published = SqlCatalog("published", uri=f"sqlite:///{root}/{name}/published.db", warehouse=published_prefix)
 ```
 
 Both tables are created with an **explicit location** — `<root>/<name>` and
@@ -266,7 +272,12 @@ otherwise derive. The namespace survives as the table's name inside its catalog;
 longer part of any path. That separation is what let the layout move without rewriting a
 single catalog row's identity.
 
-The published catalog's SQLite file is itself replicated to S3, so other machines can attach.
+A log from before 0.6 keeps the catalog names it stored, `local` and `archive`, and its
+`archive.db`: the catalogs are replicated and found by name, so they are read as they are
+rather than renamed.
+
+The published catalog's SQLite file is replicated with the others (§3a), but no other machine
+attaches it: the published table names its own metadata through `version-hint.text` (§3b).
 A REST catalog is a drop-in replacement once more than one machine needs to write.
 
 ---
@@ -335,16 +346,16 @@ be the real crossing, and there is deliberately none.
 opposite — that replication is not configured in `LogConfig`, because a boolean claiming a
 sidecar was running would be a setting nothing reads. The flag exists now, and it is read:
 `_discard_on_seal` consults it on every seal to decide whether the rows stay in SQLite until
-the published table has them, and `validate` refuses it without a published table to ship to and refuses
-`wal_retention` without it. What it still does not do is assert that a sidecar is running,
-which the library cannot know. So it states an intent the deployment has to honour, and
+the published table has them, and `validate` refuses it without a remote (`s3://`) published
+table to ship to and refuses `wal_retention` without it. What it still does not do is assert
+that a sidecar is running, which the library cannot know. So it states an intent the deployment has to honour, and
 stating it falsely costs the growth without buying the durability that growth was traded
 for: seals hold their rows, nothing ships them, and only `publish` reaching the range releases
 them.
 
 **The sidecar needs a monotonic clock that does not run backwards.** litestream reports a
 measured interval through a Prometheus counter, which panics on a negative value, so one
-regression of `CLOCK_MONOTONIC` crash-loops it — while logging successful publishes right up to
+regression of `CLOCK_MONOTONIC` crash-loops it — while logging successful syncs right up to
 each panic. On a slow stream that is a durability failure, because the buffer holds the only
 copy of unsealed rows. The known trigger is a VM on the `tsc` clocksource; see `docs/API.md`
 under Replication, and `python -m litelink` warns on the combination.
@@ -437,8 +448,8 @@ the log fails outright. See §3a's failover notes and `litelink.restore`.
 
 **litelink reads on the primary.** Every handle is built from a root on the machine that holds
 the log — the writer, or a `LocalReadHandle` beside it — and reads the buffer, the staging table
-and, when asked, the published table from there. Off that host, the published table is the interface: an
-ordinary Iceberg table that publishes `version-hint.text` at every commit, so any engine
+and, when a query could match it, the published table from there (§7). Off that host, the
+published table is the interface: an ordinary Iceberg table that publishes `version-hint.text` at every commit, so any engine
 pointed at `<published>/<name>` resolves its current metadata with no catalog service and no
 litelink install (API.md, "Reading from another machine").
 
@@ -996,7 +1007,7 @@ The real reason is that the number is wrong in both directions at once. With a p
 that settled but were never pushed — an I4 violation, and the binding constraint is
 `published_through` anyway, which is never the larger of the two. Without a published table, nothing
 else clamps, so the holdback becomes the only constraint and applies where it has no reason
-to: "settled enough to published table" needs the trailing run held back because compaction may
+to: "settled enough to publish" needs the trailing run held back because compaction may
 still merge it and pushing a file about to be replaced is waste, while "safe to evict" is a
 question about age, not about what may still change. One number cannot mean both, because
 the two consumers are asking about different directions in time.
@@ -1006,24 +1017,24 @@ the two consumers are asking about different directions in time.
 Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
 
 ```
-1. Upload data files not yet in the published table.
-2. remote.add_files([...s3 paths...])          -- register; no data movement
-3. Replicate compactions (§6) into the published table.
-4. Expire snapshots on both tables.
-5. Evict files older than staging_retention from the STAGING table only.
+1. Upload the settled staging files not yet in the published table — those compaction
+   has finished with (`stable_prefix`), or every one with push_unsettled.
+2. published.add_files([...published paths...])  -- register, ONE commit; no data movement
+3. Record each file's published copy in `extent`, and the watermark in `meta`.
 ```
 
-Step 5 removes files from the staging table's current snapshot; the published table is untouched.
-**A file must never be evicted locally before step 2 has registered it** — the one ordering
-in publishing that is correctness, not optimisation (I4).
+**Compactions are never replicated.** A file is pushed only once compaction is done with it,
+and compaction refuses to merge anything the published table holds (§4a), so the two tables
+never need the same overwrite applied twice. Re-cutting what is already published is
+`rewrite_published`'s job, run on purpose.
 
-Publish records how far it has registered in `meta`, as one offset under the key `archive_through` (stored names keep their pre-#98 spelling).
+Publish records how far it has registered in `meta`, as one offset under `published_through`
+(`archive_through` on a log from before 0.6, which a writer's `open` renames).
 
-**Steps 4 and 5 do not belong to publish.** Snapshot expiry and local eviction are local
-storage work; they are listed here because eviction must respect the registration watermark
-step 2 writes. But every other step is publishing work, and a log may go a long time
-between publishes — so expiry and eviction are owned by `maintain()` (§12), which reads that same
-watermark to enforce I4 and runs whether or not a publish has.
+**Expiry and eviction are not publishing work.** They are local storage work, owned by
+`maintain()` (§12), because a log may go a long time between publishes. Eviction reads what
+step 3 records to enforce I4: **a file is never evicted locally before step 2 has registered
+it** — the one ordering in publishing that is correctness, not optimisation.
 
 ---
 
@@ -1033,8 +1044,8 @@ Runs on the happy path, and has real work to do there. Not because seals come ou
 undersized — every file a seal writes is already the size it was asked to be, since the cut
 is exact and there is no timer to cut early — but because the seal size and the file size
 are two different targets (§12). `target_compact_size` defaults to eight times
-`target_seal_size`, so eight sealed files become one, and that conversion is on **with no
-published table configured**: file count is a read cost locally too, measured at 1.0 ms to read the
+`target_seal_size`, so eight sealed files become one, and that conversion is on **whether
+or not the published table is remote**: file count is a read cost locally too, measured at 1.0 ms to read the
 offset boundary over one file against 44 ms over 64.
 
 It picks up the deliberate exceptions on the way — an explicit `seal()`, which cuts short by
@@ -1059,7 +1070,7 @@ from the seal that measured it, added up across a merge, and dropped when the fi
 unlinked. It cannot be recovered from the file afterwards: on data compressing
 8:1 a file holding a full target is an eighth of it on disk, so a rule reading sizes off disk
 merges eight already-full files into one holding eight times the memory the target allows —
-and, since `publish` refuses anything compaction may still rewrite, published tables nothing at all in the
+and, since `publish` refuses anything compaction may still rewrite, publishes nothing at all in the
 meantime. A file whose size was never recorded counts as full, so an unmeasured file is never
 rewritten on a guess.
 
@@ -1068,15 +1079,17 @@ rewritten on a guess.
    require compact_min_files.
 2. Scan them into one Arrow table; re-sort by `sort_by`.
 3. Verify row count and per-column min/max against the sources.
-4. local.overwrite(table, overwrite_filter=(offset >= start) & (offset < end))  -- one snapshot
-5. Upload the compacted file; replicate the same overwrite to the published table.
+4. staging.overwrite(table, overwrite_filter=(offset >= start) & (offset < end))  -- one snapshot
 ```
+
+Only the staging table is compacted. The output reaches the published table later, as an
+ordinary file `publish` pushes (§5).
 
 Using the offset range as the filter is what makes this safe without partitions: the
 predicate selects exactly the source files and nothing else, because no other file overlaps
 that range.
 
-Step 3 is atomic — Iceberg swaps the snapshot pointer — so readers never observe a gap or a
+Step 4 is atomic — Iceberg swaps the snapshot pointer — so readers never observe a gap or a
 double count. No grace window is needed for *correctness*.
 
 Snapshot expiry still needs one: expiring the pre-compaction snapshot deletes files a
@@ -1209,16 +1222,16 @@ what makes this load-bearing rather than a note about developer laptops.
 ```sql
 SELECT * FROM <staging table>        WHERE <predicates>
 UNION ALL
-SELECT * FROM buffer                 WHERE offset > :boundary AND <predicates>
+SELECT * FROM buffer                 WHERE offset >= :boundary AND <predicates>
 ```
 
 **The boundary is derived from the Iceberg table, not from a flag:**
-`boundary = max(offset)` over the staging table's current snapshot, read from manifest column
-statistics.
+`boundary = max(offset) + 1` over the staging table's current snapshot — its `end` — read from
+manifest column statistics.
 
 This is self-consistent at every instant, which is why the seal needs no `sealed` column:
 
-- **before** the Iceberg commit — the boundary is the previous max, so in-flight rows are
+- **before** the Iceberg commit — the boundary is the previous end, so in-flight rows are
   still served from the buffer;
 - **after** the commit, before the buffer delete — the boundary has advanced past them, so
   the buffer contribution excludes exactly the rows the table now holds.
@@ -1358,11 +1371,11 @@ fsync is 20-50 us against ~1 ms here.
 ### Full-stream read — all three tiers
 
 **Decided per query, from per-tier statistics (#90).** Every query reads the buffer. The
-local leg and the published leg are added only when their tier's statistics could hold a row the
+staging leg and the published leg are added only when their tier's statistics could hold a row the
 query matches. Neither source is on the network, so I5 holds for any query bounded inside the
 staging window:
 
-- **Local:** the rollup of the snapshot the read resolved, from the staging table's own Iceberg
+- **Staging table:** the rollup of the snapshot the read resolved, from the staging table's own Iceberg
   manifests. The process that commits a new version stores its rollup in `buffer.db` after
   the commit, stamped with the version (its metadata file) and written forward only, so every
   other process reads it rather than rolling the same version up. A read uses a stored row
@@ -1370,17 +1383,19 @@ staging window:
   itself (`LogTable.statistics_at`, cached per process by version). The stamp makes a late,
   missing or out-of-order store cost a rollup and never a wrong answer. Only the latest
   version is kept: a read misses it only in the milliseconds around a commit.
-- **Published table:** a row in `buffer.db` describing what the published table holds **below** the staging
-  table. The published leg reads only offsets under the staging table's `start`, and the published table's
-  copy of the staging window would put its maximum timestamp at "minutes ago" and send every hot
-  query to the network. Stored because its statistics otherwise live on S3, and eviction —
-  usually in another process — is the last moment they are on local disk.
+- **Published table:** a row in `buffer.db` describing what the published table holds **below**
+  the staging table. The published leg reads only offsets under the staging table's `start`,
+  and the published table's copy of the staging window would put its maximum timestamp at
+  "minutes ago" and send every hot query to the network. Stored because its statistics
+  otherwise live with the published table — on S3, when it is remote — and eviction, usually
+  in another process, is the last moment they are on local disk.
 
 **`litelink_offset` prunes every tier, the buffer included, by range.** It is the log's
 sequence, dense and monotonic across the tiers, so each tier's `[start_offset, end_offset)`
-says exactly where it sits — local from its snapshot's extent, published table from `tier_offsets`,
-kept apart from its statistics in `tier_statistics`. The buffer's starts at its lowest offset
-and is open above. It is decided before the buffer is read, from that one indexed `min`, which
+says exactly where it sits — the staging table's from its snapshot's span, the published
+table's from `tier_offsets`, kept apart from its statistics in `tier_statistics`. The buffer's
+starts at its lowest offset and is open above, until `retire()` stores it closed and empty at
+the log's end. It is decided before the buffer is read, from that one indexed `min`, which
 only rises: rows arrive above it and leave as a prefix, so a query below it now matches
 nothing the buffer can later hold. streamcast prunes whole logs the same way (streamcast#32).
 
@@ -1434,8 +1449,8 @@ which matters, since two Iceberg commits cannot be made atomic with each other.
 
 Both `start` and `end` come from manifest column statistics; neither requires opening a data
 file. If the staging table is empty (everything evicted), it drops out and the read becomes
-published table plus buffer bounded by the published table's max offset — on a handle that reads the
-published table. On one that does not, the same state is a refusal.
+published table plus buffer bounded by the published table's `end`. A read with `published=False`
+gets the buffer alone: rows only the published table holds are left out, not refused.
 
 ### Historical read
 
@@ -1444,10 +1459,11 @@ knowledge of the staging tier.
 
 ### Who reads what
 
-- The **writing machine** uses its local catalog, always.
-- **Other machines and engines** attach to the published catalog. Whether a file happens to sit
-  on some machine's disk is not modelled and not published; the published table describes what is in
-  S3.
+- The **writing machine** reads through litelink, which resolves both tables from their local
+  catalogs and decides per query which tiers to read (§3b).
+- **Other machines and engines** read the published table directly, through its
+  `version-hint.text`, with no catalog. Whether a file happens to sit on some machine's disk is
+  not modelled and not published; the published table describes what is in its prefix.
 
 ---
 
@@ -1512,7 +1528,7 @@ Offsets stay dense across the two logs, and any engine reads `<prefix>/trades` a
 the old name against the same published table is refused by the foreign-table guard, as it should be: two
 logs would put the same offsets in one table.
 
-**What this replaced.** Through 0.5, `add_column` widened a log in place: the published table first,
+**What this replaced.** Through 0.5, `add_column` widened a log in place: the archive (as the published table was then called) first,
 then the staging table, then the buffer's DDL, with an intent recorded in SQLite before it began
 and replayed on recovery, because the Iceberg commits and the SQLite writes cannot be made
 atomic. `rename_column` and `drop_column` were specified and never built. All three are gone.
@@ -1528,8 +1544,8 @@ Iceberg gives an atomic commit **to one table**, and that is worth relying on �
 compaction rests on it, swapping the snapshot pointer so readers never observe a gap or a
 double count. What it gives across systems is nothing, and every operation here spans
 systems: a seal touches the buffer, a file and the table; a compaction touches a file, the
-table and the deletion queue; a schema change touches the table and the declared Arrow
-schema. There is no commit that covers a pair of those.
+table and the deletion queue; a retirement touches the buffer, both tables and the
+replica. There is no commit that covers a pair of those.
 
 So the local database is the coordinator, and the protocol is the same one four times over:
 
@@ -1540,12 +1556,12 @@ So the local database is the coordinator, and the protocol is the same one four 
 ```
 
 `sealing` is step 1 for a seal, `compacting` for a compaction, `pending_delete` for a
-deletion, and a schema change needs its own. **An operation is complete when step 3 lands,
-not when the Iceberg commit does.**
+deletion, and the buffer's `tier_offsets` row — its end — for a retirement. **An operation
+is complete when step 3 lands, not when the Iceberg commit does.**
 
 This is not two-phase commit, and it is better suited than 2PC would be: there is no vote and
 no participant that can veto, because **the true state is always derivable**. Recovery asks
-the table which half already happened — does it contain this path, does it hold this column —
+the table which half already happened — does it contain this path, does it hold this range —
 and drives forward or gives up accordingly. Every step is idempotent, so replaying costs a
 rewrite at worst.
 
@@ -1584,7 +1600,7 @@ Each needs a test.
 | Network unavailable indefinitely | Capture, seal, compaction and hot reads all continue. Unregistered files accumulate; local eviction stalls (I4). Fails only when local disk fills. |
 | Two publish passes race | The Iceberg catalog commit is atomic; the loser refreshes and retries. |
 | Local disk fills | Backpressure — §13.3. |
-| Machine lost | Exposure is whatever was unregistered. The published table is intact and independently readable. |
+| Machine lost | Exposure is whatever was unregistered. An S3 published table is intact and independently readable; a local one is lost with the machine. |
 | Compaction crashes mid-write | No snapshot was committed; the orphaned file is unreferenced and swept. |
 | A second process opens a live log | **Currently unsafe.** Opening runs recovery, and recovery does not know which operations belong to the opener — see below. |
 
@@ -1627,12 +1643,12 @@ target_seal_size       Arrow bytes per SEAL               (size it for READ late
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
                                                           whatever compression achieved)
-staging_retention      staging window, by TIME            (> longest hot lookback, with margin; 0 = evict on upload)
+staging_retention      staging window, by TIME            (> longest hot lookback, with margin; 0 = evict on publish)
 staging_rows           staging window, by ROWS            (floor: keep at least this many recent rows)
 snapshot_retention     snapshot expiry floor              (> longest scan)
 compact_min_files      minimum adjacent files to compact  (default 4; below 2 is refused —
                                                           every run would look mergeable)
-wal_replication        ship the WAL with a sidecar        (needs a published table; also decides
+wal_replication        ship the WAL with a sidecar        (needs an s3:// published table; also decides
                                                           whether a seal keeps its rows)
 wal_retention          how far back a restore may go      (None = litestream's own default)
 ```
@@ -1642,8 +1658,9 @@ no rewrite; the sort order is a read-shape decision that re-clusters every file 
 table owns, so it is set at `litelink.new` and changed by `set_sort_by`. It lives in `meta` beside the
 schema, not in `LogConfig`.
 
-`maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no
-published table. Each is a no-op or a regression without the others: compaction alone increases
+`maintain()` runs compaction, eviction **and** expiry together, in that order, and does not
+publish: eviction takes only what `publish` has already put in the published table. Each is
+a no-op or a regression without the others: compaction alone increases
 storage, since superseded files stay referenced until their snapshots expire; eviction alone
 frees no disk, since it removes a file from the current snapshot while the previous one still
 references it; and expiry is what actually deletes bytes, held back by `snapshot_retention`
@@ -1712,7 +1729,7 @@ The consequence worth planning for is that local disk holds roughly
    mechanism is actually sound in is a re-point with every other process stopped.
 
 0. ~~**Per-operation claims, replacing the maintenance lease.**~~ **Closed: built.**
-   The `claim(id, owner, expires_at, kind, lo, hi, rel_path)` table exists, every
+   The `claim(id, owner, expires_at, kind, start_offset, end_offset, rel_path)` table exists, every
    range-owning pass claims before it works with the conflict check and the insert in one
    `BEGIN IMMEDIATE`, and recovery reclaims expired claims rather than a role's. See §4a
    and `_claim.py`.
@@ -1746,7 +1763,7 @@ The consequence worth planning for is that local disk holds roughly
    "local disk fills." Bound the buffer on **bytes**, not row count — a row-count bound can
    exceed a byte-based memory limit, letting the OOM killer win the race against the policy
    meant to prevent it.
-4. **Bulk ingest.** Loading an existing corpus — a backfill, a published table import — through
+4. **Bulk ingest.** Loading an existing corpus — a backfill, an import from another store — through
    `append()` row by row wastes the point of already having Parquet. The wanted path is to
    lock writes, reserve a contiguous offset range, materialise `litelink_offset` into the file, and
    commit. Four things it meets, none blocking, none free.
@@ -1774,7 +1791,7 @@ The consequence worth planning for is that local disk holds roughly
    `target_seal_size` already bounds it.
 
    **A reservation is a hole in the offset space.** A seal spanning it writes a file whose
-   `litelink_offset` statistics cover `[lo, hi]` while containing none of it; when the staged file
+   `litelink_offset` statistics cover `[start, end)` while containing none of it; when the staged file
    commits, the two overlap, which is exactly what §6's *"no other file overlaps that
    range"* forbids. The weaker property is also the correct one: §6 needs files
    non-overlapping and adjacent in offset order, not free of integer gaps, and gaps already
@@ -1798,11 +1815,11 @@ The consequence worth planning for is that local disk holds roughly
    which works because every spilled blob has a buffer row carrying `{name}_spilled`. A bulk
    file has no buffer row and sits *above* the boundary until it commits, so an abandoned
    ingest reads as still-referenced forever. It needs a table parallel to `sealing`, holding
-   `(lo, hi, rel_path)` — not a row in `buffer`, which §7's hot read would union into reader
+   `(start_offset, end_offset, rel_path)` — not a row in `buffer`, which §7's hot read would union into reader
    output, and not `sealing` itself, which holds one row and would block seals for the
    length of a rewrite.
 
-   That table already exists: `compacting` holds exactly `(lo, hi, rel_path)`, takes several
+   That table already exists: `compacting` holds exactly `(start_offset, end_offset, rel_path)`, takes several
    rows because a published rewrite claims one object at a time, and its recovery already
    does the right thing for an abandoned ingest — queue every claimed path, and let `drain`
    refuse the ones the table turned out to reference. A second table of the same shape would
@@ -2004,7 +2021,7 @@ The consequence worth planning for is that local disk holds roughly
    event loop would rather own. A capture feed arriving over a websocket is asyncio by
    construction, so the wrapper is worth having.
 
-   Deliberately deferred rather than forgotten. It is a surface decision — publish core with
+   Deliberately deferred rather than forgotten. It is a surface decision — sync core with
    an async facade, or async all the way down — and it should be made when the API has
    users to be broken, not stacked onto the change that made the core coherent.
 
@@ -2283,7 +2300,7 @@ The consequence worth planning for is that local disk holds roughly
    moves it to the tier that can wait.
 
    One coupling survives the move, and it closes a loop worth watching. Eviction may not
-   precede registration (I4), so if published commits slow enough that publish falls behind,
+   precede registration (I4), so if commits to the published table slow enough that publish falls behind,
    eviction stalls, the local file count grows, and local seals degrade — the write path
    feeling a cost that was supposed to have been moved off it. The remote table wants the same
    manifest-merge properties as the local one for that reason, and §5's throughput is worth a
@@ -2306,8 +2323,9 @@ The consequence worth planning for is that local disk holds roughly
    is refused by pyiceberg on v2, and `timestamp[us]` truncates nanoseconds and fails every
    seal past year 9999, because pyiceberg's manifest statistics go through Python's `datetime`.
 
-   **Default column values**, which would make §9's add-a-column less lossy: an older file
-   could read a declared default rather than null.
+   **Default column values**, which would have made 0.5's `add_column` less lossy — an older
+   file could read a declared default rather than null. Logs are immutable now (§9), so this
+   no longer applies.
 
    **Row lineage does not replace `litelink_offset`**, though it is the obvious candidate. v3
    gives each row a table-level `_row_id`, which answers §2's objection that Iceberg's sequence
@@ -2333,8 +2351,8 @@ Beyond §10:
   row exactly once (I3).
 - With the published table deliberately overlapping the staging window, assert a full three-tier read
   returns every row exactly once (I3).
-- Evict the staging table to empty; assert a full read still returns everything, from published table
-  plus buffer alone.
+- Evict the staging table to empty; assert a full read still returns everything, from the published
+  table plus the buffer alone.
 - Seal until the buffer is empty, insert again, and assert the new offsets exceed every
   offset already committed to Iceberg (I9). This fails with a bare `INTEGER PRIMARY KEY`.
 - Assert an unregistered file is never evicted locally, even past `staging_retention` (I4).
@@ -2402,7 +2420,7 @@ bytes never enter SQLite (§15.3) and meet the table only at seal.
 
 Blob fields are unbuilt, so a payload that size does not belong in a log yet. Where the line
 falls between the two is §15.12's open small-blob threshold — around 1 MB, below which the
-staging path costs more than it saves.
+spill path costs more than it saves.
 
 ---
 
@@ -2411,7 +2429,7 @@ staging path costs more than it saves.
 **Bytes live beside SQLite while hot, and inside Iceberg once sealed.** The column is the
 same shape in both tiers: a plain Iceberg `binary` column holding the bytes themselves.
 
-There is no pointer in the schema. The hot-side staging path is derived from `litelink_offset` and
+There is no pointer in the schema. The hot-side spill path is derived from `litelink_offset` and
 the field name, so it exists only on the write side and never reaches the table. The published table
 is therefore ordinary Iceberg with a binary column, readable by any engine with no
 convention to know about and no dereference step.
@@ -2491,7 +2509,7 @@ stay in an ordinary `binary` column and go through the normal buffer path.
 
 ### Getting `litelink_offset` before the bytes are written
 
-The staging path derives from `litelink_offset`, so the offset must exist before step 2 — but §2 pins
+The spill path derives from `litelink_offset`, so the offset must exist before step 2 — but §2 pins
 `INTEGER PRIMARY KEY AUTOINCREMENT`, which assigns at INSERT.
 
 Both hold at once by keeping the transaction open: `INSERT` inside `BEGIN` yields
@@ -2524,7 +2542,7 @@ It is deliberately **not** `{name}_size`, and not any column in the published sc
 A blob file whose row has `{name}_spilled = 0`, or no row at all, is an orphan by
 definition, and the §15.4 sweep removes it.
 
-Staging is local, buffer-scoped, and never uploaded.
+Spilled blobs are local, buffer-scoped, and never uploaded.
 
 ---
 
@@ -2590,7 +2608,7 @@ costs nothing and keeps the option.
 
 ## 15.6 Read behaviour
 
-Unchanged in shape. The hot read joins staging by derivation, the sealed read reads the
+Unchanged in shape. The hot read joins the spilled blobs by derivation, the sealed read reads the
 column directly, and both return the same schema, so callers see one thing.
 
 Degradation is confined to queries that project the blob column:
@@ -2610,7 +2628,7 @@ push a tight row filter rather than materializing a scan.
 ### The reads, in full
 
 Both §7 reads with a blob field resolved. Expressible entirely in DuckDB, using `sqlite` to
-attach the buffer, `iceberg` to scan the tables, and `read_blob` for staging.
+attach the buffer, `iceberg` to scan the tables, and `read_blob` for the spilled blobs.
 
 `start` and `end` are §7's names: the staging table's span over `litelink_offset` in its
 current snapshot, `[start, end)`, read from manifest column statistics. The hot read needs only
@@ -2626,16 +2644,17 @@ reader wrote against the published table would have to quote it, forever, with t
 syntax error rather than anything that says why. Verified in both directions —
 `max(litelink_offset)` parses unquoted, `max(offset)` does not.
 
-The prefix also namespaces it. §9 lets an application add columns freely, and a collision
-with the one column the library owns would be a schema change that cannot be made.
+The prefix also namespaces it. An application names its own columns freely, and a schema
+naming the one column the library owns is refused at creation (I11) — a log's columns are
+fixed there for life (§9).
 
-Staging resolution is identical in both reads, so it is factored out once:
+Spill resolution is identical in both reads, so it is factored out once:
 
 ```sql
 INSTALL sqlite; INSTALL iceberg;
 ATTACH 'buffer.db' AS buf (TYPE sqlite, READ_ONLY);
 
-CREATE OR REPLACE TEMP VIEW staging AS
+CREATE OR REPLACE TEMP VIEW spilled AS
   SELECT
     regexp_extract(filename, '(\d+)\.payload\.bin$', 1)::BIGINT AS "offset",
     content AS payload
@@ -2646,19 +2665,19 @@ CREATE OR REPLACE TEMP VIEW staging AS
 
 ```sql
 SELECT "offset", event_ts, key, payload
-FROM iceberg_scan('<local metadata json>')
+FROM iceberg_scan('<staging metadata json>')
 WHERE <predicates>
 
 UNION ALL
 
 SELECT b."offset", b.event_ts, b.key, s.payload
 FROM buf.buffer b
-LEFT JOIN staging s USING ("offset")
+LEFT JOIN spilled s USING ("offset")
 WHERE b."offset" >= $end AND <predicates>;
 ```
 
-**Full-stream read** (published table plus local plus buffer). The published table holds no staging tier, so
-its blob column is read directly:
+**Full-stream read** (published table plus staging table plus buffer). The published table holds no
+spilled blobs, so its blob column is read directly:
 
 ```sql
 SELECT "offset", event_ts, key, payload
@@ -2668,26 +2687,26 @@ WHERE "offset" < $start AND <predicates>
 UNION ALL
 
 SELECT "offset", event_ts, key, payload
-FROM iceberg_scan('<local metadata json>')
+FROM iceberg_scan('<staging metadata json>')
 WHERE <predicates>
 
 UNION ALL
 
 SELECT b."offset", b.event_ts, b.key, s.payload
 FROM buf.buffer b
-LEFT JOIN staging s USING ("offset")
+LEFT JOIN spilled s USING ("offset")
 WHERE b."offset" >= $end AND <predicates>;
 ```
 
 The blob field changes nothing about the tier boundaries. Both queries bound each tier by its
-neighbour's committed extent exactly as §7 specifies, and the staging join sits entirely
+neighbour's committed extent exactly as §7 specifies, and the spill join sits entirely
 inside the buffer branch.
 
 **Explicit column lists, not `SELECT *`.** The buffer branch sources `payload` from a
 different relation than the other branches, so the union cannot be built positionally. This
 is the only structural difference from §7's pseudocode.
 
-**The staging join is a glob and a parse, not a per-row lookup.** `read_blob` returns
+**The spill join is a glob and a parse, not a per-row lookup.** `read_blob` returns
 `filename`, `content`, `size` and `last_modified`, so the directory is globbed once and
 joined on the offset parsed out of the name. Table functions cannot take correlated
 arguments, so a per-row path could not be passed in even if the pointer were stored; deriving
@@ -2723,7 +2742,7 @@ Cast the buffer side explicitly rather than relying on the `UNION ALL` to reconc
 SQLite's per-value typing comes through the `sqlite` extension loosely, and a column that
 holds integers in every row but was declared without affinity can still surprise the union.
 
-With multiple blob fields, each gets its own staging view and its own `LEFT JOIN`, keyed on
+With multiple blob fields, each gets its own spill view and its own `LEFT JOIN`, keyed on
 the field name in the glob pattern.
 
 ---
@@ -2734,7 +2753,7 @@ the field name in the glob pattern.
 snapshot expiry, compaction and orphan cleanup handle them with no additional machinery. This
 is the whole payoff of inlining and it should not be given up casually.
 
-**Staging is the only library-managed storage**, and it is local, offset-named, and swept
+**The spill directory is the only library-managed storage**, and it is local, offset-named, and swept
 against the same boundary the read path already computes. Nothing accumulates in object
 storage that Iceberg does not know about.
 
@@ -2752,9 +2771,9 @@ justifies.
 |---|---|
 | §2 Layout | Buffer holds no blob bytes. Adds an internal `{name}_spilled` bit per blob field, in the buffer table only — never in the Iceberg schema. |
 | §3 Write path | Adds the blob write and the fsync ordering (§15.3). |
-| §4 Seal | Adds materialization (step 2), the staging sweep (step 5), and sort-by-key-then-permute. |
+| §4 Seal | Adds materialization (step 2), the spill sweep (step 5), and sort-by-key-then-permute. |
 | §6 Compaction | Unchanged in logic; needs a separate size bound for blob streams. |
-| §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `litelink_offset` must be quoted. |
+| §7 Read path | Unchanged in shape. Hot reads resolve spilled blobs by derivation; `litelink_offset` must be quoted. |
 | §8 Retention | Unchanged. Blobs inherit it. |
 | §12 Configuration | Adds `blob_row_group_blobs`, `blob_compact_size`; `target_seal_size` raised. |
 
@@ -2786,7 +2805,7 @@ Extends §11.
 | Crash between buffer commit and seal | Blob file survives; the row is durable and readable. This is the case I12 protects. |
 | Blob file missing for a row with `{name}_spilled = 1` | Unrecoverable data loss for that row. Detectable at seal; fail loudly rather than writing a null. |
 | Crash mid-seal after Parquet commit | Blob files below the boundary are now redundant; recovery sweeps them. |
-| Local disk fills | Blobs dominate the bound, so §13's byte-based backpressure must count staging, not only buffer rows. |
+| Local disk fills | Blobs dominate the bound, so §13's byte-based backpressure must count spilled blobs, not only buffer rows. |
 
 ---
 
@@ -2800,7 +2819,7 @@ Extends §11.
 - Delete a blob file behind a row with `{name}_spilled = 1`; assert seal fails loudly
   rather than writing a null or a short value.
 - Declare a blob field with `size=False`; assert the published schema contains no
-  `{name}_size`, that the staging bit appears nowhere in the Iceberg table, and that seal
+  `{name}_size`, that the spilled bit appears nowhere in the Iceberg table, and that seal
   still resolves blobs correctly.
 - Assert a projection excluding the blob column reads no blob bytes. Measure, do not assume.
 - Assert a single-blob fetch reads at most one row group's worth.
@@ -2824,7 +2843,7 @@ is already `binary`, so no schema change is implied and no data has to move; onl
 written files change format. Nothing in this section should be designed around it arriving.
 
 **Small-blob threshold.** Everything here assumes payloads large enough to amortize a
-per-blob fsync. Below roughly 1 MB the staging round trip is pure overhead and an ordinary
+per-blob fsync. Below roughly 1 MB the spill round trip is pure overhead and an ordinary
 `binary` column through the normal buffer path is better. Whether the library should route
 this automatically by size, or require the application to choose, is unresolved. Automatic
 routing is friendlier and introduces a size-dependent write path, which is a durability

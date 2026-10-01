@@ -1,12 +1,13 @@
 """Building logs and readers.
 
-`log.py` owns what the handles *do*; this module owns how they come to exist.
+`_handle.py` owns what the handles *do*; this module owns how they come to
+exist.
 
 Every factory here builds its object's collaborators and hands them over
 complete. `open` builds a writer or, with `read_only=True`, a reader on the same
 host; `new` and `restore` build writers. Every handle reads on the primary —
-reading a log from another machine is any Iceberg engine over its published table, not
-something litelink assembles (#90).
+reading a log from another machine is any Iceberg engine over its published
+table, not something litelink assembles (#90).
 """
 
 from __future__ import annotations
@@ -20,12 +21,7 @@ from litelink._buffer import (
     CONFIG_KEY,
     Buffer,
 )
-from litelink._layout import Layout
-from litelink._maintenance import Maintenance
-from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import Reader, duckdb_connection
-from litelink._table import LogTable
-from litelink.log import (
+from litelink._handle import (
     LocalReadHandle,
     LogConfig,
     LogHandle,
@@ -34,6 +30,11 @@ from litelink.log import (
     application_schema,
     legacy_layout,
 )
+from litelink._layout import Layout
+from litelink._maintenance import Maintenance
+from litelink._published import PUBLISHED_KEY, Published
+from litelink._read import Reader, duckdb_connection
+from litelink._table import LogTable
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -83,9 +84,9 @@ def open(  # noqa: A001
     misuse was invisible until it ran. Here read-only returns a class that has
     no write methods at all.
 
-    Takes none of the log's shape: columns, config, published table and sort order all
-    come from the log itself, so nothing at the call site can disagree with
-    what is on disk.
+    Takes none of the log's shape: columns, config, published table and sort
+    order all come from the log itself, so nothing at the call site can
+    disagree with what is on disk.
 
     **Read-only recovers nothing**, which is the point of it. Finishing an
     interrupted seal is the writer's to do, and a second process doing it is a
@@ -95,7 +96,8 @@ def open(  # noqa: A001
     table read-only, so this cannot advance the log even by accident.
 
     Reading sees the writer's commits as they land: `catalog.db` and
-    `published.db` live in the log's directory and both processes read the same rows.
+    `published.db` live in the log's directory and both processes read the
+    same rows.
     """
     layout = Layout(Path(root), name)
     table, schema = _existing(layout, name, readonly=read_only)

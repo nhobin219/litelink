@@ -11,11 +11,11 @@ import pyarrow.parquet as pq
 import pytest
 
 import litelink
-import litelink.log
+import litelink._handle
+from litelink import OFFSET, LogConfig, WriteHandle
 from litelink._claim import EVERYTHING, new_owner
 from litelink._layout import Layout
 from litelink._s3 import S3Options
-from litelink.log import OFFSET, LogConfig, WriteHandle
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -413,7 +413,7 @@ def test_a_load_that_dies_mid_write_leaves_nothing_unnameable(
     this database can still name — the one category §12 refuses to have."""
     config = LogConfig(target_seal_size=4096, target_compact_size=8192)
     written: list[object] = []
-    real = litelink.log.write_parquet
+    real = litelink._handle.write_parquet
 
     def failing(rows: Any, path: Any, compression: Any) -> None:
         written.append(path)
@@ -426,7 +426,7 @@ def test_a_load_that_dies_mid_write_leaves_nothing_unnameable(
             raise OSError(msg)
 
     with open_log(tmp_path, config) as log:
-        monkeypatch.setattr(litelink.log, "write_parquet", failing)
+        monkeypatch.setattr(litelink._handle, "write_parquet", failing)
 
         with pytest.raises(OSError, match="the disk went away"):
             log.ingest(table(4000))
@@ -494,7 +494,7 @@ def test_files_are_registered_several_per_commit(
     """A commit costs far more than the write it publishes — 4.1 s against
     648 ms against S3 — so writes and commits decouple."""
     config = LogConfig(target_seal_size=4096, target_compact_size=8192)
-    monkeypatch.setattr(litelink.log, "_INGEST_BATCH", 3)
+    monkeypatch.setattr(litelink._handle, "_INGEST_BATCH", 3)
     commits: list[int] = []
 
     with open_log(tmp_path, config) as log:

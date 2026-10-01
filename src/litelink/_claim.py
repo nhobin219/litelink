@@ -16,7 +16,7 @@ publish pushing another have nothing to say to each other.
 **The check and the insert are one transaction.** Reading the live claims,
 deciding, and then inserting leaves exactly the window the decision was meant to
 close: eviction sees no claim and decides to drop everything below 500, a
-compaction claims [400, 600] and starts merging, eviction commits its removal,
+compaction claims [400, 600) and starts merging, eviction commits its removal,
 and the merge commits rows 400-500 back. Both sides declaring in a transaction
 that saw the other's absence is what makes the ordering total, which is why
 eviction claims a range rather than merely consulting the claims of others.
@@ -67,8 +67,8 @@ def new_owner() -> str:
     which would let a stranger re-enter a lease as though it were its own.
 
     Being unique per attempt is also what lets one mechanism cover both cases.
-    Callers mint an owner per acquisition rather than per Log, so two threads
-    sharing a Log are two owners, and the row that refuses a second holder in
+    Callers mint an owner per acquisition rather than per handle, so two threads
+    sharing a handle are two owners, and the row that refuses a second holder in
     another process refuses one in another thread on the same terms.
 
     The pid and thread are for whoever reads the table wanting to know who is

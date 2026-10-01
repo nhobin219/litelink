@@ -20,8 +20,8 @@ import pyarrow as pa
 import pytest
 
 import litelink
+from litelink import OFFSET
 from litelink._buffer import Buffer
-from litelink.log import OFFSET
 from tests.test_seal_group import open_log, quiet, rows
 
 if TYPE_CHECKING:

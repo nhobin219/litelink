@@ -1,15 +1,18 @@
-"""Statistics manifests: one row of per-column bounds per unit, and pruning on them.
+"""Statistics manifests: one entry of per-column bounds per unit, and pruning on them.
 
-A manifest is a Parquet table with one row per unit a reader might skip — a
-tier of one log in litelink (`staging`, `published`), a sealed log of a stream in
-streamcast — and one struct column per prunable column:
+A manifest is a Parquet table with one row — one `Entry` — per unit a reader
+might skip: a
+tier of one log in litelink (`staging`, `published`), a sealed log of a stream
+in streamcast — and one struct column per prunable column:
 
     tier       start_offset  end_offset  record_count  price                     side
     staging    3001          4001        1000          {min, max, null_count, …} {min, max, …}
     published  1             3001        3000          {min, max, null_count, …} {min, max, …}
 
 Named for Iceberg's own: an Iceberg manifest is per-file statistics for
-skipping files, and this is the same thing one level up. **Wide**, one struct
+skipping files, and this is the same thing one level up — so its units are
+entries too. Where both appear, "manifest entry" means litelink's and an
+Iceberg manifest entry is called that. **Wide**, one struct
 per column, because a long `(unit, column, min, max)` layout cannot hold typed
 bounds for columns of different types.
 
@@ -68,14 +71,15 @@ terms — dropping a conjunct can only include more, never fewer.
 """
 
 
-class Row(NamedTuple):
-    """One unit's row: its name, offsets, declared columns and statistics.
+class Entry(NamedTuple):
+    """One unit of a manifest: its name, offsets, declared columns and
+    statistics. `build` makes each one a row of the manifest table.
 
-    `end_offset` is exclusive, as it is on every extent in litelink, and None
-    for a unit still growing — the buffer, a stream's live log — which is then
-    never skipped for a term above it. `schema`
-    is what decides each struct column's type, so a column with no statistics
-    in this unit still gets a typed NULL rather than none at all.
+    `end_offset` is exclusive, as it is on every offset range in litelink, and
+    None for a unit still growing — the buffer, a stream's live log — which is
+    then never skipped for a term above it. `schema` is what decides each
+    struct column's type, so a column with no statistics in this unit still
+    gets a typed NULL rather than none at all.
     """
 
     name: str
@@ -115,13 +119,13 @@ def _struct(kind: pa.DataType) -> pa.DataType:
     return pa.struct(fields)
 
 
-def build(rows: Sequence[Row], *, key: str = "tier") -> pa.Table:
-    """The manifest for `rows`: one row per unit, one struct per column.
+def build(entries: Sequence[Entry], *, key: str = "tier") -> pa.Table:
+    """The manifest for `entries`: one row per entry, one struct per column.
 
     A column the unit does not have, or has no statistics for, is a NULL
     struct — which is "no statistics", and never prunes.
     """
-    kinds = columns(row.schema for row in rows)
+    kinds = columns(entry.schema for entry in entries)
     schema = pa.schema(
         [
             pa.field(key, pa.string(), nullable=False),
@@ -133,12 +137,12 @@ def build(rows: Sequence[Row], *, key: str = "tier") -> pa.Table:
     )
 
     table = []
-    for row in rows:
-        statistics = row.statistics
+    for entry in entries:
+        statistics = entry.statistics
         record: dict[str, object] = {
-            key: row.name,
-            "start_offset": row.start_offset,
-            "end_offset": row.end_offset,
+            key: entry.name,
+            "start_offset": entry.start_offset,
+            "end_offset": entry.end_offset,
             "record_count": statistics.record_count,
         }
         for name, kind in kinds.items():
@@ -163,21 +167,21 @@ def build(rows: Sequence[Row], *, key: str = "tier") -> pa.Table:
     return pa.Table.from_pylist(table, schema=schema)
 
 
-def extend(previous: pa.Table | None, row: Row, *, key: str = "tier") -> pa.Table:
-    """`previous` with `row`, replacing any row it already had for that unit.
+def extend(previous: pa.Table | None, entry: Entry, *, key: str = "tier") -> pa.Table:
+    """`previous` with `entry`, replacing any row it already had for that unit.
 
     Replacing rather than appending, because a write that is retried after a
     crash would otherwise leave two rows for one unit saying two things.
 
-    The new row's columns are unioned with the old ones; a column one side
+    The new entry's columns are unioned with the old ones; a column one side
     lacks is NULL there — no statistics, which never prunes.
     """
-    added = build([row], key=key)
+    added = build([entry], key=key)
     if previous is None:
         return added
 
     return pa.concat_tables(
-        [without(previous, row.name, key=key), added], promote_options="default"
+        [without(previous, entry.name, key=key), added], promote_options="default"
     )
 
 
@@ -342,7 +346,7 @@ __all__ = [
     "OFFSET",
     "OPERATORS",
     "PRUNABLE",
-    "Row",
+    "Entry",
     "Term",
     "build",
     "columns",

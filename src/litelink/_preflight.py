@@ -13,11 +13,11 @@ itself, and each one goes missing quietly in its own way:
   explicit `LOAD` does not fetch it, so a published read fails on a machine
   where every other check passed. Extensions are built per DuckDB version AND
   platform, so one provisioned for a different duckdb will not load either.
-- A published table can be configured against credentials that do not work. `new`
-  deliberately allows that — credentials commonly attach to a box after the log
-  is configured, and an attempt to refuse it here broke sixteen tests doing
-  exactly that legitimately — so nothing on the write path finds out until the
-  first `publish`.
+- A remote published table can be configured against credentials that do not
+  work. `new` deliberately allows that — credentials commonly attach to a box
+  after the log is configured, and an attempt to refuse it here broke sixteen
+  tests doing exactly that legitimately — so nothing on the write path finds
+  out until the first `publish`.
 
 None of those is checkable by looking at the code, and all of them are
 checkable in about a second. Run this from the process and the user that will
@@ -192,9 +192,9 @@ def _extension(name: str, *, required: bool) -> Check:
 def _published(prefix: str, name: str, s3: S3Options | None) -> Check:
     """Can this machine READ that published table with the credentials it has?
 
-    Through `published_span`, which is the same call `new` and `restore` make,
+    Through `published_span`, which is the same call `new` and `set_published` make,
     so this checks what they will actually do rather than something adjacent.
-    It reads the published hint from the bucket alone — no `published.db`, no
+    It reads the version hint from the bucket alone — no `published.db`, no
     catalog — and it separates the two answers an operator needs told apart:
     `None` for "nothing published there", and a raise for "answered with a
     refusal".
@@ -243,7 +243,7 @@ def _clocksource() -> Check:
     `Restart=always` that is a crash loop. Reported upstream as
     benbjohnson/litestream#1488.
 
-    The symptom lies. The sidecar logs successful publishes and uploads right up
+    The symptom lies. The sidecar logs successful syncs and uploads right up
     to each panic, so a minute of watching the log shows healthy replication;
     the damage is only visible in the restart count. And this is a durability
     failure rather than an inconvenience, because on a stream that never
@@ -304,7 +304,7 @@ def _clocksource() -> Check:
         detail=(
             f"clocksource tsc on a {virtual} guest. If CLOCK_MONOTONIC regresses "
             f"here, litestream panics and crash-loops — and it logs successful "
-            f"publishes up to each panic, so check restarts, not log lines."
+            f"syncs up to each panic, so check restarts, not log lines."
             f"{remedy}"
         ),
     )
@@ -343,7 +343,7 @@ def preflight(
         python -m litelink s3://bucket/prefix trades   # and the published table
 
     `replication` skips the litestream check for a deployment that genuinely
-    never restores or follows. Everything else is always checked, because a
+    never restores. Everything else is always checked, because a
     log that only writes locally still reads through DuckDB.
     """
     checks: list[Check] = [_read_path()]

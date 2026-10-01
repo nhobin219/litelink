@@ -13,9 +13,9 @@ import pyarrow.parquet as pq
 import pytest
 
 import litelink
+from litelink import OFFSET, LogConfig, WriteHandle
 from litelink._buffer import Buffer
 from litelink._layout import Layout
-from litelink.log import OFFSET, LogConfig, WriteHandle
 
 SCHEMA = pa.schema(
     [

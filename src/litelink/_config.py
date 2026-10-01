@@ -1,7 +1,7 @@
 """The operational policy, and nothing else (SPEC §12).
 
-Its own module because `Buffer` needs it and `log` imports `Buffer`. Kept in
-`log`, that is a cycle — which the buffer worked around with a deferred import
+Its own module because `Buffer` needs it and `_handle` imports `Buffer`. Kept
+in `_handle`, that is a cycle — which the buffer worked around with a deferred import
 inside the one method that reads it, twice. A deferred import is a cycle you
 have decided to live with; this is the cycle not existing.
 
@@ -102,9 +102,10 @@ class LogConfig:
     # much may sit in the buffer, and the two pull in opposite directions.
     #
     # §7 wants the seal SMALL: the buffer is what a hot read scans, so its size
-    # is read latency. The published table wants files LARGE: measured against S3, a
-    # 9 kB file takes 648 ms to upload and almost all of that is the round
-    # trip, so halving file size doubles the cost of publishing the same stream.
+    # is read latency. The published table wants files LARGE: measured against
+    # S3, a 9 kB file takes 648 ms to upload and almost all of that is the
+    # round trip, so halving file size doubles the cost of publishing the same
+    # stream.
     # One knob cannot serve both — it did, and compaction could therefore never
     # produce a file bigger than a seal, which is why it was a no-op.
     #
@@ -121,9 +122,10 @@ class LogConfig:
     # compacted file, once.
     #
     # None means `COMPACT_MULTIPLE` times the seal size, and the conversion is
-    # therefore ON by default. A log gets the benefit at read time too: file count is a measured cost here, not a
-    # reputation — reading the offset boundary from manifest statistics
-    # measured 1.0 ms over one file and 44 ms over 64.
+    # therefore ON by default. A log gets the benefit at read time too: file
+    # count is a measured cost here, not a reputation — reading the offset
+    # boundary from manifest statistics measured 1.0 ms over one file and 44 ms
+    # over 64.
     #
     # It is a MULTIPLE for a reason. Sealed files are uniform, so merging whole
     # files lands exactly on the target when it divides and short when it does
@@ -158,11 +160,10 @@ class LogConfig:
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
-    # None keeps everything locally and grows without bound. Zero means "evict
-    # on upload" — pure archival capture, hot reads limited to the buffer — and
-    # presupposes a published table: with `published=None` it would delete each file as
-    # soon as it sealed, so the pair is rejected at construction rather than
-    # honoured.
+    # None keeps everything in staging and grows without bound. Zero means
+    # "evict on publish" — pure archival capture, hot reads limited to the
+    # buffer. Every log has a published table (#98), local by default, so zero
+    # never deletes a file publish has not taken: eviction still waits on I4.
     staging_retention: timedelta | None = None
     # §8, the other half of the same policy. A window in time and a count of
     # rows bound different things, and which one binds depends on a rate the
@@ -192,9 +193,10 @@ class LogConfig:
     # `min` below, because a cap evicts MORE and can therefore violate both
     # floors. It would measure on-disk size (`DataFile.size`), one of the few
     # places where that is the right unit. And it could not be honoured at all
-    # while publish is behind, since I4 forbids evicting what the published table lacks —
-    # a log breaching its floors to stay under a cap is misconfigured and
-    # should say so rather than quietly serving every read from object storage.
+    # while publish is behind, since I4 forbids evicting what the published
+    # table lacks — a log breaching its floors to stay under a cap is
+    # misconfigured and should say so rather than quietly serving every read
+    # from object storage.
     staging_rows: int | None = None
 
     # §3a. Continuous WAL shipping, which is the ONLY thing bounding RPO now
@@ -202,12 +204,13 @@ class LogConfig:
     # partial file's worth of rows indefinitely.
     #
     # A declaration rather than a supervisor. It is read — `_discard_on_seal`
-    # consults it on every seal, and validation refuses it without a published table
-    # to replicate to — but litelink never starts the sidecar. That is a separate
-    # process reading the WAL, which is exactly why replication does not put
-    # the network in the write path, and litestream is explicit that two
-    # instances must never replicate one database. Supervising it belongs in
-    # deployment code, where it is visible: see `examples/adsb/maintainer.py`.
+    # consults it on every seal, and validation refuses it without a remote
+    # published table to replicate to — but litelink never starts the sidecar.
+    # That is a separate process reading the WAL, which is exactly why
+    # replication does not put the network in the write path, and litestream is
+    # explicit that two instances must never replicate one database. Supervising
+    # it belongs in deployment code, where it is visible: see
+    # `examples/adsb/maintainer.py`.
     wal_replication: bool = False
 
     # §3a. When a maintenance pass finds at least this share of `buffer.db` on
@@ -243,16 +246,16 @@ class LogConfig:
     # the LATEST replicated state; retention bounds point-in-time depth and
     # never endangers the current point. So the question it answers is "how old
     # a moment might I want to restore to", and the answer follows from the
-    # published table: once publish has pushed a range, that range is recoverable from
-    # object storage, and WAL history older than the un-published window is
-    # covering something that is covered twice.
+    # published table: once publish has pushed a range, that range is
+    # recoverable from object storage, and WAL history older than the
+    # un-published window is covering something that is covered twice.
     #
     # **A duration, because litestream has nothing else.** The obvious spelling
     # is "retain WAL above the published offset" and it is not expressible:
     # v0.5.16's knobs are `snapshot.interval`, `snapshot.retention` and
     # `l0-retention`, all durations, and its CLI has no `snapshot` verb to
-    # force one after a publish and make a duration behave like an offset. So this
-    # is the un-published window stated as time.
+    # force one after a publish pass and make a duration behave like an offset.
+    # So this is the un-published window stated as time.
     #
     # That window is append -> seal -> compact -> publish, which no library can
     # know in advance: it depends on the arrival rate and on how often a
@@ -286,14 +289,14 @@ class LogConfig:
     # It is not a size-for-speed trade, which is why this is a default and not
     # advice. The same measurement put zstd's full-scan read at 0.65x Snappy's,
     # because there is less to read and decompressing it is cheap; the cost is
-    # write CPU, 1.9x, against a write path that is fsync-bound and a published table
-    # push that is network-bound.
+    # write CPU, 1.9x, against a write path that is fsync-bound and a published
+    # table push that is network-bound.
     #
     # Changing it is safe at any time and rewrites nothing. Parquet records the
     # codec per column chunk, so a table holding both reads correctly —
     # verified across `scan` and `sql` — and existing files are never touched.
-    # `rewrite_published` is what re-cuts history into the new one, when the size
-    # is worth the transfer.
+    # `rewrite_published` is what re-cuts history into the new one, when the
+    # size is worth the transfer.
     compression: str = "zstd"
 
     def to_json(self) -> str:

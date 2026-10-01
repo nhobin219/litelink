@@ -26,6 +26,7 @@ import pytest
 import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._buffer import Buffer
+from litelink._handle import OFFSET, RESTORE_RESERVE, LogHandle, table_schema
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._published import PUBLISHED_KEY, Published
@@ -37,7 +38,6 @@ from litelink._table import (
     _recorded_location,
     forget_published_entry,
 )
-from litelink.log import OFFSET, RESTORE_RESERVE, LogHandle, table_schema
 from tests.conftest import filesystem
 
 pytestmark = pytest.mark.s3

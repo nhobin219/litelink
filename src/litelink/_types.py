@@ -307,8 +307,9 @@ above every float in a row it reads, while Iceberg's file bounds and Parquet's
 row-group statistics leave it out, so whether a stored NaN is read at all
 depends on what else shares its file. ±inf round-trips, but the layer above
 is JSON, which has no infinity: streamcast's socket delivers one as null while
-catch-up from the published table delivers `inf`. With both gone, every float column's
-statistics are prunable, and `column_statistics` reports `nan_count = 0`.
+catch-up from the published table delivers `inf`. With both gone, every float
+column's statistics are prunable, and `column_statistics` reports
+`nan_count = 0`.
 """
 
 

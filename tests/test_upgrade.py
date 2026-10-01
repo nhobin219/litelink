@@ -20,8 +20,8 @@ import duckdb
 import pytest
 
 import litelink
+from litelink import OFFSET
 from litelink._read import Reader
-from litelink.log import OFFSET
 
 if TYPE_CHECKING:
     from pathlib import Path

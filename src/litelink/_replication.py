@@ -13,19 +13,18 @@ What the library owns is what the config has to SAY: which files carry the
 log's state, and where they go. Both are things only the log knows, and both
 are silently wrong when written by hand.
 
-`published.db` is in the set, though the published table can now name its own metadata
-(`version-hint.text`) and a FAILOVER deliberately does not restore it — a
-stale copy wins over the bucket's own pointer. It is replicated for the
+`published.db` is in the set, though the published table can now name its own
+metadata (`version-hint.text`) and a FAILOVER deliberately does not restore it
+— a stale copy wins over the bucket's own pointer. It is replicated for the
 same-machine case, where it saves a round trip. See `litelink.restore`.
 
-**One sidecar per ROOT, not per log.** `catalog.db` and `archive.db` live at the
-root and are shared by every log under it, so two logs each running their own
-sidecar would have two litestream instances replicating those two files — the
-one thing litestream says never to do — and, under a shared published prefix,
-shipping them to one replica path. Only the buffer is per log. A root holding
-several logs therefore wants one config naming every buffer under it, which
-this does not generate: it describes the log it was asked about. Until it does,
-put each log in its own root, or write that config by hand.
+**One sidecar per LOG.** All three databases live in the log's own directory,
+and the config does too (`Layout.replication_config`), so each log runs its own
+sidecar shipping to `<prefix>/<name>/_wal`. It used to be one per ROOT, while
+`catalog.db` and `archive.db` sat at the root shared by every log under it: two
+logs each running their own sidecar would have had two litestream instances
+replicating those two files — the one thing litestream says never to do. See
+`WAL_PREFIX`.
 """
 
 from __future__ import annotations
@@ -209,9 +208,9 @@ def flush(layout: Layout, binary: str | None = None, timeout: int = 60) -> None:
     """Ship `buffer.db` to its replica now, and return once the replica has it.
 
     `litestream sync -wait` through the running sidecar's control socket:
-    measured on 0.5.16 against rustfs with the periodic publish at 1 h, a restore
-    before it had none of 5 new rows, the command returned in 29 ms, and a
-    restore after it had all 5. It is a CLIENT of the sidecar — it opens no
+    measured on 0.5.16 against rustfs with litestream's periodic sync at 1 h,
+    a restore before it had none of 5 new rows, the command returned in 29 ms,
+    and a restore after it had all 5. It is a CLIENT of the sidecar — it opens no
     database and writes no replica — so it never makes a second writer.
 
     Raises when the sidecar does not answer, rather than starting a litestream

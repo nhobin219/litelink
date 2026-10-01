@@ -24,7 +24,7 @@ from hypothesis import strategies as st
 
 from litelink import manifest
 from litelink._statistics import ColumnStatistics, TierStatistics
-from litelink.manifest import Row, build, prune
+from litelink.manifest import Entry, build, prune
 
 POOL: dict[str, pa.DataType] = {
     "i32": pa.int32(),
@@ -67,8 +67,8 @@ def statistics(table: pa.Table) -> TierStatistics:
     )
 
 
-def row(name: str, start: int, table: pa.Table) -> Row:
-    return Row(name, start, start + table.num_rows, table.schema, statistics(table))
+def row(name: str, start: int, table: pa.Table) -> Entry:
+    return Entry(name, start, start + table.num_rows, table.schema, statistics(table))
 
 
 # -- what DuckDB says ------------------------------------------------------------
@@ -249,7 +249,7 @@ def test_an_excluded_unit_never_holds_a_match(scenario):
 # -- the rules, one at a time -----------------------------------------------------
 
 
-def one(table: pa.Table, name: str = "unit0") -> Row:
+def one(table: pa.Table, name: str = "unit0") -> Entry:
     return row(name, 1, table)
 
 
@@ -303,7 +303,7 @@ class TestItIncludesWhatItCannotDecide:
             columns={"x": ColumnStatistics(1.0, 2.0, 0, 2, nan_count=None)},
         )
         table = pa.table({"x": pa.array([1.0, 2.0])})
-        manifest_ = build([Row("unit0", 1, 3, table.schema, stats)])
+        manifest_ = build([Entry("unit0", 1, 3, table.schema, stats)])
 
         assert prune(manifest_, ["unit0"], [("x", ">", 50.0)]) == ["unit0"]
 
@@ -386,9 +386,9 @@ class TestTheTable:
 class TestTheOffsetIsTheUnitsRange:
     """`litelink_offset` is judged against `[start_offset, end_offset)`."""
 
-    def unit(self, name: str, start: int, end: int | None) -> Row:
+    def unit(self, name: str, start: int, end: int | None) -> Entry:
         empty = TierStatistics(tier=None, record_count=None, file_count=0, columns={})
-        return Row(name, start, end, pa.schema([pa.field("x", pa.int64())]), empty)
+        return Entry(name, start, end, pa.schema([pa.field("x", pa.int64())]), empty)
 
     def test_a_unit_is_skipped_by_its_range_alone(self):
         """No statistics at all, and still skipped — the buffer, a live log.
@@ -430,6 +430,6 @@ class TestTheOffsetIsTheUnitsRange:
         schema = pa.schema(
             [pa.field("litelink_offset", pa.int64()), pa.field("x", pa.int64())]
         )
-        table = build([Row("u", 1, 3, schema, statistics(pa.table({"x": [1, 2]})))])
+        table = build([Entry("u", 1, 3, schema, statistics(pa.table({"x": [1, 2]})))])
 
         assert "litelink_offset" not in table.column_names

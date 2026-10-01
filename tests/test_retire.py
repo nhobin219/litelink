@@ -19,12 +19,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 import litelink
-from litelink import LogConfig, RetiredError, WriteHandle
+from litelink import OFFSET, LogConfig, RetiredError, WriteHandle
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._replication import control_socket, litestream_binary
 from litelink._table import RETIRED_PROPERTY
-from litelink.log import OFFSET
 from tests.test_publish import ROWS, published_log, rows
 
 if TYPE_CHECKING:
@@ -188,7 +187,7 @@ def test_restore_refuses_on_the_replica_marker_alone(
         log.retire()
         backup(Layout(primary, "s").buffer_db, Layout(second, "s").buffer_db)
 
-    monkeypatch.setattr("litelink.log.published_retired", lambda *_: None)
+    monkeypatch.setattr("litelink._handle.published_retired", lambda *_: None)
     with pytest.raises(RetiredError, match="retired"):
         litelink.restore(second, "s", published=where, s3=s3)
 

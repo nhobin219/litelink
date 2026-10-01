@@ -35,7 +35,8 @@ first thing to fix, and the fix is `adsb/` below.
 ## `adsb/` — the shape a deployment wants
 
 A synthetic ADS-B position feed, driven as hard as you like, with one process
-per storage role. None of it needs a published table, a service, or a network.
+per storage role. None of it needs object storage, a service, or a network: the
+log publishes to a local published table under its own directory.
 
 ```
 just demo-capture      # terminal 1: append, and nothing else
@@ -62,16 +63,16 @@ The feed is synthetic on purpose. A demo you can turn up to a hundred thousand
 rows a second is the one that shows what the tiers are for; a real feed arrives
 at whatever rate it arrives at.
 
-## Adding the published tier
+## Publishing to object storage
 
-Everything above is local. To push sealed files to object storage and read across both
-tiers, add a bucket:
+Everything above is local. To publish sealed files to object storage instead, and evict
+from local disk what the bucket holds, add a bucket:
 
 ```
 just rustfs            # a local S3-compatible store, in one container
-just demo-published      # terminal 1: capture, with a published table configured
-just demo-maintain     # terminal 2: also pushes, and evicts what it has pushed
-just demo-tail         # terminal 3: `in table` falls as `published` rises
+just demo-published    # terminal 1: capture, publishing to S3
+just demo-maintain     # terminal 2: pushes, and evicts what it has pushed
+just demo-tail         # terminal 3: `staging rows` falls as `published rows` rises
 ```
 
 **Against a real AWS bucket instead**, nothing changes but the environment:
@@ -95,10 +96,10 @@ is what makes a hot read a hot read.
 ## Continuous RPO
 
 Add `--replicate` to `demo-published` and the maintainer runs litestream alongside itself,
-shipping the SQLite WAL to `_wal` beside the published data. Needs a published table to ship to and
-the binary — `just litestream` fetches a checksum-verified pinned build into `.bin/`, which
-both the maintainer and `just demo-replicate` prefer over whatever is on PATH, because the
-config format is version-dependent.
+shipping the SQLite WAL to `_wal` beside the published data. Needs an `s3://` published table
+to ship to and the binary — `just litestream` fetches a checksum-verified pinned build into
+`.bin/`, which both the maintainer and `just demo-replicate` prefer over whatever is on PATH,
+because the config format is version-dependent.
 
 That supervision lives in `adsb/maintainer.py`, not in the library: replication is a separate
 process reading the WAL, which is exactly why it keeps the network out of the write path,
@@ -116,7 +117,7 @@ role — it is the first thing done with what the writer leaves behind. (A reade
 role: any number may open the log with `litelink.open(..., read_only=True)`, holding and mutating nothing.)
 
 `demo-capture` seals nothing at all, and that is the point of running it alone first:
-`demo-tail` shows every row in the buffer and none in the table. They are durable and
+`demo-tail` shows every row in the buffer and none in the staging table. They are durable and
 readable the whole time — `scan()` unions the buffer with the table — so nothing is lost
 by starting the maintainer late. Start it and the rows move into Parquet at exactly the
 cuts recorded while it was not running.
@@ -125,9 +126,9 @@ Nothing coordinates that but the `claim` table. The writer holds no lease and ne
 tries; the maintainer takes both when it starts, and if it dies they lapse and the next
 one takes over.
 
-`adsb/maintainer.py` is one loop calling two plain methods at two cadences — `seal_due()`
-often, `maintain()` rarely. The library owns neither the thread nor the interval, so
-there is no `seal_mode` to set and nothing starts behind your back.
+`adsb/maintainer.py` is one loop calling plain methods at their own cadences — `seal_due()`
+often, `maintain()` and `publish()` less so. The library owns neither the thread nor the
+interval, so there is no `seal_mode` to set and nothing starts behind your back.
 
 ```
 just demo-clean        # delete the captured data when you are done
@@ -192,4 +193,4 @@ legs derive from one committed extent (§7, I3). It counts in DuckDB rather than
 materialising rows, which is what §7 means about a query over `litelink_offset` never
 touching the columns it did not ask for.
 
-None of them needs a published table, a service, or a network.
+None of them needs object storage, a service, or a network.

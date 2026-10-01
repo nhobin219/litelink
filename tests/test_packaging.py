@@ -213,7 +213,7 @@ def test_the_s3_tier_is_not_silently_skipped() -> None:
     except ImportError:  # pragma: no cover - the failure this exists to make loud
         pytest.fail(
             "s3fs is not installed, so the entire published tier will SKIP rather "
-            "than run. It is a dev dependency of the test fixtures. Run `uv publish`."
+            "than run. It is a dev dependency of the test fixtures. Run `uv sync`."
         )
 
 
@@ -275,7 +275,7 @@ def test_the_required_check_depends_on_every_job() -> None:
     except ImportError:  # pragma: no cover - the failure this makes loud
         pytest.fail(
             "PyYAML is not installed, so the check that the CI gate covers "
-            "every job cannot run. It is a dev dependency. Run `uv publish`."
+            "every job cannot run. It is a dev dependency. Run `uv sync`."
         )
 
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())

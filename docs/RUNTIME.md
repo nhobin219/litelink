@@ -37,10 +37,10 @@ That is the whole reason the claims exist.
 **Why it is one process and not two.** Sealing and compaction are the same kind of work:
 off the hot path, committing to the same Iceberg table, neither latency-critical the way
 an append is. Sharing a GIL between them costs nothing that matters, while splitting them
-costs something real — `_table_lock` serialises a seal's commit against a maintenance
-pass *within* a process, and nothing does across processes, so two maintainer processes
-race on Iceberg's delete-after-commit metadata cleanup and each warns about files the
-other already removed.
+costs something real — within a process the seal and the passes share one `LogTable`, which
+guards its handle, and nothing does across processes, so two maintainer processes race on
+Iceberg's delete-after-commit metadata cleanup and each warns about files the other
+already removed.
 
 The one role does hold **two kinds of claim**, over the seal's queued range and over the
 range a pass is working on, because they guard different recovery records: `sealing`
@@ -89,7 +89,7 @@ python -m litelink.migrate --root ./data --name trades --apply
 
 Data files are not touched or rewritten; only pointers move. 0.5.1's
 [RUNTIME.md](https://github.com/nhobin219/litelink/blob/v0.5.1/docs/RUNTIME.md#migrating-from-01)
-covers moving the published table's metadata, the shared WAL replica, and roots holding several
+covers moving the archive's metadata (0.5's name for the published table), the shared WAL replica, and roots holding several
 streams.
 
 ## End to end
@@ -109,8 +109,8 @@ streams.
                               │ no queue object, no event, no signal
                               ▼
  ┌──────────────────── buffer.db  (SQLite, WAL) ────────────────────────┐
- │ buffer │ extent │ extent_intent │ sealing │ compacting │ claim │
- │ pending_delete                                                       │
+ │ buffer │ extent │ extent_intent │ sealing │ compacting │ claim       │
+ │ pending_delete │ meta │ tier_offsets │ tier_statistics               │
  │                                                                      │
  │  the coordinator (I16). every hand-off below is a row in here, so    │
  │  it works between THREADS and between PROCESSES on identical terms   │
@@ -121,7 +121,7 @@ streams.
   ─────── seal claim ───────────           ─────── pass claim ────────────
   poll extent (one indexed            maintain() in a loop
   row read; no lock taken if
-  there is nothing queued)                _table_lock + lease
+  there is nothing queued)                a claim per pass
                                             ├─ compact()
   §4 step 1   with _lock:                   │    merge undersized runs
     lease.acquire() ─► lose? return         │    (intent → `compacting`)
@@ -136,8 +136,8 @@ streams.
     commit to Iceberg ────────────────┐          snapshot_retention, then
                                       │          unlink files whose grace
   §4 step 3   with _lock:             │          has passed, in the SAME
-    DELETE rows < end IF discarding  │          txn that clears the queue
-    NAME the extent's row          │
+    DELETE rows < end IF discarding   │          txn that clears the queue
+    NAME the extent's row             │
     lease.release()                   ▼
                     ┌─────────────────────────────┐
                     │  staging Iceberg table      │
@@ -507,9 +507,9 @@ calling back into anything above it.
 
 **One extent, four states.** `extent` is the only record of where a range of the stream
 lives, and a row keeps its identity through every stage: open while the appender fills it,
-closed when the cut is frozen, named when the seal commits the file, and re-pointed at an
-S3 URI when `publish` pushes a second copy. `bytes` — what the appender counted those rows as
-in memory — is written once, at the cut, and carried by everything downstream: compaction
+closed when the cut is frozen, named when the seal commits the file, and re-pointed at the
+published copy's URI when `publish` pushes a second copy. `bytes` — what the appender counted
+those rows as in memory — is written once, at the cut, and carried by everything downstream: compaction
 adds up the runs it merges, `publish` copies the number to the published table's name for the file,
 and the published rewrite sizes its merges from the same column. Nothing re-derives it,
 because nothing can: a Parquet footer records what the rows compressed from, not what they
@@ -614,9 +614,10 @@ nor repair it.
 
 ## Losing the machine
 
-Sealed data is in the published table once `publish` has pushed it. Everything else — rows that have
-not sealed yet, and the catalogs that say what the sealed files are — is SQLite on local
-disk, and a WAL-shipping sidecar is what gets it off the machine.
+Sealed data is off the machine once `publish` has pushed it to an S3 published table — the
+local default shares this disk. Everything else — rows that have not sealed yet, and the
+catalogs that say what the sealed files are — is SQLite on local disk, and a WAL-shipping
+sidecar is what gets it off the machine.
 
 **Nothing bounds the loss window without one.** The seal fires on `target_seal_size` alone,
 so a stream that goes quiet holds its last partial file's worth of rows indefinitely. The
@@ -746,7 +747,7 @@ than free of gaps. So 2²⁰ offsets are skipped, and `recovery()` reports which
 **What is not recovered:** rows appended inside the replication lag. They are
 gone, and no mechanism here returns them — that is the RPO the sidecar's
 replication lag sets. Everything below the seal frontier comes back, including
-the sealed-but-unsynced band, because a seal keeps its rows until the published table
+the sealed-but-unpublished band, because a seal keeps its rows until the published table
 has them.
 
 **Split-brain is not detected.** If the primary is not actually dead you have

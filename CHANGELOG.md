@@ -66,6 +66,10 @@ minor version carries breaking changes.
   `"published"` + `"buffer"` is `tier=None`. For the whole log, use
   `tier=None`. A log with nothing in staging (retired, or evicted dry) still
   gets the whole published table from `"published"`.
+- **`litelink.log` is now private (`litelink._handle`).** Everything public is
+  exported from `litelink` itself, and `litelink.manifest` stays public. The
+  one name callers took from `litelink.log`, `OFFSET`, is now `litelink.OFFSET`:
+  `from litelink import OFFSET`.
 - **Every offset range litelink reports is half-open, `[start, end)`**, the
   convention its stored tier offsets and `litelink.manifest` already used:
   `coverage()`, `staging_extent()` (was `table_extent()`), and
@@ -142,8 +146,9 @@ minor version carries breaking changes.
   against each tier's `[start_offset, end_offset)`, the buffer's included, so
   a history scan no longer converts the buffered rows to Arrow.
 - **`litelink.manifest`**: the statistics manifest and its pruning, public, so
-  streamcast uses the same implementation for its sealed logs (`build`,
-  `extend`, `prune`, with the key column a parameter). A term on
+  streamcast uses the same implementation for its sealed logs (`Entry`, one
+  unit with its offsets and statistics; `build`, `extend`, `prune`, with the
+  key column a parameter). A term on
   `litelink_offset` is judged against each unit's `[start_offset, end_offset)`,
   so a unit with no statistics — a live log, the buffer — still prunes by
   offset; an `end_offset` of None marks a range still growing.

@@ -1,4 +1,4 @@
-"""The published table's tier row: what a read consults to skip the published table (#90).
+"""The published tier row: what a read consults to skip the published table (#90).
 
 A read decides per query which tiers it needs, with `litelink.manifest.prune`
 over two rows keyed by `tier`:
@@ -11,31 +11,32 @@ over two rows keyed by `tier`:
   memory per version). A late or missing store costs a rollup, never a wrong
   answer.
 - **`published`** — what the published table holds BELOW the staging table:
-  the rows
-  eviction moved there. Not the whole published table, whose copy of the staging window
-  would put its maximum timestamp at "a few minutes ago" and send every hot
-  query to the network. The published leg of a read covers exactly this range —
-  offsets under the staging table's first — so this is the row that decides it.
+  the rows eviction moved there. Not the whole published table, whose copy of
+  the staging window would put its maximum timestamp at "a few minutes ago"
+  and send every hot query to the network. The published leg of a read covers
+  exactly this range — offsets under the staging table's first — so this is
+  the row that decides it.
 
-The published table's row is the one stored, in `buffer.db`, because its statistics
-otherwise live in the published table's manifests on S3 and the decision must not
-cost the round trip it exists to avoid. Eviction is the last moment those rows'
-statistics are on local disk, and it usually runs in another process than the
-reader, so the row is written by the writer side and read by everyone.
+The published table's row is the one stored, in `buffer.db`, because its
+statistics otherwise live in the published table's manifests on S3 and the
+decision must not cost the round trip it exists to avoid. Eviction is the last
+moment those rows' statistics are on local disk, and it usually runs in another
+process than the reader, so the row is written by the writer side and read by
+everyone.
 
-**Overstating is the safe direction.** A row that claims more than the published table
-holds below the staging table costs a read that finds nothing; one that claims
-less loses rows. So eviction WIDENS the row before the commit that moves rows
-below the staging table, and the one write that narrows — an exact rollup from
-the published table's manifests — runs only under the whole-log maintenance claim,
-where eviction cannot run beside it. `publish` and `rewrite_published` never change
-it: one adds copies of rows the staging table still holds, the other re-cuts
-rows the published table already has.
+**Overstating is the safe direction.** A row that claims more than the
+published table holds below the staging table costs a read that finds nothing;
+one that claims less loses rows. So eviction WIDENS the row before the commit
+that moves rows below the staging table, and the one write that narrows — an
+exact rollup from the published table's manifests — runs only under the
+whole-log maintenance claim, where eviction cannot run beside it. `publish` and
+`rewrite_published` never change it: one adds copies of rows the staging table
+still holds, the other re-cuts rows the published table already has.
 
 **A missing row means "no statistics", and nothing turns it into a row but an
 exact rollup.** Widening a row that is not there would describe only the rows
-being added, so it does nothing; the published table is read until something computes
-the whole of it.
+being added, so it does nothing; the published table is read until something
+computes the whole of it.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import pyarrow as pa
 
 from litelink._statistics import ColumnStatistics, TierStatistics, _merge
-from litelink.manifest import Row, columns
+from litelink.manifest import Entry, columns
 
 if TYPE_CHECKING:
     from litelink._buffer import Buffer
@@ -128,7 +129,8 @@ class PublishedTier:
         """Add `statistics` to the row, before the commit that evicts them.
 
         A missing row stays missing: it is "no statistics", and a row made of
-        only the rows being added would claim the published table holds nothing else.
+        only the rows being added would claim the published table holds
+        nothing else.
         """
         added = offsets(statistics)
 
@@ -195,14 +197,14 @@ def decode(raw: str) -> TierStatistics:
     )
 
 
-def row(
+def entry(
     tier: str,
     span: tuple[int, int | None],
     schema: pa.Schema,
     statistics: TierStatistics,
-) -> Row:
-    """A tier as a manifest row: `span` is its `[start, end)`."""
-    return Row(tier, span[0], span[1], schema, statistics)
+) -> Entry:
+    """A tier as a manifest entry: `span` is its `[start, end)`."""
+    return Entry(tier, span[0], span[1], schema, statistics)
 
 
 # The buffer's statistics: none. It is pruned by its offset range alone.
