@@ -1270,11 +1270,12 @@ class Maintenance:
         """Expire snapshots past `snapshot_retention`, then reclaim (§6, §8)."""
         cutoff = datetime.now(UTC) - self.config.snapshot_retention
 
-        # Collect the doomed snapshots' manifest lists and manifests BEFORE
+        # Collect the doomed snapshots' manifest lists and manifests (and the
+        # manifests their commits merged away, #111) BEFORE
         # expiring them. Afterwards their names exist nowhere: the metadata that
         # referenced them is gone, and the only remaining way to find the files
         # would be to list the directory — the thing this design refuses to do.
-        doomed = self._table.metadata_paths(self._table.snapshots_older_than(cutoff))
+        doomed = self._table.expiring_paths(self._table.snapshots_older_than(cutoff))
 
         # Queued BEFORE the expiry, like every other supersession here. After
         # it, these names exist nowhere — the metadata that referenced them is
@@ -1296,7 +1297,7 @@ class Maintenance:
         # an expiry that failed between the queue and the commit and ran again
         # a pass later would otherwise retire these the instant they became
         # unreferenced.
-        # Through `_key`, like the enqueue above it. `metadata_paths` returns
+        # Through `_key`, like the enqueue above it. `expiring_paths` returns
         # absolute paths and the queue is keyed root-relative, so passing them
         # raw made this an UPDATE matching nothing — silently, because that is
         # what SQL does. Every other restamp site happens to be key-invariant
@@ -1359,7 +1360,7 @@ class Maintenance:
         checkpoint(sweep.renew)
 
         retiring = list(
-            published.metadata_paths(published.snapshots_older_than(cutoff))
+            published.expiring_paths(published.snapshots_older_than(cutoff))
         )
         self._enqueue(retiring)
         published.expire_snapshots_older_than(cutoff)
