@@ -114,7 +114,8 @@ def test_compaction_preserves_every_row(tmp_path: Path) -> None:
 
 
 def test_eviction_drops_files_past_local_retention(tmp_path: Path) -> None:
-    """§8. With no archive this is deletion of the only copy, by design."""
+    """§8. Eviction drops what the published table holds, and the rows stay
+    readable from there — a local-only log's archive is a local table (#98)."""
     config = LogConfig(
         compact_min_files=99,  # isolate eviction from compaction
         local_retention=timedelta(microseconds=1),
@@ -124,12 +125,30 @@ def test_eviction_drops_files_past_local_retention(tmp_path: Path) -> None:
         log.extend(rows(2, start=12))
         assert len(log._table.data_files()) == 3
 
+        log.sync(push_unsettled=True)
         log.maintain()
 
         assert log._table.data_files() == []
         # The buffer is untouched: retention governs the table, and buffer rows
         # are removed at seal and nowhere else (§8).
-        assert len(read_all(log)) == 2
+        assert log.buffered_rows() == 2
+        assert len(read_all(log)) == 14, "every row, the evicted ones published"
+
+
+def test_eviction_never_drops_what_is_not_published(tmp_path: Path) -> None:
+    """I4 holds for every log (#98): a local-only log's retention used to
+    delete the only copy, and now waits for `sync` like any other.
+
+    Falsify by skipping the archive clamp in `Maintenance.evict`: every sealed
+    file leaves, and twelve rows with it.
+    """
+    config = LogConfig(compact_min_files=99, local_retention=timedelta(microseconds=1))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        log.maintain()
+
+        assert len(log._table.data_files()) == 3, "nothing is published yet"
+        assert len(read_all(log)) == 12
 
 
 def test_no_eviction_without_local_retention(tmp_path: Path) -> None:
@@ -225,13 +244,15 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        on_disk = {p.name for p in tmp_path.rglob("data/**/*.parquet")}
+        local = tmp_path / "s" / "data"
+        on_disk = {p.name for p in local.rglob("*.parquet")}
         assert len(on_disk) == 3
 
+        log.sync(push_unsettled=True)
         log.maintain()
 
         assert log._table.data_files() == [], "evicted from the table"
-        assert {p.name for p in tmp_path.rglob("data/**/*.parquet")} == on_disk, (
+        assert {p.name for p in local.rglob("*.parquet")} == on_disk, (
             "still on disk, held by the pre-eviction snapshot"
         )
 
@@ -241,7 +262,7 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
     ) as log:
         log.maintain()
 
-        assert list(tmp_path.rglob("data/**/*.parquet")) == [], (
+        assert list((tmp_path / "s" / "data").rglob("*.parquet")) == [], (
             "expiry is what deletes bytes"
         )
 
@@ -519,6 +540,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
         log.seal()
         agrees("seal after compaction")
 
+        log.sync(push_unsettled=True)
         log._maintenance.evict()
         agrees("after eviction")
 
@@ -703,6 +725,7 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         seal_files(log, 4)
         files = log._table.data_files()
         assert len(files) == 4
+        log.sync(push_unsettled=True)
 
         # A commit AFTER the last seal, which is what makes every remaining
         # file's adding snapshot expirable. Iceberg always keeps the current
@@ -791,6 +814,7 @@ def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
+        log.sync(push_unsettled=True)
         log._maintenance.evict()
 
         kept = log._table.data_files()
@@ -943,14 +967,15 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         converted = len(log._table.data_files())
         assert converted < before, "compaction must run on its own"
 
+        log.sync(push_unsettled=True)
         log.evict()
         log.expire()
 
         assert log._table.data_files() == [], "eviction must run on its own"
-        # What is left is the unsealed tail, which never reached the seal
-        # target and is therefore still in the buffer. Eviction removes FILES;
-        # rows that are not in one are not its business.
-        assert log.scan().read_all().num_rows == log.buffered_rows()
+        # Every row still reads: the evicted ones from the published table,
+        # the unsealed tail from the buffer, which eviction never touches.
+        assert log.scan().read_all().num_rows == 1200
+        assert log.buffered_rows() > 0, "the tail never reached the seal target"
 
 
 def test_a_pass_defers_to_a_claim_over_the_range_it_wanted(tmp_path: Path) -> None:
@@ -1137,13 +1162,16 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        archive=f"file://{tmp_path}/prefix",
     )
     with log:
         seal_files(log, 2)
         first = min(log._table.data_files(), key=lambda f: f.lo)
         log._buffer.record_file(
-            f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
+            f"file://{tmp_path}/prefix/data/{first.lo}.parquet",
+            first.lo,
+            first.hi + 1,
+            1,
         )
         local = log._table.data_files()
 
@@ -1154,7 +1182,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
             == first.hi
         )
 
-        log.set_archive("s3://bucket/elsewhere")
+        log.set_archive(f"file://{tmp_path}/elsewhere")
 
         assert (
             log._maintenance.archived_prefix(
@@ -1163,7 +1191,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
             == 0
         ), "the new archive holds nothing, and says so without any reset"
 
-        log.set_archive("s3://bucket/prefix")
+        log.set_archive(f"file://{tmp_path}/prefix")
 
         assert (
             log._maintenance.archived_prefix(
@@ -1314,6 +1342,7 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
     config = LogConfig(local_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
+        log.sync(push_unsettled=True)
         before = log.table_files()
 
         assert before == 3
@@ -1514,12 +1543,15 @@ def test_eviction_reads_the_archive_under_its_own_claim(tmp_path: Path) -> None:
     config = LogConfig(local_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
+        # Published to the local default, so the archive eviction reads first
+        # holds every file and would let it drop all but the newest.
+        log.sync(push_unsettled=True)
         before = log.table_files()
 
         assert before == 3
-        assert not log._archive.configured()
 
-        # The archive is attached between eviction's read and its claim.
+        # The log is re-pointed between eviction's read and its claim, at an
+        # archive holding nothing.
         original = Claim.acquire
 
         def attaching(self: Claim) -> bool:
@@ -1536,7 +1568,7 @@ def test_eviction_reads_the_archive_under_its_own_claim(tmp_path: Path) -> None:
             Claim.acquire = original
 
         assert log.table_files() == before, (
-            "deleted the only copy of rows an archive had just been configured for"
+            "evicted on the strength of an archive the log had just left"
         )
 
 
@@ -1869,6 +1901,7 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
     config = LogConfig(local_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
+        log.sync(push_unsettled=True)
         dropped = [log._maintenance._key(f.path) for f in log._table.data_files()]
 
         assert len(dropped) == 3

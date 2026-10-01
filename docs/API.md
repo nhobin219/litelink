@@ -453,8 +453,9 @@ log.expire(heartbeat=None) -> None
 ```
 
 `maintain()` is the one call most deployments want: it takes the maintenance claim once, runs
-compaction, eviction and expiry in that order, then calls `seal_due()` at the end. It needs no
-archive — this is the call that makes `local_retention` mean anything on a local-only log.
+compaction, eviction and expiry in that order, then calls `seal_due()` at the end. Eviction
+drops only what the archive already holds (I4), so on every log — a local-only one included —
+`local_retention` takes effect as `sync` publishes.
 
 The three are exposed separately because their costs differ by an order of magnitude:
 **`compact` reads and rewrites whole files while `evict` and `expire` are metadata commits
@@ -481,8 +482,15 @@ load's tail on a log that has gone quiet; the cost is undersized objects the arc
 until `rewrite_archive` re-cuts them.
 
 `sync` is lazy, restartable and arbitrarily far behind, and **no read
-depends on it**. All three raise `ValueError` on a log with no archive, and `RuntimeError`
-when another owner holds the claim.
+depends on it**. All three raise `RuntimeError` when another owner holds the claim.
+
+**Every log has an archive** (#98). Given `archive="s3://bucket/prefix"` it is on S3; given
+`archive="file:///directory"` it is that directory; given none, it is
+`<root>/<name>/published`. The pipeline is the same either way — a local-only log publishes,
+evicts and retires exactly like one on S3, and any Iceberg engine reads its table through
+`version-hint.text`. Its cost is disk: the local archive keeps everything, until truncation
+lands (a follow-up). `wal_replication`, `restore` and `hydrate` need a remote one: the WAL
+replica exists to get rows off the machine, and a local archive is on this disk already.
 
 `hydrate(since)` re-registers archived files back into the local table. Raising
 `local_retention` is an operation rather than a config change: without this, a raised setting
@@ -606,7 +614,7 @@ rows; there is no separate marker.
 taken, read in the same transaction — so no row can arrive after the final seal and push. A
 crash leaves the log `retiring`, taking no rows, and a writer can still open it to call
 `retire()` again. The last step narrows the range to empty, which is what reads as `retired`
-and lets every read skip the buffer without reading it. It needs an archive.
+and lets every read skip the buffer without reading it.
 
 **With `wal_replication`, it flushes the replica** through the running sidecar
 (`litestream sync -wait` on its control socket) after each of those two steps, so a restore from the
@@ -619,8 +627,8 @@ says to regenerate the config (see RUNTIME.md).
 ```python
 log.config -> LogConfig
 log.set_config(config) -> None
-log.archive -> str | None
-log.set_archive(archive) -> None              # None detaches
+log.archive -> str                            # s3://… or file://…
+log.set_archive(archive) -> None              # None: the local default
 log.schema -> pa.Schema                       # your columns, as declared at new()
 log.sort_by -> tuple[str, ...]
 log.set_sort_by(sort_by, *, rewrite) -> None
@@ -645,8 +653,13 @@ sync, a merge or an eviction. Both wait for maintenance rather than failing on t
 because the shipped writer calls `set_archive` on every restart while a maintainer runs
 elsewhere.
 
-**`set_archive(None)` is refused while a retention floor is set.** Detaching retires the I4
-clamp for every process at once, and eviction would then delete files still queued for upload.
+**There is no detached state.** `set_archive(None)` points the log back at its local default,
+and I4 holds across every move: nothing leaves the local table until the archive it now
+points at holds it. **A move opens its new table before recording it** — creating it, or
+adopting one through its `version-hint.text` — so a move that cannot reach it raises with
+nothing changed. Re-stating the current location does nothing at all — no claim, no write,
+no network — so a writer that declares its archive on every restart never waits on
+maintenance or an outage for it.
 
 `set_sort_by` re-clusters what the local table owns, so `rewrite` must be passed explicitly
 and `rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under
@@ -674,7 +687,7 @@ local_retention       timedelta|None  = None     local window by TIME (None keep
 local_rows            int | None      = None     local window by ROWS — a floor, not a ceiling
 snapshot_retention    timedelta       = 1 hour   how long expired snapshots survive
 compact_min_files     int             = 4        minimum adjacent files to merge
-wal_replication       bool            = False    needs an archive; also makes a seal KEEP its rows
+wal_replication       bool            = False    needs an s3:// archive; also makes a seal KEEP its rows
 wal_retention         timedelta|None  = None     how far back a restore may go
 vacuum_free_ratio     float | None    = None     reclaim buffer dead space at this free share
 compression           str             = "zstd"   Parquet codec: none | snappy | gzip | zstd
@@ -686,7 +699,7 @@ only, so `set_config` needs no rewrite.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
 construction: `compact_min_files` below 2, a compact size below the seal size, `wal_retention`
-without `wal_replication`, `wal_replication` without an archive, a `vacuum_free_ratio` outside
+without `wal_replication`, `wal_replication` without an s3:// archive, a `vacuum_free_ratio` outside
 `[0, 1]`, and a `compression` this build cannot write are each refused.
 
 **`vacuum_free_ratio` is about what READERS pay.** SQLite puts pages freed by a delete on a

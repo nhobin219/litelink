@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -306,12 +306,6 @@ def test_close_waits_for_an_in_flight_seal(tmp_path: Path) -> None:
     with open_log(tmp_path) as reopened:
         assert reopened._buffer.pending_seal() is None, "left a claim behind"
         assert len(read_all(reopened)) == 60
-
-
-def test_local_retention_zero_without_an_archive_is_rejected(tmp_path: Path) -> None:
-    """§8: it means 'evict on upload', and there is nothing to upload to."""
-    with pytest.raises(ValueError, match="archive"):
-        open_log(tmp_path, LogConfig(local_retention=timedelta(0)))
 
 
 def test_readonly_sees_a_writer_s_committed_rows(tmp_path: Path) -> None:
@@ -1202,7 +1196,7 @@ def test_a_writer_reports_where_its_next_append_lands(tmp_path: Path) -> None:
         assert log.append({"event_ts": 9, "key": "k", "payload": "p"}) == 6
         assert log.end_offset() == 7, "it must move with the sequence, not with a tier"
 
-        # And it is a local read: no archive is configured, so nothing here
-        # can reach for one.
-        assert log.archive is None
+        # And it is a local read: the archive is the local default, so
+        # nothing here can reach the network.
+        assert log.archive.startswith("file://")
         assert log.end_offset() == 7

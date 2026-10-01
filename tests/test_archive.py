@@ -1186,15 +1186,18 @@ def test_eviction_learns_about_an_archive_attached_by_another_process(
         snapshot_retention=timedelta(seconds=0),
     )
     writer = litelink.new(
-        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
+        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config, s3=s3
     )
     with writer:
         writer.extend(rows(ROWS))
         writer.seal_due()
+        # Published to the local default, so the archive the maintainer
+        # opened against holds every sealed file.
+        writer.sync(push_unsettled=True)
 
-        # The maintainer opened while the log was local-only.
+        # The maintainer opened while the log published locally.
         with litelink.open(tmp_path, "s", s3=s3) as maintainer:
-            assert not maintainer._archive.configured()
+            assert not maintainer._archive.remote()
 
             writer.set_archive(f"s3://{bucket}/prefix")
 
@@ -2455,7 +2458,9 @@ def test_attaching_an_archive_that_is_ahead_of_the_log_is_refused(
         with pytest.raises(ValueError, match="another log's history"):
             fresh.set_archive(where)
 
-        assert fresh.archive is None, "the log was re-pointed despite the refusal"
+        assert fresh.archive == Layout(tmp_path / "second", "s").default_archive, (
+            "the log was re-pointed despite the refusal"
+        )
 
 
 def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
@@ -2476,18 +2481,18 @@ def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
         assert log.archive == f"s3://{bucket}/never-written-to"
 
 
-def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
+def test_a_hint_naming_unreadable_metadata_refuses_the_move(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The guard reads the network in TWO steps, and either can fail.
+    """A move adopts the table at its new location before recording it, and a
+    hint naming metadata that cannot be read is a broken archive: refused, with
+    the log left where it was and the hint not written over.
 
-    An unreachable endpoint is already absorbed — `_published_location`
-    swallows and answers None — so this exercises the other half: a hint that
-    IS readable, naming metadata that is not. The guard has to treat that as
-    "cannot tell" rather than "refuse", because `set_archive` runs on every
-    writer restart and configuring an archive is a statement of intent. A real
-    problem there surfaces loudly at the first `sync`, which is where it can
-    be acted on.
+    It used to be accepted as a statement of intent, leaving the first `sync`
+    to fail. A move that reports success has to have a table to point at.
+
+    Falsify by making the adopt in `set_archive` best effort: the move is
+    recorded.
     """
     prefix = f"s3://{bucket}/corrupt"
     fs = filesystem(s3)
@@ -2496,9 +2501,13 @@ def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
 
     with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
         log.extend(rows(10))
-        log.set_archive(prefix)
+        before = log.archive
 
-        assert log.archive == prefix
+        with pytest.raises(FileNotFoundError):
+            log.set_archive(prefix)
+
+        assert log.archive == before
+        assert fs.cat(hint) == b"00042-does-not-exist", "the hint was written over"
 
 
 def test_a_log_is_recovered_onto_another_machine(
@@ -2887,7 +2896,9 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
         with pytest.raises(ValueError, match="no record of pushing"):
             other.set_archive(foreign)
 
-        assert other.archive is None, "the log was pointed despite the refusal"
+        assert other.archive == Layout(tmp_path / "other", "s").default_archive, (
+            "the log was pointed despite the refusal"
+        )
 
 
 def test_a_restore_from_a_replica_the_archive_has_outrun(
@@ -3296,32 +3307,26 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
         assert reopened.scan().read_all().num_rows == readable
 
 
-def test_detaching_with_a_retention_floor_is_refused(
+def test_moving_back_to_the_local_default_keeps_every_row(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Detaching retires I4's clamp, for every process at once.
+    """`set_archive(None)` re-points to the local default (#98), and I4 holds
+    across the move: the local archive holds nothing yet, so nothing may leave
+    the local table until a `sync` publishes it there.
 
-    `evict`'s "never delete what the archive lacks" runs only while an archive
-    is configured, so `set_archive(None)` does not merely stop using the
-    archive — it makes the files still waiting to be pushed ordinary retention
-    candidates, and the next maintenance pass deletes them. A maintainer
-    looping in another process does it without the operator calling anything.
+    It used to detach, which retired the clamp: measured before the refusal
+    that guarded it, 4,025 acknowledged offsets unreadable after one pass.
+    There is no detached state now, so there is no clamp to retire.
 
-    Measured before this refusal: sync 4,550 rows behind, one detach, one pass,
-    4,025 acknowledged offsets unreadable. `hydrate` restores only what the
-    archive holds and `sync` cannot push files that have left the table, so
-    nothing gets them back.
-
-    Blunt on purpose. Keeping the clamp alive across a detach is the real fix
-    and is tracked separately; until then the library refuses the shape rather
-    than guessing at the cases.
+    Falsify by skipping the archive clamp in `Maintenance.evict`: the files
+    below the floor are deleted unpublished.
     """
-    where = f"s3://{bucket}/lossy-detach"
+    where = f"s3://{bucket}/back-home"
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
         compact_min_files=2,
-        local_rows=100,
+        local_rows=0,
     )
     with litelink.new(
         tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
@@ -3330,57 +3335,26 @@ def test_detaching_with_a_retention_floor_is_refused(
         log.seal_due()
         readable = log.scan().read_all().num_rows
 
-        with pytest.raises(ValueError, match="refusing to detach"):
-            log.set_archive(None)
-
-        assert log.archive == where, "detached despite the refusal"
-
-        # Clearing the floors is how you say you accept it — and then the
-        # detach goes through.
-        log.set_config(replace(config, local_rows=None, local_retention=None))
         log.set_archive(None)
+        assert log.archive == Layout(tmp_path, "s").default_archive
 
-        assert log.archive is None
+        log.maintain()
+        assert log.scan().read_all().num_rows == readable
+
+        log.sync(push_unsettled=True)
+        log.maintain()
+        assert log.table_rows() == 0, "published, so eviction may proceed"
         assert log.scan().read_all().num_rows == readable
 
 
-def test_detaching_a_log_with_no_retention_floor_is_allowed(
+def test_every_empty_archive_spelling_means_the_local_default(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """With no floor, eviction does nothing and a detach costs nothing.
+    """`set_archive("")` must land where `None` does, guards and all.
 
-    The refusal has to leave this alone: `local_retention` and `local_rows` are
-    both None by default, so refusing here would refuse the ordinary case.
-    """
-    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
-    with litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        config=config,
-        archive=f"s3://{bucket}/plain-detach",
-        s3=s3,
-    ) as log:
-        log.extend(rows(600))
-        log.seal_due()
-        log.set_archive(None)
-
-        assert log.archive is None
-
-
-def test_an_empty_archive_string_is_a_detach_and_is_refused_as_one(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """`set_archive("")` must not slip past the guards that `None` hits.
-
-    Every check reads `archive is None`, and normalising `"" -> None` used to
-    happen in `_repoint`, AFTER all of them. So an empty string was non-None to
-    `validate`, to `_refuse_archive_ahead` and to `_refuse_lossy_detach`, and
-    None to the write that followed — a detach with no guard applying.
-    Measured before the fix: 7,828 acknowledged rows lost, the same magnitude
-    as the case those guards exist for.
-
-    The plausible route is not a literal but `os.environ.get("ARCHIVE", "")`.
+    Normalising `"" -> None` once happened after the guards, so an empty
+    string slipped past them to a detach — 7,828 acknowledged rows lost. The
+    plausible route is not a literal but `os.environ.get("ARCHIVE", "")`.
     """
     config = replace(
         LogConfig(), target_seal_size=8 * 1024, compact_min_files=2, local_rows=100
@@ -3398,34 +3372,20 @@ def test_an_empty_archive_string_is_a_detach_and_is_refused_as_one(
         readable = log.scan().read_all().num_rows
 
         for spelling in ("", "/", "///"):
-            with pytest.raises(ValueError, match="refusing to detach"):
-                log.set_archive(spelling)
+            log.set_archive(spelling)
+            assert log.archive == Layout(tmp_path, "s").default_archive
 
-        assert log.archive is not None, "detached through an empty spelling"
         log.maintain()
 
         assert log.scan().read_all().num_rows == readable
 
 
-def test_creating_a_log_with_an_empty_archive_is_a_local_only_log(
+def test_creating_a_log_with_an_empty_archive_publishes_locally(
     tmp_path: Path,
 ) -> None:
-    """And `validate` judges it as one.
-
-    `litelink.new(archive="")` was non-None to `validate`, so every rule that
-    presupposes an archive was skipped — while `Archive.configured()` came back
-    False. `local_retention=0` means "evict on upload" and is refused with no
-    archive; with an empty string it was accepted, which is the exact pair the
-    rule exists to prevent.
-    """
-    with pytest.raises(ValueError, match="presuppose an archive"):
-        litelink.new(
-            tmp_path,
-            "s",
-            schema=SCHEMA,
-            config=replace(LogConfig(), local_retention=timedelta(0), local_rows=0),
-            archive="",
-        )
+    """`litelink.new(archive="")` is `archive=None`: the local default."""
+    with litelink.new(tmp_path, "s", schema=SCHEMA, archive="") as log:
+        assert log.archive == Layout(tmp_path, "s").default_archive
 
 
 @pytest.mark.slow
@@ -3972,10 +3932,10 @@ def test_restore_accepts_the_same_archive_written_with_a_trailing_slash(
         assert revived_log.scan().read_all().num_rows > 0
 
 
-def test_restore_refuses_a_buffer_that_records_no_archive(
+def test_restore_refuses_a_buffer_from_a_local_only_log(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A buffer from a log that never had an archive cannot be attached to one.
+    """A buffer from a log that published locally cannot be attached to S3.
 
     It fails without this guard too — but at the very END, from
     `write_replication_config`, which is after `LogTable.create`. That is the
@@ -3991,7 +3951,7 @@ def test_restore_refuses_a_buffer_that_records_no_archive(
     (revived / "s").mkdir(parents=True)
     _clone_buffer(Layout(donor, "s").buffer_db, Layout(revived, "s").buffer_db)
 
-    with pytest.raises(ValueError, match="records no archive") as caught:
+    with pytest.raises(ValueError, match="records archive='file://") as caught:
         litelink.restore(revived, "s", archive=f"s3://{bucket}/nowhere", s3=s3)
 
     assert f"s3://{bucket}/nowhere" in str(caught.value)

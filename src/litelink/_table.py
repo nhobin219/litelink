@@ -869,7 +869,7 @@ class LogTable:
         field = self._table.schema().find_field("litelink_offset")
         found = [
             DataFile(
-                path=_local(path),
+                path=self._name(path),
                 size=int(size),
                 rows=int(rows),
                 lo=from_bytes(field.field_type, dict(lower)[field.field_id]),
@@ -1043,13 +1043,25 @@ class LogTable:
 
             return self._table.schema(), entries
 
+    def _name(self, path: object) -> str:
+        """How this table names a file: a plain path for the local table, the
+        full URI for the archive.
+
+        The archive's files are URIs even when it is a local directory (#98).
+        Everything that records a file tells the two tiers apart by the scheme
+        — the deletion queue above all, where a published file keyed like a
+        local one would be unlinked once the local table stopped naming it,
+        while the published table still did.
+        """
+        return str(path) if self._is_archive else _plain(path)
+
     def file_paths(self) -> set[str]:
         return {f.path for f in self.data_files()}
 
     def referenced_paths(self) -> set[str]:
         """Every file any live snapshot needs — data and Iceberg's own."""
         return {
-            _local(path)
+            self._name(path)
             for path in self._table.inspect.all_files()["file_path"].to_pylist()
         } | self.metadata_paths(self._table.snapshots())
 
@@ -1063,9 +1075,9 @@ class LogTable:
         """
         paths: set[str] = set()
         for snapshot in snapshots:
-            paths.add(_local(snapshot.manifest_list))
+            paths.add(self._name(snapshot.manifest_list))
             paths.update(
-                _local(manifest.manifest_path)
+                self._name(manifest.manifest_path)
                 for manifest in snapshot.manifests(self._table.io)
             )
 
@@ -1107,7 +1119,7 @@ class LogTable:
         ):
             added = committed.get(snapshot_id)
             if added is not None:
-                ages[_local(data_file["file_path"])] = added
+                ages[self._name(data_file["file_path"])] = added
 
         return ages
 
@@ -1493,6 +1505,6 @@ class LogTable:
             transaction.set_properties(properties)
 
 
-def _local(path: object) -> str:
+def _plain(path: object) -> str:
     """Iceberg records `file://` URIs; the filesystem wants plain paths."""
     return str(path).removeprefix("file://")

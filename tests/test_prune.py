@@ -539,11 +539,11 @@ def test_repointing_forgets_the_archive_row(
     """A row describes one archive; a move must not carry it to another.
 
     Pointed at a fresh prefix, the row is recomputed there: nothing below the
-    local table. Pointed back, the original's again. Pointed at one that
-    cannot be read, the row is gone — and reads include that archive.
+    local table. Pointed back, the original's again. A move to one that
+    cannot be reached is refused, and leaves the row as it was.
 
-    Falsify by removing the `drop(ARCHIVE)` in `_repoint`: the unreadable
-    prefix keeps the old archive's row.
+    Falsify by removing the `drop()` in `_repoint`: the fresh prefix keeps the
+    old archive's row.
     """
     with evicted(tmp_path, bucket, s3) as log:
         original = log.archive
@@ -561,8 +561,11 @@ def test_repointing_forgets_the_archive_row(
         assert again is not None and again.offsets == before.offsets
         assert log.scan().read_all().num_rows == ROWS
 
-        log.set_archive(f"s3://{bucket}-nonexistent/prefix")
-        assert archive_row(log) is None
+        with pytest.raises(OSError):  # noqa: PT011
+            log.set_archive(f"s3://{bucket}-nonexistent/prefix")
+
+        assert log.archive == original
+        assert archive_row(log) == again
 
 
 @pytest.mark.s3

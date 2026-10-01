@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Literal, overload
 
 import pyarrow as pa
 
-from litelink._archive import Archive
+from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import (
     CONFIG_KEY,
     Buffer,
@@ -133,6 +133,12 @@ def open(  # noqa: A001
         buffer.close()
 
         raise
+
+    # A log written before #98 with no archive records none; it publishes to
+    # the local default now, recorded so the stored location is the one every
+    # fence compares against.
+    if not buffer.get_meta(ARCHIVE_KEY):
+        buffer.set_meta(ARCHIVE_KEY, layout.default_archive)
 
     handle.recover()
     handle._backfill_manifest()  # noqa: SLF001

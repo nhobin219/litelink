@@ -9,11 +9,11 @@
 
 # An embedded Iceberg storage engine for append-only data
 
-litelink takes high-throughput transactional appends and turns them into well-sized Iceberg
-tables, on local disk and in object storage. `append()` commits to a SQLite buffer and returns
-once the row is durable. Behind it, the library seals rows into sorted Parquet, compacts small
-files up to a target size, pushes settled files to an Iceberg archive on S3, and evicts from
-local disk what the archive already holds. Through all of it the log stays one queryable
+litelink takes high-throughput transactional appends and turns them into one well-sized
+Iceberg table per log — on S3, or in a local directory. `append()` commits to a SQLite buffer
+and returns once the row is durable. Behind it, the library seals rows into sorted Parquet,
+compacts small files up to a target size, publishes settled files to that table, and evicts
+from local disk what it already holds. Through all of it the log stays one queryable
 unit: a read sees every row exactly once, whichever tier holds it, and maintenance runs beside
 appends rather than in front of them, so no pass blocks appends for its duration or shows a
 reader a half-finished state.
@@ -48,12 +48,14 @@ Doing that by hand goes wrong the same way every time: one production capture sy
 125,884 objects, 62.5% of them under 16 KiB, Parquet files at 2 rows each, a compaction
 routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
 
-## The Parquet is the product
+## The Iceberg table is the product
 
 The usual shape is a write path in one system and an analytical store in another, with a job
-copying between them. Here they are one store with tiers: rows land in the SQLite buffer,
-seal into Parquet behind it, and reads span both, so **no read on the hot path touches the
-network**. Every other machine reads the archive with any Iceberg engine:
+copying between them. Here they are one log: rows land in the SQLite buffer, seal into a
+local Iceberg table, and are published to the log's one output — an Iceberg table on S3, or
+in a local directory for a log with no S3 archive. litelink reads across all three, so **no
+read on the hot path touches the network**. Everything else reads the published table with
+any Iceberg engine, through its `version-hint.text`, with no catalog and no litelink:
 
 ```python
 import duckdb
@@ -67,13 +69,17 @@ log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
 # Read on the same box, across the buffer and the local table.
 log.sql("SELECT count(*), max(price) FROM log").read_all()
 
-# Read from another box with any Iceberg engine, and litelink not installed at all.
+# Read the published table with any Iceberg engine, and litelink not installed at all —
+# from S3, or for a local-only log from data/trades/published/trades.
 duckdb.sql("""
     SELECT count(*), max(price)
     FROM iceberg_scan('s3://bucket/prefix/trades',
                       version_name_format = '%s%s.metadata.json')
 """)
 ```
+
+The published table holds what `sync` has pushed, which trails the buffer by the sync
+interval; rows newer than that are readable through litelink on the writer's machine.
 
 ## How it works
 

@@ -723,13 +723,11 @@ rest of that run merging into a local file straddling the archive's extent — a
 re-cuts a local straddler, so every later push is refused and the watermark never moves
 again.
 
-**`validate` checks a PAIR, so both halves are read durably.** An evict-on-upload policy
-with no archive to evict into is refused in one call, and each setter was checking its own
-new half against this process's memory of the other — so two processes could assemble the
-refused pair between them, after which the next maintenance pass executes it faithfully and
-deletes the only copy of everything sealed. And the rule itself has to match how eviction
-combines the floors: it takes the lower boundary, so the policy retaining MORE wins, and a
-config is "evict on upload" only when every floor it states is one.
+**`validate` checks a PAIR, so both halves are read durably.** `wal_replication` with a
+local archive is refused in one call — the replica exists to get rows off the machine — and
+each setter was checking its own new half against this process's memory of the other, so
+two processes could assemble the refused pair between them. (The pair this was found on, an
+evict-on-upload policy with no archive, no longer exists: every log has an archive, #98.)
 
 Reading both halves durably is still not enough, and this is the part that took two rounds
 to see: read and write as two transactions with nothing between them, and the check is only
@@ -877,14 +875,12 @@ An equality check on a recorded value, and the consequences fall out:
 `archived_through` may remain as a derived `MAX(...)` for the push floor and for display.
 What it may not be again is the thing that authorises a deletion.
 
-**Local-only is the same rule with one term absent.** With no archive there is no URI to
-record and no row to find, so I4 is vacuous — not unsatisfiable. Eviction is then
-`local_retention` and `local_rows` alone, which §8 already says is a deletion policy over
-the only copy.
+**There is no local-only exception.** Every log has an archive (#98) — a local directory when
+no remote one is given — so I4 is never vacuous: a local-only log's eviction clamps against
+its local archive's records exactly as an S3 log's does.
 
-It is tempting to require that a file be compacted before local-only eviction will take it,
-by symmetry with the archive case, where only compacted files are ever pushed and therefore
-only compacted files are ever eligible. **Resist it.** The reason to hold a file back is
+It is tempting to require that a file be compacted before eviction will take it, since only
+compacted files are ever pushed. **Resist it.** The reason to hold a file back is
 never its compaction state; it is that a merge — `_rewrite_run`, reading a run of files to
 write the one that replaces them — holds it as an input right now. That is a claim, and it
 is already answered above.
@@ -1017,10 +1013,9 @@ Sync records how far it has registered in `meta`, as one offset under `archive_t
 
 **Steps 4 and 5 do not belong to sync.** Snapshot expiry and local eviction are local
 storage work; they are listed here because eviction must respect the registration watermark
-step 2 writes. But every other step is archive work, so a log configured with no archive
-never runs this pass at all — and would then never expire a snapshot or honour
-`local_retention`, leaving the knob silently inert. They are owned by `maintain()` (§12),
-which reads that same watermark to enforce I4 and runs with or without an archive.
+step 2 writes. But every other step is publishing work, and a log may go a long time
+between syncs — so expiry and eviction are owned by `maintain()` (§12), which reads that same
+watermark to enforce I4 and runs whether or not a sync has.
 
 ---
 
@@ -1465,35 +1460,18 @@ over the network. That is the right setting for pure archival capture — liteli
 durable staging area into Iceberg — and the wrong one wherever a hot reader looks back
 further than the buffer holds. It does not weaken I4: eviction still never precedes registration.
 
-**With no archive, retention is deletion, and that is the intended contract.** I4 forbids
-evicting a file the archive still lacks — but nothing is owed to an archive that does not
-exist, so the invariant is vacuous and `local_retention` becomes an ordinary retention
-policy over the only copy. Data past the window is gone for good.
+**Retention is never deletion** (#98). It used to be, on a log with no archive: I4 was
+vacuous there, so `local_retention` became a retention policy over the only copy. That made
+DETACHING an archive a silent conversion into it — the clamp retired for every process at
+once, and a maintainer the operator never invoked deleted 4,025 acknowledged offsets of
+8,000 — and it left a local-only log with no output table for compaction and sizing to
+shape.
 
-That is the right shape for a bounded local capture window, and it is worth stating plainly
-because I4's rationale is literally *"eviction before registration is data loss."* Here the
-loss is the operator's instruction rather than a bug, and the two are distinguishable only
-by whether an archive was configured.
-
-**Which makes DETACHING the operation that converts one into the other**, and that was
-invisible. I4's clamp is gated on an archive being configured, so `set_archive(None)`
-retires it — for every process at once, since the gate reads `meta` — and the next
-maintenance pass treats the files still queued for upload as ordinary retention candidates.
-A log that HAD an archive never asked for the contract above; it inherited it as a side
-effect of a call that reads as "stop using the archive". Measured at 4,025 acknowledged
-offsets of 8,000, deleted by a maintainer in another process that the operator never
-invoked.
-
-So a detach is refused while `local_retention` or `local_rows` is set. Clearing them first
-is how an operator says the loss is intended, which puts the instruction back where this
-section says it belongs. The refusal is blunt — it declines cases that are provably safe —
-because the precise question is "is there an unarchived file retention would reach", and
-answering it properly means keeping the clamp alive across a detach rather than asking
-better questions at the setter. `local_retention = None` is the setting that keeps
-everything, at unbounded local growth.
-
-`local_retention = 0` presupposes an archive: with none, it would delete each file as it
-sealed. Reject the pair at construction rather than honouring it.
+Now every log has an archive: on S3 when one is given, otherwise a local directory under the
+log's own. Eviction drops only what it holds, `set_archive(None)` re-points to the local
+default rather than detaching, and `local_retention = 0` means "evict on publish" on every
+log. The cost moves to the archive: a local one keeps everything until truncation by offset
+or age lands, which is a follow-up.
 
 Raising it is an operation, not a config change: `hydrate(since=…)` fetches archived files
 and re-registers them into the local table. Without it, a raised setting applies only to
@@ -1575,7 +1553,7 @@ Each needs a test.
 | **I1** | The Parquet file is written and fsynced before the Iceberg commit. | The reverse publishes a manifest entry for a file that may not exist. |
 | **I2** | The seal range and its path are persisted before the file is written. | No file can exist that this database cannot name. |
 | **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The archive overlaps the local window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
-| **I4** | A file is never evicted from the local table while a configured archive still lacks it. Vacuous when no archive is configured (§8). | Eviction before registration is data loss. With no archive nothing is owed, and `local_retention` is then a deletion policy the operator asked for — see §8. |
+| **I4** | A file is never evicted from the local table while the archive still lacks it. Every log has one (#98): on S3, or a local directory. | Eviction before registration is data loss. It used to be vacuous for a log with no archive, which made `local_retention` a deletion policy over the only copy — and made detaching an archive a silent conversion into one (§8). |
 | **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
 | **I7** | *Retired with schema changes (#93).* Schema changes reached the archive before the local table. | Logs are immutable (§9), so there is no schema change to order. |
