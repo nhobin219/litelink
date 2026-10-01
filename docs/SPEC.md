@@ -194,7 +194,7 @@ turned out to be application semantics.
 
 **No reader can observe a partial transaction regardless**, so nothing is being given up. A
 seal may split a batch across two files, but the boundary read in §7 returns the table's rows
-plus every buffer row above `hi` — so the union yields the whole batch either way, before or
+plus every buffer row from the table's `end` up — so the union yields the whole batch either way, before or
 after a crash.
 
 **And the truncate argument dissolves with it.** "Revert should land on a transaction
@@ -270,6 +270,13 @@ The published catalog's SQLite file is itself replicated to S3, so other machine
 A REST catalog is a drop-in replacement once more than one machine needs to write.
 
 ---
+
+**Offsets are named for what they are, everywhere.** A range is `[start, end)`, with `end`
+excluded — in the code (`DataFile.start`/`.end`, `span()`, claims), in every SQLite table
+(`start_offset`/`end_offset`), and in the API. A single inclusive offset is a `through`: the
+last one held, as in the `published_through` watermark. `lo`/`hi` read as two values a range
+contains, which is the inclusive convention litelink left in 0.6, and are not used for
+ranges.
 
 ## 3. Write path
 
@@ -572,7 +579,7 @@ integers. The exclusion is interval arithmetic, not mutual exclusion.
 | pair | why it is safe |
 |---|---|
 | seal ∥ anything | the seal appends above every range the others touch |
-| compact ∥ evict | eviction stays below every in-flight merge's `lo` |
+| compact ∥ evict | eviction stays below every in-flight merge's `start` |
 | compact ∥ compact | each claims a distinct run and skips runs already claimed |
 | compact ∥ publish | a merge must not span into what publish is publishing, and vice versa |
 | publish ∥ publish | `register` declines a range the published table already covers |
@@ -596,7 +603,7 @@ So every operation that owns a range writes a claim before its file exists (I2),
 claim carries an owner and an expiry:
 
 ```
-claims(id, owner, expires_at, kind, lo, hi, rel_path)
+claims(id, owner, expires_at, kind, start_offset, end_offset, rel_path)
 ```
 
 One row per **operation** rather than one per **role**. Choosing work means skipping ranges
@@ -675,7 +682,7 @@ eviction only when it is UNDERSTATED, which is why the pre-segment design kept t
 and read one from each; or ship a tool that re-cuts a local straddler, which would also make
 the sentence above true.
 
-The test is `lo <= extent_hi`, with no lower bound. A lower bound was there first and was a
+The test is `start < span_end`, with no lower bound. A lower bound was there first and was a
 hole rather than a safety condition: it exempted exactly the range that starts BELOW the
 extent and runs past it, engulfing the whole thing — every published offset in two files,
 which is the worst version of this rather than an excused one.
@@ -1057,11 +1064,11 @@ meantime. A file whose size was never recorded counts as full, so an unmeasured 
 rewritten on a guess.
 
 ```
-1. Select adjacent files holding < target_compact_size in total, spanning [lo, hi];
+1. Select adjacent files holding < target_compact_size in total, spanning [start, end);
    require compact_min_files.
 2. Scan them into one Arrow table; re-sort by `sort_by`.
 3. Verify row count and per-column min/max against the sources.
-4. local.overwrite(table, overwrite_filter=(offset >= lo) & (offset <= hi))  -- one snapshot
+4. local.overwrite(table, overwrite_filter=(offset >= start) & (offset < end))  -- one snapshot
 5. Upload the compacted file; replicate the same overwrite to the published table.
 ```
 
@@ -1364,7 +1371,7 @@ staging window:
   missing or out-of-order store cost a rollup and never a wrong answer. Only the latest
   version is kept: a read misses it only in the milliseconds around a commit.
 - **Published table:** a row in `buffer.db` describing what the published table holds **below** the staging
-  table. The published leg reads only offsets under the staging table's `lo`, and the published table's
+  table. The published leg reads only offsets under the staging table's `start`, and the published table's
   copy of the staging window would put its maximum timestamp at "minutes ago" and send every hot
   query to the network. Stored because its statistics otherwise live on S3, and eviction —
   usually in another process — is the last moment they are on local disk.
@@ -1410,14 +1417,14 @@ The published table overlaps the staging window, so the tiers cannot simply be u
 its neighbour's **actual extent**, read at query time:
 
 ```
-lo = min(offset) in the staging table's current snapshot
-hi = max(offset) in the staging table's current snapshot
+start = min(offset) in the staging table's current snapshot
+end   = max(offset) + 1, likewise
 
-SELECT * FROM <published table> WHERE offset <  lo   AND <predicates>
+SELECT * FROM <published table> WHERE offset <  start AND <predicates>
 UNION ALL
-SELECT * FROM <staging table>                        WHERE <predicates>
+SELECT * FROM <staging table>                         WHERE <predicates>
 UNION ALL
-SELECT * FROM buffer            WHERE offset >  hi   AND <predicates>
+SELECT * FROM buffer            WHERE offset >= end   AND <predicates>
 ```
 
 Correct at every instant regardless of transient overlap, because `litelink_offset` is monotonic and
@@ -1425,7 +1432,7 @@ the staging window is a contiguous range over it. This is the §7 hot-read bound
 generalised, and it is why **no atomic handoff between the two catalogs is required** —
 which matters, since two Iceberg commits cannot be made atomic with each other.
 
-Both `lo` and `hi` come from manifest column statistics; neither requires opening a data
+Both `start` and `end` come from manifest column statistics; neither requires opening a data
 file. If the staging table is empty (everything evicted), it drops out and the read becomes
 published table plus buffer bounded by the published table's max offset — on a handle that reads the
 published table. On one that does not, the same state is a refusal.
@@ -2605,10 +2612,10 @@ push a tight row filter rather than materializing a scan.
 Both §7 reads with a blob field resolved. Expressible entirely in DuckDB, using `sqlite` to
 attach the buffer, `iceberg` to scan the tables, and `read_blob` for staging.
 
-`lo` and `hi` are §7's names: the min and max of `litelink_offset` over the staging table's current
-snapshot, read from manifest column statistics. The hot read needs only `hi`, which is the
-value §7's hot-read prose calls `boundary`; it is the same number and this section uses `hi`
-throughout so one value carries one name.
+`start` and `end` are §7's names: the staging table's span over `litelink_offset` in its
+current snapshot, `[start, end)`, read from manifest column statistics. The hot read needs only
+`end`, which is the value §7's hot-read prose calls `boundary`; it is the same number and this
+section uses `end` throughout so one value carries one name.
 
 **The column is named `litelink_offset`, not `offset`.** Two reasons, and the second is the
 one that forced it. `offset` is a plausible application column — a byte offset, a page
@@ -2647,7 +2654,7 @@ UNION ALL
 SELECT b."offset", b.event_ts, b.key, s.payload
 FROM buf.buffer b
 LEFT JOIN staging s USING ("offset")
-WHERE b."offset" > $hi AND <predicates>;
+WHERE b."offset" >= $end AND <predicates>;
 ```
 
 **Full-stream read** (published table plus local plus buffer). The published table holds no staging tier, so
@@ -2656,7 +2663,7 @@ its blob column is read directly:
 ```sql
 SELECT "offset", event_ts, key, payload
 FROM iceberg_scan('<published metadata json>')
-WHERE "offset" < $lo AND <predicates>
+WHERE "offset" < $start AND <predicates>
 
 UNION ALL
 
@@ -2669,7 +2676,7 @@ UNION ALL
 SELECT b."offset", b.event_ts, b.key, s.payload
 FROM buf.buffer b
 LEFT JOIN staging s USING ("offset")
-WHERE b."offset" > $hi AND <predicates>;
+WHERE b."offset" >= $end AND <predicates>;
 ```
 
 The blob field changes nothing about the tier boundaries. Both queries bound each tier by its
@@ -2690,7 +2697,7 @@ faster one.
 `LEFT JOIN` rather than inner: a blob field may be null for some rows, and an inner join
 would silently drop them.
 
-**`$lo` and `$hi` are supplied, not computed in SQL.** Expressing either as a scalar subquery
+**`$start` and `$end` are supplied, not computed in SQL.** Expressing either as a scalar subquery
 over `iceberg_scan` would read the offset column rather than manifest statistics, which is the
 opposite of the §7 design. Resolve them through pyiceberg and pass them as parameters.
 
@@ -2701,8 +2708,8 @@ ICEBERG)` against a SQLite catalog fails demanding OAuth2 credentials.) Note thi
 different extension from `ducklake`, whose SQLite catalog support is unrelated.
 
 That constraint happens to coincide with what correctness requires. If DuckDB resolved the
-catalog itself, it would select its own snapshot independently of the one `lo` and `hi` were
-computed from. A seal committing between the two leaves `hi` stale-low against a newer scan,
+catalog itself, it would select its own snapshot independently of the one `start` and `end` were
+computed from. A seal committing between the two leaves `end` stale-low against a newer scan,
 so every row in the gap appears in both the Iceberg branch and the buffer branch. Pinning the
 metadata file makes the boundary and the scan come from one snapshot by construction, which
 is the same argument as deriving boundaries from committed extents rather than flags (I3).

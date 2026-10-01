@@ -79,7 +79,7 @@ def test_a_retired_log_is_all_published_and_nothing_in_staging(
         log.retire()
 
         assert log.staging_rows() == 0
-        assert log._buffer.extent() is None  # noqa: SLF001
+        assert log._buffer.span() is None  # noqa: SLF001
         marker = log._buffer.retired()  # noqa: SLF001
         assert marker is not None
         assert (marker["state"], marker["through"]) == ("retired", total)
@@ -348,13 +348,13 @@ def test_a_retired_log_never_reads_its_buffer(
         assert rows["buffer"][0] == (through + 1, through + 1)
 
     read: list[object] = []
-    original = Buffer.rows_above
+    original = Buffer.rows_from
 
     def counted(buffer: Buffer, boundary: int | None):  # noqa: ANN202
         read.append(boundary)
         return original(buffer, boundary)
 
-    monkeypatch.setattr(Buffer, "rows_above", counted)
+    monkeypatch.setattr(Buffer, "rows_from", counted)
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         assert reader.scan().read_all().num_rows == through
         assert reader.scan(where="event_ts < 10").read_all().num_rows == 10

@@ -482,3 +482,47 @@ def test_a_lapsed_claim_renews_only_while_nobody_has_taken_it(
         assert not stalled.renew(), "renewed a range another owner had taken"
 
         taker.release()
+
+
+def test_a_buffer_with_the_inclusive_column_names_is_renamed_on_open(
+    tmp_path: Path,
+) -> None:
+    """`claim` and `compacting` named their range `lo`/`hi` before every range
+    became half-open. A writer's open renames them to `start_offset` and
+    `end_offset`, keeping their rows, and claims still exclude exactly what
+    overlaps.
+
+    Falsify by dropping `_rename_range_columns` from `Buffer._create`: the
+    claim insert names a column the old table does not have.
+    """
+    import sqlite3
+
+    open_log(tmp_path).close()
+    db = Layout(tmp_path, "s").buffer_db
+    with sqlite3.connect(db) as con:
+        for table in ("claim", "compacting"):
+            con.execute(f"ALTER TABLE {table} RENAME COLUMN start_offset TO lo")
+            con.execute(f"ALTER TABLE {table} RENAME COLUMN end_offset TO hi")
+
+        con.execute("INSERT INTO compacting (lo, hi, rel_path) VALUES (1, 5, 'x')")
+
+    with litelink.open(tmp_path, "s") as log:
+        for table in ("claim", "compacting"):
+            columns = {
+                row[1]
+                for row in log._buffer._con.execute(f"PRAGMA table_info({table})")
+            }
+            assert {"start_offset", "end_offset"} <= columns
+            assert not {"lo", "hi"} & columns
+
+        # Read through the renamed columns by recovery, which queued its file.
+        assert log._buffer.pending_outputs() == []
+        assert "x" in log._buffer.queued_deletions()
+
+        held = log._buffer.claim("compact", 10, 20, new_owner())
+        assert held.acquire()
+        assert not log._buffer.claim("compact", 19, 30, new_owner()).acquire()
+        adjacent = log._buffer.claim("compact", 20, 30, new_owner())
+        assert adjacent.acquire(), "[10, 20) and [20, 30) do not overlap"
+        held.release()
+        adjacent.release()

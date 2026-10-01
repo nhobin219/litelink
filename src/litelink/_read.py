@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 VIEW = "log"
 
 # The name the buffer's unsealed tail is registered under, re-registered per
-# query. NOT an attached database: see `Buffer.rows_above` for why letting
+# query. NOT an attached database: see `Buffer.rows_from` for why letting
 # DuckDB open the SQLite file corrupts it.
 BUFFER_REL = "buf_tail"
 
@@ -243,7 +243,7 @@ def duckdb_connection() -> duckdb.DuckDBPyConnection:
         load_extension(connection, "avro", remote=False)
 
     load_extension(connection, "iceberg", remote=False)
-    # No ATTACH of the buffer database. `Buffer.rows_above` records what that
+    # No ATTACH of the buffer database. `Buffer.rows_from` records what that
     # cost: two SQLite libraries in one process is silent corruption, not a
     # slow path.
 
@@ -388,13 +388,13 @@ class Reader:
         found = terms(cursor, sql, self._schema)
 
         self._table.reload()
-        floor = self._table.extent()
+        floor = self._table.span()
         # The buffer is ruled out only by offset, from its lowest offset, and
         # only BEFORE its rows are read — skipping that read is the point.
         # Sound whenever it is taken: the lowest offset only rises, so a
         # query below it now matches nothing the buffer can later hold.
         tail = (
-            self._buffer.rows_above(None if floor is None else floor[1])
+            self._buffer.rows_from(None if floor is None else floor[1])
             if self._buffer_could_match(found)
             else self._buffer.no_rows()
         )
@@ -495,8 +495,7 @@ class Reader:
                 else self._table.statistics_at(location)
             )
             if local is not None:
-                span = (extent[0], extent[1] + 1)
-                rows.append(row(STAGING, span, self._schema, local))
+                rows.append(row(STAGING, extent, self._schema, local))
 
         table = build(rows, key=KEY) if rows else None
         kept = prune(table, TIERS, found, key=KEY)
@@ -550,7 +549,7 @@ class Reader:
 
             return (
                 f"SELECT {projection} FROM iceberg_scan('{location}')"
-                f' UNION ALL {buffered} WHERE b."{OFFSET}" > {covered[1]}'
+                f' UNION ALL {buffered} WHERE b."{OFFSET}" >= {covered[1]}'
             )
 
         legs = []
@@ -573,7 +572,7 @@ class Reader:
         # registered tail was read against an earlier floor, so it can still
         # hold rows this snapshot has since taken ownership of; without this
         # they would appear in both legs.
-        legs.append(f'{buffered} WHERE b."{OFFSET}" > {extent[1]}')
+        legs.append(f'{buffered} WHERE b."{OFFSET}" >= {extent[1]}')
 
         return " UNION ALL ".join(legs)
 

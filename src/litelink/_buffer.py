@@ -455,12 +455,12 @@ class Buffer:
         # 1,000 acknowledged offsets in neither tier, from a scan and a seal
         # running concurrently through the public API.
         #
-        # Readers do not need this among themselves: `rows_above` holds
+        # Readers do not need this among themselves: `rows_from` holds
         # `_tail_lock` across its fetch, so only one steps at a time. A stale
         # view would be self-correcting there anyway, and structurally so —
         # offsets come from AUTOINCREMENT under one serialised writer and
         # deletions are prefix-only, so what a stale snapshot lacks is always a
-        # SUFFIX, and `_rows("> _tail_hi")` cannot skip it.
+        # SUFFIX, and `_rows(">= _tail_end")` cannot skip it.
         #
         # **This isolates the seal from READERS.** What keeps seals off each
         # other is the CLAIM: `Claim.acquire` filters on range overlap and
@@ -528,10 +528,10 @@ class Buffer:
         # open read transaction**, and `_rows` steps one for the whole of its
         # `fetchall` — so that premise was false and cost acknowledged rows.
         # What actually keeps `_reader` safe is that its one caller,
-        # `rows_above`, holds `_tail_lock` across the fetch; the seal reads on
+        # `rows_from`, holds `_tail_lock` across the fetch; the seal reads on
         # `_sealer` for the same reason. See `_sealer`.
         self._lock = threading.RLock()
-        # The read cache — see `rows_above`. Its own lock rather than the one
+        # The read cache — see `rows_from`. Its own lock rather than the one
         # above, which appends hold: a read must not wait behind a write to
         # look at a table the write cannot invalidate.
         self._tail_lock = threading.Lock()
@@ -546,22 +546,24 @@ class Buffer:
         # so invalidating from inside `shape()` hangs the reader on itself.
         # Found by stack-dumping a suite that had sat idle for 29 minutes.
         self._tail_shape: Shape | None = None
-        self._tail_lo = 0
-        self._tail_hi = 0
-        # The lowest boundary this cache is COMPLETE for — the floor it was
-        # fetched above, not the offset it happens to start at.
+        # The offsets the cached table holds, `[_tail_start, _tail_end)`, taken
+        # from its rows. `_tail_end` is where the next fetch starts.
+        self._tail_start = 0
+        self._tail_end = 0
+        # The lowest `start` this cache is COMPLETE for — the `start` it was
+        # fetched from, not the offset its first row happens to have.
         #
-        # `_tail_lo` is `first_offset - 1`, which on a log whose offsets start
-        # high is far above any boundary a reader asks for before the first
-        # seal: `Reader.query` passes 0 while the staging table has no extent, so
-        # gating on `_tail_lo <= floor` missed on EVERY read and re-converted
-        # the whole buffer per query. Measured at the default 8 MiB first-seal
+        # On a log whose offsets start high, `_tail_start` is far above any
+        # `start` a reader asks for before the first seal: `Reader.query`
+        # passes None while the staging table has no span, so gating on
+        # `_tail_start <= start` missed on EVERY read and re-converted the
+        # whole buffer per query. Measured at the default 8 MiB first-seal
         # window: 4.2 ms/read against 42.
         #
         # Two distinct facts, and conflating them is what cost that. Where the
-        # cache STARTS bounds the slice arithmetic; what it is complete FOR
+        # cache STARTS bounds the slice arithmetic; what it is complete FROM
         # decides whether it can answer at all.
-        self._tail_from = 0
+        self._tail_complete_from = 0
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -657,6 +659,17 @@ class Buffer:
 
         return buffer
 
+    def _rename_range_columns(self, table: str) -> None:
+        """`lo`/`hi` → `start_offset`/`end_offset` on `table`, once."""
+        columns = {
+            str(row[1]) for row in self._con.execute(f"PRAGMA table_info({table})")
+        }
+        if "lo" in columns:
+            self._con.execute(f"ALTER TABLE {table} RENAME COLUMN lo TO start_offset")
+
+        if "hi" in columns:
+            self._con.execute(f"ALTER TABLE {table} RENAME COLUMN hi TO end_offset")
+
     @staticmethod
     def _connect_readonly(path: Path) -> sqlite3.Connection:
         return sqlite3.connect(
@@ -687,7 +700,7 @@ class Buffer:
         # path this database does not already hold — see `pending_delete`.
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS compacting (
-              lo INTEGER, hi INTEGER, rel_path TEXT
+              start_offset INTEGER, end_offset INTEGER, rel_path TEXT
             )
         """)
         # The deletion queue. A file leaves the current snapshot long before it
@@ -817,17 +830,25 @@ class Buffer:
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               owner      TEXT NOT NULL,
               expires_at INTEGER NOT NULL,
-              kind       TEXT NOT NULL,
-              lo         INTEGER NOT NULL,
-              hi         INTEGER NOT NULL,
-              rel_path   TEXT
+              kind         TEXT NOT NULL,
+              start_offset INTEGER NOT NULL,
+              end_offset   INTEGER NOT NULL,
+              rel_path     TEXT
             )
         """)
+        # Both tables named their range `lo`/`hi` before every range became
+        # half-open, and those names read as inclusive. Renamed in place, as
+        # every other table names a range; SQLite carries `claim_live` along.
+        # The values need no conversion: a claim lives 30 s, and recovery
+        # reads only the path from a `compacting` row.
+        self._rename_range_columns("claim")
+        self._rename_range_columns("compacting")
         # Every acquisition asks the same question — is a live claim covering
         # this range — and asks it inside a write transaction, so it is the one
         # query that must not degrade into a scan as claims accumulate.
         self._con.execute("""
-            CREATE INDEX IF NOT EXISTS claim_live ON claim (expires_at, lo, hi)
+            CREATE INDEX IF NOT EXISTS claim_live
+            ON claim (expires_at, start_offset, end_offset)
         """)
         # A buffer carrying the old `lease` table was last written by a build
         # that coordinated through it, and this one coordinates through
@@ -1123,8 +1144,8 @@ class Buffer:
 
         return (row[0] if row else 0) + 1
 
-    def extent(self) -> tuple[int, int] | None:
-        """`(min, max)` offset currently buffered, or None if empty.
+    def span(self) -> tuple[int, int] | None:
+        """The buffered offsets as `[start, end)`, or None if empty.
 
         Two statements, deliberately. SQLite rewrites `min(pk)` or `max(pk)`
         into a single B-tree edge seek ONLY when it is the sole aggregate in
@@ -1143,10 +1164,10 @@ class Buffer:
                 'SELECT max("litelink_offset") FROM buffer'
             ).fetchone()[0]
 
-        return (int(lo), int(hi))
+        return (int(lo), int(hi) + 1)
 
-    def count_above(self, boundary: int) -> int:
-        """How many buffered rows sit above `boundary` — the unsealed tail.
+    def count_from(self, start: int) -> int:
+        """How many buffered rows sit at or above `start` — the unsealed tail.
 
         `litelink_offset` is the INTEGER PRIMARY KEY, so SQLite answers this
         with a rowid range rather than a scan, and rows already sealed but not
@@ -1154,7 +1175,7 @@ class Buffer:
         """
         with self._lock:
             row = self._con.execute(
-                'SELECT count(*) FROM buffer WHERE "litelink_offset" > ?', (boundary,)
+                'SELECT count(*) FROM buffer WHERE "litelink_offset" >= ?', (start,)
             ).fetchone()
 
         return int(row[0])
@@ -1222,7 +1243,7 @@ class Buffer:
                 )
 
     def reserve(self, n: int) -> tuple[int, int]:
-        """Take `n` offsets without writing a row. Returns `(lo, hi)`, inclusive.
+        """Take `n` offsets without writing a row. Returns `[start, end)`.
 
         What bulk ingest needs and nothing else provides (§13.4). A path that
         writes Parquet directly still has to make those offsets unissuable, or
@@ -1295,7 +1316,7 @@ class Buffer:
                 )
                 raise RuntimeError(msg)
 
-        return floor + 1, ceiling
+        return floor + 1, ceiling + 1
 
     def open_group_started(self) -> bool:
         """Whether the open group has taken rows — bulk ingest's third read.
@@ -1344,7 +1365,7 @@ class Buffer:
         range (§3a), that stops being true — and an unbounded read then writes
         every row from the published frontier upward into the new file.
 
-        Nothing catches that at seal time. The local `register` passes no `lo`,
+        Nothing catches that at seal time. The local `register` passes no `start`,
         so `_refuse_straddle` returns early; what fails is later and elsewhere.
         The manifest's own ranges stop being non-overlapping (§4, §6), the local
         leg of a read is an unfiltered `iceberg_scan` so every overlapped row
@@ -1359,11 +1380,11 @@ class Buffer:
         # deleting rows this never saw.
         return self._rows("BETWEEN ? AND ?", (start, end - 1), self._sealer)
 
-    def rows_above(self, boundary: int | None) -> pa.Table:
-        """Buffered rows with `offset > boundary`, as Arrow. The read's input.
+    def rows_from(self, start: int | None) -> pa.Table:
+        """Buffered rows with `offset >= start`, as Arrow. The read's input.
 
-        `boundary` is the staging table's committed extent, so this is §7's
-        unsealed tail — the rows the Iceberg leg does not already carry.
+        `start` is the end of the staging table's committed span, so this is
+        §7's unsealed tail — the rows the Iceberg leg does not already carry.
 
         Read here rather than by the query engine, and that is a correctness
         requirement rather than a preference. DuckDB's sqlite extension carries
@@ -1385,7 +1406,8 @@ class Buffer:
         Measured at a full 8 MiB buffer: 29.4 ms rebuilt, and two thirds of
         that is `fetchall` turning 120,000 values into Python objects.
         """
-        floor = 0 if boundary is None else boundary
+        # Offsets start at 1, so "no boundary" is a `start` of 0.
+        start = 0 if start is None else start
         with self._tail_lock:
             # The tail is an Arrow table under the schema in force when it was
             # built, so a schema change has to discard it. Loud rather than
@@ -1395,15 +1417,15 @@ class Buffer:
             shape = self.shape()
             if self._tail_shape is not shape:
                 self._tail = None
-                self._tail_lo = self._tail_hi = self._tail_from = 0
+                self._tail_start = self._tail_end = self._tail_complete_from = 0
                 self._tail_shape = shape
 
-            cached = self._reusable(floor)
+            cached = self._reusable(start)
             if cached is None:
-                table = self._rows("> ?", (floor,))
-                self._tail_from = floor
+                table = self._rows(">= ?", (start,))
+                self._tail_complete_from = start
             else:
-                fresh = self._rows("> ?", (self._tail_hi,))
+                fresh = self._rows(">= ?", (self._tail_end,))
                 table = (
                     cached if fresh.num_rows == 0 else pa.concat_tables([cached, fresh])
                 )
@@ -1412,65 +1434,72 @@ class Buffer:
                     # copy, so it is amortised rather than paid every time.
                     table = table.combine_chunks()
 
-                # A hit implies `_tail_from <= floor`, so this only ever
-                # raises — the guard above is what makes that true, and a
+                # A hit implies `_tail_complete_from <= start`, so this only
+                # ever raises — the guard above is what makes that true, and a
                 # `max()` here would be dead.
                 #
                 # Conservative in one direction and never wrong in the other:
-                # when `floor` is below where the cache STARTS the slice prunes
+                # when `start` is below where the cache STARTS the slice prunes
                 # nothing, so the cache is still complete from where it was,
                 # and raising loses a later hit rather than serving short. That
                 # costs nothing in practice because the boundary is the staging
-                # table's extent, which only rises.
-                self._tail_from = floor
+                # table's span end, which only rises.
+                self._tail_complete_from = start
 
             self._tail = table
-            # Taken from the DATA, never from `floor`. They are not the same
-            # number: `floor` is the table's boundary, and the first buffered
-            # row above it can be higher still if a seal deleted the rows
-            # between while this was being read. Recording `floor` as though it
-            # were the row before the first made the slice arithmetic below
-            # count from a row that no longer existed, and the miscount hid
-            # buffered rows from every subsequent query — silently, because an
-            # over-long slice comes back empty rather than raising.
+            # Taken from the DATA, never from `start`. They are not the same
+            # number: `start` is the table's boundary, and the first buffered
+            # row at or above it can be higher still if a seal deleted the rows
+            # between while this was being read. Recording `start` as though it
+            # were the first cached row made the slice arithmetic below count
+            # from a row that no longer existed, and the miscount hid buffered
+            # rows from every subsequent query — silently, because an over-long
+            # slice comes back empty rather than raising.
             if table.num_rows:
-                self._tail_lo = int(table.column(OFFSET)[0].as_py()) - 1
-                self._tail_hi = int(table.column(OFFSET)[-1].as_py())
+                self._tail_start = int(table.column(OFFSET)[0].as_py())
+                self._tail_end = int(table.column(OFFSET)[-1].as_py()) + 1
             else:
-                self._tail_lo = self._tail_hi = floor
+                self._tail_start = self._tail_end = start
 
             return table
 
-    def _reusable(self, floor: int) -> pa.Table | None:
-        """The cached tail with everything through `floor` dropped, or None.
+    def _reusable(self, start: int) -> pa.Table | None:
+        """The cached tail with everything below `start` dropped, or None.
+
+        Usable when the cache is complete from at or below `start` and
+        `start` is within what it has fetched: `_tail_complete_from <= start
+        <= _tail_end`.
 
         The slice index is arithmetic — cached offsets are contiguous from
-        `_tail_lo + 1`, so dropping through the clamped `base` drops exactly
-        `base - _tail_lo` rows — and then checked, because that contiguity is
-        a property of AUTOINCREMENT and prefix-only deletion rather than
-        something enforced here. A failed check costs a rebuild, which is what
-        the code did unconditionally before.
+        `_tail_start`, so dropping everything below the clamped `base` drops
+        exactly `base - _tail_start` rows — and then checked, because that
+        contiguity is a property of AUTOINCREMENT and prefix-only deletion
+        rather than something enforced here. A reserved range (`ingest`,
+        `restore`) is a hole no buffered row fills, so a cache spanning one
+        fails the check and is rebuilt; a failed check costs only that.
 
         Both directions are checked. A wrong non-empty slice starts at the
         wrong offset; a wrong EMPTY slice is the dangerous one, because it
-        looks exactly like "nothing buffered above the boundary" and would be
-        returned as an answer. `_tail_hi > floor` says the last cached row
+        looks exactly like "nothing buffered from the boundary" and would be
+        returned as an answer. `_tail_end > start` says the last cached row
         qualifies, so an empty result contradicts the cache itself.
         """
-        if self._tail is None or not (self._tail_from <= floor <= self._tail_hi):
+        if self._tail is None or not (
+            self._tail_complete_from <= start <= self._tail_end
+        ):
             return None
 
-        # Clamped, because a floor BELOW where the cache starts drops nothing
+        # Clamped, because a `start` BELOW where the cache starts drops nothing
         # rather than a negative number of rows. That is the ordinary case on a
-        # log whose offsets start high — every buffered row is already above
-        # the boundary — and the unclamped subtraction is why the guard could
-        # not simply be widened.
-        base = max(floor, self._tail_lo)
-        kept = self._tail.slice(base - self._tail_lo)
+        # log whose offsets start high — every buffered row is already at or
+        # above the boundary — and the unclamped subtraction is why the guard
+        # could not simply be widened.
+        base = max(start, self._tail_start)
+        kept = self._tail.slice(base - self._tail_start)
         if kept.num_rows:
-            if int(kept.column(OFFSET)[0].as_py()) != base + 1:
+            if int(kept.column(OFFSET)[0].as_py()) != base:
                 return None
-        elif self._tail_hi > floor:
+        elif self._tail_end > start:
             return None
 
         return kept
@@ -1535,17 +1564,17 @@ class Buffer:
     def claim(
         self,
         kind: str,
-        lo: int,
-        hi: int,
+        start: int,
+        end: int,
         owner: str,
         rel_path: str | None = None,
         ttl_ms: int = DEFAULT_TTL_MS,
     ) -> Claim:
-        """A claim on the offset range `[lo, hi]`, backed by this database.
+        """A claim on the offsets `[start, end)`, backed by this database.
 
         Handed the connection AND the lock that guards it — see `Claim`.
         """
-        return Claim(self._con, self._lock, kind, lo, hi, owner, rel_path, ttl_ms)
+        return Claim(self._con, self._lock, kind, start, end, owner, rel_path, ttl_ms)
 
     # -- the seal queue ---------------------------------------------------
 
@@ -1671,7 +1700,7 @@ class Buffer:
         range the published table does not have yet — and the machine dying in that
         window loses them, silently, from the middle of the offset space
         (§3a). The caller passes False when replication is on and something is
-        owed to a published table; `release_published` is what removes them afterwards.
+        owed to a published table; `release_below` is what removes them afterwards.
 
         Only the CALLER can decide that, which is why it is a parameter rather
         than a check here: this object knows nothing about published tables.
@@ -1850,7 +1879,7 @@ class Buffer:
     def published_records(
         self, prefix: str, floor: int
     ) -> list[tuple[str, int, int, int]]:
-        """Landed copies under `prefix`, keyed by PATH: `(rel_path, lo, hi, bytes)`.
+        """Landed copies under `prefix`, keyed by PATH: `(rel_path, start, end, bytes)`.
 
         Reconciliation matches by path, and `published_ranges` answers in bare
         offsets — so it cannot serve. Bounded by `floor` like the manifest walk
@@ -2001,7 +2030,7 @@ class Buffer:
         def wanted(path: str) -> bool:
             return path.startswith(boundary) if boundary is not None else "://" in path
 
-        return sorted((lo, hi) for lo, hi, path in rows if wanted(path))
+        return sorted((start, end) for start, end, path in rows if wanted(path))
 
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.
@@ -2402,7 +2431,7 @@ class Buffer:
         return None if row is None or row[0] is None else int(row[0])
 
     def no_rows(self) -> pa.Table:
-        """A buffer tail with no rows, shaped as `rows_above` shapes one.
+        """A buffer tail with no rows, shaped as `rows_from` shapes one.
 
         For a read that has ruled the buffer out: its leg stays in the union,
         empty, so nothing about the query's shape changes. Read on the reader
@@ -2530,7 +2559,7 @@ class Buffer:
 
     # -- compaction bookkeeping -------------------------------------------
 
-    def claim_compaction(self, lo: int, hi: int, rel_path: str) -> None:
+    def claim_compaction(self, start: int, end: int, rel_path: str) -> None:
         """Record a compaction's output path before the file exists.
 
         The seal's I2 argument applied to the other writer: a compaction that
@@ -2546,11 +2575,12 @@ class Buffer:
         # clears its own.
         with self._lock:
             self._con.execute(
-                "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
-                (lo, hi, rel_path),
+                "INSERT INTO compacting (start_offset, end_offset, rel_path)"
+                " VALUES (?, ?, ?)",
+                (start, end, rel_path),
             )
 
-    def claim_output(self, lo: int, hi: int, rel_path: str) -> None:
+    def claim_output(self, start: int, end: int, rel_path: str) -> None:
         """Record one more output path, without clearing the others.
 
         A compaction writes one file and `claim_compaction` says so by
@@ -2561,14 +2591,15 @@ class Buffer:
         """
         with self._lock:
             self._con.execute(
-                "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
-                (lo, hi, rel_path),
+                "INSERT INTO compacting (start_offset, end_offset, rel_path)"
+                " VALUES (?, ?, ?)",
+                (start, end, rel_path),
             )
 
     def pending_compaction(self) -> tuple[int, int, str] | None:
         with self._lock:
             row = self._con.execute(
-                "SELECT lo, hi, rel_path FROM compacting"
+                "SELECT start_offset, end_offset, rel_path FROM compacting"
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
@@ -2578,10 +2609,11 @@ class Buffer:
         several for an interrupted published rewrite."""
         with self._lock:
             rows = self._con.execute(
-                "SELECT lo, hi, rel_path FROM compacting ORDER BY rowid"
+                "SELECT start_offset, end_offset, rel_path FROM compacting"
+                " ORDER BY rowid"
             ).fetchall()
 
-        return [(int(lo), int(hi), str(path)) for lo, hi, path in rows]
+        return [(int(start), int(end), str(path)) for start, end, path in rows]
 
     def clear_compaction(self, rel_path: str | None = None) -> None:
         """Retire one claim, or every claim.
@@ -2777,8 +2809,9 @@ class Buffer:
 
         self._seed_group()
 
-    def release_published(self, boundary: int) -> int:
-        """Drop buffer rows the published table now holds. Returns how many.
+    def release_below(self, end: int) -> int:
+        """Drop buffer rows below `end`, which the published table now holds.
+        Returns how many.
 
         The other half of `finish_seal(discard=False)`: those rows stayed
         because the published table did not have them yet, and this is what notices
@@ -2797,7 +2830,7 @@ class Buffer:
         """
         with self._lock, self._con:
             cursor = self._con.execute(
-                'DELETE FROM buffer WHERE "litelink_offset" <= ?', (boundary,)
+                'DELETE FROM buffer WHERE "litelink_offset" < ?', (end,)
             )
 
         return cursor.rowcount
@@ -2838,7 +2871,7 @@ class Buffer:
         data rather than an implicit rowid SQLite may renumber: values keep their
         gaps and are never rewritten. `sqlite_sequence` survives too, including
         across a VACUUM of a FULLY DRAINED buffer — the ordinary state after
-        `release_published` on a log the published table has caught up with, and the case
+        `release_below` on a log the published table has caught up with, and the case
         that would matter: were that counter lost, AUTOINCREMENT would restart
         at 1 and reissue offsets the published table already holds. Verified both
         directly.
@@ -2875,7 +2908,7 @@ class Buffer:
     def _drop_tail(self) -> None:
         with self._tail_lock:
             self._tail = None
-            self._tail_lo = self._tail_hi = self._tail_from = 0
+            self._tail_start = self._tail_end = self._tail_complete_from = 0
 
     def close(self) -> None:
         # The cache goes too. It is bounded by the unsealed tail and falls to

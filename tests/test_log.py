@@ -105,7 +105,7 @@ def test_seal_empties_the_buffer_but_not_the_log(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(4))
         log.seal()
-        assert log._buffer.extent() is None
+        assert log._buffer.span() is None
         assert len(read_all(log)) == 4
 
 
@@ -114,7 +114,7 @@ def test_offsets_never_reused_after_the_buffer_empties(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(3))
         log.seal()
-        assert log._buffer.extent() is None
+        assert log._buffer.span() is None
         assert log.extend(rows(1, start=3)) == [4]
         assert log.staging_extent() == (1, 4)
 
@@ -153,19 +153,19 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
     """
     with open_log(tmp_path) as log:
         log.extend(rows(4))
-        extent = log._buffer.extent()
-        assert extent is not None
-        end = extent[1] + 1
+        span = log._buffer.span()
+        assert span is not None
+        end = span[1]
         rel_path = log._layout.seal_path(1, end, "tok")
         log._buffer.claim_seal(1, end, rel_path)
         log._write_and_commit(1, end, rel_path)
         # deliberately NOT finish_seal: this is the crash window
-        assert log._buffer.extent() is not None
+        assert log._buffer.span() is not None
         assert len(read_all(log)) == 4
 
     with open_log(tmp_path) as recovered:
         assert recovered._buffer.pending_seal() is None
-        assert recovered._buffer.extent() is None
+        assert recovered._buffer.span() is None
         assert len(read_all(recovered)) == 4
 
 
@@ -1017,7 +1017,7 @@ def test_start_offset_reserves_the_range_below_it(tmp_path: Path) -> None:
         assert log.extend(rows(3)) == [1001, 1002, 1003]
         log.seal()
 
-        assert log._table.extent() == (1000, 1003)
+        assert log._table.span() == (1000, 1004)
         assert log.scan().read_all().num_rows == 4
 
 
@@ -1060,16 +1060,17 @@ def test_the_tail_cache_serves_a_seeded_log_before_its_first_seal(
 ) -> None:
     """Assert HITS, not rows — the rows are right either way.
 
-    `_tail_lo` is `first_offset - 1`, which on a seeded log is far above the
-    boundary `Reader.query` passes while the staging table has no extent (0). A
-    guard gating on `_tail_lo <= floor` therefore missed on every read and
-    re-converted the whole buffer per query — 4.2 ms/read against 42 at the
-    default 8 MiB first-seal window.
+    `_tail_start` is the first cached offset, which on a seeded log is far
+    above the boundary `Reader.query` passes while the staging table has no
+    span (none, read as 0). A guard gating on `_tail_start <= start` therefore
+    missed on every read and re-converted the whole buffer per query — 4.2
+    ms/read against 42 at the default 8 MiB first-seal window.
 
     Three broken variants all return correct rows and all pass the rest of this
-    suite: the unguarded original (0 hits of 20), one that pins `_tail_from` at
-    the buffer's floor instead of only raising it (about half), and one that
-    drops the lower bound entirely. So this asserts the mechanism.
+    suite: the unguarded original (0 hits of 20), one that pins
+    `_tail_complete_from` at the buffer's first offset instead of only raising
+    it (about half), and one that drops the lower bound entirely. So this
+    asserts the mechanism.
     """
     log = litelink.new(tmp_path, "s", schema=SCHEMA, start_offset=1_000_000)
     with log:
@@ -1078,9 +1079,9 @@ def test_the_tail_cache_serves_a_seeded_log_before_its_first_seal(
         hits = 0
         original = Buffer._reusable
 
-        def counting(self: Buffer, floor: int) -> pa.Table | None:
+        def counting(self: Buffer, start: int) -> pa.Table | None:
             nonlocal hits
-            got = original(self, floor)
+            got = original(self, start)
             hits += got is not None
 
             return got
@@ -1097,25 +1098,25 @@ def test_the_tail_cache_serves_a_seeded_log_before_its_first_seal(
 
 
 def test_the_tail_cache_prunes_what_the_boundary_excludes(tmp_path: Path) -> None:
-    """The slice must still drop rows at or below `floor`.
+    """The slice must still drop rows below `start`.
 
-    Asked of `rows_above` directly, because going through `scan()` cannot see
+    Asked of `rows_from` directly, because going through `scan()` cannot see
     it: a seal deletes the rows it covered, so the buffer holds nothing below
     the boundary and the slice has nothing to prune. The bug this guards
     against — returning the whole cache regardless of `floor` — is invisible
     there and returns duplicate rows here.
 
-    Falsify by slicing at `self._tail_lo` instead of `max(floor, _tail_lo)`:
-    the second call returns 40 rows instead of 20.
+    Falsify by slicing from 0 instead of `max(start, _tail_start) -
+    _tail_start`: the second call returns 40 rows instead of 20.
     """
     with open_log(tmp_path) as log:
         log.extend(rows(40))
         buffer = log._buffer
 
-        assert buffer.rows_above(0).num_rows == 40
-        assert buffer.rows_above(20).num_rows == 20
-        assert buffer.rows_above(39).num_rows == 1
-        assert buffer.rows_above(40).num_rows == 0
+        assert buffer.rows_from(1).num_rows == 40
+        assert buffer.rows_from(21).num_rows == 20
+        assert buffer.rows_from(40).num_rows == 1
+        assert buffer.rows_from(41).num_rows == 0
 
 
 def test_the_tail_cache_refuses_a_boundary_below_what_it_holds(
@@ -1127,15 +1128,15 @@ def test_the_tail_cache_refuses_a_boundary_below_what_it_holds(
     to a lower boundary returns fewer rows than exist — silently, since the
     result looks like a perfectly ordinary answer.
 
-    Falsify by dropping the lower bound (`floor <= _tail_hi` alone): the second
-    call returns the 10 cached rows instead of all 40.
+    Falsify by dropping the lower bound (`start <= _tail_end` alone): the
+    second call returns the 10 cached rows instead of all 40.
     """
     with open_log(tmp_path) as log:
         log.extend(rows(40))
         buffer = log._buffer
 
-        assert buffer.rows_above(30).num_rows == 10
-        assert buffer.rows_above(0).num_rows == 40
+        assert buffer.rows_from(31).num_rows == 10
+        assert buffer.rows_from(1).num_rows == 40
 
 
 def test_the_identity_surface_is_properties_not_methods(tmp_path: Path) -> None:

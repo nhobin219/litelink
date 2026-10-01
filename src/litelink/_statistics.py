@@ -209,22 +209,23 @@ def rollup(
     )
 
 
-def _offsets(schema: Schema, data_file: DataFile) -> tuple[int, int]:
-    """The offset range one file covers. Every litelink file has these bounds."""
+def file_span(schema: Schema, data_file: DataFile) -> tuple[int, int]:
+    """The offsets one file covers, `[start, end)`. Every litelink file has
+    these bounds; Iceberg's upper one is the last offset held."""
     field = schema.find_field(OFFSET)
     return (
         from_bytes(field.field_type, data_file.lower_bounds[field.field_id]),
-        from_bytes(field.field_type, data_file.upper_bounds[field.field_id]),
+        from_bytes(field.field_type, data_file.upper_bounds[field.field_id]) + 1,
     )
 
 
 def staging_span(schema: Schema, files: Sequence[DataFile]) -> tuple[int, int] | None:
-    """The offset range the local files cover, or None when there are none."""
-    covered = [_offsets(schema, data_file) for data_file in files]
+    """The `[start, end)` the local files cover, or None when there are none."""
+    covered = [file_span(schema, data_file) for data_file in files]
     if not covered:
         return None
 
-    return min(lo for lo, _ in covered), max(hi for _, hi in covered)
+    return min(start for start, _ in covered), max(end for _, end in covered)
 
 
 def below_staging(
@@ -241,21 +242,22 @@ def below_staging(
     beyond = []
     straddles = False
     for data_file in files:
-        lo, hi = _offsets(schema, data_file)
-        if span is None or hi < span[0] or lo > span[1]:
+        start, end = file_span(schema, data_file)
+        if span is None or end <= span[0] or start >= span[1]:
             beyond.append(data_file)
-        elif lo < span[0] or hi > span[1]:
+        elif start < span[0] or end > span[1]:
             beyond.append(data_file)
             straddles = True
 
     return beyond, straddles
 
 
-def above(buffered: pa.Table, ceiling: int) -> pa.Table:
-    """The buffered rows above every file: the ones no tier's file holds yet."""
+def rows_at_or_after(buffered: pa.Table, start: int) -> pa.Table:
+    """The buffered rows from `start` — the end of every file, so the ones no
+    tier's file holds yet."""
     offsets = buffered.column(OFFSET).to_pylist()
 
-    return buffered.slice(sum(1 for offset in offsets if offset <= ceiling))
+    return buffered.slice(sum(1 for offset in offsets if offset < start))
 
 
 def uncounted(statistics: TierStatistics) -> TierStatistics:
@@ -313,12 +315,12 @@ def whole_log(
         published_schema, published_files = published
         beyond, straddles = below_staging(span, published_schema, published_files)
         parts.append(rollup(None, published_schema, beyond))
-        ceiling = max([ceiling, *(_offsets(published_schema, f)[1] for f in beyond)])
+        ceiling = max([ceiling, *(file_span(published_schema, f)[1] for f in beyond)])
 
     # Above every file, rather than above the staging table alone: with the
     # staging table evicted dry the published table is the boundary, and a seal that
     # keeps its rows leaves them here too.
-    parts.append(_from_rows(above(buffered, ceiling)))
+    parts.append(_from_rows(rows_at_or_after(buffered, ceiling)))
 
     merged = _merge(names, parts)
 

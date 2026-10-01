@@ -41,7 +41,7 @@ import duckdb
 # The §7 read path: iceberg_scan for the table leg. The buffer leg is NOT read
 # by DuckDB — the `sqlite_scanner` was removed from this list because attaching
 # the buffer put it under two independently linked SQLite libraries in one
-# process and corrupted it; see `Buffer.rows_above`. It is handed to DuckDB as
+# process and corrupted it; see `Buffer.rows_from`. It is handed to DuckDB as
 # Arrow instead, which needs no extension.
 #
 # `avro` is iceberg's dependency, not a choice: iceberg's init function

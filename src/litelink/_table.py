@@ -28,7 +28,7 @@ from pyiceberg.table import StaticTable
 from pyiceberg.transforms import IdentityTransform
 
 from litelink._fs import fsync
-from litelink._predicates import offset_at_or_below, offset_between
+from litelink._predicates import offset_below, offset_in
 from litelink._s3 import S3Options
 from litelink._statistics import TierStatistics, rollup
 
@@ -93,8 +93,9 @@ class DataFile:
     path: str
     size: int
     rows: int
-    lo: int
-    hi: int
+    # The offsets it holds, `[start, end)` like every range in litelink.
+    start: int
+    end: int
 
 
 # The catalog names each `SqlCatalog` is built with, and the key its rows are
@@ -302,10 +303,10 @@ def forget_published_entry(layout: Layout) -> bool:
     return bool(cursor.rowcount)
 
 
-def published_extent(
+def published_span(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[int, int] | None:
-    """`(lo, hi)` of the published table at `prefix`, read from the bucket alone.
+    """`[start, end)` of the published table at `prefix`, read from the bucket alone.
 
     Answers "what does that published table hold" WITHOUT touching `published.db`, which
     is what makes it usable as a pre-flight check. The catalog row is keyed by
@@ -327,7 +328,7 @@ def published_extent(
 
     table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
 
-    return LogTable(None, layout, table, prefix).extent()  # ty: ignore
+    return LogTable(None, layout, table, prefix).span()  # ty: ignore
 
 
 # The published table property `retire()` sets: JSON `{"through": …, "at": …}`.
@@ -339,7 +340,7 @@ def published_retired(
 ) -> dict[str, object] | None:
     """The retirement the published table at `prefix` records, read from the bucket alone.
 
-    Like `published_extent`: the published pointer, then the metadata it names,
+    Like `published_span`: the published pointer, then the metadata it names,
     with no catalog involved — so `restore` can ask before it builds anything.
     None when the published table has no hint or records no retirement.
     """
@@ -359,7 +360,7 @@ def published_columns(
 ) -> tuple[str, ...] | None:
     """The column names of the published table at `prefix`, read from the bucket alone.
 
-    The sibling of `published_extent` and for the same reason: a pre-flight
+    The sibling of `published_span` and for the same reason: a pre-flight
     check has to ask about a published table this log is not pointed at yet, and
     `open_published` on a different prefix either raises on the boundary check
     or drops a catalog row as a side effect.
@@ -429,8 +430,8 @@ class LogTable:
         # different depths of the metadata tree. Counts are summarised in the
         # manifest list; per-file bounds are only in the manifest entries, which
         # means opening each manifest.
-        self._extent_at: str | None = None
-        self._extent: tuple[int, int] | None = None
+        self._span_at: str | None = None
+        self._span: tuple[int, int] | None = None
         self._counts_at: str | None = None
         # The entry walk, cached against the same pointer. Manifest MERGING
         # already collapses one manifest per commit into one for the table —
@@ -900,8 +901,9 @@ class LogTable:
                 path=self._name(path),
                 size=int(size),
                 rows=int(rows),
-                lo=from_bytes(field.field_type, dict(lower)[field.field_id]),
-                hi=from_bytes(field.field_type, dict(upper)[field.field_id]),
+                start=from_bytes(field.field_type, dict(lower)[field.field_id]),
+                # Iceberg's upper bound is the last offset held.
+                end=from_bytes(field.field_type, dict(upper)[field.field_id]) + 1,
             )
             for path, size, rows, lower, upper in zip(
                 files["file_path"].to_pylist(),
@@ -913,10 +915,10 @@ class LogTable:
             )
         ]
 
-        return sorted(found, key=lambda f: f.lo)
+        return sorted(found, key=lambda f: f.start)
 
-    def extent(self) -> tuple[int, int] | None:
-        """`(lo, hi)` over the current snapshot — §7's tier boundary.
+    def span(self) -> tuple[int, int] | None:
+        """`[start, end)` over the current snapshot — §7's tier boundary.
 
         Cached against `metadata_location`, which is the version pointer: an
         unchanged pointer is the same snapshot, so the extent cannot have moved.
@@ -933,10 +935,10 @@ class LogTable:
         with self._lock:
             self._refresh()
 
-            return self._extent
+            return self._span
 
     def snapshot(self) -> tuple[str, tuple[int, int] | None]:
-        """The metadata pointer and the extent it belongs to, read together.
+        """The metadata pointer and the span it belongs to, read together.
 
         Two calls could not be paired safely: a commit between them hands a
         reader a new snapshot with an old boundary, or the reverse, and each
@@ -946,7 +948,7 @@ class LogTable:
         with self._lock:
             self._refresh()
 
-            return self.metadata_location, self._extent
+            return self.metadata_location, self._span
 
     def file_count(self) -> int:
         """How many data files the current snapshot holds.
@@ -995,11 +997,11 @@ class LogTable:
 
     def _refresh(self) -> None:
         location = self.metadata_location
-        if location != self._extent_at:
-            self._extent = self._read_extent()
-            self._extent_at = location
+        if location != self._span_at:
+            self._span = self._read_span()
+            self._span_at = location
 
-    def _read_extent(self) -> tuple[int, int] | None:
+    def _read_span(self) -> tuple[int, int] | None:
         """Offset bounds straight off the manifest entries.
 
         Deliberately not `inspect.files()`, which materialises an 18-column
@@ -1029,7 +1031,8 @@ class LogTable:
                     )
                 )
 
-        return None if not lows else (min(lows), max(highs))
+        # Iceberg's upper bounds are the last offset held.
+        return None if not lows else (min(lows), max(highs) + 1)
 
     def statistics_at(self, location: str) -> TierStatistics | None:
         """Every column's rollup over the snapshot at `location`, or None.
@@ -1337,9 +1340,9 @@ class LogTable:
     def register(
         self,
         paths: list[str],
-        sealed_through: int | None = None,
+        end: int | None = None,
         published_through: int = 0,
-        lo: int | None = None,
+        start: int | None = None,
     ) -> bool:
         """Add already-written files to the table, in ONE commit (§4 step 2).
 
@@ -1347,9 +1350,10 @@ class LogTable:
         itself and commits afterwards, so a crash in between orphans a file
         under a name nothing recorded — exactly what I2 exists to prevent.
 
-        `sealed_through` is the exclusive end of the range this file covers,
-        and passing it makes the commit a no-op if the range is already in the
-        table. That is what closes the race two owners can otherwise win.
+        `end` is the exclusive end of the range these files cover, and passing
+        it makes the commit a no-op if the range is already in the table —
+        here, or published through `published_through` (the last offset the
+        published table holds). That is what closes the race two owners can otherwise win.
 
         Iceberg already serialises them: both compare-and-swap against the same
         pointer, one moves it, the other raises `CommitFailedException`. What
@@ -1384,14 +1388,12 @@ class LogTable:
 
         def add() -> None:
             nonlocal added
-            if sealed_through is not None and (
-                self._covers(sealed_through) or published_through >= sealed_through - 1
-            ):
+            if end is not None and (self._covers(end) or published_through + 1 >= end):
                 added = False
 
                 return
 
-            self._refuse_straddle(lo)
+            self._refuse_straddle(start)
             added = True
             self._table.add_files(paths)
 
@@ -1399,7 +1401,7 @@ class LogTable:
 
         return added
 
-    def _refuse_straddle(self, lo: int | None) -> None:
+    def _refuse_straddle(self, start: int | None) -> None:
         """Refuse a range that PARTIALLY overlaps what this table holds.
 
         The last line of defence, and the only one that cannot be reasoned
@@ -1417,16 +1419,16 @@ class LogTable:
         each such path is a fresh piece of reasoning; this is one check that
         holds however the reasoning turns out.
 
-        The test is `lo <= covered[1]`, with no lower bound, and the missing
-        lower bound is the point. `covered[0] <= lo` was there first and was a
+        The test is `start < covered[1]`, with no lower bound, and the missing
+        lower bound is the point. `covered[0] <= start` was there first and was a
         hole rather than a safety condition: it exempted exactly the range that
         starts BELOW the extent and spans past it, engulfing the whole thing —
         every published offset in two files at once, which is the worst version
         of what this exists to stop, not an excused one.
 
         Nothing legitimate is refused. `publish` pushes only files above the
-        published table's extent, so a batch whose first file starts at or below
-        `covered[1]` necessarily contains that offset — the last row of the
+        published table's span, so a batch whose first file starts below
+        `covered[1]` necessarily contains `covered[1] - 1` — the last row of the
         published table's top file, a real published row — and is a genuine overlap
         however it is shaped. Whole-batch replays are excused earlier, by
         `_covers`.
@@ -1445,20 +1447,20 @@ class LogTable:
         backfills those rows from the published table's manifest. SPEC §4a records the
         window and what would close it.
         """
-        if lo is None:
+        if start is None:
             return
 
-        covered = self.extent()
-        if covered is not None and lo <= covered[1]:
+        covered = self.span()
+        if covered is not None and start < covered[1]:
             msg = (
-                f"refusing a range starting at {lo}, which reaches into this "
-                f"table's extent {covered} without being covered by it: "
+                f"refusing a range starting at {start}, which reaches into this "
+                f"table's span {covered} without being covered by it: "
                 "admitting it would put those offsets in two files at once"
             )
             raise ValueError(msg)
 
-    def _covers(self, sealed_through: int) -> bool:
-        """Whether the table already holds everything below `sealed_through`.
+    def _covers(self, end: int) -> bool:
+        """Whether the table already holds everything below `end`.
 
         Data files cover contiguous, non-overlapping offset ranges (§4), so the
         extent's upper bound answers this on its own.
@@ -1471,12 +1473,12 @@ class LogTable:
         holding [0, 999] serves 200-999 from no leg at all, until eviction
         drops it again up to `staging_retention` later.
         """
-        extent = self.extent()
+        span = self.span()
 
-        return extent is not None and extent[1] >= sealed_through - 1
+        return span is not None and span[1] >= end
 
-    def replace_range(self, lo: int, hi: int, paths: Sequence[str]) -> None:
-        """Swap `[lo, hi]` for already-written files, in one snapshot (§6).
+    def replace_range(self, start: int, end: int, paths: Sequence[str]) -> None:
+        """Swap `[start, end)` for already-written files, in one snapshot (§6).
 
         `overwrite()` would do this in a single call, but it writes the output
         itself — putting a path on disk this process only learns about
@@ -1490,16 +1492,14 @@ class LogTable:
 
         def swap() -> None:
             with self._table.transaction() as transaction:
-                transaction.delete(delete_filter=offset_between(lo, hi))
+                transaction.delete(delete_filter=offset_in(start, end))
                 transaction.add_files(list(paths))
 
         self._commit(swap)
 
-    def evict_through(self, boundary: int) -> None:
-        """Drop every file at or below `boundary` from the current snapshot (§8)."""
-        self._commit(
-            lambda: self._table.delete(delete_filter=offset_at_or_below(boundary))
-        )
+    def evict_below(self, end: int) -> None:
+        """Drop every file below `end` from the current snapshot (§8)."""
+        self._commit(lambda: self._table.delete(delete_filter=offset_below(end)))
 
     def expire_snapshots_older_than(self, cutoff: datetime) -> None:
         """Expire snapshot METADATA. Does not delete any file — see §6."""
@@ -1509,8 +1509,8 @@ class LogTable:
             )
         )
 
-    def scan_range(self, lo: int, hi: int) -> pa.Table:
-        return self._table.scan(row_filter=offset_between(lo, hi)).to_arrow()
+    def scan_range(self, start: int, end: int) -> pa.Table:
+        return self._table.scan(row_filter=offset_in(start, end)).to_arrow()
 
     def ensure_metadata_properties(self) -> None:
         """Apply the metadata-retention properties to a table that predates them."""

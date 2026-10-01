@@ -60,10 +60,10 @@ from litelink._statistics import (
     Tier,
     TierStatistics,
     _from_rows,
-    _offsets,
-    above,
     below_staging,
+    file_span,
     rollup,
+    rows_at_or_after,
     staging_span,
     uncounted,
     whole_log,
@@ -73,8 +73,8 @@ from litelink._table import (
     LogTable,
     forget_published_entry,
     published_columns,
-    published_extent,
     published_retired,
+    published_span,
 )
 from litelink._tiers import PUBLISHED as PUBLISHED_TIER
 from litelink._tiers import STAGING as STAGING_TIER
@@ -381,11 +381,6 @@ def _span(start: int, end: int) -> tuple[int, int] | None:
     return None if end <= start else (start, end)
 
 
-def _half_open(extent: tuple[int, int] | None) -> tuple[int, int] | None:
-    """An inclusive `(lo, hi)` extent as `[lo, hi + 1)`."""
-    return None if extent is None else (extent[0], extent[1] + 1)
-
-
 def _now() -> str:
     """A timestamp a person will read."""
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -661,11 +656,9 @@ class LogHandle:
         if not self._published_required():
             return self._buffer.next_offset()
 
-        buffered = self._buffer.extent()
+        buffered = self._buffer.span()
 
-        return (
-            max(self._checked_extent()[1], 0 if buffered is None else buffered[1]) + 1
-        )
+        return max(self._checked_span()[1], 0 if buffered is None else buffered[1])
 
     def buffered_rows(self) -> int:
         """Rows durable in the buffer but not yet sealed.
@@ -676,7 +669,7 @@ class LogHandle:
         until the published table has the range, so its row count is not the unsealed
         tail.
 
-        **Through `staging_extent`, which reloads.** `LogTable.extent` compares
+        **It reloads first.** `LogTable.span` compares
         against this handle's in-memory `metadata_location` and resolves
         nothing, so reading it directly pins the boundary to whatever snapshot
         was last loaded and every row another process has since sealed still
@@ -691,9 +684,9 @@ class LogHandle:
         first in the same tuple.
         """
         self._table.reload()
-        extent = self._table.extent()
+        span = self._table.span()
 
-        return self._buffer.count_above(0 if extent is None else extent[1])
+        return self._buffer.count_from(0 if span is None else span[1])
 
     def staging_rows(self) -> int:
         """Rows in the staging table, from the manifests."""
@@ -714,7 +707,7 @@ class LogHandle:
         """
         self._table.reload()
 
-        return _half_open(self._table.extent())
+        return self._table.span()
 
     def published_through(self) -> int:
         """Highest offset the published table is known to hold, 0 if none (§5, I4).
@@ -796,7 +789,7 @@ class LogHandle:
         # published table LAST: eviction follows registration (I4), so a published
         # snapshot taken after the local one holds everything the local one
         # has already given up.
-        buffered = self._buffer.rows_above(None)
+        buffered = self._buffer.rows_from(None)
         self._table.reload()
         local_schema, local_files = self._table.live_files()
         span = staging_span(local_schema, local_files)
@@ -805,7 +798,9 @@ class LogHandle:
             # With local files, nothing in the published table reaches above them, so
             # the buffer's part needs no network read.
             ceiling = 0 if span is None else span[1]
-            return self._retier("buffer", _from_rows(above(buffered, ceiling)))
+            return self._retier(
+                "buffer", _from_rows(rows_at_or_after(buffered, ceiling))
+            )
 
         remote = None
         published = self._published.table()
@@ -829,10 +824,12 @@ class LogHandle:
         ceiling = 0 if span is None else span[1]
         if remote is not None:
             beyond, straddles = below_staging(span, remote[0], remote[1])
-            ceiling = max([ceiling, *(_offsets(remote[0], f)[1] for f in beyond)])
+            ceiling = max([ceiling, *(file_span(remote[0], f)[1] for f in beyond)])
 
         if tier == "buffer":
-            return self._retier("buffer", _from_rows(above(buffered, ceiling)))
+            return self._retier(
+                "buffer", _from_rows(rows_at_or_after(buffered, ceiling))
+            )
 
         if remote is None:
             msg = f"log {self.name!r} has no published table to take statistics from"
@@ -882,13 +879,11 @@ class LogHandle:
         self._table.reload()
         location, extent = self._table.snapshot()
 
-        # Everything here is `[start, end)`. The stored rows already are; the
-        # snapshot's extent and the buffer's are inclusive, and converted once.
         cached = stored.get(STAGING_TIER)
         if cached is not None and cached.version == location:
             local = _span(*cached.offsets)
         else:
-            local = _half_open(extent)
+            local = extent
 
         published_row = stored.get(PUBLISHED_TIER)
         if published_row is not None:
@@ -898,7 +893,7 @@ class LogHandle:
         else:
             below = None
 
-        held = _half_open(self._buffer.extent())
+        held = self._buffer.span()
         ceiling = max((r[1] for r in (below, local) if r is not None), default=0)
         buffer = None if held is None else _span(max(held[0], ceiling), held[1])
 
@@ -923,13 +918,12 @@ class LogHandle:
         except FileNotFoundError as exc:
             raise self._swept(exc) from exc
 
-        spans = [_offsets(schema, f) for f in files]
+        spans = [file_span(schema, f) for f in files]
         below = [s for s in spans if local is None or s[0] < local[0]]
         if not below:
             return None
 
-        # `_offsets` is inclusive; the range is `[start, end)`.
-        return min(lo for lo, _ in below), max(hi for _, hi in below) + 1
+        return min(start for start, _ in below), max(end for _, end in below)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1021,16 +1015,16 @@ class LogHandle:
         # files" on one another process has just evicted — that would drop the
         # published leg and serve short with no error.
         self._table.reload()
-        if self._table.extent() is not None:
+        if self._table.span() is not None:
             return False
 
-        return self._published_extent() is not None
+        return self._published_span() is not None
 
-    def _published_extent(self) -> tuple[int, int] | None:
-        """The published table's extent, forcing a real re-read, or None if unreachable.
+    def _published_span(self) -> tuple[int, int] | None:
+        """The published table's span, forcing a real re-read, or None if unreachable.
 
         **The re-read is not optional.** Both caches short-circuit —
-        `Published.table` on a live handle and `LogTable.extent` on an unchanged
+        `Published.table` on a live handle and `LogTable.span` on an unchanged
         `metadata_location` — so without `reload()` a long-lived reader would
         answer from the pointer it last saw, and `end_offset()` would report
         a published table another process has since committed past.
@@ -1047,19 +1041,19 @@ class LogHandle:
 
             adopted.reload()
 
-            return adopted.extent()
+            return adopted.span()
         except FileNotFoundError as exc:
             raise self._swept(exc) from exc
 
-    def _checked_extent(self) -> tuple[int, int]:
-        """The published table's extent, or a refusal — for when it is load-bearing.
+    def _checked_span(self) -> tuple[int, int]:
+        """The published table's span, or a refusal — for when it is load-bearing.
 
         Two failures, and neither may be silent. An unreachable published table would
         otherwise fall through to the buffer leg, which on an empty staging table
         is every published row missing with no error; and a published table reporting
         no extent has nothing for this to merge.
         """
-        extent = self._published_extent()
+        extent = self._published_span()
         if extent is None:
             msg = (
                 f"{self.root}/{self.name} can no longer reach its published table, and it "
@@ -1339,7 +1333,7 @@ class WriteHandle(LocalReadHandle):
         # one that points the log.
         if published is not None:
             try:
-                covered = published_extent(layout, published, s3 or S3Options())
+                covered = published_span(layout, published, s3 or S3Options())
             except Exception:
                 # Unreachable or unreadable is "cannot tell", which passes:
                 # configuring a published table is a statement of intent, not a claim
@@ -1882,10 +1876,12 @@ class WriteHandle(LocalReadHandle):
             # it. Those rows are genuinely safe: the published table has them, which is
             # the same authority `_push` releases on.
             adopted = remote.table()
-            covered = None if adopted is None else adopted.extent()
+            # `frontier` is the published span's end: the offset after the last
+            # one the bucket holds.
+            covered = None if adopted is None else adopted.span()
             frontier = 0 if covered is None else covered[1]
             if covered is not None:
-                released -= buffer.release_published(covered[1])
+                released -= buffer.release_below(covered[1])
                 buffer.reseed_group()
 
             # **And the fence has to clear the PUBLISHED table, not just the replica.**
@@ -1909,7 +1905,7 @@ class WriteHandle(LocalReadHandle):
             # the colliding local extent, so ~1.95M published rows are served by
             # no leg at all while five offsets durably name two different rows.
             #
-            # The report already knew. `skipped` is `(highest + 1, resumed - 1)`
+            # The report already knew. `skipped` was `(highest + 1, resumed - 1)`
             # over a `highest` that takes this frontier into account, so it came
             # back INVERTED — `(2864715, 1048876)` — which is what an invariant
             # looks like when it is computed and then not checked.
@@ -1920,9 +1916,9 @@ class WriteHandle(LocalReadHandle):
             # during a sidecar outage and now takes one `reserve` that ships
             # almost no WAL. The hazard is lag plus restore either way, so it
             # is closed here rather than by refusing the load.
-            wanted = frontier + RESTORE_RESERVE + 1
+            wanted = frontier + RESTORE_RESERVE
             if wanted > resumed:
-                resumed = buffer.reserve(wanted - resumed)[1] + 1
+                resumed = buffer.reserve(wanted - resumed)[1]
         finally:
             buffer.close()
 
@@ -1983,8 +1979,8 @@ class WriteHandle(LocalReadHandle):
         # subtraction above it performs: rows the published table already held were
         # released two lines later, and counting them as recovered describes a
         # buffer that no longer exists.
-        local = log._table.extent()  # noqa: SLF001
-        buffered = log._buffer.extent()  # noqa: SLF001
+        local = log._table.span()  # noqa: SLF001
+        buffered = log._buffer.span()  # noqa: SLF001
         # The PUBLISHED table's own frontier, read above, not `published_through` — that
         # reads the replica's `meta`, which is the exact staleness the reconcile
         # ten lines up exists to correct. It bites whenever the release empties
@@ -1993,7 +1989,10 @@ class WriteHandle(LocalReadHandle):
         # readable. Nothing is lost by it, but the documented response to a
         # skipped range is to re-fetch from upstream, and doing that would
         # duplicate them.
-        highest = max(
+        # Every one an end, so this is the first offset nothing holds — and
+        # never below 1, where offsets start.
+        held_end = max(
+            1,
             0 if local is None else local[1],
             frontier,
             0 if buffered is None else buffered[1],
@@ -2001,7 +2000,7 @@ class WriteHandle(LocalReadHandle):
         log._restored_from = _Recovery(  # noqa: SLF001
             recovered=released,
             resumed_at=resumed,
-            skipped=(highest + 1, resumed),
+            skipped=(held_end, resumed),
         )
 
         return log
@@ -2256,7 +2255,7 @@ class WriteHandle(LocalReadHandle):
             return
 
         try:
-            covered = published_extent(self._layout, published, self._published.s3)
+            covered = published_span(self._layout, published, self._published.s3)
         except Exception:
             return
 
@@ -2264,9 +2263,10 @@ class WriteHandle(LocalReadHandle):
             return
 
         nxt = self._buffer.next_offset()
-        if covered[1] >= nxt:
+        # Ahead when its last offset, `covered[1] - 1`, is at or past `nxt`.
+        if covered[1] > nxt:
             msg = (
-                f"the published table at {published!r} holds offsets up to {covered[1]}, at or "
+                f"the published table at {published!r} holds offsets up to {covered[1] - 1}, at or "
                 f"above this log's next offset ({nxt}) — it is another log's "
                 f"history. Attaching it would push nothing and pin eviction, "
                 f"silently. To resume that log here, use litelink.restore"
@@ -2485,8 +2485,8 @@ class WriteHandle(LocalReadHandle):
 
             time.sleep(random.uniform(0.01, 0.05))
 
-    def _lease(self, role: str, lo: int = 0, hi: int = EVERYTHING) -> Claim:
-        """A fresh claim on `[lo, hi]` for this attempt.
+    def _lease(self, role: str, start: int = 0, end: int = EVERYTHING) -> Claim:
+        """A fresh claim on `[start, end)` for this attempt.
 
         Minted per call rather than held as a field. A field would fix one owner
         for the whole Log, and two threads sharing it would then re-enter each
@@ -2497,7 +2497,7 @@ class WriteHandle(LocalReadHandle):
         on an offset interval, so it excludes every pass rather than commuting
         with any of them.
         """
-        return self._buffer.claim(role, lo, hi, new_owner())
+        return self._buffer.claim(role, start, end, new_owner())
 
     # -- write ---------------------------------------------------------------
 
@@ -2667,7 +2667,7 @@ class WriteHandle(LocalReadHandle):
         deployment that found this, across nine streams and ~698,000 rows. The
         window scaled by the arrival rate, and a slow stream has none.
 
-        **Compare `published_through()` against the `hi` this returns whenever
+        **Compare `published_through()` against the `end - 1` this returns whenever
         the push did not run** — `publish=False`, or a push that raised after the
         load had landed.** Until they meet, the corpus you loaded from is the range's
         second copy, which is the same durability this path's whole premise
@@ -2757,7 +2757,7 @@ class WriteHandle(LocalReadHandle):
                 # difference between a caller retrying the load — which would
                 # reserve a fresh range and duplicate it — and retrying the push.
                 msg = (
-                    f"loaded offsets {loaded[0]}..{loaded[1]} successfully, but "
+                    f"loaded offsets [{loaded[0]}, {loaded[1]}) successfully, but "
                     f"could not push them to the published table: {exc}. The rows are in "
                     f"local Parquet and are NOT yet second-copied; retry with "
                     f"publish(push_unsettled=True) rather than re-running the "
@@ -2765,9 +2765,7 @@ class WriteHandle(LocalReadHandle):
                 )
                 raise RuntimeError(msg) from exc
 
-        # `_ingest_chunks` speaks the inclusive `(lo, hi)` the tables use
-        # internally; the caller gets `[start, end)`.
-        return _half_open(loaded)
+        return loaded
 
     def _refuse_unfiled_rows(self) -> None:
         """Refuse an ingest while any acknowledged row is still owed a file.
@@ -2779,7 +2777,7 @@ class WriteHandle(LocalReadHandle):
         past the stranded row, so the row is in no leg of the read at all.
         Measured: 501 acknowledged, `scan` returned 500. Durably, the next seal
         cuts from that row upward and commits a file overlapping the bulk range,
-        which nothing objects to — `_write_and_commit` passes no `lo`, so
+        which nothing objects to — `_write_and_commit` passes no `start`, so
         `_refuse_straddle` never fires on the seal path.
 
         **The obvious one-read version of this is not enough**, and the failure
@@ -2787,7 +2785,7 @@ class WriteHandle(LocalReadHandle):
         losing the lease is not a failure — so a writer that appends and calls
         `seal()` while a maintainer holds the range is left with a FRESH empty
         open group and its rows sitting in a group already queued. Checking the
-        open group alone passes; the rows are below `lo`, in no file; the
+        open group alone passes; the rows are below `start`, in no file; the
         maintainer drains its queue, `_covers` declines the file, and
         `finish_seal(discard=True)` deletes them. The resulting table is
         contiguous, non-overlapping and undetectably wrong.
@@ -2840,18 +2838,20 @@ class WriteHandle(LocalReadHandle):
 
         **`register` cannot decline these, by arithmetic rather than by the
         claim**, and the difference matters to whoever later tries to shorten
-        the claim believing they are trading only concurrency. `lo` is `seq + 1`
-        and AUTOINCREMENT never issues above `seq`, so every file already in the
-        table ends at or below `lo - 1`, and `_covers` is False by construction
-        — file by file, since after file N registers the frontier is its `hi`
-        and the next reserve starts above it. The same arithmetic settles
-        `published_through`, which is some file's `hi`. What the claim actually
+        the claim believing they are trading only concurrency. `start` is
+        `seq + 1` and AUTOINCREMENT never issues above `seq`, so every file
+        already in the table ends at or before `start`, and `_covers` is False
+        by construction — file by file, since after file N registers the
+        frontier is its `end` and the next reserve starts there. The same
+        arithmetic settles `published_through`, which is some file's last
+        offset. What the claim actually
         buys is keeping a maintainer's `evict` or `compact` off the range while
         this runs.
         """
         config = self.config
         order = self._buffer.sort_by()
         offset_field = shape.table.field(0)
+        # The load's `[first, last)`.
         first: int | None = None
         last: int | None = None
         staged: list[tuple[str, int, int, int]] = []
@@ -2861,25 +2861,25 @@ class WriteHandle(LocalReadHandle):
                 # Before the reservation, which is what makes a refusal free:
                 # after it, the chunk's offsets are a permanent hole.
                 _refuse_non_finite(rows)
-                lo, hi = self._buffer.reserve(rows.num_rows)
+                start, end = self._buffer.reserve(rows.num_rows)
                 rows = rows.add_column(
-                    0, offset_field, pa.array(range(lo, hi + 1), type=pa.int64())
+                    0, offset_field, pa.array(range(start, end), type=pa.int64())
                 )
                 if order:
                     rows = rows.sort_by([(c, "ascending") for c in order])
 
-                rel_path = self._layout.ingest_path(lo, hi, uuid.uuid4().hex[:8])
+                rel_path = self._layout.ingest_path(start, end, uuid.uuid4().hex[:8])
                 # I2: the path is in SQLite before the bytes are on disk, so a
                 # crash before the commit leaves a file recovery can name rather
                 # than one only a directory scan could find. `claim_output`
                 # rather than `claim_seal` — see `INGEST_ROLE`.
-                self._buffer.claim_output(lo, hi + 1, rel_path)
+                self._buffer.claim_output(start, end, rel_path)
                 dest = self._layout.absolute(rel_path)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 write_parquet(rows, dest, config.compression)
-                staged.append((rel_path, lo, hi + 1, rows.nbytes))
-                first = lo if first is None else first
-                last = hi
+                staged.append((rel_path, start, end, rows.nbytes))
+                first = start if first is None else first
+                last = end
                 # `DEFAULT_TTL_MS` is 30 s and this path is sized in hours, so
                 # without a renew per file the exclusion evaporates during the
                 # first `pq.write_table`.
@@ -2916,13 +2916,13 @@ class WriteHandle(LocalReadHandle):
         checkpoint(lease.renew)
         added = self._table.register(
             [str(self._layout.absolute(rel_path)) for rel_path, _, _, _ in staged],
-            sealed_through=staged[-1][2],
+            end=staged[-1][2],
             published_through=self._maintenance.published_through(),
             # The last line of defence, which the seal path does not get: a
             # range partially overlapping the table is refused rather than
             # admitted into two files at once. It cannot fire here — see the
-            # arithmetic in `_ingest_chunks` — and it costs one extent read.
-            lo=staged[0][1],
+            # arithmetic in `_ingest_chunks` — and it costs one span read.
+            start=staged[0][1],
         )
         if not added:
             msg = (
@@ -2933,7 +2933,7 @@ class WriteHandle(LocalReadHandle):
             )
             raise RuntimeError(msg)
 
-        for rel_path, lo, end, held in staged:
+        for rel_path, start, end, held in staged:
             # What the file holds UNCOMPRESSED, which is the currency
             # `target_compact_size` and every `extent.bytes` are stated in —
             # never its size on disk, which on data that compresses 8:1 would
@@ -2946,7 +2946,7 @@ class WriteHandle(LocalReadHandle):
             # Recorded AFTER the commit: a crash between the two leaves the
             # size unknown, and unknown reads as full, which is the direction
             # that leaves the file alone.
-            self._buffer.record_file(rel_path, lo, end, held)
+            self._buffer.record_file(rel_path, start, end, held)
             self._buffer.clear_compaction(rel_path)
 
     def _abandon(self, staged: list[tuple[str, int, int, int]]) -> None:
@@ -3061,7 +3061,7 @@ class WriteHandle(LocalReadHandle):
         # row that refuses a sealer in another process refuses one in another
         # thread on the same terms — and it lapses if this attempt dies
         # mid-seal, so another may finish what `sealing` records.
-        lease = self._buffer.claim(SEAL_ROLE, start, end - 1, new_owner())
+        lease = self._buffer.claim(SEAL_ROLE, start, end, new_owner())
         if not lease.acquire():
             return None
 
@@ -3193,7 +3193,7 @@ class WriteHandle(LocalReadHandle):
           a disk and die together, so holding buys nothing and costs SQLite
           growth. Discard.
         - **Published table and `wal_replication`** — the buffer IS the off-box copy
-          until the published table has the range. Hold, and let `release_published`
+          until the published table has the range. Hold, and let `release_below`
           drop them once publish has pushed it.
 
         `validate` refuses `wal_replication` without a published table, so the last
@@ -3270,7 +3270,7 @@ class WriteHandle(LocalReadHandle):
         # failure of that fence harmless rather than a duplicate.
         if not self._table.register(
             [str(dest)],
-            sealed_through=end,
+            end=end,
             # The published table too. An empty staging table covers nothing, so after a
             # stalled writer's range has been sealed, published and evicted, the
             # local check alone would let it re-register a file the log has
@@ -3587,7 +3587,8 @@ class WriteHandle(LocalReadHandle):
         if not self._tiers.has():
             self._record_published_row(published)
 
-        covered = published.extent()
+        # The published span's end: everything below it is in the bucket.
+        covered = published.span()
         floor = 0 if covered is None else covered[1]
 
         # RELEASED HERE, at the top of the pass, from the published table's own extent.
@@ -3611,7 +3612,7 @@ class WriteHandle(LocalReadHandle):
             # published table's whole manifest by the backfill within one publish. Both
             # are downstream of a contamination that has to be stopped at the
             # point the log is pointed.
-            self._buffer.release_published(floor)
+            self._buffer.release_below(floor)
 
         # The watermark reconciled against the published table itself. It is a cache of
         # what the published table holds — kept for the push floor and for display, and
@@ -3624,7 +3625,8 @@ class WriteHandle(LocalReadHandle):
         # Reconciling against a published table the log has been pointed away from is
         # the loss this path is here to prevent, and a guard that reads first
         # only reports where the published table was.
-        confirmed = max(self._maintenance.published_through(), floor)
+        # Stored as the last offset held, so one below the span's end.
+        confirmed = max(self._maintenance.published_through(), floor - 1)
         self._buffer.set_meta_if(
             _PUBLISHED_KEY, pinned, {Maintenance.PUBLISHED_THROUGH_KEY: str(confirmed)}
         )
@@ -3640,7 +3642,7 @@ class WriteHandle(LocalReadHandle):
         #
         # The published table's own manifest is the truth, so recover from it rather
         # than promising anything beforehand. Reading it costs nothing extra:
-        # `extent()` above already walked it.
+        # `span()` above already walked it.
         # Bounded by the staging window, not by the published table. Every decision the
         # rows feed — what compaction may merge, what eviction may drop — is
         # about files the staging table still holds, so a published file entirely
@@ -3651,7 +3653,7 @@ class WriteHandle(LocalReadHandle):
         # same policy — two reads, and nothing that makes them agree.
         config = self.config
         local = self._table.data_files()
-        base = min((f.lo for f in local), default=0)
+        base = min((f.start for f in local), default=0)
 
         # RECONCILIATION, matched by path in the published table's manifest rather than
         # by offset range. Range matching reads plausibly and is wrong: a
@@ -3663,13 +3665,13 @@ class WriteHandle(LocalReadHandle):
         # bounded by the staging window, or it grows with the published table and runs on
         # every publish. The intent read is unbounded, because an intent below the
         # window has to be reachable to be dropped.
-        held_paths = {f.path: f for f in published.data_files() if f.hi >= base}
+        held_paths = {f.path: f for f in published.data_files() if f.end > base}
         recorded = {
             path for path, _, _, _ in self._buffer.published_records(pinned or "", base)
         }
         intended = {
-            path: (lo, hi, size)
-            for path, lo, hi, size in self._buffer.intents(pinned or "")
+            path: (start, end, size)
+            for path, start, end, size in self._buffer.intents(pinned or "")
         }
 
         # ONE rule per path, decided by which of the two tables holds it. An
@@ -3686,15 +3688,15 @@ class WriteHandle(LocalReadHandle):
                 # 1. The register landed. Confirm it with the bytes the intent
                 #    carried — the only measurement that survives a crash
                 #    between a rewrite's commit and its confirm.
-                lo, hi, size = recovered
-                self._buffer.record_file(path, lo, hi, size)
+                start, end, size = recovered
+                self._buffer.record_file(path, start, end, size)
             elif path not in recorded:
                 # 2. In the manifest with no row of either kind: the backfill
                 #    this rule grew out of.
                 self._buffer.record_file(
                     path,
-                    landed.lo,
-                    landed.hi + 1,
+                    landed.start,
+                    landed.end,
                     memory.get(path, config.compact_size),
                 )
 
@@ -3707,7 +3709,7 @@ class WriteHandle(LocalReadHandle):
                 #    never measured. No reader below the window asks.
                 self._buffer.forget_intent(path)
 
-        pending = [f for f in self._table.data_files() if f.hi > floor]
+        pending = [f for f in self._table.data_files() if f.end > floor]
         # `stable_prefix` holds a file back when compaction might still merge
         # it, and compaction refuses to merge anything some published table already
         # holds — so the two need the SAME exclusion or they deadlock. They
@@ -3726,7 +3728,7 @@ class WriteHandle(LocalReadHandle):
         # a second input one of them could not see is what deadlocked them once
         # already.
         frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
-        head = [f for f in pending if f.lo > frozen]
+        head = [f for f in pending if f.start >= frozen]
         settled = (len(pending) - len(head)) + stable_prefix(
             head,
             config.compact_size,
@@ -3770,8 +3772,8 @@ class WriteHandle(LocalReadHandle):
             # exactly the ones the confirm below used to skip.
             self._buffer.intend_file(
                 published.uri(rel_path),
-                data_file.lo,
-                data_file.hi + 1,
+                data_file.start,
+                data_file.end,
                 memory.get(data_file.path, config.compact_size),
             )
             published.put(self._layout.absolute(rel_path), rel_path)
@@ -3798,12 +3800,12 @@ class WriteHandle(LocalReadHandle):
 
         if not published.register(
             [published.uri(rel_path) for _, rel_path in uploaded],
-            sealed_through=last.hi + 1,
+            end=last.end,
             # The low end too, so the published table can refuse a range that starts
             # inside what it already holds. Everything upstream is arranged so
             # that cannot happen; this is the check that holds regardless of
             # whether the arrangement has a gap.
-            lo=uploaded[0][0].lo,
+            start=uploaded[0][0].start,
         ):
             return
 
@@ -3820,12 +3822,11 @@ class WriteHandle(LocalReadHandle):
             # reconciliation dropped, so skipping any file reopens the window
             # for exactly the files the intent was added to protect.
             #
-            # Same extent, second location. `end_offset` is exclusive, as it is
-            # on every other extent — the cut is the offset AFTER the last row.
+            # Same span, second location.
             self._buffer.record_file(
                 published.uri(rel_path),
-                data_file.lo,
-                data_file.hi + 1,
+                data_file.start,
+                data_file.end,
                 memory.get(data_file.path, config.compact_size),
             )
 
@@ -3843,7 +3844,10 @@ class WriteHandle(LocalReadHandle):
         # write: nothing lowers a watermark afterwards, so recording one earned
         # by a bucket the log has left is not a mistake anything corrects.
         if not self._buffer.set_meta_if(
-            _PUBLISHED_KEY, pinned, {Maintenance.PUBLISHED_THROUGH_KEY: str(last.hi)}
+            # The stored watermark is the last offset held.
+            _PUBLISHED_KEY,
+            pinned,
+            {Maintenance.PUBLISHED_THROUGH_KEY: str(last.end - 1)},
         ):
             raise _repointed_mid_push()
 
@@ -3859,7 +3863,7 @@ class WriteHandle(LocalReadHandle):
         # have been uploaded. Neither placement alone is both.
         #
         if not self._discard_on_seal():
-            self._buffer.release_published(last.hi)
+            self._buffer.release_below(last.end)
 
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.
@@ -3874,7 +3878,7 @@ class WriteHandle(LocalReadHandle):
         if statistics is None:
             return
 
-        offsets = (0, 0) if extent is None else (extent[0], extent[1] + 1)
+        offsets = (0, 0) if extent is None else extent
         self._buffer.store_staging_statistics(
             location, offsets, encode_tier(self._buffer.shape().table, statistics)
         )
@@ -3893,10 +3897,8 @@ class WriteHandle(LocalReadHandle):
         published.reload()
         schema, files = published.live_files()
         self._table.reload()
-        extent = self._table.extent()
-        below = [
-            f for f in files if extent is None or _offsets(schema, f)[0] < extent[0]
-        ]
+        span = self._table.span()
+        below = [f for f in files if span is None or file_span(schema, f)[0] < span[0]]
         self._tiers.replace(self._buffer.shape().table, rollup(None, schema, below))
 
     def _backfill_manifest(self) -> None:
@@ -4138,7 +4140,7 @@ class WriteHandle(LocalReadHandle):
         self._maintenance.evict(everything=True)
 
         self._table.reload()
-        if self._table.extent() is not None or self._buffer.extent() is not None:
+        if self._table.span() is not None or self._buffer.span() is not None:
             msg = (
                 f"retire() could not empty {self.root}/{self.name}: local files or "
                 "buffered rows remain that the published table does not hold yet. It stays "
@@ -4149,8 +4151,9 @@ class WriteHandle(LocalReadHandle):
 
         published = self._published.require()
         published.reload()
-        covered = published.extent()
-        through = None if covered is None else covered[1]
+        # The property records the last offset held, as `through` does everywhere.
+        covered = published.span()
+        through = None if covered is None else covered[1] - 1
         claim = self._claim_settings()
         try:
             published.set_properties(
@@ -4228,7 +4231,7 @@ class WriteHandle(LocalReadHandle):
         published = self._published.require()
         self._table.reload()
 
-        covered = self._table.extent()
+        covered = self._table.span()
         # Nothing local means nothing to sit below, so everything qualifies.
         floor = covered[0] if covered is not None else None
         cutoff = datetime.now(UTC) - since
@@ -4238,7 +4241,7 @@ class WriteHandle(LocalReadHandle):
         eligible = [
             data_file
             for data_file in published.data_files()
-            if (floor is None or data_file.hi < floor)
+            if (floor is None or data_file.end <= floor)
             and (stamped := added.get(data_file.path)) is not None
             and stamped.replace(tzinfo=UTC) >= cutoff
         ]
@@ -4260,8 +4263,8 @@ class WriteHandle(LocalReadHandle):
         # next run continues from there. Stopping at a gap rather than stepping
         # over it is the same rule: what cannot be joined onto cannot be
         # restored without creating one.
-        for data_file in sorted(eligible, key=lambda f: f.hi, reverse=True):
-            if floor is not None and data_file.hi != floor - 1:
+        for data_file in sorted(eligible, key=lambda f: f.end, reverse=True):
+            if floor is not None and data_file.end != floor:
                 break
 
             checkpoint(lease.renew)
@@ -4281,7 +4284,7 @@ class WriteHandle(LocalReadHandle):
             # for a whole `staging_retention`, while a re-run of `hydrate` skips
             # the range because the local floor now covers it.
             checkpoint(lease.renew)
-            # No `sealed_through`: that check exists to decline a range the
+            # No `end`: that check exists to decline a range the
             # table already covers, and every range here is deliberately below
             # what it covers. The filter above is what prevents an overlap.
             self._table.register([str(destination)])
@@ -4298,11 +4301,11 @@ class WriteHandle(LocalReadHandle):
             # merging can never make big enough to stop being one.
             self._buffer.record_file(
                 rel_path,
-                data_file.lo,
-                data_file.hi + 1,
+                data_file.start,
+                data_file.end,
                 held.get(data_file.path, self.config.compact_size),
             )
-            floor = data_file.lo
+            floor = data_file.start
 
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:

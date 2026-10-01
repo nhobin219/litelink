@@ -147,7 +147,7 @@ def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
         assert log.staging_rows() and log.buffered_rows(), "need both legs"
 
         buffer = log._buffer
-        real = buffer.rows_above
+        real = buffer.rows_from
         fired = []
 
         def seal_midway(boundary: int | None) -> object:
@@ -157,7 +157,7 @@ def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
 
             return tail
 
-        monkeypatch.setattr(buffer, "rows_above", seal_midway)
+        monkeypatch.setattr(buffer, "rows_from", seal_midway)
         got = log.scan().read_all()
         monkeypatch.undo()
 

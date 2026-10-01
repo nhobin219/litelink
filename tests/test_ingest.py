@@ -57,7 +57,7 @@ def test_a_reserve_makes_the_next_append_skip_the_range(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(3))
 
-        assert log._buffer.reserve(1000) == (4, 1003)
+        assert log._buffer.reserve(1000) == (4, 1004)
         assert log.end_offset() == 1004
         assert log.append(rows(1)[0]) == 1004
 
@@ -66,7 +66,7 @@ def test_a_reserve_on_an_empty_buffer_starts_at_one(tmp_path: Path) -> None:
     """The sequence row does not exist until the first insert, so a log whose
     whole load arrives through ingest never sees one."""
     with open_log(tmp_path) as log:
-        assert log._buffer.reserve(500) == (1, 500)
+        assert log._buffer.reserve(500) == (1, 501)
         assert log.end_offset() == 501
 
 
@@ -77,9 +77,9 @@ def test_sequential_reserves_are_adjacent(tmp_path: Path) -> None:
         second = log._buffer.reserve(10)
         third = log._buffer.reserve(1)
 
-    assert first == (1, 10)
-    assert second == (11, 20)
-    assert third == (21, 21)
+    assert first == (1, 11)
+    assert second == (11, 21), "adjacent: each starts where the last ended"
+    assert third == (21, 22)
 
 
 @pytest.mark.parametrize("count", [0, -1])
@@ -117,9 +117,9 @@ def test_a_reserve_never_lands_on_a_buffered_row(tmp_path: Path) -> None:
         log.extend(rows(50))
         log._buffer._con.execute("UPDATE sqlite_sequence SET seq = 10")
 
-        lo, hi = log._buffer.reserve(5)
+        start, end = log._buffer.reserve(5)
 
-        assert (lo, hi) == (51, 55)
+        assert (start, end) == (51, 56)
         assert log.append(rows(1)[0]) == 56
 
 
@@ -140,10 +140,10 @@ def test_ingest_writes_rows_that_read_back_once(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         assert log.ingest(table(2000)) == (1, 2001)
 
-        assert log._table.extent() == (1, 2000)
+        assert log._table.span() == (1, 2001)
         assert log.scan().read_all().num_rows == 2000
         # Nothing went through the buffer, and the sequence still moved.
-        assert log._buffer.extent() is None
+        assert log._buffer.span() is None
         assert log.append(rows(1)[0]) == 2001
         # No claim outstanding, or recovery would queue a live file.
         assert log._buffer.pending_outputs() == []
@@ -154,7 +154,7 @@ def test_ingest_returns_none_for_a_source_with_no_rows(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         assert log.ingest(table(0)) is None
         assert log.end_offset() == 1
-        assert log._table.extent() is None
+        assert log._table.span() is None
 
 
 def test_ingest_accepts_a_record_batch_reader(tmp_path: Path) -> None:
@@ -184,15 +184,15 @@ def test_a_large_source_is_split_at_the_compaction_target(tmp_path: Path) -> Non
     config = LogConfig(target_seal_size=4096, target_compact_size=8192)
     with open_log(tmp_path, config) as log:
         log.ingest(table(4000))
-        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+        files = sorted(log._table.data_files(), key=lambda f: f.start)
         held = log._buffer.file_bytes()
 
     assert len(files) > 3
     # Contiguous and non-overlapping, with nothing computing adjacency.
-    assert files[0].lo == 1
-    assert files[-1].hi == 4000
+    assert files[0].start == 1
+    assert (files[-1].end - 1) == 4000
     for earlier, later in zip(files, files[1:], strict=False):
-        assert later.lo == earlier.hi + 1
+        assert later.start == earlier.end
 
     # Every file but the remainder is at the budget, so `runs()` gives each a
     # run of its own and compaction never selects it.
@@ -235,7 +235,7 @@ def test_ingest_is_refused_while_rows_await_a_seal(tmp_path: Path) -> None:
             log.ingest(table(100))
 
         assert log.end_offset() == 41
-        assert log._table.extent() is None
+        assert log._table.span() is None
 
 
 def test_ingest_is_refused_while_the_seal_queue_holds_a_group(tmp_path: Path) -> None:
@@ -277,7 +277,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     The load now pushes its own output, so the scope statement is narrower than
     it was: WAL still cannot carry a bulk range, but the published table has it before
     `ingest` returns. Note the knock-on asserted below — the push is a PREFIX,
-    so it takes the captured rows as well, and `release_published` then drops
+    so it takes the captured rows as well, and `release_below` then drops
     what the published table holds. The rows move from buffer to bucket; they are never
     in neither.
     """
@@ -310,7 +310,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
         assert log.scan().read_all().num_rows == 800
         # The captured rows still have an off-box copy — the load did not strip
         # it, which is the whole of what refusing got wrong. They have MOVED,
-        # though: the load's own publish pushed them, and `release_published` then
+        # though: the load's own publish pushed them, and `release_below` then
         # dropped what the published table had taken. Buffer or bucket, never neither.
         assert log.published_through() >= retained
         # And the loaded range is second-copied too, which is the point of
@@ -400,7 +400,7 @@ def test_a_value_the_schema_cannot_hold_costs_no_offsets(tmp_path: Path) -> None
             log.ingest(unparseable)
 
         assert log.end_offset() == 1
-        assert log._table.extent() is None
+        assert log._table.span() is None
 
 
 # -- ingest: what a failure leaves behind (I2) ---------------------------------
@@ -433,7 +433,7 @@ def test_a_load_that_dies_mid_write_leaves_nothing_unnameable(
 
         monkeypatch.undo()
         # Nothing landed: the batch commit had not run.
-        assert log._table.extent() is None
+        assert log._table.span() is None
         # The two complete files were queued by the ingest itself...
         queued = set(log._buffer.due_deletions(2**62))
         assert len(queued) == 2
@@ -461,7 +461,7 @@ def test_a_declined_register_raises_rather_than_returning(
             log.ingest(table(100))
 
         monkeypatch.undo()
-        assert log._table.extent() is None
+        assert log._table.span() is None
         assert len(log._buffer.due_deletions(2**62)) == 1
         assert log._buffer.pending_outputs() == []
 
@@ -483,7 +483,7 @@ def test_a_lost_reservation_leaves_a_gap_the_log_reads_across(
         log.await_seal()
 
         assert log.scan().read_all().num_rows == 53
-        assert log._table.extent() == (101, 153)
+        assert log._table.span() == (101, 154)
         log.maintain()
         assert log.scan().read_all().num_rows == 53
 
@@ -543,7 +543,7 @@ def test_an_ingested_range_survives_the_whole_published_table_cycle(
         log.await_seal()
 
         log.publish()
-        assert log._published.require().extent() is not None
+        assert log._published.require().span() is not None
         log.maintain()
 
         assert log.scan().read_all().num_rows == 3400
@@ -797,7 +797,7 @@ def test_a_bulk_load_holding_a_non_finite_float_costs_no_offsets(
             log.ingest(load)
 
         assert log.end_offset() == 1
-        assert log._table.extent() is None
+        assert log._table.span() is None
 
 
 def test_a_nan_under_a_null_struct_is_not_a_stored_value(tmp_path: Path) -> None:
