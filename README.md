@@ -48,9 +48,6 @@ Doing that by hand goes wrong the same way every time: one production capture sy
 125,884 objects, 62.5% of them under 16 KiB, Parquet files at 2 rows each, a compaction
 routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
 
-**Status: early.** All three tiers work, and a log survives losing its machine. Read
-[what it is not](#what-it-is-not) and [not implemented yet](#not-implemented-yet) first.
-
 ## The Parquet is the product
 
 The usual shape is a write path in one system and an analytical store in another, with a job
@@ -136,7 +133,7 @@ litelink.preflight(...)                                            # what python
     log.seal_due() · log.maintain()                 # seal; compact, evict, expire
     log.sync(*, push_unsettled=False)               # push to the archive
     log.retire()                                    # end the log: all archived, none local
-    log.set_config(...) · set_archive(...) · set_sort_by(..., rewrite=True) · add_column(...)
+    log.set_config(...) · set_archive(...) · set_sort_by(..., rewrite=True)
 ```
 
 The deliberate choices:
@@ -316,6 +313,11 @@ Upgrading a log written by 0.1.0: see [Migrating from 0.1](docs/RUNTIME.md#migra
   in-process, real-time analytics store: freshness is sub-second *with* durability, but
   "real-time" means fresh, not point-lookup fast.
 
+- **Not a schema that changes.** A log keeps the schema it was created with. To change it,
+  `retire()` the log and start a new one where it ended:
+  `new(root, "trades-v2", schema=…, archive=…, start_offset=old.end_offset())`. Offsets stay
+  dense across the two, and any engine reads both archives as one sequence.
+
 - **Not an unbounded local archive.** A seal's cost tracks what the table's metadata holds, so
   a log that never runs `maintain()` and never evicts gets slower on the write path over time.
   `maintain()` arrests the larger factor; a retention bounds the rest. Numbers and the
@@ -326,9 +328,6 @@ Upgrading a log written by 0.1.0: see [Migrating from 0.1](docs/RUNTIME.md#migra
 - **Indexes for point lookups.** A lookup by key scans the tiers, pruned only by min/max
   statistics, so finding one row costs a scan rather than a seek — least on `sort_by`'s leading
   column, where the statistics are tight.
-
-- **Schema evolution** is half built: `add_column` works, `rename_column` and `drop_column`
-  raise `NotImplementedError` ([SPEC](docs/SPEC.md) §9).
 
 - **Blob fields** — large payloads that bypass the buffer — are specified and unbuilt;
   `binary` columns are carried, for ids and other small values rather than payloads

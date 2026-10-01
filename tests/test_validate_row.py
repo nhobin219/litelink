@@ -128,14 +128,3 @@ def test_a_schema_new_refuses_is_refused_the_same_way(
 
     assert created is not None
     assert validated == created
-
-
-def test_a_column_added_later_validates_through_the_log_schema(tmp_path: Path) -> None:
-    """`LogHandle.schema` is the schema to pass, and it follows `add_column`."""
-    with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
-        with pytest.raises(ValueError, match="does not have"):
-            litelink.validate_row(log.schema, {**BASE, "region": "eu"})
-
-        log.add_column("region", pa.string())
-
-        litelink.validate_row(log.schema, {**BASE, "region": "eu"})

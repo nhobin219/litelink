@@ -35,7 +35,6 @@ from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import (
-    INTENT_KEY,
     SCHEMA_KEY,
     SORT_KEY,
     START_OFFSET_KEY,
@@ -99,9 +98,9 @@ Row = Mapping[str, object]
 
 # Keys in the buffer's `meta` table (§2). These hold what the Iceberg table
 # cannot: deployment policy rather than data shape.
-# The one column the library owns (§2). Named rather than spelled inline so a
-# schema change has something to check against, and prefixed so it can never
-# collide with a column §9 lets an application add.
+# The one column the library owns (§2). Named rather than spelled inline so
+# `validate` has something to check against, and prefixed so it can never
+# collide with a column an application declares.
 OFFSET = "litelink_offset"
 
 # The two operations whose ownership must survive the process holding it (§13.6).
@@ -351,6 +350,29 @@ def _foreign_archive(archive: str) -> ValueError:
     )
 
 
+# The last release that can still move a 0.1 log to the per-stream layout, or
+# finish an `add_column` it interrupted. Both were removed in the next (§9).
+LAST_MIGRATING_RELEASE = "0.5.1"
+
+# The record an interrupted `add_column` left in `meta`. Read only to refuse.
+_LEGACY_INTENT_KEY = "schema_intent"
+
+
+def legacy_layout(layout: Layout, why: str = "") -> str:
+    """The refusal for a log still in the pre-0.2 layout: catalogs at the root.
+
+    This release no longer carries the migration, so the message names the
+    last one that does, and the command it runs.
+    """
+    return (
+        f"the log at {layout.root}/{layout.name} uses the pre-0.2 layout, whose "
+        f"catalogs sit at the root{'; ' + why if why else ''}. This release cannot "
+        f"move it. Install litelink {LAST_MIGRATING_RELEASE} and run:\n"
+        f"  python -m litelink.migrate --root {layout.root} --name {layout.name} --apply\n"
+        f"then open it with this release"
+    )
+
+
 def _now() -> str:
     """A timestamp a person will read."""
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -402,15 +424,6 @@ def _scan_query(
     clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
 
     return f'SELECT {projection} FROM log{clause} ORDER BY "{OFFSET}"'
-
-
-class _ArchiveDeferred(RuntimeError):
-    """Step 4 could not run because the archive is not reachable.
-
-    Its own type because recovery treats it as "leave the intent standing and
-    open anyway", while `add_column` lets it out to the caller — the same
-    condition, but a failed call and a deferred replay are different answers.
-    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -1214,9 +1227,9 @@ class WriteHandle(LocalReadHandle):
         Arrow, always. The table underneath is Iceberg and its schema could be
         stated directly, but every Iceberg field needs an explicit `field_id`
         and pyiceberg accepts duplicates without complaint — two fields
-        numbered 1 construct fine. Field IDs are what §9's add, drop and rename
-        resolve by, so a duplicate quietly breaks evolution for both columns.
-        That numbering is library bookkeeping, the same argument §2 makes for
+        numbered 1 construct fine — and every engine reading the archive
+        resolves columns by field ID, so a duplicate silently breaks both. That
+        numbering is library bookkeeping, the same argument §2 makes for
         `offset`, so it is pyiceberg's job and not the caller's.
 
         The cost of one schema type is that Arrow does not map onto Iceberg
@@ -1406,12 +1419,7 @@ class WriteHandle(LocalReadHandle):
         # thing on the read-only path; both open paths have to, or the same
         # directory gets two different diagnoses.
         if layout.is_legacy():
-            msg = (
-                f"the log at {layout.root}/{name} uses the pre-0.2 layout, whose "
-                f"catalogs sit at the root. Move it with:\n"
-                f"  python -m litelink.migrate --root {layout.root} --name {name}"
-            )
-            raise FileNotFoundError(msg)
+            raise FileNotFoundError(legacy_layout(layout))
 
         # Asked of THIS log's table, not merely of `catalog.db`. The file was
         # once shared by every log under the root, so a root holding one log
@@ -1583,13 +1591,7 @@ class WriteHandle(LocalReadHandle):
         # written to. Measured on a real one: 300 readable rows down to 240,
         # with eight Parquet files stranded and referenced by nothing.
         if layout.is_legacy():
-            msg = (
-                f"the log at {layout.root}/{name} uses the pre-0.2 layout, whose "
-                f"catalogs sit at the root. restore refuses to touch it — move "
-                f"it first with:\n"
-                f"  python -m litelink.migrate --root {layout.root} --name {name}"
-            )
-            raise FileExistsError(msg)
+            raise FileExistsError(legacy_layout(layout, "restore refuses to touch it"))
 
         try:
             has_table = LogTable.exists_for(layout)
@@ -2144,19 +2146,19 @@ class WriteHandle(LocalReadHandle):
         raise ValueError(msg)
 
     def _refuse_archive_behind(self, archive: str | None) -> None:
-        """Refuse an archive missing a column this log has since added.
+        """Refuse an archive missing a column this log has.
 
-        Attaching does no schema work — `open_archive` only DECLARES a schema
+        Logs are immutable now (§9), but a log that used `add_column` under an
+        older release can still meet an archive detached before that change:
+        attaching does no schema work — `open_archive` only DECLARES a schema
         when it creates a table, and nothing in `src/` re-declares an existing
-        one. So an archive detached before an `add_column` and re-attached
-        after it stays narrow, and every later push fails permanently:
+        one — so that archive stays narrow, and every later push fails
+        permanently:
 
             ValueError: PyArrow table contains more columns: region.
 
         `sync` then never advances, eviction's I4 clamp pins on the unpushed
-        files, and local disk grows without bound — the exact consequence
-        `_apply_add_column` orders its steps to prevent, arrived at through a
-        door that skips step 4 entirely.
+        files, and local disk grows without bound.
 
         Refused rather than repaired. Widening an existing archive is
         `union_by_name` against a table this log did not create, which belongs
@@ -3328,84 +3330,6 @@ class WriteHandle(LocalReadHandle):
             finally:
                 seal.release()
 
-        # Last, and under the settings claim rather than either of those: an
-        # unfinished schema change is not a seal and not a compaction, and it
-        # must not interleave with the setters that share this range.
-        self._recover_schema_change()
-
-    def _recover_schema_change(self) -> None:
-        """Replay an interrupted `add_column`, or leave it standing.
-
-        Every step is settled by ASKING the thing itself rather than by a
-        record of what was done. A stamp cannot be made atomic with the commit
-        it describes — it only moves the unreconciled gap from before the
-        commit to after it — and a stamp can be false: `litelink.restore` rebuilds
-        the local table from `meta`, so a replica captured after step 5 would
-        arrive carrying a stamp for a step that never landed on THIS machine.
-
-        **If the archive is unreachable the intent is left in place and this
-        returns.** The log opens, appends, seals and reads; the change simply
-        has not finished. That is safe because step 7 has not run, so the
-        declared schema is unchanged and no value of the new column can be
-        stored — the INSERT column list derives from `arrow_schema`. Failing
-        the open instead would mean an `add_column` interrupted by an outage
-        makes the log unopenable for writing until the bucket returns, which
-        breaks §11's promise that a log works with no network.
-        """
-        pending = self._buffer.get_meta(INTENT_KEY)
-        if not pending:
-            return
-
-        recorded = json.loads(pending)
-        name = recorded["add"]
-        type_ = (
-            pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(recorded["type"])))
-            .field(0)
-            .type
-        )
-
-        try:
-            # Inside the try, because taking the claim can itself fail. Unlike
-            # the other two halves of `recover()`, which use a non-blocking
-            # `acquire()`, this one waits and then RAISES if a maintainer is
-            # holding the whole-log range — and `recover()` is unguarded in
-            # `open`, so that would fail the open for every writer while
-            # `litelink.open(..., read_only=True)` kept working. That is the failure this method
-            # exists to avoid; leaving the acquisition outside meant it could
-            # still happen, just for a different reason.
-            lease = self._claim_settings()
-        except Exception:
-            return
-
-        try:
-            # Re-read under the claim: another process may have finished it
-            # between the check above and here.
-            if not self._buffer.get_meta(INTENT_KEY):
-                return
-
-            declared = self._buffer.shape().schema
-            if name in declared.names:
-                # Step 7 landed; only the intent is outstanding.
-                self._buffer.set_meta(INTENT_KEY, "")
-
-                return
-
-            self._apply_add_column(name, type_, declared, lease)
-        except Exception:
-            # Deliberate, and broad on purpose: recovery DEFERS, it never
-            # fails the open. §11 promises a log works with no network, and an
-            # `add_column` interrupted by an outage must not make the log
-            # unopenable for writing until the bucket returns.
-            #
-            # A genuine conflict — `union_by_name` refusing a real type change
-            # — defers here too rather than raising. That is not silent: the
-            # intent stands, so the change never completes and the next
-            # `add_column` refuses while NAMING the outstanding column. A
-            # visible stall beats a log no writer can open.
-            return
-        finally:
-            lease.release()
-
     def _recover_seal(self, lease: Claim | None = None) -> None:
         """If the commit landed, only the buffer delete is outstanding; if it
         did not, the whole file is rewritten to the same path.
@@ -4400,212 +4324,19 @@ class WriteHandle(LocalReadHandle):
             )
             floor = data_file.lo
 
-    # -- schema evolution --------------------------------------------------
-    #
-    # Each of these writes two records: the Iceberg schema, and the declared
-    # Arrow spelling in `meta`. An Iceberg catalog commit and a SQLite write are
-    # separate transactions and cannot be made atomic with each other — the same
-    # reason §7 gives for not requiring an atomic handoff between two catalogs —
-    # so a crash can land between them.
-    #
-    # **The change is complete when the Arrow schema lands in SQLite, not when
-    # the Iceberg commit does.** That is the same completion boundary every
-    # other multi-step operation here uses: a seal completes at its final SQLite
-    # transaction (§4 step 3), a compaction at `clear_compaction`, a deletion at
-    # `forget_deletion`. Iceberg holds the data; SQLite holds the record of what
-    # this library has finished doing.
-    #
-    # So these follow §4's shape rather than relying on `open`'s fallback:
-    #
-    #   1. record the intended Arrow schema in SQLite, before anything changes
-    #   2. commit the schema update to Iceberg
-    #   3. write the Arrow schema to `meta` and clear the intent
-    #
-    # Recovery replays it. An intent whose Iceberg commit already landed
-    # finishes at step 3; one whose commit did not is redone or abandoned, and
-    # the columns in the table say which. The fallback in `open` is then what it
-    # should be — an upgrade path for logs written before the Arrow schema was
-    # stored — rather than the crash handler, which would silently drop the
-    # declared spelling of the column just added.
-
-    def add_column(self, name: str, type_: pa.DataType) -> None:
-        """Add a column. Non-breaking: older files read null (§9).
-
-        Must reject `litelink_offset` (I11), which `validate` enforces at
-        creation and this has to enforce again: a schema change is the other
-        way a caller could introduce it, and the prefix makes the collision
-        unlikely rather than impossible.
-        """
-        reject_reserved(name)
-        # Refuses exactly what `validate_schema` refuses at creation, so a
-        # column cannot be added that could never have been declared.
-        column_type(type_)
-
-        # Nullability is not checked because it cannot be expressed: `type_` is
-        # a DataType, which carries none, and `pa.field(name, type_)` below is
-        # nullable. That is the right constraint rather than a gap — rows that
-        # predate the column have no value for it, so a required column would
-        # make every existing file invalid, and Iceberg refuses it too.
-
-        with self._lock:
-            # The claim `set_config` and `set_archive` share. Claims exclude by
-            # RANGE, not by kind, and this one is `[0, EVERYTHING]` — so seal,
-            # compact, sync, evict, `rewrite_archive`, `hydrate` and
-            # `set_sort_by` are all excluded for the whole change.
-            #
-            # What it does NOT exclude is `Log.extend`, which takes no claim at
-            # all, nor `Reader.query`. That is safe only because every holder of
-            # the schema now reads it from `meta` per call: a writer appending
-            # during the change sees the old columns or the new ones, never a
-            # torn pair.
-            lease = self._claim_settings()
-            try:
-                declared = self._buffer.shape().schema
-                self._refuse_duplicate_column(name, declared)
-
-                # Step 3: the intent, before anything it describes (I16).
-                # Nothing else is recorded — every step below is settled by
-                # asking the thing itself, because a stamp can be FALSE.
-                # `litelink.restore` rebuilds the local table from `meta`, so a
-                # replica captured mid-change would carry a stamp saying step 5
-                # had landed onto a machine where it had not.
-                self._buffer.set_meta(INTENT_KEY, _intent(name, type_))
-                checkpoint(lease.renew)
-                self._apply_add_column(name, type_, declared, lease)
-            finally:
-                lease.release()
-
-    def _refuse_duplicate_column(self, name: str, declared: pa.Schema) -> None:
-        """One change at a time, and the refusal says which one is outstanding.
-
-        The intent clause is not belt-and-braces. Recovery defers step 4 when
-        the archive is unreachable, so an unfinished change can stand for as
-        long as the outage lasts. Allow a SECOND change on top of it and step 7
-        writes `declared + the new one`, dropping the pending column from the
-        declaration while `union_by_name` keeps it in both Iceberg tables — and
-        clears the intent, which is what makes it fatal. `_declared_schema` then
-        refuses to open the log for every process, reader and writer, on a log
-        with every row intact.
-        """
-        pending = self._buffer.get_meta(INTENT_KEY)
-        if pending:
-            outstanding = json.loads(pending)["add"]
-            msg = (
-                f"cannot add {name!r}: the change adding {outstanding!r} has not "
-                "finished. Reopen the log to complete it — if its archive is "
-                "unreachable the change waits for the archive rather than "
-                "failing the open"
-            )
-            raise ValueError(msg)
-
-        if name in declared.names:
-            msg = f"column {name!r} already exists"
-            raise ValueError(msg)
-
-    def _apply_add_column(
-        self, name: str, type_: pa.DataType, declared: pa.Schema, lease: Claim
-    ) -> None:
-        """Steps 4-7, in the one order that cannot strand data.
-
-        Step 4 before step 6 is ordered, not merely sequenced. Step 6 is what
-        makes a value of the new column storable at all; step 4 is what makes
-        the archive able to ACCEPT a file carrying one. `add_files` treats an
-        optional field missing from a file as compatible but refuses a file
-        with a column the table lacks — so an archive left behind while the
-        buffer moves ahead means every later push fails permanently, I4 pins
-        eviction, and local disk grows without bound.
-
-        If step 4 cannot complete the change stops there, with nothing local
-        changed and nothing to undo.
-        """
-        widened = pa.schema([*declared, pa.field(name, type_)])
-        table = table_schema(widened)
-
-        # Step 4: the ARCHIVE first — §9, "the local table is a window and can
-        # be rebuilt; the archive cannot". A full S3 metadata commit against a
-        # 30 s TTL, so the lease is renewed immediately before it.
-        try:
-            remote = self._archive.table(repair=False)
-        except Exception as exc:
-            # Reaching the archive is a NETWORK question, and every way it can
-            # fail means the same thing here: step 4 cannot run. `table()`
-            # returns None for an absent archive but raises for an unreachable
-            # one, so both shapes have to be converted.
-            msg = f"cannot add {name!r}: the archive is unreachable ({exc})"
-            raise _ArchiveDeferred(msg) from exc
-
-        if remote is None and self._archive.configured():
-            # Configured but not reachable. `table()` returns None for both
-            # "no archive" and "cannot open it", and treating them alike here
-            # would skip step 4 and run steps 5-7 anyway — leaving the archive
-            # behind a buffer that can now store the new column. Every later
-            # push would fail permanently.
-            msg = (
-                f"cannot add {name!r}: the archive is configured but unreachable, "
-                "and the archive must be widened first (§9). The change is "
-                "recorded and completes on a later open"
-            )
-            raise _ArchiveDeferred(msg)
-
-        if remote is not None:
-            checkpoint(lease.renew)
-            remote.add_column(table)
-
-        # Step 5: the local table, same call, same reason.
-        checkpoint(lease.renew)
-        self._table.add_column(table)
-        self._table.reload()
-
-        # Step 6: the buffer DDL. Without it the INSERT column list would name
-        # a column SQLite does not have.
-        self._buffer.add_table_column(name, type_)
-
-        # Step 7: the declaration, and only then the intent cleared — §9, a
-        # schema change is complete when SQLite says so, not when Iceberg does.
-        # One transaction, so no reader sees the new schema without the intent
-        # already gone.
-        self._buffer.set_meta_all(
-            {
-                _SCHEMA_KEY: widened.serialize().to_pybytes().hex(),
-                INTENT_KEY: "",
-            }
-        )
-
-    def rename_column(self, old: str, new: str, *, breaking_ok: bool) -> None:
-        """Rename a column. Safe for the data, BREAKING for consumers (§9).
-
-        Renaming TO `litelink_offset` is refused for the same reason as adding
-        it, and renaming it away would retire the column §7 derives every tier
-        boundary from.
-
-        Iceberg resolves by field ID, so no file is rewritten — and no engine's
-        SQL is rewritten either, so `SELECT qty` breaks the moment the column
-        becomes `quantity`. `breaking_ok` must be passed explicitly: the format
-        will not stop you, so the API has to (I10).
-        """
-        reject_reserved(new)
-        reject_reserved(old)
-        raise NotImplementedError
-
-    def drop_column(self, name: str, *, breaking_ok: bool) -> None:
-        """Drop a column. Same contract as `rename_column` (§9, I10).
-
-        Re-adding the name later creates a NEW field ID and cannot collide with
-        the retired data.
-        """
-        reject_reserved(name)
-        raise NotImplementedError
-
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
     """The Arrow schema as declared, checked against the table's columns.
 
-    Both records must exist and agree. There is no fall back to the table's own
-    view: under I16 a schema change records its intent before acting and is
-    replayed on recovery, so a log whose two records disagree has not been
-    interrupted — it has been corrupted, or written to behind the library's
-    back. Continuing with a guess would serve reads under a schema the data
-    does not have.
+    Both records must exist and agree. A log's schema is fixed at creation
+    (§9), so a log whose two records disagree has been corrupted, or written to
+    behind the library's back. Continuing with a guess would serve reads under
+    a schema the data does not have.
+
+    One disagreement used to be legitimate: an `add_column` interrupted between
+    its Iceberg commits and its SQLite record, which recovery finished. That
+    operation is gone, so a log left mid-change by an older release is refused
+    with the way to finish it.
     """
     encoded = Buffer.peek_meta(layout.buffer_db, _SCHEMA_KEY)
     if encoded is None:
@@ -4615,44 +4346,25 @@ def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
         )
         raise ValueError(msg)
 
+    if Buffer.peek_meta(layout.buffer_db, _LEGACY_INTENT_KEY):
+        msg = (
+            f"log at {layout.root}/{layout.name} has an `add_column` that an "
+            f"older release started and did not finish. This release has no "
+            f"schema changes (logs are immutable, §9), so it cannot finish it: "
+            f"open the log once with litelink {LAST_MIGRATING_RELEASE}, which "
+            f"completes it, then open it with this one"
+        )
+        raise ValueError(msg)
+
     declared = pa.ipc.read_schema(pa.BufferReader(bytes.fromhex(encoded)))
     if declared.names != from_table.names:
-        # One disagreement is legitimate, and only one: a schema change that
-        # got its Iceberg commits in and was interrupted before step 7 leaves
-        # the table holding exactly one column the declaration does not, with
-        # the intent that names it still standing. Recovery finishes it a few
-        # lines after this returns.
-        #
-        # Narrow deliberately — an outstanding intent excuses THAT column and
-        # nothing else. Accepting any superset would let a genuinely corrupt
-        # table through, which is what this check exists to catch.
-        pending = Buffer.peek_meta(layout.buffer_db, INTENT_KEY)
-        expected = (*declared.names, json.loads(pending)["add"]) if pending else ()
-        if tuple(from_table.names) != expected:
-            msg = (
-                f"stored schema {declared.names} disagrees with the Iceberg table "
-                f"{from_table.names} — the log has been modified outside litelink"
-            )
-            raise ValueError(msg)
+        msg = (
+            f"stored schema {declared.names} disagrees with the Iceberg table "
+            f"{from_table.names} — the log has been modified outside litelink"
+        )
+        raise ValueError(msg)
 
     return declared
-
-
-def _intent(name: str, type_: pa.DataType) -> str:
-    """The record a schema change writes before it acts (I16).
-
-    The Arrow type travels with the name because recovery has to compare it:
-    `union_by_name` is idempotent in a way that also swallows a NARROWING —
-    given an existing `n: long` and a passed `n: int32` it calls `promote()`,
-    succeeds, and changes nothing. Without the type here the replay could not
-    tell that apart from the change it meant to finish.
-    """
-    return json.dumps(
-        {
-            "add": name,
-            "type": pa.schema([pa.field(name, type_)]).serialize().to_pybytes().hex(),
-        }
-    )
 
 
 def validate_row(schema: pa.Schema, row: Row) -> None:
@@ -4689,18 +4401,6 @@ def application_schema(schema: pa.Schema) -> pa.Schema:
 def table_schema(schema: pa.Schema) -> pa.Schema:
     """The caller's columns with `offset` in front — the table's real schema."""
     return pa.schema([pa.field("litelink_offset", pa.int64(), nullable=False), *schema])
-
-
-def reject_reserved(name: str) -> None:
-    """Refuse any operation that would touch the library's own column (I11).
-
-    Checked at schema-change time as well as at creation: those are the two
-    ways a caller could reach it, and monotonicity and non-reuse cannot be
-    enforced on a column an application controls.
-    """
-    if name == OFFSET:
-        msg = f"`{OFFSET}` is owned by the library and cannot be added, renamed or dropped (I11)"
-        raise ValueError(msg)
 
 
 def validate(

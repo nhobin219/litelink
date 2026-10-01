@@ -35,7 +35,7 @@ Every handle can read. Each subclass only **adds**:
 ```
 LogHandle                    identity · read · observe · close        ← annotate this
 ├── LocalReadHandle          + databases · replication_config · write_replication_config
-    └── WriteHandle          + append · seal · maintain · sync · set_* · add_column
+    └── WriteHandle          + append · seal · maintain · sync · retire · set_*
 ```
 
 **Nothing inherits a method it has to refuse**, which is the property two earlier shapes kept
@@ -101,7 +101,6 @@ Each row is what that class **adds** to the one above it. A test pins every set 
 | **`+ WriteHandle`** — archive | `sync` · `hydrate` · `rewrite_archive` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` · `set_archive` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
-| **`+ WriteHandle`** — schema | `add_column`; `rename_column`/`drop_column` raise `NotImplementedError` |
 
 `await_seal` is deliberately a `WriteHandle` method: it *helps* drain the queue each round
 rather than only watching, and a reader could only watch.
@@ -775,21 +774,20 @@ reporter's host showed 4 in 45 seconds. A sampling check would print PASS on har
 still crash-loop, and false confidence is worse than no check. What it reports is the risky
 combination, which is a fact rather than a sample.
 
-## Schema evolution
+## A log's schema is fixed
+
+A log has the schema it was created with, for life (SPEC §9, #93). There is no `add_column`,
+`rename_column` or `drop_column`. To change a schema, start a new log where the old one ended:
 
 ```python
-log.add_column(name, type_) -> None
-log.rename_column(old, new, *, breaking_ok) -> None
-log.drop_column(name, *, breaking_ok) -> None
+old.retire()
+new = litelink.new(root, "trades-v2", schema=widened, archive=prefix,
+                   start_offset=old.end_offset())
 ```
 
-**All three raise `NotImplementedError`.** They are specified in §9 and the signatures are the
-contract that will hold when they land: `breaking_ok` is explicit because Iceberg resolves by
-field ID, so no file is rewritten and no engine's SQL is rewritten either — `SELECT qty` breaks
-the moment the column becomes `quantity`, and the format will not stop you, so the API has to.
-
-All three refuse `litelink_offset` before they raise, which is where I11 is enforced against
-the second way a caller could reach it.
+Offsets stay dense across the two, so any engine reads `<prefix>/trades` and
+`<prefix>/trades-v2` as one sequence. A log a 0.5 release widened with `add_column` stays
+readable; one it left mid-change is refused with the release that can finish it (0.5.1).
 
 ## Rules that cut across
 

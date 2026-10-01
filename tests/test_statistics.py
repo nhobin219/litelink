@@ -30,7 +30,7 @@ SCHEMA = pa.schema(
         pa.field("allnull", pa.int64()),
     ]
 )
-BOUNDED = ("litelink_offset", "k", "i32", "f32", "f64", "b", "late")
+BOUNDED = ("litelink_offset", "k", "i32", "f32", "f64", "b")
 
 
 def _value(rng: random.Random, type_: pa.DataType) -> object:
@@ -50,11 +50,12 @@ def _value(rng: random.Random, type_: pa.DataType) -> object:
 
 
 def _random_log(root: Path, seed: int) -> litelink.WriteHandle:
-    """Several sealed files, then a bulk load, then a late column.
+    """Several sealed files, then a bulk load.
 
-    Every rule the rollup has is reached: a file where a column is all NULL
-    (the whole batch leaves `i32` empty), a file written by `ingest`, and files
-    that predate `late` entirely.
+    The rules a log can reach are reached: a file where a column is all NULL
+    (the whole batch leaves `i32` empty), and a file written by `ingest`. A
+    file that predates a column — possible only in a log an older release
+    widened — is covered at the file level below.
     """
     rng = random.Random(seed)
     config = LogConfig(target_seal_rows=rng.randint(3, 12))
@@ -82,11 +83,6 @@ def _random_log(root: Path, seed: int) -> litelink.WriteHandle:
         {"k": key + 2, "f64": rng.uniform(-1e6, 1e6), "f32": 2.5},
     ]
     log.ingest(pa.Table.from_pylist(loaded, schema=SCHEMA))
-    log.add_column("late", pa.int64())
-    log.extend(
-        [{"k": key + 3, "late": rng.randint(-99, 99)}, {"k": key + 4, "late": 7}]
-    )
-    log.seal()
 
     return log
 
@@ -107,7 +103,7 @@ def test_the_rollup_agrees_with_the_data(tmp_path: Path, seed: int) -> None:
         assert stats.tier == "local"
         assert stats.record_count == data.num_rows
         assert stats.file_count == log.table_files()
-        assert set(stats) == {"litelink_offset", *SCHEMA.names, "late"}
+        assert set(stats) == {"litelink_offset", *SCHEMA.names}
 
         for name in stats:
             values = data[name].to_pylist()
@@ -134,8 +130,6 @@ def test_the_rollup_agrees_with_the_data(tmp_path: Path, seed: int) -> None:
         assert stats["allnull"].null_count == data.num_rows
         assert stats["allnull"].min is None
         assert stats["s"].min is None, "string bounds are truncated, so none"
-        assert stats["late"].null_count is None, "older files predate the column"
-        assert stats["late"].min is None
         assert stats["f64"].nan_count == 0, "no write path admits NaN (#87)"
         assert stats["f32"].nan_count == 0
         assert stats["i32"].nan_count is None, "only floats have one"
@@ -145,11 +139,7 @@ def test_the_rollup_agrees_with_the_data(tmp_path: Path, seed: int) -> None:
         tail_key = max(data["k"].to_pylist())
         log.extend(
             [
-                {
-                    "k": tail_key + n,
-                    "i32": rng.randint(-5, 5),
-                    "late": rng.choice([None, 1000]),
-                }
+                {"k": tail_key + n, "i32": rng.randint(-5, 5)}
                 for n in range(1, rng.randint(2, 9))
             ]
         )

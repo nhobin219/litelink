@@ -32,6 +32,7 @@ from litelink.log import (
     WriteHandle,
     _declared_schema,
     application_schema,
+    legacy_layout,
 )
 
 if TYPE_CHECKING:
@@ -155,12 +156,7 @@ def _existing(
     # which: told "use new()", an operator creates an empty log beside data
     # that is still there.
     if layout.is_legacy():
-        msg = (
-            f"the log at {layout.root}/{name} uses the pre-0.2 layout, whose "
-            f"catalogs sit at the root. Move it with:\n"
-            f"  python -m litelink.migrate --root {layout.root} --name {name}"
-        )
-        raise FileNotFoundError(msg)
+        raise FileNotFoundError(legacy_layout(layout))
 
     try:
         present = LogTable.exists_for(layout)

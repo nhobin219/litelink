@@ -2,8 +2,9 @@
 
 See ``docs/SPEC.md``. All three tiers are implemented — the SQLite buffer, the
 local Iceberg table, and the archive on object storage — and a log survives
-losing its machine (``restore``). Schema evolution (§9) is implemented for
-``add_column``; blob fields (§15) are specified and are not.
+losing its machine (``restore``). A log's schema is fixed when it is created;
+changing it means starting a new log (§9). Blob fields (§15) are specified and
+are not implemented.
 
 **The log is the directory and the objects in the bucket; these classes are
 handles to it.** That is why none of them is called ``Log`` — a class named

@@ -390,19 +390,6 @@ def test_an_otel_log_round_trips_through_every_local_path(tmp_path: Path) -> Non
     with litelink.open(tmp_path, "s") as reopened:
         assert _read_back(reopened) == _expected(rows), "after reopen"
 
-        reopened.add_column("resource", pa.map_(pa.string(), pa.string()))
-        reopened.append({**otel_row(26), "resource": {"host.name": "h1"}})
-        reopened.seal()
-        added = reopened.scan(where="ts = 26").read_all()["resource"].to_pylist()
-        assert added == [[("host.name", "h1")]]
-
-        loaded = pa.Table.from_pylist(
-            [{**otel_row(n), "resource": None} for n in (27, 28)],
-            schema=reopened.schema,
-        )
-        assert reopened.ingest(loaded) == (27, 28)
-        assert reopened.scan().read_all().num_rows == 28
-
 
 REFUSED_NESTED: list[tuple[str, dict[str, object], str]] = [
     ("unknown struct key", {"body": {"s": "x", "zz": 1}}, "does not have: \\['zz'\\]"),

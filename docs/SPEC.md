@@ -100,10 +100,11 @@ tiny transaction; a seal's seconds go to the Parquet and Avro writes, which were
 per-stream.
 
 Logs written before 0.2 keep working only after being moved — `open` detects the old tree
-and names the command rather than reporting an absent log. See `python -m litelink.migrate`,
-which rewrites metadata pointers in place and preserves snapshot ids and commit times,
-because §8 derives a file's age from the snapshot that added it. Data files are neither
-moved nor rewritten: they were always at `<root>/<name>/data`.
+and names the command rather than reporting an absent log. The migration itself,
+`python -m litelink.migrate`, shipped through 0.5.1 and is gone from later releases (#93): run
+it with 0.5.1. It rewrites metadata pointers in place and preserves snapshot ids and commit
+times, because §8 derives a file's age from the snapshot that added it. Data files are
+neither moved nor rewritten: they were always at `<root>/<name>/data`.
 
 A root holding several streams moves one stream at a time, and four things stay shared until
 the last of them has: `catalog.db`, `archive.db`, the root `litestream.yml` — which names
@@ -1503,72 +1504,35 @@ Buffer rows are deleted once something off-box holds them — at seal, or at syn
 
 ---
 
-## 9. Schema evolution
+## 9. Immutable logs
 
-Iceberg assigns each column a permanent field ID and writes it into every Parquet file as
-`PARQUET:field_id`. Resolution is by ID, not name, so **add, drop and rename are all safe at
-the storage layer**:
+**A log's schema is fixed when it is created, for life. To change it, start a new log** (#93).
+litelink is a storage engine, not a query engine, and an immutable log is the storage-engine
+shape: every file in a log has every column, so there is no field-ID bookkeeping, no file
+that predates a column, and no operation that spans the archive, the local table and the
+buffer's DDL at once.
 
-- **add** — new ID; older files simply have no value and read null.
-- **drop** — the ID is retired; its data stops being projected, which is what dropping means.
-  Re-adding the same name later creates a *new* ID and cannot collide with the retired data.
-- **rename** — the ID is unchanged, so every existing file follows the new name with no
-  rewrite.
+Changing a schema is therefore a new name — and so a new archive table — starting where the
+old log ended:
 
-**The constraint is the read contract, not the format.** Iceberg resolves by ID inside the
-table; it does not rewrite anyone's SQL. `SELECT qty` breaks the moment the column becomes
-`quantity`, and the archive exists so external engines can query it directly.
+```python
+old.retire()                                  # everything archived, nothing local
+new = litelink.new(root, "trades-v2", schema=widened, archive=prefix,
+                   start_offset=old.end_offset())
+```
 
-So drops and renames are **supported but breaking for consumers**. Expose them as explicit,
-deliberate operations — never as a side effect of editing a schema dict — and treat them as
-a versioned change to the stream's public surface. Adds are non-breaking and need no
-ceremony.
+Offsets stay dense across the two logs, and any engine reads `<prefix>/trades` and
+`<prefix>/trades-v2` as one sequence. streamcast's `Stream.migrate` does exactly this. Reusing
+the old name against the same archive is refused by the archive guard, as it should be: two
+logs would put the same offsets in one table.
 
-Apply any schema change to the archive **first**. The local table is a window and can be
-rebuilt; the archive cannot.
-
-**A schema change is complete when SQLite says so, not when Iceberg does.** Iceberg cannot
-hold the whole declaration: it has one string type and one binary type, so a column declared
-as a wide Arrow type comes back narrow, and the declared spelling has to live in the local
-database beside the buffer. That makes a schema change two writes — an Iceberg commit and a
-SQLite write — which cannot be made atomic with each other, for the same reason §7 gives for
-not requiring an atomic handoff between two catalogs.
-
-Use §4's shape, not a best-effort ordering: record the intended schema in SQLite before
-anything changes, commit to Iceberg, then write the schema and clear the intent. Recovery
-replays it, and the table's columns say which half already landed.
-
-**Probe, never stamp.** The intent records WHAT the change is, never which of its steps have
-run. Recording a step does not make it atomic with the commit it describes — it only moves
-the unreconciled gap from before that commit to after it — and a stamp can be *false*:
-`litelink.restore` rebuilds the local table from the declared schema, so a replica captured
-mid-change arrives carrying a record of a step that never landed on that machine. Every step
-is settled by asking the thing itself: the archive's columns, the local table's, `PRAGMA
-table_info(buffer)`, the `meta` row. This requires the Iceberg step to be replayable against
-a table where it already landed, which is why it uses `union_by_name` — idempotent — rather
-than `add_column`, which raises `name already exists`.
-
-**Recovery defers; it never fails the open.** If the archive cannot be widened, the intent is
-left standing and the log opens anyway. It appends, seals and reads; the change simply has
-not finished, and it is safe to leave because the declaration is unchanged — so no value of
-the new column can be stored, the insert column list being derived from it. Failing the open
-instead would mean a change interrupted by an outage makes the log unopenable for writing
-until the bucket returns, breaking §11's promise that a log works with no network.
-
-**One change at a time.** A second change while one is outstanding is refused, and the
-refusal names the pending column. This is not tidiness: the second change would write
-`declared + its own column`, dropping the pending one from the declaration while the Iceberg
-tables keep it, and then clear the intent — after which the declared schema and the table
-disagree with nothing to explain it, and no process can open the log at all.
-
-This is the same completion boundary every other multi-step operation here uses — a seal
-completes at its final SQLite transaction, a compaction when its claim is cleared, a deletion
-when its queue row is forgotten. **Iceberg holds the data; SQLite holds the record of what the
-library has finished doing.** Treating the Iceberg commit as completion would leave a crash
-having added a column whose declared type is gone, with nothing to indicate it.
-
-Nothing is ever lost to a schema mistake: the raw `payload` is stored verbatim, so a column
-can be re-promoted under any name at any time.
+**What this replaced.** Through 0.5, `add_column` widened a log in place: the archive first,
+then the local table, then the buffer's DDL, with an intent recorded in SQLite before it began
+and replayed on recovery, because the Iceberg commits and the SQLite writes cannot be made
+atomic. `rename_column` and `drop_column` were specified and never built. All three are gone.
+A log a 0.5 release left mid-`add_column` is refused, naming the release that can finish it,
+and a log a 0.5 release widened stays readable: the rollup and the reader already treat a
+file that predates a column as holding NULLs, with unknown statistics.
 
 ## 10. Invariants
 
@@ -1614,11 +1578,11 @@ Each needs a test.
 | **I4** | A file is never evicted from the local table while a configured archive still lacks it. Vacuous when no archive is configured (§8). | Eviction before registration is data loss. With no archive nothing is owed, and `local_retention` is then a deletion policy the operator asked for — see §8. |
 | **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
-| **I7** | Schema changes reach the archive before the local table. | The local table is rebuildable; the archive is not. |
+| **I7** | *Retired with schema changes (#93).* Schema changes reached the archive before the local table. | Logs are immutable (§9), so there is no schema change to order. |
 | **I11** | `litelink_offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
-| **I17** | An append names only columns the log declares, supplies a value for every non-nullable one, and gives each a value of its declared type, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. The type clause closes the same two outcomes reached through a value rather than a name: SQLite has affinities, not types, so it stores whatever it is given and the declared schema is not consulted again until the read. A value Arrow cannot parse (`"x"` into an int64) wedges every scan; one it can parse but not preserve (`1.5` into an int64, `12345` into a string, `True` into an int64) is silently rewritten, so what is read back is not what was appended and nothing raises at all. Magnitude is checked with it: `2**40` IS an int and `1e300` IS a float, and they fail the same two ways — the int32 wedges every scan, the float32 reads back as `inf`. **Enforced by the buffer's DDL, not by Python.** Every column is declared `ANY` with a `typeof` CHECK, and that is the whole design: a STRICT column of a declared type does not refuse a wrong value, it CONVERTS one. An INTEGER column given `'77'` stores 77 and `'007'` stores 7; a REAL column given `'1e999'` stores `inf`; a TEXT column given `12345` stores `'12345'`. The conversion happens before any CHECK could see it, so a constraint on a typed column would be asked about a value that had already been changed. `ANY` stores the value exactly as given, which is what lets `typeof` tell the truth about it; STRICT is still declared, because it is what makes `ANY` mean "no conversion". `NOT NULL` carries the nullability half — absent and explicitly-None reach SQLite identically — and the range tests ride in the same CHECK. An integer is a legal value for a FLOAT column — `{"price": 5}` is too natural to refuse — but only within the range where every integer converts exactly (2**53 for float64, 2**24 for float32). Past it the value stays an integer in the buffer, since `ANY` performs no conversion, and Arrow then cannot build the column at all: one such value makes every scan and every seal raise for ever while appends keep succeeding. The bound is a range rather than a per-value test because a SQL CHECK cannot ask whether one particular integer is representable, so some that would convert exactly are refused too. A column added later by `add_column` gets the identical DDL through `ALTER TABLE`, which accepts a CHECK; building it from the affinity alone left every added column unvalidated for the life of the log. Python is left with the one question SQLite cannot be asked, an unknown column: the insert names the schema's columns, so a key the log does not have is dropped before any SQL exists. One leniency is deliberate — `True` into an integer column stores 1, because the driver converts it before SQLite sees it, and it is lossless. A `fixed_size_binary(n)` column adds `length() = n` to its CHECK. **A float must be finite** (#87): the CHECK refuses ±inf, and NaN — which SQLite stores as NULL before any CHECK sees it — is refused in Python, as are non-finite values in a nested column and in `ingest`'s Arrow. NaN because readers disagree about it: Iceberg's file bounds and Parquet's row-group statistics leave it out, so whether DuckDB returns a stored NaN depends on what else shares its file. ±inf because the layer above speaks JSON, which has no infinity. **Nested columns are the one place Python enforces I17.** A `struct`, `map` or `list` value is stored as JSON text, which no CHECK can see into, and Arrow is no check either: it drops a struct key the type does not declare, silently, and accepts `None` for a non-nullable child. So `Nested` walks the declared type before the insert and refuses the same classes — wrong type, out of range, inexact integer into a float, unknown struct field, null where the field is not nullable — naming the path to the value. |
+| **I17** | An append names only columns the log declares, supplies a value for every non-nullable one, and gives each a value of its declared type, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. The type clause closes the same two outcomes reached through a value rather than a name: SQLite has affinities, not types, so it stores whatever it is given and the declared schema is not consulted again until the read. A value Arrow cannot parse (`"x"` into an int64) wedges every scan; one it can parse but not preserve (`1.5` into an int64, `12345` into a string, `True` into an int64) is silently rewritten, so what is read back is not what was appended and nothing raises at all. Magnitude is checked with it: `2**40` IS an int and `1e300` IS a float, and they fail the same two ways — the int32 wedges every scan, the float32 reads back as `inf`. **Enforced by the buffer's DDL, not by Python.** Every column is declared `ANY` with a `typeof` CHECK, and that is the whole design: a STRICT column of a declared type does not refuse a wrong value, it CONVERTS one. An INTEGER column given `'77'` stores 77 and `'007'` stores 7; a REAL column given `'1e999'` stores `inf`; a TEXT column given `12345` stores `'12345'`. The conversion happens before any CHECK could see it, so a constraint on a typed column would be asked about a value that had already been changed. `ANY` stores the value exactly as given, which is what lets `typeof` tell the truth about it; STRICT is still declared, because it is what makes `ANY` mean "no conversion". `NOT NULL` carries the nullability half — absent and explicitly-None reach SQLite identically — and the range tests ride in the same CHECK. An integer is a legal value for a FLOAT column — `{"price": 5}` is too natural to refuse — but only within the range where every integer converts exactly (2**53 for float64, 2**24 for float32). Past it the value stays an integer in the buffer, since `ANY` performs no conversion, and Arrow then cannot build the column at all: one such value makes every scan and every seal raise for ever while appends keep succeeding. The bound is a range rather than a per-value test because a SQL CHECK cannot ask whether one particular integer is representable, so some that would convert exactly are refused too. Python is left with the one question SQLite cannot be asked, an unknown column: the insert names the schema's columns, so a key the log does not have is dropped before any SQL exists. One leniency is deliberate — `True` into an integer column stores 1, because the driver converts it before SQLite sees it, and it is lossless. A `fixed_size_binary(n)` column adds `length() = n` to its CHECK. **A float must be finite** (#87): the CHECK refuses ±inf, and NaN — which SQLite stores as NULL before any CHECK sees it — is refused in Python, as are non-finite values in a nested column and in `ingest`'s Arrow. NaN because readers disagree about it: Iceberg's file bounds and Parquet's row-group statistics leave it out, so whether DuckDB returns a stored NaN depends on what else shares its file. ±inf because the layer above speaks JSON, which has no infinity. **Nested columns are the one place Python enforces I17.** A `struct`, `map` or `list` value is stored as JSON text, which no CHECK can see into, and Arrow is no check either: it drops a struct key the type does not declare, silently, and accepts `None` for a non-nullable child. So `Nested` walks the declared type before the insert and refuses the same classes — wrong type, out of range, inexact integer into a float, unknown struct field, null where the field is not nullable — naming the path to the value. |
 | **I9** | `litelink_offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
-| **I10** | Drops and renames go through an explicit versioned operation, never an implicit schema diff. | They are safe for the data and breaking for consumers; the format will not stop you, so the API must. |
+| **I10** | *Retired with schema changes (#93).* Drops and renames were to go through an explicit versioned operation. | A log's schema is fixed (§9); a changed schema is a new log. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
 | **I16** | Every operation spanning Iceberg and local state records its intent in SQLite before acting, and is complete only once SQLite records completion. | Iceberg's atomicity stops at one table, so nothing spanning two systems can be committed at once. Without the intent record a crash leaves work half-applied and unattributable; without the completion record the library cannot tell a finished operation from an interrupted one. |
 
@@ -2389,11 +2353,6 @@ Beyond §10:
   offset already committed to Iceberg (I9). This fails with a bare `INTEGER PRIMARY KEY`.
 - Assert an unregistered file is never evicted locally, even past `local_retention` (I4).
 - Expire snapshots during a long scan; assert the scan completes (I6).
-- Add a column mid-stream; assert files written before and after union cleanly with nulls.
-- Drop a column, re-add the name with a different type; assert both files stay readable and
-  the columns do not merge (the retired ID's data is simply not projected).
-- Rename a column; assert files written before and after read back under the new name with
-  no rewrite, and that the operation is refused unless invoked explicitly (I10).
 - Attach an external engine to the archive; assert it sees exactly the expected rows with no
   custom logic.
 - Assert written files are sorted by `sort_by`, and that an `event_ts` predicate over a
@@ -2429,13 +2388,6 @@ Beyond §10:
   check from being a blanket "every key must be present". Falsify by allowing it and
   scanning: the failure is not scoped to the bad row, so assert the rows written BEFORE it
   become unreadable too.
-- Add a column to a log with sealed files; assert old rows read null, new rows carry values,
-  and not one file was rewritten. Assert a SEALER that never appends does not drop the new
-  column — the process that would never revalidate if the schema were cached per append.
-- Interrupt a schema change before its final SQLite write; assert the next open completes it,
-  and that a reader opened during the window reads rather than raising. Assert an
-  `add_column` whose archive is unreachable leaves the log openable, appendable and readable,
-  and that the change completes on a later open (§11).
 - Commit twice, then assert a reader that cached `metadata_location` from the first commit
   is detectably stale -- the reason §7 requires resolving it per query.
 - Run with `local_retention = 0`; assert seal, upload, archive reads and compaction all work
