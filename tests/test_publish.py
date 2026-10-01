@@ -119,10 +119,12 @@ def test_publish_pushes_sealed_files_and_records_the_watermark(
         log.publish()
 
         remote = log._published.require()
-        assert remote.extent() == (1, sealed[-1].hi), (
+        assert remote.span() == (1, sealed[-1].end), (
             "the published table must cover them"
         )
-        assert int(log._buffer.get_meta("published_through") or 0) == sealed[-1].hi
+        assert int(log._buffer.get_meta("published_through") or 0) == (
+            sealed[-1].end - 1
+        )
 
 
 def test_a_read_spans_published_staging_and_buffer(
@@ -228,8 +230,10 @@ def test_only_settled_files_reach_the_published_table(
 
         log.publish()
 
-        assert int(log._buffer.get_meta("published_through") or 0) == files[-2].hi
-        assert log._published.require().extent() == (1, files[-2].hi)
+        assert int(log._buffer.get_meta("published_through") or 0) == (
+            files[-2].end - 1
+        )
+        assert log._published.require().span() == (1, files[-2].end)
 
 
 def test_hydrate_brings_evicted_files_back_to_local_disk(
@@ -349,9 +353,9 @@ def test_rewrite_published_merges_files_left_undersized(
         remote.reload()
         after = remote.data_files()
         assert len(after) < before, "the rewrite must reduce the file count"
-        assert [f.lo for f in after] == sorted(f.lo for f in after)
-        assert after[0].lo == 1, "the range must still start where it did"
-        assert after[-1].hi == max(f.hi for f in remote.data_files())
+        assert [f.start for f in after] == sorted(f.start for f in after)
+        assert after[0].start == 1, "the range must still start where it did"
+        assert (after[-1].end - 1) == max((f.end - 1) for f in remote.data_files())
 
         restored = log.sql("SELECT * FROM log").read_all()
         assert sorted(restored.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1))
@@ -1334,24 +1338,25 @@ def test_the_published_table_refuses_a_range_that_starts_inside_its_extent(
         log.publish()
         published = log._published.require()
         published.reload()
-        covered = published.extent()
+        covered = published.span()
 
         assert covered is not None
 
-        # A file whose range begins inside what the published table already holds.
+        # A file whose range begins inside what the published table already
+        # holds: at its last offset.
         with pytest.raises(ValueError, match="two files at once"):
-            published.register(["s3://nowhere/straddle.parquet"], lo=covered[1])
+            published.register(["s3://nowhere/straddle.parquet"], start=covered[1] - 1)
 
         # And one that ENGULFS it — starting below the extent and running past
         # it. This is the worse shape, not an excused one: it puts every
         # published offset in two files rather than some of them.
         with pytest.raises(ValueError, match="two files at once"):
             published.register(
-                ["s3://nowhere/engulf.parquet"], lo=max(covered[0] - 5, 0)
+                ["s3://nowhere/engulf.parquet"], start=max(covered[0] - 5, 0)
             )
 
         # And one that begins cleanly above it is not refused by this check.
-        published._refuse_straddle(covered[1] + 1)
+        published._refuse_straddle(covered[1])
 
 
 def test_the_log_keeps_working_after_the_published_table_is_re_cut(
@@ -1407,7 +1412,7 @@ def test_the_log_keeps_working_after_the_published_table_is_re_cut(
         # The superseded rows still sit in `extent`: `drain` removes them only
         # after the grace period, and until it does they still match the local
         # cuts. The state that matters is the one AFTER that, so take it.
-        current = {(f.lo, f.hi + 1) for f in log._published.require().data_files()}
+        current = {(f.start, f.end) for f in log._published.require().data_files()}
         with log._buffer._lock:
             for lo, hi in log._buffer.published_ranges(
                 log._published.uri or "", 0, include_intents=False
@@ -1594,7 +1599,7 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
         log.maintain()
 
         assert all(
-            f.lo > published or f.hi <= published for f in log._table.data_files()
+            f.start >= published or f.end <= published for f in log._table.data_files()
         ), "merged across a range the published table holds while detached"
 
         log.set_published(where)
@@ -1955,7 +1960,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
         published = log._published.require()
         published.reload()
-        extent = published.extent()
+        extent = published.span()
         intents = log._buffer.intents(log._published.uri or "")
 
         assert extent is not None
@@ -1976,7 +1981,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         log.maintain()
 
         assert all(
-            f.lo > extent[1] or f.hi <= extent[1] for f in log._table.data_files()
+            f.start >= extent[1] or f.end <= extent[1] for f in log._table.data_files()
         ), "merged across the published table's extent"
 
         log.publish()
@@ -2021,9 +2026,9 @@ def test_eviction_never_acts_on_an_intended_copy(
 
         for data_file in log._table.data_files():
             log._buffer.intend_file(
-                f"s3://{bucket}/prefix/data/{data_file.lo}.parquet",
-                data_file.lo,
-                data_file.hi + 1,
+                f"s3://{bucket}/prefix/data/{data_file.start}.parquet",
+                data_file.start,
+                data_file.end,
                 1,
             )
 
@@ -2292,9 +2297,9 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         sealed = log.staging_extent()
 
         assert sealed is not None, "nothing sealed, so the case is not set up"
-        # The buffer's FLOOR is the measure, not its size: `count_above(0)`
+        # The buffer's FLOOR is the measure, not its size: `count_from(0)`
         # counts the unsealed tail too, which is in the buffer either way.
-        buffered = log._buffer.extent()  # noqa: SLF001
+        buffered = log._buffer.span()  # noqa: SLF001
 
         assert buffered is not None
         assert buffered[0] < sealed[1], (
@@ -2310,7 +2315,7 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
 
         assert published > 0, "nothing reached the published table"
         # Released only up to the PUBLISHED table's frontier, never the seal's.
-        released = log._buffer.extent()  # noqa: SLF001
+        released = log._buffer.span()  # noqa: SLF001
 
         assert released is not None
         assert released[0] > published, (
@@ -2344,7 +2349,7 @@ def test_without_replication_a_seal_still_drops_its_rows(
         sealed = log.staging_extent()
 
         assert sealed is not None
-        buffered = log._buffer.extent()  # noqa: SLF001
+        buffered = log._buffer.span()  # noqa: SLF001
         # Either the buffer is empty, or what is in it is strictly the unsealed
         # tail — never a row the seal already wrote to Parquet.
         assert buffered is None or buffered[0] >= sealed[1], (
@@ -2390,15 +2395,15 @@ def test_a_held_seal_does_not_widen_the_next_file(
             log.extend(rows(600))
             log.seal_due()
 
-        files = sorted(log._table.data_files(), key=lambda f: f.lo)  # noqa: SLF001
+        files = sorted(log._table.data_files(), key=lambda f: f.start)  # noqa: SLF001
 
         assert len(files) > 2, "not enough seals to have a second one to widen"
         # Contiguous and non-overlapping (§4, §6). A widened file starts at the
         # log's floor instead of its own group's, so every later file overlaps
         # every earlier one.
         for earlier, later in zip(files, files[1:], strict=False):
-            assert later.lo == earlier.hi + 1, (
-                f"{later.lo} does not follow {earlier.hi}: ranges overlap"
+            assert later.start == earlier.end, (
+                f"{later.start} does not follow {(earlier.end - 1)}: ranges overlap"
             )
 
         # And the read agrees, which is what the overlap would break.
@@ -2842,13 +2847,13 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         # Committed, not retired: the crash lands between the two.
         log._write_and_commit(start, end, rel_path)
 
-        held = log._buffer.count_above(0)  # noqa: SLF001
+        held = log._buffer.count_from(0 + 1)  # noqa: SLF001
 
         assert held > 0
 
         log.recover()
 
-        assert log._buffer.count_above(0) == held, (  # noqa: SLF001
+        assert log._buffer.count_from(0 + 1) == held, (  # noqa: SLF001
             "recovery deleted rows the published table has not been sent"
         )
 
@@ -3084,10 +3089,10 @@ def test_a_restore_fence_clears_the_published_table_and_not_just_the_replica(
             )
         )
         log.publish()
-        published = log._published.require().extent()  # noqa: SLF001
+        published = log._published.require().span()  # noqa: SLF001
 
         assert published is not None, "the published table holds nothing to outrun with"
-        ahead = published[1]
+        ahead = published[1] - 1
 
     assert ahead > stalled_at + RESTORE_RESERVE, (
         "the published table did not outrun the snapshot by more than the fence, "
@@ -3512,7 +3517,7 @@ def test_buffered_rows_sees_another_process_seal(
     This is the documented two-role topology: RUNTIME.md has the writer append
     while the maintainer seals.
 
-    Falsify by reading `self._table.extent()` instead of `self.staging_extent()`
+    Falsify by reading `self._table.span()` without the reload
     in `buffered_rows`: the reader reports 20 buffered and 20 in the table for
     a log holding 20.
     """
@@ -3590,8 +3595,8 @@ def test_a_handle_that_read_an_empty_published_table_still_sees_it_fill(
     Every other test opens a fresh handle after the eviction, which is why
     nine review rounds did not reach this.
 
-    Falsify by reading `self._published.table(repair=False).extent()` in
-    `_published_required` instead of `self._published_extent()`.
+    Falsify by reading `self._published.table(repair=False).span()` in
+    `_published_required` instead of `self._published_span()`.
     """
     where = f"s3://{bucket}/prefix"
     config = replace(
@@ -4083,7 +4088,7 @@ def test_the_statistics_tiers_partition_the_log(
             {"event_ts": ROWS + i, "key": "h", "payload": "y"} for i in range(held)
         )
         log.seal()
-        assert log._buffer.extent() is not None, "the seal must keep its rows"  # noqa: SLF001
+        assert log._buffer.span() is not None, "the seal must keep its rows"  # noqa: SLF001
         log.extend(
             {"event_ts": ROWS + held + i, "key": "t", "payload": "y"}
             for i in range(tail)
@@ -4132,7 +4137,7 @@ def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
         log.extend(rows(500))
         log.seal()
 
-        assert log._buffer.count_above(0) == 500, "the fixture must keep sealed rows"
+        assert log._buffer.count_from(0 + 1) == 500, "the fixture must keep sealed rows"
         assert log.buffered_rows() == 0
         assert log.staging_rows() == 500
 

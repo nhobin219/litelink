@@ -11,20 +11,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pyiceberg.expressions import And, GreaterThanOrEqual, LessThanOrEqual
+from pyiceberg.expressions import And, GreaterThanOrEqual, LessThan
 
 if TYPE_CHECKING:
     from pyiceberg.expressions import BooleanExpression
 
 
-def offset_between(lo: int, hi: int) -> BooleanExpression:
-    """`lo <= offset <= hi` — the compaction unit (§6)."""
+def offset_in(start: int, end: int) -> BooleanExpression:
+    """`start <= offset < end` — a compaction or re-cut unit (§6)."""
     return And(
-        GreaterThanOrEqual("litelink_offset", lo),
-        LessThanOrEqual("litelink_offset", hi),
+        GreaterThanOrEqual("litelink_offset", start),
+        LessThan("litelink_offset", end),
     )
 
 
-def offset_at_or_below(hi: int) -> BooleanExpression:
-    """`offset <= hi` — the eviction prefix (§8)."""
-    return LessThanOrEqual("litelink_offset", hi)
+def offset_below(end: int) -> BooleanExpression:
+    """`offset < end` — the eviction prefix (§8)."""
+    return LessThan("litelink_offset", end)

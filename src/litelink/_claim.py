@@ -95,8 +95,10 @@ class Claim:
     connection: sqlite3.Connection
     lock: threading.RLock
     kind: str
-    lo: int
-    hi: int
+    # The claimed offsets, `[start, end)`. Stored in the `lo` and `hi`
+    # columns, which kept their names.
+    start: int
+    end: int
     owner: str
     rel_path: str | None = None
     ttl_ms: int = DEFAULT_TTL_MS
@@ -114,12 +116,12 @@ class Claim:
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                # Ranges are inclusive on both ends, so [a, b] and [c, d]
-                # overlap exactly when a <= d and b >= c.
+                # Ranges are half-open, so [a, b) and [c, d) overlap exactly
+                # when a < d and b > c.
                 clash = self.connection.execute(
                     "SELECT 1 FROM claim WHERE expires_at > ? AND owner <> ? "
-                    "AND lo <= ? AND hi >= ? LIMIT 1",
-                    (now, self.owner, self.hi, self.lo),
+                    "AND lo < ? AND hi > ? LIMIT 1",
+                    (now, self.owner, self.end, self.start),
                 ).fetchone()
                 if clash is not None:
                     self.connection.execute("ROLLBACK")
@@ -132,8 +134,8 @@ class Claim:
                 # and a lapsed holder would still find its own row and renew
                 # itself back to life over the range someone else now owns.
                 self.connection.execute(
-                    "DELETE FROM claim WHERE expires_at <= ? AND lo <= ? AND hi >= ?",
-                    (now, self.hi, self.lo),
+                    "DELETE FROM claim WHERE expires_at <= ? AND lo < ? AND hi > ?",
+                    (now, self.end, self.start),
                 )
                 cursor = self.connection.execute(
                     "INSERT INTO claim (owner, expires_at, kind, lo, hi, rel_path) "
@@ -142,8 +144,8 @@ class Claim:
                         self.owner,
                         now + self.ttl_ms,
                         self.kind,
-                        self.lo,
-                        self.hi,
+                        self.start,
+                        self.end,
                         self.rel_path,
                     ),
                 )

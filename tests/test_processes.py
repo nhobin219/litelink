@@ -126,7 +126,7 @@ MAINTAINER = """
         except RuntimeError:
             pass
         passes += 1
-        if log.staging_rows() >= ROWS and not log._buffer.rows_above(0).num_rows:
+        if log.staging_rows() >= ROWS and not log._buffer.rows_from(0 + 1).num_rows:
             # One more of each before leaving. Eviction reads the published
             # watermark, so it can only remove what the PREVIOUS publish pushed —
             # stopping the moment everything is sealed would leave the last

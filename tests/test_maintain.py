@@ -208,9 +208,9 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
         assert log.staging_files() == before, "evicted with an empty published table"
 
         # The published table now holds the first file, and only that one.
-        first = min(log._table.data_files(), key=lambda f: f.lo)
+        first = min(log._table.data_files(), key=lambda f: f.start)
         log._buffer.record_file(
-            f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
+            f"s3://bucket/prefix/data/{first.start}.parquet", first.start, first.end, 1
         )
         log.maintain()
 
@@ -345,7 +345,9 @@ def test_recovery_never_removes_a_file_the_table_adopted(tmp_path: Path) -> None
         live = log._table.data_files()[0]
         # Claimed as though a crashed compaction had produced it, while the
         # table in fact references it.
-        log._buffer.claim_compaction(live.lo, live.hi, log._layout.relative(live.path))
+        log._buffer.claim_compaction(
+            live.start, live.end, log._layout.relative(live.path)
+        )
 
     with open_log(tmp_path, config) as recovered:
         recovered._maintenance.drain()
@@ -525,7 +527,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
         table = log._table
 
         def agrees(stage: str) -> None:
-            table._counts_at = table._extent_at = None
+            table._counts_at = table._span_at = None
             files = table.data_files()
 
             assert table.file_count() == len(files), stage
@@ -614,7 +616,7 @@ def sized(*sizes: int) -> tuple[list[DataFile], dict[str, int]]:
         path = f"{offset}.parquet"
         # A deliberately misleading on-disk size: every rule under test must
         # read `memory`, and any that reaches for `size` gets a wrong answer.
-        files.append(DataFile(path=path, size=1, rows=1, lo=offset, hi=offset))
+        files.append(DataFile(path=path, size=1, rows=1, start=offset, end=offset + 1))
         memory[path] = size
         offset += 1
 
@@ -737,7 +739,7 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         # the rest out with it — which is why the fault only appears once a log
         # has been running a while, and never in a test that just seals.
         # Eviction itself is the commit that does it in practice.
-        log._table.evict_through(files[0].hi)
+        log._table.evict_below(files[0].end)
         log._maintenance.expire()
 
         remaining = log._table.data_files()
@@ -778,7 +780,7 @@ def test_staging_rows_keeps_recent_data_a_time_window_would_drop(
         assert sum(f.rows for f in kept) >= 8, (
             "the row floor must hold data the window would have dropped"
         )
-        assert kept[-1].hi == 16, "the newest rows are the ones kept"
+        assert (kept[-1].end - 1) == 16, "the newest rows are the ones kept"
 
 
 def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> None:
@@ -823,7 +825,7 @@ def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
 
         kept = log._table.data_files()
         assert sum(f.rows for f in kept) == 4
-        assert kept[-1].hi == 16
+        assert (kept[-1].end - 1) == 16
 
 
 def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> None:
@@ -1031,25 +1033,25 @@ def test_two_owners_compact_disjoint_ranges_at_once(tmp_path: Path) -> None:
         tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
     ) as log:
         seal_files(log, 4)
-        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+        files = sorted(log._table.data_files(), key=lambda f: f.start)
 
         assert len(files) >= 4
 
         # One owner is working on the bottom of the log.
-        low = log._buffer.claim("compact", files[0].lo, files[1].hi, "other-owner")
+        low = log._buffer.claim("compact", files[0].start, files[1].end, "other-owner")
 
         assert low.acquire()
 
         try:
             # A second owner claims the top, and is not refused.
-            high = log._buffer.claim("compact", files[2].lo, files[-1].hi, "mine")
+            high = log._buffer.claim("compact", files[2].start, files[-1].end, "mine")
 
             assert high.acquire(), "disjoint ranges must not exclude each other"
 
             high.release()
 
             # Overlapping, and it is.
-            clash = log._buffer.claim("compact", files[1].lo, files[2].hi, "mine")
+            clash = log._buffer.claim("compact", files[1].start, files[2].end, "mine")
 
             assert not clash.acquire(), "overlapping ranges must exclude"
         finally:
@@ -1059,7 +1061,7 @@ def test_two_owners_compact_disjoint_ranges_at_once(tmp_path: Path) -> None:
 def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
     """A row floor lands mid-file; the boundary must not.
 
-    `evict_through` filters by ROW, so a boundary inside a file makes pyiceberg
+    `evict_below` filters by ROW, so a boundary inside a file makes pyiceberg
     rewrite it copy-on-write — and the replacement lands at a path this library
     never learns, which breaks the rule every reclamation rests on: a file's
     path is in SQLite before the file exists (I2). The superseded original is
@@ -1130,25 +1132,25 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
     try:
         log.extend(rows(1200))
         log.seal_due()
-        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+        files = sorted(log._table.data_files(), key=lambda f: f.start)
 
         assert len(files) >= 4
 
         # The published table holds the first two.
         for data_file in files[:2]:
             log._buffer.record_file(
-                f"s3://bucket/prefix/data/{data_file.lo}.parquet",
-                data_file.lo,
-                data_file.hi + 1,
+                f"s3://bucket/prefix/data/{data_file.start}.parquet",
+                data_file.start,
+                data_file.end,
                 1,
             )
 
-        boundary = files[1].hi
+        boundary = files[1].end - 1
         log.compact()
 
         merged = log._table.data_files()
 
-        assert all(f.lo > boundary or f.hi <= boundary for f in merged), (
+        assert all(f.start > boundary or (f.end - 1) <= boundary for f in merged), (
             "no file may span the published table's extent, or the published table gets it twice"
         )
         assert log.scan().read_all().num_rows == 1200
@@ -1174,11 +1176,11 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
     )
     with log:
         seal_files(log, 2)
-        first = min(log._table.data_files(), key=lambda f: f.lo)
+        first = min(log._table.data_files(), key=lambda f: f.start)
         log._buffer.record_file(
-            f"file://{tmp_path}/prefix/data/{first.lo}.parquet",
-            first.lo,
-            first.hi + 1,
+            f"file://{tmp_path}/prefix/data/{first.start}.parquet",
+            first.start,
+            first.end,
             1,
         )
         local = log._table.data_files()
@@ -1187,7 +1189,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
             log._maintenance.published_prefix(
                 local, log._published.uri, include_intents=False
             )
-            == first.hi
+            == first.end
         )
 
         log.set_published(f"file://{tmp_path}/elsewhere")
@@ -1205,7 +1207,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
             log._maintenance.published_prefix(
                 local, log._published.uri, include_intents=False
             )
-            == first.hi
+            == first.end
         ), "pointing back finds the copies still recorded where they are"
 
 
@@ -1230,22 +1232,22 @@ def test_rewriting_the_published_table_does_not_strand_staging_eviction(
     )
     with log:
         seal_files(log, 3, per_file=4)
-        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+        files = sorted(log._table.data_files(), key=lambda f: f.start)
 
         assert len(files) == 3
 
         # The published table holds every row of all three, cut its own way: two files
         # whose boundaries line up with none of the local ones.
-        lo, hi = files[0].lo, files[-1].hi
-        middle = files[1].lo + 1
-        log._buffer.record_file("s3://bucket/prefix/data/a.parquet", lo, middle, 1)
-        log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, hi + 1, 1)
+        start, end = files[0].start, files[-1].end
+        middle = files[1].start + 1
+        log._buffer.record_file("s3://bucket/prefix/data/a.parquet", start, middle, 1)
+        log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, end, 1)
 
         assert (
             log._maintenance.published_prefix(
                 files, log._published.uri, include_intents=False
             )
-            == hi
+            == end
         ), "the published table holds every row; how it cut them is not I4's business"
 
 
@@ -1260,21 +1262,21 @@ def test_a_gap_in_the_published_table_stops_the_walk(tmp_path: Path) -> None:
     )
     with log:
         seal_files(log, 3, per_file=4)
-        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+        files = sorted(log._table.data_files(), key=lambda f: f.start)
 
         # The first file, then a hole, then the third.
         log._buffer.record_file(
-            "s3://bucket/prefix/data/a.parquet", files[0].lo, files[0].hi + 1, 1
+            "s3://bucket/prefix/data/a.parquet", files[0].start, files[0].end, 1
         )
         log._buffer.record_file(
-            "s3://bucket/prefix/data/c.parquet", files[2].lo, files[2].hi + 1, 1
+            "s3://bucket/prefix/data/c.parquet", files[2].start, files[2].end, 1
         )
 
         assert (
             log._maintenance.published_prefix(
                 files, log._published.uri, include_intents=False
             )
-            == files[0].hi
+            == files[0].end
         ), "a range the published table does not hold must stop the walk"
 
 
@@ -1293,14 +1295,14 @@ def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        run = sorted(log._table.data_files(), key=lambda f: f.lo)
+        run = sorted(log._table.data_files(), key=lambda f: f.start)
         rows_before = len(read_all(log))
 
         assert len(run) == 3
 
         # Eviction happened after this run was chosen and before the merge
         # takes its claim.
-        log._table.evict_through(run[0].hi)
+        log._table.evict_below(run[0].end)
         remaining = len(read_all(log))
 
         assert remaining < rows_before, "the setup must actually evict"
@@ -1376,7 +1378,12 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
                 )
 
             taker = Claim(
-                self.connection, self.lock, "compact", self.lo, self.hi, new_owner()
+                self.connection,
+                self.lock,
+                "compact",
+                self.start,
+                (self.end - 1),
+                new_owner(),
             )
             assert original(taker)
             rival.append(taker)
@@ -1766,8 +1773,8 @@ def test_the_published_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
     described, and the watermark is written from the wrong file.
 
     Files are ordered by offset and the walk stops at the first file the
-    published table does not fully hold, so the answer is either 0 or some file's `hi`,
-    and everything at or below it is a prefix. Asserted over random coverage
+    published table does not fully hold, so the answer is either 0 or some file's `end`,
+    and everything below it is a prefix. Asserted over random coverage
     rather than argued.
     """
     random.seed(20260823)
@@ -1780,7 +1787,7 @@ def test_the_published_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
     )
     with log:
         seal_files(log, 5, per_file=4)
-        files = sorted(log._table.data_files(), key=lambda f: f.lo)
+        files = sorted(log._table.data_files(), key=lambda f: f.start)
 
         assert len(files) == 5
 
@@ -1796,18 +1803,18 @@ def test_the_published_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
                 if random.random() < 0.6:
                     log._buffer.record_file(
                         f"s3://bucket/prefix/data/{trial}-{index}.parquet",
-                        data_file.lo,
-                        data_file.hi + 1,
+                        data_file.start,
+                        data_file.end,
                         1,
                     )
 
             frozen = log._maintenance.published_prefix(
                 files, "s3://bucket/prefix", include_intents=False
             )
-            below = [f for f in files if f.lo <= frozen]
-            above = [f for f in files if f.lo > frozen]
+            below = [f for f in files if f.start < frozen]
+            above = [f for f in files if f.start >= frozen]
 
-            assert frozen == 0 or frozen in {f.hi for f in files}, (
+            assert frozen == 0 or frozen in {f.end for f in files}, (
                 f"{frozen} is not a file boundary"
             )
             assert files[: len(below)] == below, "the split is not a prefix"

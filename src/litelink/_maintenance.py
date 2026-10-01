@@ -191,32 +191,32 @@ def _both(
     return beat
 
 
-def _covered(ranges: Sequence[tuple[int, int]], lo: int, hi: int) -> bool:
-    """Whether `[lo, hi)` sits entirely inside `ranges`, which are sorted.
+def _covered(ranges: Sequence[tuple[int, int]], start: int, end: int) -> bool:
+    """Whether `[start, end)` sits entirely inside `ranges`, which are sorted.
 
     A walk rather than a set membership test, because the published table's cuts need
     not line up with anyone else's. Adjacent published files join — offsets are
     contiguous, so `[1, 151)` and `[151, 301)` together hold `[101, 201)` even
     though neither holds it alone — and a gap ends the answer.
     """
-    if hi <= lo:
+    if end <= start:
         # An empty range is held by anything, vacuously. Unreachable from I4,
         # where a file always holds at least one row, but a predicate that
         # answers "no" to a question with no rows in it is a trap for the next
         # caller.
         return True
 
-    reach = lo
-    for start, end in ranges:
-        if start > reach:
+    reach = start
+    for held_start, held_end in ranges:
+        if held_start > reach:
             return False
 
-        if end > reach:
-            reach = end
-            if reach >= hi:
+        if held_end > reach:
+            reach = held_end
+            if reach >= end:
                 return True
 
-    return reach >= hi
+    return reach >= end
 
 
 def is_remote(path: str) -> bool:
@@ -336,7 +336,8 @@ class Maintenance:
     def published_prefix(
         self, files: Sequence[DataFile], prefix: str | None, *, include_intents: bool
     ) -> int:
-        """The highest `hi` whose whole prefix the published table holds (§4a).
+        """The `end` of the longest prefix of `files` the published table holds
+        (§4a), or 0 when it holds none of it.
 
         I4 asked of segments. A file is the published table's business if the published table
         holds THAT FILE'S ROWS, which `publish` wrote down when it pushed it. The
@@ -360,21 +361,19 @@ class Maintenance:
         here: the row is written when the copy exists, and it names the bucket
         it went to.
         """
-        ordered = sorted(files, key=lambda f: f.lo)
+        ordered = sorted(files, key=lambda f: f.start)
         if not ordered:
             return 0
 
         covered = self._buffer.published_ranges(
-            prefix, ordered[0].lo, include_intents=include_intents
+            prefix, ordered[0].start, include_intents=include_intents
         )
         reached = 0
         for data_file in ordered:
-            # `record_file` stores the end offset exclusive, as every extent
-            # does — the cut is the offset AFTER the last row.
-            if not _covered(covered, data_file.lo, data_file.hi + 1):
+            if not _covered(covered, data_file.start, data_file.end):
                 break
 
-            reached = data_file.hi
+            reached = data_file.end
 
         return reached
 
@@ -429,7 +428,7 @@ class Maintenance:
         # What it buys is that no merge can ever straddle a range a published table
         # holds. `_push` applies the same exclusion, or the two deadlock.
         published = self.published_prefix(local, None, include_intents=True)
-        pending = [f for f in local if f.hi > published]
+        pending = [f for f in local if f.end > published]
 
         # One read, so the two limits describe the same policy.
         config = self.config
@@ -478,10 +477,10 @@ class Maintenance:
         commit that supersedes them, carrying their measured sizes onto the
         output — is identical, and was identical when it was written twice.
         """
-        lo, hi = run[0].lo, run[-1].hi
+        start, end = run[0].start, run[-1].end
         # Unique per attempt. See `compaction_path`: a fixed name made a
         # rewrite of a previous compaction write over the file it was reading.
-        rel_path = self._layout.compaction_path(lo, hi, uuid.uuid4().hex[:8])
+        rel_path = self._layout.compaction_path(start, end, uuid.uuid4().hex[:8])
         target = table.uri(rel_path) if upload else str(self._layout.absolute(rel_path))
         # Claimed before the file exists, exactly as a seal claims its path
         # (I2). One that dies between the write and the commit is then
@@ -499,7 +498,7 @@ class Maintenance:
         # owner here would make this merge a rival to the operation it is part
         # of — refused by its own claim, silently doing nothing.
         claim = self._buffer.claim(
-            "compact", lo, hi, owner or new_owner(), self._key(target)
+            "compact", start, end, owner or new_owner(), self._key(target)
         )
         if not claim.acquire():
             return
@@ -538,12 +537,12 @@ class Maintenance:
         # watermark never advances again, and eviction pins on it.
         if table is self._table:
             published = self.published_prefix(current, None, include_intents=True)
-            if any(f.lo <= published for f in run):
+            if any(f.start < published for f in run):
                 claim.release()
 
                 return
 
-        self._buffer.claim_compaction(lo, hi, self._key(target))
+        self._buffer.claim_compaction(start, end, self._key(target))
         try:
             # The claim renews itself while the merge runs. A rewrite over a
             # large run outlasts the TTL, and letting it lapse would invite
@@ -573,8 +572,8 @@ class Maintenance:
         *,
         upload: bool = False,
     ) -> None:
-        lo, hi = run[0].lo, run[-1].hi
-        merged = table.scan_range(lo, hi)
+        start, end = run[0].start, run[-1].end
+        merged = table.scan_range(start, end)
         order = self.sort_by
         if order:
             # Re-sorted, not merely concatenated: concatenation would leave the
@@ -582,7 +581,7 @@ class Maintenance:
             # statistic the sort exists to tighten.
             merged = merged.sort_by([(c, "ascending") for c in order])
 
-        _verify(merged, run, lo, hi)
+        _verify(merged, run, start, end)
 
         # Written locally either way, because Parquet is written to a file and
         # the alternative is holding a second copy of the run in memory. For
@@ -612,7 +611,7 @@ class Maintenance:
         # Superseded, not yet deletable either way: a scan that started before
         # this commit is still reading them (I6).
         self._enqueue(f.path for f in run)
-        table.replace_range(lo, hi, [target])
+        table.replace_range(start, end, [target])
         # Re-dated to the commit, for the reason `restamp_deletions` gives: a
         # merge that failed between the queueing and this line and was retried
         # later would otherwise supersede these files against a stamp already
@@ -652,7 +651,7 @@ class Maintenance:
     # -- eviction -----------------------------------------------------------
 
     def _retention_boundary(self) -> int:
-        """The highest offset the retention policies would drop, before I4.
+        """The `end` below which the retention policies would drop, before I4.
 
         Files cover contiguous non-overlapping ranges, so evicting a prefix is
         a single upper bound. Anything newer is untouched — and each policy is
@@ -682,7 +681,7 @@ class Maintenance:
             stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
             # Nothing old enough is a limit of zero, not an absent one: it
             # means this policy would keep everything.
-            limits.append(max((f.hi for f in stale), default=0))
+            limits.append(max((f.end for f in stale), default=0))
 
         if config.staging_rows is not None:
             # COUNTED, not subtracted from the frontier. `next_offset() - 1 -
@@ -701,12 +700,12 @@ class Maintenance:
             # already did.
             kept = 0
             for data_file in sorted(
-                self._table.data_files(), key=lambda f: f.hi, reverse=True
+                self._table.data_files(), key=lambda f: f.end, reverse=True
             ):
                 if kept >= config.staging_rows:
                     # This file lies entirely outside the window, so everything
-                    # at or below it may go.
-                    limits.append(data_file.hi)
+                    # up to its end may go.
+                    limits.append(data_file.end)
                     break
 
                 kept += data_file.rows
@@ -754,11 +753,11 @@ class Maintenance:
         # under the claim.
         files = self._table.data_files()
         boundary = (
-            max((f.hi for f in files), default=0)
+            max((f.end for f in files), default=0)
             if everything
             else self._retention_boundary()
         )
-        boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
+        boundary = max((f.end for f in files if f.end <= boundary), default=0)
         if boundary <= 0:
             return
 
@@ -813,13 +812,13 @@ class Maintenance:
         # age limit is already one — some file's `hi` — and so is the published table
         # clamp, but the row floor is arbitrary and lands mid-file on most
         # passes. A mid-file boundary is not a smaller eviction:
-        # `evict_through` filters by row, so pyiceberg rewrites the straddling
+        # `evict_below` filters by row, so pyiceberg rewrites the straddling
         # file copy-on-write at a path this library never learns. That breaks
         # the rule the whole deletion design rests on — every file's path is in
         # SQLite before the file exists (I2) — and leaves the superseded
         # original out of the queue, so once expiry drops the snapshots naming
         # it, nothing can name it again.
-        boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
+        boundary = max((f.end for f in files if f.end <= boundary), default=0)
         if boundary <= 0:
             removal.release()
 
@@ -846,7 +845,7 @@ class Maintenance:
             # the merged output, which is in nobody's deletion queue. Once
             # expiry drops the snapshots naming it, nothing can name it again.
             checkpoint(removal.renew)
-            dropped = [f.path for f in files if f.hi <= boundary]
+            dropped = [f.path for f in files if f.end <= boundary]
             # The published table's tier row describes what it holds below the
             # staging table, and these rows are about to be exactly that —
             # so it grows BEFORE they leave, or a read between the two
@@ -867,7 +866,7 @@ class Maintenance:
             )
 
             self._enqueue(dropped)
-            self._table.evict_through(boundary)
+            self._table.evict_below(boundary)
             # Re-dated to the commit, like every other supersession. Eviction
             # needs it without any failure at all: `hydrate` re-registers a
             # file under the very path the queue still holds, drain's veto then
@@ -993,8 +992,8 @@ class Maintenance:
         # was ever re-cut however much accumulated there.
         segment: list[DataFile] = []
         for data_file in published.data_files():
-            dense = data_file.rows == data_file.hi - data_file.lo + 1
-            if dense and (not segment or data_file.lo == segment[-1].hi + 1):
+            dense = data_file.rows == data_file.end - data_file.start
+            if dense and (not segment or data_file.start == segment[-1].end):
                 segment.append(data_file)
                 continue
 
@@ -1018,7 +1017,7 @@ class Maintenance:
         owner: str | None = None,
     ) -> None:
         """Append `stale` back through a buffer and seal it out again."""
-        lo, hi = stale[0].lo, stale[-1].hi
+        start, end = stale[0].start, stale[-1].end
         # Not durable, deliberately. Every row in here came from the published table
         # and is still in the published table until the single commit at the end, so a
         # crash costs a re-run rather than data — and this does one transaction
@@ -1069,11 +1068,11 @@ class Maintenance:
             # resumes at the start of the range rather than at 1. Reassigned
             # rather than supplied, which is what keeps I11 true of the rewrite
             # as well: nothing hands an offset to `append`.
-            scratch.seed_offsets(lo)
+            scratch.seed_offsets(start)
             expected = 0
             for data_file in stale:
                 checkpoint(heartbeat)
-                rows = published.scan_range(data_file.lo, data_file.hi)
+                rows = published.scan_range(data_file.start, data_file.end)
                 # Sorted by offset and then stripped of it. The counter is what
                 # reassigns them, so the rows have to arrive in the order their
                 # offsets already have — files are clustered by `sort_by`, not
@@ -1099,8 +1098,8 @@ class Maintenance:
         # any of them must fail while the originals are still the live files.
         # Against the RANGE WIDTH, deliberately, and this is one of the few
         # places that inference is right rather than a bug. `_recut` re-appends
-        # through `seed_offsets(lo)`, so rows are RENUMBERED sequentially from
-        # `lo` — which reproduces their original offsets only if the range is
+        # through `seed_offsets(start)`, so rows are RENUMBERED sequentially from
+        # `start` — which reproduces their original offsets only if the range is
         # dense. Comparing against `sum(f.rows)` instead would let a gapped
         # range pass and commit every row above the gap under an offset
         # belonging to different data, which is the corruption I9 exists to
@@ -1110,9 +1109,9 @@ class Maintenance:
         # range no longer REACHES it: `_badly_sized` excludes such files, so
         # a reserved hole (§3a) leaves one file un-rewritable rather than
         # raising on every rewrite the log ever attempts afterwards.
-        if expected != hi - lo + 1:
+        if expected != end - start:
             msg = (
-                f"published rewrite read {expected} rows for offsets {lo}-{hi}, "
+                f"published rewrite read {expected} rows for offsets [{start}, {end}), "
                 f"which is not a dense range"
             )
             raise RuntimeError(msg)
@@ -1132,7 +1131,9 @@ class Maintenance:
         # acquire deleted this claim's row, so the renew finds nothing and the
         # rewrite aborts while the originals are still live.
         checkpoint(heartbeat)
-        published.replace_range(lo, hi, [published.uri(p) for p, _, _, _ in written])
+        published.replace_range(
+            start, end, [published.uri(p) for p, _, _, _ in written]
+        )
         # The grace period starts HERE, not when they were queued. A reader
         # cannot hold a file the commit has not yet superseded, and a rewrite
         # slower than `snapshot_retention` would otherwise have burnt the whole
@@ -1174,15 +1175,13 @@ class Maintenance:
                 return written
 
             start, end = queued
-            rel_path = self._layout.compaction_path(
-                start, end - 1, uuid.uuid4().hex[:8]
-            )
+            rel_path = self._layout.compaction_path(start, end, uuid.uuid4().hex[:8])
             # Both claims. `sealing` in the scratch buffer makes the extent
             # recoverable there; `compacting` in the real one is what an
             # interrupted rewrite is found by, since the scratch database is
             # deleted on the way out.
             scratch.claim_seal(start, end, rel_path)
-            self._buffer.claim_output(start, end - 1, published.uri(rel_path))
+            self._buffer.claim_output(start, end, published.uri(rel_path))
 
             # Bounded at BOTH ends, though this loop's own `finish_seal`
             # would leave the floor correct anyway. That is the point: relying
@@ -1499,7 +1498,7 @@ class Maintenance:
         )
 
 
-def _verify(merged: pa.Table, run: list[DataFile], lo: int, hi: int) -> None:
+def _verify(merged: pa.Table, run: list[DataFile], start: int, end: int) -> None:
     """§6 step 3, as far as it can be taken.
 
     Row count and the offset extent are checked exactly; both are what the
@@ -1517,6 +1516,6 @@ def _verify(merged: pa.Table, run: list[DataFile], lo: int, hi: int) -> None:
     # kernels are generated from a runtime registry, so no static checker can
     # see them. §6 step 2 already holds the whole merge in memory.
     offsets = merged["litelink_offset"].to_pylist()
-    if min(offsets) != lo or max(offsets) != hi:
+    if min(offsets) != start or max(offsets) != end - 1:
         msg = "compaction changed the offset extent"
         raise RuntimeError(msg)

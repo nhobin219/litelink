@@ -105,7 +105,7 @@ def test_seal_empties_the_buffer_but_not_the_log(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(4))
         log.seal()
-        assert log._buffer.extent() is None
+        assert log._buffer.span() is None
         assert len(read_all(log)) == 4
 
 
@@ -114,7 +114,7 @@ def test_offsets_never_reused_after_the_buffer_empties(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(3))
         log.seal()
-        assert log._buffer.extent() is None
+        assert log._buffer.span() is None
         assert log.extend(rows(1, start=3)) == [4]
         assert log.staging_extent() == (1, 4)
 
@@ -153,19 +153,19 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
     """
     with open_log(tmp_path) as log:
         log.extend(rows(4))
-        extent = log._buffer.extent()
-        assert extent is not None
-        end = extent[1] + 1
+        span = log._buffer.span()
+        assert span is not None
+        end = span[1]
         rel_path = log._layout.seal_path(1, end, "tok")
         log._buffer.claim_seal(1, end, rel_path)
         log._write_and_commit(1, end, rel_path)
         # deliberately NOT finish_seal: this is the crash window
-        assert log._buffer.extent() is not None
+        assert log._buffer.span() is not None
         assert len(read_all(log)) == 4
 
     with open_log(tmp_path) as recovered:
         assert recovered._buffer.pending_seal() is None
-        assert recovered._buffer.extent() is None
+        assert recovered._buffer.span() is None
         assert len(read_all(recovered)) == 4
 
 
@@ -1017,7 +1017,7 @@ def test_start_offset_reserves_the_range_below_it(tmp_path: Path) -> None:
         assert log.extend(rows(3)) == [1001, 1002, 1003]
         log.seal()
 
-        assert log._table.extent() == (1000, 1003)
+        assert log._table.span() == (1000, 1004)
         assert log.scan().read_all().num_rows == 4
 
 
@@ -1099,7 +1099,7 @@ def test_the_tail_cache_serves_a_seeded_log_before_its_first_seal(
 def test_the_tail_cache_prunes_what_the_boundary_excludes(tmp_path: Path) -> None:
     """The slice must still drop rows at or below `floor`.
 
-    Asked of `rows_above` directly, because going through `scan()` cannot see
+    Asked of `rows_from` directly, because going through `scan()` cannot see
     it: a seal deletes the rows it covered, so the buffer holds nothing below
     the boundary and the slice has nothing to prune. The bug this guards
     against — returning the whole cache regardless of `floor` — is invisible
@@ -1112,10 +1112,10 @@ def test_the_tail_cache_prunes_what_the_boundary_excludes(tmp_path: Path) -> Non
         log.extend(rows(40))
         buffer = log._buffer
 
-        assert buffer.rows_above(0).num_rows == 40
-        assert buffer.rows_above(20).num_rows == 20
-        assert buffer.rows_above(39).num_rows == 1
-        assert buffer.rows_above(40).num_rows == 0
+        assert buffer.rows_from(0 + 1).num_rows == 40
+        assert buffer.rows_from(20 + 1).num_rows == 20
+        assert buffer.rows_from(39 + 1).num_rows == 1
+        assert buffer.rows_from(40 + 1).num_rows == 0
 
 
 def test_the_tail_cache_refuses_a_boundary_below_what_it_holds(
@@ -1134,8 +1134,8 @@ def test_the_tail_cache_refuses_a_boundary_below_what_it_holds(
         log.extend(rows(40))
         buffer = log._buffer
 
-        assert buffer.rows_above(30).num_rows == 10
-        assert buffer.rows_above(0).num_rows == 40
+        assert buffer.rows_from(30 + 1).num_rows == 10
+        assert buffer.rows_from(0 + 1).num_rows == 40
 
 
 def test_the_identity_surface_is_properties_not_methods(tmp_path: Path) -> None:

@@ -159,20 +159,20 @@ def test_the_extent_cache_follows_the_metadata_pointer(tmp_path: Path) -> None:
     log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     table = log._table
 
-    assert table.extent() is None, "nothing sealed yet"
+    assert table.span() is None, "nothing sealed yet"
 
     log.extend([{"event_ts": 1, "key": "a"}, {"event_ts": 2, "key": "b"}])
     log.seal()
     table.reload()
     first = table.metadata_location
-    assert table.extent() == (1, 2)
+    assert table.span() == (1, 3)
 
     log.extend([{"event_ts": 3, "key": "c"}])
     log.seal()
     table.reload()
 
     assert table.metadata_location != first, "a commit must move the pointer"
-    assert table.extent() == (1, 3), "cache served a stale extent across a seal"
+    assert table.span() == (1, 4), "cache served a stale extent across a seal"
     log.close()
 
 
@@ -188,18 +188,18 @@ def test_the_extent_cache_is_reused_while_the_pointer_holds(tmp_path: Path) -> N
 
     table = log._table
     table.reload()
-    first = table.extent()
-    assert first == (1, 1)
+    first = table.span()
+    assert first == (1, 2)
 
     for _ in range(5):
         table.reload()
-        assert table.extent() is first, "recomputed with the pointer unchanged"
+        assert table.span() is first, "recomputed with the pointer unchanged"
 
     log.extend([{"event_ts": 2, "key": "b"}])
     log.seal()
     table.reload()
 
-    assert table.extent() is not first, "a commit must force a re-read"
+    assert table.span() is not first, "a commit must force a re-read"
     log.close()
 
 
@@ -1344,9 +1344,9 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
                 {"event_ts": i, "key": payload} for i in range(2000)
             )
 
-        # The published table takes all but a tail, which is `release_published`'s shape.
+        # The published table takes all but a tail, which is `release_below`'s shape.
         boundary = issued[-300]
-        buffer.release_published(boundary)
+        buffer.release_below(boundary + 1)
         # Then punch holes in what is left, so a renumbering rewrite would show
         # up as closed gaps rather than having to be inferred.
         survivors = [o for o in issued if o > boundary and o % 3 == 0]
@@ -1399,7 +1399,7 @@ def test_reclaiming_a_small_buffer_does_nothing(tmp_path: Path) -> None:
         # Enough to leave a free list that is most of the file, and far enough
         # under the floor that reclaiming it would be pure cost.
         issued = buffer.append({"event_ts": i, "key": "k" * 400} for i in range(4000))
-        buffer.release_published(issued[-1])
+        buffer.release_below(issued[-1] + 1)
         pages, free = _page_stats(buffer)
         page_size = int(buffer._con.execute("PRAGMA page_size").fetchone()[0])  # noqa: SLF001
 

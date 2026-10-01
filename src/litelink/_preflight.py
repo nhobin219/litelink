@@ -40,7 +40,7 @@ from litelink._layout import Layout, validate_published
 from litelink._read import ExtensionMissing, duckdb_connection, load_extension
 from litelink._replication import litestream_binary
 from litelink._s3 import S3Options
-from litelink._table import published_extent
+from litelink._table import published_span
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -192,7 +192,7 @@ def _extension(name: str, *, required: bool) -> Check:
 def _published(prefix: str, name: str, s3: S3Options | None) -> Check:
     """Can this machine READ that published table with the credentials it has?
 
-    Through `published_extent`, which is the same call `new` and `restore` make,
+    Through `published_span`, which is the same call `new` and `restore` make,
     so this checks what they will actually do rather than something adjacent.
     It reads the published hint from the bucket alone — no `published.db`, no
     catalog — and it separates the two answers an operator needs told apart:
@@ -212,7 +212,7 @@ def _published(prefix: str, name: str, s3: S3Options | None) -> Check:
         # It is also the check most likely to fire here — the prefix arrives
         # from a shell, where a missing slash survives every other layer.
         validate_published(prefix)
-        extent = published_extent(layout, prefix, (s3 or S3Options()).resolved())
+        extent = published_span(layout, prefix, (s3 or S3Options()).resolved())
     except Exception as exc:  # noqa: BLE001
         return Check(
             f"published table {prefix}",
@@ -230,7 +230,7 @@ def _published(prefix: str, name: str, s3: S3Options | None) -> Check:
     return Check(
         f"published table {prefix}",
         ok=True,
-        detail=f"reachable, holds offsets {extent}",
+        detail=f"reachable, holds offsets [{extent[0]}, {extent[1]})",
     )
 
 

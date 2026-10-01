@@ -115,7 +115,7 @@ def test_it_passes_a_published_table_that_is_merely_empty(
     """Empty is not broken, and conflating them would make the check useless.
 
     A published table nothing has been pushed to yet is the ordinary state of a log
-    on its first day. `published_extent` answers None there and raises only when
+    on its first day. `published_span` answers None there and raises only when
     the bucket answers with a refusal, which is the distinction this reports.
     """
     report = preflight(

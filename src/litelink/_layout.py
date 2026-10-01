@@ -263,14 +263,14 @@ class Layout:
         """
         return f"{self.name}/data/{start}-{end}-{token}.parquet"
 
-    def compaction_path(self, lo: int, hi: int, token: str) -> str:
-        """Root-relative path for the merge of the offset range `[lo, hi]` (§6).
+    def compaction_path(self, start: int, end: int, token: str) -> str:
+        """Root-relative path for the merge of the offsets `[start, end)` (§6).
 
         `token` makes it unique per attempt, and unlike a seal's path it does
         NOT need to be derivable: `compacting` records it before the file
         exists, so recovery reads the name rather than recomputing it.
 
-        Uniqueness is the point. A deterministic `{lo}-{hi}` meant a compaction
+        Uniqueness is the point. A deterministic `{start}-{end}` meant a compaction
         whose inputs were themselves a previous compaction of the same range
         wrote to the path it was reading — `set_sort_by(rewrite=True)` after
         any compaction truncated the live, table-referenced file, and a crash
@@ -279,10 +279,10 @@ class Layout:
         because its source is the buffer, which is still there; a compaction's
         source is the file it is replacing.
         """
-        return f"{self.name}/data/compacted/{lo}-{hi}-{token}.parquet"
+        return f"{self.name}/data/compacted/{start}-{end}-{token}.parquet"
 
-    def ingest_path(self, lo: int, hi: int, token: str) -> str:
-        """Root-relative path for a bulk-ingested file covering `[lo, hi]` (§13.4).
+    def ingest_path(self, start: int, end: int, token: str) -> str:
+        """Root-relative path for a bulk-ingested file covering `[start, end)` (§13.4).
 
         Its own directory, beside `compacted/`, because the file is neither: it
         was never buffered and never merged. That is worth being able to see
@@ -295,7 +295,7 @@ class Layout:
         exist and read back from there, so it never has to be derivable, and
         two owners racing the range must not write one file.
         """
-        return f"{self.name}/data/ingested/{lo}-{hi}-{token}.parquet"
+        return f"{self.name}/data/ingested/{start}-{end}-{token}.parquet"
 
     def absolute(self, rel_path: str) -> Path:
         return self.root / rel_path

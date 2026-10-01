@@ -206,14 +206,14 @@ def test_a_read_below_the_buffer_does_not_read_it(
     from litelink._buffer import Buffer
 
     read: list[int | None] = []
-    original = Buffer.rows_above
+    original = Buffer.rows_from
 
     def counted(buffer: Buffer, boundary: int | None) -> pa.Table:
         read.append(boundary)
         return original(buffer, boundary)
 
     with buffered_log(tmp_path) as log:
-        monkeypatch.setattr(Buffer, "rows_above", counted)
+        monkeypatch.setattr(Buffer, "rows_from", counted)
 
         below = log.scan(end_offset=51).read_all()
         assert below.column(OFFSET).to_pylist() == list(range(1, 51))
@@ -618,12 +618,12 @@ def test_eviction_widens_the_published_row_before_it_commits(
     evicting — so a read resolving the new, higher floor finds it covered.
 
     Falsify by moving the `widen` in `Maintenance.evict` after
-    `evict_through`: at the commit the row still stops below the new floor.
+    `evict_below`: at the commit the row still stops below the new floor.
     """
     from litelink._table import LogTable
 
     seen: list[tuple[int, int | None]] = []
-    original = LogTable.evict_through
+    original = LogTable.evict_below
 
     def checked(table: LogTable, boundary: int) -> None:
         stored = PublishedTier(log._buffer).load()  # noqa: SLF001
@@ -637,12 +637,12 @@ def test_eviction_widens_the_published_row_before_it_commits(
         log.extend(rows(ROWS))
         log.seal()
         log.publish(push_unsettled=True)
-        monkeypatch.setattr(LogTable, "evict_through", checked)
+        monkeypatch.setattr(LogTable, "evict_below", checked)
         log.maintain()
 
     assert seen, "the fixture must evict"
     for boundary, covered_until in seen:
-        assert covered_until is not None and covered_until > boundary
+        assert covered_until is not None and covered_until >= boundary
 
 
 # -- coverage -------------------------------------------------------------------

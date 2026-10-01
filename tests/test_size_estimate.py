@@ -111,7 +111,7 @@ def test_the_estimate_is_never_below_arrow_and_close_to_it(
         (estimate,) = log._buffer._con.execute(
             "SELECT bytes FROM extent WHERE end_offset IS NULL"
         ).fetchone()
-        actual = log._buffer.rows_above(None).nbytes
+        actual = log._buffer.rows_from(None).nbytes
 
         assert 1.0 <= estimate / actual <= 1.25, f"{estimate} for {actual}"
 
