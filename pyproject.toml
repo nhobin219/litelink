@@ -48,7 +48,7 @@ dependencies = [
 # clean venv with only the base wheel — 21 files pushed to a bucket and read
 # back, with s3fs absent.
 #
-# The archive and replication tiers need BINARIES rather than packages, which
+# The S3 published tier and replication need BINARIES rather than packages, which
 # an extra cannot deliver: extras add dependencies, not files. They ship in the
 # platform wheel instead (see `hatch_build.py`) and are checked by
 # `python -m litelink`.
@@ -84,7 +84,7 @@ dev = [
     # access, and that goes through pyarrow. It moved here from an `s3` extra
     # that declared it as though the library needed it.
     #
-    # Its absence skips the whole archive tier, which is 91 tests. That is a
+    # Its absence skips the whole S3 published tier, which is 91 tests. That is a
     # silent loss, so `test_s3_tier_is_not_silently_skipped` fails instead.
     "s3fs>=2024.6.0",
     # The build backend, so the type checker can see `hatch_build.py`'s hook

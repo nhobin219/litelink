@@ -116,7 +116,7 @@ def test_offsets_never_reused_after_the_buffer_empties(tmp_path: Path) -> None:
         log.seal()
         assert log._buffer.extent() is None
         assert log.extend(rows(1, start=3)) == [4]
-        assert log.table_extent() == (1, 3)
+        assert log.staging_extent() == (1, 4)
 
 
 def test_sealed_file_is_sorted_by_sort_by(tmp_path: Path) -> None:
@@ -180,7 +180,7 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
 
     with open_log(tmp_path) as recovered:
         assert recovered._buffer.pending_seal() is None
-        assert recovered.table_extent() == (1, 3)
+        assert recovered.staging_extent() == (1, 4)
         assert len(read_all(recovered)) == 3
         assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 1, "no orphaned file"
 
@@ -196,10 +196,10 @@ def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None
         log.extend(rows(40))
 
         assert log._buffer.pending_group() is not None, "the cut was not recorded"
-        assert log.table_extent() is None, "an append wrote a file"
+        assert log.staging_extent() is None, "an append wrote a file"
 
         assert log.seal_due() is not None, "seal_due found nothing queued"
-        assert log.table_extent() is not None, "should have sealed on size"
+        assert log.staging_extent() is not None, "should have sealed on size"
         assert len(read_all(log)) == 40
 
 
@@ -208,11 +208,11 @@ def test_a_synchronous_seal_is_available(tmp_path: Path) -> None:
     with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(40))
 
-        assert log.table_extent() is None, "an append sealed on its own"
+        assert log.staging_extent() is None, "an append sealed on its own"
 
         log.seal()
 
-        assert log.table_extent() is not None, "seal() did not move the table"
+        assert log.staging_extent() is not None, "seal() did not move the table"
         assert len(read_all(log)) == 40
 
 
@@ -290,11 +290,11 @@ def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
 
         # Recording the cut is unconditional; writing the file is not.
         assert log.seal() == 51
-        assert log.table_files() == 0, "sealed while another seal was in flight"
+        assert log.staging_files() == 0, "sealed while another seal was in flight"
 
         held.release()
         assert log.seal() == 51
-        assert log.table_files() == 1
+        assert log.staging_files() == 1
 
 
 def test_close_waits_for_an_in_flight_seal(tmp_path: Path) -> None:
@@ -347,12 +347,12 @@ def test_a_reader_has_no_mutation_to_refuse(tmp_path: Path) -> None:
             "compact",
             "evict",
             "expire",
-            "sync",
+            "publish",
             "hydrate",
-            "rewrite_archive",
+            "rewrite_published",
             "set_config",
             "set_sort_by",
-            "set_archive",
+            "set_published",
             "recover",
         ):
             assert not hasattr(reader, absent), f"a reader exposes {absent}"
@@ -490,7 +490,7 @@ def test_a_log_needs_no_sort_by(tmp_path: Path) -> None:
         log.seal()
 
         assert log.sort_by == ()
-        assert log.table_files() == 1
+        assert log.staging_files() == 1
 
         stored = log.scan().read_all()
         offsets = stored.column(OFFSET).to_pylist()
@@ -1061,7 +1061,7 @@ def test_the_tail_cache_serves_a_seeded_log_before_its_first_seal(
     """Assert HITS, not rows — the rows are right either way.
 
     `_tail_lo` is `first_offset - 1`, which on a seeded log is far above the
-    boundary `Reader.query` passes while the local table has no extent (0). A
+    boundary `Reader.query` passes while the staging table has no extent (0). A
     guard gating on `_tail_lo <= floor` therefore missed on every read and
     re-converted the whole buffer per query — 4.2 ms/read against 42 at the
     default 8 MiB first-seal window.
@@ -1154,7 +1154,7 @@ def test_the_identity_surface_is_properties_not_methods(tmp_path: Path) -> None:
     Falsify by removing any of these decorators: the value becomes a bound
     method and the isinstance check fails.
     """
-    for name in ("root", "name", "config", "sort_by", "schema", "archive"):
+    for name in ("root", "name", "config", "sort_by", "schema", "published"):
         for cls in (litelink.LogHandle, WriteHandle):
             attr = inspect.getattr_static(cls, name)
             assert isinstance(attr, property), (
@@ -1176,12 +1176,12 @@ def test_a_writer_reports_where_its_next_append_lands(tmp_path: Path) -> None:
     `LogHandle.end_offset` answers "past the last row I can SERVE", which is
     what a follower needs. A writer is asked where its next row will land, and
     only `sqlite_sequence` knows — it is what assigns it. The two coincide on a
-    healthy log and diverge where the local table is empty while the archive
+    healthy log and diverge where the staging table is empty while the published table
     holds rows.
 
     `restore` is that state by construction: the fence reserves
-    `RESTORE_RESERVE` offsets, so the sequence sits far above the archive's
-    frontier while the rebuilt local table is empty. Inheriting the reader's
+    `RESTORE_RESERVE` offsets, so the sequence sits far above the published table's
+    frontier while the rebuilt staging table is empty. Inheriting the reader's
     answer reported 801 where the next append took 1,049,377 — a caller
     reading it as "what comes next" would collide with the fence I9 exists to
     hold.
@@ -1196,7 +1196,7 @@ def test_a_writer_reports_where_its_next_append_lands(tmp_path: Path) -> None:
         assert log.append({"event_ts": 9, "key": "k", "payload": "p"}) == 6
         assert log.end_offset() == 7, "it must move with the sequence, not with a tier"
 
-        # And it is a local read: the archive is the local default, so
+        # And it is a local read: the published table is the local default, so
         # nothing here can reach the network.
-        assert log.archive.startswith("file://")
+        assert log.published.startswith("file://")
         assert log.end_offset() == 7

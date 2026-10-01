@@ -15,14 +15,14 @@ from typing import TYPE_CHECKING
 import duckdb
 import pyarrow as pa
 
-from litelink._archive import Archive
 from litelink._prune import terms
+from litelink._published import Published
 from litelink._s3 import S3Options
 from litelink._tiers import (
-    ARCHIVE,
     BUFFER,
     KEY,
-    LOCAL,
+    PUBLISHED,
+    STAGING,
     TIERS,
     UNKNOWN,
     StoredTiers,
@@ -54,7 +54,7 @@ def secret_sql(options: S3Options) -> str:
 
     Separate from the query path so it can be tested without object storage —
     the fault it exists to prevent only appeared against real AWS, where writes
-    worked and every read of the archive came back 403.
+    worked and every read of the published table came back 403.
     """
     parts = ["TYPE s3"]
     if options.access_key is not None and options.secret_key is not None:
@@ -65,7 +65,7 @@ def secret_sql(options: S3Options) -> str:
         # looks for them: a profile, instance metadata, SSO. pyiceberg and s3fs
         # resolve those themselves, so WRITES worked while reads got a secret
         # with no keys — which DuckDB treats as anonymous, so a log on an
-        # ordinary AWS host archived happily and answered every archive read
+        # ordinary AWS host published happily and answered every published read
         # with 403. A local endpoint never showed it, because there the keys
         # are always passed explicitly.
         #
@@ -165,10 +165,10 @@ def load_extension(
     precisely what that check is written to detect, so adding one would leave
     the check passing on a machine it was meant to fail.
 
-    `remote` says whether this extension is needed only for the archive tier,
+    `remote` says whether this extension is needed only for the published tier,
     which changes what the message should tell the reader: a local-first log
-    never loads `httpfs`, so someone who hits it has either configured an
-    archive or is reading one, and someone who has not can ignore it entirely.
+    never loads `httpfs`, so someone who hits it has either configured a
+    published table or is reading one, and someone who has not can ignore it entirely.
     It also picks the flag for the contributor recipe.
     """
     bundled = _bundled_extension(connection, name)
@@ -195,8 +195,8 @@ def load_extension(
     except duckdb.IOException as exc:
         flag = " --remote" if remote else ""
         tier = (
-            "\n\nOnly the archive tier needs this. A local-first log never "
-            "loads it, so if you are not reading an archive you can ignore it."
+            "\n\nOnly the published tier needs this. A local-first log never "
+            "loads it, so if you are not reading a published table you can ignore it."
             if remote
             else ""
         )
@@ -259,17 +259,17 @@ class Reader:
         table: LogTable,
         buffer: Buffer,
         connect: Callable[[], duckdb.DuckDBPyConnection],
-        archive: Archive,
+        published: Published,
     ) -> None:
         self._layout = layout
         self._table = table
         self._buffer = buffer
         self._connect_to = connect
-        # The shared archive object, not a table handle: it opens the table on
-        # first use, so a reader whose queries the archive cannot answer never
-        # touches the network (I5), and `Log.set_archive` re-points this same
+        # The shared published object, not a table handle: it opens the table on
+        # first use, so a reader whose queries the published table cannot answer never
+        # touches the network (I5), and `Log.set_published` re-points this same
         # object rather than leaving the reader holding a stale one.
-        self._archive = archive
+        self._published = published
         self._remote_ready = False
         # Which tiers a query needs, per tier (#90). Read from disk per query;
         # it re-parses only when the file changed.
@@ -296,55 +296,55 @@ class Reader:
     def _prepare_remote(
         self, cursor: duckdb.DuckDBPyConnection
     ) -> tuple[str, tuple[int, int]] | None:
-        """Load httpfs, install the credentials, return the archive's pointer
+        """Load httpfs, install the credentials, return the published table's pointer
         and the offset range it covers.
 
-        None when there is no archive or it holds nothing yet, which is the
+        None when there is no published table or it holds nothing yet, which is the
         signal to build the union without a third leg rather than to fail.
 
         The extent comes back with the pointer because the union needs it when
         there is nothing sealed locally: with no local extent there is no
-        boundary between the archive and the buffer, and the registered tail
-        can hold rows the archive has since taken ownership of.
+        boundary between the published table and the buffer, and the registered tail
+        can hold rows the published table has since taken ownership of.
         """
-        archive = self._archive.table()
-        if archive is None:
+        published = self._published.table()
+        if published is None:
             return None
 
-        archive.reload()
+        published.reload()
         # Paired, not two reads. `snapshot()` exists because a pointer and an
         # extent taken separately can come from different commits — and this
-        # handle is shared, so a concurrent `sync` advances it between them.
-        # Unpaired, the empty-extent branch below scans a NEWER archive
+        # handle is shared, so a concurrent `publish` advances it between them.
+        # Unpaired, the empty-extent branch below scans a NEWER published
         # snapshot while cutting the buffer at an OLDER extent, and every row
         # registered in between comes back from both legs.
-        location, covered = archive.snapshot()
+        location, covered = published.snapshot()
         if covered is None:
             return None
 
-        if not self._archive.remote():
-            # A local archive is read like the local table: no extension to
+        if not self._published.remote():
+            # A local published table is read like the staging table: no extension to
             # load and no credentials to install.
             return location, covered
 
         if not self._remote_ready:
             # Once per connection. `httpfs` is not in the local read path, so a
-            # log whose queries never need the archive never pays for it — §7's
+            # log whose queries never need the published table never pays for it — §7's
             # rule that a hot read is offline.
             load_extension(self._connect(), "httpfs", remote=True)
             self._remote_ready = True
 
-        cursor.execute(secret_sql(self._archive.s3.resolved()))
+        cursor.execute(secret_sql(self._published.s3.resolved()))
 
         return location, covered
 
-    def query(self, sql: str, *, archive: bool = True) -> pa.RecordBatchReader:
+    def query(self, sql: str, *, published: bool = True) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
 
         **Which tiers it reads is decided here, per query.** The buffer always;
-        the local table and the archive only when the log's tier manifest says
+        the staging table and the published table only when the log's tier manifest says
         they could hold a row `sql` matches — see `_tiers`. So a query bounded
-        inside the local window never touches the network, and one that asks
+        inside the staging window never touches the network, and one that asks
         for history reads it.
 
         The relation is rebuilt per call and cannot be held across calls.
@@ -364,8 +364,8 @@ class Reader:
         with its own registrations and temp views, so one query cannot reach
         into another's. Verified directly rather than assumed.
 
-        `archive=False` drops the archive leg whatever the terms say: the
-        caller has asked for the local table and the buffer only.
+        `published=False` drops the published leg whatever the terms say: the
+        caller has asked for the staging table and the buffer only.
         """
         # Buffer first, table second, and the order is the correctness
         # argument. A seal commits its file and THEN deletes the rows it
@@ -406,20 +406,20 @@ class Reader:
         self._table.reload()
         location, extent = self._table.snapshot()
 
-        # The archive AFTER the local snapshot, and that order is the
-        # correctness argument. The archive leg is bounded by `extent[0]` — the
+        # The published table AFTER the local snapshot, and that order is the
+        # correctness argument. The published leg is bounded by `extent[0]` — the
         # oldest offset still local — so every offset below it must be in the
-        # archive snapshot this reads. Resolved first, it can be older than the
-        # bound it is measured against: a sync registering [100, 199] and an
-        # eviction dropping them both land in between, and the reader pairs an
-        # archive snapshot ending at 99 with a local extent starting at 200.
+        # published snapshot this reads. Resolved first, it can be older than the
+        # bound it is measured against: a publish registering [100, 199] and an
+        # eviction dropping them both land in between, and the reader pairs a
+        # published snapshot ending at 99 with a local extent starting at 200.
         # Rows 100-199 are then in no leg at all.
         #
         # After, it cannot happen. I4 means nothing is evicted before it is
-        # registered, so an archive snapshot taken later than the local one
+        # registered, so a published snapshot taken later than the local one
         # holds everything the local one has given up.
         local, needed = self._tiers(found, location, extent)
-        remote = self._prepare_remote(cursor) if archive and needed else None
+        remote = self._prepare_remote(cursor) if published and needed else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
@@ -464,29 +464,31 @@ class Reader:
         location: str,
         extent: tuple[int, int] | None,
     ) -> tuple[bool, bool]:
-        """`(local, archive)`: which of the two tiers the query needs (#90).
+        """`(local, published)`: which of the two tiers the query needs (#90).
 
-        The local tier's row is the rollup of the snapshot this read resolved
+        The staging tier's row is the rollup of the snapshot this read resolved
         (`location`), so the decision and the data are one version. The
-        archive's is the row in `buffer.db`, read AFTER that snapshot: eviction
-        widens it before the commit that moves rows below the local table, so
+        published table's is the row in `buffer.db`, read AFTER that snapshot: eviction
+        widens it before the commit that moves rows below the staging table, so
         a row read later covers everything the resolved snapshot has given up.
         Neither touches the network.
 
-        With no terms, only a tier known to be empty is skipped, and a local
+        With no terms, only a tier known to be empty is skipped, and a staging
         table with an extent is not empty — so the local rollup, 2–3 ms after
         each commit, is not computed for a query it cannot narrow.
         """
         rows = []
         stored = self._stored.load()
-        archive = stored.get(ARCHIVE)
-        if archive is not None:
-            rows.append(row(ARCHIVE, archive.offsets, self._schema, archive.statistics))
+        published = stored.get(PUBLISHED)
+        if published is not None:
+            rows.append(
+                row(PUBLISHED, published.offsets, self._schema, published.statistics)
+            )
 
         if extent is not None and found:
             # The stored rollup when it is of exactly the version this read
             # resolved; else this process's own, computed once per version.
-            cached = stored.get(LOCAL)
+            cached = stored.get(STAGING)
             local = (
                 cached.statistics
                 if cached is not None and cached.version == location
@@ -494,12 +496,12 @@ class Reader:
             )
             if local is not None:
                 span = (extent[0], extent[1] + 1)
-                rows.append(row(LOCAL, span, self._schema, local))
+                rows.append(row(STAGING, span, self._schema, local))
 
         table = build(rows, key=KEY) if rows else None
         kept = prune(table, TIERS, found, key=KEY)
 
-        return LOCAL in kept, ARCHIVE in kept
+        return STAGING in kept, PUBLISHED in kept
 
     def _union(
         self,
@@ -509,7 +511,7 @@ class Reader:
         *,
         local: bool = True,
     ) -> str:
-        """The hot read: the local table, plus the buffer above its extent.
+        """The hot read: the staging table, plus the buffer above its extent.
 
         `location` is passed rather than re-read, so the snapshot scanned and
         the boundary cutting the buffer are the same one.
@@ -532,16 +534,16 @@ class Reader:
         projection = ", ".join(f'"{c}"' for c in columns)
         buffered = f"SELECT {casts} FROM {BUFFER_REL} b"
         if extent is None:
-            # Nothing sealed locally. The archive can still hold history — a
-            # log evicted down to nothing is §8's `local_retention=0` shape —
+            # Nothing sealed locally. The published table can still hold history — a
+            # log evicted down to nothing is §8's `staging_retention=0` shape —
             # and then everything local is in the buffer.
             if remote is None:
                 return buffered
 
             # The buffer still needs a floor, and with no local extent the
-            # archive supplies it. The tail was registered against an earlier
-            # read, so it can hold rows that have since been sealed, archived
-            # and evicted — leaving the local table empty again and both legs
+            # published table supplies it. The tail was registered against an earlier
+            # read, so it can hold rows that have since been sealed, published
+            # and evicted — leaving the staging table empty again and both legs
             # claiming them. Bounding here is what the `extent[1]` cut does in
             # the branch below, from the only boundary available.
             location, covered = remote
@@ -553,7 +555,7 @@ class Reader:
 
         legs = []
         if remote is not None:
-            # Strictly below what the local table holds. `extent[0]` is the
+            # Strictly below what the staging table holds. `extent[0]` is the
             # oldest offset still local, so anything at or above it is served
             # from disk rather than over the network.
             legs.append(
@@ -562,7 +564,7 @@ class Reader:
             )
 
         if local:
-            # Skipped when the tier manifest rules the local table out. Its
+            # Skipped when the tier manifest rules the staging table out. Its
             # extent still bounds the other two legs, so they cover exactly
             # what they would have beside it.
             legs.append(f"SELECT {projection} FROM iceberg_scan('{location}')")

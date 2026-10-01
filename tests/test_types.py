@@ -384,7 +384,7 @@ def test_an_otel_log_round_trips_through_every_local_path(tmp_path: Path) -> Non
 
         log.seal()
         log.maintain()
-        assert log.table_files() == 1, "compaction merged nested files"
+        assert log.staging_files() == 1, "compaction merged nested files"
         assert _read_back(log) == _expected(rows), "after compaction"
 
     with litelink.open(tmp_path, "s") as reopened:

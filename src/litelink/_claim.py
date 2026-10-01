@@ -11,7 +11,7 @@ anything; only a deadline answers it.
 So a claim carries both: a range, and an owner with an expiry. One row per
 OPERATION rather than one per role, which is what lets several passes run at
 once without excluding each other by kind — a compaction merging one run and a
-sync pushing another have nothing to say to each other.
+publish pushing another have nothing to say to each other.
 
 **The check and the insert are one transaction.** Reading the live claims,
 deciding, and then inserting leaves exactly the window the decision was meant to
@@ -52,8 +52,8 @@ if TYPE_CHECKING:
 DEFAULT_TTL_MS = 30_000
 
 # Above every offset the log will ever assign. What an operation claims when it
-# is not an operation on an interval at all — a re-point, a config change, an
-# archive rewrite, a drain — so that it excludes every pass rather than
+# is not an operation on an interval at all — a re-point, a config change, a
+# published rewrite, a drain — so that it excludes every pass rather than
 # commuting with one it has nothing in common with.
 EVERYTHING = 1 << 62
 

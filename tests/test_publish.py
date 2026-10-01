@@ -25,17 +25,17 @@ import pytest
 
 import litelink
 from litelink import LogConfig, WriteHandle
-from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
+from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import load_extension, secret_sql
 from litelink._s3 import S3Options
 from litelink._table import (
     VERSION_HINT,
     LogTable,
     _recorded_location,
-    forget_archive_entry,
+    forget_published_entry,
 )
 from litelink.log import OFFSET, RESTORE_RESERVE, LogHandle, table_schema
 from tests.conftest import filesystem
@@ -64,7 +64,7 @@ def rows(count: int) -> list[dict[str, object]]:
 # Coprime with any row count used here, so the sort column is a PERMUTATION of
 # arrival order rather than agreeing with it. Files are clustered by `sort_by`,
 # and a test whose sort column only ever increases cannot tell that apart from
-# offset order — which is the one thing the archive rewrite depends on.
+# offset order — which is the one thing the published rewrite depends on.
 STRIDE = 7919
 
 
@@ -75,17 +75,17 @@ def scrambled(count: int) -> list[dict[str, object]]:
     ]
 
 
-def archived_log(
+def published_log(
     root: Path, bucket: str, s3: S3Options, **overrides: object
 ) -> WriteHandle:
     settings: dict[str, object] = {
         "target_seal_size": 64 * 1024,
-        # Conversion off, so these tests are about what reaches the archive and
+        # Conversion off, so these tests are about what reaches the published table and
         # not about what makes a file eligible. By default compaction converts
-        # sealed files into ones eight times larger and `sync` waits for that,
+        # sealed files into ones eight times larger and `publish` waits for that,
         # which is correct and has its own test —
-        # `test_only_compacted_files_are_eligible_for_the_archive`. Leaving it
-        # on here would mean every archive test first had to produce eight
+        # `test_only_compacted_files_are_eligible_for_the_published_table`. Leaving it
+        # on here would mean every published table test first had to produce eight
         # seals' worth of rows to observe anything.
         "target_compact_size": 64 * 1024,
         "compact_min_files": 2,
@@ -100,51 +100,55 @@ def archived_log(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
 
 
-def test_sync_pushes_sealed_files_and_records_the_watermark(
+def test_publish_pushes_sealed_files_and_records_the_watermark(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """§5 steps 1-3: upload, register, record — and the watermark is what I4
     later reads to decide what may be evicted."""
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
         sealed = log._table.data_files()
         assert sealed, "the fixture must produce sealed files to push"
 
-        log.sync()
+        log.publish()
 
-        remote = log._archive.require()
-        assert remote.extent() == (1, sealed[-1].hi), "the archive must cover them"
-        assert int(log._buffer.get_meta("archive_through") or 0) == sealed[-1].hi
+        remote = log._published.require()
+        assert remote.extent() == (1, sealed[-1].hi), (
+            "the published table must cover them"
+        )
+        assert int(log._buffer.get_meta("published_through") or 0) == sealed[-1].hi
 
 
-def test_a_read_spans_archive_local_and_buffer(
+def test_a_read_spans_published_staging_and_buffer(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The union that is the whole point: rows evicted from local disk are
     still readable, exactly once, alongside rows that never left.
 
-    `local_retention=0` evicts everything the archive holds as soon as it holds
+    `staging_retention=0` evicts everything the published table holds as soon as it holds
     it, so by the end the only local rows are the unsealed tail — and a merged
     read must still return the full stream with no gap at either seam.
     """
-    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        before = log.table_files()
-        log.sync()
+        before = log.staging_files()
+        log.publish()
         log.maintain()
 
-        assert log.table_files() < before, "eviction must have removed local files"
-        assert log.table_extent() is None, "the fixture must evict the local tier dry"
+        assert log.staging_files() < before, "eviction must have removed local files"
+        assert log.staging_extent() is None, (
+            "the fixture must evict the staging tier dry"
+        )
 
-        # `scan()` reaches the archive of its own accord (#90): nothing below
-        # the local table is on local disk, and the query asks for all of it.
+        # `scan()` reaches the published table of its own accord (#90): nothing below
+        # the staging table is on local disk, and the query asks for all of it.
         # This once asserted a SHORT read here, which was the defect rather
         # than the design — measured then, 476 of 1,500 rows with no error.
         merged = log.sql("SELECT * FROM log").read_all()
@@ -154,38 +158,38 @@ def test_a_read_spans_archive_local_and_buffer(
         )
 
 
-def test_a_hot_read_never_touches_the_archive(
+def test_a_hot_read_never_touches_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """I5, asserted rather than assumed, with the archive genuinely unreachable.
+    """I5, asserted rather than assumed, with the published table genuinely unreachable.
 
-    Part of the log is evicted, so the archive holds rows local disk does not.
+    Part of the log is evicted, so the published table holds rows local disk does not.
     Then the credentials point at a dead endpoint: a read bounded inside the
-    local window must still be served, because the archive's tier row says
-    nothing below the local table matches it — and a read that reaches into
+    staging window must still be served, because the published table's tier row says
+    nothing below the staging table matches it — and a read that reaches into
     the evicted history must FAIL rather than come back short.
 
     Falsify by returning `(True, True)` from `Reader._tiers`: the bounded read
     raises. Or `(True, False)`: the unbounded one returns the local rows alone.
     """
-    with archived_log(
-        tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000
+    with published_log(
+        tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
     ) as log:
         log.extend(rows(ROWS))
         log.seal()
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log.maintain()
-        extent = log.table_extent()
+        extent = log.staging_extent()
         assert extent is not None
         assert 1 < extent[0], "the fixture must evict part of the log"
 
-        log._archive._s3 = S3Options(
+        log._published._s3 = S3Options(
             endpoint="http://127.0.0.1:1",
             access_key="nobody",
             secret_key="nothing",
             region="us-east-1",
         )
-        log._archive._handle = None
+        log._published._handle = None
 
         hot = log.scan(start_offset=extent[0]).read_all()
         assert hot.num_rows == ROWS - extent[0] + 1
@@ -194,14 +198,14 @@ def test_a_hot_read_never_touches_the_archive(
             log.scan().read_all()
 
 
-def test_only_settled_files_reach_the_archive(
+def test_only_settled_files_reach_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The rule that keeps the archive well-sized by construction.
+    """The rule that keeps the published table well-sized by construction.
 
     An explicit `seal()` cuts wherever the buffer happens to be, so it can emit
     a file holding far less than the target. Pushed, it would sit in object
-    storage as an undersized file nothing local can merge away — the archive
+    storage as an undersized file nothing local can merge away — the published table
     would need a repair pass to fix a sizing decision made here. So a trailing
     small file stays behind, and the watermark stops short of it.
 
@@ -210,7 +214,7 @@ def test_only_settled_files_reach_the_archive(
     beside a target stated in uncompressed bytes, and a rule reading sizes off
     disk pushed nothing at all.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
         log.extend(rows(4))
@@ -222,35 +226,35 @@ def test_only_settled_files_reach_the_archive(
             "the tail must hold less than a full target to test this"
         )
 
-        log.sync()
+        log.publish()
 
-        assert int(log._buffer.get_meta("archive_through") or 0) == files[-2].hi
-        assert log._archive.require().extent() == (1, files[-2].hi)
+        assert int(log._buffer.get_meta("published_through") or 0) == files[-2].hi
+        assert log._published.require().extent() == (1, files[-2].hi)
 
 
 def test_hydrate_brings_evicted_files_back_to_local_disk(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """§8: raising `local_retention` is an operation, not a config change.
+    """§8: raising `staging_retention` is an operation, not a config change.
 
-    Everything is evicted first, so the local table holds only the unsealed
-    tail and every read reaches the archive. After hydrating, the rows are
+    Everything is evicted first, so the staging table holds only the unsealed
+    tail and every read reaches the published table. After hydrating, the rows are
     back on local disk rather than merely reachable.
     """
-    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         log.maintain()
 
-        assert log.table_extent() is None, "the fixture must evict something"
+        assert log.staging_extent() is None, "the fixture must evict something"
         assert log.scan().read_all().num_rows == ROWS, (
-            "the rows are in the archive, and a read that needs them reads it"
+            "the rows are in the published table, and a read that needs them reads it"
         )
 
         log.hydrate(since=timedelta(hours=1))
 
-        assert log.table_rows() + log.buffered_rows() == ROWS, (
+        assert log.staging_rows() + log.buffered_rows() == ROWS, (
             "hydrating puts them back on local disk"
         )
         assert log.scan().read_all().num_rows == ROWS
@@ -263,23 +267,23 @@ def test_hydrate_brings_evicted_files_back_to_local_disk(
 def test_hydrate_is_idempotent(tmp_path: Path, bucket: str, s3: S3Options) -> None:
     """Run twice and nothing doubles.
 
-    Files land under the name they have in the archive, so the second pass
-    rewrites the same paths, and the range filter refuses anything the local
+    Files land under the name they have in the published table, so the second pass
+    rewrites the same paths, and the range filter refuses anything the staging
     table already holds. Without that filter the second run would register the
-    archive's copy of a range alongside the copy it just restored, and every
+    published table's copy of a range alongside the copy it just restored, and every
     row in it would be read twice.
     """
-    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         log.maintain()
 
         log.hydrate(since=timedelta(hours=1))
-        once = log.table_files()
+        once = log.staging_files()
         log.hydrate(since=timedelta(hours=1))
 
-        assert log.table_files() == once
+        assert log.staging_files() == once
         assert log.scan().read_all().num_rows == ROWS
 
 
@@ -287,51 +291,51 @@ def test_hydrate_ignores_files_older_than_the_window(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A zero window restores nothing, which is what makes the window real."""
-    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         log.maintain()
-        evicted = log.table_files()
+        evicted = log.staging_files()
 
         log.hydrate(since=timedelta(0))
 
-        assert log.table_files() == evicted
+        assert log.staging_files() == evicted
 
 
-def test_rewrite_archive_merges_files_left_undersized(
+def test_rewrite_published_merges_files_left_undersized(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The repair, on the layout that needs repairing.
 
     Every file here is pushed under a small target and is then undersized
     against a larger one — which is what lowering and raising `target_seal_size`
-    does to an archive, since the archive is immutable history and a size
+    does to a published table, since the published table is immutable history and a size
     change applies only to what has not been written yet. The rewrite merges
     them and the data survives exactly.
     """
-    with archived_log(
+    with published_log(
         tmp_path,
         bucket,
         s3,
         target_seal_size=8 * 1024,
         target_compact_size=8 * 1024,
-        local_retention=timedelta(0),
+        staging_retention=timedelta(0),
     ) as log:
         log.extend(scrambled(ROWS))
         log.seal_due()
-        log.sync()
-        # Evicted, so the read at the end is served BY the archive. Without
-        # this the local table still holds every row, the archive leg of the
+        log.publish()
+        # Evicted, so the read at the end is served BY the published table. Without
+        # this the staging table still holds every row, the published leg of the
         # union is bounded above by the local extent and contributes nothing,
         # and the assertions below pass without reading a rewritten file at
         # all — which is exactly what they did before this line.
         log.maintain()
-        assert log.table_extent() is None, "the read must need S3"
+        assert log.staging_extent() is None, "the read must need S3"
 
-        remote = log._archive.require()
+        remote = log._published.require()
         before = len(remote.data_files())
-        assert before >= 4, "the fixture must archive several files to merge"
+        assert before >= 4, "the fixture must published table several files to merge"
 
         log.set_config(
             replace(
@@ -340,7 +344,7 @@ def test_rewrite_archive_merges_files_left_undersized(
                 target_compact_size=1024 * 1024,
             )
         )
-        log.rewrite_archive()
+        log.rewrite_published()
 
         remote.reload()
         after = remote.data_files()
@@ -367,18 +371,18 @@ def test_rewrite_archive_merges_files_left_undersized(
         ], "a row was handed an offset belonging to another row"
 
 
-def test_rewrite_archive_defers_deleting_what_it_superseded(
+def test_rewrite_published_defers_deleting_what_it_superseded(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """I6 reaches across the network.
 
-    A reader that resolved the archive before the rewrite is still reading
+    A reader that resolved the published table before the rewrite is still reading
     those objects, so they go through the same queue and the same grace period
     a local compaction's sources do. Deleting them at commit time would break
     a scan already in flight — and object storage has no equivalent of a POSIX
     unlink that leaves an open handle working.
     """
-    with archived_log(
+    with published_log(
         tmp_path,
         bucket,
         s3,
@@ -388,8 +392,8 @@ def test_rewrite_archive_defers_deleting_what_it_superseded(
     ) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        superseded = {f.path for f in log._archive.require().data_files()}
+        log.publish()
+        superseded = {f.path for f in log._published.require().data_files()}
 
         log.set_config(
             replace(
@@ -398,7 +402,7 @@ def test_rewrite_archive_defers_deleting_what_it_superseded(
                 target_compact_size=1024 * 1024,
             )
         )
-        log.rewrite_archive()
+        log.rewrite_published()
 
         queued = set(log._buffer.queued_deletions())
         assert superseded & queued, "the sources must be queued, not deleted"
@@ -426,21 +430,21 @@ def test_an_interrupted_hydrate_can_be_finished(
     Restoring upward makes the first file the new lowest local range, so a
     failure before the next one leaves the gap ABOVE what was restored. The
     next run takes its floor from that new lower bound, finds the gap is no
-    longer below it, and skips it for ever — and `_union` bounds the archive
+    longer below it, and skips it for ever — and `_union` bounds the published
     leg by the local floor, so those offsets are then served by neither tier.
 
     Restoring downward, an interruption is only a range that starts higher than
     intended, and the next run continues from there.
     """
-    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         log.maintain()
-        assert log.table_extent() is None, "the fixture must evict the local tier"
+        assert log.staging_extent() is None, "the fixture must evict the staging tier"
 
-        archive = log._archive.require()
-        real_fetch = archive.fetch
+        published = log._published.require()
+        real_fetch = published.fetch
         calls = 0
 
         def fail_after_one(path: str, destination: Path) -> None:
@@ -452,11 +456,11 @@ def test_an_interrupted_hydrate_can_be_finished(
 
             real_fetch(path, destination)
 
-        archive.fetch = fail_after_one  # ty: ignore[invalid-assignment]
+        published.fetch = fail_after_one  # ty: ignore[invalid-assignment]
         with pytest.raises(OSError, match="mid-hydrate"):
             log.hydrate(since=timedelta(hours=1))
 
-        archive.fetch = real_fetch  # ty: ignore[invalid-assignment]
+        published.fetch = real_fetch  # ty: ignore[invalid-assignment]
         partial = log.sql("SELECT * FROM log").read_all().column(OFFSET).to_pylist()
         assert partial, "the first file must have been restored"
         assert sorted(partial) == list(range(min(partial), max(partial) + 1)), (
@@ -471,84 +475,86 @@ def test_an_interrupted_hydrate_can_be_finished(
         )
 
 
-def test_repointing_an_archive_reaches_the_new_one(
+def test_repointing_a_published_table_reaches_the_new_one(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """Re-pointing must actually re-point, and must not carry a watermark.
 
-    The archive's catalog is a LOCAL SQLite file keyed by table id, so an entry
+    The published table's catalog is a LOCAL SQLite file keyed by table id, so an entry
     made for the old prefix is found again unless it is dropped — and the
-    handle then reads, and `sync` writes, into the bucket the log claims to
+    handle then reads, and `publish` writes, into the bucket the log claims to
     have left. Worse, `_push` reconciles the watermark up from that old
-    archive's extent, undoing the reset that exists to stop eviction deleting
-    the only copy of rows the new archive has never been sent.
+    published table's extent, undoing the reset that exists to stop eviction deleting
+    the only copy of rows the new published table has never been sent.
     """
     first, second = f"s3://{bucket}/one", f"s3://{bucket}/two"
     fs = filesystem(s3)
-    with archived_log(tmp_path, bucket, s3) as log:
-        log.set_archive(first)
+    with published_log(tmp_path, bucket, s3) as log:
+        log.set_published(first)
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        assert log.archived_through() > 0
+        log.publish()
+        assert log.published_through() > 0
         in_first = len(fs.find(first.removeprefix("s3://")))
         assert in_first > 0
 
-        log.set_archive(second)
+        log.set_published(second)
 
-        assert log.archived_through() == 0, (
+        assert log.published_through() == 0, (
             "a bucket that has been sent nothing has earned no watermark"
         )
 
-        log.sync()
+        log.publish()
 
-        assert second.removeprefix("s3://") in log._archive.require().metadata_location
+        assert (
+            second.removeprefix("s3://") in log._published.require().metadata_location
+        )
         assert len(fs.find(second.removeprefix("s3://"))) > 0, (
-            "sync must reach the NEW archive"
+            "publish must reach the NEW published table"
         )
         assert len(fs.find(first.removeprefix("s3://"))) == in_first, (
-            "detaching an archive is not deleting it"
+            "detaching a published table is not deleting it"
         )
 
 
-def test_detaching_and_reattaching_keeps_the_archive(
+def test_detaching_and_reattaching_keeps_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Coming back to the same archive must find what is in it.
+    """Coming back to the same published table must find what is in it.
 
     Dropping the catalog entry the moment a log is re-pointed looked like the
-    fix for reaching the wrong archive, and broke this instead: pointing back
-    at an archive that still held data built a fresh empty table over it, and
+    fix for reaching the wrong published table, and broke this instead: pointing back
+    at a published table that still held data built a fresh empty table over it, and
     rows already evicted locally were reachable from nowhere. The entry is
-    checked against the prefix when the archive is opened, so leaving and
+    checked against the prefix when the published table is opened, so leaving and
     returning to the same one changes nothing.
     """
     # A microsecond rather than zero, because zero means "evict on upload" and
     # `validate` refuses that pair at construction. Either way the floor is
     # cleared below before detaching, which is now the enforced order.
-    with archived_log(
-        tmp_path, bucket, s3, local_retention=timedelta(microseconds=1)
+    with published_log(
+        tmp_path, bucket, s3, staging_retention=timedelta(microseconds=1)
     ) as log:
-        where = log.archive
+        where = log.published
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         log.maintain()
-        assert log.table_extent() is None, "rows must be archive-only"
-        watermark = log.archived_through()
+        assert log.staging_extent() is None, "rows must be published-only"
+        watermark = log.published_through()
 
         # The floor comes off BEFORE the detach, which is the documented order
         # and now the enforced one: detaching retires I4's clamp, so a log with
-        # a retention floor could evict files the archive never took. Retention
+        # a retention floor could evict files the published table never took. Retention
         # has already done its work above; this is about coming back to the
-        # same archive.
-        log.set_config(replace(log.config, local_retention=None, local_rows=None))
-        log.set_archive(None)
-        log.set_archive(where)
-        log.sync()
+        # same published table.
+        log.set_config(replace(log.config, staging_retention=None, staging_rows=None))
+        log.set_published(None)
+        log.set_published(where)
+        log.publish()
 
-        assert log.archived_through() == watermark, (
-            "the same archive still holds the same range"
+        assert log.published_through() == watermark, (
+            "the same published table still holds the same range"
         )
         merged = log.sql("SELECT * FROM log").read_all()
         assert sorted(merged.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1)), (
@@ -561,37 +567,37 @@ def test_a_sibling_prefix_is_not_mistaken_for_this_one(
 ) -> None:
     """`s3://b/one` is a string prefix of `s3://b/one-more`.
 
-    The archive's catalog entry is checked against the prefix asked for, and a
+    The published table's catalog entry is checked against the prefix asked for, and a
     bare `startswith` accepts a sibling's entry as this log's — so a log
     re-pointed from `one-more` to `one` would keep reading and writing into
     `one-more`, which is a neighbour it was explicitly pointed away from.
     """
     sibling, target = f"s3://{bucket}/one-more", f"s3://{bucket}/one"
     fs = filesystem(s3)
-    with archived_log(tmp_path, bucket, s3) as log:
-        log.set_archive(sibling)
+    with published_log(tmp_path, bucket, s3) as log:
+        log.set_published(sibling)
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         assert len(fs.find(sibling.removeprefix("s3://"))) > 0
 
-        log.set_archive(target)
-        log.sync()
+        log.set_published(target)
+        log.publish()
 
-        where = log._archive.require().metadata_location
+        where = log._published.require().metadata_location
         assert where.startswith(f"{target}/"), (
             f"a sibling prefix was mistaken for this one: {where}"
         )
 
 
-def test_a_transient_failure_does_not_replace_the_archive(
+def test_a_transient_failure_does_not_replace_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """An archive that cannot be READ is not an archive that is not there.
+    """A published table that cannot be READ is not a published table that is not there.
 
     Opening it used to catch everything and rebuild, so a 503, a timeout or an
     expired token was taken for "no table" — and the repair dropped the only
-    pointer to a live archive and wrote an empty one over it, while the
+    pointer to a live published table and wrote an empty one over it, while the
     watermark went on telling eviction those rows were safe elsewhere.
 
     Whether the entry belongs to this prefix is answered from the local catalog
@@ -599,11 +605,11 @@ def test_a_transient_failure_does_not_replace_the_archive(
     bucket at all. Only a failed read of OUR OWN metadata reaches here, and
     that is an error.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        where = log.archive
+        log.publish()
+        where = log.published
         assert where is not None
         recorded = _recorded_location(log._layout)
         assert recorded is not None and recorded.startswith(f"{where}/")
@@ -614,12 +620,12 @@ def test_a_transient_failure_does_not_replace_the_archive(
 
     unreadable = replace(s3, access_key="wrong", secret_key="wrong")
     with pytest.raises(Exception, match=r".+"):
-        LogTable.open_archive(
+        LogTable.open_published(
             Layout(tmp_path, "s"), where, unreadable, table_schema(SCHEMA)
         )
 
     assert len(fs.find(where.removeprefix("s3://"))) == before, (
-        "an unreadable archive must not be replaced"
+        "an unreadable published table must not be replaced"
     )
     assert _recorded_location(Layout(tmp_path, "s")) == recorded, (
         "and its catalog entry must survive"
@@ -642,32 +648,32 @@ def test_an_unreadable_catalog_schema_falls_back_rather_than_rebuilds(
 
     The failure is injected rather than simulated by damaging the catalog,
     because damaging it breaks pyiceberg too — which then rebuilds it empty and
-    makes the archive genuinely absent, testing something else entirely.
+    makes the published table genuinely absent, testing something else entirely.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        where = log.archive
+        log.publish()
+        where = log.published
         assert where is not None
         expected = _recorded_location(log._layout)
         assert expected is not None
 
     def unanswerable(_: Layout) -> str | None:
-        msg = "cannot read the archive catalog's own table"
+        msg = "cannot read the published catalog's own table"
         raise LookupError(msg)
 
     monkeypatch.setattr("litelink._table._recorded_location", unanswerable)
-    table = LogTable.open_archive(
+    table = LogTable.open_published(
         Layout(tmp_path, "s"), where, s3, table_schema(SCHEMA)
     )
 
     assert table.metadata_location == expected, (
-        "the existing archive must be found, not replaced"
+        "the existing published table must be found, not replaced"
     )
 
 
-def test_a_read_never_repairs_the_archive_catalog(
+def test_a_read_never_repairs_the_published_catalog(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """Dropping and recreating a catalog entry is a write, and reads do not
@@ -679,35 +685,35 @@ def test_a_read_never_repairs_the_archive_catalog(
     over pushed files. So only a caller holding the maintenance lease may
     repair, and a reader that finds a mismatch says so.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        first = log.archive
+        log.publish()
+        first = log.published
         assert first is not None
 
     # The entry now names `first`, while the log is pointed at `second`.
-    # Written straight to `meta` rather than through `set_archive`, so nothing
+    # Written straight to `meta` rather than through `set_published`, so nothing
     # has had the chance to repair the entry before the read sees it.
     second = f"s3://{bucket}/elsewhere"
     with litelink.open(tmp_path, "s", s3=s3) as writer:
-        writer._buffer.set_meta("archive", second)
+        writer._buffer.set_meta("published", second)
 
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         with pytest.raises(ValueError, match="not under"):
-            reader._archive.table()
+            reader._published.table()
 
     assert _recorded_location(Layout(tmp_path, "s")) is not None, (
         "a read must not have dropped the entry"
     )
 
 
-def test_a_read_before_the_first_sync_simply_has_no_archive_leg(
+def test_a_read_before_the_first_publish_simply_has_no_published_leg(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Absent is not wrong. A log configured with an archive nothing has pushed
+    """Absent is not wrong. A log configured with a published table nothing has pushed
     to yet reads without that leg, and creates nothing by reading."""
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(200))
         log.seal_due()
 
@@ -715,7 +721,7 @@ def test_a_read_before_the_first_sync_simply_has_no_archive_leg(
 
         assert merged.num_rows == 200
         assert _recorded_location(log._layout) is None, (
-            "reading must not create the archive table"
+            "reading must not create the published table"
         )
 
 
@@ -725,18 +731,18 @@ def test_a_repoint_leaves_reads_working(
     """Re-pointing is routine, so it must not break reading until a maintainer
     happens to run.
 
-    The catalog entry still names the previous archive until something replaces
-    it, and only a lease holder may — so `set_archive` does it, under the
+    The catalog entry still names the previous published table until something replaces
+    it, and only a lease holder may — so `set_published` does it, under the
     lease, rather than leaving every cross-tier read raising in the meantime.
     The check at open stays as the repair for what this misses: another owner
     holding the lease, or a crash between the two durable writes.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
 
-        log.set_archive(f"s3://{bucket}/moved")
+        log.set_published(f"s3://{bucket}/moved")
 
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         merged = reader.sql("SELECT * FROM log").read_all()
@@ -744,20 +750,20 @@ def test_a_repoint_leaves_reads_working(
         assert merged.num_rows == ROWS, "a re-pointed log must still be readable"
 
 
-def test_repointing_cannot_interleave_with_a_sync(
+def test_repointing_cannot_interleave_with_a_publish(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A sync that has already pushed finishes by writing the watermark.
+    """A publish that has already pushed finishes by writing the watermark.
 
     Land a re-point between those two moments and the log points at the new,
-    empty archive while carrying a watermark earned by the old one — eviction
-    believes it and deletes the only local copy of rows the new archive has
-    never been sent. Nothing lowers a watermark, so no later sync undoes it.
+    empty published table while carrying a watermark earned by the old one — eviction
+    believes it and deletes the only local copy of rows the new published table has
+    never been sent. Nothing lowers a watermark, so no later publish undoes it.
 
-    Re-reading the location at the top of `sync` narrows that window; only the
+    Re-reading the location at the top of `publish` narrows that window; only the
     lease closes it. Held here by a stand-in for the maintainer.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(200))
         log.seal_due()
 
@@ -767,105 +773,105 @@ def test_repointing_cannot_interleave_with_a_sync(
         assert held.acquire()
         try:
             with pytest.raises(RuntimeError, match="has held a claim"):
-                log.set_archive(f"s3://{bucket}/elsewhere")
+                log.set_published(f"s3://{bucket}/elsewhere")
         finally:
             held.release()
 
-        # And the refusal changed nothing: the archive is still the old one.
-        assert log.archive is not None
-        assert log.archive.endswith("/prefix")
+        # And the refusal changed nothing: the published table is still the old one.
+        assert log.published is not None
+        assert log.published.endswith("/prefix")
 
-        log.set_archive(f"s3://{bucket}/elsewhere")
-        assert log.archive.endswith("/elsewhere")
+        log.set_published(f"s3://{bucket}/elsewhere")
+        assert log.published.endswith("/elsewhere")
 
 
-def test_a_read_against_a_never_synced_archive_writes_nothing(
+def test_a_read_against_a_never_published_published_writes_nothing(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """ "Creates nothing" has to mean locally too.
 
-    Constructing the catalog creates its tables in `archive.db`, and
+    Constructing the catalog creates its tables in `published.db`, and
     registering the namespace adds a row — writes, from a path that promised to
     make none. So absence is decided from the catalog file before one is built,
-    and a reader against an archive nothing has pushed to touches nothing.
+    and a reader against a published table nothing has pushed to touches nothing.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(200))
         log.seal_due()
-        assert not log._layout.archive_db.exists()
+        assert not log._layout.published_db.exists()
 
         merged = log.sql("SELECT * FROM log").read_all()
 
         assert merged.num_rows == 200
-        assert not log._layout.archive_db.exists(), (
-            "a read must not create the archive catalog"
+        assert not log._layout.published_db.exists(), (
+            "a read must not create the published catalog"
         )
 
 
 def test_a_failed_repoint_puts_the_old_catalog_entry_back(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A half-done move that leaves NEITHER archive is worse than not moving.
+    """A half-done move that leaves NEITHER published table is worse than not moving.
 
     The repair drops the entry and creates a table at the new prefix, and
-    creating can fail — configuring an archive deliberately does not require
+    creating can fail — configuring a published table deliberately does not require
     the bucket to exist yet. A drop with no create destroys the only record of
-    where the previous archive's metadata is, and
+    where the previous published table's metadata is, and
     `previous_metadata_location` dies with the row, so rolling back would build
     an empty table over data nothing could then reach.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         original = _recorded_location(log._layout)
         assert original is not None
 
     # A prefix in a bucket that does not exist, so the create must fail.
     missing = "s3://litelink-no-such-bucket-3f9a2/elsewhere"
     with pytest.raises(Exception, match=r".+"):
-        LogTable.open_archive(
+        LogTable.open_published(
             Layout(tmp_path, "s"), missing, s3, table_schema(SCHEMA), repair=True
         )
 
     assert _recorded_location(Layout(tmp_path, "s")) == original, (
-        "a failed repair must leave the previous archive reachable"
+        "a failed repair must leave the previous published table reachable"
     )
 
 
-def test_drain_never_deletes_from_an_archive_the_log_has_left(
+def test_drain_never_deletes_from_a_published_table_the_log_has_left(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A queued remote path names the archive it was superseded in.
+    """A queued remote path names the published table it was superseded in.
 
-    The reference veto asks the archive the log is pointed at NOW, so after a
-    re-point those entries would be checked against a new archive that
+    The reference veto asks the published table the log is pointed at NOW, so after a
+    re-point those entries would be checked against a new published table that
     references nothing, and deleted from the old bucket — where they may still
     be live, and may be the only copy of rows already evicted locally.
     """
     old = f"s3://{bucket}/retired"
     fs = filesystem(s3)
-    with archived_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
-        log.set_archive(old)
+    with published_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
+        log.set_published(old)
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         objects = fs.find(old.removeprefix("s3://"))
         assert objects
 
-        # Queue one of the old archive's live objects, as an interrupted
-        # rewrite would have, then leave for a different archive.
+        # Queue one of the old published table's live objects, as an interrupted
+        # rewrite would have, then leave for a different published table.
         stranded = f"s3://{objects[0]}"
         log._buffer.enqueue_deletions([stranded], 0)
-        log.set_archive(f"s3://{bucket}/current")
+        log.set_published(f"s3://{bucket}/current")
 
         log._maintenance.drain()
 
         assert fs.exists(objects[0]), (
-            "drain must not delete from the archive the log has left"
+            "drain must not delete from the published table the log has left"
         )
         assert stranded in log._buffer.queued_deletions(), (
-            "and it stays queued for whoever owns that archive"
+            "and it stays queued for whoever owns that published table"
         )
 
 
@@ -876,26 +882,26 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
 
     Every remote path is built from the warehouse with its slashes stripped, so
     comparing against the URI verbatim classifies this log's OWN objects as
-    another archive's — and the guard that exists to protect a retired bucket
+    another published table's — and the guard that exists to protect a retired bucket
     instead stops the queue draining at all, for ever.
     """
-    with archived_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
-        log.set_archive(f"s3://{bucket}/slashed")
+    with published_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
+        log.set_published(f"s3://{bucket}/slashed")
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
 
         fs = filesystem(s3)
         objects = fs.find(f"{bucket}/slashed")
         assert objects
 
-        # An object the archive does NOT reference, chosen deliberately. This
+        # An object the published table does NOT reference, chosen deliberately. This
         # used to take `objects[0]`, which passed on listing order rather than
         # on the guard under test: the first key happened to be an unreferenced
         # metadata object, so when the layout changed and a live data file
         # sorted first, the drain refused for the referenced-file veto — a
         # correct refusal, with nothing to do with slashes.
-        remote = log._archive.table(repair=True)
+        remote = log._published.table(repair=True)
         assert remote is not None
         referenced = remote.referenced_paths()
         doomed = next(
@@ -904,7 +910,7 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         log._buffer.enqueue_deletions([doomed], 0)
 
         # The slash goes into `meta` DIRECTLY, because every public way in
-        # normalises it away: `set_archive`, `new` and `open` all `rstrip("/")`
+        # normalises it away: `set_published`, `new` and `open` all `rstrip("/")`
         # before storing. Written through any of them this test cannot fail —
         # verified by deleting the guard's own `rstrip` and watching it still
         # pass — so it proved nothing about the guard it names.
@@ -912,13 +918,13 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         # A durable value with a trailing slash is still reachable: it is what
         # a log written by a version that normalised somewhere else carries,
         # and `drain` reads `meta`, not the argument someone once passed.
-        log._buffer.set_meta(ARCHIVE_KEY, f"s3://{bucket}/slashed/")
-        assert log._archive.uri == f"s3://{bucket}/slashed/"
+        log._buffer.set_meta(PUBLISHED_KEY, f"s3://{bucket}/slashed/")
+        assert log._published.uri == f"s3://{bucket}/slashed/"
 
         log._maintenance.drain()
 
         assert doomed not in log._buffer.queued_deletions(), (
-            "the log's own archived object must be drainable"
+            "the log's own published object must be drainable"
         )
 
 
@@ -927,23 +933,23 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
 ) -> None:
     """The crash window I4-per-segment has, and how it closes (§4a).
 
-    The row naming a file's archive copy is written AFTER the register, so a
-    crash between the two leaves the archive holding a range nothing local
+    The row naming a file's published copy is written AFTER the register, so a
+    crash between the two leaves the published table holding a range nothing local
     records. Compaction decides from those rows, so it would merge that file
-    into one spanning the archive's extent, and the next push would register a
+    into one spanning the published table's extent, and the next push would register a
     partially overlapping range — which `register` admits, because it declines
     only a range entirely covered.
 
-    Nothing is promised beforehand to cover it. The archive's own manifest is
+    Nothing is promised beforehand to cover it. The published table's own manifest is
     the truth, and the next push reads it anyway, so recovery is a backfill.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         local = log._table.data_files()
-        settled = log._maintenance.archived_prefix(
-            local, log._archive.uri, include_intents=False
+        settled = log._maintenance.published_prefix(
+            local, log._published.uri, include_intents=False
         )
 
         assert settled > 0
@@ -954,20 +960,20 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
             log._buffer._con.commit()
 
         assert (
-            log._maintenance.archived_prefix(
-                local, log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                local, log._published.uri, include_intents=False
             )
             == 0
         ), "the setup must actually reproduce the crash"
 
-        log.sync()
+        log.publish()
 
         assert (
-            log._maintenance.archived_prefix(
-                log._table.data_files(), log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                log._table.data_files(), log._published.uri, include_intents=False
             )
             == settled
-        ), "the archive's manifest says what it holds; recover from it"
+        ), "the published table's manifest says what it holds; recover from it"
         assert log.scan().read_all().num_rows == ROWS
 
 
@@ -976,25 +982,25 @@ def test_the_backfill_sees_copies_another_process_pushed(
 ) -> None:
     """The manifest is read as it IS, not as this handle last saw it.
 
-    A pyiceberg handle is a frozen snapshot and `Archive` caches it for the
-    life of the process, so a maintainer that synced, released the lease and
-    took it back would otherwise recover against an archive that has since
-    grown — and go on treating another maintainer's pushes as unarchived.
+    A pyiceberg handle is a frozen snapshot and `Published` caches it for the
+    life of the process, so a maintainer that published, released the lease and
+    took it back would otherwise recover against a published table that has since
+    grown — and go on treating another maintainer's pushes as unpublished.
     """
-    with archived_log(tmp_path, bucket, s3) as writer:
+    with published_log(tmp_path, bucket, s3) as writer:
         writer.extend(rows(ROWS))
         writer.seal_due()
-        writer.sync()
+        writer.publish()
 
         with litelink.open(tmp_path, "s", s3=s3) as other:
-            # `other` caches its archive handle here, at today's extent.
-            assert other.archive_files() > 0
+            # `other` caches its published handle here, at today's extent.
+            assert other.published_files() > 0
 
             writer.extend(rows(ROWS))
             writer.seal_due()
-            writer.sync()
-            grown = writer._maintenance.archived_prefix(
-                writer._table.data_files(), writer._archive.uri, include_intents=False
+            writer.publish()
+            grown = writer._maintenance.published_prefix(
+                writer._table.data_files(), writer._published.uri, include_intents=False
             )
 
             with other._buffer._lock:
@@ -1003,38 +1009,40 @@ def test_the_backfill_sees_copies_another_process_pushed(
                 )
                 other._buffer._con.commit()
 
-            other.sync()
+            other.publish()
 
             assert (
-                other._maintenance.archived_prefix(
-                    other._table.data_files(), other._archive.uri, include_intents=False
+                other._maintenance.published_prefix(
+                    other._table.data_files(),
+                    other._published.uri,
+                    include_intents=False,
                 )
                 == grown
             ), "recovered against a stale manifest"
 
 
-def test_repointing_to_the_same_archive_spelled_differently_keeps_the_watermark(
+def test_repointing_to_the_same_published_table_spelled_differently_keeps_the_watermark(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A trailing slash is not a move.
 
     Every path builder strips one, so `s3://b/p` and `s3://b/p/` name the same
-    objects everywhere except the comparison that decides whether the archive
-    changed. Read verbatim, re-stating the current archive with a slash on the
+    objects everywhere except the comparison that decides whether the published table
+    changed. Read verbatim, re-stating the current published table with a slash on the
     end reads as a move and resets both watermarks — against a bucket that
     genuinely holds the data, which is I4's whole premise for eviction.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        settled = log.archived_through()
+        log.publish()
+        settled = log.published_through()
         assert settled > 0
 
-        log.set_archive(f"s3://{bucket}/prefix/")
+        log.set_published(f"s3://{bucket}/prefix/")
 
-        assert log.archived_through() == settled, (
-            "the same archive, spelled with a trailing slash, is the same archive"
+        assert log.published_through() == settled, (
+            "the same published table, spelled with a trailing slash, is the same published table"
         )
         assert log.scan().read_all().num_rows == ROWS
 
@@ -1042,23 +1050,23 @@ def test_repointing_to_the_same_archive_spelled_differently_keeps_the_watermark(
 def test_a_repoint_is_all_or_nothing(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Where the archive is and what it holds are only true together.
+    """Where the published table is and what it holds are only true together.
 
-    The two watermarks describe the PREVIOUS archive, so a crash between them
+    The two watermarks describe the PREVIOUS published table, so a crash between them
     and the location leaves a log whose parts disagree — and both orderings
-    have cost a defect. Watermark last leaves the new archive carrying the old
+    have cost a defect. Watermark last leaves the new published table carrying the old
     one's promise, which eviction believes. Watermark first leaves the OLD
-    archive with a frontier of zero, and compaction, unlike eviction, does not
-    wait for a sync before merging across a boundary the archive already holds.
+    published table with a frontier of zero, and compaction, unlike eviction, does not
+    wait for a publish before merging across a boundary the published table already holds.
 
     So the failure is injected rather than reasoned about: any single write may
     fail, and what survives must still be coherent.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        settled = log.archived_through()
+        log.publish()
+        settled = log.published_through()
         assert settled > 0
 
         calls = 0
@@ -1074,32 +1082,32 @@ def test_a_repoint_is_all_or_nothing(
 
         log._buffer.set_meta = flaky  # ty: ignore[invalid-assignment]
         try:
-            log.set_archive(f"s3://{bucket}/elsewhere")
+            log.set_published(f"s3://{bucket}/elsewhere")
         except RuntimeError:
             pass
 
         finally:
             log._buffer.set_meta = original  # ty: ignore[invalid-assignment]
 
-        recorded = log._buffer.get_meta("archive") or None
+        recorded = log._buffer.get_meta("published") or None
         if recorded == f"s3://{bucket}/prefix":
-            assert log.archived_through() == settled, (
-                "still the old archive, so its watermark must still be true"
+            assert log.published_through() == settled, (
+                "still the old published table, so its watermark must still be true"
             )
 
         else:
-            assert log.archived_through() == 0, (
-                "a new archive must not inherit the old one's promise"
+            assert log.published_through() == 0, (
+                "a new published table must not inherit the old one's promise"
             )
 
 
 def test_set_meta_if_writes_only_while_the_guard_still_holds(tmp_path: Path) -> None:
     """The guard and the write it protects are one transaction, or no guard.
 
-    `sync` re-reads which archive it is pushing to before recording a
+    `publish` re-reads which published table it is pushing to before recording a
     watermark. Read and written separately, that check only reports where the
-    archive was — a `set_archive` landing between leaves the log pointed at the
-    NEW archive holding the OLD one's extent, which eviction believes (I4) and
+    published table was — a `set_published` landing between leaves the log pointed at the
+    NEW published table holding the OLD one's extent, which eviction believes (I4) and
     nothing ever lowers.
 
     What this pins is the contract, not the atomicity: the window the
@@ -1109,80 +1117,80 @@ def test_set_meta_if_writes_only_while_the_guard_still_holds(tmp_path: Path) -> 
     """
     log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     with log:
-        log._buffer.set_meta("archive", "s3://a/p")
+        log._buffer.set_meta("published", "s3://a/p")
 
-        assert not log._buffer.set_meta_if("archive", "s3://b/p", {"w": "9"}), (
+        assert not log._buffer.set_meta_if("published", "s3://b/p", {"w": "9"}), (
             "a guard that no longer holds must decline"
         )
         assert log._buffer.get_meta("w") is None
 
-        assert log._buffer.set_meta_if("archive", "s3://a/p", {"w": "9"})
+        assert log._buffer.set_meta_if("published", "s3://a/p", {"w": "9"})
         assert log._buffer.get_meta("w") == "9"
 
 
 def test_a_repoint_during_a_push_forfeits_the_watermark(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A watermark earned by one archive is never recorded against another.
+    """A watermark earned by one published table is never recorded against another.
 
     The push outlives its lease — a register alone measured 4.1 s against S3,
-    and retries compound it — so the `set_archive` that races it holds the
+    and retries compound it — so the `set_published` that races it holds the
     lease lawfully. What must not happen is the log ending up pointed at the
-    new archive while `archived_through` describes the old one: eviction acts
-    on that number (I4) and deletes local files the new archive was never sent.
+    new published table while `published_through` describes the old one: eviction acts
+    on that number (I4) and deletes local files the new published table was never sent.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        settled = log.archived_through()
+        log.publish()
+        settled = log.published_through()
         assert settled > 0
 
         log.extend(rows(ROWS))
         log.seal_due()
 
         # The re-point lands while this push is still in S3.
-        archive = log._archive.require()
-        original = archive.register
+        published = log._published.require()
+        original = published.register
 
         def racing(*args: object, **kwargs: object) -> bool:
             outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
-            log._buffer.set_meta("archive", f"s3://{bucket}/elsewhere")
+            log._buffer.set_meta("published", f"s3://{bucket}/elsewhere")
             return outcome
 
-        archive.register = racing  # ty: ignore[invalid-assignment]
+        published.register = racing  # ty: ignore[invalid-assignment]
         try:
             with pytest.raises(RuntimeError, match="re-pointed"):
-                log.sync()
+                log.publish()
 
         finally:
-            archive.register = original  # ty: ignore[invalid-assignment]
+            published.register = original  # ty: ignore[invalid-assignment]
 
-        assert log._maintenance.archived_through() == settled, (
-            "an archive the log has never pushed to must not inherit a watermark"
+        assert log._maintenance.published_through() == settled, (
+            "a published table the log has never pushed to must not inherit a watermark"
         )
 
 
-def test_eviction_learns_about_an_archive_attached_by_another_process(
+def test_eviction_learns_about_a_published_table_attached_by_another_process(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """I4 is owed by the log, not by a process's memory of it.
 
-    Attaching an archive to a log a maintainer already has open is supported
-    (§13.0). `sync` is the only thing that refreshes this process's `Archive`,
-    and a maintainer that believes the log is local-only never syncs — so it
+    Attaching a published table to a log a maintainer already has open is supported
+    (§13.0). `publish` is the only thing that refreshes this process's `Published`,
+    and a maintainer that believes the log is local-only never publishes — so it
     would go on deleting the only copy of every row that ages past
-    `local_retention`, for as long as it ran, while the durable configuration
-    promised the archive held them.
+    `staging_retention`, for as long as it ran, while the durable configuration
+    promised the published table held them.
 
-    The detach direction heals on its own, because a push to an archive that is
+    The detach direction heals on its own, because a push to a published table that is
     gone fails. This direction has nothing that fails.
     """
     config = LogConfig(
         target_seal_size=32 * 1024,
         target_compact_size=32 * 1024,
         compact_min_files=2,
-        local_rows=1,
+        staging_rows=1,
         snapshot_retention=timedelta(seconds=0),
     )
     writer = litelink.new(
@@ -1191,24 +1199,24 @@ def test_eviction_learns_about_an_archive_attached_by_another_process(
     with writer:
         writer.extend(rows(ROWS))
         writer.seal_due()
-        # Published to the local default, so the archive the maintainer
+        # Published to the local default, so the published table the maintainer
         # opened against holds every sealed file.
-        writer.sync(push_unsettled=True)
+        writer.publish(push_unsettled=True)
 
         # The maintainer opened while the log published locally.
         with litelink.open(tmp_path, "s", s3=s3) as maintainer:
-            assert not maintainer._archive.remote()
+            assert not maintainer._published.remote()
 
-            writer.set_archive(f"s3://{bucket}/prefix")
+            writer.set_published(f"s3://{bucket}/prefix")
 
             maintainer.evict()
 
             assert maintainer.scan().read_all().num_rows == ROWS, (
-                "nothing may be deleted for an archive that holds nothing"
+                "nothing may be deleted for a published table that holds nothing"
             )
 
 
-def test_a_commit_retry_will_not_follow_the_catalog_to_another_archive(
+def test_a_commit_retry_will_not_follow_the_catalog_to_another_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The Iceberg commit is the one durable write with no watermark fence.
@@ -1216,50 +1224,50 @@ def test_a_commit_retry_will_not_follow_the_catalog_to_another_archive(
     `_commit` reloads and retries when the branch moves under it, and the
     catalog row is keyed by table id rather than by identity — so a re-point
     racing a slow register makes the reload re-bind the operation to the NEW
-    archive, and the retry commits paths that live in the old bucket.
+    published table, and the retry commits paths that live in the old bucket.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
 
-        archive = log._archive.require()
+        published = log._published.require()
         moved = Layout(tmp_path, "s").warehouse_uri
-        archive._warehouse = f"s3://{bucket}/somewhere-else"
+        published._warehouse = f"s3://{bucket}/somewhere-else"
 
         with pytest.raises(RuntimeError, match="moved out of"):
-            archive._verify_identity()
+            published._verify_identity()
 
         assert moved
 
 
-def test_restating_the_archive_from_a_stale_process_keeps_the_watermark(
+def test_restating_the_published_table_from_a_stale_process_keeps_the_watermark(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """ "Is this a move?" is a question about the log, not about this process.
 
-    Nothing refreshes a process's memory of where the archive is except a sync,
-    so in the two-process deployment `set_archive` is documented for, a caller
+    Nothing refreshes a process's memory of where the published table is except a publish,
+    so in the two-process deployment `set_published` is documented for, a caller
     can hold a stale one. Asked of that memory, both answers are wrong — here,
-    re-asserting the archive the log already has reads as a move and zeroes the
+    re-asserting the published table the log already has reads as a move and zeroes the
     watermarks of a bucket that genuinely holds the data, which drops the
-    compaction frontier to 0 over a live archive.
+    compaction frontier to 0 over a live published table.
     """
-    with archived_log(tmp_path, bucket, s3) as writer:
+    with published_log(tmp_path, bucket, s3) as writer:
         writer.extend(rows(ROWS))
         writer.seal_due()
-        writer.sync()
-        settled = writer.archived_through()
+        writer.publish()
+        settled = writer.published_through()
         assert settled > 0
 
         with litelink.open(tmp_path, "s", s3=s3) as other:
             # There is no per-process memory to go stale any more, so the
-            # case this once modelled cannot arise: re-asserting the archive
+            # case this once modelled cannot arise: re-asserting the published table
             # the log already has reads the same durable value either way.
-            other.set_archive(f"s3://{bucket}/prefix")
+            other.set_published(f"s3://{bucket}/prefix")
 
-            assert other.archived_through() == settled, (
-                "re-asserting the archive the log already has is not a move"
+            assert other.published_through() == settled, (
+                "re-asserting the published table the log already has is not a move"
             )
 
 
@@ -1268,17 +1276,17 @@ def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
 ) -> None:
     """Both sides of the comparison must not move together.
 
-    `Archive` is shared by the log, the reader and the maintainer exactly so a
-    re-point reaches all three — which means a `set_archive` on another thread
+    `Published` is shared by the log, the reader and the maintainer exactly so a
+    re-point reaches all three — which means a `set_published` on another thread
     updates the value a fence is about to compare against as well as the one it
     compares. Read live, the fence passes, and the watermark this push earned
-    is recorded against an archive that never received it.
+    is recorded against a published table that never received it.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        settled = log.archived_through()
+        log.publish()
+        settled = log.published_through()
         assert settled > 0
 
         log.extend(rows(ROWS))
@@ -1286,28 +1294,28 @@ def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
 
         # A full in-process re-point, landing while the push is in S3: it moves
         # the durable location AND this shared object's memory of it.
-        archive = log._archive.require()
-        original = archive.register
+        published = log._published.require()
+        original = published.register
 
         def racing(*args: object, **kwargs: object) -> bool:
             outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
-            log._buffer.set_meta("archive", f"s3://{bucket}/elsewhere")
+            log._buffer.set_meta("published", f"s3://{bucket}/elsewhere")
             return outcome
 
-        archive.register = racing  # ty: ignore[invalid-assignment]
+        published.register = racing  # ty: ignore[invalid-assignment]
         try:
             with pytest.raises(RuntimeError, match="re-pointed"):
-                log.sync()
+                log.publish()
 
         finally:
-            archive.register = original  # ty: ignore[invalid-assignment]
+            published.register = original  # ty: ignore[invalid-assignment]
 
-        assert log._maintenance.archived_through() == settled, (
-            "an archive the log has never pushed to must not inherit a watermark"
+        assert log._maintenance.published_through() == settled, (
+            "a published table the log has never pushed to must not inherit a watermark"
         )
 
 
-def test_the_archive_refuses_a_range_that_starts_inside_its_extent(
+def test_the_published_table_refuses_a_range_that_starts_inside_its_extent(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The last line of defence, and the only one not reasoned around.
@@ -1316,43 +1324,45 @@ def test_the_archive_refuses_a_range_that_starts_inside_its_extent(
     harmless. A range that starts inside the extent and ends beyond it is a
     different thing: those offsets land in two files at once, in the immutable
     tier, with nothing able to repair it. Everything upstream is arranged so a
-    merge never straddles the archive's extent, and every gap found in that
+    merge never straddles the published table's extent, and every gap found in that
     arrangement has been a fresh piece of reasoning — this check holds however
     the reasoning turns out.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
-        archive = log._archive.require()
-        archive.reload()
-        covered = archive.extent()
+        log.publish()
+        published = log._published.require()
+        published.reload()
+        covered = published.extent()
 
         assert covered is not None
 
-        # A file whose range begins inside what the archive already holds.
+        # A file whose range begins inside what the published table already holds.
         with pytest.raises(ValueError, match="two files at once"):
-            archive.register(["s3://nowhere/straddle.parquet"], lo=covered[1])
+            published.register(["s3://nowhere/straddle.parquet"], lo=covered[1])
 
         # And one that ENGULFS it — starting below the extent and running past
         # it. This is the worse shape, not an excused one: it puts every
-        # archived offset in two files rather than some of them.
+        # published offset in two files rather than some of them.
         with pytest.raises(ValueError, match="two files at once"):
-            archive.register(["s3://nowhere/engulf.parquet"], lo=max(covered[0] - 5, 0))
+            published.register(
+                ["s3://nowhere/engulf.parquet"], lo=max(covered[0] - 5, 0)
+            )
 
         # And one that begins cleanly above it is not refused by this check.
-        archive._refuse_straddle(covered[1] + 1)
+        published._refuse_straddle(covered[1] + 1)
 
 
-def test_the_log_keeps_working_after_the_archive_is_re_cut(
+def test_the_log_keeps_working_after_the_published_table_is_re_cut(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """`rewrite_archive` while local files still overlap what it re-cuts.
+    """`rewrite_published` while local files still overlap what it re-cuts.
 
     The two tiers then hold the same rows at boundaries neither shares, which
     is the state every later decision has to survive: I4 asking whether the
-    archive holds a local file's rows, compaction deciding what is already the
-    archive's business, and the archive refusing a range that starts inside its
+    published table holds a local file's rows, compaction deciding what is already the
+    published table's business, and the published table refusing a range that starts inside its
     extent. The existing rewrite test evicts everything first, so none of that
     is exercised there.
     """
@@ -1361,7 +1371,7 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
         target_seal_size=16 * 1024,
         target_compact_size=32 * 1024,
         compact_min_files=2,
-        local_rows=2000,
+        staging_rows=2000,
         snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
@@ -1370,7 +1380,7 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -1380,25 +1390,27 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
             total += 3000
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        assert log.archive_files() > 2, "expected several undersized archive files"
-        assert log._table.data_files(), "local files must still overlap the archive"
+        assert log.published_files() > 2, "expected several undersized published files"
+        assert log._table.data_files(), (
+            "local files must still overlap the published table"
+        )
 
         # The documented reason it exists: a raised target leaves history sized
         # for the old one.
         log.set_config(replace(config, target_compact_size=256 * 1024))
-        log.rewrite_archive()
+        log.rewrite_published()
 
         assert log.scan().read_all().num_rows == total
 
         # The superseded rows still sit in `extent`: `drain` removes them only
         # after the grace period, and until it does they still match the local
         # cuts. The state that matters is the one AFTER that, so take it.
-        current = {(f.lo, f.hi + 1) for f in log._archive.require().data_files()}
+        current = {(f.lo, f.hi + 1) for f in log._published.require().data_files()}
         with log._buffer._lock:
-            for lo, hi in log._buffer.archived_ranges(
-                log._archive.uri or "", 0, include_intents=False
+            for lo, hi in log._buffer.published_ranges(
+                log._published.uri or "", 0, include_intents=False
             ):
                 if (lo, hi) not in current:
                     log._buffer._con.execute(
@@ -1409,67 +1421,67 @@ def test_the_log_keeps_working_after_the_archive_is_re_cut(
 
             log._buffer._con.commit()
 
-        # And the log has to keep going past a re-cut archive.
+        # And the log has to keep going past a re-cut published table.
         log.extend(rows(3000))
         total += 3000
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
 
         table = log.scan().read_all()
         offsets = log.scan(columns=["litelink_offset"]).read_all().column(0).to_pylist()
 
-        assert table.num_rows == total, "sync stalled or lost rows after the re-cut"
+        assert table.num_rows == total, "publish stalled or lost rows after the re-cut"
         assert len(set(offsets)) == len(offsets), "duplicate offsets after the re-cut"
 
         # And eviction must still be making progress. This is what the re-cut
         # actually broke: reads keep answering correctly whether or not I4 can
-        # still recognise the archive's copies, so a row count says nothing.
-        # `local_rows` is what says it — asked for 2,000 and the archive holds
-        # every one of these, a local table still carrying all 15,000 means
-        # eviction has stopped and `local_retention` is silently void.
-        local = log.table_rows()
+        # still recognise the published table's copies, so a row count says nothing.
+        # `staging_rows` is what says it — asked for 2,000 and the published table holds
+        # every one of these, a staging table still carrying all 15,000 means
+        # eviction has stopped and `staging_retention` is silently void.
+        local = log.staging_rows()
 
         assert local < total // 2, (
             f"eviction stalled after the re-cut: {local} of {total} rows still local"
         )
 
 
-def test_a_stale_handle_cannot_repair_the_archive_it_was_pointed_away_from(
+def test_a_stale_handle_cannot_repair_the_published_table_it_was_pointed_away_from(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """Opening with `repair` is the most dangerous thing a handle does.
 
-    It lets `open_archive` drop a catalog entry naming another prefix and
+    It lets `open_published` drop a catalog entry naming another prefix and
     create a fresh table at this one. The maintenance claim is what entitles a
-    caller to that; the durable location is what tells it WHICH archive to
-    repair, and every repairing caller except `sync` inherited the privilege
-    without the premise. A handle that remembers the archive the log has left
-    then destroys the live archive's catalog entry, and the next pass "repairs"
+    caller to that; the durable location is what tells it WHICH published table to
+    repair, and every repairing caller except `publish` inherited the privilege
+    without the premise. A handle that remembers the published table the log has left
+    then destroys the live published table's catalog entry, and the next pass "repairs"
     again by creating an empty table over its data.
     """
-    with archived_log(tmp_path, bucket, s3) as writer:
+    with published_log(tmp_path, bucket, s3) as writer:
         writer.extend(rows(ROWS))
         writer.seal_due()
-        writer.sync()
+        writer.publish()
 
         with litelink.open(tmp_path, "s", s3=s3) as stale:
-            # `stale` remembers the first archive and never opens its handle.
-            assert stale._archive.uri == f"s3://{bucket}/prefix"
+            # `stale` remembers the first published table and never opens its handle.
+            assert stale._published.uri == f"s3://{bucket}/prefix"
 
-            writer.set_archive(f"s3://{bucket}/second")
+            writer.set_published(f"s3://{bucket}/second")
             writer.extend(rows(ROWS))
             writer.seal_due()
-            writer.sync()
+            writer.publish()
             readable = writer.scan().read_all().num_rows
 
             # The documented ad-hoc operation, run from the stale handle.
-            stale.rewrite_archive()
+            stale.rewrite_published()
 
             assert writer.scan().read_all().num_rows == readable, (
-                "a stale handle repaired the wrong archive and lost history"
+                "a stale handle repaired the wrong published table and lost history"
             )
-            assert stale._archive.uri == f"s3://{bucket}/second", (
+            assert stale._published.uri == f"s3://{bucket}/second", (
                 "the repairing open must adopt the location the log records"
             )
 
@@ -1480,11 +1492,11 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
     """The scratch takes BOTH targets from compaction, not one from each.
 
     It cuts at whichever ceiling comes first, so carrying the live seal ROW cap
-    made a rewrite cut its outputs at the seal's row limit while the archive
+    made a rewrite cut its outputs at the seal's row limit while the published table
     holds files sized to the compact one — many times more files than it
     started with, each still undersized by bytes, so the next
-    `rewrite_archive` flags the same tail again and it never converges. The
-    operation exists to merge undersized archived files; that inverted it.
+    `rewrite_published` flags the same tail again and it never converges. The
+    operation exists to merge undersized published files; that inverted it.
     """
     config = replace(
         LogConfig(),
@@ -1501,7 +1513,7 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -1509,21 +1521,21 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        before = log.archive_files()
+        before = log.published_files()
 
-        assert before > 1, "expected several archived files to re-cut"
+        assert before > 1, "expected several published files to re-cut"
 
         # A raised target makes the history undersized, which is the reason
         # this operation exists.
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.rewrite_archive()
+        log.rewrite_published()
 
-        after = log.archive_files()
+        after = log.published_files()
 
         assert after <= before, (
-            f"the rewrite fragmented the archive: {before} files became {after}"
+            f"the rewrite fragmented the published table: {before} files became {after}"
         )
         assert log.scan().read_all().num_rows == 2400
 
@@ -1534,16 +1546,16 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
     """Four legitimate operations, no warning at any step, and a dead log.
 
     Detach, raise the compaction target so history is undersized again,
-    maintain, re-attach. While detached, compaction had no archive to ask
-    about, so it merged across ranges the archive still holds — and nothing
-    re-cuts a LOCAL straddler: `rewrite_archive` works the other side. On
+    maintain, re-attach. While detached, compaction had no published table to ask
+    about, so it merged across ranges the published table still holds — and nothing
+    re-cuts a LOCAL straddler: `rewrite_published` works the other side. On
     re-attach, eviction pins below the straddler for ever and every push is
     refused by `_refuse_straddle`, which the shipped maintainer does not catch.
 
-    Detaching does not make the archive's copies stop existing, so compaction
-    asks whether ANY archive holds a file, not whether the configured one
+    Detaching does not make the published table's copies stop existing, so compaction
+    asks whether ANY published table holds a file, not whether the configured one
     does. It costs nothing: only compacted files are ever pushed, so a file
-    with an archive copy is already at the target.
+    with a published copy is already at the target.
     """
     config = replace(
         LogConfig(),
@@ -1552,14 +1564,14 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
         compact_min_files=2,
         snapshot_retention=timedelta(seconds=0),
     )
-    archive = f"s3://{bucket}/prefix"
+    where = f"s3://{bucket}/prefix"
     log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=archive,
+        published=where,
         s3=s3,
     )
     with log:
@@ -1567,32 +1579,32 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        archived = log._maintenance.archived_prefix(
-            log._table.data_files(), log._archive.uri, include_intents=False
+        published = log._maintenance.published_prefix(
+            log._table.data_files(), log._published.uri, include_intents=False
         )
 
-        assert archived > 0, "expected the archive to hold a prefix"
+        assert published > 0, "expected the published table to hold a prefix"
 
-        log.set_archive(None)
+        log.set_published(None)
         log.set_config(replace(config, target_compact_size=1 << 20))
         log.extend(rows(400))
         log.seal_due()
         log.maintain()
 
         assert all(
-            f.lo > archived or f.hi <= archived for f in log._table.data_files()
-        ), "merged across a range the archive holds while detached"
+            f.lo > published or f.hi <= published for f in log._table.data_files()
+        ), "merged across a range the published table holds while detached"
 
-        log.set_archive(archive)
+        log.set_published(where)
         log.maintain()
-        log.sync()
+        log.publish()
 
         assert log.scan().read_all().num_rows == 2000
 
 
-def test_expiring_the_archive_will_not_repair_it_without_a_claim(
+def test_expiring_the_published_table_will_not_repair_it_without_a_claim(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A repairing open is a claim holder's privilege, and expiry had neither.
@@ -1604,7 +1616,7 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
     pyiceberg writes the metadata object before inserting the catalog row — and
     the loser raises a bare `Exception` the shipped maintainer does not catch.
 
-    Rounds nine and ten fixed which archive a repairing open targets; this is
+    Rounds nine and ten fixed which published table a repairing open targets; this is
     the other half, who is entitled to open one.
     """
     config = replace(
@@ -1620,7 +1632,7 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -1628,19 +1640,19 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
         # A rewrite is the one thing that queues a REMOTE deletion, which is
-        # the signal `_expire_archive` acts on.
+        # the signal `_expire_published` acts on.
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.rewrite_archive()
+        log.rewrite_published()
 
         assert any("://" in p for p in log._buffer.queued_deletions()), (
-            "expected a remote entry to make expiry reach the archive"
+            "expected a remote entry to make expiry reach the published table"
         )
 
         opened: list[bool] = []
-        original = log._archive.table
+        original = log._published.table
 
         def watching(*, repair: bool = False) -> object:
             opened.append(repair)
@@ -1651,16 +1663,16 @@ def test_expiring_the_archive_will_not_repair_it_without_a_claim(
 
         assert held.acquire()
 
-        log._archive.table = watching  # ty: ignore[invalid-assignment]
+        log._published.table = watching  # ty: ignore[invalid-assignment]
         try:
             log.expire()
 
         finally:
-            log._archive.table = original  # ty: ignore[invalid-assignment]
+            log._published.table = original  # ty: ignore[invalid-assignment]
             held.release()
 
         assert not any(opened), (
-            "opened the archive with repair while another owner held the log"
+            "opened the published table with repair while another owner held the log"
         )
 
 
@@ -1670,9 +1682,9 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
     """The hint has to name the metadata the table is actually at.
 
     Asserted against the pointer directly, which is why this sits beside the
-    re-attach test rather than inside it: a round trip through `set_archive`
+    re-attach test rather than inside it: a round trip through `set_published`
     recovers a hint that is one version stale often enough to pass, because the
-    missing snapshot's rows may still be in the local tier.
+    missing snapshot's rows may still be in the staging tier.
 
     It does NOT pin publish-after-reload. That was the intent, and falsifying
     it showed the ordering is not observable: pyiceberg updates the handle in
@@ -1685,32 +1697,32 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
         "s",
         schema=SCHEMA,
         config=replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2),
-        archive=where,
+        published=where,
         s3=s3,
     ) as log:
         log.extend(rows(400))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
 
-        archive = log._archive.require()  # noqa: SLF001
-        archive.reload()
-        current = str(archive.metadata_location)
+        published = log._published.require()  # noqa: SLF001
+        published.reload()
+        current = str(published.metadata_location)
 
     fs = filesystem(s3)
-    published = fs.cat(f"{bucket}/hinted/s/metadata/{VERSION_HINT}")
+    hint = fs.cat(f"{bucket}/hinted/s/metadata/{VERSION_HINT}")
 
-    assert current.endswith(f"/{published.decode().strip()}.metadata.json"), (
-        f"hint {published!r} does not name {current!r}"
+    assert current.endswith(f"/{hint.decode().strip()}.metadata.json"), (
+        f"hint {hint!r} does not name {current!r}"
     )
 
 
-def test_the_archive_reads_as_a_directory_with_no_catalog_at_all(
+def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """What the hint buys beyond re-attach: an archive nothing local can read.
+    """What the hint buys beyond re-attach: a published table nothing local can read.
 
-    litelink resolves the archive through `archive.db` and hands DuckDB a
+    litelink resolves the published table through `published.db` and hands DuckDB a
     metadata path (§7). This is the other reader — an engine pointed at the
     prefix, with no catalog, no local root, and nothing but the bucket.
 
@@ -1728,20 +1740,20 @@ def test_the_archive_reads_as_a_directory_with_no_catalog_at_all(
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        local_rows=200,
+        staging_rows=200,
     )
     with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         for _ in range(4):
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        archived = log.archived_through()
+        published = log.published_through()
 
-    assert archived > 0, "nothing reached the archive to read back"
+    assert published > 0, "nothing reached the published table to read back"
 
     connection = duckdb.connect()
     load_extension(connection, "iceberg", remote=False)
@@ -1759,32 +1771,32 @@ def test_the_archive_reads_as_a_directory_with_no_catalog_at_all(
     ).fetchone()
 
     assert rows_read is not None
-    assert rows_read[0] == archived
+    assert rows_read[0] == published
 
 
-def test_pointing_back_at_an_archive_restores_everything_it_held(
+def test_pointing_back_at_a_published_table_restores_everything_it_held(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A re-point costs reach, not data — and pointing back gets it back.
 
     Both halves matter and they are different claims. While pointed elsewhere,
-    rows evicted into the old archive are out of reach: the read path resolves
-    exactly one archive, so a full `scan()` returns fewer rows
+    rows evicted into the old published table are out of reach: the read path resolves
+    exactly one published table, so a full `scan()` returns fewer rows
     than were written, silently. That has not changed.
 
-    What has is the way back. This test asserted the opposite until the archive
+    What has is the way back. This test asserted the opposite until the published table
     began publishing `version-hint.text` beside its metadata — before that, the
-    local catalog row was the only thing naming the archive's current metadata,
+    local catalog row was the only thing naming the published table's current metadata,
     and re-pointing drops it, so returning built an EMPTY table over objects
     still sitting in the bucket. Now the bucket says where its own metadata is,
-    and `open_archive` registers from that instead of creating.
+    and `open_published` registers from that instead of creating.
     """
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        local_rows=200,
+        staging_rows=200,
         snapshot_retention=timedelta(seconds=0),
     )
     first = f"s3://{bucket}/first"
@@ -1794,7 +1806,7 @@ def test_pointing_back_at_an_archive_restores_everything_it_held(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=first,
+        published=first,
         s3=s3,
     )
     with log:
@@ -1804,46 +1816,46 @@ def test_pointing_back_at_an_archive_restores_everything_it_held(
             written += 400
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
         assert log.scan().read_all().num_rows == written
 
-        log.set_archive(f"s3://{bucket}/second")
+        log.set_published(f"s3://{bucket}/second")
         moved = log.scan().read_all().num_rows
 
         assert moved < written, "expected the evicted history to be out of reach"
 
-        # ALL of them, not merely more than `moved`. Adopting the archive has
+        # ALL of them, not merely more than `moved`. Adopting the published table has
         # to hand back the extent it actually holds; a partial recovery would
         # mean registering a metadata JSON older than the last commit, which is
         # the failure mode a remembered-at-open pointer would have had and this
         # one must not.
-        log.set_archive(first)
+        log.set_published(first)
 
         assert log.scan().read_all().num_rows == written
 
         # And it is genuinely the old table, not a new one that happens to
         # read: an empty table created over the objects would show no files at
-        # all while the union still answered from the local tier.
-        assert log.archive_files() > 0
+        # all while the union still answered from the staging tier.
+        assert log.published_files() > 0
 
 
 def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Compaction and `sync` must exclude the same files, or they deadlock.
+    """Compaction and `publish` must exclude the same files, or they deadlock.
 
     `stable_prefix` holds a file back when compaction might still merge it, and
-    compaction refuses to merge anything some archive already holds. Give
-    compaction that second input without giving it to `sync` and the two stop
+    compaction refuses to merge anything some published table already holds. Give
+    compaction that second input without giving it to `publish` and the two stop
     agreeing: after a re-point to a FRESH prefix the floor is 0, so files the
-    old archive covers are back in `pending`, group into a mergeable run under
+    old published table covers are back in `pending`, group into a mergeable run under
     the raised target, and are held back for ever against a merge that will
     never happen. Nothing is ever pushed, the watermark never moves, eviction
     pins on it, and no error surfaces anywhere.
 
     The re-attach test next to this one hides it, because re-attaching the SAME
-    archive leaves its own extent as the floor, which keeps those files out of
+    published table leaves its own extent as the floor, which keeps those files out of
     `pending` entirely.
     """
     config = replace(
@@ -1859,7 +1871,7 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/first",
+        published=f"s3://{bucket}/first",
         s3=s3,
     )
     with log:
@@ -1867,26 +1879,26 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.set_archive(f"s3://{bucket}/second")
+        log.set_published(f"s3://{bucket}/second")
 
         for _ in range(4):
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        assert log.archive_files() > 0, (
-            "nothing was ever pushed to the new archive: sync and compaction "
+        assert log.published_files() > 0, (
+            "nothing was ever pushed to the new published table: publish and compaction "
             "disagree about which files are still in play"
         )
-        assert log.archived_through() > 0, "the watermark never moved"
+        assert log.published_through() > 0, "the watermark never moved"
 
 
 def _crash_before_recording(log: WriteHandle) -> None:
-    """Sync, dying between the register and the rows recording it."""
+    """Publish, dying between the register and the rows recording it."""
     original = Buffer.record_file
 
     def dying(*args: object, **kwargs: object) -> None:
@@ -1896,7 +1908,7 @@ def _crash_before_recording(log: WriteHandle) -> None:
     Buffer.record_file = dying
     try:
         with pytest.raises(RuntimeError, match="crash between"):
-            log.sync()
+            log.publish()
 
     finally:
         Buffer.record_file = original
@@ -1909,8 +1921,8 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
     A register lands and the rows recording it do not. Compaction decides what
     it may merge from those rows, so a compaction-target change before the next
-    sync regroups the pushed-but-unrecorded files and commits a LOCAL file
-    straddling the archive's extent — after which every push is refused for
+    publish regroups the pushed-but-unrecorded files and commits a LOCAL file
+    straddling the published table's extent — after which every push is refused for
     ever and nothing re-cuts a local straddler.
 
     The intent is written before the register, and compaction reads intents
@@ -1930,7 +1942,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -1941,20 +1953,20 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
         _crash_before_recording(log)
 
-        archive = log._archive.require()
-        archive.reload()
-        extent = archive.extent()
-        intents = log._buffer.intents(log._archive.uri or "")
+        published = log._published.require()
+        published.reload()
+        extent = published.extent()
+        intents = log._buffer.intents(log._published.uri or "")
 
         assert extent is not None
         assert intents, "the crash must leave the intents behind"
 
         local = log._table.data_files()
 
-        assert log._maintenance.archived_prefix(local, None, include_intents=True) > 0
+        assert log._maintenance.published_prefix(local, None, include_intents=True) > 0
         assert (
-            log._maintenance.archived_prefix(
-                local, log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                local, log._published.uri, include_intents=False
             )
             == 0
         ), "eviction must not see an intended copy as a landed one"
@@ -1965,11 +1977,13 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
         assert all(
             f.lo > extent[1] or f.hi <= extent[1] for f in log._table.data_files()
-        ), "merged across the archive's extent"
+        ), "merged across the published table's extent"
 
-        log.sync()
+        log.publish()
 
-        assert not log._buffer.intents(log._archive.uri or ""), "intents not reconciled"
+        assert not log._buffer.intents(log._published.uri or ""), (
+            "intents not reconciled"
+        )
         assert log.scan().read_all().num_rows == 1200
 
 
@@ -1983,14 +1997,14 @@ def test_eviction_never_acts_on_an_intended_copy(
     coverage is the loss this whole record exists to prevent — and it is the
     direction a `confirmed` column would have handed an older build for free.
     """
-    config = replace(LogConfig(), local_rows=50, target_seal_size=1 << 30)
+    config = replace(LogConfig(), staging_rows=50, target_seal_size=1 << 30)
     log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -2033,7 +2047,7 @@ def test_two_owners_intending_one_path_do_not_collide(
     Nothing else in this suite drives two live intents onto one path: every
     other scenario intends a path reconciliation has already cleared.
     """
-    with archived_log(tmp_path, bucket, s3) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         path = f"s3://{bucket}/prefix/data/contested.parquet"
 
         log._buffer.intend_file(path, 1, 101, 4096)
@@ -2060,7 +2074,7 @@ def test_a_healed_row_carries_the_measured_bytes(
 
     What that costs is not cosmetic: a rewrite's deliberately undersized tail
     recorded as full is never flagged by `_badly_sized` again, so
-    `rewrite_archive` stops converging it, and nothing re-measures an archived
+    `rewrite_published` stops converging it, and nothing re-measures a published
     file.
     """
     config = replace(
@@ -2076,7 +2090,7 @@ def test_a_healed_row_carries_the_measured_bytes(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -2089,7 +2103,7 @@ def test_a_healed_row_carries_the_measured_bytes(
 
         intended = {
             path: size
-            for path, _, _, size in log._buffer.intents(log._archive.uri or "")
+            for path, _, _, size in log._buffer.intents(log._published.uri or "")
         }
 
         assert intended, "the crash must leave intents behind"
@@ -2097,7 +2111,7 @@ def test_a_healed_row_carries_the_measured_bytes(
             "the fixture must not coincide with the default it is testing for"
         )
 
-        log.sync()
+        log.publish()
 
         healed = {
             path: size
@@ -2141,7 +2155,7 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -2149,9 +2163,9 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        before = log.archive_files()
+        before = log.published_files()
         readable = log.scan().read_all().num_rows
 
         assert before > 1
@@ -2175,24 +2189,24 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
         Maintenance._discard_scratch = after_teardown
         try:
             with pytest.raises(RuntimeError, match="lost the claim"):
-                log._maintenance.rewrite_archive(heartbeat=lambda: state["calls"] < 2)
+                log._maintenance.rewrite_published(heartbeat=lambda: state["calls"] < 2)
 
         finally:
             Maintenance._discard_scratch = discard
 
-        assert log.archive_files() == before, "committed without holding the claim"
+        assert log.published_files() == before, "committed without holding the claim"
         assert log.scan().read_all().num_rows == readable
 
 
 def test_a_rewrite_restamps_the_files_it_supersedes(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The archive half of the grace fix, where the loss was demonstrated.
+    """The published half of the grace fix, where the loss was demonstrated.
 
-    `rewrite_archive` queues the files it is replacing when it STARTS, and they
+    `rewrite_published` queues the files it is replacing when it STARTS, and they
     stop being referenced only when `replace_range` commits. Left at the
-    queueing, a rewrite slower than `snapshot_retention` — and re-cutting an
-    archive is the slowest thing here — spends the whole grace before it
+    queueing, a rewrite slower than `snapshot_retention` — and re-cutting a
+    published table is the slowest thing here — spends the whole grace before it
     commits, so drain takes the originals out from under any reader that
     resolved the pre-rewrite snapshot.
 
@@ -2213,7 +2227,7 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     )
     with log:
@@ -2221,41 +2235,41 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
             log.extend(rows(400))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        assert log.archive_files() > 1
+        assert log.published_files() > 1
 
         # A rewrite that began a day ago, as a slow one effectively has.
         stale = int(datetime.now(UTC).timestamp()) - 86_400
-        superseded = [f.path for f in log._archive.require().data_files()]
+        superseded = [f.path for f in log._published.require().data_files()]
         log._buffer.enqueue_deletions(superseded, stale)
 
         assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
 
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.rewrite_archive()
+        log.rewrite_published()
 
         overdue = [p for p in log._buffer.due_deletions(stale + 1) if p in superseded]
 
         assert not overdue, (
-            "superseded archive files are still due against a stamp from "
+            "superseded published files are still due against a stamp from "
             f"before the commit that superseded them: {overdue}"
         )
 
 
-def test_replication_holds_sealed_rows_until_the_archive_has_them(
+def test_replication_holds_sealed_rows_until_the_published_table_has_them(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """§3a's middle hole, closed. I4 one tier up.
 
     A seal moves rows from SQLite into a Parquet file that no sidecar
     replicates, so with WAL shipping on, dropping them at seal removes the only
-    off-box copy of a range the archive does not hold yet. The machine dying in
+    off-box copy of a range the published table does not hold yet. The machine dying in
     that window loses them from the MIDDLE of the offset space: below the seal
-    frontier so the buffer no longer has them, above the archive frontier so
+    frontier so the buffer no longer has them, above the published frontier so
     the bucket does not either.
 
-    So they stay until sync has pushed the range, and only then go.
+    So they stay until publish has pushed the range, and only then go.
     """
     config = replace(
         LogConfig(),
@@ -2269,13 +2283,13 @@ def test_replication_holds_sealed_rows_until_the_archive_has_them(
         "s",
         schema=SCHEMA,
         config=config,
-        archive=f"s3://{bucket}/held",
+        published=f"s3://{bucket}/held",
         s3=s3,
     ) as log:
         log.extend(rows(1200))
         log.seal_due()
 
-        sealed = log.table_extent()
+        sealed = log.staging_extent()
 
         assert sealed is not None, "nothing sealed, so the case is not set up"
         # The buffer's FLOOR is the measure, not its size: `count_above(0)`
@@ -2283,34 +2297,36 @@ def test_replication_holds_sealed_rows_until_the_archive_has_them(
         buffered = log._buffer.extent()  # noqa: SLF001
 
         assert buffered is not None
-        assert buffered[0] <= sealed[1], (
-            "the seal dropped rows the archive does not have yet"
+        assert buffered[0] < sealed[1], (
+            "the seal dropped rows the published table does not have yet"
         )
         # And a read is unaffected, which is what makes holding them affordable:
-        # the buffer leg is bounded by the local table's committed extent.
+        # the buffer leg is bounded by the staging table's committed extent.
         assert log.scan().read_all().num_rows == 1200
 
         log.maintain()
-        log.sync()
-        archived = log.archived_through()
+        log.publish()
+        published = log.published_through()
 
-        assert archived > 0, "nothing reached the archive"
-        # Released only up to the ARCHIVE's frontier, never the seal's.
+        assert published > 0, "nothing reached the published table"
+        # Released only up to the PUBLISHED table's frontier, never the seal's.
         released = log._buffer.extent()  # noqa: SLF001
 
         assert released is not None
-        assert released[0] > archived, "rows the archive holds were never released"
+        assert released[0] > published, (
+            "rows the published table holds were never released"
+        )
         assert log.scan().read_all().num_rows == 1200
 
 
 def test_without_replication_a_seal_still_drops_its_rows(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """An archive alone is not the trigger.
+    """A published table alone is not the trigger.
 
     Without a sidecar the buffer and the Parquet share a disk and die together,
     so holding buys nothing and costs SQLite growth on every seal. The gate is
-    `wal_replication`, and this is the half that proves an archive by itself
+    `wal_replication`, and this is the half that proves a published table by itself
     does not flip it.
     """
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
@@ -2319,19 +2335,19 @@ def test_without_replication_a_seal_still_drops_its_rows(
         "s",
         schema=SCHEMA,
         config=config,
-        archive=f"s3://{bucket}/unheld",
+        published=f"s3://{bucket}/unheld",
         s3=s3,
     ) as log:
         log.extend(rows(1200))
         log.seal_due()
 
-        sealed = log.table_extent()
+        sealed = log.staging_extent()
 
         assert sealed is not None
         buffered = log._buffer.extent()  # noqa: SLF001
         # Either the buffer is empty, or what is in it is strictly the unsealed
         # tail — never a row the seal already wrote to Parquet.
-        assert buffered is None or buffered[0] > sealed[1], (
+        assert buffered is None or buffered[0] >= sealed[1], (
             "rows were held with no sidecar to replicate them"
         )
 
@@ -2349,7 +2365,7 @@ def test_a_held_seal_does_not_widen_the_next_file(
     Nothing catches it at seal time — the local `register` passes no `lo`, so
     `_refuse_straddle` returns early. It surfaces later and elsewhere: manifest
     ranges stop being non-overlapping, the local leg is an unfiltered
-    `iceberg_scan` so the overlap is returned twice, and the next sync refuses
+    `iceberg_scan` so the overlap is returned twice, and the next publish refuses
     the straddle for ever.
 
     So this asserts the FILES, not the row count — a total can be right while
@@ -2367,7 +2383,7 @@ def test_a_held_seal_does_not_widen_the_next_file(
         "s",
         schema=SCHEMA,
         config=config,
-        archive=f"s3://{bucket}/widen",
+        published=f"s3://{bucket}/widen",
         s3=s3,
     ) as log:
         for _ in range(3):
@@ -2390,15 +2406,15 @@ def test_a_held_seal_does_not_widen_the_next_file(
         assert log.scan().read_all().column(OFFSET).to_pylist() == list(range(1, 1801))
 
 
-def test_the_archive_declares_the_same_sort_order_as_the_log(
+def test_the_published_table_declares_the_same_sort_order_as_the_log(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """§4: the order is declared as table metadata, on BOTH tiers.
 
-    `open_archive` never declared one, so an archive holding clustered data
+    `open_published` never declared one, so a published table holding clustered data
     said nothing about it — a table lying about itself to any reader that is
     not this library, and the reason `sort_by` was unanswerable from the
-    archive alone.
+    published table alone.
     """
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
     with litelink.new(
@@ -2407,58 +2423,58 @@ def test_the_archive_declares_the_same_sort_order_as_the_log(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/sorted",
+        published=f"s3://{bucket}/sorted",
         s3=s3,
     ) as log:
         log.extend(scrambled(600))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
 
-        archive = log._archive.require()  # noqa: SLF001
+        published = log._published.require()  # noqa: SLF001
 
-        assert archive.sort_by() == ("event_ts",), (
-            "the archive holds clustered data and declares no order"
+        assert published.sort_by() == ("event_ts",), (
+            "the published table holds clustered data and declares no order"
         )
         # And it still holds the rows, so declaring the order did not disturb
         # the create/publish sequence around it.
-        assert log.archived_through() > 0
+        assert log.published_through() > 0
 
 
-def test_attaching_an_archive_that_is_ahead_of_the_log_is_refused(
+def test_attaching_a_published_table_that_is_ahead_of_the_log_is_refused(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The obvious failover attempt, which wedges the log silently.
 
-    `WriteHandle.new` on a second box then `set_archive` at the old prefix: `sync`
-    computes its floor from the archive's extent, every local file sits below
+    `WriteHandle.new` on a second box then `set_published` at the old prefix: `publish`
+    computes its floor from the published table's extent, every local file sits below
     it, so nothing is ever pushed. The watermark is still written, eviction's
     I4 clamp finds no `extent` rows and pins at zero, and local disk grows
-    without bound while `sync()` returns success having uploaded nothing.
+    without bound while `publish()` returns success having uploaded nothing.
     """
     where = f"s3://{bucket}/ahead"
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
-    # A populated archive: this is the log that legitimately owns it.
+    # A populated published table: this is the log that legitimately owns it.
     with litelink.new(
-        tmp_path / "first", "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        tmp_path / "first", "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as owner:
         owner.extend(rows(1200))
         owner.seal_due()
         owner.maintain()
-        owner.sync()
+        owner.publish()
 
-        assert owner.archived_through() > 0
+        assert owner.published_through() > 0
 
-    # A fresh log elsewhere, appending from offset 1, pointed at that archive.
+    # A fresh log elsewhere, appending from offset 1, pointed at that published table.
     with litelink.new(
         tmp_path / "second", "s", schema=SCHEMA, config=config, s3=s3
     ) as fresh:
         fresh.extend(rows(10))
 
         with pytest.raises(ValueError, match="another log's history"):
-            fresh.set_archive(where)
+            fresh.set_published(where)
 
-        assert fresh.archive == Layout(tmp_path / "second", "s").default_archive, (
+        assert fresh.published == Layout(tmp_path / "second", "s").default_published, (
             "the log was re-pointed despite the refusal"
         )
 
@@ -2468,30 +2484,30 @@ def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
 ) -> None:
     """The guard must not fail closed.
 
-    `_repoint` deliberately tolerates an archive that does not exist yet —
+    `_repoint` deliberately tolerates a published table that does not exist yet —
     configuring one is a statement of intent, not a claim that the bucket is
-    there — and `set_archive` runs on every writer restart. A check that
+    there — and `set_published` runs on every writer restart. A check that
     raised on an unreadable prefix would turn a routine restart into a coin
     toss against object storage.
     """
     with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
         log.extend(rows(10))
-        log.set_archive(f"s3://{bucket}/never-written-to")
+        log.set_published(f"s3://{bucket}/never-written-to")
 
-        assert log.archive == f"s3://{bucket}/never-written-to"
+        assert log.published == f"s3://{bucket}/never-written-to"
 
 
 def test_a_hint_naming_unreadable_metadata_refuses_the_move(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A move adopts the table at its new location before recording it, and a
-    hint naming metadata that cannot be read is a broken archive: refused, with
+    hint naming metadata that cannot be read is a broken published table: refused, with
     the log left where it was and the hint not written over.
 
-    It used to be accepted as a statement of intent, leaving the first `sync`
+    It used to be accepted as a statement of intent, leaving the first `publish`
     to fail. A move that reports success has to have a table to point at.
 
-    Falsify by making the adopt in `set_archive` best effort: the move is
+    Falsify by making the adopt in `set_published` best effort: the move is
     recorded.
     """
     prefix = f"s3://{bucket}/corrupt"
@@ -2501,12 +2517,12 @@ def test_a_hint_naming_unreadable_metadata_refuses_the_move(
 
     with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
         log.extend(rows(10))
-        before = log.archive
+        before = log.published
 
         with pytest.raises(FileNotFoundError):
-            log.set_archive(prefix)
+            log.set_published(prefix)
 
-        assert log.archive == before
+        assert log.published == before
         assert fs.cat(hint) == b"00042-does-not-exist", "the hint was written over"
 
 
@@ -2539,21 +2555,21 @@ def test_a_log_is_recovered_onto_another_machine(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=where,
+        published=where,
         s3=s3,
     ) as log:
         log.extend(rows(1200))
         log.seal_due()
         log.maintain()
-        log.sync()
-        # More on top, sealed but never synced: the band that used to be lost.
+        log.publish()
+        # More on top, sealed but never published: the band that used to be lost.
         log.extend(rows(400))
         log.seal_due()
-        archived = log.archived_through()
+        published = log.published_through()
         replicated = log.end_offset() - 1
         served = log.scan().read_all().num_rows
 
-        assert archived < replicated, "nothing left unsynced, so the band is untested"
+        assert published < replicated, "nothing left unsynced, so the band is untested"
 
         replication = log.write_replication_config()
 
@@ -2586,13 +2602,13 @@ def test_a_log_is_recovered_onto_another_machine(
     second = tmp_path / "second"
 
     with litelink.restore(
-        second, "s", archive=where, s3=s3, binary=str(binary)
+        second, "s", published=where, s3=s3, binary=str(binary)
     ) as revived:
         report = revived.recovery()
 
         assert report is not None
         # Every row is readable again — including the sealed-but-unsynced band,
-        # which survives because a seal keeps its rows until the archive has
+        # which survives because a seal keeps its rows until the published table has
         # them when wal_replication is on.
         assert revived.scan().read_all().num_rows == served
         # The shape came from `meta`, not from the catalog that was not restored.
@@ -2603,14 +2619,14 @@ def test_a_log_is_recovered_onto_another_machine(
         resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
 
         assert resumed > written, f"reissued offset {resumed}, primary served {written}"
-        assert report.skipped[1] - report.skipped[0] + 1 == RESTORE_RESERVE
+        assert report.skipped[1] - report.skipped[0] == RESTORE_RESERVE
 
         # And it goes on working. `maintain` is where a stale local `extent`
         # row would surface: compaction reads those rows to decide what to
         # merge, and they name Parquet that is on the machine that died.
         revived.seal_due()
         revived.maintain()
-        revived.sync()
+        revived.publish()
 
         assert revived.scan().read_all().num_rows == served + 1
 
@@ -2623,23 +2639,23 @@ def test_a_log_is_recovered_onto_another_machine(
                 )
 
 
-def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
+def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The measured 261-vs-1061 case, and the one line that fixes it.
 
-    `open_archive` consults `version-hint.text` only when the catalog has NO
+    `open_published` consults `version-hint.text` only when the catalog has NO
     row for the table. With a stale row present it calls `load_table` on
     whatever that names — and old metadata JSONs survive in the bucket until
-    expiry, so the load SUCCEEDS and reports the archive as it was several
-    syncs ago. Silent, and in the losing direction.
+    expiry, so the load SUCCEEDS and reports the published table as it was several
+    publishes ago. Silent, and in the losing direction.
 
-    Worse than under-reading: the next sync commits onto that lineage and
+    Worse than under-reading: the next publish commits onto that lineage and
     `publish_pointer` republishes the hint over the fork, destroying the
     pointer a later recovery depends on.
 
     Both halves are asserted here — the hazard, so it stays documented, and
-    that `forget_archive_entry` removes it. `WriteHandle.restore` calls that before
+    that `forget_published_entry` removes it. `WriteHandle.restore` calls that before
     opening, so an operator who restored all three databases by hand gets the
     same protection as one who did not.
     """
@@ -2653,53 +2669,57 @@ def test_a_stale_archive_catalog_reads_short_until_it_is_dropped(
     root = tmp_path / "log"
     layout = Layout(root, "s")
     with litelink.new(
-        root, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        root, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
         log.seal_due()
         log.maintain()
-        log.sync()
-        early = log.archive_files()
+        log.publish()
+        early = log.published_files()
 
-    # A replica of `archive.db` taken here — the state a WAL restore would
-    # bring back — and then the archive grows past it.
+    # A replica of `published.db` taken here — the state a WAL restore would
+    # bring back — and then the published table grows past it.
     stale = tmp_path / "stale-archive.db"
-    shutil.copyfile(layout.archive_db, stale)
+    shutil.copyfile(layout.published_db, stale)
 
     with litelink.open(root, "s", s3=s3) as log:
         for _ in range(3):
             log.extend(rows(600))
             log.seal_due()
             log.maintain()
-            log.sync()
+            log.publish()
 
-        current = log.archive_files()
+        current = log.published_files()
 
-    assert current > early, "the archive did not grow, so staleness is untestable"
+    assert current > early, (
+        "the published table did not grow, so staleness is untestable"
+    )
 
     # The hazard: the old catalog wins over the bucket's own pointer.
-    shutil.copyfile(stale, layout.archive_db)
+    shutil.copyfile(stale, layout.published_db)
     with litelink.open(root, "s", s3=s3) as log:
-        assert log.archive_files() == early, (
+        assert log.published_files() == early, (
             "expected the stale catalog to be believed; the case has changed"
         )
 
     # And the fix, which is what `restore` does before it opens anything.
-    assert forget_archive_entry(layout), "there was no entry to drop"
+    assert forget_published_entry(layout), "there was no entry to drop"
 
     with litelink.open(root, "s", s3=s3) as log:
-        # A reader may not adopt — that is a write to `archive.db` — so it
+        # A reader may not adopt — that is a write to `published.db` — so it
         # still sees nothing until a repairing caller runs.
-        assert log.archive_files() == 0
-        log.sync()
+        assert log.published_files() == 0
+        log.publish()
 
-        assert log.archive_files() == current, "adoption did not recover the archive"
+        assert log.published_files() == current, (
+            "adoption did not recover the published table"
+        )
 
 
-def test_forgetting_an_archive_entry_that_is_not_there_is_a_no_op(
+def test_forgetting_a_published_entry_that_is_not_there_is_a_no_op(
     tmp_path: Path,
 ) -> None:
-    """A fresh restore has no `archive.db` at all, which is the ordinary case.
+    """A fresh restore has no `published.db` at all, which is the ordinary case.
 
     Constructing a `SqlCatalog` to drop one row would create that catalog's own
     tables as a side effect — a write, from a path whose whole purpose is to
@@ -2707,8 +2727,8 @@ def test_forgetting_an_archive_entry_that_is_not_there_is_a_no_op(
     """
     layout = Layout(tmp_path, "s")
 
-    assert forget_archive_entry(layout) is False
-    assert not layout.archive_db.exists(), "it created the database it was checking"
+    assert forget_published_entry(layout) is False
+    assert not layout.published_db.exists(), "it created the database it was checking"
 
 
 def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
@@ -2739,12 +2759,12 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(800))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
         # A seal claimed and never finished, exactly as a crash leaves one.
         log.extend(rows(400))
         group = log._buffer.pending_group()  # noqa: SLF001
@@ -2774,7 +2794,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
 
     LogTable.create(Layout(second, "s"), table_schema(SCHEMA), ())
     with litelink.open(second, "s", s3=s3) as revived:
-        revived._archive.table(repair=True)  # noqa: SLF001
+        revived._published.table(repair=True)  # noqa: SLF001
         # `seal()`, not `seal_due()`. The recovered group is OPEN — `_seed_group`
         # builds it, and the appender never cut it — so `seal_due` drains
         # nothing and the overlap never materialises. Closing it is what the
@@ -2798,7 +2818,7 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
 
     `_recover_seal` has two exits. The one that finds the file already
     committed retired the group with the default `discard=True`, so it deleted
-    rows the archive had not taken — the only off-box copy — while the sibling
+    rows the published table had not taken — the only off-box copy — while the sibling
     exit eighteen lines below passed the flag correctly.
     """
     where = f"s3://{bucket}/recovered"
@@ -2809,7 +2829,7 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         wal_replication=True,
     )
     with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
         group = log._buffer.pending_group()  # noqa: SLF001
@@ -2829,30 +2849,30 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         log.recover()
 
         assert log._buffer.count_above(0) == held, (  # noqa: SLF001
-            "recovery deleted rows the archive has not been sent"
+            "recovery deleted rows the published table has not been sent"
         )
 
 
-def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
+def test_attaching_another_logs_published_table_is_refused_at_both_entry_points(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A populated archive this log never pushed to belongs to another log.
+    """A populated published table this log never pushed to belongs to another log.
 
     Offsets cannot tell them apart — two logs of the same name both start at 1,
-    so a foreign archive whose ranges sit BELOW this log's next offset passes
+    so a foreign published table whose ranges sit BELOW this log's next offset passes
     the "is it ahead of us" check. What tells them apart is that a log which
-    pushed to an archive keeps its `extent` rows naming that prefix across a
+    pushed to a published table keeps its `extent` rows naming that prefix across a
     detach (§4a).
 
     Refused at the door rather than contained afterwards, and two attempts to
-    contain it are why. `_push` raises the watermark to the archive's extent on
-    every pass, and its backfill writes `extent` rows for the archive's ENTIRE
-    manifest within one sync — so by the time anything downstream looks, the
-    foreign archive's ranges ARE this log's records. Measured: a bound derived
+    contain it are why. `_push` raises the watermark to the published table's extent on
+    every pass, and its backfill writes `extent` rows for the published table's ENTIRE
+    manifest within one publish — so by the time anything downstream looks, the
+    foreign published table's ranges ARE this log's records. Measured: a bound derived
     from either moved with the contamination.
 
     Both entry points, because either can be the one that points the log —
-    `litelink.new(archive=...)` is exactly what an operator reaches for when failing
+    `litelink.new(published=...)` is exactly what an operator reaches for when failing
     over by hand.
     """
     foreign = f"s3://{bucket}/foreign"
@@ -2864,19 +2884,26 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
     )
     # Someone else's log, which fills that prefix.
     with litelink.new(
-        tmp_path / "owner", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
+        tmp_path / "owner", "s", schema=SCHEMA, config=config, published=foreign, s3=s3
     ) as owner:
         owner.extend(rows(1200))
         owner.seal_due()
         owner.maintain()
-        owner.sync()
+        owner.publish()
 
-        assert owner.archived_through() > 0, "the foreign archive holds nothing"
+        assert owner.published_through() > 0, (
+            "the foreign published table holds nothing"
+        )
 
     # Creating a log against it — the failover-by-hand shape.
     with pytest.raises(ValueError, match="no record of pushing"):
         litelink.new(
-            tmp_path / "mine", "s", schema=SCHEMA, config=config, archive=foreign, s3=s3
+            tmp_path / "mine",
+            "s",
+            schema=SCHEMA,
+            config=config,
+            published=foreign,
+            s3=s3,
         )
 
     assert not (tmp_path / "mine" / "s" / "buffer.db").exists(), (
@@ -2884,7 +2911,7 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
     )
 
     # And pointing an existing one at it. Created local-only, so without
-    # `wal_replication` — `validate` refuses that pair, and the archive is
+    # `wal_replication` — `validate` refuses that pair, and the published table is
     # what this is about to try to attach.
     local_only = replace(config, wal_replication=False)
     with litelink.new(
@@ -2894,29 +2921,29 @@ def test_attaching_another_logs_archive_is_refused_at_both_entry_points(
         other.seal_due()
 
         with pytest.raises(ValueError, match="no record of pushing"):
-            other.set_archive(foreign)
+            other.set_published(foreign)
 
-        assert other.archive == Layout(tmp_path / "other", "s").default_archive, (
+        assert other.published == Layout(tmp_path / "other", "s").default_published, (
             "the log was pointed despite the refusal"
         )
 
 
-def test_a_restore_from_a_replica_the_archive_has_outrun(
+def test_a_restore_from_a_replica_the_published_table_has_outrun(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A replica is a snapshot from BEFORE the primary's last sync.
+    """A replica is a snapshot from BEFORE the primary's last publish.
 
     That is ordinary replication lag, not a crash window: the bucket routinely
     holds ranges the replicated `extent` rows do not mention. Seeded from the
-    replica alone, the open group starts below the archive's frontier, and the
-    first seal here writes a file reaching into the archive's extent.
+    replica alone, the open group starts below the published table's frontier, and the
+    first seal here writes a file reaching into the published table's extent.
 
     Which wedges the log for good — `_refuse_straddle` raises on every push,
-    `archived_prefix` returns 0 for the straddler so eviction pins at zero, and
+    `published_prefix` returns 0 for the straddler so eviction pins at zero, and
     local disk grows without bound. Nothing re-cuts a local straddler, and this
-    is the operation you run when the archive is the only surviving copy.
+    is the operation you run when the published table is the only surviving copy.
 
-    Asserted by DOING the work a revived box does — seal, maintain, sync,
+    Asserted by DOING the work a revived box does — seal, maintain, publish,
     repeatedly — rather than by inspecting the group, because the group looks
     entirely reasonable right up until the push.
     """
@@ -2929,14 +2956,14 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(800))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
 
-        # THE SNAPSHOT, taken here — before the sync below. This is the lag.
+        # THE SNAPSHOT, taken here — before the publish below. This is the lag.
         second = tmp_path / "second"
         (second / "s").mkdir(parents=True)
         source = sqlite3.connect(Layout(primary, "s").buffer_db)
@@ -2945,26 +2972,26 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
         source.close()
         copy.close()
 
-        # The primary carries on: more rows, sealed and PUSHED. The archive is
+        # The primary carries on: more rows, sealed and PUSHED. The published table is
         # now ahead of everything the snapshot knows about.
         log.extend(rows(800))
         log.seal_due()
         log.maintain()
-        log.sync()
-        ahead = log.archived_through()
+        log.publish()
+        ahead = log.published_through()
 
-    stale = Buffer.peek_meta(Layout(second, "s").buffer_db, "archive_through")
+    stale = Buffer.peek_meta(Layout(second, "s").buffer_db, "published_through")
 
     assert stale is not None and int(stale) < ahead, (
-        "the archive did not outrun the snapshot, so the case is not set up"
+        "the published table did not outrun the snapshot, so the case is not set up"
     )
 
     # Restored from that snapshot, then worked the way a revived box is.
-    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3=s3) as revived:
         # Checked BEFORE any work: the first seal recycles the open group, so
-        # a stale one is invisible a moment later. Releasing the archived rows
+        # a stale one is invisible a moment later. Releasing the published rows
         # empties this buffer — every row in the snapshot is below the frontier
-        # the archive reached — so a group still naming the replica's start
+        # the published table reached — so a group still naming the replica's start
         # would be one with no rows behind it.
         group = revived._buffer._con.execute(  # noqa: SLF001
             "SELECT start_offset FROM extent"
@@ -2981,29 +3008,29 @@ def test_a_restore_from_a_replica_the_archive_has_outrun(
             revived.extend(rows(200))
             revived.seal_due()
             revived.maintain()
-            revived.sync()
+            revived.publish()
 
-        assert revived.archived_through() > ahead, (
-            "sync never got past the archive's frontier: the log is wedged"
+        assert revived.published_through() > ahead, (
+            "publish never got past the published table's frontier: the log is wedged"
         )
         # And eviction is not pinned at zero by a straddling local file.
         assert revived.scan().read_all().num_rows > 0
 
 
-def test_a_restore_fence_clears_the_archive_and_not_just_the_replica(
+def test_a_restore_fence_clears_the_published_table_and_not_just_the_replica(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """`RESTORE_RESERVE` is measured from the REPLICA's sequence, and the
     replica's sequence is not the highest offset anyone issued.
 
-    `strip_local_state` runs before `restore` knows where the archive is, so it
+    `strip_local_state` runs before `restore` knows where the published table is, so it
     fences above what the snapshot carried. The reconcile below it exists
     precisely because that is not the whole truth — the bucket routinely holds
     ranges the replicated `extent` rows have never heard of — and the fence was
-    never told. Left alone the restored log issues offsets the archive already
-    holds: I9 broken, `sync` reporting success while pushing nothing for ever
-    because the file sits below the archive's floor, and the union truncating
-    the archive leg at the colliding local extent, so archived rows are served
+    never told. Left alone the restored log issues offsets the published table already
+    holds: I9 broken, `publish` reporting success while pushing nothing for ever
+    because the file sits below the published table's floor, and the union truncating
+    the published leg at the colliding local extent, so published rows are served
     by no leg at all.
 
     The report already knew, and said so in a way nothing read: `skipped` is
@@ -3013,7 +3040,7 @@ def test_a_restore_fence_clears_the_archive_and_not_just_the_replica(
 
     The sequence is advanced with `reserve` rather than by writing a million
     rows, because the hazard is the DISTANCE between the replica's sequence and
-    the archive's frontier and nothing about how it was travelled. Bulk ingest
+    the published table's frontier and nothing about how it was travelled. Bulk ingest
     makes that distance cheap; it does not create it.
     """
     where = f"s3://{bucket}/fence"
@@ -3023,14 +3050,14 @@ def test_a_restore_fence_clears_the_archive_and_not_just_the_replica(
         # Equal to the seal target, so the load emits several files AT the
         # budget rather than one under it — `stable_prefix` holds back a
         # trailing run with room in it, and a single undersized file would
-        # leave the archive exactly where the snapshot left it.
+        # leave the published table exactly where the snapshot left it.
         target_compact_size=8 * 1024,
         compact_min_files=2,
         wal_replication=True,
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(300))
         log.seal()
@@ -3048,7 +3075,7 @@ def test_a_restore_fence_clears_the_archive_and_not_just_the_replica(
         stalled_at = log.end_offset()
 
         # The primary carries on past the fence's whole width and PUSHES, so
-        # the archive holds offsets a `RESTORE_RESERVE` above the snapshot
+        # the published table holds offsets a `RESTORE_RESERVE` above the snapshot
         # cannot reach.
         log._buffer.reserve(2 * RESTORE_RESERVE)  # noqa: SLF001
         log.ingest(
@@ -3056,39 +3083,39 @@ def test_a_restore_fence_clears_the_archive_and_not_just_the_replica(
                 [f.name for f in SCHEMA]
             )
         )
-        log.sync()
-        archived = log._archive.require().extent()  # noqa: SLF001
+        log.publish()
+        published = log._published.require().extent()  # noqa: SLF001
 
-        assert archived is not None, "the archive holds nothing to outrun with"
-        ahead = archived[1]
+        assert published is not None, "the published table holds nothing to outrun with"
+        ahead = published[1]
 
     assert ahead > stalled_at + RESTORE_RESERVE, (
-        "the archive did not outrun the snapshot by more than the fence, "
+        "the published table did not outrun the snapshot by more than the fence, "
         "so the case is not set up"
     )
 
-    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3=s3) as revived:
         report = revived.recovery()
 
         assert report is not None, "a restored log must carry its report"
         assert revived.end_offset() > ahead, (
-            f"resumed at {revived.end_offset()} while the archive holds "
-            f"through {ahead}: the next append reuses an archived offset"
+            f"resumed at {revived.end_offset()} while the published table holds "
+            f"through {ahead}: the next append reuses a published offset"
         )
         # A WHOLE fence above the frontier, not one offset past it. The
-        # archive is a lower bound on what the primary issued — rows it
-        # acknowledged and never got to sync are above it, and their offsets
+        # published table is a lower bound on what the primary issued — rows it
+        # acknowledged and never got to publish are above it, and their offsets
         # must not be reissued either. That is the same reason the reserve
         # exists over the replica's own sequence.
         assert report.resumed_at > ahead + RESTORE_RESERVE
         # The inverted range was the symptom, and it is an invariant now.
-        assert report.skipped[0] <= report.skipped[1] + 1, (
+        assert report.skipped[0] <= report.skipped[1], (
             f"skipped range is inverted: {report.skipped}"
         )
 
         issued = revived.extend(rows(5))
 
-        assert min(issued) > ahead, f"reissued archived offsets: {issued}"
+        assert min(issued) > ahead, f"reissued published offsets: {issued}"
 
 
 def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
@@ -3114,12 +3141,12 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
         log.extend(rows(300))
         served = log.end_offset() - 1
 
@@ -3140,7 +3167,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     monkeypatch.setattr(Buffer, "strip_local_state", die)
 
     with pytest.raises(RuntimeError, match="interrupted"):
-        litelink.restore(second, "s", archive=where, s3=s3)
+        litelink.restore(second, "s", published=where, s3=s3)
 
     monkeypatch.undo()
 
@@ -3151,7 +3178,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
         litelink.open(second, "s", s3=s3)
 
     # And the half state is resumable rather than a dead end.
-    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3=s3) as revived:
         resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
 
         assert resumed > served, (
@@ -3170,8 +3197,8 @@ def test_a_failed_restore_never_leaves_an_openable_root(
     earlier ordering put it second and claimed no such state existed; it had
     one, one write later, and the measured consequence was worse than the
     offset reuse that ordering was fixing: the open group still at the
-    replica's stale frontier, the first seal straddling the archive's extent,
-    and 712 archived offsets vanishing from every full `scan()`
+    replica's stale frontier, the first seal straddling the published table's extent,
+    and 712 published offsets vanishing from every full `scan()`
     with no error anywhere.
 
     So the property, rather than any one window: if `restore` raises, nothing
@@ -3187,12 +3214,12 @@ def test_a_failed_restore_never_leaves_an_openable_root(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
 
     def die(*args: object, **kwargs: object) -> object:
         msg = "a bad minute in object storage"
@@ -3206,7 +3233,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
     for attempt, (target, method) in enumerate(
         [
             (Buffer, "strip_local_state"),
-            (Archive, "table"),
+            (Published, "table"),
             (Buffer, "reseed_group"),
             (LogTable, "set_sort_order"),
         ]
@@ -3223,7 +3250,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
             patched.setattr(target, method, die)
 
             with pytest.raises(RuntimeError, match="bad minute"):
-                litelink.restore(root, "s", archive=where, s3=s3)
+                litelink.restore(root, "s", published=where, s3=s3)
 
         # The root is not a log. Whatever failed, nothing here can be opened
         # and handed offsets, because the table that would make it openable is
@@ -3235,7 +3262,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
             litelink.open(root, "s", s3=s3)
 
         # And it is resumable rather than a dead end.
-        with litelink.restore(root, "s", archive=where, s3=s3) as revived:
+        with litelink.restore(root, "s", published=where, s3=s3) as revived:
             assert revived.scan().read_all().num_rows > 0
 
 
@@ -3267,12 +3294,12 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
         wal_replication=True,
     )
     with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(1200))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
         readable = log.scan().read_all().num_rows
         replication = log.write_replication_config()
 
@@ -3298,7 +3325,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     Layout(tmp_path, "s").buffer_db.unlink()
 
     with pytest.raises(Exception, match="already exists"):
-        litelink.restore(tmp_path, "s", archive=where, s3=s3, binary=str(binary))
+        litelink.restore(tmp_path, "s", published=where, s3=s3, binary=str(binary))
 
     # The row survives, so the local files are still referenced and the log
     # still reads. Before this, `WriteHandle.open` answered "use new() to create one".
@@ -3310,15 +3337,15 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
 def test_moving_back_to_the_local_default_keeps_every_row(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """`set_archive(None)` re-points to the local default (#98), and I4 holds
-    across the move: the local archive holds nothing yet, so nothing may leave
-    the local table until a `sync` publishes it there.
+    """`set_published(None)` re-points to the local default (#98), and I4 holds
+    across the move: the local published table holds nothing yet, so nothing may leave
+    the staging table until a `publish` publishes it there.
 
     It used to detach, which retired the clamp: measured before the refusal
     that guarded it, 4,025 acknowledged offsets unreadable after one pass.
     There is no detached state now, so there is no clamp to retire.
 
-    Falsify by skipping the archive clamp in `Maintenance.evict`: the files
+    Falsify by skipping the published table clamp in `Maintenance.evict`: the files
     below the floor are deleted unpublished.
     """
     where = f"s3://{bucket}/back-home"
@@ -3326,45 +3353,45 @@ def test_moving_back_to_the_local_default_keeps_every_row(
         LogConfig(),
         target_seal_size=8 * 1024,
         compact_min_files=2,
-        local_rows=0,
+        staging_rows=0,
     )
     with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, archive=where, s3=s3
+        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
         log.seal_due()
         readable = log.scan().read_all().num_rows
 
-        log.set_archive(None)
-        assert log.archive == Layout(tmp_path, "s").default_archive
+        log.set_published(None)
+        assert log.published == Layout(tmp_path, "s").default_published
 
         log.maintain()
         assert log.scan().read_all().num_rows == readable
 
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log.maintain()
-        assert log.table_rows() == 0, "published, so eviction may proceed"
+        assert log.staging_rows() == 0, "published, so eviction may proceed"
         assert log.scan().read_all().num_rows == readable
 
 
-def test_every_empty_archive_spelling_means_the_local_default(
+def test_every_empty_published_table_spelling_means_the_local_default(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """`set_archive("")` must land where `None` does, guards and all.
+    """`set_published("")` must land where `None` does, guards and all.
 
     Normalising `"" -> None` once happened after the guards, so an empty
     string slipped past them to a detach — 7,828 acknowledged rows lost. The
-    plausible route is not a literal but `os.environ.get("ARCHIVE", "")`.
+    plausible route is not a literal but `os.environ.get("PUBLISHED", "")`.
     """
     config = replace(
-        LogConfig(), target_seal_size=8 * 1024, compact_min_files=2, local_rows=100
+        LogConfig(), target_seal_size=8 * 1024, compact_min_files=2, staging_rows=100
     )
     with litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         config=config,
-        archive=f"s3://{bucket}/empty-string",
+        published=f"s3://{bucket}/empty-string",
         s3=s3,
     ) as log:
         log.extend(rows(600))
@@ -3372,20 +3399,20 @@ def test_every_empty_archive_spelling_means_the_local_default(
         readable = log.scan().read_all().num_rows
 
         for spelling in ("", "/", "///"):
-            log.set_archive(spelling)
-            assert log.archive == Layout(tmp_path, "s").default_archive
+            log.set_published(spelling)
+            assert log.published == Layout(tmp_path, "s").default_published
 
         log.maintain()
 
         assert log.scan().read_all().num_rows == readable
 
 
-def test_creating_a_log_with_an_empty_archive_publishes_locally(
+def test_creating_a_log_with_an_empty_published_table_publishes_locally(
     tmp_path: Path,
 ) -> None:
-    """`litelink.new(archive="")` is `archive=None`: the local default."""
-    with litelink.new(tmp_path, "s", schema=SCHEMA, archive="") as log:
-        assert log.archive == Layout(tmp_path, "s").default_archive
+    """`litelink.new(published="")` is `published=None`: the local default."""
+    with litelink.new(tmp_path, "s", schema=SCHEMA, published="") as log:
+        assert log.published == Layout(tmp_path, "s").default_published
 
 
 @pytest.mark.slow
@@ -3399,12 +3426,12 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
     honestly claim. A writer is asked where its next row will land, and only
     `sqlite_sequence` knows that — it is the thing that assigns it.
 
-    The two coincide on a healthy log and diverge exactly where the local
-    table is empty while the archive holds rows. `restore` is that state by
+    The two coincide on a healthy log and diverge exactly where the staging
+    table is empty while the published table holds rows. `restore` is that state by
     construction: the fence burns `RESTORE_RESERVE` offsets, so the sequence
-    sits 2**20 above the archive's frontier while the rebuilt table is empty.
+    sits 2**20 above the published table's frontier while the rebuilt table is empty.
 
-    Inheriting the reader's answer reported the ARCHIVE's frontier there. A
+    Inheriting the reader's answer reported the PUBLISHED table's frontier there. A
     caller reading `end_offset()` as "what comes next" — which is what its
     docstring and §4's half-open seal ranges promise — would land inside the
     fence that I9 exists to hold.
@@ -3414,11 +3441,11 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
     """
     where = f"s3://{bucket}/prefix"
     second = tmp_path / "second"
-    with archived_log(tmp_path / "first", bucket, s3) as log:
+    with published_log(tmp_path / "first", bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal_due()
         log.maintain()
-        log.sync()
+        log.publish()
 
         # Stand the second box up from a copy of the buffer, the way the
         # failover tests beside this one do — `restore` needs a replica and
@@ -3430,9 +3457,9 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
         source.close()
         copy.close()
 
-    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
-        assert revived.table_extent() is None, (
-            "a restore rebuilds the local table empty — that is the state where "
+    with litelink.restore(second, "s", published=where, s3=s3) as revived:
+        assert revived.staging_extent() is None, (
+            "a restore rebuilds the staging table empty — that is the state where "
             "the two questions diverge"
         )
 
@@ -3447,8 +3474,8 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
         # A READER on the same log answers the other question, correctly —
         # checked BEFORE the append below, which would close the gap by
         # putting a row at the sequence.
-        # Restored from a replica, so the local table is empty and the rows
-        # are in the archive — a view that reads it is the only one that can
+        # Restored from a replica, so the staging table is empty and the rows
+        # are in the published table — a view that reads it is the only one that can
         # answer "what can I serve".
         with litelink.open(second, "s", read_only=True, s3=s3) as view:
             served = view.scan().read_all().column(OFFSET).to_pylist()
@@ -3470,22 +3497,22 @@ def test_buffered_rows_sees_another_process_seal(
     """The §7 boundary has to be re-read, or the two tiers double-count.
 
     A seal LEAVES its rows in the buffer when `wal_replication` is on — the
-    buffer is the off-box copy until the archive has the range (§3a) — so
+    buffer is the off-box copy until the published table has the range (§3a) — so
     `buffered_rows` cannot ask the buffer how many rows it holds. It counts
-    above the local table's frontier instead.
+    above the staging table's frontier instead.
 
     That frontier moves when ANOTHER process seals, and `LogTable.extent`
     resolves nothing: it compares against this handle's in-memory
     `metadata_location`. Read directly, it pins the boundary to whatever
     snapshot was last loaded, and every row the other process has sealed still
-    counts as unsealed — so `table_rows() + buffered_rows()` counts that band
+    counts as unsealed — so `staging_rows() + buffered_rows()` counts that band
     twice, against I3's guarantee that each row crosses the boundary exactly
     once.
 
     This is the documented two-role topology: RUNTIME.md has the writer append
     while the maintainer seals.
 
-    Falsify by reading `self._table.extent()` instead of `self.table_extent()`
+    Falsify by reading `self._table.extent()` instead of `self.staging_extent()`
     in `buffered_rows`: the reader reports 20 buffered and 20 in the table for
     a log holding 20.
     """
@@ -3502,7 +3529,7 @@ def test_buffered_rows_sees_another_process_seal(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=where,
+        published=where,
         s3=s3,
     ) as writer:
         writer.extend(rows(20))
@@ -3511,23 +3538,23 @@ def test_buffered_rows_sees_another_process_seal(
             # Warm the reader's view BEFORE the seal, so its cached pointer is
             # the stale one.
             assert reader.buffered_rows() == 20
-            assert reader.table_rows() == 0
+            assert reader.staging_rows() == 0
 
             writer.seal_due()
 
             # `buffered_rows` FIRST, before anything else reloads. That order
-            # is the whole test: `table_rows()` resolves the catalog, so
+            # is the whole test: `staging_rows()` resolves the catalog, so
             # calling it first repairs the stale pointer and hides this.
             # `examples/adsb/tail.py` only reads the right number because it
-            # happens to evaluate `table_rows()` earlier in the same tuple.
+            # happens to evaluate `staging_rows()` earlier in the same tuple.
             buffered = reader.buffered_rows()
             assert buffered == 0, (
                 f"the reader counted {buffered} rows as unsealed after another "
                 f"process sealed them"
             )
 
-            assert reader.table_rows() == 20, "the fixture must seal"
-            assert reader.table_rows() + reader.buffered_rows() == 20, (
+            assert reader.staging_rows() == 20, "the fixture must seal"
+            assert reader.staging_rows() + reader.buffered_rows() == 20, (
                 "the tiers must not double-count across the §7 boundary"
             )
 
@@ -3537,25 +3564,25 @@ def test_buffered_rows_sees_another_process_seal(
 
 
 @pytest.mark.slow
-def test_a_handle_that_read_an_empty_archive_still_sees_it_fill(
+def test_a_handle_that_read_an_empty_published_table_still_sees_it_fill(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """Handle lifetime, which is where the last two criticals both lived.
 
-    `Archive.table` returns its cached handle while the URI matches, and
+    `Published.table` returns its cached handle while the URI matches, and
     `LogTable.extent` short-circuits on an unchanged `metadata_location`. So a
-    handle that first touches the archive while the table EXISTS BUT IS EMPTY
-    pins the answer "no extent" — and `_archive_required` then derives that the
-    archive is not load-bearing, for the rest of that handle's life.
+    handle that first touches the published table while the table EXISTS BUT IS EMPTY
+    pins the answer "no extent" — and `_published_required` then derives that the
+    published table is not load-bearing, for the rest of that handle's life.
 
-    The empty-but-existing archive is ordinary, not a corner: `sync` creates
+    The empty-but-existing published table is ordinary, not a corner: `publish` creates
     the table on a maintenance tick before anything is sealed, and
-    `set_archive` creates one at a new prefix. One early call is enough to pin
+    `set_published` creates one at a new prefix. One early call is enough to pin
     it — a `scan`, an `end_offset`, even a bare metadata poll of the kind
     `examples/adsb/tail.py` makes on its first tick.
 
     Measured before the fix, on the documented two-role topology: after the
-    maintainer sealed, synced and evicted 20 rows, a reader that had scanned
+    maintainer sealed, published and evicted 20 rows, a reader that had scanned
     once beforehand returned **0 of 20, indefinitely**, while `coverage()` on
     the same handle reported it gap-free. `coverage` resolves, so touching it
     repaired the pointer by accident; a scan-only loop never healed.
@@ -3563,8 +3590,8 @@ def test_a_handle_that_read_an_empty_archive_still_sees_it_fill(
     Every other test opens a fresh handle after the eviction, which is why
     nine review rounds did not reach this.
 
-    Falsify by reading `self._archive.table(repair=False).extent()` in
-    `_archive_required` instead of `self._archive_extent()`.
+    Falsify by reading `self._published.table(repair=False).extent()` in
+    `_published_required` instead of `self._published_extent()`.
     """
     where = f"s3://{bucket}/prefix"
     config = replace(
@@ -3572,7 +3599,7 @@ def test_a_handle_that_read_an_empty_archive_still_sees_it_fill(
         target_seal_size=64 * 1024,
         target_compact_size=64 * 1024,
         compact_min_files=2,
-        local_retention=timedelta(0),
+        staging_retention=timedelta(0),
         snapshot_retention=timedelta(seconds=0),
     )
     with litelink.new(
@@ -3581,33 +3608,33 @@ def test_a_handle_that_read_an_empty_archive_still_sees_it_fill(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=where,
+        published=where,
         s3=s3,
     ) as writer:
         # A maintenance tick BEFORE anything is sealed: this creates the
-        # archive table, empty. That is the state that used to poison a handle.
-        writer.sync()
+        # published table, empty. That is the state that used to poison a handle.
+        writer.publish()
 
         with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
             assert reader.scan().read_all().num_rows == 0
             assert reader.end_offset() >= 1
 
-            # Now the log fills, is archived, and is evicted dry — the rows
-            # exist only in the archive.
+            # Now the log fills, is published, and is evicted dry — the rows
+            # exist only in the published table.
             writer.extend(rows(ROWS))
             writer.seal_due()
-            writer.sync()
+            writer.publish()
             writer.maintain()
-            assert writer.table_extent() is None, "the fixture must evict dry"
+            assert writer.staging_extent() is None, "the fixture must evict dry"
 
-            # The SAME handle, which read the archive while it was empty.
+            # The SAME handle, which read the published table while it was empty.
             served = reader.scan().read_all().column(OFFSET).to_pylist()
             assert sorted(served) == list(range(1, ROWS + 1)), (
-                f"a handle that read the archive while it was empty served "
+                f"a handle that read the published table while it was empty served "
                 f"{len(served)} of {ROWS} rows afterwards"
             )
 
-            # And the writer's own, through a view that reads the archive.
+            # And the writer's own, through a view that reads the published table.
             assert writer.scan().read_all().num_rows == ROWS
 
 
@@ -3617,25 +3644,25 @@ def test_an_evicted_log_still_serves_every_row(
 ) -> None:
     """A default read must not go short because eviction emptied the table.
 
-    Eviction moves files out of the local table once the archive holds them
+    Eviction moves files out of the staging table once the published table holds them
     (I4). A log evicted dry therefore has its rows in exactly one place, and a
-    read that skips the archive returns the unsealed buffer alone — measured
+    read that skips the published table returns the unsealed buffer alone — measured
     before this was fixed, 476 of 1,500 rows, with no error at all.
 
-    With nothing local, every archived file is below the local table, so any
-    read that could match one reads the archive.
+    With nothing local, every published file is below the staging table, so any
+    read that could match one reads the published table.
 
     Falsify by returning `(True, False)` from `Reader._tiers`: the row count
     drops to the buffer's share with no error at all.
     """
-    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         log.maintain()
 
-        assert log.table_extent() is None, "the fixture must evict the tier dry"
-        assert log.archived_through() > 0
+        assert log.staging_extent() is None, "the fixture must evict the tier dry"
+        assert log.published_through() > 0
 
         served = log.scan().read_all().column(OFFSET).to_pylist()
         assert sorted(served) == list(range(1, ROWS + 1)), (
@@ -3653,47 +3680,47 @@ def test_an_evicted_log_serves_everything_across_a_re_point(
 ) -> None:
     """Detach and re-attach must not make an evicted log read short.
 
-    `_repoint` zeroes `archive_through` when the location moves, deliberately:
+    `_repoint` zeroes `published_through` when the location moves, deliberately:
     a maintainer re-asserting a stale location must not claim the new bucket
     already holds rows. A detach-and-reattach is two moves, so a log returning
-    to the archive it just left carries watermark 0 while the bucket still
-    holds every row — and `set_archive`'s own docstring promises "Pointing BACK
+    to the published table it just left carries watermark 0 while the bucket still
+    holds every row — and `set_published`'s own docstring promises "Pointing BACK
     undoes that".
 
-    **So the watermark cannot stand in for "the archive holds rows".** Deriving
+    **So the watermark cannot stand in for "the published table holds rows".** Deriving
     it that way sent an evicted-dry log back to serving its buffer alone:
     measured, 550 of 4,000 rows with no error, `litelink.open(, read_only=True)` agreeing,
     and `coverage()` reporting `gap=None` over the missing 3,450. The window
-    closes only at the next `sync()`, which is why the existing detach test
+    closes only at the next `publish()`, which is why the existing detach test
     passes — it reads after one.
 
-    The archive is asked directly now.
+    The published table is asked directly now.
 
-    Falsify by keying `_archive_required` on `archived_through() > 0`: this
+    Falsify by keying `_published_required` on `published_through() > 0`: this
     fails while every other reader test still passes.
     """
-    with archived_log(tmp_path, bucket, s3, local_retention=timedelta(0)) as log:
-        where = log.archive
+    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
+        where = log.published
         log.extend(rows(ROWS))
         log.seal_due()
-        log.sync()
+        log.publish()
         log.maintain()
 
-        assert log.table_extent() is None, "the fixture must evict the tier dry"
+        assert log.staging_extent() is None, "the fixture must evict the tier dry"
         assert log.scan().read_all().num_rows == ROWS
 
         # The floor comes off first, which detaching requires: an evict-on-upload
-        # policy presupposes an archive to upload to.
-        log.set_config(replace(log.config, local_retention=None, local_rows=None))
-        log.set_archive(None)
-        log.set_archive(where)
-        assert log.archived_through() == 0, (
+        # policy presupposes a published table to upload to.
+        log.set_config(replace(log.config, staging_retention=None, staging_rows=None))
+        log.set_published(None)
+        log.set_published(where)
+        assert log.published_through() == 0, (
             "the fixture must reproduce the zeroed watermark a re-point leaves"
         )
 
         served = log.scan().read_all().column(OFFSET).to_pylist()
         assert sorted(served) == list(range(1, ROWS + 1)), (
-            f"served {len(served)} of {ROWS} after a re-point, before any sync"
+            f"served {len(served)} of {ROWS} after a re-point, before any publish"
         )
 
         # And a separate reader process agrees, opened the same way.
@@ -3705,7 +3732,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
     """Every handle is on the primary, and the surface is pinned to API.md.
 
     `snapshot` and `RemoteReadHandle` are gone (#90): reading a log from another
-    machine is any Iceberg engine over its archive, not a litelink handle. The
+    machine is any Iceberg engine over its published table, not a litelink handle. The
     remaining hierarchy only ADDS, and each class's members are exactly the
     table `docs/API.md` prints — a member added without updating it makes the
     documented surface a lie, which this catches.
@@ -3724,7 +3751,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
     # The one deliberate override: a writer is asked where its next append
     # lands, from `sqlite_sequence`, which only a writer can know. Inheriting
     # the reader's "past the last row I can serve" made a restored log report
-    # the archive's frontier while its next append took an offset
+    # the published table's frontier while its next append took an offset
     # RESTORE_RESERVE higher, inside the fence I9 exists to hold.
     assert WriteHandle.end_offset is not LogHandle.end_offset
     assert litelink.LocalReadHandle.end_offset is LogHandle.end_offset, (
@@ -3736,7 +3763,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
     assert issubclass(litelink.LocalReadHandle, LogHandle)
 
     # The write surface is not merely refused, it is absent.
-    for absent in ("append", "extend", "seal", "sync", "maintain", "set_config"):
+    for absent in ("append", "extend", "seal", "publish", "maintain", "set_config"):
         assert not hasattr(LogHandle, absent), f"LogHandle exposes {absent}"
 
     assert {n for n in vars(LogHandle) if not n.startswith("_")} == {
@@ -3747,11 +3774,11 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         "coverage",
         "end_offset",
         "buffered_rows",
-        "table_rows",
-        "table_files",
-        "table_extent",
-        "archived_through",
-        "archive_files",
+        "staging_rows",
+        "staging_files",
+        "staging_extent",
+        "published_through",
+        "published_files",
         "column_statistics",
         # identity
         "root",
@@ -3759,7 +3786,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         "config",
         "sort_by",
         "schema",
-        "archive",
+        "published",
         # lifecycle
         "close",
     }
@@ -3778,45 +3805,47 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         "layout",
         "table",
         "buffer",
-        "archive",
+        "published",
         "reader",
     }
 
 
-def test_a_log_whose_stored_archive_is_malformed_can_still_be_repaired(
+def test_a_log_whose_stored_published_table_is_malformed_can_still_be_repaired(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The escape hatch the new shape check must not close.
 
     `validate` refuses a malformed prefix, and `set_config` and `set_sort_by`
     pass the STORED one — so a log written before that rule existed would meet
-    it on a call that has nothing to do with the archive. That is acceptable
+    it on a call that has nothing to do with the published table. That is acceptable
     only while the repair is reachable, which is why `open` deliberately does
-    not validate: it takes no archive argument, and refusing to open the log
-    would remove the `set_archive` that fixes it.
+    not validate: it takes no published table argument, and refusing to open the log
+    would remove the `set_published` that fixes it.
 
-    Falsify by calling `validate_archive` from `open` as well: the log cannot
+    Falsify by calling `validate_published` from `open` as well: the log cannot
     be opened, and there is no supported way to correct the prefix.
     """
     where = f"s3://{bucket}/repairable"
-    with litelink.new(tmp_path, "s", schema=SCHEMA, archive=where, s3=s3) as log:
+    with litelink.new(tmp_path, "s", schema=SCHEMA, published=where, s3=s3) as log:
         log.extend(rows(1))
 
     # The state the rule is retroactive about, forged directly: a stored prefix
     # that `new` would refuse today.
     with sqlite3.connect(tmp_path / "s" / "buffer.db") as con:
         con.execute(
-            "UPDATE meta SET v = ? WHERE k = ?", ("s3:/bucket/bad", ARCHIVE_KEY)
+            "UPDATE meta SET v = ? WHERE k = ?", ("s3:/bucket/bad", PUBLISHED_KEY)
         )
 
     with litelink.open(tmp_path, "s", s3=s3) as log:
-        assert log.archive == "s3:/bucket/bad", "open refused a malformed stored prefix"
+        assert log.published == "s3:/bucket/bad", (
+            "open refused a malformed stored prefix"
+        )
 
         with pytest.raises(ValueError, match="missing a slash"):
             log.set_config(LogConfig())
 
-        log.set_archive(where)
-        assert log.archive == where
+        log.set_published(where)
+        assert log.published == where
 
         # And the setter that was blocked works again, which is what makes the
         # repair a repair rather than a way to keep going around the rule.
@@ -3839,68 +3868,72 @@ def _clone_buffer(source: Path, target: Path) -> None:
         src.close()
 
 
-def test_restore_refuses_a_buffer_bound_to_another_archive(
+def test_restore_refuses_a_buffer_bound_to_another_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """`archive=` says where the replica came from; `meta` says which log it is.
+    """`published=` says where the replica came from; `meta` says which log it is.
 
     They agree on the ordinary path by construction, so the divergence only
     appears when the buffer arrives some other way — and hand-placing one is
     the documented recovery for a log whose WAL was never replicated. Left
     unchecked the mismatch is silent: the handle comes back attached to the
-    buffer's archive, reporting ITS frontier, while the rows under the archive
+    buffer's published table, reporting ITS frontier, while the rows under the published table
     the caller actually named are invisible.
 
     Both harms are asserted, because the second is the one an operator would
     never think to look for: adoption runs `table(repair=True)`, which with no
     published hint takes the CREATE branch and writes a fresh `metadata.json`
     and `version-hint.text` into the OTHER bucket. A restore that refuses must
-    leave that archive untouched.
+    leave that published table untouched.
     """
     held = f"s3://{bucket}/held"
     other = f"s3://{bucket}/other"
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
 
-    # The archive the caller means, with rows actually in it.
+    # The published table the caller means, with rows actually in it.
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=held, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=held, s3=s3
     ) as log:
         log.extend(rows(800))
         log.seal_due()
         log.maintain()
-        log.sync()
-        seeded = log.archived_through()
+        log.publish()
+        seeded = log.published_through()
 
-    assert seeded > 0, "the archive was never published, so the case is not set up"
+    assert seeded > 0, (
+        "the published table was never published, so the case is not set up"
+    )
 
-    # A different log, bound to a different archive, whose buffer is the donor.
+    # A different log, bound to a different published table, whose buffer is the donor.
     donor = tmp_path / "donor"
-    litelink.new(donor, "s", schema=SCHEMA, config=config, archive=other, s3=s3).close()
+    litelink.new(
+        donor, "s", schema=SCHEMA, config=config, published=other, s3=s3
+    ).close()
 
     revived = tmp_path / "revived"
     (revived / "s").mkdir(parents=True)
     _clone_buffer(Layout(donor, "s").buffer_db, Layout(revived, "s").buffer_db)
 
-    with pytest.raises(ValueError, match="records archive=") as caught:
-        litelink.restore(revived, "s", archive=held, s3=s3)
+    with pytest.raises(ValueError, match="records published=") as caught:
+        litelink.restore(revived, "s", published=held, s3=s3)
 
     # Both prefixes named: which one it found, and which one was asked for.
     assert other in str(caught.value)
     assert held in str(caught.value)
 
-    # And the archive it would have misbound to is untouched -- no lineage
+    # And the published table it would have misbound to is untouched -- no lineage
     # published into a bucket this call never had any business writing.
     fs = filesystem(s3)
     assert not fs.exists(f"{bucket}/other/s/metadata/version-hint.text"), (
-        "a refused restore still published a table into the buffer's archive"
+        "a refused restore still published a table into the buffer's published table"
     )
 
 
-def test_restore_accepts_the_same_archive_written_with_a_trailing_slash(
+def test_restore_accepts_the_same_published_table_written_with_a_trailing_slash(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """`s3://b/p/` and `s3://b/p` name one archive, and must not read as two.
+    """`s3://b/p/` and `s3://b/p` name one published table, and must not read as two.
 
     The conflict check compares the argument against what `meta` recorded, and
     a prefix is an ordinary string a caller types — so without normalising the
@@ -3912,23 +3945,25 @@ def test_restore_accepts_the_same_archive_written_with_a_trailing_slash(
 
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, archive=held, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=held, s3=s3
     ) as log:
         log.extend(rows(800))
         log.seal_due()
         log.maintain()
-        log.sync()
-        seeded = log.archived_through()
+        log.publish()
+        seeded = log.published_through()
 
-    assert seeded > 0, "the archive was never published, so the case is not set up"
+    assert seeded > 0, (
+        "the published table was never published, so the case is not set up"
+    )
 
     revived = tmp_path / "revived"
     (revived / "s").mkdir(parents=True)
     _clone_buffer(Layout(primary, "s").buffer_db, Layout(revived, "s").buffer_db)
 
-    # The SAME archive, one trailing slash different. This must attach.
-    with litelink.restore(revived, "s", archive=held + "/", s3=s3) as revived_log:
-        assert revived_log.archived_through() == seeded
+    # The SAME published table, one trailing slash different. This must attach.
+    with litelink.restore(revived, "s", published=held + "/", s3=s3) as revived_log:
+        assert revived_log.published_through() == seeded
         assert revived_log.scan().read_all().num_rows > 0
 
 
@@ -3945,14 +3980,14 @@ def test_restore_refuses_a_buffer_from_a_local_only_log(
     no table was created, which is the difference the guard buys.
     """
     donor = tmp_path / "donor"
-    litelink.new(donor, "s", schema=SCHEMA, archive=None).close()
+    litelink.new(donor, "s", schema=SCHEMA, published=None).close()
 
     revived = tmp_path / "revived"
     (revived / "s").mkdir(parents=True)
     _clone_buffer(Layout(donor, "s").buffer_db, Layout(revived, "s").buffer_db)
 
-    with pytest.raises(ValueError, match="records archive='file://") as caught:
-        litelink.restore(revived, "s", archive=f"s3://{bucket}/nowhere", s3=s3)
+    with pytest.raises(ValueError, match="records published='file://") as caught:
+        litelink.restore(revived, "s", published=f"s3://{bucket}/nowhere", s3=s3)
 
     assert f"s3://{bucket}/nowhere" in str(caught.value)
     # The commit point was never reached, so a corrected call can still run.
@@ -3961,14 +3996,14 @@ def test_restore_refuses_a_buffer_from_a_local_only_log(
     )
 
 
-def test_an_otel_log_reads_back_exactly_from_the_archive(
+def test_an_otel_log_reads_back_exactly_from_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Binary and nested columns through sync, the archive leg, and plain DuckDB.
+    """Binary and nested columns through publish, the published leg, and plain DuckDB.
 
     Read on the primary with the local copy evicted, so every row comes back
-    through `iceberg_scan` over the archive — where a fixed width or a nested
-    type would come back reshaped if anything on the way lost it. And the archive is read by engines with no litelink at
+    through `iceberg_scan` over the published table — where a fixed width or a nested
+    type would come back reshaped if anything on the way lost it. And the published table is read by engines with no litelink at
     all, which is where the map has to be addressable as a map (#79).
     """
     from tests.test_types import OTEL, otel_row
@@ -3978,21 +4013,27 @@ def test_an_otel_log_reads_back_exactly_from_the_archive(
     config = LogConfig(
         target_seal_rows=10,
         compact_min_files=2,
-        local_retention=timedelta(0),
+        staging_retention=timedelta(0),
     )
     with litelink.new(
-        tmp_path, "s", schema=OTEL, sort_by=("ts",), config=config, archive=where, s3=s3
+        tmp_path,
+        "s",
+        schema=OTEL,
+        sort_by=("ts",),
+        config=config,
+        published=where,
+        s3=s3,
     ) as log:
         log.extend(rows)
         log.seal()
         log.maintain()
-        log.sync(push_unsettled=True)
-        assert log.archived_through() == 40
-        log.maintain()  # evicts the local copy, so the read below is the archive leg
+        log.publish(push_unsettled=True)
+        assert log.published_through() == 40
+        log.maintain()  # evicts the local copy, so the read below is the published leg
 
     expected = pa.Table.from_pylist(rows, schema=OTEL).to_pylist()
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
-        assert view.table_rows() == 0, "the local copy must be evicted"
+        assert view.staging_rows() == 0, "the local copy must be evicted"
         assert view.schema == OTEL
         assert view.scan().read_all().drop([OFFSET]).to_pylist() == expected
 
@@ -4010,33 +4051,33 @@ def test_the_statistics_tiers_partition_the_log(
 ) -> None:
     """Each row in exactly one tier, and the three together are the whole log.
 
-    `"archive"` is what eviction moved below the local table, not the
-    archive's copy of the local window, which `"local"` already counts; the
+    `"published"` is what eviction moved below the staging table, not the
+    published table's copy of the staging window, which `"staging"` already counts; the
     buffer is what no file holds yet. Their counts add up to `tier=None` and to
     what a scan returns.
 
     With `wal_replication`, a seal keeps its rows in the buffer until the
-    archive has them, so the last batch here is in both the local table and
+    published table has them, so the last batch here is in both the staging table and
     the buffer — and must be counted once.
 
-    Falsify by rolling up every archive file for `"archive"` (dropping the
-    `below_local` split): its count is the whole archive. Or by counting the
+    Falsify by rolling up every published file for `"published"` (dropping the
+    `below_staging` split): its count is the whole published table. Or by counting the
     buffer without the ceiling: the held batch is counted twice. Either way the
     three tiers add up to more than the log.
     """
     tail = 37
     held = 23
-    with archived_log(
+    with published_log(
         tmp_path,
         bucket,
         s3,
-        local_retention=timedelta(0),
-        local_rows=1000,
+        staging_retention=timedelta(0),
+        staging_rows=1000,
         wal_replication=True,
     ) as log:
         log.extend(rows(ROWS))
         log.seal()
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log.maintain()
         log.extend(
             {"event_ts": ROWS + i, "key": "h", "payload": "y"} for i in range(held)
@@ -4048,29 +4089,29 @@ def test_the_statistics_tiers_partition_the_log(
             for i in range(tail)
         )
 
-        local = log.column_statistics(tier="local")
-        archive = log.column_statistics(tier="archive")
+        local = log.column_statistics(tier="staging")
+        published = log.column_statistics(tier="published")
         buffered = log.column_statistics(tier="buffer")
         whole = log.column_statistics()
-        extent = log.table_extent()
+        extent = log.staging_extent()
         assert extent is not None
 
         assert local.record_count is not None
         assert 0 < local.record_count < ROWS, "the fixture must evict part of it"
-        assert (local[OFFSET].min, local[OFFSET].max) == extent
+        assert (local[OFFSET].min, local[OFFSET].max + 1) == extent
 
-        assert archive.tier == "archive"
-        assert (archive[OFFSET].min, archive[OFFSET].max) == (1, extent[0] - 1)
-        assert archive["event_ts"].max == extent[0] - 2
+        assert published.tier == "published"
+        assert (published[OFFSET].min, published[OFFSET].max) == (1, extent[0] - 1)
+        assert published["event_ts"].max == extent[0] - 2
 
         assert buffered.record_count == tail
         assert buffered[OFFSET].min == ROWS + held + 1
 
         everything = log.scan().read_all()
-        assert archive.record_count is not None
+        assert published.record_count is not None
         assert buffered.record_count is not None
         assert (
-            local.record_count + archive.record_count + buffered.record_count
+            local.record_count + published.record_count + buffered.record_count
             == whole.record_count
             == everything.num_rows
             == ROWS + held + tail
@@ -4087,13 +4128,13 @@ def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
     """With `wal_replication` a seal leaves its rows in the buffer, so the
     buffer and the files both hold them; the whole log counts each once.
     """
-    with archived_log(tmp_path, bucket, s3, wal_replication=True) as log:
+    with published_log(tmp_path, bucket, s3, wal_replication=True) as log:
         log.extend(rows(500))
         log.seal()
 
         assert log._buffer.count_above(0) == 500, "the fixture must keep sealed rows"
         assert log.buffered_rows() == 0
-        assert log.table_rows() == 500
+        assert log.staging_rows() == 500
 
         whole = log.column_statistics()
         assert whole.record_count == 500

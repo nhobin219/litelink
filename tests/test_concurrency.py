@@ -66,7 +66,7 @@ def test_one_log_survives_being_passed_around_a_thread_pool(tmp_path: Path) -> N
             counts = [f.result(timeout=60) for f in futures]
 
         assert log.seal_due() is not None, "nothing was queued by 500 appends"
-        assert log.table_rows() + log.buffered_rows() == 500
+        assert log.staging_rows() + log.buffered_rows() == 500
         assert max(c for c in counts if isinstance(c, int)) <= 500
 
 
@@ -144,7 +144,7 @@ def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
         log.extend(rows(200, start=200))
         log.scan().read_all()  # warm the view and the tail cache
 
-        assert log.table_rows() and log.buffered_rows(), "need both legs"
+        assert log.staging_rows() and log.buffered_rows(), "need both legs"
 
         buffer = log._buffer
         real = buffer.rows_above

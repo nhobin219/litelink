@@ -1,7 +1,7 @@
 """Durable append-only capture into Iceberg tables.
 
 See ``docs/SPEC.md``. All three tiers are implemented — the SQLite buffer, the
-local Iceberg table, and the archive on object storage — and a log survives
+staging table, and the published table on object storage — and a log survives
 losing its machine (``restore``). A log's schema is fixed when it is created;
 changing it means starting a new log (§9). Blob fields (§15) are specified and
 are not implemented.
@@ -15,15 +15,15 @@ of it. Every handle can read, and each subclass only adds:
 
     LogHandle                    identity, read, observe, close
     └── LocalReadHandle          + the replication config surface
-        └── WriteHandle          + append, seal, maintain, sync, ...
+        └── WriteHandle          + append, seal, maintain, publish, ...
 
 Nothing inherits a method it has to refuse. Annotate ``LogHandle`` when you do
 not care which you were given.
 
 **Every handle is on the primary**, the host that holds the log's directory.
 ``open`` wants a *root on this machine*, and ``read_only=`` picks the type it
-returns; it reads the buffer, the local table and the archive, and sees the
-writer's commits as they land. Another machine reads the archive with any
+returns; it reads the buffer, the staging table and the published table, and sees the
+writer's commits as they land. Another machine reads the published table with any
 Iceberg engine — it is plain Iceberg, published through ``version-hint.text``
 — rather than through litelink (#90).
 

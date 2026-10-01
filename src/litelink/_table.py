@@ -1,4 +1,4 @@
-"""The local Iceberg table, and the pyiceberg calls that reach it.
+"""The staging table, and the pyiceberg calls that reach it.
 
 Everything that knows pyiceberg's shape lives here, so the rest of the library
 deals in offsets, paths and extents. Several methods exist only because
@@ -97,22 +97,48 @@ class DataFile:
     hi: int
 
 
-# The catalog name the archive's `SqlCatalog` is built with, and the key its
-# rows are stored under. One constant so the reader below and the writer above
-# cannot disagree about which rows are ours.
-ARCHIVE_CATALOG = "archive"
-
-# The local catalog's name, spelled once. `exists_for` reads `iceberg_tables`
-# by it directly, so a literal here and a different one in `_catalog_for` would
-# make that read answer False for every table that exists.
-LOCAL_CATALOG = "local"
+# The catalog names each `SqlCatalog` is built with, and the key its rows are
+# stored under in `iceberg_tables`. Spelled once, so a raw read of that table
+# and the catalog cannot disagree about which rows are ours — and always through
+# `catalog_name`, which keeps a log written before #98 on the names it stored.
+PUBLISHED_CATALOG = "published"
+STAGING_CATALOG = "staging"
+_LEGACY_CATALOG = {PUBLISHED_CATALOG: "archive", STAGING_CATALOG: "local"}
 
 
-class ArchiveAbsent(LookupError):
-    """No archive table exists at the prefix yet.
+def catalog_name(database: Path, name: str) -> str:
+    """`name`, or its pre-#98 spelling if that is what `database` holds.
+
+    An old log's catalog keys its rows `archive` and `local`, and a catalog
+    built under another name sees none of them. Asked of the file rather than
+    renamed in it: the catalogs are replicated, and a sidecar mid-replication
+    is a poor moment to rewrite one.
+    """
+    legacy = _LEGACY_CATALOG[name]
+    if not database.exists():
+        return name
+
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT catalog_name FROM iceberg_tables"
+            ).fetchall()
+        }
+    except sqlite3.Error:
+        return name
+    finally:
+        connection.close()
+
+    return legacy if legacy in names and name not in names else name
+
+
+class PublishedAbsent(LookupError):
+    """No published table exists at the prefix yet.
 
     Distinct from a mismatch, because the two want opposite handling: absent is
-    the ordinary state of a log whose first sync has not run, and a reader
+    the ordinary state of a log whose first publish has not run, and a reader
     simply leaves that leg out of the union. A mismatch means the catalog names
     somewhere the log is not pointed, which no reader should quietly work
     around.
@@ -120,7 +146,7 @@ class ArchiveAbsent(LookupError):
 
 
 def _recorded_location(layout: Layout) -> str | None:
-    """Where the archive's catalog entry says its metadata is, without a read.
+    """Where the published table's catalog entry says its metadata is, without a read.
 
     Straight out of the catalog's own SQLite file, because the question — does
     this entry belong to the prefix being opened? — has to be answerable when
@@ -143,19 +169,19 @@ def _recorded_location(layout: Layout) -> str | None:
     caller falls back to loading, and pyiceberg answers for itself — slower and
     correct, instead of fast and destructive.
     """
-    if not layout.archive_db.exists():
+    if not layout.published_db.exists():
         return None
 
     namespace, _, name = layout.table_id.rpartition(".")
-    connection = sqlite3.connect(f"file:{layout.archive_db}?mode=ro", uri=True)
+    connection = sqlite3.connect(f"file:{layout.published_db}?mode=ro", uri=True)
     try:
         row = connection.execute(
             "SELECT metadata_location FROM iceberg_tables"
             " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
-            (ARCHIVE_CATALOG, namespace, name),
+            (catalog_name(layout.published_db, PUBLISHED_CATALOG), namespace, name),
         ).fetchone()
     except sqlite3.Error as exc:
-        msg = f"cannot read the archive catalog's own table: {exc}"
+        msg = f"cannot read the published catalog's own table: {exc}"
         raise LookupError(msg) from exc
     finally:
         connection.close()
@@ -163,13 +189,13 @@ def _recorded_location(layout: Layout) -> str | None:
     return None if row is None or row[0] is None else str(row[0])
 
 
-# Where an archive says which of its metadata JSONs is current, written beside
+# Where a published table says which of its metadata JSONs is current, written beside
 # them at every commit. `SqlCatalog` keeps that pointer in the catalog rather
-# than in the warehouse (§7), so without this the local `archive.db` is the
-# ONLY thing that names the archive's current metadata — and `open_archive`
+# than in the warehouse (§7), so without this the local `published.db` is the
+# ONLY thing that names the published table's current metadata — and `open_published`
 # says what that costs: a re-point drops the row, and "a drop that is not
 # followed by a create destroys the only record of where the PREVIOUS
-# archive's metadata is."
+# published table's metadata is."
 #
 # The name is the one DuckDB's iceberg extension looks for, so a reader can
 # scan the directory rather than being handed a pointer:
@@ -201,37 +227,37 @@ def _hint_for(metadata_location: str) -> tuple[str, str]:
 
 
 def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
-    """What the archive at `prefix` says its current metadata is, or None.
+    """What the published table at `prefix` says its current metadata is, or None.
 
-    Read from the bucket, which is the point: it answers for an archive this
+    Read from the bucket, which is the point: it answers for a published table this
     log has no catalog row for. The directory is reconstructed from the layout
     — `{prefix}/{name}/metadata` — rather than from a table handle, because
     there is no handle yet; that is the situation.
 
     It must be reconstructed the SAME way `create_table` is told to lay the
-    archive out. It once was not: this rebuilt pyiceberg's default
+    published table out. It once was not: this rebuilt pyiceberg's default
     `{prefix}/{namespace}/{name}/metadata` while the table location had been
     set explicitly to `{prefix}/{name}`, so `publish_pointer` — which derives
     its path from the live metadata location — wrote the hint to one place and
     this looked for it in another. Every write was correct and every read said
     ABSENT, which is the one answer that makes the caller create an empty table
-    over a live archive.
+    over a live published table.
 
     **None means ABSENT, never "could not tell".** An earlier version swallowed
     every failure into None, and the caller reads None as "nothing here yet,
     create one" — so one 503, one expired token, one throttled GET on this
     single object was indistinguishable from a virgin prefix, and the repair
-    built an empty table over a live archive. Then `publish_pointer`
+    built an empty table over a live published table. Then `publish_pointer`
     republished the hint onto the empty lineage, destroying the last pointer to
     the real one; after a re-point has dropped the catalog row, that hint is
     all there is. The sibling `load_table` branch refuses exactly this, in
     those words.
 
     So a read that fails RAISES. Callers that would rather carry on — the
-    `set_archive` guard, which must not fail closed on a bad minute in object
+    `set_published` guard, which must not fail closed on a bad minute in object
     storage — catch it themselves and say so.
     """
-    directory = f"{layout.archive_table_location(prefix)}/metadata"
+    directory = f"{layout.published_table_location(prefix)}/metadata"
     source = io.new_input(f"{directory}/{VERSION_HINT}")
     if not source.exists():
         return None
@@ -241,30 +267,30 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     return f"{directory}/{version}.metadata.json" if version else None
 
 
-def forget_archive_entry(layout: Layout) -> bool:
-    """Drop the archive's catalog row, so the next open must ADOPT.
+def forget_published_entry(layout: Layout) -> bool:
+    """Drop the published table's catalog row, so the next open must ADOPT.
 
-    For a restore: a row that survived onto this machine describes an archive
-    as it was when the replica was taken, and `open_archive` reads
+    For a restore: a row that survived onto this machine describes a published table
+    as it was when the replica was taken, and `open_published` reads
     `version-hint.text` only when there is no row. A stale row therefore wins
     over the bucket's own pointer, silently and in the losing direction.
 
     Returns whether a row was there. Touches the table `SqlCatalog` owns
     directly rather than through pyiceberg, because constructing a catalog to
     drop one row would create the catalog's own tables as a side effect — and
-    on a fresh restore there is no `archive.db` at all, which is the ordinary
+    on a fresh restore there is no `published.db` at all, which is the ordinary
     case and must stay a no-op.
     """
-    if not layout.archive_db.exists():
+    if not layout.published_db.exists():
         return False
 
     namespace, _, name = layout.table_id.rpartition(".")
-    connection = sqlite3.connect(layout.archive_db)
+    connection = sqlite3.connect(layout.published_db)
     try:
         cursor = connection.execute(
             "DELETE FROM iceberg_tables"
             " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
-            (ARCHIVE_CATALOG, namespace, name),
+            (catalog_name(layout.published_db, PUBLISHED_CATALOG), namespace, name),
         )
         connection.commit()
     except sqlite3.Error:
@@ -276,23 +302,23 @@ def forget_archive_entry(layout: Layout) -> bool:
     return bool(cursor.rowcount)
 
 
-def archive_extent(
+def published_extent(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[int, int] | None:
-    """`(lo, hi)` of the archive at `prefix`, read from the bucket alone.
+    """`(lo, hi)` of the published table at `prefix`, read from the bucket alone.
 
-    Answers "what does that archive hold" WITHOUT touching `archive.db`, which
+    Answers "what does that published table hold" WITHOUT touching `published.db`, which
     is what makes it usable as a pre-flight check. The catalog row is keyed by
-    table id, so while a log is pointed at one archive the row names that one —
-    `open_archive` on a different prefix therefore either raises on the boundary
+    table id, so while a log is pointed at one published table the row names that one —
+    `open_published` on a different prefix therefore either raises on the boundary
     check or, with `repair=True`, drops the row as a side effect of a read.
 
     Two objects instead: the published pointer, then the metadata it names.
-    `None` when the archive has no hint, which covers both "nothing has been
-    pushed there" and "it is not a litelink archive". A hint that cannot be
+    `None` when the published table has no hint, which covers both "nothing has been
+    pushed there" and "it is not a litelink published table". A hint that cannot be
     READ raises instead, because `_published_location` no longer conflates the
     two — the caller decides whether a bad minute in object storage is fatal,
-    and `_refuse_archive_ahead` treats it as "cannot tell" and passes.
+    and `_refuse_published_ahead` treats it as "cannot tell" and passes.
     """
     io = load_file_io(options.resolved().catalog_properties(), prefix)
     location = _published_location(io, layout, prefix)
@@ -304,18 +330,18 @@ def archive_extent(
     return LogTable(None, layout, table, prefix).extent()  # ty: ignore
 
 
-# The archive table property `retire()` sets: JSON `{"through": …, "at": …}`.
+# The published table property `retire()` sets: JSON `{"through": …, "at": …}`.
 RETIRED_PROPERTY = "litelink.retired"
 
 
-def archive_retired(
+def published_retired(
     layout: Layout, prefix: str, options: S3Options
 ) -> dict[str, object] | None:
-    """The retirement the archive at `prefix` records, read from the bucket alone.
+    """The retirement the published table at `prefix` records, read from the bucket alone.
 
-    Like `archive_extent`: the published pointer, then the metadata it names,
+    Like `published_extent`: the published pointer, then the metadata it names,
     with no catalog involved — so `restore` can ask before it builds anything.
-    None when the archive has no hint or records no retirement.
+    None when the published table has no hint or records no retirement.
     """
     io = load_file_io(options.resolved().catalog_properties(), prefix)
     location = _published_location(io, layout, prefix)
@@ -328,18 +354,18 @@ def archive_retired(
     return None if raw is None else json.loads(raw)
 
 
-def archive_columns(
+def published_columns(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[str, ...] | None:
-    """The column names of the archive at `prefix`, read from the bucket alone.
+    """The column names of the published table at `prefix`, read from the bucket alone.
 
-    The sibling of `archive_extent` and for the same reason: a pre-flight
-    check has to ask about an archive this log is not pointed at yet, and
-    `open_archive` on a different prefix either raises on the boundary check
+    The sibling of `published_extent` and for the same reason: a pre-flight
+    check has to ask about a published table this log is not pointed at yet, and
+    `open_published` on a different prefix either raises on the boundary check
     or drops a catalog row as a side effect.
 
-    `None` when the archive has no published hint, which covers both "nothing
-    has been pushed there" and "not a litelink archive" — neither of which the
+    `None` when the published table has no published hint, which covers both "nothing
+    has been pushed there" and "not a litelink published table" — neither of which the
     caller can conclude anything from.
     """
     io = load_file_io(options.resolved().catalog_properties(), prefix)
@@ -353,7 +379,7 @@ def archive_columns(
 
 
 class LogTable:
-    """The local Iceberg table for one log.
+    """The staging table for one log.
 
     Holds a pyiceberg `Table`, which is a snapshot-in-time view, and reloads it
     whenever the current state matters. §7 is explicit that a cached pointer
@@ -386,15 +412,15 @@ class LogTable:
         self._lock = threading.RLock()
         self._table = table
         # Where this table's files live. The local one derives it from the
-        # layout; the archive is told, because its prefix is the caller's.
+        # layout; the published table is told, because its prefix is the caller's.
         self._warehouse = warehouse or layout.warehouse_uri
         # Which of the two this is, and the only thing that turns on it: the
         # ARCHIVE publishes a pointer to its own metadata, because it is the
-        # one whose catalog can be lost or pointed away from. The local table's
+        # one whose catalog can be lost or pointed away from. The staging table's
         # catalog sits in the same directory as its warehouse — lose one and
         # you have lost the other, so a hint beside it would answer a question
         # nobody can be in a position to ask.
-        self._is_archive = warehouse is not None
+        self._is_published = warehouse is not None
         # Snapshot-derived facts, cached against the metadata pointer. See
         # `extent`. The file count rides along because reading the manifests
         # produces it for free, and counting files any other way means
@@ -422,7 +448,7 @@ class LogTable:
         self._statistics: TierStatistics | None = None
         # Run after every commit that lands, on the table the writer holds —
         # which stores the new version's rollup for every other process (#90).
-        # None on the archive table and on a reader's.
+        # None on the published table and on a reader's.
         self.after_commit: Callable[[], None] | None = None
         self._file_count = 0
         self._record_count = 0
@@ -471,11 +497,13 @@ class LogTable:
     @staticmethod
     def _catalog_for(layout: Layout) -> SqlCatalog:
         return SqlCatalog(
-            LOCAL_CATALOG, uri=layout.catalog_uri, warehouse=layout.warehouse_uri
+            catalog_name(layout.catalog_db, STAGING_CATALOG),
+            uri=layout.catalog_uri,
+            warehouse=layout.warehouse_uri,
         )
 
     @classmethod
-    def open_archive(
+    def open_published(
         cls,
         layout: Layout,
         prefix: str,
@@ -489,19 +517,19 @@ class LogTable:
 
         Its catalog is a SQLite file beside the local one and its warehouse is
         the object-store prefix — §2's two-catalog shape. Created lazily rather
-        than at `litelink.new`, because a log may be configured with an archive long
+        than at `litelink.new`, because a log may be configured with a published table long
         before anything is pushed to it and creating a remote table costs a
         round trip a local-only run should never pay.
 
-        The schema is the local table's, so the two cannot drift: one declared
-        shape, and the archive is the same rows later.
+        The schema is the staging table's, so the two cannot drift: one declared
+        shape, and the published table is the same rows later.
 
         The catalog entry is keyed by table id, not by warehouse, so an entry
         made for a DIFFERENT prefix would be found here and hand back a table
         whose metadata still lives in the old bucket. So it is checked against
         the prefix asked for, and replaced when it does not match.
 
-        Checked HERE rather than dropped when the archive is re-pointed, which
+        Checked HERE rather than dropped when the published table is re-pointed, which
         is what this did first. Re-pointing is three durable writes — the URI,
         the watermark, the catalog entry — and a crash between any two leaves
         them disagreeing; no ordering avoids it, because the damage differs in
@@ -509,25 +537,25 @@ class LogTable:
         half-finished re-point corrects itself.
 
         It is also what keeps detach-and-reattach working. Dropping the entry
-        eagerly meant pointing back at an archive that still held data built a
+        eagerly meant pointing back at a published table that still held data built a
         fresh empty table over it, and rows already evicted locally were then
         reachable from nowhere.
 
-        Adopting an archive that holds data but has no entry here IS
-        supported, and is what makes a re-point reversible. The archive names
+        Adopting a published table that holds data but has no entry here IS
+        supported, and is what makes a re-point reversible. The published table names
         its own current metadata in `version-hint.text` beside it, written at
         every commit, so a prefix with no catalog row is registered from that
         rather than created empty over the top of it.
 
         **Only a repairing caller adopts.** `register_table` is a write to
-        `archive.db`, and a reader promised to make none — so a reader still
-        gets `ArchiveAbsent` here and sees the archive once a maintenance pass
+        `published.db`, and a reader promised to make none — so a reader still
+        gets `PublishedAbsent` here and sees the published table once a maintenance pass
         has adopted it. Same rule as the drop above, for the same reason.
         """
         # Asked BEFORE the catalog is constructed, because constructing one
-        # creates its tables in `archive.db` and registering the namespace adds
+        # creates its tables in `published.db` and registering the namespace adds
         # a row — writes, from a path that promised to make none. A reader
-        # against a never-synced archive should touch nothing at all.
+        # against a published table never published to should touch nothing at all.
         boundary = prefix.rstrip("/") + "/"
         if not repair:
             try:
@@ -538,12 +566,12 @@ class LogTable:
                 known = ""
 
             if known is None:
-                msg = f"no archive table at {prefix!r} yet"
-                raise ArchiveAbsent(msg)
+                msg = f"no published table at {prefix!r} yet"
+                raise PublishedAbsent(msg)
 
         catalog = SqlCatalog(
-            ARCHIVE_CATALOG,
-            uri=layout.archive_catalog_uri,
+            catalog_name(layout.published_db, PUBLISHED_CATALOG),
+            uri=layout.published_catalog_uri,
             warehouse=prefix,
             **options.resolved().catalog_properties(),
         )
@@ -551,12 +579,12 @@ class LogTable:
 
         # Read OFFLINE, before deciding anything. Whether the entry belongs to
         # this prefix is answerable from the local catalog row, and asking it
-        # that way is what separates "this names another archive" from "this
+        # that way is what separates "this names another published table" from "this
         # names ours and object storage is having a bad minute".
         #
         # On a separator, not a bare prefix: `s3://b/one` is a prefix of
         # `s3://b/one-more` as a string, so a plain `startswith` accepts a
-        # SIBLING archive's entry as this one's, and the log then reads and
+        # SIBLING published table's entry as this one's, and the log then reads and
         # writes into the neighbour it was pointed away from.
         try:
             recorded = _recorded_location(layout)
@@ -565,7 +593,7 @@ class LogTable:
             # or says there is none. Slower than the offline read, and it must
             # still answer the SAME question — returning the loaded table here
             # skipped the prefix check entirely, so a process that hit a locked
-            # catalog adopted the archive it had been pointed away from and
+            # catalog adopted the published table it had been pointed away from and
             # read, pushed and reconciled its watermark from it for the rest of
             # its life.
             try:
@@ -577,30 +605,30 @@ class LogTable:
         # back. See below.
         displaced: str | None = None
         if recorded is not None and not recorded.startswith(boundary):
-            # Another archive's table, found by table id. No read of the old
-            # bucket is needed to know this, which matters when the archive
+            # Another published table's table, found by table id. No read of the old
+            # bucket is needed to know this, which matters when the published table
             # being left has already been taken away.
             if not repair:
                 # Only a caller holding the maintenance lease may fix it.
                 # Dropping and recreating is a mutation of shared state, and it
-                # was reachable from any read of the archive — two processes
+                # was reachable from any read of the published table — two processes
                 # cold-opening after a re-point would both find the mismatch,
                 # and the second's drop could land after the first had already
                 # created, uploaded and committed, taking the live entry with
                 # it. A reader that cannot fix it must not pretend it can.
                 msg = (
-                    f"the archive catalog names {recorded!r}, which is not "
+                    f"the published catalog names {recorded!r}, which is not "
                     f"under {prefix!r} — a maintenance pass repairs this"
                 )
                 raise ValueError(msg)
 
-            # The entry goes; the objects do not, because detaching an
-            # archive is not deleting one. Held onto, though: the create below
+            # The entry goes; the objects do not, because detaching a
+            # published table is not deleting one. Held onto, though: the create below
             # can fail — the new prefix may not exist yet, which this design
             # explicitly allows — and a half-done move that leaves NEITHER
             # entry is worse than not moving.
             #
-            # It is no longer the only record of where the previous archive's
+            # It is no longer the only record of where the previous published table's
             # metadata is. It was, and that is what made a roll-back build an
             # empty table over unreachable data; `version-hint.text` in the
             # bucket is that record now, and it survives this drop because it
@@ -610,17 +638,17 @@ class LogTable:
 
         if recorded is None:
             if not repair:
-                # Absent, not wrong. A log configured with an archive that
+                # Absent, not wrong. A log configured with a published table that
                 # nothing has pushed to yet is an ordinary state, and a reader
-                # that needs the archive before the first sync should get
+                # that needs the published table before the first publish should get
                 # a union without that leg — not an error, and not a table
                 # created as a side effect of reading.
-                msg = f"no archive table at {prefix!r} yet"
-                raise ArchiveAbsent(msg)
+                msg = f"no published table at {prefix!r} yet"
+                raise PublishedAbsent(msg)
 
-            # ADOPT BEFORE CREATING. This is what makes re-attaching to an
-            # archive expressible, which `open_archive` used to say plainly it
-            # was not: "Adopting an archive that holds data but has no entry
+            # ADOPT BEFORE CREATING. This is what makes re-attaching to a
+            # published table expressible, which `open_published` used to say plainly it
+            # was not: "Adopting a published table that holds data but has no entry
             # here is a different operation and is NOT supported: this creates
             # an empty table at the prefix rather than discovering what is
             # already there."
@@ -638,12 +666,12 @@ class LogTable:
                     table = catalog.create_table(
                         layout.table_id,
                         schema=schema,
-                        location=layout.archive_table_location(prefix),
+                        location=layout.published_table_location(prefix),
                         properties=METADATA_PROPERTIES,
                     )
                 else:
                     # Deliberately unguarded, like the load below. A hint
-                    # naming metadata that cannot be read is a broken archive,
+                    # naming metadata that cannot be read is a broken published table,
                     # and the fallback available here — create an empty table —
                     # is the single worst response to it: it writes over data
                     # that is still there, having just been told where it is.
@@ -651,7 +679,7 @@ class LogTable:
             except Exception:
                 if displaced is not None:
                     # Put the old entry back. The repair is meant to move the
-                    # log from one archive to another, and a half-done move
+                    # log from one published table to another, and a half-done move
                     # that leaves NEITHER is the one outcome worse than not
                     # moving at all.
                     catalog.register_table(layout.table_id, displaced)
@@ -666,15 +694,15 @@ class LogTable:
             # real error and skipping the rollback the comment promises.
             if published is None:
                 opened = cls(catalog, layout, table, prefix)
-                # DECLARED, like the local table's (§4). The archive is the
+                # DECLARED, like the staging table's (§4). The published table is the
                 # same rows later and is clustered the same way, so a table
                 # that does not say so is lying about itself to every reader
                 # that is not this library — and `sort_by` was therefore
-                # unanswerable from the archive alone.
+                # unanswerable from the published table alone.
                 if sort_by:
                     opened.set_sort_order(sort_by)
 
-                # So a freshly created archive names its own metadata from the
+                # So a freshly created published table names its own metadata from the
                 # start, rather than only from its first commit.
                 opened.publish_pointer()
                 table = opened._table  # the declaration's commit reloaded it
@@ -682,7 +710,7 @@ class LogTable:
             # Deliberately unguarded. Catching everything here and rebuilding
             # meant a 503, a timeout or an expired token read as "there is no
             # table" — and the repair then dropped the only pointer to a live
-            # archive and wrote an empty table over it, while the watermark
+            # published table and wrote an empty table over it, while the watermark
             # still promised eviction that those rows were safe. A failed read
             # of OUR OWN metadata is an error, not an absence.
             table = catalog.load_table(layout.table_id)
@@ -720,7 +748,7 @@ class LogTable:
         Answering False there tells `litelink.restore` it is resuming an interrupted
         restore when it is looking at a LIVE log — and the resume path then
         reserves 2**20 offsets on it, deletes every `extent` row including
-        queued cuts, wipes `sealing` and `claim`, drops the archive catalog
+        queued cuts, wipes `sealing` and `claim`, drops the published catalog
         row, and deletes buffered rows below the frontier.
         """
         if layout.is_legacy():
@@ -750,7 +778,7 @@ class LogTable:
             row = connection.execute(
                 "SELECT 1 FROM iceberg_tables"
                 " WHERE catalog_name = ? AND table_namespace = ? AND table_name = ?",
-                (LOCAL_CATALOG, namespace, name),
+                (catalog_name(layout.catalog_db, STAGING_CATALOG), namespace, name),
             ).fetchone()
         except sqlite3.Error as exc:
             msg = f"cannot read the local catalog's own table: {exc}"
@@ -1016,7 +1044,7 @@ class LogTable:
                 return None
 
             if self._statistics_at != location:
-                self._statistics = rollup("local", *self.live_files())
+                self._statistics = rollup("staging", *self.live_files())
                 self._statistics_at = location
 
             return self._statistics
@@ -1044,16 +1072,16 @@ class LogTable:
             return self._table.schema(), entries
 
     def _name(self, path: object) -> str:
-        """How this table names a file: a plain path for the local table, the
-        full URI for the archive.
+        """How this table names a file: a plain path for the staging table, the
+        full URI for the published table.
 
-        The archive's files are URIs even when it is a local directory (#98).
+        The published table's files are URIs even when it is a local directory (#98).
         Everything that records a file tells the two tiers apart by the scheme
         — the deletion queue above all, where a published file keyed like a
-        local one would be unlinked once the local table stopped naming it,
+        local one would be unlinked once the staging table stopped naming it,
         while the published table still did.
         """
-        return str(path) if self._is_archive else _plain(path)
+        return str(path) if self._is_published else _plain(path)
 
     def file_paths(self) -> set[str]:
         return {f.path for f in self.data_files()}
@@ -1163,12 +1191,12 @@ class LogTable:
                 time.sleep(random.uniform(0, _COMMIT_BACKOFF_MS * (2**attempt)) / 1000)
                 self.reload()
                 # Refreshed, so check it is still the same table. The catalog
-                # row is keyed by table id, not by identity, and a `set_archive`
+                # row is keyed by table id, not by identity, and a `set_published`
                 # racing a slow register replaces what that row names — so the
-                # reload silently re-binds this operation to the NEW archive
+                # reload silently re-binds this operation to the NEW published table
                 # and the retry commits paths that live in the old bucket. The
-                # new archive's manifests would then reference objects the
-                # re-point retired, and the next sync's reconcile would launder
+                # new published table's manifests would then reference objects the
+                # re-point retired, and the next publish's reconcile would launder
                 # that extent into the watermark eviction acts on.
                 self._verify_identity()
             else:
@@ -1209,12 +1237,12 @@ class LogTable:
         """Upload a local file into this table's warehouse (§5 step 1).
 
         Through pyiceberg's own FileIO rather than a second S3 client, so the
-        credentials and endpoint that reach the archive are the ones the
+        credentials and endpoint that reach the published table are the ones the
         catalog was built with — one place to configure, and no way for an
         upload to land somewhere the table cannot then read.
 
         Overwrites. The name carries a per-attempt token, so a repeat is the
-        same sync replaying the same file, and finishing it is what makes the
+        same publish replaying the same file, and finishing it is what makes the
         pass restartable.
         """
         destination = self.uri(rel_path)
@@ -1228,15 +1256,15 @@ class LogTable:
     def publish_pointer(self) -> None:
         """Record which metadata JSON is current, beside them in the warehouse.
 
-        Called after every archive commit, so the bucket always names its own
+        Called after every published commit, so the bucket always names its own
         current metadata. Two things need that and neither can get it from
-        `archive.db`: re-attaching to an archive this log was pointed away from
+        `published.db`: re-attaching to a published table this log was pointed away from
         (the catalog row is gone — that is what re-pointing does), and reading
-        the archive from anywhere that is not this machine.
+        the published table from anywhere that is not this machine.
 
         **Best effort, and it has to be.** The commit has already landed; the
         table is correct whether or not this succeeds. Raising here would turn
-        a published archive into a failed sync and send the caller into a retry
+        a published table that took the commit into a failed publish and send the caller into a retry
         of work that is done. A hint that fails to write is a hint that still
         names the previous metadata — behind, never wrong, and corrected by the
         next commit.
@@ -1252,7 +1280,7 @@ class LogTable:
         first produces the same hint. Kept in this order because reading the
         pointer at the point the table is known-current needs no argument.
         """
-        if not self._is_archive:
+        if not self._is_published:
             return
 
         path, version = _hint_for(str(self._table.metadata_location))
@@ -1261,7 +1289,7 @@ class LogTable:
                 writing.write(version.encode())
         except Exception:
             # Deliberately swallowed, and deliberately not logged from a
-            # library. The next commit rewrites it; a sync that raised here
+            # library. The next commit rewrites it; a publish that raised here
             # would be reporting a failure that did not happen.
             return
 
@@ -1269,7 +1297,7 @@ class LogTable:
         """Download a file out of this table's warehouse. Inverse of `put`.
 
         Through the catalog's own FileIO for the same reason `put` is: the
-        credentials that reach the archive are the ones the table was opened
+        credentials that reach the published table are the ones the table was opened
         with, so there is no second client to configure and no way to read from
         somewhere the table does not point.
 
@@ -1300,7 +1328,7 @@ class LogTable:
     def key(self, path: str) -> str:
         """The warehouse-relative name of a file in this table.
 
-        The inverse of `uri`, and what lets an archived file be placed locally
+        The inverse of `uri`, and what lets a published file be placed locally
         under the same name it has remotely — so hydrating twice writes the
         same path rather than accumulating copies.
         """
@@ -1310,7 +1338,7 @@ class LogTable:
         self,
         paths: list[str],
         sealed_through: int | None = None,
-        archived_through: int = 0,
+        published_through: int = 0,
         lo: int | None = None,
     ) -> bool:
         """Add already-written files to the table, in ONE commit (§4 step 2).
@@ -1344,7 +1372,7 @@ class LogTable:
         because each commit reads the new file's footer, writes a manifest, a
         manifest list and a fresh metadata.json, and rewrites the catalog
         pointer — none of which gets cheaper for holding one file instead of
-        twenty. One commit per file made `sync` take 83 s over sixteen files
+        twenty. One commit per file made `publish` take 83 s over sixteen files
         and starved the sealer that shared its thread.
 
 
@@ -1357,7 +1385,7 @@ class LogTable:
         def add() -> None:
             nonlocal added
             if sealed_through is not None and (
-                self._covers(sealed_through) or archived_through >= sealed_through - 1
+                self._covers(sealed_through) or published_through >= sealed_through - 1
             ):
                 added = False
 
@@ -1381,10 +1409,10 @@ class LogTable:
         once, in the immutable tier, with nothing able to repair it.
 
         Everything upstream is arranged so this cannot arise: compaction skips
-        files the archive holds, so a merge never straddles its extent. That
+        files the published table holds, so a merge never straddles its extent. That
         argument has a gap, and it is narrow enough to have survived several
         reviews — a crash between a register and the row recording it, then a
-        compaction-config change before the next sync backfills, regroups
+        compaction-config change before the next publish backfills, regroups
         pushed-but-unrecorded files into a mergeable run. The upstream fix for
         each such path is a fresh piece of reasoning; this is one check that
         holds however the reasoning turns out.
@@ -1393,28 +1421,28 @@ class LogTable:
         lower bound is the point. `covered[0] <= lo` was there first and was a
         hole rather than a safety condition: it exempted exactly the range that
         starts BELOW the extent and spans past it, engulfing the whole thing —
-        every archived offset in two files at once, which is the worst version
+        every published offset in two files at once, which is the worst version
         of what this exists to stop, not an excused one.
 
-        Nothing legitimate is refused. `sync` pushes only files above the
-        archive's extent, so a batch whose first file starts at or below
+        Nothing legitimate is refused. `publish` pushes only files above the
+        published table's extent, so a batch whose first file starts at or below
         `covered[1]` necessarily contains that offset — the last row of the
-        archive's top file, a real archived row — and is a genuine overlap
+        published table's top file, a real published row — and is a genuine overlap
         however it is shaped. Whole-batch replays are excused earlier, by
         `_covers`.
 
         Refusing costs a stall, and the stall is worse than this used to say.
         The straddling file never lands, the watermark stops, eviction pins
-        below it, and **nothing re-cuts a local straddler**: `rewrite_archive`
+        below it, and **nothing re-cuts a local straddler**: `rewrite_published`
         works the other side, and no tool does this one. The refusal is still
         right — a loud permanent stall beats a silent permanent duplication —
         but calling it recoverable was wrong, and the operator's only route
         today is to lower the compaction target so the straddler is left alone,
-        or to start a fresh archive prefix.
+        or to start a fresh published prefix.
 
         Reaching it at all takes a crash between a register and the rows
-        recording it, and then a compaction-target change before the next sync
-        backfills those rows from the archive's manifest. SPEC §4a records the
+        recording it, and then a compaction-target change before the next publish
+        backfills those rows from the published table's manifest. SPEC §4a records the
         window and what would close it.
         """
         if lo is None:
@@ -1436,12 +1464,12 @@ class LogTable:
         extent's upper bound answers this on its own.
 
         An EMPTY table answers False, which is why `register` also consults the
-        archive watermark. A writer stalled between renewing its lease and
-        registering, while another owner sealed the same range, archived it and
+        published watermark. A writer stalled between renewing its lease and
+        registering, while another owner sealed the same range, published it and
         evicted the table to nothing, would otherwise resume and re-add its
-        stale file — and a local table holding only [100, 199] under an archive
+        stale file — and a staging table holding only [100, 199] under a published table
         holding [0, 999] serves 200-999 from no leg at all, until eviction
-        drops it again up to `local_retention` later.
+        drops it again up to `staging_retention` later.
         """
         extent = self.extent()
 
@@ -1454,7 +1482,7 @@ class LogTable:
         itself — putting a path on disk this process only learns about
         afterwards, which is what the deletion queue exists to avoid.
 
-        Several paths because an archive rewrite re-cuts a range into however
+        Several paths because a published rewrite re-cuts a range into however
         many correctly sized files it takes, and the swap has to be one
         snapshot: committing them one at a time would mean each commit deleting
         a sub-range of a file the next commit still needs.

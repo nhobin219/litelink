@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 # Six tries against the library's own ten-second wait: a minute of patience,
-# which covers the longest sync this repo has measured.
+# which covers the longest publish this repo has measured.
 _SETTLE_ATTEMPTS = 6
 
 
@@ -53,7 +53,7 @@ def _settle(change: Callable[[], None], what: str) -> None:
     halves have to be decided together — which means they queue behind ordinary
     maintenance. The library waits ten seconds and then reports rather than
     hanging, and that is the right library behaviour: a wedged log should
-    surface. But a sync holds its claim for the whole push, measured at 83 s
+    surface. But a publish holds its claim for the whole push, measured at 83 s
     over sixteen files, and a merge over a large run at 20 s — so a writer that
     treated the report as fatal would crash on any restart that happened to
     land during one, which is exactly when restarts are most likely.
@@ -82,47 +82,47 @@ def main() -> None:
     # starts one locally and prints the URI to pass here; the same flag with an
     # `s3://` bucket on AWS is the entire difference between the two.
     parser.add_argument(
-        "--archive",
+        "--published",
         default=None,
-        help="s3:// prefix for the archive tier (see `just rustfs`)",
+        help="s3:// prefix for the published tier (see `just rustfs`)",
     )
-    # Only meaningful with an archive: it is how long a file stays on local
-    # disk AFTER the archive has it, and I4 will not let it be evicted before.
+    # Only meaningful with a published table: it is how long a file stays on local
+    # disk AFTER the published table has it, and I4 will not let it be evicted before.
     # Off by default because it needs a binary the demo does not install. With
     # it on, the maintainer writes the config and runs the sidecar itself.
     parser.add_argument(
         "--replicate",
         action="store_true",
-        help="ship the WAL continuously (needs litestream on PATH, and --archive)",
+        help="ship the WAL continuously (needs litestream on PATH, and --published)",
     )
     parser.add_argument(
-        "--local-retention",
+        "--staging-retention",
         type=float,
         default=60.0,
-        help="seconds to keep archived files locally",
+        help="seconds to keep published files locally",
     )
     args = parser.parse_args()
 
     # Small for a demo — seal often, so the reader sees the table grow within
-    # seconds — and larger than that where the archive is concerned, because
+    # seconds — and larger than that where the published table is concerned, because
     # the two want opposite things. A real deployment sizes the seal by §7's
     # read-latency argument rather than to make a demo lively.
     #
     # Measured against S3: 648 ms to upload a 9 kB file. Almost all of that is
     # the round trip, not the bytes, so halving file size doubles the cost of
-    # archiving the same stream. Compaction is what bridges it: seal at 1 MiB
-    # so the buffer stays shallow, convert to 8 MiB so the archive receives
+    # publishing the same stream. Compaction is what bridges it: seal at 1 MiB
+    # so the buffer stays shallow, convert to 8 MiB so the published table receives
     # eight times fewer objects for the same data.
     config = LogConfig(
         target_seal_size=1024 * 1024,
         target_compact_size=8 * 1024 * 1024,
         compact_min_files=3,
         snapshot_retention=timedelta(seconds=30),
-        # None without an archive, because with nowhere to push to a retention
+        # None without a published table, because with nowhere to push to a retention
         # is a policy for deleting the only copy — which `WriteHandle.new` refuses to
         # be told by accident.
-        local_retention=(
-            timedelta(seconds=args.local_retention) if args.archive else None
+        staging_retention=(
+            timedelta(seconds=args.staging_retention) if args.published else None
         ),
         wal_replication=args.replicate,
     )
@@ -140,22 +140,25 @@ def main() -> None:
     s3 = S3Options()
     try:
         log = litelink.open(args.root, NAME, s3=s3)
-        # The ARCHIVE first, then the policy. `validate` refuses a pair, and
+        # The PUBLISHED table first, then the policy. `validate` refuses a pair, and
         # each call is checked against the durable other half — so setting the
-        # policy first refuses `--local-retention 0` and `--replicate` on a log
-        # that has no archive YET, while the same command line attaches one on
+        # policy first refuses `--staging-retention 0` and `--replicate` on a log
+        # that has no published table YET, while the same command line attaches one on
         # the next line. The final pair is valid; only the order made it
         # unreachable, and the error told the user they had asked for something
         # they had not.
         #
         # Only when one was actually asked for. Unconditionally, a plain
-        # `just demo-capture` on a log created by `just demo-archive` passes
-        # None and DETACHES the archive — which succeeds without credentials,
+        # `just demo-capture` on a log created by `just demo-published` passes
+        # None and DETACHES the published table — which succeeds without credentials,
         # resets the watermark, and strands every row already evicted from
-        # local disk. `demo-clean` then sees no archive, skips the S3 removal,
+        # local disk. `demo-clean` then sees no published table, skips the S3 removal,
         # and deletes the local state, leaving paid storage nothing can name.
-        if args.archive is not None:
-            _settle(lambda: log.set_archive(args.archive), "attaching the archive")
+        if args.published is not None:
+            _settle(
+                lambda: log.set_published(args.published),
+                "attaching the published table",
+            )
 
         _settle(lambda: log.set_config(config), "applying the config")
     except FileNotFoundError:
@@ -165,14 +168,14 @@ def main() -> None:
             schema=SCHEMA,
             sort_by=SORT_BY,
             config=config,
-            archive=args.archive,
+            published=args.published,
             s3=s3,
         )
 
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
     print("appending only — `just demo-maintain` seals and reclaims disk")
-    if args.archive:
-        print(f"archiving to {args.archive} once files are sealed and settled")
+    if args.published:
+        print(f"publishing to {args.published} once files are sealed and settled")
 
     if args.replicate:
         print("WAL replication on — `just demo-maintain` runs the sidecar")
@@ -211,7 +214,7 @@ def main() -> None:
     print(f"{args.root}/ holds {on_disk / 1e6:.1f} MB — `just demo-clean` to remove it")
     # Nothing deletes this on exit, deliberately: tail.py reads it after the
     # writer stops, and a demo you cannot inspect afterwards is not much of one.
-    # Note the demo leaves local_retention unset, so the window grows without
+    # Note the demo leaves staging_retention unset, so the window grows without
     # bound; a real deployment sets it and lets maintain() hold the size.
     # Rows still queued or buffered here are not lost — they are durable, and
     # the next process to open the log finds the cuts already recorded.

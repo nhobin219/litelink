@@ -3,7 +3,8 @@
 The tier statistics (#90) are new state an older log does not have. The
 backfill tests elsewhere forge that by deleting the rows; this one doesn't
 forge anything. It writes, syncs and evicts a log with litelink 0.5.1 from
-PyPI, in an isolated environment, then opens it here.
+PyPI — through 0.5.1's API, `archive=` and `sync()` — in an isolated
+environment, then opens it here.
 """
 
 from __future__ import annotations
@@ -118,12 +119,12 @@ def written_by_release(tmp_path: Path, bucket: str, s3: S3Options) -> dict:
 def test_a_log_a_released_version_wrote_reads_back_and_backfills(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Opened here, a 0.5.1 log gets its archive row from the archive's own
-    manifests, then serves every row, and a hot read stops reaching the
-    archive.
+    """Opened here, a 0.5.1 log gets its published tier row from the published
+    table's own manifests, then serves every row, and a hot read stops reaching
+    the published table.
 
-    Falsify by removing `_backfill_manifest` from `litelink.open`: the archive
-    row is never stored, and the hot read reaches the archive.
+    Falsify by removing `_backfill_manifest` from `litelink.open`: the tier
+    row is never stored, and the hot read reaches the published table.
     """
     report = written_by_release(tmp_path, bucket, s3)
     low = report["extent"][0]
@@ -131,7 +132,7 @@ def test_a_log_a_released_version_wrote_reads_back_and_backfills(
 
     with litelink.open(tmp_path, "s", s3=s3) as log:
         coverage = log.coverage()
-        assert coverage.archive == (1, low - 1)
+        assert coverage.published == (1, low)
         offsets = log.scan(columns=[OFFSET]).read_all().column(0).to_pylist()
         assert sorted(offsets) == list(range(1, ROWS + 1))
 

@@ -197,7 +197,7 @@ def test_the_s3_tier_is_not_silently_skipped() -> None:
     """91 tests vanished when `s3fs` stopped being installed, and nothing said so.
 
     `conftest.filesystem` uses `pytest.importorskip`, so removing the `s3`
-    extra turned the entire archive tier into skips — a green run that had
+    extra turned the entire published tier into skips — a green run that had
     stopped checking the tier most of this library's bugs have been in. The
     suite reported `286 passed, 91 skipped` and looked fine.
 
@@ -206,14 +206,14 @@ def test_the_s3_tier_is_not_silently_skipped() -> None:
     dev group, and its absence should fail rather than skip.
 
     Falsify by removing `s3fs` from the dev group: this fails instead of the
-    archive suite quietly halving.
+    published table suite quietly halving.
     """
     try:
         import s3fs  # noqa: F401
     except ImportError:  # pragma: no cover - the failure this exists to make loud
         pytest.fail(
-            "s3fs is not installed, so the entire archive tier will SKIP rather "
-            "than run. It is a dev dependency of the test fixtures. Run `uv sync`."
+            "s3fs is not installed, so the entire published tier will SKIP rather "
+            "than run. It is a dev dependency of the test fixtures. Run `uv publish`."
         )
 
 
@@ -275,7 +275,7 @@ def test_the_required_check_depends_on_every_job() -> None:
     except ImportError:  # pragma: no cover - the failure this makes loud
         pytest.fail(
             "PyYAML is not installed, so the check that the CI gate covers "
-            "every job cannot run. It is a dev dependency. Run `uv sync`."
+            "every job cannot run. It is a dev dependency. Run `uv publish`."
         )
 
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
@@ -315,7 +315,7 @@ def test_release_notes_group_and_carry_the_reason() -> None:
             "type": "feat",
             "scope": "read",
             "subject": "follow a log from another machine",
-            "body": "The archive merged with a replicated buffer.\n\nDetail after.",
+            "body": "The published table merged with a replicated buffer.\n\nDetail after.",
             "commit": "a" * 40,
             "breaking": "",
         },
@@ -345,7 +345,7 @@ def test_release_notes_group_and_carry_the_reason() -> None:
     )
 
     # The reason travels, and only the lead paragraph of it.
-    assert "The archive merged with a replicated buffer." in notes
+    assert "The published table merged with a replicated buffer." in notes
     assert "Detail after." not in notes
 
     # An unknown type is SHOWN, not dropped. A change that ships unannounced is
@@ -384,7 +384,7 @@ def test_no_document_states_the_pre_0_2_path_as_current() -> None:
 
     Scoped by MEANING rather than by syntax, because the defect that survived
     the first pass was prose, not code: `docs/API.md` said "The table sits at
-    `<archive prefix>/litelink/<log name>`" four lines under an `iceberg_scan`
+    `<published prefix>/litelink/<log name>`" four lines under an `iceberg_scan`
     example that had already been corrected. An earlier version of this test
     matched `iceberg_scan\('...'\)` and found nothing — it pinned the snippets
     and left the sentence explaining them free to contradict them.
@@ -415,8 +415,8 @@ def test_the_documented_trees_match_the_layout() -> None:
 
     Each fenced block is checked against the tier it describes, and each file
     is looked for on a LINE OF ITS OWN. Substring-matching the whole section
-    was close to vacuous: `buffer.db`, `catalog.db` and `archive.db` all appear
-    on the archive tree's `_wal/` line, so all three could be deleted from the
+    was close to vacuous: `buffer.db`, `catalog.db` and `published.db` all appear
+    on the published table tree's `_wal/` line, so all three could be deleted from the
     on-disk diagram with this still green. Only `litestream.yml` was pinned.
     """
     from litelink._layout import Layout
@@ -426,12 +426,12 @@ def test_the_documented_trees_match_the_layout() -> None:
     section = (ROOT / "docs" / "SPEC.md").read_text().split("## 2. Layout", 1)[1]
     section = section.split("**One SQLite database", 1)[0]
     blocks = section.split("```")
-    local, archive = blocks[1], blocks[3]
+    local, published = blocks[1], blocks[3]
 
     for path in (
         layout.buffer_db,
         layout.catalog_db,
-        layout.archive_db,
+        layout.published_db,
         layout.replication_config,
     ):
         assert path.parent == layout.directory, (
@@ -443,14 +443,14 @@ def test_the_documented_trees_match_the_layout() -> None:
 
     for entry in ("data/", "metadata/"):
         assert any(line.strip().startswith(entry) for line in local.splitlines())
-        assert any(line.strip().startswith(entry) for line in archive.splitlines())
+        assert any(line.strip().startswith(entry) for line in published.splitlines())
 
-    # The archive half, against the code that builds it — the half that drifted
+    # The published half, against the code that builds it — the half that drifted
     # and produced a scan example naming a prefix with no table in it.
-    assert layout.archive_table_location("s3://b/p") == "s3://b/p/trades"
+    assert layout.published_table_location("s3://b/p") == "s3://b/p/trades"
     assert destination("s3://b/p", "trades").endswith("/trades/_wal")
-    assert "_wal/" in archive, "SPEC §2's archive tree must show the replica"
-    assert "/litelink/" not in local and "/litelink/" not in archive, (
+    assert "_wal/" in published, "SPEC §2's published table tree must show the replica"
+    assert "/litelink/" not in local and "/litelink/" not in published, (
         "the trees must draw the current layout, not the pre-0.2 one"
     )
 
@@ -524,7 +524,7 @@ def test_a_breaking_change_footer_leads_the_notes(
         "-q",
         "--no-verify",
         "-m",
-        "feat(sync): footer only",
+        "feat(publish): footer only",
         "-m",
         "why it changed",
         "-m",

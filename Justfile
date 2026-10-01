@@ -1,13 +1,17 @@
 # litelink development commands
 # Install just: uv tool install rust-just
 
-# The local S3-compatible endpoint the archive tier is tested and demoed against.
+# The local S3-compatible endpoint the S3 published tier is tested and demoed against.
 # Matches tests/conftest.py; change both together.
 # Loaded from `.env` if present, so the demo can point at a real bucket without
 # editing anything here — see `.env.example`. Recipes read AWS_* through the
 # environment exactly as the library does, so what works here works in
 # production.
 set dotenv-load := true
+
+# Where the demo publishes, if not to rustfs. A `.env` written before #98 names
+# it LITELINK_DEMO_ARCHIVE, which is still read when the new name is absent.
+export LITELINK_DEMO_PUBLISHED := env_var_or_default("LITELINK_DEMO_PUBLISHED", env_var_or_default("LITELINK_DEMO_ARCHIVE", ""))
 
 RUSTFS_ENDPOINT := "http://127.0.0.1:9000"
 RUSTFS_KEY := "litelink"
@@ -29,14 +33,14 @@ bootstrap:
     uv sync
     uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
     # `--remote` here, though httpfs is opt-in for the LIBRARY. Anyone working
-    # in this repo runs `just demo-archive` sooner or later, and an explicit
+    # in this repo runs `just demo-published` sooner or later, and an explicit
     # LOAD does not autoinstall — so leaving it out buys nothing and costs a
-    # cryptic DuckDB error on the first archive read.
+    # cryptic DuckDB error on the first read of the published table.
     @just duckdb-extensions --remote
     # And litestream, or eleven tests skip: every follower, restore and
     # replication test guards on it. CI fetches it, so leaving it out here
     # means a contributor's green run and CI's green run check different
-    # things — which is how the archive tier went unexamined for the life of
+    # things — which is how the S3 published tier went unexamined for the life of
     # that workflow.
     @just litestream
 
@@ -47,7 +51,7 @@ bootstrap:
 # download out of the first hot-path read, where it is supposed to be offline.
 #
 #   just duckdb-extensions            provision the read path
-#   just duckdb-extensions --remote   ...and httpfs, for the archive tier
+#   just duckdb-extensions --remote   ...and httpfs, for the S3 published tier
 #   just duckdb-extensions --check    verify, offline-style; installs nothing
 
 # Provision the DuckDB extensions the read path needs
@@ -147,9 +151,9 @@ demo-capture *args:
 demo-maintain *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Same rule as demo-archive: a real endpoint if `.env` names one, rustfs
-    # otherwise. Needed here too — the maintainer is what pushes to the archive.
-    if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
+    # Same rule as demo-published: a real endpoint if `.env` names one, rustfs
+    # otherwise. Needed here too — the maintainer is what publishes.
+    if [ -z "${LITELINK_DEMO_PUBLISHED:-}" ]; then
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
@@ -163,9 +167,8 @@ demo-maintain *args:
     # the interpreter — the same argument that made the writer its own process,
     # one level down. `just demo-tail` is the combined view; these print only
     # when they do something.
-    # Every role, always. The sync one exits quietly on a local-only log
-    # rather than making the reader learn which roles apply.
-    roles="seal compact reclaim sync"
+    # Every role, always: a local-only log publishes too, to its own directory.
+    roles="seal compact reclaim publish"
     pids=""
     stop() { kill $pids 2>/dev/null || true; }
     # Ctrl-C reaches the children directly — they are in this process group —
@@ -211,37 +214,37 @@ demo-tail *args:
     uv run python examples/adsb/tail.py {{args}}
 
 # Needs `just rustfs` first, and a maintainer alongside — the writer seals,
-# archives and evicts nothing on its own.
+# publishes and evicts nothing on its own.
 #
 #   just rustfs         # once
-#   just demo-archive   # terminal 1: append, with an archive configured
+#   just demo-published   # terminal 1: append, publishing to S3
 #   just demo-maintain  # terminal 2: seal, compact, push, evict
-#   just demo-tail      # terminal 3: watch `in table` fall as `archived` rises
+#   just demo-tail      # terminal 3: watch `in table` fall as `published` rises
 #
-# Capture into a log with the archive tier configured, against local rustfs.
-demo-archive *args:
+# Capture into a log publishing to S3, against local rustfs.
+demo-published *args:
     #!/usr/bin/env bash
     set -euo pipefail
     # A real bucket if `.env` names one, rustfs otherwise. The library reads
     # credentials from the environment either way, so this is the whole
     # difference between the local demo and a production deployment.
-    if [ -n "${LITELINK_DEMO_ARCHIVE:-}" ]; then
-        echo "archiving to $LITELINK_DEMO_ARCHIVE (credentials from the environment)"
-        uv run python examples/adsb/capture.py --archive "$LITELINK_DEMO_ARCHIVE" {{args}}
+    if [ -n "${LITELINK_DEMO_PUBLISHED:-}" ]; then
+        echo "publishing to $LITELINK_DEMO_PUBLISHED (credentials from the environment)"
+        uv run python examples/adsb/capture.py --published "$LITELINK_DEMO_PUBLISHED" {{args}}
     else
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
         export AWS_REGION=us-east-1
         uv run python examples/adsb/capture.py \
-            --archive s3://{{RUSTFS_BUCKET}}/demo {{args}}
+            --published s3://{{RUSTFS_BUCKET}}/demo {{args}}
     fi
 
 # Needs `just rustfs`, a capture running, and the litestream binary — either
 # from `just litestream` (the pinned build, into `.bin/`) or on PATH.
 #
 #   just litestream       # once
-#   just demo-archive     # terminal 1
+#   just demo-published     # terminal 1
 #   just demo-replicate   # terminal 2: ship the WAL continuously
 #
 # Then to prove it: keep a copy of the config, because since 0.2 it lives INSIDE
@@ -270,7 +273,7 @@ demo-replicate root="litelink-data":
         exit 1
     fi
     # rustfs unless `.env` names a real bucket, as everywhere else.
-    if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
+    if [ -z "${LITELINK_DEMO_PUBLISHED:-}" ]; then
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
@@ -316,14 +319,14 @@ _rustfs-bucket:
 # it is there to poke at — so nothing removes it automatically. The benchmarks do
 # clean up: they run in a temp directory.
 #
-# rustfs is an S3-compatible object store in one container — the archive tier
+# rustfs is an S3-compatible object store in one container — the S3 published tier
 # needs somewhere to push to, and pointing tests and demos at real S3 makes both
 # slow, costly and dependent on credentials nobody should need to run `just check`.
 # The same code path runs against AWS; only the endpoint differs.
 #
 #   just rustfs-stop    tears it down, discarding its data
 #
-# Bring up a local S3-compatible object store for the archive tier. Idempotent.
+# Bring up a local S3-compatible object store for the S3 published tier. Idempotent.
 rustfs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -349,7 +352,7 @@ rustfs:
             echo "  export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}"
             echo "  export AWS_REGION=us-east-1"
             echo
-            echo "then: just demo-archive"
+            echo "then: just demo-published"
             exit 0
         fi
         sleep 0.25
@@ -374,10 +377,10 @@ demo-clean root="litelink-data" ws_root="litelink-ws":
     if [ ! -e "{{root}}" ]; then
         echo "nothing at {{root}}"
     else
-    # The archive first, while the log can still say where it is. Reading it
+    # The published table first, while the log can still say where it is. Reading it
     # from the log rather than from the environment means this removes what
     # THIS demo wrote, even if `.env` has changed since.
-    if [ -z "${LITELINK_DEMO_ARCHIVE:-}" ]; then
+    if [ -z "${LITELINK_DEMO_PUBLISHED:-}" ]; then
         export AWS_ENDPOINT_URL={{RUSTFS_ENDPOINT}}
         export AWS_ACCESS_KEY_ID={{RUSTFS_KEY}}
         export AWS_SECRET_ACCESS_KEY={{RUSTFS_SECRET}}
@@ -388,23 +391,24 @@ demo-clean root="litelink-data" ws_root="litelink-ws":
     from pathlib import Path
     sys.path.insert(0, 'examples/adsb')
     from _stream import NAME
-    from litelink import Log
+    import litelink
     try:
-        with Log.open(Path('{{root}}'), NAME, read_only=True) as log:
-            archive = log.archive
+        with litelink.open(Path('{{root}}'), NAME, read_only=True) as log:
+            published = log.published
     except Exception as exc:
-        print(f'  could not read the archive location: {exc}')
+        print(f'  could not read the published location: {exc}')
         raise SystemExit(0) from None
-    if archive is None:
+    # A local published table lives under the root, which goes below.
+    if not published.startswith('s3://'):
         raise SystemExit(0)
     import s3fs
     fs = s3fs.S3FileSystem()
     # Never the bare prefix. It is shared by every demo run and may be
     # somewhere real (see the env template), so a recursive delete of it takes
-    # another run archived rows, or objects that were never ours. Only what
+    # another run published rows, or objects that were never ours. Only what
     # this log wrote, which since 0.2 is one subtree: `{prefix}/{name}` holds
     # `data/`, `metadata/` and `_wal/` together.
-    base = archive.removeprefix('s3://').rstrip('/')
+    base = published.removeprefix('s3://').rstrip('/')
     # The legacy prefixes stay in the list so this still cleans a demo root
     # left over from 0.1, where metadata went to `{prefix}/litelink/{name}` and
     # the WAL to `{prefix}/_wal`. Both are no-ops on a current log.
@@ -416,13 +420,13 @@ demo-clean root="litelink-data" ws_root="litelink-ws":
             fs.rm(target, recursive=True)
         else:
             print(f'  nothing at s3://{target}')
-    " || echo "  skipped the archive (no credentials, or nothing to remove)"
+    " || echo "  skipped the published table (no credentials, or nothing to remove)"
     echo "removing {{root}} ($(du -sh "{{root}}" | cut -f1))"
     rm -rf "{{root}}"
     fi
-    # No archive pass for the websocket root: that demo is local-only — it
-    # never takes an `archive=`, so there is nothing off-box to consult or
-    # remove, and opening the log to ask would only be a way to fail.
+    # No S3 pass for the websocket root: that demo is local-only — it never
+    # takes a `published=`, so its published table is under its root, and
+    # opening the log to ask would only be a way to fail.
     if [ ! -e "{{ws_root}}" ]; then
         echo "nothing at {{ws_root}}"
     else

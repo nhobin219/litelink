@@ -156,8 +156,8 @@ def test_a_sealer_that_falls_behind_still_writes_sized_files(tmp_path: Path) -> 
         # seals everything up to that cut.
         assert log.seal() is not None
         assert log.seal() is None, "left work behind"
-        assert log.table_files() == len(queued) + 1, (
-            f"{len(queued)} queued plus the open group, {log.table_files()} files"
+        assert log.staging_files() == len(queued) + 1, (
+            f"{len(queued)} queued plus the open group, {log.staging_files()} files"
         )
 
         sizes = [f.size for f in log._table.data_files()]
@@ -202,8 +202,8 @@ def test_an_explicit_seal_cuts_its_own_rows_whatever_else_is_running(
             draining.join(30)
 
         assert log.await_seal(timeout=30), "a queued cut was never written"
-        assert log.table_files() == 8, "eight appends and eight seals, eight files"
-        assert log.table_rows() == 160
+        assert log.staging_files() == 8, "eight appends and eight seals, eight files"
+        assert log.staging_rows() == 160
 
 
 def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
@@ -237,14 +237,14 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
         log._buffer.claim_seal(start, end, path)
         log._write_and_commit(start, end, path)
 
-        assert log.table_rows() == 100, "the commit did not land"
+        assert log.staging_rows() == 100, "the commit did not land"
         assert log._buffer.pending_group() == group, "the group was retired early"
 
         # The next sealer must finish it rather than redo it.
         assert log.seal_due() == end
         assert log._buffer.pending_group() is None, "the queue never drained"
-        assert log.table_files() == 1, "the file was written twice"
-        assert log.table_rows() == 100
+        assert log.staging_files() == 1, "the file was written twice"
+        assert log.staging_rows() == 100
 
 
 def test_an_empty_group_is_never_closed(tmp_path: Path) -> None:
@@ -281,7 +281,7 @@ def test_only_an_explicit_seal_cuts_short(tmp_path: Path) -> None:
 
         assert log.seal_due() is None, "something cut without being asked"
         assert log.seal() is not None, "an explicit seal must still cut"
-        assert log.table_files() == 1
+        assert log.staging_files() == 1
 
 
 def test_a_reopened_log_adopts_the_rows_it_finds(tmp_path: Path) -> None:
@@ -467,8 +467,8 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
         end = log.seal()
 
         assert end is not None
-        assert log.table_files() == 1
-        assert log.table_rows() == 60
+        assert log.staging_files() == 1
+        assert log.staging_rows() == 60
 
         # A lapsed writer, waking with its own file already written, commits.
         second = log._layout.seal_path(1, end, "lapsed")
@@ -478,8 +478,8 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
 
         log._table.register([str(dest)], sealed_through=end)
 
-        assert log.table_files() == 1, "a second file for the same range landed"
-        assert log.table_rows() == 60, "rows were duplicated"
+        assert log.staging_files() == 1, "a second file for the same range landed"
+        assert log.staging_rows() == 60, "rows were duplicated"
 
 
 def test_the_seal_cuts_on_whichever_limit_is_reached_first(tmp_path: Path) -> None:

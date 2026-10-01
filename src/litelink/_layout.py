@@ -108,7 +108,7 @@ class Layout:
     @property
     def warehouse_uri(self) -> str:
         """Still the root, because `relative` is what turns a local file into
-        an archive key and both tiers have to agree on it.
+        a published key and both tiers have to agree on it.
 
         The table's location is passed explicitly at creation rather than left
         to `<warehouse>/<namespace>/<table>`, so this no longer decides where
@@ -118,7 +118,7 @@ class Layout:
 
     @property
     def table_location(self) -> str:
-        """Where the local Iceberg table lives — data AND metadata (§2).
+        """Where the staging table lives — data AND metadata (§2).
 
         Passed to `create_table` explicitly, which is the whole point. Left to
         pyiceberg it resolved to `<warehouse>/<namespace>/<table>`, so metadata
@@ -131,8 +131,8 @@ class Layout:
         return f"file://{self.directory}"
 
     @property
-    def default_archive(self) -> str:
-        """Where a log with no remote archive publishes: a local directory (#98).
+    def default_published(self) -> str:
+        """Where a log with no remote published table publishes: a local directory (#98).
 
         Computed rather than stored, so `meta` records only a location the
         caller chose, and an empty row — what a log written before #98 holds —
@@ -141,10 +141,10 @@ class Layout:
         """
         return f"{LOCAL_SCHEME}{self.directory / 'published'}"
 
-    def archive_table_location(self, prefix: str) -> str:
-        """The same, in the archive prefix.
+    def published_table_location(self, prefix: str) -> str:
+        """The same, in the published prefix.
 
-        A data file keeps its root-relative name in the archive — `LogTable`
+        A data file keeps its root-relative name in the published table — `LogTable`
         maps `<name>/data/...` to `<prefix>/<name>/data/...` — so the remote
         table's location has to be `<prefix>/<name>` for its metadata to sit
         beside its data the way the local one now does.
@@ -165,9 +165,9 @@ class Layout:
 
     @property
     def rewrite_db(self) -> Path:
-        """Scratch buffer for an archive rewrite.
+        """Scratch buffer for a published rewrite.
 
-        Its own file, not the log's: the rewrite re-ingests archived rows
+        Its own file, not the log's: the rewrite re-ingests published rows
         through an ordinary `Buffer` to re-cut them, and that buffer must not
         be the log's own — appends are still landing there, and its offsets are
         the live ones. Inside the stream directory like everything else, so a
@@ -176,22 +176,30 @@ class Layout:
         return self.directory / "rewrite.db"
 
     @property
-    def archive_db(self) -> Path:
-        """The archive catalog, kept beside the local one (§2).
+    def published_db(self) -> Path:
+        """The published catalog, kept beside the local one (§2).
 
         A local SQLite file describing a warehouse on object storage. It is
         replicated like the others — but it is deliberately NOT restored onto
         another machine. Its paths are `s3://` and so machine-independent, yet
         it is TIME-dependent, and a stale copy is worse than none:
-        `open_archive` consults `version-hint.text` only when the catalog has
+        `open_published` consults `version-hint.text` only when the catalog has
         no row, so a stale row wins over the bucket's own pointer and the
-        archive reads short, silently. See `litelink.restore`.
+        published reads short, silently. See `litelink.restore`.
+
+        `published.db` for a log written before #98 that has one, so an old log
+        opens unchanged; `published.db` for every other.
         """
-        return self.directory / "archive.db"
+        legacy = self.directory / "archive.db"
+        current = self.directory / "published.db"
+        if legacy.exists() and not current.exists():
+            return legacy
+
+        return current
 
     @property
-    def archive_catalog_uri(self) -> str:
-        return f"sqlite:///{self.archive_db}"
+    def published_catalog_uri(self) -> str:
+        return f"sqlite:///{self.published_db}"
 
     @property
     def databases(self) -> tuple[Path, ...]:
@@ -199,16 +207,16 @@ class Layout:
 
         What a WAL-shipping sidecar has to replicate. All three, not just the
         buffer: the buffer holds rows no Parquet file has yet, `catalog.db`
-        holds which files the local table is made of, and `archive.db` holds
-        the same for the archive.
+        holds which files the staging table is made of, and `published.db` holds
+        the same for the published table.
 
         That last one used to be justified as the only thing able to name the
-        objects in S3. It is not, since the archive publishes
+        objects in S3. It is not, since the published table publishes
         `version-hint.text`; it is replicated for the SAME-machine case, where
         it saves a round trip, and a failover deliberately does not restore it
         because a stale copy wins over the bucket's own pointer.
 
-        The rewrite scratch is excluded. It is derived from the archive and
+        The rewrite scratch is excluded. It is derived from the published table and
         deleted at the end of the operation that makes it, so replicating it
         would ship a temporary file to object storage to no purpose.
 
@@ -216,7 +224,7 @@ class Layout:
         matter is exactly what this class knows and nothing else should have to
         rediscover by listing a directory.
         """
-        return (self.buffer_db, self.catalog_db, self.archive_db)
+        return (self.buffer_db, self.catalog_db, self.published_db)
 
     @property
     def table_id(self) -> str:
@@ -300,18 +308,18 @@ class Layout:
         self.directory.mkdir(parents=True, exist_ok=True)
 
 
-# The schemes an archive prefix may carry. Not a general URI parser: a remote
-# archive is object storage, everything downstream builds `s3://` paths from
+# The schemes a published prefix may carry. Not a general URI parser: a remote
+# published table is object storage, everything downstream builds `s3://` paths from
 # it, and `litestream_config` emits a `type: s3` replica. A local one is a
 # directory, and every log has one — the default, under the log's own
-# directory, when no remote archive is given (#98).
-ARCHIVE_SCHEME = "s3://"
+# directory, when no remote published table is given (#98).
+S3_SCHEME = "s3://"
 LOCAL_SCHEME = "file://"
 
 
-def is_remote(archive: str) -> bool:
-    """Whether an archive location is object storage rather than a directory."""
-    return archive.startswith(ARCHIVE_SCHEME)
+def is_remote(published: str) -> bool:
+    """Whether a published location is object storage rather than a directory."""
+    return published.startswith(S3_SCHEME)
 
 
 # What may appear in a bucket name. Deliberately laxer than AWS's own rule —
@@ -324,8 +332,8 @@ def is_remote(archive: str) -> bool:
 _BUCKET_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_")
 
 
-def validate_archive(archive: str) -> None:
-    """Refuse an archive prefix that is not `s3://bucket[/prefix]` or
+def validate_published(published: str) -> None:
+    """Refuse a published prefix that is not `s3://bucket[/prefix]` or
     `file:///directory`.
 
     Checked where the caller hands one over, because nothing downstream can
@@ -333,7 +341,7 @@ def validate_archive(archive: str) -> None:
     POSITIONALLY, so a wrong shape does not fail, it means something else.
 
     The case that motivated this is a single missing slash.
-    `litestream_config` does `archive.removeprefix("s3://").partition("/")`, so
+    `litestream_config` does `published.removeprefix("s3://").partition("/")`, so
     `s3:/bucket/prefix` keeps its scheme, splits at the first slash, and yields
     the bucket `s3:` — which it writes into the config as `bucket: s3:`, a
     plain scalar ending in a colon. litestream then fails with
@@ -350,42 +358,42 @@ def validate_archive(archive: str) -> None:
     anything. Nothing here touches the network — whether the bucket EXISTS is a
     different question, answered by the operation that needs it.
     """
-    if archive.startswith(LOCAL_SCHEME):
-        if not archive.startswith(LOCAL_SCHEME + "/"):
+    if published.startswith(LOCAL_SCHEME):
+        if not published.startswith(LOCAL_SCHEME + "/"):
             msg = (
-                f"archive={archive!r} is not an absolute path. A local archive "
+                f"published={published!r} is not an absolute path. A local published table "
                 f"is `file:///absolute/directory`."
             )
             raise ValueError(msg)
 
         return
 
-    if not archive.startswith(ARCHIVE_SCHEME):
+    if not published.startswith(S3_SCHEME):
         # The near-miss first and by name. A caller who typed one slash is not
         # helped by being told the general rule; they are helped by being shown
         # their own string with the slash put back.
-        if archive.startswith("s3:"):
-            fixed = ARCHIVE_SCHEME + archive[len("s3:") :].lstrip("/")
+        if published.startswith("s3:"):
+            fixed = S3_SCHEME + published[len("s3:") :].lstrip("/")
             msg = (
-                f"archive={archive!r} is missing a slash after the scheme. "
+                f"published={published!r} is missing a slash after the scheme. "
                 f"Did you mean {fixed!r}?"
             )
             raise ValueError(msg)
 
         msg = (
-            f"archive must be an s3:// URI, not {archive!r}. It is the remote "
+            f"published table must be an s3:// URI, not {published!r}. It is the remote "
             f"prefix a log's data is published under — `s3://bucket` or "
             f"`s3://bucket/prefix` — and the log's own name is appended to it, "
             f"so the prefix names the DIRECTORY that holds the logs, not one "
-            f"log. A local one is `file:///directory`, and archive=None "
+            f"log. A local one is `file:///directory`, and published=None "
             f"publishes under the log's own directory."
         )
         raise ValueError(msg)
 
-    bucket, _, _ = archive.removeprefix(ARCHIVE_SCHEME).partition("/")
+    bucket, _, _ = published.removeprefix(S3_SCHEME).partition("/")
     if not bucket:
         msg = (
-            f"archive={archive!r} names no bucket. The form is "
+            f"published={published!r} names no bucket. The form is "
             f"`s3://bucket` or `s3://bucket/prefix`."
         )
         raise ValueError(msg)
@@ -393,7 +401,7 @@ def validate_archive(archive: str) -> None:
     if not set(bucket) <= _BUCKET_CHARS:
         bad = sorted(set(bucket) - _BUCKET_CHARS)
         msg = (
-            f"archive={archive!r} has {''.join(bad)!r} in its bucket name "
+            f"published={published!r} has {''.join(bad)!r} in its bucket name "
             f"{bucket!r}, which cannot appear in one. The form is "
             f"`s3://bucket` or `s3://bucket/prefix`."
         )

@@ -89,7 +89,7 @@ python -m litelink.migrate --root ./data --name trades --apply
 
 Data files are not touched or rewritten; only pointers move. 0.5.1's
 [RUNTIME.md](https://github.com/nhobin219/litelink/blob/v0.5.1/docs/RUNTIME.md#migrating-from-01)
-covers moving the archive's metadata, the shared WAL replica, and roots holding several
+covers moving the published table's metadata, the shared WAL replica, and roots holding several
 streams.
 
 ## End to end
@@ -126,7 +126,7 @@ streams.
   §4 step 1   with _lock:                   │    merge undersized runs
     lease.acquire() ─► lose? return         │    (intent → `compacting`)
     take (start, end) FROM THE QUEUE        │
-    claim_seal(start, end, path)            ├─ evict()   ← local_retention
+    claim_seal(start, end, path)            ├─ evict()   ← staging_retention
        └─ path recorded BEFORE the          │    drop files from the table,
           file exists  (I2)                 │    ENQUEUE their paths.
                                             │    never unlinks here
@@ -140,7 +140,7 @@ streams.
     NAME the extent's row          │
     lease.release()                   ▼
                     ┌─────────────────────────────┐
-                    │  local Iceberg table        │
+                    │  staging Iceberg table      │
                     │  (Parquet + SQLite catalog) │
                     └─────────────────────────────┘
 ```
@@ -153,14 +153,14 @@ Two different things get called "eviction". They happen in different roles:
 
 - **Buffer rows** are deleted by the **maintainer**, and WHEN depends on one setting.
   Without `wal_replication` they go at step 3 of a seal, once the Iceberg commit has
-  landed. With it, the seal keeps them and `sync` drops them once the archive holds the
+  landed. With it, the seal keeps them and `publish` drops them once the published table holds the
   range — a seal moves rows into a Parquet file no sidecar replicates, so deleting them
   earlier removes the only off-box copy (§3a). `WriteHandle._discard_on_seal` is the one place
   that decides. The appending call never does either. The delete takes the write lock
   briefly, so a concurrent append waits for it — but it is a delete by primary key, not
   work proportional to the seal.
 - **Parquet files** are removed from the table by the **maintainer** under
-  `local_retention`, and *unlinked* only later by `drain()`, once `snapshot_retention`
+  `staging_retention`, and *unlinked* only later by `drain()`, once `snapshot_retention`
   has passed.
 
 A file's path is written to SQLite **before** the file is created (`sealing`,
@@ -258,9 +258,9 @@ identical terms.
 
 ## Reading
 
-Reads never block the writer, and a read bounded inside the local window never touches the
-network. A scan unions up to three legs in DuckDB — the archive below the local table, the
-local Iceberg table, and the buffer's unsealed tail above its committed extent — so a row
+Reads never block the writer, and a read bounded inside the staging window never touches the
+network. A scan unions up to three legs in DuckDB — the published table below the staging table, the
+staging table, and the buffer's unsealed tail above its committed extent — so a row
 appears exactly once even though the tiers overlap by design. Which of the first two a query
 needs is decided per query from local statistics (#90; SPEC §7).
 
@@ -314,10 +314,10 @@ ratio: rows per file would swing with the data, and memory per file would be unb
 **Everything downstream is stated in the same currency.** A file's uncompressed size is
 recorded by the seal that measured it — the appender's own byte count for exactly those
 rows — carried in the buffer beside the file, added up across a merge, and dropped when the
-file is finally unlinked. Compaction and sync both read it, so neither ever compares a
+file is finally unlinked. Compaction and publish both read it, so neither ever compares a
 compressed size to a memory bound. That mistake is not hypothetical: measuring on disk, the
 system merged eight already-full files into one holding eight times the target and, because
-sync refuses anything compaction may still rewrite, archived nothing at all while doing it.
+publish refuses anything compaction may still rewrite, published nothing at all while doing it.
 A file whose size was never recorded counts as full, so an unmeasured file is never
 rewritten on a guess.
 
@@ -337,8 +337,8 @@ a run worth merging. It is a no-op the rest of the time — measured at 19.3 ms 
 files, which is the cost of *asking* (`data_files()` opens every manifest) rather than of
 doing.
 
-**Retention has two floors, and the looser one binds.** `local_retention` is a window in
-time, `local_rows` a count of recent rows, and which of them actually bounds local disk
+**Retention has two floors, and the looser one binds.** `staging_retention` is a window in
+time, `staging_rows` a count of recent rows, and which of them actually bounds local disk
 depends on a rate the library cannot know — an hour of a quiet stream is a handful of rows,
 an hour of a busy one is more disk than the machine has. Both say what must stay readable
 without a network round trip, so eviction keeps whichever retains MORE. That is the mirror
@@ -354,35 +354,35 @@ left the table, because that one is about readers still holding it (I6).
 "When it left the table" is the COMMIT, not the queueing, and the two are not the same
 moment. Files are queued before the commit that supersedes them, since a crash in between
 would lose the only record of their paths, so every supersession corrects the stamp
-afterwards — a merge, an archive rewrite, an eviction and both expiries. Left at the
+afterwards — a merge, a published rewrite, an eviction and both expiries. Left at the
 queueing, an operation slower than `snapshot_retention` spends the whole grace before it
 commits and the files fall due the instant they stop being referenced: measured at a five
 second retention, a reader 0.4 s old lost every file its snapshot named and failed
 mid-scan.
 
-**Sync holds back exactly what compaction might still rewrite**, which it decides by asking
+**Publish holds back exactly what compaction might still rewrite**, which it decides by asking
 compaction's own rule rather than a size of its own — a file pushed and then merged locally
-would leave the archive holding rows that have been rewritten underneath it, so the two
+would leave the published table holding rows that have been rewritten underneath it, so the two
 must agree, and the only way to guarantee that is to share the function. Disqualified are
 files in a run compaction would merge now, and files in the trailing run, which is under
 budget and so still has room for files not yet written.
 
 A small file in the middle is therefore pushed, not held. It can never grow — files are
 immutable and its neighbours are too big to merge with — so waiting achieves nothing.
-Holding it blocked the archive permanently: everything after it is newer, so the watermark
+Holding it blocked the published table permanently: everything after it is newer, so the watermark
 never advanced, and I4 pinned local disk with it.
 
-So the archive can gain one small file per explicit seal. `rewrite_archive` is the tool
+So the published table can gain one small file per explicit seal. `rewrite_published` is the tool
 for that, ad-hoc, and the same one that recompacts after a `target_compact_size` change.
 
 **What would change this.** Compaction rewriting everything downstream of an undersized
-file would keep the archive perfect — merging `[0.1][8][8]` and splitting at the cap moves
+file would keep the published table perfect — merging `[0.1][8][8]` and splitting at the cap moves
 the remainder to the tail, where an undersized file is allowed to be. It is not done
-online because the rewrite window is everything unarchived, so the work is largest exactly
-when sync is furthest behind, and it charges a full rewrite for a rare deliberate act.
+online because the rewrite window is everything unpublished, so the work is largest exactly
+when publish is furthest behind, and it charges a full rewrite for a rare deliberate act.
 
 That reasoning depends on `seal()` being exceptional. **If it turns out to be common in
-real use, small files will accumulate in the archive faster than anyone runs the offline
+real use, small files will accumulate in the published table faster than anyone runs the offline
 tool, and this belongs online after all.** It is a threshold change rather than a redesign:
 the mechanism is the same, only the trigger moves.
 
@@ -408,11 +408,11 @@ calls:
 - `append` / `extend`
 - `scan` / `sql`
 - `seal` / `seal_due` / `maintain`
-- `await_seal`, `table_rows`, `table_files`, `table_extent`, `end_offset`
+- `await_seal`, `staging_rows`, `staging_files`, `staging_extent`, `end_offset`
 
 **Not** concurrency-safe — call them when nothing else is using the log:
 
-- `set_config`, `set_archive`, `set_sort_by`
+- `set_config`, `set_published`, `set_sort_by`
 - `close`
 
 The first three mutate a SQLite row and a Python object together, and they are the only
@@ -496,11 +496,11 @@ independent connection over the same database, with its own registrations and vi
 costs 0.0055 ms.
 
 **Lock order**, for anyone adding one: `WriteHandle._lock` → `Reader._lock` →
-{`Archive._lock`, `LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
+{`Published._lock`, `LogTable._lock`, `Buffer._lock`, `Buffer._tail_lock`}. The leaves are never held while
 acquiring one another, and nothing below reaches back up, so there is no cycle to
 deadlock on. A read takes `Reader._lock` then briefly `LogTable._lock` and
 `Buffer._tail_lock`; a seal takes `Buffer._lock` and `LogTable._lock` at different
-moments and never together. `Archive._lock` guards the archive URI, its credentials and
+moments and never together. `Published._lock` guards the published URI, its credentials and
 the handle they open as one fact, so a re-point cannot race an open in flight and two
 threads cannot each pay the round trip; it is held across that open, and never while
 calling back into anything above it.
@@ -508,10 +508,10 @@ calling back into anything above it.
 **One extent, four states.** `extent` is the only record of where a range of the stream
 lives, and a row keeps its identity through every stage: open while the appender fills it,
 closed when the cut is frozen, named when the seal commits the file, and re-pointed at an
-S3 URI when `sync` pushes a second copy. `bytes` — what the appender counted those rows as
+S3 URI when `publish` pushes a second copy. `bytes` — what the appender counted those rows as
 in memory — is written once, at the cut, and carried by everything downstream: compaction
-adds up the runs it merges, `sync` copies the number to the archive's name for the file,
-and the archive rewrite sizes its merges from the same column. Nothing re-derives it,
+adds up the runs it merges, `publish` copies the number to the published table's name for the file,
+and the published rewrite sizes its merges from the same column. Nothing re-derives it,
 because nothing can: a Parquet footer records what the rows compressed from, not what they
 cost to hold, and Iceberg has no per-file field to keep it in — v2's data-file metadata is
 a fixed set with nothing user-extensible, and `add_files` cannot attach one.
@@ -553,7 +553,7 @@ for, while every byte-based check reports the buffer is fine. Compaction respect
 it would merge exactly the files a row cap just created straight back past it.
 
 Note the direction, which is the opposite of retention's. These are ceilings on one file
-and the tighter wins; `local_retention` and `local_rows` are floors on what stays readable
+and the tighter wins; `staging_retention` and `staging_rows` are floors on what stays readable
 and the looser wins.
 
 **One process per role is the deployable shape.** A seal is CPU-bound pure Python — most
@@ -572,7 +572,7 @@ and the metadata this library depends on is deleted through its own expiry queue
 
 **The passes are callable one at a time**, and worth doing when their costs diverge.
 Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
-finish in milliseconds; `sync` is the only one that can block on a network. `maintain()`
+finish in milliseconds; `publish` is the only one that can block on a network. `maintain()`
 runs the three local ones and is what most deployments want; `compact()`, `evict()` and
 `expire()` exist for the schedules it cannot express.
 
@@ -582,8 +582,8 @@ not a way around anything, and two maintainers working different parts of the lo
 wait for each other (§4a).
 
 Measured on the demo against local object storage, one pass: seal 0 ms, compact 147–920 ms,
-reclaim 20–400 ms, sync 11–712 ms. A combined number reports an S3 timeout as slow
-compaction, which is how an 83 s sync went unnoticed until the buffer had reached 170,540
+reclaim 20–400 ms, publish 11–712 ms. A combined number reports an S3 timeout as slow
+compaction, which is how an 83 s publish went unnoticed until the buffer had reached 170,540
 rows. `seal` reading 0 ms is the healthy case — the loop drains the queue every quarter
 second, so anything else means sealing fell behind.
 
@@ -608,13 +608,13 @@ An UNCORRELATED key costs twice, and neither cost shows up in a benchmark of the
   offset order, so reading from an offset needs a sort after reading rather than a scan.
   For a log this is the primary access pattern, which makes it the expensive half.
 
-Both are properties of the first seal, not of any later rewrite. `rewrite_archive` and
+Both are properties of the first seal, not of any later rewrite. `rewrite_published` and
 `compact` re-sort what they rewrite, exactly as a seal does — they neither introduce this
 nor repair it.
 
 ## Losing the machine
 
-Sealed data is in the archive once `sync` has pushed it. Everything else — rows that have
+Sealed data is in the published table once `publish` has pushed it. Everything else — rows that have
 not sealed yet, and the catalogs that say what the sealed files are — is SQLite on local
 disk, and a WAL-shipping sidecar is what gets it off the machine.
 
@@ -634,22 +634,22 @@ stream's own directory (SPEC §2).
 
 **`wal_retention` bounds how far BACK a restore can go**, and nothing else. A restore always
 recovers the latest replicated state; retention only trims point-in-time depth. Set it from
-the un-archived window — which `adsb/tail.py` shows as the gap between `stream rows` and
-`archived rows` — with margin. `write_replication_config()` emits it as a per-database
+the un-published window — which `adsb/tail.py` shows as the gap between `stream rows` and
+`published rows` — with margin. `write_replication_config()` emits it as a per-database
 `snapshot:` block, deriving `interval` as half the retention so the window can never hold
 zero snapshots. Leave it `None` for litestream's own defaults.
 
 **Three databases, not one.** `examples/adsb/replicate.py` generates the config from
 `LocalReadHandle.databases` rather than leaving it to be written by hand, because the set is not
 obvious and getting it wrong is silent: `buffer.db` holds rows no Parquet file has yet,
-`catalog.db` says which files the local table is made of, and `archive.db` says the same
-for the archive.
+`catalog.db` says which files the staging table is made of, and `published.db` says the same
+for the published table.
 
 That last one used to be justified as the only thing able to name the objects in S3. It is
-not: the archive publishes `version-hint.text` at every commit and names its own metadata.
+not: the published table publishes `version-hint.text` at every commit and names its own metadata.
 It stays in the set for the SAME-machine case, where it saves a round trip — and a failover
 deliberately does NOT restore it, because a stale copy wins over the bucket's own pointer.
-See "Failing over". `archive.db` is created on first use, so a log that has never opened its archive has
+See "Failing over". `published.db` is created on first use, so a log that has never opened its published table has
 none to restore, and a restore procedure has to tolerate that.
 
 **The config enables the sidecar's control socket.** `retire()` asks the running sidecar to
@@ -668,9 +668,9 @@ region against real AWS unless the replica names one, so against anything else i
 with "cannot lookup bucket region" while the credentials it needs sit unused in the
 environment.
 
-**The archive says where its own metadata is.** Every archive commit writes
+**The published table says where its own metadata is.** Every published commit writes
 `version-hint.text` beside the metadata JSONs it names, which is what makes a bucket
-recoverable without the local root and a re-point reversible — `archive.db`'s catalog row
+recoverable without the local root and a re-point reversible — `published.db`'s catalog row
 is otherwise the only pointer to the current metadata, and re-pointing drops it. An engine
 with no catalog at all reads the prefix directly:
 
@@ -706,7 +706,7 @@ points into the dead machine's filesystem. It is not particular to sealed logs e
 same way. What the measurement above actually exercised was a restore back onto the SAME
 paths.
 
-Failing over to another box therefore rebuilds the local table rather than restoring it —
+Failing over to another box therefore rebuilds the staging table rather than restoring it —
 `litelink.restore` — and `catalog.db` stays in the replication set because same-machine
 recovery, where those paths still resolve, is exactly where it is the only record of which
 Parquet the table is made of.
@@ -714,23 +714,23 @@ Parquet the table is made of.
 ### Failing over
 
 ```python
-log = litelink.restore("/data", "positions", archive="s3://bucket/prefix")
+log = litelink.restore("/data", "positions", published="s3://bucket/prefix")
 print(log.recovery())      # what came back, and which offsets were skipped
 ```
 
 One call. It refuses a root that already holds this log, or whose
 `litestream.yml` replicates a different one; writes the config from the layout
 alone — which is the chicken-and-egg, since you need the config to name the
-databases you are restoring; restores `buffer.db`; rebuilds the local Iceberg
-table empty; drops what described the dead machine; adopts the archive through
+databases you are restoring; restores `buffer.db`; rebuilds the staging
+table empty; drops what described the dead machine; adopts the published table through
 `version-hint.text`; and reserves an offset gap.
 
-**`archive.db` is not restored, deliberately.** It is replicated and it is
+**`published.db` is not restored, deliberately.** It is replicated and it is
 machine-independent — but it is *time*-dependent, and stale is worse than
-absent here. `open_archive` reads `version-hint.text` only when the catalog has
-no row, so a stale row wins over the bucket's own pointer: measured, one archive
+absent here. `open_published` reads `version-hint.text` only when the catalog has
+no row, so a stale row wins over the bucket's own pointer: measured, one published
 file reported where the bucket held five, and a union reading 261 rows instead
-of 1061. The next sync then commits onto that lineage and republishes the hint
+of 1061. The next publish then commits onto that lineage and republishes the hint
 over the fork, destroying the pointer the next recovery would need. `restore`
 drops any entry it finds before opening, so a hand restore of all three gets the
 same protection.
@@ -746,13 +746,13 @@ than free of gaps. So 2²⁰ offsets are skipped, and `recovery()` reports which
 **What is not recovered:** rows appended inside the replication lag. They are
 gone, and no mechanism here returns them — that is the RPO the sidecar's
 replication lag sets. Everything below the seal frontier comes back, including
-the sealed-but-unsynced band, because a seal keeps its rows until the archive
+the sealed-but-unsynced band, because a seal keeps its rows until the published table
 has them.
 
 **Split-brain is not detected.** If the primary is not actually dead you have
-two writers on one archive, and if both replicate, two litestream instances on
+two writers on one published table, and if both replicate, two litestream instances on
 one replica path — the thing litestream is explicit about. Nothing here checks
-it; §13's archive-identity token is what would.
+it; §13's published-identity token is what would.
 
 ## Operating it
 

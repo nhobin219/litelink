@@ -1,7 +1,7 @@
 """The core append-only stream.
 
-A `WriteHandle` is one stream: one SQLite buffer, one local Iceberg table, and
-optionally one archive table (SPEC §1). Rows are durable at commit and
+A `WriteHandle` is one stream: one SQLite buffer, one staging table, and
+optionally one published table (SPEC §1). Rows are durable at commit and
 queryable immediately; `offset` is assigned by the library and is the only
 column it owns (§2, I11).
 
@@ -33,7 +33,6 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from pyiceberg.exceptions import TableAlreadyExistsError
 
-from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import (
     SCHEMA_KEY,
     SORT_KEY,
@@ -46,13 +45,14 @@ from litelink._buffer import (
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
 from litelink._fs import write_parquet
-from litelink._layout import Layout, is_remote, validate_archive
+from litelink._layout import Layout, is_remote, validate_published
 from litelink._maintenance import (
     CONFIG_KEY,
     Maintenance,
     checkpoint,
     stable_prefix,
 )
+from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import flush, litestream_config, restore_buffer
 from litelink._s3 import S3Options
@@ -62,24 +62,24 @@ from litelink._statistics import (
     _from_rows,
     _offsets,
     above,
-    below_local,
-    local_span,
+    below_staging,
     rollup,
+    staging_span,
     uncounted,
     whole_log,
 )
 from litelink._table import (
     RETIRED_PROPERTY,
     LogTable,
-    archive_columns,
-    archive_extent,
-    archive_retired,
-    forget_archive_entry,
+    forget_published_entry,
+    published_columns,
+    published_extent,
+    published_retired,
 )
-from litelink._tiers import ARCHIVE as ARCHIVE_TIER
-from litelink._tiers import LOCAL as LOCAL_TIER
+from litelink._tiers import PUBLISHED as PUBLISHED_TIER
+from litelink._tiers import STAGING as STAGING_TIER
 from litelink._tiers import UNKNOWN as UNKNOWN_TIER
-from litelink._tiers import ArchiveTier, StoredTiers, empty
+from litelink._tiers import PublishedTier, StoredTiers, empty
 from litelink._tiers import encode as encode_tier
 from litelink._types import NON_FINITE, column_type, validate_schema
 
@@ -129,8 +129,8 @@ INGEST_ROLE = "ingest"
 
 # One home, in `_maintenance`, because eviction reads it too.
 _CONFIG_KEY = CONFIG_KEY
-# One home, in `_archive`, because `evict` reads it too.
-_ARCHIVE_KEY = ARCHIVE_KEY
+# One home, in `_published`, because `evict` reads it too.
+_PUBLISHED_KEY = PUBLISHED_KEY
 # One home, in `_buffer`, because the buffer is what reads it per call — it
 # owns `meta`, and `shape()` is where every holder of the schema now gets it.
 _SCHEMA_KEY = SCHEMA_KEY
@@ -141,11 +141,11 @@ _START_OFFSET_KEY = START_OFFSET_KEY
 # Not a duplicate of the Iceberg sort order — a fact the local CATALOG carries
 # and nothing else does. `catalog.db` is replicated but cannot be restored onto
 # another machine (it records absolute paths to local metadata no sidecar
-# ships), so a failover rebuilds the local table rather than restoring it, and
-# has to be told what order to declare. `open_archive` never declared one
-# either, so the archive could not answer it.
+# ships), so a failover rebuilds the staging table rather than restoring it, and
+# has to be told what order to declare. `open_published` never declared one
+# either, so the published table could not answer it.
 #
-# One home, in `_buffer`, because the seal, compaction and the archive all read
+# One home, in `_buffer`, because the seal, compaction and the published table all read
 # it too — see `Buffer.sort_by`.
 _SORT_KEY = SORT_KEY
 
@@ -332,19 +332,20 @@ class _Recovery:
 
     recovered: int
     resumed_at: int
+    # `[start, end)`, half-open like every range litelink reports.
     skipped: tuple[int, int]
 
 
-def _foreign_archive(archive: str) -> ValueError:
-    """This log has no record of pushing to an archive that already holds data.
+def _foreign_published(published: str) -> ValueError:
+    """This log has no record of pushing to a published table that already holds data.
 
     Which makes it another log's. Two logs of the same name both start at
     offset 1, so the ranges cannot tell them apart — what can is that a log
-    which pushed to an archive keeps its `extent` rows naming that prefix, even
+    which pushed to a published table keeps its `extent` rows naming that prefix, even
     across a detach (§4a). No rows, data present: not ours.
     """
     return ValueError(
-        f"the archive at {archive!r} holds data this log has no record of pushing, "
+        f"the published table at {published!r} holds data this log has no record of pushing, "
         f"so it belongs to another log. Attaching it would let its contents be read "
         f"as this log's own, push nothing, and pin eviction — silently. To resume "
         f"that log here use litelink.restore; to start a new one, point at an unused "
@@ -375,11 +376,14 @@ def legacy_layout(layout: Layout, why: str = "") -> str:
     )
 
 
-def _inclusive(span: tuple[int, int]) -> tuple[int, int] | None:
-    """A stored `[start, end)` as an inclusive range, or None when empty."""
-    start, end = span
+def _span(start: int, end: int) -> tuple[int, int] | None:
+    """`[start, end)`, or None when it holds nothing."""
+    return None if end <= start else (start, end)
 
-    return None if end <= start else (start, end - 1)
+
+def _half_open(extent: tuple[int, int] | None) -> tuple[int, int] | None:
+    """An inclusive `(lo, hi)` extent as `[lo, hi + 1)`."""
+    return None if extent is None else (extent[0], extent[1] + 1)
 
 
 def _now() -> str:
@@ -388,17 +392,17 @@ def _now() -> str:
 
 
 def _repointed_mid_push() -> RuntimeError:
-    """The log was pointed at another archive while a sync was pushing.
+    """The log was pointed at another published table while a publish was pushing.
 
     A push can outlive its lease — a register alone measured 4.1 s against S3,
     and retries compound it — so the re-point that races it took the lease
     lawfully. Nothing here is corrupt; the watermark this push earned simply
-    describes an archive the log has left, and recording it would tell eviction
-    (I4) that the new archive holds rows it has never been sent.
+    describes a published table the log has left, and recording it would tell eviction
+    (I4) that the new published table holds rows it has never been sent.
     """
     return RuntimeError(
-        "the archive was re-pointed while this sync was pushing; its watermark "
-        "belongs to the previous archive and is not recorded"
+        "the published table was re-pointed while this publish was pushing; its watermark "
+        "belongs to the previous published table and is not recorded"
     )
 
 
@@ -437,18 +441,20 @@ def _scan_query(
 
 @dataclass(frozen=True, slots=True)
 class Coverage:
-    """Where each tier sits in the log, as inclusive `(lo, hi)` offset ranges.
+    """Where each tier sits in the log, as half-open `[start, end)` offset
+    ranges — the convention of the stored tier offsets and `litelink.manifest`.
 
-    The ranges partition the log, as `column_statistics`' tiers do: `archive`
-    is what only the archive holds — below the local table — `local` is the
-    local table, and `buffer` is the buffered rows above every file. None for a
-    tier holding nothing. The lowest offset any of them reports is where the
-    log starts; the lowest of `local` and `buffer` is how far back a read can
-    go without the archive.
+    The ranges partition the log, as `column_statistics`' tiers do: `published`
+    is what only the published table holds — below the staging table — `staging`
+    is the staging table, and `buffer` is the buffered rows above every file.
+    None for a tier holding nothing. The lowest offset any of them reports is
+    where the log starts, and the highest `end` is the offset after its last
+    buffered or published row; the lowest of `staging` and `buffer` is how far
+    back a read can go without the published table.
     """
 
-    archive: tuple[int, int] | None
-    local: tuple[int, int] | None
+    published: tuple[int, int] | None
+    staging: tuple[int, int] | None
     buffer: tuple[int, int] | None
 
 
@@ -456,24 +462,24 @@ class LogHandle:
     """Everything you can ask a log without writing to it.
 
     Every handle is on the primary, the host that holds the log's directory:
-    it reads the buffer, the local table and — when asked — the archive, and
+    it reads the buffer, the staging table and — when asked — the published table, and
     sees the writer's commits as they land. Reading a log from another machine
-    is any Iceberg engine over its archive, not a litelink handle (#90); the
+    is any Iceberg engine over its published table, not a litelink handle (#90); the
     `follow`/`snapshot` readers that once did it are gone.
 
     **Which tiers a read touches is decided per query, from what it asks
-    for** (#90). Every read takes the buffer and the local table; the archive
-    is read only when the bounds `sync` records locally for each archive file
-    say one below the local table could hold a matching row. A read bounded
-    inside the local window stays on local disk (I5), and one that reaches
+    for** (#90). Every read takes the buffer and the staging table; the published table
+    is read only when the bounds `publish` records locally for each published file
+    say one below the staging table could hold a matching row. A read bounded
+    inside the staging window stays on local disk (I5), and one that reaches
     back reads history — because the whole log is the right answer to it.
 
     That reverses 0.4.0, deliberately. 0.4.0 fixed the tiers at assembly with
     `include_archive`, so a `scan` would not start touching the network
     because eviction happened to run; the price was that the caller named a
-    tier, and a handle without the archive answered short for any query that
-    reached below the local window. Now latency follows the predicate rather
-    than the handle: the same query reads the archive once eviction has moved
+    tier, and a handle without the published table answered short for any query that
+    reached below the staging window. Now latency follows the predicate rather
+    than the handle: the same query reads the published table once eviction has moved
     the rows it asks for there.
     """
 
@@ -483,13 +489,13 @@ class LogHandle:
         layout: Layout,
         table: LogTable,
         buffer: Buffer,
-        archive: Archive,
+        published: Published,
         reader: Reader,
     ) -> None:
         self._layout = layout
         self._table = table
         self._buffer = buffer
-        self._archive = archive
+        self._published = published
         self._reader = reader
 
     # -- identity ----------------------------------------------------------
@@ -526,14 +532,14 @@ class LogHandle:
         return self._buffer.schema
 
     @property
-    def archive(self) -> str:
-        """Where the archive is: `s3://…`, or a `file://` directory — by
+    def published(self) -> str:
+        """Where the published table is: `s3://…`, or a `file://` directory — by
         default under the log's own, for a log given no remote one (#98).
 
         Read from `meta` on every access, so a caller cannot disagree with the
         log about it.
         """
-        return self._archive.uri
+        return self._published.uri
 
     # -- read --------------------------------------------------------------
 
@@ -544,7 +550,7 @@ class LogHandle:
         where: str | None = None,
         start_offset: int | None = None,
         end_offset: int | None = None,
-        archive: bool = True,
+        published: bool = True,
     ) -> pa.RecordBatchReader:
         """Read the log as one relation, newest data included.
 
@@ -554,8 +560,8 @@ class LogHandle:
         exactly once.
 
         Which tiers, and therefore whether this touches the network, follows
-        from `where` and the offset bounds: the archive is read only when a
-        file of it below the local table could hold a matching row.
+        from `where` and the offset bounds: the published table is read only when a
+        file of it below the staging table could hold a matching row.
 
         **`start_offset`/`end_offset` are the only bounds that can skip the
         buffer.** It keeps no column statistics, but its offsets are a known
@@ -563,9 +569,9 @@ class LogHandle:
         reads it. A `where` on any other column still reads it. The same holds
         for a `litelink_offset` comparison in `where` or in `sql`.
 
-        `archive=False` never reads the archive: the result is what the local
-        table and the buffer hold, and rows only the archive has are left out
-        rather than refused. `coverage(archive=False)` says where that floor
+        `published=False` never reads the published table: the result is what the staging
+        table and the buffer hold, and rows only the published table has are left out
+        rather than refused. `coverage(published=False)` says where that floor
         is, without the network either.
 
         Always bound on a LEADING column of `sort_by`. §7 measures a
@@ -584,28 +590,28 @@ class LogHandle:
                 start_offset=start_offset,
                 end_offset=end_offset,
             ),
-            archive=archive,
+            published=published,
         )
 
-    def sql(self, query: str, *, archive: bool = True) -> pa.RecordBatchReader:
+    def sql(self, query: str, *, published: bool = True) -> pa.RecordBatchReader:
         """Run arbitrary DuckDB SQL against the log, exposed as `log`.
 
         The escape hatch for what `scan` cannot express. Quote
         `"litelink_offset"` — it is a DuckDB reserved word.
 
-        Reads the archive only when the query could match a row of it; see
+        Reads the published table only when the query could match a row of it; see
         `LogHandle`. Only a single SELECT over `log` with AND-ed comparisons
         in its WHERE is narrowed — any other shape reads every tier, which is
         always correct and only slower.
 
-        `archive=False` never reads the archive, as for `scan`.
+        `published=False` never reads the published table, as for `scan`.
         """
         try:
             # No lock. `Reader` guards its own connection and `LogTable` its
             # own cache, both briefly.
-            return self._reader.query(query, archive=archive)
+            return self._reader.query(query, published=published)
         except FileNotFoundError as exc:
-            # Narrow: the race where a concurrent `sync` sweeps the metadata
+            # Narrow: the race where a concurrent `publish` sweeps the metadata
             # JSON this read resolved before it loaded it. pyiceberg raises
             # `FileNotFoundError` there.
             #
@@ -614,11 +620,11 @@ class LogHandle:
             # `OSError` (NETWORK_CONNECTION) and bad credentials raise `OSError`
             # (ACCESS_DENIED). Neither is mislabelled "reassemble".
             #
-            # It does NOT cover the archive's data files or manifests. A
+            # It does NOT cover the published table's data files or manifests. A
             # missing data file surfaces as `HTTPException` inside `execute`,
             # and a missing manifest can abort the process outright — DuckDB's
             # iceberg extension calls `std::terminate` — which is pre-existing
-            # and reaches an ordinary local read of an archive too. Neither is
+            # and reaches an ordinary local read of a published table too. Neither is
             # catchable here.
             #
             # "Can", not "does": that abort was observed on a COLD read. A
@@ -633,26 +639,26 @@ class LogHandle:
     def end_offset(self) -> int:
         """The offset after the last row this reader can see.
 
-        **Which tier answers depends on whether the archive is load-bearing.**
+        **Which tier answers depends on whether the published table is load-bearing.**
         With local files, `sqlite_sequence` is authoritative: it is the offset
         the next append receives, and nothing below it is missing, because the
-        local table holds whatever the buffer has sealed. That keeps this a
+        staging table holds whatever the buffer has sealed. That keeps this a
         cheap SQLite read on the writer's own log.
 
-        With an empty local table — a log evicted dry — it is not authoritative,
+        With an empty staging table — a log evicted dry — it is not authoritative,
         and this is where a replica-restored reader once bit. `next_offset` reads a sequence its own docstring
         calls "the highest value ever assigned and never lowers", so it keeps
         counting rows the replica no longer carries: a seal taken while
         `_discard_on_seal()` was true deletes its rows and they reach the
-        archive only at the next `sync`. In between they are in neither tier.
+        published table only at the next `publish`. In between they are in neither tier.
 
         Measured on such a reader in that window: it served 864 rows and
         reported 1,501, and a caller using this as a resume cursor skipped 636
-        rows permanently once the primary synced. Over-reporting loses data;
+        rows permanently once the primary published. Over-reporting loses data;
         under-reporting only re-delivers. So the answer is taken from the
         tiers that actually hold rows, which is `litelink.restore`'s formula.
         """
-        if not self._archive_required():
+        if not self._published_required():
             return self._buffer.next_offset()
 
         buffered = self._buffer.extent()
@@ -664,13 +670,13 @@ class LogHandle:
     def buffered_rows(self) -> int:
         """Rows durable in the buffer but not yet sealed.
 
-        Counted against the local table's boundary rather than by asking the
+        Counted against the staging table's boundary rather than by asking the
         buffer how many rows it holds, because a seal LEAVES its rows there
         when `wal_replication` is on (§3a) — the buffer is the off-box copy
-        until the archive has the range, so its row count is not the unsealed
+        until the published table has the range, so its row count is not the unsealed
         tail.
 
-        **Through `table_extent`, which reloads.** `LogTable.extent` compares
+        **Through `staging_extent`, which reloads.** `LogTable.extent` compares
         against this handle's in-memory `metadata_location` and resolves
         nothing, so reading it directly pins the boundary to whatever snapshot
         was last loaded and every row another process has since sealed still
@@ -681,57 +687,61 @@ class LogHandle:
 
         A refactor inlined this method's body minus the reload, and it hid
         because every other observation here reloads — `examples/adsb/tail.py`
-        only reads the right number because it happens to call `table_rows()`
+        only reads the right number because it happens to call `staging_rows()`
         first in the same tuple.
         """
-        extent = self.table_extent()
+        self._table.reload()
+        extent = self._table.extent()
 
         return self._buffer.count_above(0 if extent is None else extent[1])
 
-    def table_rows(self) -> int:
-        """Rows in the local Iceberg table, from the manifests."""
+    def staging_rows(self) -> int:
+        """Rows in the staging table, from the manifests."""
         self._table.reload()
 
         return self._table.record_count()
 
-    def table_files(self) -> int:
-        """Data files in the local table — what compaction is bringing down."""
+    def staging_files(self) -> int:
+        """Data files in the staging table — what compaction is bringing down."""
         self._table.reload()
 
         return self._table.file_count()
 
-    def table_extent(self) -> tuple[int, int] | None:
-        """`(lo, hi)` offset extent of the local table, from statistics (§7)."""
+    def staging_extent(self) -> tuple[int, int] | None:
+        """The staging table's offsets as `[start, end)`, from statistics (§7).
+
+        Half-open, like `coverage()` and the stored tier offsets.
+        """
         self._table.reload()
 
-        return self._table.extent()
+        return _half_open(self._table.extent())
 
-    def archived_through(self) -> int:
-        """Highest offset the archive is known to hold, 0 if none (§5, I4).
+    def published_through(self) -> int:
+        """Highest offset the published table is known to hold, 0 if none (§5, I4).
 
         The log's own cached watermark, not a network read — the same `meta`
         row eviction consults so it can ask a keyed read instead of a round
-        trip. `coverage()` gives the archive's range below the local table.
+        trip. `coverage()` gives the published table's range below the staging table.
         """
-        recorded = self._buffer.get_meta(Maintenance.ARCHIVED_KEY)
+        recorded = self._buffer.get_meta(Maintenance.PUBLISHED_THROUGH_KEY)
 
         return 0 if recorded is None else int(recorded)
 
-    def archive_files(self) -> int:
-        """How many data files the archive holds, or 0 before its first sync.
+    def published_files(self) -> int:
+        """How many data files the published table holds, or 0 before its first publish.
 
-        A network round trip, unlike `table_files()`.
+        A network round trip, unlike `staging_files()`.
         """
-        archive = self._archive.table()
-        if archive is None:
+        published = self._published.table()
+        if published is None:
             return 0
 
         try:
-            archive.reload()
+            published.reload()
 
-            return len(archive.data_files())
+            return len(published.data_files())
         except FileNotFoundError as exc:
-            # The same refusal every other archive-touching member gives. This
+            # The same refusal every other published-touching member gives. This
             # was the one that escaped the conversion and raised a bare
             # `FileNotFoundError` naming an S3 key — loud either way, but a
             # caller handling "the snapshot was swept" should not have to
@@ -744,12 +754,12 @@ class LogHandle:
         The tiers partition the log — each row counted in exactly one — and
         together they are `tier=None`, the whole log:
 
-        - `"local"`: the local Iceberg table's current snapshot.
-        - `"archive"`: what the archive holds BELOW the local table, the rows
-          eviction moved there. Not the archive's copy of the local window,
-          which `"local"` already counts. Read from the archive's manifests,
+        - `"staging"`: the staging table's current snapshot.
+        - `"published"`: what the published table holds BELOW the staging table, the rows
+          eviction moved there. Not the published table's copy of the staging window,
+          which `"staging"` already counts. Read from the published table's manifests,
           so it asks the network. A log with nothing local (retired, or
-          evicted dry) has the whole archive here.
+          evicted dry) has the whole published table here.
         - `"buffer"`: the buffered rows above every file, counted from the
           rows themselves.
 
@@ -757,16 +767,16 @@ class LogHandle:
         no file holds yet, are counted directly. A consumer prunes on this, so
         missing information is None rather than a narrower bound — see
         `ColumnStatistics` for exactly when, including why a float's bounds say
-        nothing about NaN and why strings carry none. An archive file that
-        straddles the local range (only `rewrite_archive` cuts one) makes
-        every count None in `"archive"` and in the whole log: its bounds hold,
+        nothing about NaN and why strings carry none. A published file that
+        straddles the local range (only `rewrite_published` cuts one) makes
+        every count None in `"published"` and in the whole log: its bounds hold,
         but its rows cannot be counted once without opening it.
         """
-        if tier is not None and tier not in ("local", "archive", "buffer"):
-            msg = f"tier must be 'local', 'archive', 'buffer' or None, not {tier!r}"
+        if tier is not None and tier not in ("staging", "published", "buffer"):
+            msg = f"tier must be 'staging', 'published', 'buffer' or None, not {tier!r}"
             raise ValueError(msg)
 
-        if tier == "local":
+        if tier == "staging":
             # Through the cache routing uses, so the same snapshot is rolled
             # up once whichever asks first.
             self._table.reload()
@@ -776,33 +786,33 @@ class LogHandle:
                 # The table moved between the reload and the ask: roll up the
                 # snapshot it is at now.
                 self._table.reload()
-                return rollup("local", *self._table.live_files())
+                return rollup("staging", *self._table.live_files())
 
             return found
 
         # The order a read resolves its legs in, and for the same reason. The
         # buffer FIRST: a seal lands its file and then deletes the rows, so a
         # row it moves afterwards is in the local snapshot taken next. The
-        # archive LAST: eviction follows registration (I4), so an archive
+        # published table LAST: eviction follows registration (I4), so a published
         # snapshot taken after the local one holds everything the local one
         # has already given up.
         buffered = self._buffer.rows_above(None)
         self._table.reload()
         local_schema, local_files = self._table.live_files()
-        span = local_span(local_schema, local_files)
+        span = staging_span(local_schema, local_files)
 
         if tier == "buffer" and span is not None:
-            # With local files, nothing in the archive reaches above them, so
+            # With local files, nothing in the published table reaches above them, so
             # the buffer's part needs no network read.
             ceiling = 0 if span is None else span[1]
             return self._retier("buffer", _from_rows(above(buffered, ceiling)))
 
         remote = None
-        archive = self._archive.table()
-        if archive is not None:
+        published = self._published.table()
+        if published is not None:
             try:
-                archive.reload()
-                remote = archive.live_files()
+                published.reload()
+                remote = published.live_files()
             except FileNotFoundError as exc:
                 raise self._swept(exc) from exc
 
@@ -818,17 +828,17 @@ class LogHandle:
         straddles = False
         ceiling = 0 if span is None else span[1]
         if remote is not None:
-            beyond, straddles = below_local(span, remote[0], remote[1])
+            beyond, straddles = below_staging(span, remote[0], remote[1])
             ceiling = max([ceiling, *(_offsets(remote[0], f)[1] for f in beyond)])
 
         if tier == "buffer":
             return self._retier("buffer", _from_rows(above(buffered, ceiling)))
 
         if remote is None:
-            msg = f"log {self.name!r} has no archive to take statistics from"
+            msg = f"log {self.name!r} has no published table to take statistics from"
             raise ValueError(msg)
 
-        found = rollup("archive", remote[0], beyond)
+        found = rollup("published", remote[0], beyond)
 
         return uncounted(found) if straddles else found
 
@@ -841,27 +851,27 @@ class LogHandle:
             columns=statistics.columns,
         )
 
-    def coverage(self, *, archive: bool = True) -> Coverage:
+    def coverage(self, *, published: bool = True) -> Coverage:
         """Each tier's offset range, from the offsets the log keeps — no network.
 
         `litelink_offset` is the log's own sequence, dense and monotonic across
         the tiers, so each tier is fully described by where it starts and ends.
-        Those are kept already, for routing (#90): the archive's range and the
-        local table's are stored in `buffer.db`, and the buffer's are its own
+        Those are kept already, for routing (#90): the published table's range and the
+        staging table's are stored in `buffer.db`, and the buffer's are its own
         indexed `min` and `max`. So this is one SQLite read and two edge seeks,
         against `column_statistics`' walk of every manifest.
 
         The local range is the stored one when it was stamped with the
         version the table is at, and the snapshot's own extent otherwise —
         cached per version, so a commit costs one manifest walk per process at
-        most. The archive's range is read from its manifests only when the log
+        most. The published table's range is read from its manifests only when the log
         has no stored row yet: a log written before the row existed and not
         yet backfilled, or one just re-pointed. That is the one case this
         touches the network, and it is never answered wrongly instead.
 
-        `archive=False` is for a caller that will not read the archive — a
-        replay held to the local floor, `min(local[0], buffer[0])`. Its
-        `archive` is None, meaning "not asked" rather than "empty", and nothing
+        `published=False` is for a caller that will not read the published table — a
+        replay held to the staging floor, `min(staging[0], buffer[0])`. Its
+        `published` is None, meaning "not asked" rather than "empty", and nothing
         but local disk is opened, so the fallback above cannot reach the network.
 
         A gap — offsets assigned but in no tier — is not reported. On the
@@ -872,43 +882,44 @@ class LogHandle:
         self._table.reload()
         location, extent = self._table.snapshot()
 
-        cached = stored.get(LOCAL_TIER)
+        # Everything here is `[start, end)`. The stored rows already are; the
+        # snapshot's extent and the buffer's are inclusive, and converted once.
+        cached = stored.get(STAGING_TIER)
         if cached is not None and cached.version == location:
-            local = _inclusive(cached.offsets)
+            local = _span(*cached.offsets)
         else:
-            local = extent
+            local = _half_open(extent)
 
-        archive_row = stored.get(ARCHIVE_TIER)
-        if archive_row is not None:
-            below = _inclusive(archive_row.offsets)
-        elif archive:
-            below = self._archive_below(local)
+        published_row = stored.get(PUBLISHED_TIER)
+        if published_row is not None:
+            below = _span(*published_row.offsets)
+        elif published:
+            below = self._published_below(local)
         else:
             below = None
 
-        held = self._buffer.extent()
+        held = _half_open(self._buffer.extent())
         ceiling = max((r[1] for r in (below, local) if r is not None), default=0)
-        buffer = (
-            None
-            if held is None or held[1] <= ceiling
-            else (max(held[0], ceiling + 1), held[1])
+        buffer = None if held is None else _span(max(held[0], ceiling), held[1])
+
+        return Coverage(
+            published=below if published else None, staging=local, buffer=buffer
         )
 
-        return Coverage(archive=below if archive else None, local=local, buffer=buffer)
+    def _published_below(self, local: tuple[int, int] | None) -> tuple[int, int] | None:
+        """The published table's `[start, end)` below the staging table, read
+        from its manifests.
 
-    def _archive_below(self, local: tuple[int, int] | None) -> tuple[int, int] | None:
-        """The archive's range below the local table, read from its manifests.
-
-        The fallback for a log with no stored archive row. A file straddling the
-        local table's first offset counts whole, as everywhere else.
+        The fallback for a log with no stored published row. A file straddling the
+        staging table's first offset counts whole, as everywhere else.
         """
         try:
-            archive = self._archive.table()
-            if archive is None:
+            published = self._published.table()
+            if published is None:
                 return None
 
-            archive.reload()
-            schema, files = archive.live_files()
+            published.reload()
+            schema, files = published.live_files()
         except FileNotFoundError as exc:
             raise self._swept(exc) from exc
 
@@ -917,7 +928,8 @@ class LogHandle:
         if not below:
             return None
 
-        return min(lo for lo, _ in below), max(hi for _, hi in below)
+        # `_offsets` is inclusive; the range is `[start, end)`.
+        return min(lo for lo, _ in below), max(hi for _, hi in below) + 1
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -940,52 +952,52 @@ class LogHandle:
 
     # -- internals ---------------------------------------------------------
 
-    def _archive_required(self) -> bool:
-        """Whether the archive is the only source of this log's archived rows.
+    def _published_required(self) -> bool:
+        """Whether the published table is the only source of this log's published rows.
 
-        True when the local table holds nothing and the archive holds
+        True when the staging table holds nothing and the published table holds
         something. Both halves are asked directly, and the ORDER is what keeps
         a hot read local: the table is checked first, from manifest statistics
         already on disk, so a log with local files answers False without
         touching the network. I5 protects a read that HAS local disk to serve;
         one with none faces a metadata GET or silently wrong results.
 
-        **Do not reintroduce a local proxy for "the archive holds rows". This
+        **Do not reintroduce a local proxy for "the published table holds rows". This
         has now been wrong three times, each time in the silent direction.**
 
-        - Keying on the empty table alone demanded an archive from a log
-          created with one and never synced, refusing a first read that should
+        - Keying on the empty table alone demanded a published table from a log
+          created with one and never published, refusing a first read that should
           simply have served the buffer.
-        - Adding `archived_through() > 0` fixed that and broke re-pointing:
+        - Adding `published_through() > 0` fixed that and broke re-pointing:
           `_repoint` deliberately zeroes that watermark when the location
           moves, and a detach-and-reattach is two moves, so a log returning to
-          the archive it just left reads 0 while the bucket still holds
+          the published table it just left reads 0 while the bucket still holds
           everything. Measured on an evicted log: `scan()` returned 550 of
           4,000 rows with no error, and `coverage()` called it gap-free.
         - Replacing it with a durable marker `follow` wrote made the local
           eviction case unreachable, which hid a real defect behind what looked
           like a design boundary.
 
-        The archive is the authority on what the archive holds, and it is asked
-        through the RESOLVING read. A first version asked `Archive.table()`
+        The published table is the authority on what the published table holds, and it is asked
+        through the RESOLVING read. A first version asked `Published.table()`
         directly, on the theory that the cached handle cost one metadata
-        resolve and no more. That was the fourth wrong proxy: `Archive.table`
+        resolve and no more. That was the fourth wrong proxy: `Published.table`
         returns its handle unchanged while the URI matches, and `LogTable.extent`
         short-circuits on an unchanged `metadata_location`, so a handle first
-        touched while the archive table EXISTED BUT WAS EMPTY answered None for
+        touched while the published table EXISTED BUT WAS EMPTY answered None for
         the rest of its life.
 
-        That state is ordinary — `sync` creates the table on a maintenance tick
-        before anything is sealed, and `set_archive` creates one at a new
+        That state is ordinary — `publish` creates the table on a maintenance tick
+        before anything is sealed, and `set_published` creates one at a new
         prefix — and one early call was enough to pin it: a `scan`, an
         `end_offset`, even a bare metadata poll. The handle then served the
         buffer alone with no error while `coverage()`, which does resolve,
         reported the same log gap-free. Measured: 0 of 20 rows, indefinitely,
         on both a reader and a writer.
 
-        So the cost is archive metadata GETs on a read of a log with an empty
-        local table — two of them, since the read that follows resolves the
-        archive again for its own bounds, and an earlier version of this
+        So the cost is published metadata GETs on a read of a log with an empty
+        staging table — two of them, since the read that follows resolves the
+        published table again for its own bounds, and an earlier version of this
         docstring said one. A log with local files never reaches this line,
         which is what keeps I5 intact for a hot read; a log without them has no
         local data to protect, and the alternative is silently wrong results.
@@ -1004,32 +1016,32 @@ class LogHandle:
         docstring explains that getting it wrong leaves "rows silently missing
         from the answer". Revisit if a workload ever shows it.
         """
-        # The local table first, which is manifest statistics and no network.
+        # The staging table first, which is manifest statistics and no network.
         # Reloaded because the dangerous direction is a stale "the table has
         # files" on one another process has just evicted — that would drop the
-        # archive leg and serve short with no error.
+        # published leg and serve short with no error.
         self._table.reload()
         if self._table.extent() is not None:
             return False
 
-        return self._archive_extent() is not None
+        return self._published_extent() is not None
 
-    def _archive_extent(self) -> tuple[int, int] | None:
-        """The archive's extent, forcing a real re-read, or None if unreachable.
+    def _published_extent(self) -> tuple[int, int] | None:
+        """The published table's extent, forcing a real re-read, or None if unreachable.
 
         **The re-read is not optional.** Both caches short-circuit —
-        `Archive.table` on a live handle and `LogTable.extent` on an unchanged
+        `Published.table` on a live handle and `LogTable.extent` on an unchanged
         `metadata_location` — so without `reload()` a long-lived reader would
         answer from the pointer it last saw, and `end_offset()` would report
-        an archive another process has since committed past.
+        a published table another process has since committed past.
 
-        The archive carries `previous-versions-max: 10`, so a pointer eleven
-        archive commits old names deleted metadata. That is `_swept`: on the
-        primary it is a race with a concurrent `sync`, and retrying reads the
+        The published table carries `previous-versions-max: 10`, so a pointer eleven
+        published commits old names deleted metadata. That is `_swept`: on the
+        primary it is a race with a concurrent `publish`, and retrying reads the
         current pointer.
         """
         try:
-            adopted = self._archive.table(repair=False)
+            adopted = self._published.table(repair=False)
             if adopted is None:
                 return None
 
@@ -1040,19 +1052,19 @@ class LogHandle:
             raise self._swept(exc) from exc
 
     def _checked_extent(self) -> tuple[int, int]:
-        """The archive's extent, or a refusal — for when it is load-bearing.
+        """The published table's extent, or a refusal — for when it is load-bearing.
 
-        Two failures, and neither may be silent. An unreachable archive would
-        otherwise fall through to the buffer leg, which on an empty local table
-        is every archived row missing with no error; and an archive reporting
+        Two failures, and neither may be silent. An unreachable published table would
+        otherwise fall through to the buffer leg, which on an empty staging table
+        is every published row missing with no error; and a published table reporting
         no extent has nothing for this to merge.
         """
-        extent = self._archive_extent()
+        extent = self._published_extent()
         if extent is None:
             msg = (
-                f"{self.root}/{self.name} can no longer reach its archive, and it "
-                f"holds no local files — reading on would omit every archived row. "
-                f"Check that the archive is reachable (credentials, endpoint) and "
+                f"{self.root}/{self.name} can no longer reach its published table, and it "
+                f"holds no local files — reading on would omit every published row. "
+                f"Check that the published table is reachable (credentials, endpoint) and "
                 f"retry"
             )
             raise RuntimeError(msg)
@@ -1061,7 +1073,7 @@ class LogHandle:
 
     def _swept(self, exc: FileNotFoundError) -> RuntimeError:
         return RuntimeError(
-            f"the archive moved on while this read was resolving it — another "
+            f"the published table moved on while this read was resolving it — another "
             f"process committed past the pointer it held ({exc}). Retry: the next "
             f"read resolves the current pointer"
         )
@@ -1080,7 +1092,7 @@ class LocalReadHandle(LogHandle):
     A local handle shares the primary's root and name, so the replica key it
     emits IS the primary's own correct one.
 
-    Sees the writer's commits as they land: `catalog.db` and `archive.db` live
+    Sees the writer's commits as they land: `catalog.db` and `published.db` live
     in the stream's directory and both processes read the same rows.
     """
 
@@ -1111,19 +1123,19 @@ class LocalReadHandle(LogHandle):
         This used to be a runtime refusal on one shared class. Moving it here
         made the guard unnecessary — there is nothing to call.
         """
-        archive = self.archive
-        if not self._archive.remote():
+        published = self.published
+        if not self._published.remote():
             msg = (
-                f"{self.root}/{self.name} publishes to a local archive "
-                f"({archive}), so there is nowhere off this machine to ship its "
+                f"{self.root}/{self.name} publishes to a local published table "
+                f"({published}), so there is nowhere off this machine to ship its "
                 f"WAL — replication needs a remote (s3://) one"
             )
             raise ValueError(msg)
 
         return litestream_config(
             self._layout,
-            archive,
-            self._archive.s3,
+            published,
+            self._published.s3,
             self.config.wal_retention,
         )
 
@@ -1166,13 +1178,13 @@ class WriteHandle(LocalReadHandle):
         reader: Reader,
         maintenance: Maintenance,
         config: LogConfig,
-        archive: Archive,
+        published: Published,
     ) -> None:
         super().__init__(
             layout=layout,
             table=table,
             buffer=buffer,
-            archive=archive,
+            published=published,
             reader=reader,
         )
         # Set only by `restore`, and read only by `recovery()`. What a failover
@@ -1181,14 +1193,14 @@ class WriteHandle(LocalReadHandle):
         # trace once the sequence has moved, and the recovered count is
         # indistinguishable from ordinary buffered rows a second later.
         self._restored_from: _Recovery | None = None
-        # The tier rows (#90): the archive's, which eviction widens and a
+        # The tier rows (#90): the published table's, which eviction widens and a
         # rollup under the whole-log claim replaces, and the local one this
-        # handle stores after each commit it makes to the local table.
-        self._tiers = ArchiveTier(buffer)
-        table.after_commit = self._store_local_statistics
+        # handle stores after each commit it makes to the staging table.
+        self._tiers = PublishedTier(buffer)
+        table.after_commit = self._store_staging_statistics
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
-        # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
+        # objects at once, in `set_config`, `set_published` and `set_sort_by`,
         # where a SQLite row and a Python object have to change together.
         #
         # Nothing on the append, seal or read paths takes it. Each collaborator
@@ -1222,7 +1234,7 @@ class WriteHandle(LocalReadHandle):
         schema: pa.Schema,
         sort_by: Sequence[str] | None = None,
         config: LogConfig | None = None,
-        archive: str | None = None,
+        published: str | None = None,
         s3: S3Options | None = None,
         start_offset: int = 1,
     ) -> Self:
@@ -1257,7 +1269,7 @@ class WriteHandle(LocalReadHandle):
         Arrow, always. The table underneath is Iceberg and its schema could be
         stated directly, but every Iceberg field needs an explicit `field_id`
         and pyiceberg accepts duplicates without complaint — two fields
-        numbered 1 construct fine — and every engine reading the archive
+        numbered 1 construct fine — and every engine reading the published table
         resolves columns by field ID, so a duplicate silently breaks both. That
         numbering is library bookkeeping, the same argument §2 makes for
         `offset`, so it is pyiceberg's job and not the caller's.
@@ -1287,7 +1299,7 @@ class WriteHandle(LocalReadHandle):
         sequential and needs a sort after reading. For a log, replay is the
         primary access pattern, which makes that the expensive half.
 
-        `archive` is where the log publishes: a warehouse prefix on S3
+        `published` is where the log publishes: a warehouse prefix on S3
         (`s3://bucket/prefix`) or a local directory (`file:///directory`).
         None publishes under the log's own directory, and then capture, seal,
         compaction, publishing, retention and reads all work with no network,
@@ -1297,10 +1309,10 @@ class WriteHandle(LocalReadHandle):
         # downstream has to distinguish "unset" from "explicitly unsorted".
         order = tuple(sort_by or ())
         settings = config or LogConfig()
-        # Same normalisation as `set_archive`: an empty string and None both
+        # Same normalisation as `set_published`: an empty string and None both
         # mean the local default, which `validate` sees as None.
-        archive = (archive or "").rstrip("/") or None
-        validate(schema, order, settings, archive)
+        published = (published or "").rstrip("/") or None
+        validate(schema, order, settings, published)
         # The type as well as the range, because this one is written to `meta`
         # and read back by anything that needs the reserve: `2.5` seeds 2 and
         # records "2.5", so the durable record would disagree with the log.
@@ -1317,20 +1329,20 @@ class WriteHandle(LocalReadHandle):
         # which would then block the retry, since `new` refuses an existing
         # buffer and `restore` does too.
         #
-        # A fresh log holds no `extent` rows at all, so any archive that
+        # A fresh log holds no `extent` rows at all, so any published table that
         # already has data belongs to something else. This is the shape an
         # operator reaches for when failing over by hand: `litelink.new` on the
         # second box, pointed at the old prefix. Silently, that log pushes
-        # nothing — its offsets are below the archive's — eviction pins, and
-        # the archive's contents read back as its own. `set_archive` refuses
+        # nothing — its offsets are below the published table's — eviction pins, and
+        # the published table's contents read back as its own. `set_published` refuses
         # the same thing; both entry points need it, because either can be the
         # one that points the log.
-        if archive is not None:
+        if published is not None:
             try:
-                covered = archive_extent(layout, archive, s3 or S3Options())
+                covered = published_extent(layout, published, s3 or S3Options())
             except Exception:
                 # Unreachable or unreadable is "cannot tell", which passes:
-                # configuring an archive is a statement of intent, not a claim
+                # configuring a published table is a statement of intent, not a claim
                 # that the bucket is already there. Measured: an empty prefix
                 # and a nonexistent bucket both return None, while bad
                 # credentials and a dead endpoint raise — and all four have to
@@ -1338,7 +1350,7 @@ class WriteHandle(LocalReadHandle):
                 # log is configured.
                 #
                 # An attempt to narrow this to `except OSError` broke sixteen
-                # tests that configure an archive with no live endpoint, which
+                # tests that configure a published table with no live endpoint, which
                 # is the pattern this is protecting, not an accident of theirs.
                 # The way to catch a typo'd key is `litelink.preflight`, which
                 # can also check the things this cannot: the litestream binary
@@ -1346,7 +1358,7 @@ class WriteHandle(LocalReadHandle):
                 covered = None
 
             if covered is not None:
-                raise _foreign_archive(archive)
+                raise _foreign_published(published)
 
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
@@ -1371,7 +1383,7 @@ class WriteHandle(LocalReadHandle):
         buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
         # The pair in ONE transaction. `validate` has just accepted these two
         # together, and written separately a crash between them records the
-        # policy without the archive it presupposes — evict-on-upload with
+        # policy without the published table it presupposes — evict-on-upload with
         # nothing to evict into, which `open` never re-checks and the first
         # maintenance pass carries out.
         buffer.set_meta_all(
@@ -1379,8 +1391,9 @@ class WriteHandle(LocalReadHandle):
                 _CONFIG_KEY: settings.to_json(),
                 _SORT_KEY: json.dumps(list(order)),
                 # Always recorded (#98): the local default when none is given,
-                # so the location the sync fences compare is the stored one.
-                _ARCHIVE_KEY: (archive or "").rstrip("/") or layout.default_archive,
+                # so the location the publish fences compare is the stored one.
+                _PUBLISHED_KEY: (published or "").rstrip("/")
+                or layout.default_published,
                 # Recorded only when there IS a reserve. Absent means
                 # "started at 1", which a backfill must read as "no reserve"
                 # rather than "a reserve of nothing" — a log created at 1 and
@@ -1390,9 +1403,9 @@ class WriteHandle(LocalReadHandle):
             }
         )
 
-        # Built here and handed to all three, so each is given its archive at
+        # Built here and handed to all three, so each is given its published table at
         # construction rather than having one pushed into it afterwards.
-        remote = Archive(layout, buffer, s3)
+        remote = Published(layout, buffer, s3)
 
         log = cls(
             layout=layout,
@@ -1403,17 +1416,17 @@ class WriteHandle(LocalReadHandle):
                 table,
                 buffer,
                 duckdb_connection,
-                archive=remote,
+                published=remote,
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
             config=settings,
-            archive=remote,
+            published=remote,
         )
 
-        # A fresh local default holds nothing below the local table, known at
+        # A fresh local default holds nothing below the staging table, known at
         # birth. A given one may already hold rows, and the check above may
-        # have been unable to reach it, so its row waits for the first sync.
-        if archive is None:
+        # have been unable to reach it, so its row waits for the first publish.
+        if published is None:
             table_schema_ = buffer.shape().table
             log._tiers.replace(table_schema_, empty(table_schema_))
 
@@ -1430,7 +1443,7 @@ class WriteHandle(LocalReadHandle):
         """Open an existing log, and recover it.
 
         Takes none of the shape: the columns come from the Iceberg table, and
-        their declared Arrow types, the config, the archive and the sort order
+        their declared Arrow types, the config, the published table and the sort order
         all from the buffer's `meta` table (§2, §4). The sort order used to
         come from the table's own declaration; it moved because `catalog.db`
         cannot be restored onto another machine, so a failover rebuilds that
@@ -1502,7 +1515,7 @@ class WriteHandle(LocalReadHandle):
             msg = f"log at {layout.root}/{name} has no stored sort order; it is corrupt"
             raise ValueError(msg) from exc
 
-        remote = Archive(layout, buffer, s3)
+        remote = Published(layout, buffer, s3)
         log = cls(
             layout=layout,
             table=table,
@@ -1512,11 +1525,11 @@ class WriteHandle(LocalReadHandle):
                 table,
                 buffer,
                 duckdb_connection,
-                archive=remote,
+                published=remote,
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
-            archive=remote,
+            published=remote,
         )
         log.recover()
         log._backfill_manifest()
@@ -1528,7 +1541,7 @@ class WriteHandle(LocalReadHandle):
         cls,
         root: PathLike[str] | str,
         name: str,
-        archive: str,
+        published: str,
         s3: S3Options | None = None,
         retention: timedelta | None = None,
     ) -> str:
@@ -1538,11 +1551,11 @@ class WriteHandle(LocalReadHandle):
         log to produce it — which is the chicken-and-egg a failover hits. The
         config names the databases to restore, and you need it BEFORE you have
         them. `Layout` is pure path arithmetic, so everything the file says is
-        derivable from a root, a name and an archive.
+        derivable from a root, a name and a published table.
         """
         layout = Layout(Path(root), name)
 
-        return litestream_config(layout, archive, s3 or S3Options(), retention)
+        return litestream_config(layout, published, s3 or S3Options(), retention)
 
     @classmethod
     def restore(
@@ -1550,13 +1563,13 @@ class WriteHandle(LocalReadHandle):
         root: PathLike[str] | str,
         name: str,
         *,
-        archive: str,
+        published: str,
         s3: S3Options | None = None,
         binary: str | None = None,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 
-        Point it at the archive, get a working log back, resume appending. The
+        Point it at the published table, get a working log back, resume appending. The
         procedure this replaces was "restore the databases and open it", which
         does not work: `catalog.db` records ABSOLUTE paths to the local Iceberg
         metadata, and a sidecar ships the `.db` files and nothing else — not
@@ -1565,43 +1578,43 @@ class WriteHandle(LocalReadHandle):
 
         What is recovered, and what is not:
 
-        - **The archive**, in full. It names its own current metadata in
+        - **The published table**, in full. It names its own current metadata in
           `version-hint.text`, so it is adopted rather than rebuilt.
-        - **The unsealed tail and everything the archive lacks**, from
-          `buffer.db`. A seal keeps its rows until the archive has them when
+        - **The unsealed tail and everything the published table lacks**, from
+          `buffer.db`. A seal keeps its rows until the published table has them when
           `wal_replication` is on, so the band between the two frontiers comes
           back too — that is what change makes possible.
-        - **The local table**, rebuilt EMPTY. Its Parquet is on the dead
+        - **The staging table**, rebuilt EMPTY. Its Parquet is on the dead
           machine and its metadata was never replicated.
         - **NOT** rows appended inside the replication lag. They were served to
           callers and never shipped. Their offsets are skipped rather than
           reissued; see below.
 
-        **`archive.db` is deliberately not restored**, even though it is
-        replicated. `open_archive` consults `version-hint.text` only when the
+        **`published.db` is deliberately not restored**, even though it is
+        replicated. `open_published` consults `version-hint.text` only when the
         catalog has no row for the table — with a stale row present it loads
         whatever that names, and old metadata survives in the bucket until
-        expiry, so it succeeds. Measured: a stale replica reported one archive
+        expiry, so it succeeds. Measured: a stale replica reported one published
         file where the bucket held five, and a union read 261 rows instead of
-        1061. Worse, the next sync commits onto that lineage and republishes
+        1061. Worse, the next publish commits onto that lineage and republishes
         the hint over it, destroying the pointer this recovery depends on.
         Stale is worse than absent, and absent is already handled.
 
         **`catalog.db` is not restored either**, and stays in the replication
         set regardless: same-machine recovery is where its absolute paths still
-        resolve, and it is the only record of which Parquet the local table is
+        resolve, and it is the only record of which Parquet the staging table is
         made of in a design that refuses directory listing.
         """
         # First, because this path does not go through `validate` — it takes no
         # schema and no config — and a malformed prefix would otherwise surface
         # as a YAML parse error from the litestream subprocess, after the root
         # has already been created.
-        validate_archive(archive)
-        if not is_remote(archive):
+        validate_published(published)
+        if not is_remote(published):
             msg = (
-                f"restore needs a remote archive (s3://), not {archive!r}: it "
+                f"restore needs a remote published table (s3://), not {published!r}: it "
                 f"recovers a log from the WAL replica beside it, and only a "
-                f"remote archive has one"
+                f"remote published table has one"
             )
             raise ValueError(msg)
 
@@ -1675,7 +1688,7 @@ class WriteHandle(LocalReadHandle):
 
         options = s3 or S3Options()
         layout.create()
-        config_path.write_text(litestream_config(layout, archive, options))
+        config_path.write_text(litestream_config(layout, published, options))
 
         # ONLY the buffer. `restore_buffer` passes `-if-replica-exists`, so an
         # absent replica returns quietly and the check below is what reports
@@ -1690,22 +1703,22 @@ class WriteHandle(LocalReadHandle):
 
         if not layout.buffer_db.exists():
             # Both readings: nothing in the arguments separates a log that
-            # never replicated from `name`/`archive` naming no log at all.
+            # never replicated from `name`/`published` naming no log at all.
             msg = (
-                f"no replica of {layout.buffer_db.name} under {archive} — there is "
+                f"no replica of {layout.buffer_db.name} under {published} — there is "
                 f"nothing to restore. A log with wal_replication off has no off-box "
                 f"copy of its unsealed rows and cannot be recovered onto another "
-                f"machine, or `name` and `archive` do not describe a log that exists"
+                f"machine, or `name` and `published` do not describe a log that exists"
             )
             raise FileNotFoundError(msg)
 
-        # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `archive`
+        # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `published`
         # is a caller bug and has to be loud.
         #
-        # `archive` names where the litestream replica is pulled FROM; the log
+        # `published` names where the litestream replica is pulled FROM; the log
         # attaches to whatever `meta` records, adopted ~60 lines below. On the
         # ordinary path the two agree by construction — the replica under
-        # `archive` was written by the log that recorded it — which is why this
+        # `published` was written by the log that recorded it — which is why this
         # went unnoticed. They diverge only when the buffer arrives some other
         # way, and that is not an exotic case: hand-placing one is the
         # documented recovery for a log whose WAL was never replicated, since
@@ -1713,77 +1726,78 @@ class WriteHandle(LocalReadHandle):
         # find.
         #
         # Left alone the divergence is SILENT and the handle comes back bound
-        # to the buffer's archive. Measured on 0.2.3: `restore(archive=A)` over
+        # to the buffer's published table. Measured on 0.2.3: `restore(published=A)` over
         # a buffer recording B returned a working handle with
-        # `handle.archive == B`, `archived_through() == 0` and a
+        # `handle.published == B`, `published_through() == 0` and a
         # full `scan()` of 0 rows, while A held 5,000 — and the
         # adoption's `table(repair=True)` then took its CREATE branch and wrote
         # a `metadata.json` and a `version-hint.text` into B, publishing a
-        # lineage over an archive the caller never named.
+        # lineage over a published table the caller never named.
         #
-        # Refused rather than honoured, and refused HERE: `archive` cannot be
+        # Refused rather than honoured, and refused HERE: `published` cannot be
         # made to win without overwriting the one fact that says which log this
-        # is, and refusing before `forget_archive_entry` below means a
+        # is, and refusing before `forget_published_entry` below means a
         # conflicting call mutates neither bucket nor catalog.
         #
-        # A buffer recording NO archive is refused by the same rule, and for a
+        # A buffer recording NO published table is refused by the same rule, and for a
         # reason worth stating: it already fails, just far too late. Adoption
         # finds no location, so the `RuntimeError` below is skipped; the log is
         # built; and `write_replication_config` then raises at the very end
-        # because a log with no archive has nowhere to ship its WAL. That raise
+        # because a log with no published table has nowhere to ship its WAL. That raise
         # lands AFTER `LogTable.create`, which is the commit point — so the
         # caller gets an exception over a root that is now openable, holds a
         # local-only log, and which `restore` itself will not retry because
         # both databases exist. Refusing up here turns that into the same
         # early, retryable failure as the conflict case.
-        recorded = Buffer.peek_meta(layout.buffer_db, _ARCHIVE_KEY)
-        if (recorded or "").rstrip("/") != archive.rstrip("/"):
+        recorded = Buffer.peek_meta(layout.buffer_db, _PUBLISHED_KEY)
+        if (recorded or "").rstrip("/") != published.rstrip("/"):
             found = (
-                f"records archive={recorded!r}"
+                f"records published={recorded!r}"
                 if recorded
-                else "records no archive, so it is not from an archived log"
+                else "records no published table, so it is not from a published log"
             )
             fix = (
-                f"Pass archive={recorded!r}, or restore a buffer belonging to "
-                f"{archive!r}"
+                f"Pass published={recorded!r}, or restore a buffer belonging to "
+                f"{published!r}"
                 if recorded
                 else (
-                    f"restore cannot attach {archive!r} to it — a log's archive is "
-                    f"set when it is created, or later with set_archive"
+                    f"restore cannot attach {published!r} to it — a log's published table is "
+                    f"set when it is created, or later with set_published"
                 )
             )
             msg = (
                 f"{layout.buffer_db.name} {found}, but restore was called with "
-                f"archive={archive!r}. The buffer is the authority on which log "
+                f"published={published!r}. The buffer is the authority on which log "
                 f"this is, so the two have to agree. {fix}"
             )
             raise ValueError(msg)
 
         # A stale entry, if an operator restored all three by hand. Not merely
-        # unnecessary — actively destructive: `open_archive` consults
+        # unnecessary — actively destructive: `open_published` consults
         # `version-hint.text` ONLY when the catalog has no row, so a stale row
         # is loaded instead, and old metadata survives in the bucket until
         # expiry so the load succeeds. Measured: a stale replica reported one
-        # archive file where the bucket held five, and a union read 261 rows
-        # instead of 1061. The next sync then commits onto that lineage and
+        # published file where the bucket held five, and a union read 261 rows
+        # instead of 1061. The next publish then commits onto that lineage and
         # republishes the hint over it, destroying the pointer this recovery
         # depends on. Dropped so adoption is the only path.
         # Retired logs are not taken over. Both records are asked, because each
         # can be missing where the other is not: the replica's closed buffer
         # ships
-        # only when the sidecar does, and a log retired before the archive
+        # only when the sidecar does, and a log retired before the published table
         # property existed has only the marker.
         marker = Buffer.peek_retired(layout.buffer_db)
         if marker is not None:
             raise RetiredError.of(marker, name)
 
-        recorded_retirement = archive_retired(layout, archive, options)
+        recorded_retirement = published_retired(layout, published, options)
         if recorded_retirement is not None:
             raise RetiredError.of(
-                {"state": "retired", "archive": archive, **recorded_retirement}, name
+                {"state": "retired", "published": published, **recorded_retirement},
+                name,
             )
 
-        forget_archive_entry(layout)
+        forget_published_entry(layout)
 
         # The shape comes from `meta`, which the restored buffer carries: the
         # declared Arrow schema, the policy, and the sort order. Read before
@@ -1809,90 +1823,90 @@ class WriteHandle(LocalReadHandle):
         # `recovery() is None`. An earlier version put it second and claimed
         # "this order has no such state"; it had one, one write later. Measured
         # from that window: the open group still at the replica's stale
-        # frontier, the first seal writing a file straddling the archive's
-        # extent, 712 archived offsets vanishing from every
-        # full `scan()` with no error anywhere, and `sync`
+        # frontier, the first seal writing a file straddling the published table's
+        # extent, 712 published offsets vanishing from every
+        # full `scan()` with no error anywhere, and `publish`
         # raising for ever afterwards.
         #
         # Nothing before it needs it. Adoption and the reconcile are about the
-        # ARCHIVE and the buffer; neither reads the local table. So it becomes
+        # PUBLISHED table and the buffer; neither reads the staging table. So it becomes
         # the commit point: everything ahead of it is repeatable, and a root
         # without it cannot be opened by anything.
         buffer = Buffer.open(layout.buffer_db, schema)
         try:
             released, resumed = buffer.strip_local_state(RESTORE_RESERVE)
 
-            # ADOPTED, explicitly. `archive.db` was deliberately not restored,
-            # so nothing here has a catalog row for the archive — and an
+            # ADOPTED, explicitly. `published.db` was deliberately not restored,
+            # so nothing here has a catalog row for the published table — and an
             # ordinary `open` will not create one: adoption is a write to that
-            # catalog, and `open_archive` reserves it for a repairing caller.
+            # catalog, and `open_published` reserves it for a repairing caller.
             # Without this the log comes back holding only what the buffer
-            # carried, and every read that needs the archive silently leaves
+            # carried, and every read that needs the published table silently leaves
             # its leg out.
             #
             # Built standalone rather than reached through a `WriteHandle`, because
-            # there is no local table yet — which is the whole point of doing
-            # it here. It reads the archive's location from the restored
-            # `meta`, so it adopts the archive THIS log wrote, not whatever
+            # there is no staging table yet — which is the whole point of doing
+            # it here. It reads the published table's location from the restored
+            # `meta`, so it adopts the published table THIS log wrote, not whatever
             # prefix the caller named for the WAL.
-            remote = Archive(layout, buffer, options)
+            remote = Published(layout, buffer, options)
             where = remote.uri
             if remote.table(repair=True) is None and where is not None:
-                # Not best-effort. A restore that cannot reach the archive has
+                # Not best-effort. A restore that cannot reach the published table has
                 # recovered the unsealed tail and nothing else, and returning
                 # it as a success is the "partial recovery that looks whole"
                 # this refuses elsewhere.
                 msg = (
-                    f"restored the buffer but could not adopt the archive at "
+                    f"restored the buffer but could not adopt the published table at "
                     f"{where!r}: it holds nothing this log can read. The rows "
-                    f"below the archive frontier are not recovered"
+                    f"below the published frontier are not recovered"
                 )
                 raise RuntimeError(msg)
 
-            # RECONCILED against the archive, and this is not optional. A
+            # RECONCILED against the published table, and this is not optional. A
             # replica is a consistent snapshot from BEFORE the primary's last
-            # sync — ordinary replication lag, not a crash window — so the
-            # archive is routinely ahead of the `extent` rows the buffer
+            # publish — ordinary replication lag, not a crash window — so the
+            # published table is routinely ahead of the `extent` rows the buffer
             # carries. Left alone, `_seed_group` opens the group at the
             # replica's stale frontier while the bucket already holds past it,
-            # and the first seal here writes a file reaching into the archive's
+            # and the first seal here writes a file reaching into the published table's
             # extent.
             #
             # Which wedges the log permanently: `_refuse_straddle` raises on
-            # every push, `archived_prefix` returns 0 for the straddler so
+            # every push, `published_prefix` returns 0 for the straddler so
             # eviction pins at zero, and disk grows without bound. Nothing
             # re-cuts a local straddler, and this is the operation you run when
-            # the archive is the only surviving copy.
+            # the published table is the only surviving copy.
             #
-            # Releasing what the archive holds and re-seeding is what closes
-            # it. Those rows are genuinely safe: the archive has them, which is
+            # Releasing what the published table holds and re-seeding is what closes
+            # it. Those rows are genuinely safe: the published table has them, which is
             # the same authority `_push` releases on.
             adopted = remote.table()
             covered = None if adopted is None else adopted.extent()
             frontier = 0 if covered is None else covered[1]
             if covered is not None:
-                released -= buffer.release_archived(covered[1])
+                released -= buffer.release_published(covered[1])
                 buffer.reseed_group()
 
-            # **And the fence has to clear the ARCHIVE, not just the replica.**
+            # **And the fence has to clear the PUBLISHED table, not just the replica.**
             # `strip_local_state` ran fifty lines up, before this method knew
-            # where the archive was, so it reserved `RESTORE_RESERVE` above the
+            # where the published table was, so it reserved `RESTORE_RESERVE` above the
             # sequence the REPLICA carried. That is the right floor only while
             # the replica's sequence is the highest offset anyone issued, and
             # the paragraph above is this method admitting it is not: the whole
             # reason for the reconcile is that the bucket routinely holds
             # ranges the replicated `extent` rows have never heard of.
             #
-            # Left alone the restored log issues offsets the archive already
+            # Left alone the restored log issues offsets the published table already
             # holds, which is I9 broken in the one direction nothing detects.
             # Reproduced: replica at seq 301, 3M rows loaded and pushed,
-            # `archived_through` 2,864,714 — and the restore resumed at
-            # 1,048,877, inside the archive's range. The reissued rows seal
-            # into the rebuilt local table, `sync` reports success and pushes
-            # nothing for ever because the file sits below the archive's floor,
+            # `published_through` 2,864,714 — and the restore resumed at
+            # 1,048,877, inside the published table's range. The reissued rows seal
+            # into the rebuilt staging table, `publish` reports success and pushes
+            # nothing for ever because the file sits below the published table's floor,
             # and a full `scan()` returns 1,048,881 rows of the
-            # 3,000,600 acknowledged: the union truncates the archive leg at
-            # the colliding local extent, so ~1.95M archived rows are served by
+            # 3,000,600 acknowledged: the union truncates the published leg at
+            # the colliding local extent, so ~1.95M published rows are served by
             # no leg at all while five offsets durably name two different rows.
             #
             # The report already knew. `skipped` is `(highest + 1, resumed - 1)`
@@ -1901,7 +1915,7 @@ class WriteHandle(LocalReadHandle):
             # looks like when it is computed and then not checked.
             #
             # Reachable before bulk ingest existed, and cheaper with it: this
-            # needs the archive more than `RESTORE_RESERVE` ahead of the
+            # needs the published table more than `RESTORE_RESERVE` ahead of the
             # replica, which used to take a million rows through the buffer
             # during a sidecar outage and now takes one `reserve` that ships
             # almost no WAL. The hazard is lag plus restore either way, so it
@@ -1932,8 +1946,8 @@ class WriteHandle(LocalReadHandle):
             # pointer to its local files. Reached with `buffer.db` absent and
             # the row present — which the `FileExistsError` guard above cannot
             # catch, keying as it does on the buffer — and reproduced: a table
-            # at offsets 1..1152 with the archive at 504 lost the reference to
-            # 505..1152, sealed locally and never archived, with `litelink.open`
+            # at offsets 1..1152 with the published table at 504 lost the reference to
+            # 505..1152, sealed locally and never published, with `litelink.open`
             # then answering "use new() to create one".
             raise
         except Exception:
@@ -1944,10 +1958,10 @@ class WriteHandle(LocalReadHandle):
 
         log = cls.open(layout.root, name, s3=options)
 
-        # The archive's row taken afresh. The local table was rebuilt empty and
-        # every archive file now sits below it, so nothing a manifest said
-        # before the failover describes it. If the archive cannot be read now,
-        # the row stays missing and every query reads it until a sync can.
+        # The published table's row taken afresh. The staging table was rebuilt empty and
+        # every published file now sits below it, so nothing a manifest said
+        # before the failover describes it. If the published table cannot be read now,
+        # the row stays missing and every query reads it until a publish can.
         log._tiers.drop()
         log._backfill_manifest()
 
@@ -1966,15 +1980,15 @@ class WriteHandle(LocalReadHandle):
         # that skipped 1101..2098252 reported 1049677..2098252.
         #
         # `recovered` is likewise the count AFTER the reconcile, which the
-        # subtraction above it performs: rows the archive already held were
+        # subtraction above it performs: rows the published table already held were
         # released two lines later, and counting them as recovered describes a
         # buffer that no longer exists.
-        local = log.table_extent()
+        local = log._table.extent()  # noqa: SLF001
         buffered = log._buffer.extent()  # noqa: SLF001
-        # The ARCHIVE's own frontier, read above, not `archived_through` — that
+        # The PUBLISHED table's own frontier, read above, not `published_through` — that
         # reads the replica's `meta`, which is the exact staleness the reconcile
         # ten lines up exists to correct. It bites whenever the release empties
-        # the buffer, which is the ordinary "died shortly after a sync" shape:
+        # the buffer, which is the ordinary "died shortly after a publish" shape:
         # measured, 16,100 offsets reported skipped that were present and
         # readable. Nothing is lost by it, but the documented response to a
         # skipped range is to re-fetch from upstream, and doing that would
@@ -1987,7 +2001,7 @@ class WriteHandle(LocalReadHandle):
         log._restored_from = _Recovery(  # noqa: SLF001
             recovered=released,
             resumed_at=resumed,
-            skipped=(highest + 1, resumed - 1),
+            skipped=(highest + 1, resumed),
         )
 
         return log
@@ -2013,9 +2027,9 @@ class WriteHandle(LocalReadHandle):
         schema are not in here precisely because they do.
         """
         with self._lock:
-            # The same claim `set_archive` takes, and for the same reason.
+            # The same claim `set_published` takes, and for the same reason.
             # `validate` refuses a PAIR — an evict-on-upload policy with no
-            # archive to evict into — so the two halves have to be decided
+            # published table to evict into — so the two halves have to be decided
             # together. Reading the other half durably is not enough on its
             # own: read and write as two transactions and the check is only a
             # statement about the past, so the two setters could each pass
@@ -2030,7 +2044,7 @@ class WriteHandle(LocalReadHandle):
                     self._schema,
                     self._buffer.sort_by(),
                     config,
-                    self._buffer.get_meta(_ARCHIVE_KEY) or None,
+                    self._buffer.get_meta(_PUBLISHED_KEY) or None,
                 )
                 # Asked again at the write. The claim makes the read and the
                 # write one decision only while it is held, and a stall past
@@ -2057,11 +2071,11 @@ class WriteHandle(LocalReadHandle):
         """
         return self._restored_from
 
-    def set_archive(self, archive: str | None) -> None:
-        """Point the log at another archive, or back at its local default
+    def set_published(self, published: str | None) -> None:
+        """Point the log at another published table, or back at its local default
         with None (§5). There is no detached state (#98).
 
-        Takes the whole-log claim, so it cannot interleave with a sync, a
+        Takes the whole-log claim, so it cannot interleave with a publish, a
         merge, an eviction or the other setter — `validate` refuses a PAIR, so
         the policy and the location have to be decided together. The shipped
         writer calls this on every restart while a maintainer runs in another
@@ -2069,51 +2083,51 @@ class WriteHandle(LocalReadHandle):
         try; see `_claim_settings`.
 
         **Re-pointing does not move anything, but it is reversible.** Rows
-        already evicted into the old archive stay there, and the read path
-        resolves only the archive the log currently names — so while pointed
+        already evicted into the old published table stay there, and the read path
+        resolves only the published table the log currently names — so while pointed
         elsewhere they are not readable through this log, and
         a full `scan()` returns fewer rows than were written,
         silently.
 
-        Pointing BACK undoes that. Each archive publishes `version-hint.text`
+        Pointing BACK undoes that. Each published table publishes `version-hint.text`
         beside its metadata at every commit, so a prefix whose catalog entry
         this log dropped is registered from what the bucket itself says rather
         than created empty over the top of it. Only a repairing caller adopts,
-        which `set_archive` is; a read still leaves the archive leg out until
+        which `set_published` is; a read still leaves the published leg out until
         one has run.
 
-        **An archive AHEAD of this log is refused.** One whose extent reaches
+        **A published table AHEAD of this log is refused.** One whose extent reaches
         at or above the next offset to be assigned is another log's history,
         and attaching it wedges this one silently — nothing is ever pushed,
         eviction pins, and local disk grows without bound. `litelink.restore` is
-        the operation for resuming that log here. Re-attaching to an archive
+        the operation for resuming that log here. Re-attaching to a published table
         this log has moved past is unaffected, and supported.
 
-        **One writer per archive is otherwise assumed, not checked.** The hint
+        **One writer per published table is otherwise assumed, not checked.** The hint
         records where the metadata was at the last commit THIS log made.
-        Another writer touching that archive while it was detached would leave
+        Another writer touching that published table while it was detached would leave
         the hint behind its true state, and adopting it would strand the
-        commits made in between. That is §13's archive-identity seam; the
+        commits made in between. That is §13's published-identity seam; the
         contract is one writer per log, and nothing here enforces it.
 
         What re-pointing no longer does is disturb what the log already knows.
         There is no watermark to carry across: each pushed file records the
-        bucket its copy went to (§4a), so ranges the old archive holds go on
-        naming it, eviction keeps asking about the archive that is configured
+        bucket its copy went to (§4a), so ranges the old published table holds go on
+        naming it, eviction keeps asking about the published table that is configured
         now, and compaction keeps refusing to merge across any of them.
         """
         # NORMALISED here, not in `_repoint`, so every guard below and the
-        # write see the same location. `set_archive("")` once detached past
+        # write see the same location. `set_published("")` once detached past
         # guards that saw it as non-None — 7,828 acknowledged rows lost. None
         # and "" now both mean the local default (#98): there is no detached
         # state, so nothing for a guard to miss.
-        archive = (archive or "").rstrip("/") or self._layout.default_archive
+        published = (published or "").rstrip("/") or self._layout.default_published
 
         # Re-stating where the log already points does nothing: no claim, no
-        # write, no network. A writer that declares its archive on every
+        # write, no network. A writer that declares its published table on every
         # restart must not wait for maintenance, or fail during an outage, to
         # be told what it already knew.
-        if archive == self._archive.location():
+        if published == self._published.location():
             return
 
         with self._lock:
@@ -2133,61 +2147,61 @@ class WriteHandle(LocalReadHandle):
                 # `set_config` takes this same claim, which is what makes the
                 # two serialise. It is the rule §4a already states for data,
                 # applied to the configuration that governs it.
-                validate(self._schema, self._buffer.sort_by(), self.config, archive)
-                self._refuse_archive_ahead(archive)
-                self._refuse_archive_behind(archive)
+                validate(self._schema, self._buffer.sort_by(), self.config, published)
+                self._refuse_published_ahead(published)
+                self._refuse_published_behind(published)
                 # Asked again under the claim: another process may have made
                 # the same move meanwhile, and then there is nothing to do.
-                if archive == self._archive.location():
+                if published == self._published.location():
                     return
 
                 # A MOVE opens — or creates, or adopts through its
                 # `version-hint.text` — the table at the new location before
                 # anything is written, and fails the call if it cannot. Best
                 # effort, it reported success while the catalog still named
-                # the old table, and every other process refused the archive
+                # the old table, and every other process refused the published table
                 # until a maintenance pass repaired it.
-                self._archive.adopt(archive)
+                self._published.adopt(published)
 
                 # The other half of the same rule; see `set_config`.
                 checkpoint(lease.renew)
-                self._repoint(archive)
+                self._repoint(published)
             finally:
                 lease.release()
 
-    def _refuse_archive_behind(self, archive: str | None) -> None:
-        """Refuse an archive missing a column this log has.
+    def _refuse_published_behind(self, published: str | None) -> None:
+        """Refuse a published table missing a column this log has.
 
         Logs are immutable now (§9), but a log that used `add_column` under an
-        older release can still meet an archive detached before that change:
-        attaching does no schema work — `open_archive` only DECLARES a schema
+        older release can still meet a published table detached before that change:
+        attaching does no schema work — `open_published` only DECLARES a schema
         when it creates a table, and nothing in `src/` re-declares an existing
-        one — so that archive stays narrow, and every later push fails
+        one — so that published table stays narrow, and every later push fails
         permanently:
 
             ValueError: PyArrow table contains more columns: region.
 
-        `sync` then never advances, eviction's I4 clamp pins on the unpushed
+        `publish` then never advances, eviction's I4 clamp pins on the unpushed
         files, and local disk grows without bound.
 
-        Refused rather than repaired. Widening an existing archive is
+        Refused rather than repaired. Widening an existing published table is
         `union_by_name` against a table this log did not create, which belongs
-        with `rewrite_archive` and wants its own design; doing it quietly from
-        a setter would mean `set_archive` mutating a shared archive as a side
+        with `rewrite_published` and wants its own design; doing it quietly from
+        a setter would mean `set_published` mutating a shared published table as a side
         effect. Tracked as an issue.
         """
-        if archive is None:
+        if published is None:
             return
 
-        # Read from the bucket, not through `self._archive`: that object
-        # takes its URI from `meta`, which still names the OLD archive — or
+        # Read from the bucket, not through `self._published`: that object
+        # takes its URI from `meta`, which still names the OLD published table — or
         # None, on the detach-then-attach path this exists to catch.
         try:
-            columns = archive_columns(self._layout, archive, self._archive.s3)
+            columns = published_columns(self._layout, published, self._published.s3)
         except Exception:
             # A bad minute in object storage is not a schema disagreement.
-            # `_refuse_archive_ahead` treats it the same way: cannot tell, so
-            # pass rather than refuse an archive that may be fine.
+            # `_refuse_published_ahead` treats it the same way: cannot tell, so
+            # pass rather than refuse a published table that may be fine.
             return
 
         if columns is None:
@@ -2197,52 +2211,52 @@ class WriteHandle(LocalReadHandle):
         missing = sorted(declared - set(columns))
         if missing:
             msg = (
-                f"archive at {archive} is missing {missing}, which this log has "
-                "added since. Attaching it would make every later sync fail "
+                f"published table at {published} is missing {missing}, which this log has "
+                "added since. Attaching it would make every later publish fail "
                 "permanently and pin eviction, so the log would grow without "
-                "bound. Widen the archive first"
+                "bound. Widen the published table first"
             )
             raise ValueError(msg)
 
-    def _refuse_archive_ahead(self, archive: str | None) -> None:
-        """Refuse an archive whose extent is above this log's next offset.
+    def _refuse_published_ahead(self, published: str | None) -> None:
+        """Refuse a published table whose extent is above this log's next offset.
 
-        That archive belongs to a different log's history, and attaching it
-        wedges this one SILENTLY. Traced: `sync` computes `floor` from the
-        archive's extent, every local file sits below it, so `pending` is empty
+        That published table belongs to a different log's history, and attaching it
+        wedges this one SILENTLY. Traced: `publish` computes `floor` from the
+        published table's extent, every local file sits below it, so `pending` is empty
         and nothing is ever pushed. The watermark is still written, eviction's
         I4 clamp finds no `extent` rows and pins at zero, and local disk grows
-        without bound while `sync()` returns success having uploaded nothing.
+        without bound while `publish()` returns success having uploaded nothing.
         No error surfaces at any step.
 
         It is reachable by the obvious failover attempt — `litelink.new` on a second
-        box, then `set_archive` at the old prefix — which is exactly what
+        box, then `set_published` at the old prefix — which is exactly what
         `litelink.restore` exists to do properly.
 
-        **`>= next_offset`, not "overlaps".** Re-attaching to an archive that
+        **`>= next_offset`, not "overlaps".** Re-attaching to a published table that
         holds offsets this log has moved PAST is supported and tested; the
-        archive's ranges simply sit below the local ones. Only an archive
+        published table's ranges simply sit below the local ones. Only a published table
         reaching at or above the next offset to be assigned is describing a
         stream this log is not.
 
-        **Read through `version-hint.text`, never `open_archive`.** At this
-        point `meta` still names the OLD archive, so `Archive.table()` opens
-        that one. Going to `open_archive` for the new prefix fails both ways:
-        with `repair=False` the catalog row names the old archive and the
+        **Read through `version-hint.text`, never `open_published`.** At this
+        point `meta` still names the OLD published table, so `Published.table()` opens
+        that one. Going to `open_published` for the new prefix fails both ways:
+        with `repair=False` the catalog row names the old published table and the
         boundary check raises on every ordinary re-point; with `repair=True` it
         drops that row as a side effect of what is meant to be a read.
 
         Absent, unreachable, or unreadable all PASS. `_repoint` deliberately
-        tolerates an archive that does not exist yet — "configuring one is a
+        tolerates a published table that does not exist yet — "configuring one is a
         statement of intent, not a claim that the bucket exists" — and this is
         called on every writer restart, so it must not fail closed on a bad
         minute in object storage.
         """
-        if archive is None:
+        if published is None:
             return
 
         try:
-            covered = archive_extent(self._layout, archive, self._archive.s3)
+            covered = published_extent(self._layout, published, self._published.s3)
         except Exception:
             return
 
@@ -2252,92 +2266,92 @@ class WriteHandle(LocalReadHandle):
         nxt = self._buffer.next_offset()
         if covered[1] >= nxt:
             msg = (
-                f"the archive at {archive!r} holds offsets up to {covered[1]}, at or "
+                f"the published table at {published!r} holds offsets up to {covered[1]}, at or "
                 f"above this log's next offset ({nxt}) — it is another log's "
                 f"history. Attaching it would push nothing and pin eviction, "
                 f"silently. To resume that log here, use litelink.restore"
             )
             raise ValueError(msg)
 
-        # And it must be an archive this log has SEEN. A populated prefix that
+        # And it must be a published table this log has SEEN. A populated prefix that
         # this log holds no `extent` row for is somebody else's, whatever its
         # offsets look like — and offsets are all a comparison has to go on,
         # since two logs of the same name both start at 1.
         #
         # Attaching one cannot be contained downstream, which two attempts
-        # tried: the watermark is raised to the archive's extent by `confirmed`
+        # tried: the watermark is raised to the published table's extent by `confirmed`
         # on every pass, and this log's own `extent` rows are written for the
-        # archive's ENTIRE manifest by `_push`'s backfill within one sync.
+        # published table's ENTIRE manifest by `_push`'s backfill within one publish.
         # Measured — a bound derived from either moved with the contamination.
         # The backfill is right to trust the manifest; what it needs is for the
-        # archive to be ours, and §13's identity token is what would prove it.
+        # published table to be ours, and §13's identity token is what would prove it.
         # Until then the check belongs at the moment the log is pointed, before
         # anything has laundered anything.
         #
-        # Re-attach passes: ranges pushed to an archive go on naming it after a
+        # Re-attach passes: ranges pushed to a published table go on naming it after a
         # detach (§4a), so returning to one finds its own records intact. A
         # fresh prefix passes too — `covered` is None above.
-        if not self._buffer.archive_records(archive, 0):
-            raise _foreign_archive(archive)
+        if not self._buffer.published_records(published, 0):
+            raise _foreign_published(published)
 
-    def _repoint(self, archive: str | None) -> None:
+    def _repoint(self, published: str | None) -> None:
         """Record the new location, with the maintenance lease held."""
-        # Already normalised by `set_archive`, which is the only caller and
+        # Already normalised by `set_published`, which is the only caller and
         # does it before its guards rather than after. Repeated here so this
         # method is correct on its own terms: every path builder strips
-        # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same archive
+        # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same published table
         # everywhere except here — where the difference would read as a move
-        # and reset the watermarks of an archive that genuinely holds data.
-        normalised = (archive or "").rstrip("/") or self._layout.default_archive
+        # and reset the watermarks of a published table that genuinely holds data.
+        normalised = (published or "").rstrip("/") or self._layout.default_published
         # ONE transaction, because the three facts are only true together.
         #
-        # Where the archive is, and the two watermarks describing what the
+        # Where the published table is, and the two watermarks describing what the
         # PREVIOUS one held: the confirmed one eviction acts on, and the
         # frontier compaction reads to decide which files are already the
-        # archive's business. As separate writes a crash lands between them,
+        # published table's business. As separate writes a crash lands between them,
         # and BOTH orders have cost a defect — watermark last leaves the new
-        # archive carrying the old one's promise, which eviction believes;
-        # watermark first leaves the old archive with a frontier of zero, and
-        # compaction does not wait for a sync the way eviction does, so it
-        # merges across a boundary the archive already holds. There is no
+        # published table carrying the old one's promise, which eviction believes;
+        # watermark first leaves the old published table with a frontier of zero, and
+        # compaction does not wait for a publish the way eviction does, so it
+        # merges across a boundary the published table already holds. There is no
         # ordering that is safe, so there is no ordering.
         # Whether this is a move is decided against the DURABLE location, in
         # the transaction that acts on the decision. This object's memory of
-        # where the archive is goes stale the moment another process re-points
-        # it, and nothing but a sync refreshes it — so a maintainer re-asserting
-        # the archive it already has would read its own staleness as a move and
+        # where the published table is goes stale the moment another process re-points
+        # it, and nothing but a publish refreshes it — so a maintainer re-asserting
+        # the published table it already has would read its own staleness as a move and
         # zero the watermarks of a bucket that holds the data.
-        # The archive's tier row describes the archive being left, so a move
+        # The published table's tier row describes the published table being left, so a move
         # forgets it BEFORE the log points anywhere new: forgotten first, a
-        # read can only include the archive, never trust the old one's row
+        # read can only include the published table, never trust the old one's row
         # for the new one. A restatement keeps it — the shipped writer calls
         # this on every restart. Compared against the durable location, which
         # nothing else can move while this holds the claim.
-        if self._archive.location() != normalised:
+        if self._published.location() != normalised:
             self._tiers.drop()
 
         self._buffer.set_meta_moved(
-            _ARCHIVE_KEY,
+            _PUBLISHED_KEY,
             normalised,
-            {Maintenance.ARCHIVED_KEY: "0"},
+            {Maintenance.PUBLISHED_THROUGH_KEY: "0"},
         )
 
         # Reaches the maintainer and the reader because all three hold this
         # object. `evict` asks it whether I4 is owed anything, and a setting
         # that stopped at `WriteHandle` would leave the maintainer deleting the only
-        # copy of rows an archive was just configured to receive.
+        # copy of rows a published table was just configured to receive.
 
-        # The new archive's tier row, while the claim is held, so reads stop
-        # fetching it for every query — from the table `set_archive` already
-        # adopted, so nothing is repaired here. Best effort: the first sync
+        # The new published table's tier row, while the claim is held, so reads stop
+        # fetching it for every query — from the table `set_published` already
+        # adopted, so nothing is repaired here. Best effort: the first publish
         # records it otherwise.
         with contextlib.suppress(Exception):
-            adopted = self._archive.table()
+            adopted = self._published.table()
             if adopted is not None and not self._tiers.has():
-                self._record_archive_row(adopted)
+                self._record_published_row(adopted)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
-        """Change the sort order, re-clustering every file the local table owns.
+        """Change the sort order, re-clustering every file the staging table owns.
 
         §7 calls `sort_by` a read-shape decision rather than a tuning knob:
         it declares which predicates prune, and the clustering that makes them
@@ -2349,24 +2363,24 @@ class WriteHandle(LocalReadHandle):
         `rewrite` must be passed explicitly. It is the honest name for the
         cost: every file this rewrites is read, re-sorted and replaced.
 
-        **The archived prefix is not re-clustered, and cannot be.** `_rewrite_run`
-        skips any run reaching at or below the archive watermark, because a
-        local rewrite there would commit a file straddling the archive's extent
-        and nothing re-cuts a local straddler. So on a synced log this changes
-        three declarations and rewrites only what sync has not yet taken — and
-        `rewrite_archive` is not the other half either: it re-ingests from the
-        first badly-SIZED file onwards, so a well-sized archived prefix is
+        **The published prefix is not re-clustered, and cannot be.** `_rewrite_run`
+        skips any run reaching at or below the published watermark, because a
+        local rewrite there would commit a file straddling the published table's extent
+        and nothing re-cuts a local straddler. So on a published log this changes
+        three declarations and rewrites only what publish has not yet taken — and
+        `rewrite_published` is not the other half either: it re-ingests from the
+        first badly-SIZED file onwards, so a well-sized published prefix is
         never a candidate and keeps its original clustering for ever.
 
         That is §6's "sealed once and never rewritten" applied to history, not
         an oversight — but this docstring used to say "every existing file",
-        which on an archived log was a claim the code did not honour and did
-        not report. A re-sort is a decision for a log's local window; the
-        archive keeps the clustering it was written with.
+        which on a published log was a claim the code did not honour and did
+        not report. A re-sort is a decision for a log's staging window; the
+        published table keeps the clustering it was written with.
         """
         with self._lock:
             requested = tuple(sort_by)
-            validate(self._schema, requested, self.config, self._archive.uri)
+            validate(self._schema, requested, self.config, self._published.uri)
             if requested == self._buffer.sort_by() and not rewrite:
                 # Restating the order the log already declares, without asking
                 # for the data. Nothing to declare, nothing accepted, so this
@@ -2384,8 +2398,8 @@ class WriteHandle(LocalReadHandle):
 
             if not rewrite:
                 msg = (
-                    "changing sort_by re-clusters every file the local table "
-                    "owns, and leaves the archived prefix as it is; "
+                    "changing sort_by re-clusters every file the staging table "
+                    "owns, and leaves the published prefix as it is; "
                     "pass rewrite=True to accept that cost"
                 )
                 raise ValueError(msg)
@@ -2426,13 +2440,13 @@ class WriteHandle(LocalReadHandle):
                 # orders equal and return — which is the gap the `rewrite=True`
                 # branch above now fills.
                 self._table.set_sort_order(requested)
-                # The archive's declaration too, and BEFORE `meta` like the
-                # local one: `open_archive` declares an order only on a table
-                # it creates, so an archive that already exists is re-declared
-                # here or never. Missing it entirely left an archive created
+                # The published table's declaration too, and BEFORE `meta` like the
+                # local one: `open_published` declares an order only on a table
+                # it creates, so a published table that already exists is re-declared
+                # here or never. Missing it entirely left a published table created
                 # after a re-sort born declaring the old key, with every file
                 # pushed into it clustered by the new one.
-                self._archive.redeclare_sort_order(requested)
+                self._published.redeclare_sort_order(requested)
                 self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
                 self._maintenance.rewrite_sorted(
                     heartbeat=lease.renew, owner=lease.owner
@@ -2443,7 +2457,7 @@ class WriteHandle(LocalReadHandle):
     def _claim_settings(self) -> Claim:
         """Take the whole-log claim the configuration operations share.
 
-        Retried, not refused on the first try. `set_config` and `set_archive`
+        Retried, not refused on the first try. `set_config` and `set_published`
         exclude each other because `validate` refuses a PAIR and the two halves
         have to be decided together — but they also collide with ordinary
         maintenance, and the shipped writer calls both on every restart while a
@@ -2479,7 +2493,7 @@ class WriteHandle(LocalReadHandle):
         other's claim — leaving it excluding nothing inside a process.
 
         The default range is the whole log, which is what a configuration change
-        needs: re-pointing an archive or rewriting its files is not an operation
+        needs: re-pointing a published table or rewriting its files is not an operation
         on an offset interval, so it excludes every pass rather than commuting
         with any of them.
         """
@@ -2499,19 +2513,19 @@ class WriteHandle(LocalReadHandle):
         reader assembled from several tiers can honestly claim. A writer is asked where its next row will land, and only
         `sqlite_sequence` knows that — it is the thing that assigns it.
 
-        The two coincide on a healthy log and diverge exactly where the local
-        table is empty while the archive holds rows:
+        The two coincide on a healthy log and diverge exactly where the staging
+        table is empty while the published table holds rows:
 
         - **After `restore`.** The fence reserves `RESTORE_RESERVE` offsets, so
-          the sequence is 1,048,576 above the archive's frontier and the
-          rebuilt local table is empty. The inherited version reported 801
+          the sequence is 1,048,576 above the published table's frontier and the
+          rebuilt staging table is empty. The inherited version reported 801
           where the next append took 1,049,377 — a caller reading it as "what
           comes next" would collide with the fence I9 exists to hold.
         - **After `evict` empties the table.** The inherited version reads
-          archive metadata, so a writer's cheapest observation became a
+          published metadata, so a writer's cheapest observation became a
           network call that RAISES when the bucket is unreachable. It returned
           3,001 locally before, and could not fail. `docs/API.md` calls
-          `archived_through()` against `end_offset()` the number to alarm on,
+          `published_through()` against `end_offset()` the number to alarm on,
           which made the monitoring call the one that dies in an outage.
 
         So this reads SQLite and nothing else. It cannot fail and cannot lag.
@@ -2560,9 +2574,11 @@ class WriteHandle(LocalReadHandle):
         self,
         source: pa.Table | pa.RecordBatchReader,
         *,
-        sync: bool = True,
+        publish: bool = True,
     ) -> tuple[int, int] | None:
-        """Write Arrow straight into the immutable tier (§13.4). Returns `(lo, hi)`.
+        """Write Arrow straight into the immutable tier (§13.4). Returns the
+        offsets it took as `[start, end)` — half-open, like every range
+        litelink reports — or None for an empty source.
 
         The SQLite buffer exists to make a row durable before it is in Parquet
         (§2). A bulk load's source is ALREADY durable — a Parquet corpus, or an
@@ -2601,8 +2617,8 @@ class WriteHandle(LocalReadHandle):
 
         **`wal_replication` is not refused, and the reason it once was is worth
         recording.** WAL shipping genuinely cannot carry a bulk range: with
-        replication on and an archive configured the buffer IS the off-box copy
-        until the archive has the range (§3a), and these rows never enter the
+        replication on and a published table configured the buffer IS the off-box copy
+        until the published table has the range (§3a), and these rows never enter the
         buffer. Reproduced against a zero-lag replica: 920 rows acknowledged,
         420 restored, `recovery()` reporting plain success.
 
@@ -2611,23 +2627,23 @@ class WriteHandle(LocalReadHandle):
         strictly worse, because `_discard_on_seal` reads the same flag: turn
         replication off and the next seal stops retaining its rows, so the
         buffer's copy of everything ALREADY captured is dropped. Measured on a
-        replicated log with an archive: 300 sealed rows retained in the buffer,
+        replicated log with a published table: 300 sealed rows retained in the buffer,
         `set_config(wal_replication=False)`, one more seal, and all 300 are gone
-        from it with the archive holding none — 350 acknowledged rows in local
+        from it with the published table holding none — 350 acknowledged rows in local
         Parquet alone. To load rows that could never be replicated, the
         workaround stripped the off-box copy from rows that were.
 
-        It also fixed nothing: the range is uncovered until `sync` either way,
+        It also fixed nothing: the range is uncovered until `publish` either way,
         and `recovery()` reports plain success either way. A refusal that
         relocates an exposure, adds a second one, and leaves the reporting
         defect untouched is not a safety measure. What the caller needs is the
         scope stated, which is the paragraph below.
 
-        **This pushes its own output to the archive when one is configured**,
-        and `sync=False` opts out. That is the fix for the paragraph below,
+        **This pushes its own output to the published table when one is configured**,
+        and `publish=False` opts out. That is the fix for the paragraph below,
         which described the old behaviour: a load's rows never enter the buffer,
-        so WAL replication cannot carry them and the archive is their only
-        second copy — while an ordinary `sync` held the load's short last file
+        so WAL replication cannot carry them and the published table is their only
+        second copy — while an ordinary `publish` held the load's short last file
         back behind `stable_prefix`. On a stream that then went quiet the run
         never settled. Measured on the deployment that found it: 113,399 rows on
         one disk, with `coverage()` reporting no gap.
@@ -2636,13 +2652,13 @@ class WriteHandle(LocalReadHandle):
         loaded and raises saying so — retry the push, never the load, which
         would reserve a fresh range and duplicate it.
 
-        **The archive is still a loaded range's only second copy**, which is
-        what the push above is for. An ORDINARY `sync` is not enough and that is
+        **The published table is still a loaded range's only second copy**, which is
+        what the push above is for. An ORDINARY `publish` is not enough and that is
         why this does not call one: `stable_prefix` holds back a trailing run
         still under `target_compact_size`, because a run with room in it may yet
         take files that have not been written — and the last file of a load is
         short unless the load divides evenly. Measured: 3000 rows loaded into 11
-        files, one `sync()`, `archived_through()` 2830, the last 170 rows in one
+        files, one `publish()`, `published_through()` 2830, the last 170 rows in one
         local file with `coverage()` reporting no gap.
 
         That was documented as terminating, since the run settles once roughly
@@ -2651,8 +2667,8 @@ class WriteHandle(LocalReadHandle):
         deployment that found this, across nine streams and ~698,000 rows. The
         window scaled by the arrival rate, and a slow stream has none.
 
-        **Compare `archived_through()` against the `hi` this returns whenever
-        the push did not run** — `sync=False`, or a push that raised after the
+        **Compare `published_through()` against the `hi` this returns whenever
+        the push did not run** — `publish=False`, or a push that raised after the
         load had landed.** Until they meet, the corpus you loaded from is the range's
         second copy, which is the same durability this path's whole premise
         rests on: the source is already durable, which is why the buffer is not
@@ -2674,7 +2690,7 @@ class WriteHandle(LocalReadHandle):
         integer gaps, and every pass was measured correct on a gapped log. The
         one price worth stating rather than discovering: compaction will merge
         across the gap, and a merged file spanning one can never be re-cut by
-        `rewrite_archive`.
+        `rewrite_published`.
 
         Takes a `pa.Table` or a `pa.RecordBatchReader` and nothing else.
         Parquet-to-Arrow is the caller's — `pq.ParquetFile(...).iter_batches()`
@@ -2723,18 +2739,18 @@ class WriteHandle(LocalReadHandle):
         # `push_unsettled`, because the trailing run is precisely what has no
         # second copy — `stable_prefix` holds a load's short last file back for
         # a merge that a quiet stream never earns.
-        if loaded is not None and sync:
+        if loaded is not None and publish:
             try:
                 # COMPACT first, and it is not tidiness. The push below takes
                 # the whole trailing run, so every undersized seal still sitting
-                # below the load goes to the archive with it — and compaction
-                # will not merge what the archive holds, so they stay small
+                # below the load goes to the published table with it — and compaction
+                # will not merge what the published table holds, so they stay small
                 # there for ever. Merging them locally first collapses that to
                 # the one file a run genuinely cannot fill. Measured on five
                 # small seals: six undersized objects pushed without this, one
                 # with it.
                 self.compact()
-                self.sync(push_unsettled=True)
+                self.publish(push_unsettled=True)
             except Exception as exc:
                 # The LOAD succeeded and its rows are durable in Parquet; only
                 # the second copy is missing. Saying so leading with that is the
@@ -2742,14 +2758,16 @@ class WriteHandle(LocalReadHandle):
                 # reserve a fresh range and duplicate it — and retrying the push.
                 msg = (
                     f"loaded offsets {loaded[0]}..{loaded[1]} successfully, but "
-                    f"could not push them to the archive: {exc}. The rows are in "
+                    f"could not push them to the published table: {exc}. The rows are in "
                     f"local Parquet and are NOT yet second-copied; retry with "
-                    f"sync(push_unsettled=True) rather than re-running the "
+                    f"publish(push_unsettled=True) rather than re-running the "
                     f"load, which would reserve a new range"
                 )
                 raise RuntimeError(msg) from exc
 
-        return loaded
+        # `_ingest_chunks` speaks the inclusive `(lo, hi)` the tables use
+        # internally; the caller gets `[start, end)`.
+        return _half_open(loaded)
 
     def _refuse_unfiled_rows(self) -> None:
         """Refuse an ingest while any acknowledged row is still owed a file.
@@ -2827,7 +2845,7 @@ class WriteHandle(LocalReadHandle):
         table ends at or below `lo - 1`, and `_covers` is False by construction
         — file by file, since after file N registers the frontier is its `hi`
         and the next reserve starts above it. The same arithmetic settles
-        `archived_through`, which is some file's `hi`. What the claim actually
+        `published_through`, which is some file's `hi`. What the claim actually
         buys is keeping a maintainer's `evict` or `compact` off the range while
         this runs.
         """
@@ -2899,7 +2917,7 @@ class WriteHandle(LocalReadHandle):
         added = self._table.register(
             [str(self._layout.absolute(rel_path)) for rel_path, _, _, _ in staged],
             sealed_through=staged[-1][2],
-            archived_through=self._maintenance.archived_through(),
+            published_through=self._maintenance.published_through(),
             # The last line of defence, which the seal path does not get: a
             # range partially overlapping the table is refused rather than
             # admitted into two files at once. It cannot fire here — see the
@@ -3169,24 +3187,24 @@ class WriteHandle(LocalReadHandle):
         counts as another copy is a property of the deployment, so this is the
         one question, asked in one place.
 
-        - **No archive** — nothing is off-box either way, and holding would
+        - **No published table** — nothing is off-box either way, and holding would
           hold for ever, because nothing would ever release it. Discard.
-        - **Archive, no `wal_replication`** — the buffer and the Parquet share
+        - **Published table, no `wal_replication`** — the buffer and the Parquet share
           a disk and die together, so holding buys nothing and costs SQLite
           growth. Discard.
-        - **Archive and `wal_replication`** — the buffer IS the off-box copy
-          until the archive has the range. Hold, and let `release_archived`
-          drop them once sync has pushed it.
+        - **Published table and `wal_replication`** — the buffer IS the off-box copy
+          until the published table has the range. Hold, and let `release_published`
+          drop them once publish has pushed it.
 
-        `validate` refuses `wal_replication` without an archive, so the last
+        `validate` refuses `wal_replication` without a published table, so the last
         case is just the flag — but both halves are read, because the flag
-        alone would be a claim about the archive that this does not check.
+        alone would be a claim about the published table that this does not check.
 
         Read durably on every seal rather than cached: `set_config` and
-        `set_archive` both change the answer from another process, and §4a's
+        `set_published` both change the answer from another process, and §4a's
         rule is that a decision reads the log rather than its own memory.
         """
-        return not (self.config.wal_replication and self._archive.remote())
+        return not (self.config.wal_replication and self._published.remote())
 
     def _write_and_commit(
         self, start: int, end: int, rel_path: str, lease: Claim | None = None
@@ -3198,7 +3216,7 @@ class WriteHandle(LocalReadHandle):
 
         `start` as well as `end`, because the buffer's floor is no longer the
         group's floor: with WAL replication on, sealed rows stay until the
-        archive has them (§3a), so a read bounded only above would sweep every
+        published table has them (§3a), so a read bounded only above would sweep every
         earlier row into this file. `Buffer.rows_between` records what that
         costs.
         """
@@ -3253,11 +3271,11 @@ class WriteHandle(LocalReadHandle):
         if not self._table.register(
             [str(dest)],
             sealed_through=end,
-            # The archive too. An empty local table covers nothing, so after a
-            # stalled writer's range has been sealed, archived and evicted, the
+            # The published table too. An empty staging table covers nothing, so after a
+            # stalled writer's range has been sealed, published and evicted, the
             # local check alone would let it re-register a file the log has
             # already moved past.
-            archived_through=self._maintenance.archived_through(),
+            published_through=self._maintenance.published_through(),
         ):
             # Declined: another owner already sealed this range, so this file
             # is redundant and will never be referenced. Queue it, or it joins
@@ -3345,7 +3363,7 @@ class WriteHandle(LocalReadHandle):
         if str(self._layout.absolute(rel_path)) in self._table.file_paths():
             # `discard` here too, and it was missing. This is the crash window
             # §3a exists for — committed, not yet retired — so defaulting to a
-            # delete removed the only off-box copy of a range the archive does
+            # delete removed the only off-box copy of a range the published table does
             # not hold, with replication on. Measured: five buffered rows
             # before the crash, zero after the recovery.
             self._buffer.finish_seal(end, rel_path, discard=self._discard_on_seal())
@@ -3376,7 +3394,7 @@ class WriteHandle(LocalReadHandle):
         committed — so the table is already correct and the next `maintain()`
         will pick the same run up again. All that is owed is the half-written
         output, and `compacting` names it, so removing it costs one unlink
-        rather than a directory scan — or, for an archive rewrite, one DELETE
+        rather than a directory scan — or, for a published rewrite, one DELETE
         rather than a paginated LIST over object storage.
         """
         pending = self._buffer.pending_compaction()
@@ -3388,7 +3406,7 @@ class WriteHandle(LocalReadHandle):
         # and the decision that matters is `drain`'s, which reloads at the
         # moment it removes.
 
-        # EVERY claim, not the first. An archive rewrite writes one file per
+        # EVERY claim, not the first. A published rewrite writes one file per
         # re-cut segment and claims each before it exists (I2), so taking one
         # row and then clearing the table left the rest as objects in a bucket
         # that nothing references and only a paginated LIST could find — the
@@ -3405,7 +3423,7 @@ class WriteHandle(LocalReadHandle):
         #
         # That veto is read ONCE per drain pass, not per removal — this said
         # otherwise, and the difference is the whole of a defect found on the
-        # archive side: a commit landing after the veto was read leaves drain
+        # published side: a commit landing after the veto was read leaves drain
         # deleting objects the manifest now names. What actually makes it safe
         # is that the committer renews its claim immediately before committing,
         # so a claim recovery has taken cannot commit at all.
@@ -3413,7 +3431,7 @@ class WriteHandle(LocalReadHandle):
         self._maintenance.enqueue_recovered(key for _, _, key in claimed)
 
         # The scratch database an interrupted rewrite left behind. It is
-        # rebuilt from the archive next time, so nothing in it is owed.
+        # rebuilt from the published table next time, so nothing in it is owed.
         self._layout.rewrite_db.unlink(missing_ok=True)
         # Only the rows just read. A rewrite whose lease lapsed mid-upload can
         # be claiming its next segment while this runs, and clearing the table
@@ -3424,10 +3442,10 @@ class WriteHandle(LocalReadHandle):
 
     # -- maintenance -------------------------------------------------------
 
-    def sync(self, *, push_unsettled: bool = False) -> None:
-        """Push to the archive: upload, register, record the watermark (§5).
+    def publish(self, *, push_unsettled: bool = False) -> None:
+        """Push to the published table: upload, register, record the watermark (§5).
 
-        `push_unsettled=True` pushes EVERYTHING unarchived, including the
+        `push_unsettled=True` pushes EVERYTHING unpublished, including the
         trailing run `stable_prefix` normally holds back for compaction. It is
         not scoped to any subset — `_push` walks a prefix, because the watermark
         it records has to stay contiguous for eviction to trust it (I4), so
@@ -3436,21 +3454,21 @@ class WriteHandle(LocalReadHandle):
         `ingest` passes it, because a load's rows never enter the buffer and so
         have no second copy to wait behind. An operator passes it to close a
         load's tail on a log that has gone quiet, where the run never settles.
-        The cost is undersized objects in the archive that compaction will not
+        The cost is undersized objects in the published table that compaction will not
         merge afterwards; `ingest` runs a compaction first to keep that to what
         a run genuinely cannot fill.
 
-        Archive-facing work only. Lazy, restartable, and arbitrarily far
-        behind — no read depends on it. Raises if no archive is configured;
-        with `archive=None` there is nothing this could do.
+        Published-facing work only. Lazy, restartable, and arbitrarily far
+        behind — no read depends on it. Raises if no published table is configured;
+        with `published=None` there is nothing this could do.
 
         **Only files at or above the compaction threshold are pushed**, and
-        that one rule does three jobs. The archive never receives an undersized
+        that one rule does three jobs. The published table never receives an undersized
         file, so nothing ever has to merge one back out of object storage —
         which would mean paying egress to fix a sizing decision made locally.
         Such a file is also never a compaction input (`compact` only builds
         runs from files BELOW the threshold), so nothing merges across what the
-        archive already holds, and no push can duplicate or strand a range.
+        published table already holds, and no push can duplicate or strand a range.
         And the undersized frontier stays local, bounded by roughly
         `compact_min_files` files, until compaction grows it past the line.
 
@@ -3460,27 +3478,27 @@ class WriteHandle(LocalReadHandle):
         the trailing run holding its short last file has no second copy to wait
         behind, and the rule above would strand it on local disk for as long as
         the stream stayed quiet. A load therefore can leave undersized objects
-        in the archive — up to `compact_min_files - 1` seals forming a run
+        in the published table — up to `compact_min_files - 1` seals forming a run
         `_merge` will not rewrite, plus the load's own tail — and compaction
         will not merge them afterwards, because it refuses to touch anything the
-        archive holds. `rewrite_archive` re-cuts them. `ingest` compacts before
+        published table holds. `rewrite_published` re-cuts them. `ingest` compacts before
         pushing to keep the count to what a run genuinely cannot fill.
 
         DEVIATES from §5, which also lists snapshot expiry (step 4) and local
         eviction (step 5). Both are local storage work and belong to `maintain`,
-        which runs whether or not a sync has. Sync's remaining obligation to
+        which runs whether or not a publish has. Publish's remaining obligation to
         eviction is the registration watermark it records in `meta`, which is
         what lets `maintain` enforce I4.
         """
-        # Re-read where the archive IS before pushing to it. `set_archive` is
+        # Re-read where the published table IS before pushing to it. `set_published` is
         # a durable change made by whichever process runs it, and every other
         # process cached the old value when it opened — so a maintainer started
-        # before a re-point would go on pushing to the retired archive and,
+        # before a re-point would go on pushing to the retired published table and,
         # worse, reconcile the watermark from ITS extent. Eviction trusts that
-        # watermark and deletes local files the new archive has never been
+        # watermark and deletes local files the new published table has never been
         # sent: the rows survive only in the bucket the re-point was retiring.
         #
-        # One keyed read per sync, against a change that is rare and durable.
+        # One keyed read per publish, against a change that is rare and durable.
         # `set_uri` is a no-op when nothing moved.
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
@@ -3489,58 +3507,58 @@ class WriteHandle(LocalReadHandle):
 
         try:
             # UNDER the lease, not before it. Read first, the location can be
-            # re-pointed between the read and the acquire — `set_archive` takes
+            # re-pointed between the read and the acquire — `set_published` takes
             # the same lease, so it is free until this line — and the push then
-            # runs against the old archive while the log durably points at the
-            # new one. `_push` would reconcile the old archive's extent into
+            # runs against the old published table while the log durably points at the
+            # new one. `_push` would reconcile the old published table's extent into
             # the watermark with no network call at all, and eviction believes
             # a watermark whatever earned it.
             # PINNED here, and every fence downstream compares against this
-            # string rather than re-reading the object. `Archive` is shared by
+            # string rather than re-reading the object. `Published` is shared by
             # the log, the reader and the maintainer precisely so a re-point
-            # reaches all three — which means a `set_archive` on another thread
+            # reaches all three — which means a `set_published` on another thread
             # moves the value a fence was going to compare AGAINST, and both
             # sides of the comparison change together. The fence passes, and
-            # the watermark this push earned is recorded against an archive
+            # the watermark this push earned is recorded against a published table
             # that never received it.
-            self._push(lease, self._archive.uri, push_unsettled=push_unsettled)
+            self._push(lease, self._published.uri, push_unsettled=push_unsettled)
         finally:
             lease.release()
 
     def _push(
         self, lease: Claim, pinned: str | None, *, push_unsettled: bool = False
     ) -> None:
-        """Upload and register everything above the archive's extent.
+        """Upload and register everything above the published table's extent.
 
-        **`push_unsettled` pushes the trailing run too**, which `sync`
+        **`push_unsettled` pushes the trailing run too**, which `publish`
         otherwise holds back because compaction may still merge it. Holding it
         back is right when the rows have a second copy and wrong when they do
         not: a bulk load's last file is short unless the load divides evenly,
         and `ingest` rows never enter the buffer, so until that file is in the
-        archive the only copy is local disk. Measured on the deployment that
-        found this: 3,000 rows loaded into 11 files, one ordinary `sync()`,
-        `archived_through()` 2,830 — the last 170 rows local, with
+        published table the only copy is local disk. Measured on the deployment that
+        found this: 3,000 rows loaded into 11 files, one ordinary `publish()`,
+        `published_through()` 2,830 — the last 170 rows local, with
         `coverage()` reporting no gap. On a stream that then went quiet the run
         never settled, and 113,399 rows sat on one disk.
 
-        Safe in the direction it moves. Compaction refuses to merge anything an
-        archive already holds, so a file pushed early is simply never merged —
-        the cost is a small object the archive keeps until `rewrite_archive`
+        Safe in the direction it moves. Compaction refuses to merge anything a
+        published table already holds, so a file pushed early is simply never merged —
+        the cost is a small object the published table keeps until `rewrite_published`
         re-cuts it, not a duplicate range. The deadlock the shared `runs`
         exclusion guards against is the opposite direction: holding back a file
         compaction will never touch.
 
         Everything compaction has finished with, which `stable_prefix` decides
         from compaction's own rule rather than from a size of its own. A file
-        pushed and then merged locally would leave the archive holding rows
+        pushed and then merged locally would leave the published table holding rows
         that have been rewritten underneath it, so the two must agree on which
         files are still in play, and the only way to guarantee that is to ask
         the same function.
 
-        The archive may still gain a small file: one stranded between larger
+        The published table may still gain a small file: one stranded between larger
         neighbours can never be merged, so holding it back would block the
         watermark forever rather than improve anything. That is a cosmetic cost
-        with a deliberate cause, and `rewrite_archive` is the tool for it.
+        with a deliberate cause, and `rewrite_published` is the tool for it.
         """
         # Read under the claim, the same as everything else that decides what
         # this pass does. The grouping `stable_prefix` computes has to match
@@ -3549,32 +3567,32 @@ class WriteHandle(LocalReadHandle):
         # so agreement means both reading the policy the log records rather
         # than the one each happened to open with.
 
-        archive = self._archive.require()
+        published = self._published.require()
         self._table.reload()
-        # The ARCHIVE reloaded too, and for a stronger reason than the local
-        # table. A pyiceberg handle is a frozen snapshot view, and `Archive`
+        # The PUBLISHED table reloaded too, and for a stronger reason than the staging
+        # table. A pyiceberg handle is a frozen snapshot view, and `Published`
         # caches it for the life of the process — so a second maintainer that
-        # synced, released the lease and took it back reads the extent as it
+        # published, released the lease and took it back reads the extent as it
         # was before the OTHER maintainer's register. Every other reader of
         # this extent already reloads; this is the one place that turns it into
         # a durable watermark, and a stale answer here retires the frontier
-        # against an archive that has since grown past it.
-        archive.reload()
+        # against a published table that has since grown past it.
+        published.reload()
 
-        # The archive's tier row, if nothing has computed one yet: a log
-        # configured with an archive at `new`, one written before the manifest
-        # existed, one re-pointed where the archive could not be read. Until
-        # then every query reads the archive. A push adds only copies of local
+        # The published table's tier row, if nothing has computed one yet: a log
+        # configured with a published table at `new`, one written before the manifest
+        # existed, one re-pointed where the published table could not be read. Until
+        # then every query reads the published table. A push adds only copies of local
         # rows, so it never changes this row itself — eviction does.
         if not self._tiers.has():
-            self._record_archive_row(archive)
+            self._record_published_row(published)
 
-        covered = archive.extent()
+        covered = published.extent()
         floor = 0 if covered is None else covered[1]
 
-        # RELEASED HERE, at the top of the pass, from the archive's own extent.
+        # RELEASED HERE, at the top of the pass, from the published table's own extent.
         # These are rows a seal held because nothing off-box had them yet
-        # (`_discard_on_seal`); the archive now does, so they can go.
+        # (`_discard_on_seal`); the published table now does, so they can go.
         #
         # Not at the tail of this method, and that placement is the whole of
         # its crash-safety. `_push` returns early in three places before its
@@ -3585,69 +3603,69 @@ class WriteHandle(LocalReadHandle):
         # held indefinitely. Driven from the frontier instead, it is idempotent
         # and every pass retries it for free.
         if not self._discard_on_seal() and floor:
-            # The archive's own extent, and that is sound only because
-            # `_refuse_archive_ahead` has already established the archive is
+            # The published table's own extent, and that is sound only because
+            # `_refuse_published_ahead` has already established the published table is
             # OURS. Two narrower bounds were tried here and neither works: the
             # watermark is raised to `floor` by `confirmed` below on every
             # pass, and this log's own `extent` rows are written for the
-            # archive's whole manifest by the backfill within one sync. Both
+            # published table's whole manifest by the backfill within one publish. Both
             # are downstream of a contamination that has to be stopped at the
             # point the log is pointed.
-            self._buffer.release_archived(floor)
+            self._buffer.release_published(floor)
 
-        # The watermark reconciled against the archive itself. It is a cache of
-        # what the archive holds — kept for the push floor and for display, and
+        # The watermark reconciled against the published table itself. It is a cache of
+        # what the published table holds — kept for the push floor and for display, and
         # no longer for anything that authorises a deletion — so a commit that
         # landed while the `meta` write after it did not would leave it behind
-        # for ever: the next pass computes `floor` from the archive, finds
+        # for ever: the next pass computes `floor` from the published table, finds
         # nothing left to push, and never revisits it.
         #
         # Compared and written in one transaction, not read and then written.
-        # Reconciling against an archive the log has been pointed away from is
+        # Reconciling against a published table the log has been pointed away from is
         # the loss this path is here to prevent, and a guard that reads first
-        # only reports where the archive was.
-        confirmed = max(self._maintenance.archived_through(), floor)
+        # only reports where the published table was.
+        confirmed = max(self._maintenance.published_through(), floor)
         self._buffer.set_meta_if(
-            _ARCHIVE_KEY, pinned, {Maintenance.ARCHIVED_KEY: str(confirmed)}
+            _PUBLISHED_KEY, pinned, {Maintenance.PUBLISHED_THROUGH_KEY: str(confirmed)}
         )
 
         memory = self._maintenance.memory()
 
         # BACKFILL, and it is what makes I4-per-segment recoverable. The row
-        # naming a file's archive copy is written after the register, so a
-        # crash between the two leaves the archive holding a range that nothing
+        # naming a file's published copy is written after the register, so a
+        # crash between the two leaves the published table holding a range that nothing
         # local records — and compaction, which now decides from those rows,
-        # would merge it into a file spanning the archive's extent. The next
+        # would merge it into a file spanning the published table's extent. The next
         # push would register a partial overlap, which `register` admits.
         #
-        # The archive's own manifest is the truth, so recover from it rather
+        # The published table's own manifest is the truth, so recover from it rather
         # than promising anything beforehand. Reading it costs nothing extra:
         # `extent()` above already walked it.
-        # Bounded by the local window, not by the archive. Every decision the
+        # Bounded by the staging window, not by the published table. Every decision the
         # rows feed — what compaction may merge, what eviction may drop — is
-        # about files the local table still holds, so an archive file entirely
+        # about files the staging table still holds, so a published file entirely
         # below them changes no answer. Unbounded, this read and this loop grew
-        # with the archive and ran on every single sync.
+        # with the published table and ran on every single publish.
         # Bound before the first use. The backfill below sizes an unmeasured
-        # archive file by the compact target, and `stable_prefix` groups by the
+        # published file by the compact target, and `stable_prefix` groups by the
         # same policy — two reads, and nothing that makes them agree.
         config = self.config
         local = self._table.data_files()
         base = min((f.lo for f in local), default=0)
 
-        # RECONCILIATION, matched by path in the archive's manifest rather than
+        # RECONCILIATION, matched by path in the published table's manifest rather than
         # by offset range. Range matching reads plausibly and is wrong: a
         # rewrite's intents name new objects over a range the stale files being
         # replaced still cover, so a crashed rewrite's dead intents would be
         # confirmed rather than dropped.
         #
         # Bounds differ between the two reads and must. The manifest walk is
-        # bounded by the local window, or it grows with the archive and runs on
-        # every sync. The intent read is unbounded, because an intent below the
+        # bounded by the staging window, or it grows with the published table and runs on
+        # every publish. The intent read is unbounded, because an intent below the
         # window has to be reachable to be dropped.
-        held_paths = {f.path: f for f in archive.data_files() if f.hi >= base}
+        held_paths = {f.path: f for f in published.data_files() if f.hi >= base}
         recorded = {
-            path for path, _, _, _ in self._buffer.archive_records(pinned or "", base)
+            path for path, _, _, _ in self._buffer.published_records(pinned or "", base)
         }
         intended = {
             path: (lo, hi, size)
@@ -3661,7 +3679,7 @@ class WriteHandle(LocalReadHandle):
         # intent's measured bytes with the default. That made the `bytes`
         # column dead in every reachable path: the rewrite tail this exists to
         # size correctly was durably recorded as full, and nothing re-measures
-        # an archived file.
+        # a published file.
         for path, landed in held_paths.items():
             recovered = intended.get(path)
             if recovered is not None:
@@ -3683,7 +3701,7 @@ class WriteHandle(LocalReadHandle):
         for path in intended:
             if path not in held_paths:
                 # 3. Nothing in the manifest holds that path, so the register
-                #    never landed and the intent is dead. Below the local
+                #    never landed and the intent is dead. Below the staging
                 #    window this also drops intents whose register DID land —
                 #    the manifest walk is bounded — and their sizes are then
                 #    never measured. No reader below the window asks.
@@ -3691,11 +3709,11 @@ class WriteHandle(LocalReadHandle):
 
         pending = [f for f in self._table.data_files() if f.hi > floor]
         # `stable_prefix` holds a file back when compaction might still merge
-        # it, and compaction refuses to merge anything some archive already
+        # it, and compaction refuses to merge anything some published table already
         # holds — so the two need the SAME exclusion or they deadlock. They
         # share `runs` for exactly this reason, and giving compaction a second
         # input this could not see was enough to break it: after a re-point to
-        # a fresh prefix the floor is 0, so files an old archive covers are
+        # a fresh prefix the floor is 0, so files an old published table covers are
         # back in `pending`, group into a mergeable run under a raised target,
         # and are held back for ever against a merge that will never happen.
         # Nothing is pushed, the watermark never moves, eviction pins on it,
@@ -3707,7 +3725,7 @@ class WriteHandle(LocalReadHandle):
         # two share `runs` so they cannot disagree about what is in play, and
         # a second input one of them could not see is what deadlocked them once
         # already.
-        frozen = self._maintenance.archived_prefix(pending, None, include_intents=True)
+        frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
         head = [f for f in pending if f.lo > frozen]
         settled = (len(pending) - len(head)) + stable_prefix(
             head,
@@ -3717,14 +3735,14 @@ class WriteHandle(LocalReadHandle):
             config.compact_rows,
         )
         if push_unsettled:
-            # EVERYTHING unarchived, and that is forced rather than chosen.
+            # EVERYTHING unpublished, and that is forced rather than chosen.
             # `pending[:settled]` is a PREFIX because the watermark recorded
             # below has to stay contiguous — eviction trusts it for I4 — so
             # there is no way to push a load's tail while leaving an undersized
             # SEAL beneath it unpushed. Attempted and measured: extending only
             # through bulk-loaded files never advances past a seal sitting at
-            # index 0, and `archived_through()` stays 0 with the load
-            # unarchived. Hence the blunt name.
+            # index 0, and `published_through()` stays 0 with the load
+            # unpublished. Hence the blunt name.
             #
             # So this ships those files. Acceptable because of WHEN a load
             # happens: `ingest` claims the whole log and is a backfill-time
@@ -3732,8 +3750,8 @@ class WriteHandle(LocalReadHandle):
             # run is the load's own. And the alternative is worse by a wide
             # margin — a load's rows never enter the buffer, so not pushing them
             # leaves them on one disk. Compaction will not merge what the
-            # archive holds, so any small objects persist until
-            # `rewrite_archive` re-cuts them.
+            # published table holds, so any small objects persist until
+            # `rewrite_published` re-cuts them.
             settled = len(pending)
 
         uploaded: list[tuple[DataFile, str]] = []
@@ -3741,22 +3759,22 @@ class WriteHandle(LocalReadHandle):
             checkpoint(lease.renew)
             rel_path = self._layout.relative(data_file.path)
             # The intent BEFORE the upload, which is the seal's I2 argument
-            # applied to the archive: the name goes down before the object
+            # applied to the published table: the name goes down before the object
             # exists. What it guards is the register that follows — that can
             # land while the row recording it does not, and compaction decides
             # what it may merge from those rows, so without this a
-            # compaction-target change before the next sync merges across a
-            # range the archive holds and every later push is refused for ever.
+            # compaction-target change before the next publish merges across a
+            # range the published table holds and every later push is refused for ever.
             #
             # For EVERY file, not only measured ones: the unmeasured are
             # exactly the ones the confirm below used to skip.
             self._buffer.intend_file(
-                archive.uri(rel_path),
+                published.uri(rel_path),
                 data_file.lo,
                 data_file.hi + 1,
                 memory.get(data_file.path, config.compact_size),
             )
-            archive.put(self._layout.absolute(rel_path), rel_path)
+            published.put(self._layout.absolute(rel_path), rel_path)
             uploaded.append((data_file, rel_path))
 
         if not uploaded:
@@ -3766,22 +3784,22 @@ class WriteHandle(LocalReadHandle):
         # Measured against S3: 648 ms to upload a file and 4.1 s to register
         # it, and registering does not get cheaper for holding one file instead
         # of twenty — it reads a footer, writes a manifest, a manifest list and
-        # a fresh metadata.json whatever the count. Per file, that made `sync`
+        # a fresh metadata.json whatever the count. Per file, that made `publish`
         # take 83 s over sixteen files while the sealer sharing its thread
         # waited, and the buffer grew for the whole of it.
         checkpoint(lease.renew)
         last = uploaded[-1][0]
-        if (self._buffer.get_meta(_ARCHIVE_KEY) or None) != pinned:
+        if (self._buffer.get_meta(_PUBLISHED_KEY) or None) != pinned:
             # The upload already spent longer than a lease TTL against S3 more
             # than once, which is how the log gets re-pointed underneath a push
-            # — and registering into the archive it was pointed AWAY from
+            # — and registering into the published table it was pointed AWAY from
             # writes the log's rows somewhere nothing will look for them again.
             raise _repointed_mid_push()
 
-        if not archive.register(
-            [archive.uri(rel_path) for _, rel_path in uploaded],
+        if not published.register(
+            [published.uri(rel_path) for _, rel_path in uploaded],
             sealed_through=last.hi + 1,
-            # The low end too, so the archive can refuse a range that starts
+            # The low end too, so the published table can refuse a range that starts
             # inside what it already holds. Everything upstream is arranged so
             # that cannot happen; this is the check that holds regardless of
             # whether the arrangement has a gap.
@@ -3790,7 +3808,7 @@ class WriteHandle(LocalReadHandle):
             return
 
         for data_file, rel_path in uploaded:
-            # The archive's copy holds what the local one did, and this is the
+            # The published table's copy holds what the local one did, and this is the
             # only moment both names are known. Nothing could re-derive it
             # afterwards: the local entry goes when the local file is unlinked,
             # and a Parquet footer records what the rows compressed from, not
@@ -3805,17 +3823,17 @@ class WriteHandle(LocalReadHandle):
             # Same extent, second location. `end_offset` is exclusive, as it is
             # on every other extent — the cut is the offset AFTER the last row.
             self._buffer.record_file(
-                archive.uri(rel_path),
+                published.uri(rel_path),
                 data_file.lo,
                 data_file.hi + 1,
                 memory.get(data_file.path, config.compact_size),
             )
 
         # After the register, never before: the watermark is a promise that the
-        # archive HAS the range, and I4 lets `maintain` delete the local copy on
+        # published table HAS the range, and I4 lets `maintain` delete the local copy on
         # the strength of it.
         #
-        # And only if it is still a promise about the SAME archive. This push
+        # And only if it is still a promise about the SAME published table. This push
         # can outlive its lease — a register alone measured 4.1 s and retries
         # compound it — and a re-point that takes the lease meanwhile leaves
         # this about to record an extent earned by a bucket the log has left.
@@ -3825,14 +3843,14 @@ class WriteHandle(LocalReadHandle):
         # write: nothing lowers a watermark afterwards, so recording one earned
         # by a bucket the log has left is not a mistake anything corrects.
         if not self._buffer.set_meta_if(
-            _ARCHIVE_KEY, pinned, {Maintenance.ARCHIVED_KEY: str(last.hi)}
+            _PUBLISHED_KEY, pinned, {Maintenance.PUBLISHED_THROUGH_KEY: str(last.hi)}
         ):
             raise _repointed_mid_push()
 
         # Again, now that this push has landed and its `record_file` rows
         # exist. The release at the top of the pass ran before them, so on its
-        # own it frees rows one whole sync late — safe, since holding is the
-        # safe direction, but a busy log would carry a sync's worth it no
+        # own it frees rows one whole publish late — safe, since holding is the
+        # safe direction, but a busy log would carry a publish's worth it no
         # longer needs.
         #
         # This one is the promptness; that one is the correctness. A crash
@@ -3841,15 +3859,15 @@ class WriteHandle(LocalReadHandle):
         # have been uploaded. Neither placement alone is both.
         #
         if not self._discard_on_seal():
-            self._buffer.release_archived(last.hi)
+            self._buffer.release_published(last.hi)
 
-    def _store_local_statistics(self) -> None:
-        """Store the rollup of the local table's current version, for everyone.
+    def _store_staging_statistics(self) -> None:
+        """Store the rollup of the staging table's current version, for everyone.
 
         Run after each local commit this process makes. The rollup is 2–3 ms
         (measured at 1–64 files), paid once here rather than once per process
         that queries the new version. Stamped with the version and written
-        forward only — see `Buffer.store_local_statistics`.
+        forward only — see `Buffer.store_staging_statistics`.
         """
         location, extent = self._table.snapshot()
         statistics = self._table.statistics_at(location)
@@ -3857,23 +3875,23 @@ class WriteHandle(LocalReadHandle):
             return
 
         offsets = (0, 0) if extent is None else (extent[0], extent[1] + 1)
-        self._buffer.store_local_statistics(
+        self._buffer.store_staging_statistics(
             location, offsets, encode_tier(self._buffer.shape().table, statistics)
         )
 
-    def _record_archive_row(self, archive: LogTable) -> None:
-        """The archive's tier row, exactly, from its manifests.
+    def _record_published_row(self, published: LogTable) -> None:
+        """The published table's tier row, exactly, from its manifests.
 
-        Its files reaching below the local table — the range the archive leg
-        of a read covers. A file straddling the local table's first offset is
+        Its files reaching below the staging table — the range the published leg
+        of a read covers. A file straddling the staging table's first offset is
         included whole, so its bounds overstate; that is the safe direction.
 
         Narrows, so only under the whole-log maintenance claim: eviction, the
         one thing that widens this row, cannot run beside it, and nothing
-        else moves the local table's floor down.
+        else moves the staging table's floor down.
         """
-        archive.reload()
-        schema, files = archive.live_files()
+        published.reload()
+        schema, files = published.live_files()
         self._table.reload()
         extent = self._table.extent()
         below = [
@@ -3882,16 +3900,16 @@ class WriteHandle(LocalReadHandle):
         self._tiers.replace(self._buffer.shape().table, rollup(None, schema, below))
 
     def _backfill_manifest(self) -> None:
-        """Compute the archive's tier row if the manifest lacks it, best effort.
+        """Compute the published table's tier row if the manifest lacks it, best effort.
 
         At open, so a log written before the manifest existed stops reading the
-        archive for every query. Under the whole-log claim, which eviction
+        published table for every query. Under the whole-log claim, which eviction
         cannot hold beside. If the claim is held elsewhere, the holder's next
-        `sync` computes the row; until then the archive is simply read.
+        `publish` computes the row; until then the published table is simply read.
 
-        It reads the archive's manifests, so it needs the network. An archive
+        It reads the published table's manifests, so it needs the network. A published table
         this process has no catalog entry for is not opened at all (`table()`
-        answers None offline), so a log that has never synced touches no
+        answers None offline), so a log that has never published touches no
         network here.
         """
         if self._tiers.has():
@@ -3902,9 +3920,9 @@ class WriteHandle(LocalReadHandle):
             return
 
         try:
-            archive = self._archive.table()
-            if archive is not None:
-                self._record_archive_row(archive)
+            published = self._published.table()
+            if published is not None:
+                self._record_published_row(published)
         except Exception:  # noqa: BLE001
             # Unreachable is the ordinary case this tolerates — a box whose
             # credentials arrive after the log is opened. A row not written is
@@ -3922,11 +3940,11 @@ class WriteHandle(LocalReadHandle):
         costs do, now that conversion reads and rewrites files while the other
         two are metadata commits.
 
-        **Eviction is bounded by I4 on every log**: a file that sync has not
-        yet registered in the archive is never evicted, however old. So on a
+        **Eviction is bounded by I4 on every log**: a file that publish has not
+        yet registered in the published table is never evicted, however old. So on a
         partitioned-off machine, this compacts and expires but leaves the window
         growing — §11's "local eviction stalls" — and on a local-only log,
-        `local_retention` takes effect as `sync` publishes to its local archive.
+        `staging_retention` takes effect as `publish` publishes to its local published table.
         Eviction never deletes data (#98).
 
         Whether a stalled or partial pass should be reported rather than silent
@@ -3960,7 +3978,7 @@ class WriteHandle(LocalReadHandle):
         self.seal_due()
 
         # LAST, and only when asked. The pass above is what frees pages —
-        # eviction and the archive's release both delete — so reclaiming before
+        # eviction and the published table's release both delete — so reclaiming before
         # it would measure a free list that is about to grow. Off unless
         # `vacuum_free_ratio` is set, because this is the one part of a
         # maintenance pass that blocks appends; see `reclaim_buffer`.
@@ -3972,7 +3990,7 @@ class WriteHandle(LocalReadHandle):
         """Return `buffer.db`'s dead space to the OS. Bytes reclaimed, or 0.
 
         SQLite puts pages freed by a DELETE on a free list and never shrinks the
-        file, so a buffer that seals and archives for months keeps every page it
+        file, so a buffer that seals and publishes for months keeps every page it
         has ever needed. Locally that is invisible — the free list is reused —
         and it is FAILOVER that pays, because litestream replicates the FILE:
         every `restore` downloads and applies the dead space.
@@ -3991,7 +4009,7 @@ class WriteHandle(LocalReadHandle):
         and do nothing — the check is three PRAGMAs — so it is safe in a loop.
 
         `litelink_offset` is untouched: values keep their gaps and the
-        AUTOINCREMENT counter survives, including on a buffer the archive has
+        AUTOINCREMENT counter survives, including on a buffer the published table has
         fully drained (I9). See `Buffer.reclaim_free_pages`.
         """
         return self._buffer.reclaim_free_pages(min_free_ratio)
@@ -4009,10 +4027,10 @@ class WriteHandle(LocalReadHandle):
         self._pass(self._maintenance.compact, heartbeat)
 
     def evict(self, heartbeat: Callable[[], bool] | None = None) -> None:
-        """Drop files past `local_retention` from the local table (§8).
+        """Drop files past `staging_retention` from the staging table (§8).
 
-        Never past what the archive holds when one is configured (I4), so a
-        sync that is behind delays this rather than losing data.
+        Never past what the published table holds when one is configured (I4), so a
+        publish that is behind delays this rather than losing data.
         """
         self._pass(lambda _: self._maintenance.evict(), heartbeat)
 
@@ -4039,20 +4057,20 @@ class WriteHandle(LocalReadHandle):
         # back and cover every offset in the log while doing so.
         run(heartbeat)
 
-    def rewrite_archive(self) -> None:
-        """Merge undersized files already in the archive (§6, ad-hoc).
+    def rewrite_published(self) -> None:
+        """Merge undersized files already in the published table (§6, ad-hoc).
 
         An operation, not a policy. Nothing calls it on a schedule and normal
-        operation does not need it: `sync` pushes only files compaction has
-        finished with, so the archive is well-sized by construction — except for
+        operation does not need it: `publish` pushes only files compaction has
+        finished with, so the published table is well-sized by construction — except for
         what a bulk load pushed with `push_unsettled` to avoid stranding rows
         that have no second copy. It exists for the three things that break that
         on purpose — an explicit `seal()` stranding a small file, a change to
-        `target_compact_size`, which applies to the future while the archive is
+        `target_compact_size`, which applies to the future while the published table is
         immutable history, and that load's undersized push.
 
         Run it when nothing else is maintaining the log: it takes the same
-        lease as `maintain` and `sync`, and it rewrites the same files they
+        lease as `maintain` and `publish`, and it rewrites the same files they
         would.
         """
         lease = self._lease(MAINTAIN_ROLE)
@@ -4061,18 +4079,18 @@ class WriteHandle(LocalReadHandle):
             raise RuntimeError(msg)
 
         try:
-            self._maintenance.rewrite_archive(lease.renew, lease.owner)
+            self._maintenance.rewrite_published(lease.renew, lease.owner)
         finally:
             lease.release()
 
     def retire(self) -> None:
-        """End this log for good: every row to the archive, nothing left local.
+        """End this log for good: every row to the published table, nothing left local.
 
         After it, the log takes no rows — from this handle, from a writer that
         opened before it ran, or from anything that `open`s or `restore`s it —
         and each refusal says when it retired and at which offset, so the next
         log can start at the one after. Reads still work: `open(...,
-        read_only=True)` reads the archive, and so does any Iceberg engine.
+        read_only=True)` reads the published table, and so does any Iceberg engine.
         `hydrate` still works too, for a retired log someone replays often.
 
         Steps, each safe to re-run — a crash leaves the log `retiring`, and
@@ -4083,10 +4101,10 @@ class WriteHandle(LocalReadHandle):
            (the buffer's trigger keys on that end), so nothing can arrive after
            the final push;
         2. seal everything buffered;
-        3. `sync(push_unsettled=True)`, which also releases the rows a
+        3. `publish(push_unsettled=True)`, which also releases the rows a
            `wal_replication` seal was holding;
-        4. evict the whole local table, and check nothing is left local;
-        5. record the retirement on the archive table (`litelink.retired`), so
+        4. evict the whole staging table, and check nothing is left local;
+        5. record the retirement on the published table (`litelink.retired`), so
            `restore` refuses whatever a replica says;
         6. narrow the buffer's range to `[end, end)`, empty, and flush the WAL
            replica again. That empty range is what reads as `retired` rather
@@ -4116,26 +4134,26 @@ class WriteHandle(LocalReadHandle):
             self.seal()
             self.await_seal()
 
-        self.sync(push_unsettled=True)
+        self.publish(push_unsettled=True)
         self._maintenance.evict(everything=True)
 
         self._table.reload()
         if self._table.extent() is not None or self._buffer.extent() is not None:
             msg = (
                 f"retire() could not empty {self.root}/{self.name}: local files or "
-                "buffered rows remain that the archive does not hold yet. It stays "
-                "retiring and takes no rows; call retire() again once sync can "
-                "reach the archive"
+                "buffered rows remain that the published table does not hold yet. It stays "
+                "retiring and takes no rows; call retire() again once publish can "
+                "reach the published table"
             )
             raise RuntimeError(msg)
 
-        archive = self._archive.require()
-        archive.reload()
-        covered = archive.extent()
+        published = self._published.require()
+        published.reload()
+        covered = published.extent()
         through = None if covered is None else covered[1]
         claim = self._claim_settings()
         try:
-            archive.set_properties(
+            published.set_properties(
                 {RETIRED_PROPERTY: json.dumps({"through": through, "at": _now()})}
             )
         finally:
@@ -4153,46 +4171,46 @@ class WriteHandle(LocalReadHandle):
             flush(self._layout)
 
     def hydrate(self, since: timedelta) -> None:
-        """Re-register archived files into the local table (§8).
+        """Re-register published files into the staging table (§8).
 
-        Raising `local_retention` is an operation, not a config change: without
+        Raising `staging_retention` is an operation, not a config change: without
         this, a raised setting applies only to data captured afterwards.
 
-        `since` is measured against when the ARCHIVE took each file, which is
+        `since` is measured against when the PUBLISHED table took each file, which is
         the only age still on record — the local snapshots that once dated them
         went with the eviction, and the library stamps no timestamp of its own
-        (§2). So this reads "bring back what was archived in the last week",
+        (§2). So this reads "bring back what was published in the last week",
         not "what was captured then"; for a stream that fell behind, those
         differ.
 
         Files are copied down and registered under the name they have
         remotely, so hydrating twice writes the same paths rather than
         accumulating copies, and one interrupted halfway is finished by the
-        next run. Only ranges strictly below what the local table already holds
+        next run. Only ranges strictly below what the staging table already holds
         are considered, which is what keeps files contiguous and
-        non-overlapping (§4) — the archive's copy of a range the local table
+        non-overlapping (§4) — the published table's copy of a range the staging table
         still has would otherwise be added a second time and every row in it
         read twice.
 
         A hydrated file is not measured: nothing local counted its rows, and
         its extent carries no size. That is deliberate and it is what
         an unknown size means everywhere else — the file counts as full, so
-        compaction will not merge it and `sync` will not push it back to the
-        archive it just came from. Eviction still applies to it, which is the
-        point: this is temporary unless `local_retention` is raised too.
+        compaction will not merge it and `publish` will not push it back to the
+        published table it just came from. Eviction still applies to it, which is the
+        point: this is temporary unless `staging_retention` is raised too.
 
-        Needs a remote archive, like `restore` and `replication_config`: a
+        Needs a remote published table, like `restore` and `replication_config`: a
         local one is on this disk already, so copying from it buys nothing.
         """
-        if not self._archive.remote():
+        if not self._published.remote():
             msg = (
-                f"hydrate() needs a remote archive (s3://); this log publishes to "
-                f"{self.archive}, which is on this disk already — reads below "
-                f"the local table get its rows from there"
+                f"hydrate() needs a remote published table (s3://); this log publishes to "
+                f"{self.published}, which is on this disk already — reads below "
+                f"the staging table get its rows from there"
             )
             raise ValueError(msg)
 
-        # The maintenance lease, because this writes the local table and copies
+        # The maintenance lease, because this writes the staging table and copies
         # files into the data directory — the same two things eviction and
         # compaction do, and for the same reason they must not overlap.
         lease = self._lease(MAINTAIN_ROLE)
@@ -4206,20 +4224,20 @@ class WriteHandle(LocalReadHandle):
             lease.release()
 
     def _pull(self, lease: Claim, since: timedelta) -> None:
-        """Copy down and register everything archived since `since`."""
-        archive = self._archive.require()
+        """Copy down and register everything published since `since`."""
+        published = self._published.require()
         self._table.reload()
 
         covered = self._table.extent()
         # Nothing local means nothing to sit below, so everything qualifies.
         floor = covered[0] if covered is not None else None
         cutoff = datetime.now(UTC) - since
-        added = archive.snapshot_ages()
+        added = published.snapshot_ages()
         held = self._maintenance.memory()
 
         eligible = [
             data_file
-            for data_file in archive.data_files()
+            for data_file in published.data_files()
             if (floor is None or data_file.hi < floor)
             and (stamped := added.get(data_file.path)) is not None
             and stamped.replace(tzinfo=UTC) >= cutoff
@@ -4230,10 +4248,10 @@ class WriteHandle(LocalReadHandle):
         # Registering upward left a hole no later run could fill. The first
         # file restored becomes the new lowest local range, so a failure before
         # the next one — a lost lease, a network error, or a `since` window
-        # that selected a non-contiguous set because `rewrite_archive` re-dated
+        # that selected a non-contiguous set because `rewrite_published` re-dated
         # a middle file — leaves the gap ABOVE what was restored. The next run
         # takes its floor from that new lower bound, finds the gap no longer
-        # below it, and skips it for ever. `_union` bounds the archive leg by
+        # below it, and skips it for ever. `_union` bounds the published leg by
         # the local floor, so those offsets are then served by neither tier:
         # rows silently missing from every query.
         #
@@ -4247,9 +4265,9 @@ class WriteHandle(LocalReadHandle):
                 break
 
             checkpoint(lease.renew)
-            rel_path = archive.key(data_file.path)
+            rel_path = published.key(data_file.path)
             destination = self._layout.absolute(rel_path)
-            archive.fetch(data_file.path, destination)
+            published.fetch(data_file.path, destination)
             # Asked AGAIN, after the fetch and before the commit. The download
             # is a whole file rather than a stream, so it is the slow leg, and
             # the checkpoint above only says the claim was held before it. Past
@@ -4260,19 +4278,19 @@ class WriteHandle(LocalReadHandle):
             # this is the lapsed one. Registering afterwards points the table
             # at a file that is not on disk: every scan over the range raises,
             # and `record_file` stamps it fresh so eviction cannot age it out
-            # for a whole `local_retention`, while a re-run of `hydrate` skips
+            # for a whole `staging_retention`, while a re-run of `hydrate` skips
             # the range because the local floor now covers it.
             checkpoint(lease.renew)
             # No `sealed_through`: that check exists to decline a range the
             # table already covers, and every range here is deliberately below
             # what it covers. The filter above is what prevents an overlap.
             self._table.register([str(destination)])
-            # An extent for the local copy, carrying what the archive's copy
-            # holds. Restored data is subject to `local_retention` like
+            # An extent for the local copy, carrying what the published table's copy
+            # holds. Restored data is subject to `staging_retention` like
             # anything else, and eviction dates a file by this record — so a
             # hydrated file without one would sit undateable, treated as newly
             # written, and never leave again.
-            # A file the archive never measured counts as FULL, matching what
+            # A file the published table never measured counts as FULL, matching what
             # this promises above. Zero was the opposite, and it was dormant
             # only while a watermark kept hydrated files out of every size
             # consumer — removing the watermark is what wakes it: a file
@@ -4369,7 +4387,7 @@ def validate(
     schema: pa.Schema,
     sort_by: Sequence[str],
     config: LogConfig,
-    archive: str | None,
+    published: str | None,
 ) -> None:
     """Reject configurations that cannot mean what they say.
 
@@ -4384,13 +4402,13 @@ def validate(
     # fail here, not on the first read after the data is already durable.
     validate_schema(schema)
 
-    # The archive's SHAPE, before any rule that reads its meaning. Callers
+    # The published table's SHAPE, before any rule that reads its meaning. Callers
     # reach this with the empty string already normalised to None, so a string
     # here is one somebody meant — and a malformed one is not caught anywhere
     # downstream, because every consumer parses it positionally. See
-    # `validate_archive`.
-    if archive is not None:
-        validate_archive(archive)
+    # `validate_published`.
+    if published is not None:
+        validate_published(published)
 
     missing = [c for c in sort_by if c not in schema.names]
     if missing:
@@ -4414,20 +4432,20 @@ def validate(
         msg = f"snapshot_retention must not be negative: {config.snapshot_retention}"
         raise ValueError(msg)
 
-    if config.local_retention is not None and config.local_retention < timedelta(0):
+    if config.staging_retention is not None and config.staging_retention < timedelta(0):
         # The same check its twin above has always had, and the reason it
-        # matters more here: eviction computes `now - local_retention`, so a
+        # matters more here: eviction computes `now - staging_retention`, so a
         # negative one puts the cutoff in the FUTURE and every file in the log
-        # is stale, and eviction drops everything the archive holds, from one
+        # is stale, and eviction drops everything the published table holds, from one
         # sign slip.
-        msg = f"local_retention must not be negative: {config.local_retention}"
+        msg = f"staging_retention must not be negative: {config.staging_retention}"
         raise ValueError(msg)
 
-    if config.wal_replication and (archive is None or not is_remote(archive)):
+    if config.wal_replication and (published is None or not is_remote(published)):
         msg = (
-            "wal_replication needs a remote archive (s3://): the WAL replica "
+            "wal_replication needs a remote published table (s3://): the WAL replica "
             "exists to get unsealed rows off this machine, and a local "
-            "archive is on it"
+            "published table is on it"
         )
         raise ValueError(msg)
 
@@ -4466,8 +4484,8 @@ def validate(
             "It is how many files a run needs before compaction will merge it, "
             "and a run always holds at least one — so at one, every run looks "
             "mergeable, nothing is ever settled, and `stable_prefix` returns "
-            "zero for ever: sync pushes nothing, the watermark stands still, "
-            "eviction pins on it and the local table grows without bound, while "
+            "zero for ever: publish pushes nothing, the watermark stands still, "
+            "eviction pins on it and the staging table grows without bound, while "
             "every pass rewrites every file to no purpose. Merging a run of one "
             "is a no-op rewrite in any case"
         )
@@ -4501,8 +4519,8 @@ def validate(
         )
         raise ValueError(msg)
 
-    if config.local_rows is not None and config.local_rows < 0:
-        msg = f"local_rows must not be negative: {config.local_rows}"
+    if config.staging_rows is not None and config.staging_rows < 0:
+        msg = f"staging_rows must not be negative: {config.staging_rows}"
         raise ValueError(msg)
 
     if config.compression not in _CODECS:

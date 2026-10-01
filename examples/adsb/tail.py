@@ -23,7 +23,7 @@ from litelink._s3 import S3Options
 
 
 def snapshot(log: LogHandle) -> tuple[int, int, int, int, int]:
-    """(stream rows, local rows, buffer rows, local files, archived rows).
+    """(stream rows, staging rows, buffer rows, staging files, published rows).
 
     Nothing here scans data. Iceberg tracks a row count per file, so the table's
     total comes off the manifest read that produced the boundary; the buffer is
@@ -34,22 +34,22 @@ def snapshot(log: LogHandle) -> tuple[int, int, int, int, int]:
     the log grew — 24 ms at 50,000 rows and climbing. This is flat.
 
     Everything here is local and free, which is what lets the `read` column
-    mean something. The archive's file count is neither, so it is not in here —
-    see `ArchiveCount`.
+    mean something. The published table's file count is neither, so it is not in here —
+    see `PublishedCount`.
 
-    With an archive, `table + buffer` stops being the whole stream: eviction
-    removes files the archive has, so the local tiers SHRINK while the stream
+    With a published table, `table + buffer` stops being the whole stream: eviction
+    removes files the published table has, so the staging tiers SHRINK while the stream
     only grows. `end_offset` is the count that keeps growing either way — it is
     the next offset to be assigned, so one less than it is every row ever
     appended, whichever tier now holds it. The watermark says how much of that
-    the archive has taken, and the gap between them is how far sync is behind.
+    the published table has taken, and the gap between them is how far publish is behind.
     """
     return (
         log.end_offset() - 1,
-        log.table_rows(),
+        log.staging_rows(),
         log.buffered_rows(),
-        log.table_files(),
-        log.archived_through(),
+        log.staging_files(),
+        log.published_through(),
     )
 
 
@@ -77,13 +77,12 @@ class ScanCost:
     def due(self) -> bool:
         return time.monotonic() - self._at >= self._every
 
-    def measure(self, log: LogHandle, *, archived: bool) -> None:
+    def measure(self, log: LogHandle) -> None:
         self._at = time.monotonic()
         started = time.monotonic()
         # `read_all`, not a count: a count is answered from statistics without
         # opening a data file, which would measure the wrong thing entirely.
-        source = log if archived else log
-        self.rows = source.scan().read_all().num_rows
+        self.rows = log.scan().read_all().num_rows
         self.seconds = time.monotonic() - started
 
     def rate(self) -> str:
@@ -103,8 +102,8 @@ class ScanCost:
         return f"{per_second / 1e3:.0f}k/s"
 
 
-class ArchiveCount:
-    """How many files the archive holds, fetched only when it can have changed.
+class PublishedCount:
+    """How many files the published table holds, fetched only when it can have changed.
 
     Counting what object storage holds means asking object storage, so this is
     the one number in the display that is not free — asking every tick took the
@@ -112,7 +111,7 @@ class ArchiveCount:
     there to show.
 
     The watermark is the signal. It is a local read, and it moves exactly when
-    `sync` commits, which is exactly when the archive can have gained files. So
+    `publish` commits, which is exactly when the published table can have gained files. So
     a tick with nothing new to report costs no round trip, and one that does
     pays for it once.
     """
@@ -124,7 +123,7 @@ class ArchiveCount:
     def at(self, log: LogHandle, watermark: int) -> int:
         if watermark != self._watermark:
             self._watermark = watermark
-            self._files = log.archive_files()
+            self._files = log.published_files()
 
         return self._files
 
@@ -145,21 +144,20 @@ def main() -> None:
 
     log = litelink.open(args.root, NAME, read_only=True, s3=S3Options())
     print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.")
-    if log.archive:
-        print(f"archive: {log.archive}")
-        print("local falls as archived rises; stream counts every row either way")
+    print(f"published table: {log.published}")
+    print("staging falls as published rises; stream counts every row either way")
 
     print()
     # Named for what they are rather than for where they live. "in table"
-    # meant local rows and "files" meant local files, which asks the reader to
+    # meant staging rows and "files" meant staging files, which asks the reader to
     # remember the implementation to read the display.
-    archived_rows = f" {'archived rows':>14}" if log.archive else ""
-    archived_files = f" {'archived files':>14}" if log.archive else ""
+    published_rows = f" {'published rows':>14}"
+    published_files = f" {'published files':>14}"
     scanning = args.scan_every > 0
     scan_header = f" {'scan':>10} {'rate':>8}" if scanning else ""
     print(
-        f"{'stream rows':>13} {'buffer rows':>13} {'local rows':>13}{archived_rows}"
-        f" {'local files':>12}{archived_files} {'read':>9}{scan_header}"
+        f"{'stream rows':>13} {'buffer rows':>13} {'staging rows':>13}{published_rows}"
+        f" {'staging files':>13}{published_files} {'read':>9}{scan_header}"
     )
     if scanning:
         # Said once, because the two timings mean different things and the
@@ -171,17 +169,17 @@ def main() -> None:
         )
 
     previous = 0
-    archive = ArchiveCount()
+    counter = PublishedCount()
     scan = ScanCost(args.scan_every)
     try:
         while True:
             started = time.monotonic()
-            total, table, buffered, files, archived = snapshot(log)
-            remote = archive.at(log, archived) if log.archive else 0
+            total, table, buffered, files, published = snapshot(log)
+            remote = counter.at(log, published)
             elapsed_ms = (time.monotonic() - started) * 1000
 
             if scanning and scan.due():
-                scan.measure(log, archived=bool(log.archive))
+                scan.measure(log)
 
             delta = f"+{total - previous:,}" if total > previous else ""
             measured = (
@@ -189,8 +187,8 @@ def main() -> None:
             )
             print(
                 f"{total:>13,} {buffered:>13,} {table:>13,}"
-                f"{f' {archived:>14,}' if log.archive else ''}"
-                f" {files:>12,}{f' {remote:>14,}' if log.archive else ''}"
+                f"{f' {published:>14,}'}"
+                f" {files:>13,}{f' {remote:>14,}'}"
                 f" {elapsed_ms:>7.1f}ms{measured}  {delta}"
             )
             previous = total

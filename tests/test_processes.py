@@ -3,7 +3,7 @@
 Everything else in the suite runs the roles in one process, where a Python lock
 can paper over an ordering the design says the leases must handle. This runs
 them the way §1 says to deploy them — a writer appending, a maintainer sealing
-and compacting and syncing, a reader querying across all three tiers — as
+and compacting and publishing, a reader querying across all three tiers — as
 separate OS processes with nothing shared but the log directory, SQLite, and a
 bucket.
 
@@ -55,21 +55,21 @@ SCHEMA = pa.schema([
 S3 = S3Options(endpoint={endpoint!r}, access_key={access_key!r},
                secret_key={secret_key!r}, region={region!r})
 ROOT = {root!r}
-ARCHIVE = {archive!r}
+PUBLISHED = {published!r}
 ROWS = {rows}
 BATCH = {batch}
 TARGET = {target}
 """
 
 
-def script(body: str, root: Path, archive: str, s3: S3Options) -> str:
+def script(body: str, root: Path, published: str, s3: S3Options) -> str:
     return PRELUDE.format(
         endpoint=s3.endpoint,
         access_key=s3.access_key,
         secret_key=s3.secret_key,
         region=s3.region,
         root=str(root),
-        archive=archive,
+        published=published,
         rows=ROWS,
         batch=BATCH,
         target=TARGET,
@@ -96,11 +96,11 @@ WRITER = """
     config = LogConfig(
         target_seal_size=TARGET,
         compact_min_files=2,
-        local_retention=timedelta(seconds=0),
+        staging_retention=timedelta(seconds=0),
         snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(ROOT, "s", schema=SCHEMA, sort_by=("event_ts",),
-                  config=config, archive=ARCHIVE, s3=S3)
+                  config=config, published=PUBLISHED, s3=S3)
     print("ready", flush=True)
     for start in range(0, ROWS, BATCH):
         log.extend([
@@ -122,17 +122,17 @@ MAINTAINER = """
         log.seal_due()
         try:
             log.maintain()
-            log.sync()
+            log.publish()
         except RuntimeError:
             pass
         passes += 1
-        if log.table_rows() >= ROWS and not log._buffer.rows_above(0).num_rows:
-            # One more of each before leaving. Eviction reads the archive
-            # watermark, so it can only remove what the PREVIOUS sync pushed —
+        if log.staging_rows() >= ROWS and not log._buffer.rows_above(0).num_rows:
+            # One more of each before leaving. Eviction reads the published
+            # watermark, so it can only remove what the PREVIOUS publish pushed —
             # stopping the moment everything is sealed would leave the last
             # files local and the tier untested.
             log.maintain()
-            log.sync()
+            log.publish()
             log.maintain()
             break
         time.sleep(0.05)
@@ -142,7 +142,7 @@ MAINTAINER = """
 
 # Reads while the other two work, and checks the one invariant that has to hold
 # at every instant: whatever is visible is a contiguous run of offsets from 1,
-# each exactly once. A seal, a compaction, an eviction or a sync landing
+# each exactly once. A seal, a compaction, an eviction or a publish landing
 # mid-query would show up here as a gap or a repeat.
 READER = """
     log = litelink.open(ROOT, "s", read_only=True, s3=S3)
@@ -174,17 +174,17 @@ def test_writer_maintainer_and_reader_run_as_separate_processes(
 ) -> None:
     """All three at once, sharing only the log directory and the bucket."""
     root = tmp_path / "log"
-    archive = f"s3://{bucket}/prefix"
+    published = f"s3://{bucket}/prefix"
 
-    writer = spawn(script(WRITER, root, archive, s3))
+    writer = spawn(script(WRITER, root, published, s3))
     # The maintainer and the reader both `open()`, which needs the log to
     # exist. Waiting for the writer's first line is the handshake — a retry
     # loop would test the retry loop rather than the roles.
     assert writer.stdout is not None
     assert writer.stdout.readline().strip() == "ready"
 
-    maintainer = spawn(script(MAINTAINER, root, archive, s3))
-    reader = spawn(script(READER, root, archive, s3))
+    maintainer = spawn(script(MAINTAINER, root, published, s3))
+    reader = spawn(script(READER, root, published, s3))
 
     written = finish(writer, "writer")
     maintained = finish(maintainer, "maintainer")
@@ -197,31 +197,31 @@ def test_writer_maintainer_and_reader_run_as_separate_processes(
     )
 
 
-def test_the_archive_actually_took_part(
+def test_the_published_table_actually_took_part(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """The same run, then asserted from outside: rows really did leave local
     disk and really are being served from object storage.
 
     Without this the three-process test above would pass just as well with the
-    archive doing nothing — every row would simply still be local.
+    published table doing nothing — every row would simply still be local.
     """
 
     root = tmp_path / "log"
-    archive = f"s3://{bucket}/prefix"
+    published = f"s3://{bucket}/prefix"
 
-    writer = spawn(script(WRITER, root, archive, s3))
+    writer = spawn(script(WRITER, root, published, s3))
     assert writer.stdout is not None
     assert writer.stdout.readline().strip() == "ready"
-    maintainer = spawn(script(MAINTAINER, root, archive, s3))
+    maintainer = spawn(script(MAINTAINER, root, published, s3))
     finish(writer, "writer")
     finish(maintainer, "maintainer")
 
     with litelink.open(root, "s", s3=s3) as log:
-        watermark = int(log._buffer.get_meta("archive_through") or 0)
-        assert watermark > 0, "nothing was ever archived"
+        watermark = int(log._buffer.get_meta("published_through") or 0)
+        assert watermark > 0, "nothing was ever published"
 
-        local = log.table_rows()
+        local = log.staging_rows()
         assert local < ROWS, "eviction never removed anything from local disk"
 
         merged = log.sql("SELECT * FROM log").read_all()
@@ -229,4 +229,4 @@ def test_the_archive_actually_took_part(
         assert sorted(offsets) == list(range(1, ROWS + 1)), (
             "the union of the tiers must be the whole stream, exactly once"
         )
-        assert json.dumps({"archived_through": watermark, "local": local})
+        assert json.dumps({"published_through": watermark, "staging": local})

@@ -2,7 +2,7 @@
 
 §14's first bullet is *"block all network access; assert writes, seals,
 compaction and hot reads all succeed"*, and I5 is the claim it tests: a read
-served from within `local_retention` never touches the network. That claim is
+served from within `staging_retention` never touches the network. That claim is
 the reason the design has no daemon, no broker and no catalog service, so it is
 worth testing at the level it is made.
 
@@ -171,7 +171,7 @@ def test_an_unprovisioned_extension_names_the_command_that_fixes_it(
 ) -> None:
     """The traceback a fresh machine used to get, and what replaced it.
 
-    Reported from a working install: a scan reaching the archive raised
+    Reported from a working install: a scan reaching the published table raised
     `IOException: Extension ".../httpfs.duckdb_extension" not found`, advising
     `INSTALL httpfs` — a remedy this repo does not use and §7 argues against.
 
@@ -211,7 +211,7 @@ def test_an_unprovisioned_extension_names_the_command_that_fixes_it(
     assert "per DuckDB version and platform" in message
 
     # `remote=True` earns its keep by saying who can ignore this.
-    assert "Only the archive tier needs this" in message
+    assert "Only the published tier needs this" in message
     # DuckDB's own error is kept as the cause rather than swallowed: it names
     # the exact path that was searched, which is the only way to tell a missing
     # extension from one installed under a different HOME.

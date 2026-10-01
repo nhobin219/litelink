@@ -8,13 +8,13 @@ narrower bound or a smaller count.
 
 **Computed when asked, from what Iceberg already stores.** pyiceberg writes
 these metrics into the manifests at every commit, so nothing new is written
-and nothing has to be kept in step with seals, compaction, eviction or sync —
+and nothing has to be kept in step with seals, compaction, eviction or publish —
 a stored rollup would be a second home for a fact the manifests already hold.
 
 The one exception is deliberate and lives elsewhere: `buffer.db` keeps each
-ARCHIVE file's bounds (`_prune`), because deciding whether a query needs the
-archive must not cost the network round trip it exists to avoid. This module
-still reads the manifests, so it answers from what the archive says rather
+PUBLISHED file's bounds (`_prune`), because deciding whether a query needs the
+published table must not cost the network round trip it exists to avoid. This module
+still reads the manifests, so it answers from what the published table says rather
 than from that copy.
 
 What pyiceberg records for litelink's files, measured, decides most of it:
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from pyiceberg.schema import Schema
     from pyiceberg.types import IcebergType
 
-Tier = Literal["local", "archive", "buffer"]
+Tier = Literal["staging", "published", "buffer"]
 
 OFFSET = "litelink_offset"
 
@@ -92,7 +92,7 @@ class ColumnStatistics:
 class TierStatistics(Mapping[str, ColumnStatistics]):
     """Every column, by name, `litelink_offset` included.
 
-    `tier` is what was asked for — `"local"`, `"archive"`, or None for the
+    `tier` is what was asked for — `"staging"`, `"published"`, or None for the
     whole log. `record_count` is None only when a whole-log rollup could not
     count without double counting; see `whole_log`.
     """
@@ -218,7 +218,7 @@ def _offsets(schema: Schema, data_file: DataFile) -> tuple[int, int]:
     )
 
 
-def local_span(schema: Schema, files: Sequence[DataFile]) -> tuple[int, int] | None:
+def staging_span(schema: Schema, files: Sequence[DataFile]) -> tuple[int, int] | None:
     """The offset range the local files cover, or None when there are none."""
     covered = [_offsets(schema, data_file) for data_file in files]
     if not covered:
@@ -227,14 +227,14 @@ def local_span(schema: Schema, files: Sequence[DataFile]) -> tuple[int, int] | N
     return min(lo for lo, _ in covered), max(hi for _, hi in covered)
 
 
-def below_local(
+def below_staging(
     span: tuple[int, int] | None, schema: Schema, files: Sequence[DataFile]
 ) -> tuple[list[DataFile], bool]:
-    """The archive files holding rows outside the local range, and whether any
+    """The published files holding rows outside the local range, and whether any
     of them straddles it.
 
-    What eviction moved out of the local table, and so what a read's archive
-    leg covers. A file that straddles the range — only `rewrite_archive` can
+    What eviction moved out of the staging table, and so what a read's published
+    leg covers. A file that straddles the range — only `rewrite_published` can
     cut one — is included whole: its bounds overstate, but its rows cannot be
     split from the local copies without opening it.
     """
@@ -279,25 +279,25 @@ def uncounted(statistics: TierStatistics) -> TierStatistics:
 def whole_log(
     names: Sequence[str],
     local: tuple[Schema, list[DataFile]],
-    archive: tuple[Schema, list[DataFile]] | None,
+    published: tuple[Schema, list[DataFile]] | None,
     buffered: pa.Table,
 ) -> TierStatistics:
-    """The entire log: local files, the archive beyond them, and the buffer.
+    """The entire log: local files, the published table beyond them, and the buffer.
 
-    The tiers overlap by design (I3) — the archive keeps what local still
+    The tiers overlap by design (I3) — the published table keeps what local still
     holds, and with `wal_replication` a seal keeps its rows in the buffer — so
     this takes each row from one place, as a read does, and the three parts
-    are exactly what `column_statistics` reports for `"local"`, `"archive"`
+    are exactly what `column_statistics` reports for `"staging"`, `"published"`
     and `"buffer"`:
 
     - every **local** file;
-    - every **archive** file outside the local offset range, which is what
+    - every **published table** file outside the local offset range, which is what
       eviction dropped locally;
     - every **buffered** row above all of those files, counted from the rows
       themselves, exactly.
 
-    One case cannot be split: an archive file straddling the local range, which
-    only `rewrite_archive` re-cutting the archive can produce. Its rows are
+    One case cannot be split: a published file straddling the local range, which
+    only `rewrite_published` re-cutting the published table can produce. Its rows are
     partly local too, so its bounds still hold — a bound over rows the log
     holds twice is a bound over rows it holds — but no count can be taken
     without double counting, and every count, `record_count` included, comes
@@ -305,18 +305,18 @@ def whole_log(
     """
     local_schema, local_files = local
     parts = [rollup(None, local_schema, local_files)]
-    span = local_span(local_schema, local_files)
+    span = staging_span(local_schema, local_files)
     ceiling = 0 if span is None else span[1]
 
     straddles = False
-    if archive is not None:
-        archive_schema, archive_files = archive
-        beyond, straddles = below_local(span, archive_schema, archive_files)
-        parts.append(rollup(None, archive_schema, beyond))
-        ceiling = max([ceiling, *(_offsets(archive_schema, f)[1] for f in beyond)])
+    if published is not None:
+        published_schema, published_files = published
+        beyond, straddles = below_staging(span, published_schema, published_files)
+        parts.append(rollup(None, published_schema, beyond))
+        ceiling = max([ceiling, *(_offsets(published_schema, f)[1] for f in beyond)])
 
-    # Above every file, rather than above the local table alone: with the
-    # local table evicted dry the archive is the boundary, and a seal that
+    # Above every file, rather than above the staging table alone: with the
+    # staging table evicted dry the published table is the boundary, and a seal that
     # keeps its rows leaves them here too.
     parts.append(_from_rows(above(buffered, ceiling)))
 

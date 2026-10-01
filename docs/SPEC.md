@@ -11,22 +11,22 @@ SQLite buffer          durable on commit. unsealed rows only.
       │                WAL, synchronous=FULL, one db per stream
       │  seal at target_seal_size
       ▼
-local Iceberg table    a rolling WINDOW of recent data.
+staging table          a rolling WINDOW of recent data.
       │                SqlCatalog on SQLite, file:// warehouse
-      │  sync: upload data files, register into the archive
+      │  publish: upload data files, register into the published
       ▼
-remote Iceberg table   the full HISTORY. S3 warehouse.
+published table        the full HISTORY. S3, or a local directory.
 ```
 
-**The archive is a superset of the local window, not a disjoint half of it.** Everything
-synced is in the archive, including data the local table still holds — that overlap is what
-makes losing the machine survivable. The local table is a read accelerator over the recent
+**The published table is a superset of the staging window, not a disjoint half of it.** Everything
+published is in the published table, including data the staging table still holds — that overlap is what
+makes losing the machine survivable. The staging table is a read accelerator over the recent
 range, not a separate shard.
 
-A data file is written locally, uploaded, then registered in the archive; local eviction
-later shrinks the window without touching the archive.
+A data file is written locally, uploaded, then registered in the published table; local eviction
+later shrinks the window without touching the published table.
 
-**No hot-path read touches the network.** A hot read is the local Iceberg table plus the
+**No hot-path read touches the network.** A hot read is the staging table plus the
 SQLite buffer, both on local disk. Since v0.1.0 the platform wheels carry DuckDB's `iceberg`,
 `avro` and `httpfs` extensions, so an installed package holds unconditionally; a CHECKOUT
 still downloads them on first use, which is what `just bootstrap` discharges. See §7.
@@ -40,7 +40,7 @@ not a service, so this costs no daemon.
 | Not doing | Why |
 |---|---|
 | Time travel | Append-only. Snapshots are a commit mechanism here, not a query feature. Point-in-time filtering is `ingest_ts <= as_of` on a column — bitemporal, and strictly more expressive. |
-| CDC | No updates, no deletes. A state change is a new row with a new `ingest_ts`. Sync is a watermark. |
+| CDC | No updates, no deletes. A state change is a new row with a new `ingest_ts`. Publish is a watermark. |
 | Multi-writer per table | One writer per stream. Multiple machines write separate tables; readers union. |
 | A transaction / commit ID column | The library's commit boundary is batching, not meaning — whether 50 rows landed in one transaction or five is an implementation detail. See below. |
 
@@ -53,28 +53,29 @@ not a service, so this costs no daemon.
 ```
 <root>/<name>/
     buffer.db            unsealed rows, offsets, claims, queues  (§2, §4a)
-    catalog.db           the local Iceberg catalog               (one stream)
-    archive.db           the archive's Iceberg catalog           (one stream)
+    catalog.db           the staging table's Iceberg catalog     (one stream)
+    published.db         the published table's Iceberg catalog   (one stream;
+                         archive.db on a log from before 0.6)
     litestream.yml       the sidecar's config, if replicating    (§3a)
     data/                sealed Parquet                           (§4)
-        compacted/       merged by compaction, and rewrite_archive's
+        compacted/       merged by compaction, and rewrite_published's
                          re-cuts                                 (§6)
         ingested/        written by bulk ingest, never buffered   (§13.4)
     metadata/            Iceberg metadata JSON and Avro
 ```
 
-and in the archive prefix, mirroring it:
+and in the published prefix, mirroring it:
 
 ```
 <prefix>/<name>/
     _wal/                LTX segments, one directory per database  (§3a)
-        buffer.db/  catalog.db/  archive.db/
+        buffer.db/  catalog.db/  published.db/
     data/                the same Parquet, same relative path
     metadata/            Iceberg metadata, plus version-hint.text  (§3b)
 ```
 
 A stream is therefore a subtree that can be copied, replicated, restored or deleted whole,
-in either tier: a data file keeps its root-relative name in the archive, so its identity is
+in either tier: a data file keeps its root-relative name in the published table, so its identity is
 its offset range in both tiers and neither has to translate the other's paths.
 
 **Before 0.2 it was not so, and what that cost is worth recording.** `catalog.db` and
@@ -107,13 +108,13 @@ times, because §8 derives a file's age from the snapshot that added it. Data fi
 neither moved nor rewritten: they were always at `<root>/<name>/data`.
 
 A root holding several streams moves one stream at a time, and four things stay shared until
-the last of them has: `catalog.db`, `archive.db`, the root `litestream.yml` — which names
+the last of them has: `catalog.db`, `published.db`, the root `litestream.yml` — which names
 every stream's buffer — and `<prefix>/_wal`. Each is kept while any stream still resolves
 through it, and the old sidecar keeps running, because an unmigrated stream's layout has not
 changed. Dropping the old replica is a separate pass per stream, refused while any stream in
 the root is outstanding and until something has reached `<prefix>/<name>/_wal`: that replica
 holds the only off-box copy of unsealed rows, which are by definition in no Parquet file and
-no archive manifest.
+no published manifest.
 
 **One SQLite database per stream.** SQLite's write lock is per file, not per table, and one
 process per stream is the intended topology.
@@ -143,7 +144,7 @@ The writer assigns `litelink_offset`; Iceberg then computes its min/max as ordin
 statistics, which is what §7 reads.
 
 A bare `INTEGER PRIMARY KEY` is a rowid alias assigned as `max(rowid)+1` — and buffer rows
-are **deleted once something off-box holds them** — at the seal, or at the sync with
+are **deleted once something off-box holds them** — at the seal, or at the publish with
 `wal_replication` (§3a). Once the table empties, the next insert reuses offsets
 already committed to Iceberg, silently destroying monotonicity and corrupting every
 boundary read.
@@ -256,7 +257,7 @@ predicates use `event_ts`; both prune from Iceberg statistics like any other col
 
 ```python
 local  = SqlCatalog("local",  uri=f"sqlite:///{root}/{name}/catalog.db", warehouse=f"file://{root}")
-remote = SqlCatalog("remote", uri=f"sqlite:///{root}/{name}/archive.db", warehouse=s3_prefix)
+remote = SqlCatalog("remote", uri=f"sqlite:///{root}/{name}/published.db", warehouse=s3_prefix)
 ```
 
 Both tables are created with an **explicit location** — `<root>/<name>` and
@@ -265,7 +266,7 @@ otherwise derive. The namespace survives as the table's name inside its catalog;
 longer part of any path. That separation is what let the layout move without rewriting a
 single catalog row's identity.
 
-The archive catalog's SQLite file is itself replicated to S3, so other machines can attach.
+The published catalog's SQLite file is itself replicated to S3, so other machines can attach.
 A REST catalog is a drop-in replacement once more than one machine needs to write.
 
 ---
@@ -327,16 +328,16 @@ be the real crossing, and there is deliberately none.
 opposite — that replication is not configured in `LogConfig`, because a boolean claiming a
 sidecar was running would be a setting nothing reads. The flag exists now, and it is read:
 `_discard_on_seal` consults it on every seal to decide whether the rows stay in SQLite until
-the archive has them, and `validate` refuses it without an archive to ship to and refuses
+the published table has them, and `validate` refuses it without a published table to ship to and refuses
 `wal_retention` without it. What it still does not do is assert that a sidecar is running,
 which the library cannot know. So it states an intent the deployment has to honour, and
 stating it falsely costs the growth without buying the durability that growth was traded
-for: seals hold their rows, nothing ships them, and only `sync` reaching the range releases
+for: seals hold their rows, nothing ships them, and only `publish` reaching the range releases
 them.
 
 **The sidecar needs a monotonic clock that does not run backwards.** litestream reports a
 measured interval through a Prometheus counter, which panics on a negative value, so one
-regression of `CLOCK_MONOTONIC` crash-loops it — while logging successful syncs right up to
+regression of `CLOCK_MONOTONIC` crash-loops it — while logging successful publishes right up to
 each panic. On a slow stream that is a durability failure, because the buffer holds the only
 copy of unsealed rows. The known trigger is a VM on the `tsc` clocksource; see `docs/API.md`
 under Replication, and `python -m litelink` warns on the combination.
@@ -347,14 +348,14 @@ half the retention so a window can never hold zero snapshots — a restore needs
 or before the point it is restoring to.
 
 **All three databases, not just the buffer.** `buffer.db` holds rows no Parquet file has
-yet, `catalog.db` says which files the local table is made of, and `archive.db` says the
-same for the archive.
+yet, `catalog.db` says which files the staging table is made of, and `published.db` says the
+same for the published table.
 
 That last justification used to be "omit it and the objects in S3 survive with nothing to
-say what they are". It is no longer true — the archive publishes `version-hint.text` and can
+say what they are". It is no longer true — the published table publishes `version-hint.text` and can
 name its own metadata — and the file is now replicated for the *same-machine* case, where
 it saves a round trip, while a failover deliberately does NOT restore it: a stale copy wins
-over the bucket's own pointer and reads the archive short. See §3a and `litelink.restore`.
+over the bucket's own pointer and reads the published table short. See §3a and `litelink.restore`.
 
 **One sidecar per stream.** All three databases live in the stream's own directory (§2) and
 replicate to `<prefix>/<name>/_wal`, so a root holding several streams runs one sidecar per
@@ -369,20 +370,20 @@ advice was to keep one log per root to avoid the question.
 
 Optional. Three things to be clear about:
 
-**It covers append→sync, and it used to cover only append→seal.** The difference is a
+**It covers append→publish, and it used to cover only append→seal.** The difference is a
 hole this paragraph once described as a lag. A seal moves rows out of SQLite and into a
 Parquet file no sidecar replicates, so deleting them at seal removed the only off-box copy
-of a range the archive did not hold yet — and the machine dying in that window lost them
+of a range the published table did not hold yet — and the machine dying in that window lost them
 from the MIDDLE of the offset space: below the seal frontier so the buffer no longer had
-them, above the archive frontier so the bucket did not either.
+them, above the published frontier so the bucket did not either.
 
-**So a seal keeps its rows when `wal_replication` is on**, and `sync` drops them once the
-archive holds the range. It is I4 one tier up: never delete the only off-box copy. Reads
-are unaffected — the buffer leg is bounded by the local table's committed extent (§7), so
-held rows never reach the engine — and the cost is that `buffer.db` grows with sync lag,
-which a stalled sync makes unbounded, like a stalled eviction (§11).
+**So a seal keeps its rows when `wal_replication` is on**, and `publish` drops them once the
+published table holds the range. It is I4 one tier up: never delete the only off-box copy. Reads
+are unaffected — the buffer leg is bounded by the staging table's committed extent (§7), so
+held rows never reach the engine — and the cost is that `buffer.db` grows with publish lag,
+which a stalled publish makes unbounded, like a stalled eviction (§11).
 
-The gate is `wal_replication`, not "an archive is configured": with no sidecar the buffer
+The gate is `wal_replication`, not "a published table is configured": with no sidecar the buffer
 and the Parquet share a disk and die together, so holding buys nothing. With neither, a
 seal discards as it always did, because nothing would ever release the rows.
 
@@ -395,15 +396,15 @@ RPO = max(WAL replication lag, Parquet upload lag)   (before this; the hole)
 offset space has two holes in it, and they are different problems:
 
 ```
-  [0 .......... archived]  safe — in the archive
-                [archived ...... sealed]  hole A — local Parquet only
+  [0 .......... published]  safe — in the published table
+                [published ...... sealed]  hole A — local Parquet only
                                   [sealed ... replicated]  safe — in buffer.db
                                             [replicated ... assigned]  hole B
 ```
 
 **Hole A is closed.** It was the band a seal moved out of SQLite into a Parquet
-file no sidecar replicates, above what the archive had taken — so it was on the
-dead machine and nowhere else. Holding those rows until `sync` pushes the range
+file no sidecar replicates, above what the published table had taken — so it was on the
+dead machine and nowhere else. Holding those rows until `publish` pushes the range
 removes it.
 
 **Hole B is inherent.** Rows appended inside the replication lag were returned
@@ -428,24 +429,24 @@ the log fails outright. See §3a's failover notes and `litelink.restore`.
 ## 3b. Reading a log from another machine
 
 **litelink reads on the primary.** Every handle is built from a root on the machine that holds
-the log — the writer, or a `LocalReadHandle` beside it — and reads the buffer, the local table
-and, when asked, the archive from there. Off that host, the archive is the interface: an
+the log — the writer, or a `LocalReadHandle` beside it — and reads the buffer, the staging table
+and, when asked, the published table from there. Off that host, the published table is the interface: an
 ordinary Iceberg table that publishes `version-hint.text` at every commit, so any engine
-pointed at `<archive>/<name>` resolves its current metadata with no catalog service and no
+pointed at `<published>/<name>` resolves its current metadata with no catalog service and no
 litelink install (API.md, "Reading from another machine").
 
-What such a reader cannot see is anything newer than the last `sync`: rows in the buffer or
-the local table are on the primary alone. `litelink_offset` makes polling safe — it is
+What such a reader cannot see is anything newer than the last `publish`: rows in the buffer or
+the staging table are on the primary alone. `litelink_offset` makes polling safe — it is
 monotonic and never reused, so a reader keeps the highest one it has seen and asks for what
 came after.
 
 There used to be a litelink reader for this, `snapshot` (`follow` before 0.3), which returned a
-`RemoteReadHandle`: an archive-only view, or with `include_wal=True` a litestream restore of the
-writer's `buffer.db` merged with the archive. It was removed (#90). It rebuilt, on every read
+`RemoteReadHandle`: a published-only view, or with `include_wal=True` a litestream restore of the
+writer's `buffer.db` merged with the published table. It was removed (#90). It rebuilt, on every read
 host, a restore and an adopted catalog that an Iceberg engine does not need, and it carried a
 class of states the primary never meets — a buffer missing rows a seal discarded, pinned
 metadata swept by later commits, gaps no replica could explain — each with its own refusal.
-Freshness past the last `sync` is the primary's to serve; a WAL replica is for failover (§3a).
+Freshness past the last `publish` is the primary's to serve; a WAL replica is for failover (§3a).
 
 ## 4. Seal
 
@@ -462,7 +463,7 @@ produced worse files. Freshness in the cloud is §3a's job.
 
 ```
 1. SQLite txn: choose [start, end), write it to `sealing`.
-2. Write Parquet locally; commit it to the local Iceberg table.
+2. Write Parquet locally; commit it to the staging table.
 3. SQLite txn: delete buffer rows < end; clear `sealing`.
 ```
 
@@ -478,13 +479,13 @@ rows inside it. So a file's offset range stays dense while its rows move, and ne
 property constrains the other. That is what lets bulk ingest sort per output file rather
 than across a corpus that may not fit in memory.
 
-**Declared in three places, and each answers a different reader.** The local table's
-`sort_order` and the ARCHIVE's say what the data is clustered by, to anything reading either
-Iceberg table directly; the archive's went undeclared until failover needed it, which made
-an archive holding clustered data silently say nothing about it. `meta` carries it too, and
+**Declared in three places, and each answers a different reader.** The staging table's
+`sort_order` and the PUBLISHED table's say what the data is clustered by, to anything reading either
+Iceberg table directly; the published table's went undeclared until failover needed it, which made
+a published table holding clustered data silently say nothing about it. `meta` carries it too, and
 that is the copy `open` reads — because the local catalog cannot be restored onto another
-machine, so a failover rebuilds the local table and has to be told what to declare. An empty
-`sort_by` is a value meaning unsorted, and clears all three; the archive's declaration is
+machine, so a failover rebuilds the staging table and has to be told what to declare. An empty
+`sort_by` is a value meaning unsorted, and clears all three; the published table's declaration is
 best effort, since a re-sort has already rewritten every local file by the time it is
 attempted and an unreachable bucket must not fail it.
 
@@ -541,7 +542,7 @@ count peaked at 11 and seals held a 82 ms median, while the same workload with c
 disabled reached 400 files and 426 ms seals. Worth knowing as a feedback loop: compaction
 falling behind makes sealing more expensive, not just reads.
 
-**Recovery.** On startup, if `sealing` holds a row: if the local table already contains that
+**Recovery.** On startup, if `sealing` holds a row: if the staging table already contains that
 path, run step 3; otherwise redo step 2. Idempotent either way.
 
 Sealing never waits on the network. A machine with no connectivity keeps capturing and
@@ -573,17 +574,17 @@ integers. The exclusion is interval arithmetic, not mutual exclusion.
 | seal ∥ anything | the seal appends above every range the others touch |
 | compact ∥ evict | eviction stays below every in-flight merge's `lo` |
 | compact ∥ compact | each claims a distinct run and skips runs already claimed |
-| compact ∥ sync | a merge must not span into what sync is archiving, and vice versa |
-| sync ∥ sync | `register` declines a range the archive already covers |
+| compact ∥ publish | a merge must not span into what publish is publishing, and vice versa |
+| publish ∥ publish | `register` declines a range the published table already covers |
 | evict ∥ expire | both are metadata commits; CAS orders them and both are idempotent |
 
-`compact ∥ sync` is the one that is a correctness matter rather than wasted work.
-Compaction skips files at or below the archive watermark, so a merged file cannot span into
-the archived range — unless the watermark advances *while* it merges, which makes its
-inputs, chosen against the older watermark, include files sync has since archived. Pushing
-that merged file adds a range partially overlapping one the archive holds:
+`compact ∥ publish` is the one that is a correctness matter rather than wasted work.
+Compaction skips files at or below the published watermark, so a merged file cannot span into
+the published range — unless the watermark advances *while* it merges, which makes its
+inputs, chosen against the older watermark, include files publish has since published. Pushing
+that merged file adds a range partially overlapping one the published table holds:
 `register`'s check declines only a range that is **entirely** covered, so a partial overlap
-is admitted and the archive returns duplicate rows.
+is admitted and the published table returns duplicate rows.
 
 ### The claim, and why it needs an expiry
 
@@ -611,11 +612,11 @@ must carry the OPERATION's owner rather than mint one — a rewrite running insi
 change's whole-log claim was refused by the operation it was part of, and silently did
 nothing.
 
-Two ranges are still coarser than the design wants: `sync` and the configuration changes
+Two ranges are still coarser than the design wants: `publish` and the configuration changes
 claim the whole log. For a configuration change that is correct — a re-point is not an
-operation on an interval. For `sync` it is conservative: it cannot name the range it will
-push until it has read the archive's extent, so narrowing it to `(floor, last]` is the
-remaining refinement, and until then `compact ∥ sync` still serialises.
+operation on an interval. For `publish` it is conservative: it cannot name the range it will
+push until it has read the published table's extent, so narrowing it to `(floor, last]` is the
+remaining refinement, and until then `compact ∥ publish` still serialises.
 
 **A claim taken after the premise was read isolates nothing on its own.** Both passes choose
 their work from a file list, and the claim comes after: eviction can claim a range, commit
@@ -648,25 +649,25 @@ was the correct usage in the role-lease era, so it is a habit that survives; `he
 claim.renew` then silently stopped renewing the claim at all and answered the pre-commit
 check with a stranger's callback.
 
-**And the archive refuses a range that starts inside its extent.** Everything upstream is
+**And the published table refuses a range that starts inside its extent.** Everything upstream is
 arranged so a merge never straddles it, and each gap found in that arrangement has been a
 fresh piece of reasoning — a crash between a register and the row recording it, then a
-compaction-config change before the next sync backfills, is one that survived several
+compaction-config change before the next publish backfills, is one that survived several
 reviews. `_covers` declines only a range ENTIRELY covered, so a straddling one is admitted
 and those offsets sit in two files at once, in the immutable tier, with nothing able to
 repair it. Refusing costs a stall; admitting costs silence.
 
 **That stall has no remedy today, and this paragraph used to imply one.** Nothing re-cuts a
-LOCAL straddler — `rewrite_archive` works the other side — so the log stops advancing its
-watermark, eviction pins below the straddling file, and the shipped sync role dies on the
+LOCAL straddler — `rewrite_published` works the other side — so the log stops advancing its
+watermark, eviction pins below the straddling file, and the shipped publish role dies on the
 `ValueError` because it catches `RuntimeError` and `CommitFailedException` only. The refusal
 is still the right trade against silent permanent duplication in the immutable tier, but
 "recoverable" was not true.
 
 Reaching it needs a crash between a register and the `extent` rows recording it, and then a
-compaction-target change before the next sync backfills those rows from the archive's
+compaction-target change before the next publish backfills those rows from the published table's
 manifest. The window exists because the rows and the manifest are two records of one fact and
-only `sync` reconciles them, while compaction decides from the rows alone. What would close
+only `publish` reconciles them, while compaction decides from the rows alone. What would close
 it, in increasing order of work: reconcile the rows against the manifest on the compaction
 side too; or record a pushed range BEFORE the register and confirm it after, so the two
 readers can take opposite polarities — compaction is safe when coverage is OVERSTATED,
@@ -676,19 +677,19 @@ the sentence above true.
 
 The test is `lo <= extent_hi`, with no lower bound. A lower bound was there first and was a
 hole rather than a safety condition: it exempted exactly the range that starts BELOW the
-extent and runs past it, engulfing the whole thing — every archived offset in two files,
+extent and runs past it, engulfing the whole thing — every published offset in two files,
 which is the worst version of this rather than an excused one.
 
 **And `drain` claims, because the unlink is not metadata.** Expiry is safe claimless — a
 metadata commit CAS orders, idempotent — and the deletion that follows it inherited that
 reasoning without earning it. Consulting the table without declaring anything leaves the
 window everything else here was built to close: `hydrate` re-registers a file under the very
-name the queue still holds, deliberately reusing the archived key, and can commit that
-between the veto being read and the file being unlinked. The local table then references a
+name the queue still holds, deliberately reusing the published key, and can commit that
+between the veto being read and the file being unlinked. The staging table then references a
 file that is not there, and every scan over that range raises until eviction ages the entry
 out. And it renews before EVERY deletion, not once at the top: the unlink is this pass's
 commit, everything slow in a drain sits between the veto being read and the deletions —
-opening the archive, walking its manifests, one remote round trip per queued object — and a
+opening the published table, walking its manifests, one remote round trip per queued object — and a
 claim held for the first of those is not a claim held for the last. `hydrate` renews after
 its fetch for the same reason and against the same partner: a whole file downloaded per
 iteration, and the name it is restoring is one the deletion queue still holds — drain's own
@@ -696,12 +697,12 @@ per-deletion renewal cannot help there, because drain is then the legitimate hol
 hydrate the lapsed one.
 
 **And everything a pass reads to decide a deletion is read under its claim, not before it.**
-`sync` learned this for itself and eviction did not, though it acts on the same facts: it
-read the archive location, and the policy, before claiming anything. `set_archive` is
+`publish` learned this for itself and eviction did not, though it acts on the same facts: it
+read the published location, and the policy, before claiming anything. `set_published` is
 documented as something the shipped writer calls on every restart and it takes the whole
-log, which is free precisely while eviction holds nothing — so attaching an archive between
-the read and the acquire left eviction deleting the only copy of every aged row that archive
-was configured to receive, unrecoverably, since sync cannot push what has left the table.
+log, which is free precisely while eviction holds nothing — so attaching a published table between
+the read and the acquire left eviction deleting the only copy of every aged row that published table
+was configured to receive, unrecoverably, since publish cannot push what has left the table.
 Eviction therefore claims on the UNCLAMPED retention boundary, which only ever falls, and
 recomputes everything under the claim. `set_config` gets the same treatment for the same
 reason: it writes durable state that no running process would otherwise hear about, and
@@ -711,29 +712,29 @@ That refresh also forced a correction worth stating on its own: the policy now h
 owner. `WriteHandle` used to keep a copy beside `Maintenance`'s, with the buffer's seal target as a
 third, kept in step by `set_config` writing all three. Two copies is one too many the moment
 anything else can change the policy — refreshing one would leave compaction reading the new
-grouping while `sync` read the old, and `runs` is shared by exactly those two so that they
+grouping while `publish` read the old, and `runs` is shared by exactly those two so that they
 cannot disagree about which files are still in play. And the refresh happens in
-compaction and in `sync` as well as in eviction, because the shipped topology runs those two
+compaction and in `publish` as well as in eviction, because the shipped topology runs those two
 as SEPARATE PROCESSES: refreshing in one place only keeps them in step within a process,
 while across processes one restarting after a durable `set_config` and the other not would
-leave compaction grouping under a policy `sync` had never heard of, permanently. And
-compaction re-reads the archive premise under each RUN claim, not only at pass start: a sync
+leave compaction grouping under a policy `publish` had never heard of, permanently. And
+compaction re-reads the published premise under each RUN claim, not only at pass start: a publish
 that ran in between, under a grouping that settles a partial prefix of a run, leaves the
-rest of that run merging into a local file straddling the archive's extent — and nothing
+rest of that run merging into a local file straddling the published table's extent — and nothing
 re-cuts a local straddler, so every later push is refused and the watermark never moves
 again.
 
 **`validate` checks a PAIR, so both halves are read durably.** `wal_replication` with a
-local archive is refused in one call — the replica exists to get rows off the machine — and
+local published table is refused in one call — the replica exists to get rows off the machine — and
 each setter was checking its own new half against this process's memory of the other, so
 two processes could assemble the refused pair between them. (The pair this was found on, an
-evict-on-upload policy with no archive, no longer exists: every log has an archive, #98.)
+evict-on-upload policy with no published table, no longer exists: every log has a published table, #98.)
 
 Reading both halves durably is still not enough, and this is the part that took two rounds
 to see: read and write as two transactions with nothing between them, and the check is only
 a statement about the past. Each setter could pass against a state the other was about to
 change, so between them the two calls assembled the very pair neither would accept — and the
-next maintenance pass carried it out. **`set_config` and `set_archive` therefore take the
+next maintenance pass carried it out. **`set_config` and `set_published` therefore take the
 same claim**, which is §4a's own rule about data, applied to the configuration that governs
 it: the check and the act share a transaction, or they are not a guard. `litelink.new` records
 the pair in one `meta` transaction for the same reason, and both setters ask for the claim
@@ -749,36 +750,36 @@ metadata object before inserting the catalog row, and the loser raises a bare `E
 maintainer catches; worse, a claimless drop can land after a claim holder has already created
 and registered, taking the live entry with it.
 
-**Compaction asks whether ANY archive holds a file, not the configured one.** Detaching does
-not make the copies stop existing. Merging across a range some archive holds makes a LOCAL
+**Compaction asks whether ANY published table holds a file, not the configured one.** Detaching does
+not make the copies stop existing. Merging across a range some published table holds makes a LOCAL
 file whose boundaries line up with nothing there, and nothing re-cuts a local straddler —
-`rewrite_archive` works the other side — so re-attaching stalls the log for good: eviction
+`rewrite_published` works the other side — so re-attaching stalls the log for good: eviction
 pins below it and every push is refused. Four legitimate operations reach it, with no warning
 at any step: detach, raise the target, maintain, re-attach. Skipping those files costs
-nothing, because only compacted files are ever pushed, so one with an archive copy is already
-at the target. Eviction still asks about the CONFIGURED archive, because I4 is a promise about
+nothing, because only compacted files are ever pushed, so one with a published copy is already
+at the target. Eviction still asks about the CONFIGURED published table, because I4 is a promise about
 where the copy is.
 
-**And `sync` applies the same exclusion, or the two deadlock.** `stable_prefix` holds a file
-back when compaction might still merge it; compaction refuses to merge anything an archive
+**And `publish` applies the same exclusion, or the two deadlock.** `stable_prefix` holds a file
+back when compaction might still merge it; compaction refuses to merge anything a published table
 holds. Those are one rule, and `runs` is shared between them precisely so they cannot
 disagree — giving compaction a second input `stable_prefix` could not see was enough to
-break it. After a re-point to a fresh prefix the floor is 0, so files the old archive covers
+break it. After a re-point to a fresh prefix the floor is 0, so files the old published table covers
 return to `pending`, group into a mergeable run under a raised target, and are held back for
 ever against a merge that will never happen: nothing is pushed, the watermark never moves,
 eviction pins on it, and nothing raises. A file no merge can touch is settled by definition.
 
-Note what that correction cost the earlier justification: "a file with an archive copy is
+Note what that correction cost the earlier justification: "a file with a published copy is
 already at the target" is false the moment the target is RAISED after the copy was made —
 which is the scenario the exclusion exists for. Such a file stays at the size it was
-archived at, and `rewrite_archive` is the tool for that.
+published at, and `rewrite_published` is the tool for that.
 
-**Opening the archive with `repair` needs the durable location, not a remembered one.** That
+**Opening the published table with `repair` needs the durable location, not a remembered one.** That
 open may drop a catalog entry naming another prefix and create a fresh table at this one;
 the claim is what entitles a caller to do it, and the location the log records is what says
-WHICH archive to do it to. `sync` re-read the location for exactly this reason, and every
+WHICH published table to do it to. `publish` re-read the location for exactly this reason, and every
 other repairing caller inherited the privilege without the premise — so a handle still
-remembering an archive the log had left destroyed the live archive's catalog entry, after
+remembering a published table the log had left destroyed the live published table's catalog entry, after
 which the next pass "repaired" again by creating an empty table over its data. Measured end
 to end: 4,000 rows in, 550 readable, and no error at the point of the damage.
 
@@ -812,8 +813,8 @@ still live when it commits, and the resurrection above is unreachable rather tha
 self-correcting.
 
 For the record, when it was reachable it was a policy fault and not a duplication one. A
-resurrected range is real rows at their real offsets, and `_union` bounds the archive leg by
-the local table's lower extent — so a local table that regains `[1, 100]` bounds the archive
+resurrected range is real rows at their real offsets, and `_union` bounds the published leg by
+the staging table's lower extent — so a staging table that regains `[1, 100]` bounds the published
 leg to `offset < 1`, and the range is served by exactly one tier either way.
 
 **Three mechanisms, three jobs**, and none substitutes for another:
@@ -832,17 +833,17 @@ The tiers are four steps, and only three of them are tiers:
 buffer            rows, uncompacted, serves the newest data      (hot)
 sealed files      written out fast, unoptimised, all must be scanned
 compacted files   the read-optimised baseline that replaces them
-        └── stored locally, or in the archive, or both
+        └── stored locally, or in the published table, or both
 ```
 
-The fourth step is not a tier. A compacted file in the archive is the **same file in a
-second place**, and litelink already records that per file: `sync` calls `record_file` with
-the archive's URI, so `extent` holds a row per pushed file naming exactly where its copy
-went. `archived_through` is a global summary of facts that are already durable per segment.
+The fourth step is not a tier. A compacted file in the published table is the **same file in a
+second place**, and litelink already records that per file: `publish` calls `record_file` with
+the published table's URI, so `extent` holds a row per pushed file naming exactly where its copy
+went. `published_through` is a global summary of facts that are already durable per segment.
 
 That summary is the single most expensive line in this design, because it is **the only
 boundary in the system that can move backwards.** Offsets are immutable, seal cuts only
-advance, compaction only merges forward — and then a re-point resets the archive watermark
+advance, compaction only merges forward — and then a re-point resets the published watermark
 to zero. Every reader that cached the old position is wrong at once, and there is no
 ordering of the writes that fixes it, because the problem is not the write ordering; it is
 that a per-segment fact was compressed into one mutable number and then had to be
@@ -851,7 +852,7 @@ un-compressed by inference.
 **So do not compress it.** I4 is asked of a file, not of a watermark:
 
 > A local file may be dropped only if `extent` holds a row for the same offset range whose
-> `rel_path` names a copy in the archive this log is configured for.
+> `rel_path` names a copy in the published table this log is configured for.
 
 An equality check on a recorded value, and the consequences fall out:
 
@@ -861,23 +862,23 @@ An equality check on a recorded value, and the consequences fall out:
 - **Identity stops being inferred.** "Is this mine?" is a comparison against a URI the log
   wrote down, not an inference from a prefix, a catalog row keyed by table id, or a
   process's memory of its own configuration.
-- **Several archives coexist.** Old ranges name the old bucket and new ranges the new one,
-  which is half of what makes re-attaching to an archive that already holds data
-  expressible. The other half is the archive naming its own current metadata: `SqlCatalog`
-  keeps that pointer in the catalog, so the local `archive.db` row was the only thing that
+- **Several published tables coexist.** Old ranges name the old bucket and new ranges the new one,
+  which is half of what makes re-attaching to a published table that already holds data
+  expressible. The other half is the published table naming its own current metadata: `SqlCatalog`
+  keeps that pointer in the catalog, so the local `published.db` row was the only thing that
   had it, and a re-point drops that row. Each commit now writes `version-hint.text` beside
-  the metadata, and `open_archive` registers from it instead of creating an empty table.
-- **The compaction frontier goes.** `archive_pending` exists to stop a merge straddling a
-  range the archive may hold; per segment, compaction skips a file that records an archive
+  the metadata, and `open_published` registers from it instead of creating an empty table.
+- **The compaction frontier goes.** `published_pending` exists to stop a merge straddling a
+  range the published table may hold; per segment, compaction skips a file that records a published
   copy and needs no frontier, no crash window between writing it and using it, and no
   reconciliation to retire it.
 
-`archived_through` may remain as a derived `MAX(...)` for the push floor and for display.
+`published_through` may remain as a derived `MAX(...)` for the push floor and for display.
 What it may not be again is the thing that authorises a deletion.
 
-**There is no local-only exception.** Every log has an archive (#98) — a local directory when
+**There is no local-only exception.** Every log has a published table (#98) — a local directory when
 no remote one is given — so I4 is never vacuous: a local-only log's eviction clamps against
-its local archive's records exactly as an S3 log's does.
+its local published table's records exactly as an S3 log's does.
 
 It is tempting to require that a file be compacted before eviction will take it, since only
 compacted files are ever pushed. **Resist it.** The reason to hold a file back is
@@ -887,59 +888,59 @@ is already answered above.
 
 A merge is the pair that matters here because it is the only pass that can put rows *back*:
 select `[1, 100]`, have eviction commit their removal, then commit the replacement, and the
-range returns. Every other pass holding a file open merely fails when it vanishes — sync's
+range returns. Every other pass holding a file open merely fails when it vanishes — publish's
 upload errors and retries, expire is an idempotent metadata commit. Compaction state is a
 proxy for this and a bad one, since it is neither necessary (an uncompacted file no merge
 has claimed is safe to drop) nor sufficient (a compacted file can be an input to the next
 merge up). Requiring "compacted" instead reintroduces the trailing-run holdback
 this section rejects below — bounded in bytes, at most one compaction target, but unbounded
 in time, so a log that goes idle keeps its last target-sized residue for ever. Whether that
-is acceptable depends on whether `local_retention` is a disk heuristic or an obligation to
+is acceptable depends on whether `staging_retention` is a disk heuristic or an obligation to
 delete; §8 currently reads as the latter, which would make it a defect rather than a lag.
 
 So eviction, in both configurations, is one rule: **drop what retention no longer wants,
-except what a live claim covers, and except — where an archive is configured — what has no
+except what a live claim covers, and except — where a published table is configured — what has no
 recorded copy in it.**
 
-**Implemented.** `archive_pending` and the frontier are gone; `archived_prefix` walks the
+**Implemented.** `published_pending` and the frontier are gone; `published_prefix` walks the
 local files and stops at the first without a recorded copy, and both compaction and eviction
-ask it. Compaction skipping archived files is not optional here — it is what keeps a local
-range and its archived range the same range, so the per-segment test can match them at all.
+ask it. Compaction skipping published files is not optional here — it is what keeps a local
+range and its published range the same range, so the per-segment test can match them at all.
 
-One window survives the change and closes differently. The row naming a file's archive copy
-is written after the register, so a crash between the two leaves the archive holding a range
+One window survives the change and closes differently. The row naming a file's published copy
+is written after the register, so a crash between the two leaves the published table holding a range
 nothing local records. Nothing is promised beforehand to cover it — that is what made the
-watermark inexact in both directions — so the next push backfills from the archive's own
+watermark inexact in both directions — so the next push backfills from the published table's own
 manifest, which it reads anyway.
 
-`archived_through` remains as a derived cache, for the push floor and for display. It no
+`published_through` remains as a derived cache, for the push floor and for display. It no
 longer authorises a deletion, which was the whole of the problem.
 
 **Coverage, not equality.** The two tiers cut the same rows into files independently, so
-asking whether a local range EQUALS an archived one was wrong the moment they could differ.
-`rewrite_archive` re-cuts the archive to different boundaries by design — that is its entire
+asking whether a local range EQUALS a published one was wrong the moment they could differ.
+`rewrite_published` re-cuts the published table to different boundaries by design — that is its entire
 job — and under an equality test every local file then matched nothing, for ever: eviction
-clamped to zero and stopped, and compaction stopped treating archived files as the archive's
+clamped to zero and stopped, and compaction stopped treating published files as the published table's
 business and merged across its extent, which `register` admits as a partial overlap and the
-archive keeps as duplicate rows. Neither heals, because nothing re-cuts the archive back.
-The question I4 actually asks is whether the archive holds the ROWS, so adjacent archived
+published table keeps as duplicate rows. Neither heals, because nothing re-cuts the published table back.
+The question I4 actually asks is whether the published table holds the ROWS, so adjacent published
 files join and a gap ends the answer.
 
 ### One copy of a fact, in the log
 
 Nine review rounds of this design found the same defect nine times, each in a place the
 previous round had not looked: **a fact with a durable home in `meta` also had a mutable
-copy in the process, and a decision read the copy.** A pass reading "no archive" from memory
+copy in the process, and a decision read the copy.** A pass reading "no published table" from memory
 while the log had one. A repairing open pointed at a bucket the log had left, destroying the
-live archive's catalog entry. A fence comparing a value against itself, because a re-point
+live published table's catalog entry. A fence comparing a value against itself, because a re-point
 moved both sides of the comparison together. Two setters each validating against a stale
-half of a pair. Compaction and `sync` grouping runs under different policies.
+half of a pair. Compaction and `publish` grouping runs under different policies.
 
 The tell was not the defects but their remedy: twelve `refresh` calls, whose only work was
 dragging a copy back into agreement with the log. **A design whose correctness needs N of
 those is always one short somewhere, because nothing tells you what N is.**
 
-So the copies are gone. `Archive` stores no location and reads `meta`; `Buffer` owns the one
+So the copies are gone. `Published` stores no location and reads `meta`; `Buffer` owns the one
 `LogConfig` and everything that decides from the policy reads it there. All twelve refresh
 calls, and the methods behind them, deleted. A stale location or a stale policy is not a bug
 guarded against here — it is not a thing that can exist.
@@ -948,7 +949,7 @@ What makes it affordable is that the reads are cheap and the expensive parts are
 **keyed on the durable value**: the parsed config on the raw JSON, the pyiceberg handle on
 the URI it was opened for. A key that comes from the log is what stops a cache becoming the
 next stale copy — when the log changes, the key changes and the cache retires itself. That
-is also, exactly, the archive-handle bug of the ninth round, gone by construction rather
+is also, exactly, the published-handle bug of the ninth round, gone by construction rather
 than by a rule.
 
 Measured: a `meta` read is 1.8 us against a 5.4 ms query, and an interleaved A/B of the
@@ -958,16 +959,16 @@ and one of drift between blocks. Interleaving the runs is what settled it.
 
 **A decision reads the policy ONCE.** That is the hazard this trades for, and it is a real
 one: each read is now independent, so two of them inside a single decision can disagree. It
-bit immediately — `local_rows` seen as an int by the guard and as None by the subtraction
+bit immediately — `staging_rows` seen as an int by the guard and as None by the subtraction
 after it is `int - None`, a TypeError out of `maintain()`, which the shipped maintainer does
 not catch, so maintenance stopped entirely. The rule is not a lock; it is that every
 decision binds the policy to a local first: fresh per decision, coherent within it.
 
 Where a torn read would merely produce an odd file size it is harmless, because the policy
 is a POLICY — it decides how big to cut and when to merge, never which rows go where. The
-one place it could have been an invariant is `runs`, shared by compaction and `sync` so the
+one place it could have been an invariant is `runs`, shared by compaction and `publish` so the
 two cannot disagree about what is in play, and per-segment I4 closes that: a file the
-archive holds is never merged again.
+published table holds is never merged again.
 
 What this does NOT cover: a pyiceberg table handle is a point-in-time snapshot of REMOTE
 state, with no local durable copy to derive from, so `reload()` before deciding remains a
@@ -979,43 +980,43 @@ An earlier version of this section had a single `settled_through` that compactio
 above and eviction at or below. It does not survive, though not for the reason first
 recorded here. The original argument was that a quiet stream never settles and so never
 evicts, "removing anything at all" — an overstatement twice over: the holdback is the
-trailing run, which is bounded by the compaction target, and with an archive configured that
+trailing run, which is bounded by the compaction target, and with a published table configured that
 stall is already the behaviour, since a stream that never settles never pushes and I4 pins
 eviction regardless. It does not distinguish the design it was rejecting.
 
-The real reason is that the number is wrong in both directions at once. With an archive,
-`archived <= settled` always, so eviction at or below `settled_through` would delete files
+The real reason is that the number is wrong in both directions at once. With a published table,
+`published <= settled` always, so eviction at or below `settled_through` would delete files
 that settled but were never pushed — an I4 violation, and the binding constraint is
-`archived_through` anyway, which is never the larger of the two. Without an archive, nothing
+`published_through` anyway, which is never the larger of the two. Without a published table, nothing
 else clamps, so the holdback becomes the only constraint and applies where it has no reason
-to: "settled enough to archive" needs the trailing run held back because compaction may
+to: "settled enough to published table" needs the trailing run held back because compaction may
 still merge it and pushing a file about to be replaced is waste, while "safe to evict" is a
 question about age, not about what may still change. One number cannot mean both, because
 the two consumers are asking about different directions in time.
 
-## 5. Sync
+## 5. Publish
 
 Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
 
 ```
-1. Upload data files not yet in the archive.
+1. Upload data files not yet in the published table.
 2. remote.add_files([...s3 paths...])          -- register; no data movement
-3. Replicate compactions (§6) into the archive.
+3. Replicate compactions (§6) into the published table.
 4. Expire snapshots on both tables.
-5. Evict files older than local_retention from the LOCAL table only.
+5. Evict files older than staging_retention from the STAGING table only.
 ```
 
-Step 5 removes files from the local table's current snapshot; the archive is untouched.
+Step 5 removes files from the staging table's current snapshot; the published table is untouched.
 **A file must never be evicted locally before step 2 has registered it** — the one ordering
-in sync that is correctness, not optimisation (I4).
+in publishing that is correctness, not optimisation (I4).
 
-Sync records how far it has registered in `meta`, as one offset under `archive_through`.
+Publish records how far it has registered in `meta`, as one offset under the key `archive_through` (stored names keep their pre-#98 spelling).
 
-**Steps 4 and 5 do not belong to sync.** Snapshot expiry and local eviction are local
+**Steps 4 and 5 do not belong to publish.** Snapshot expiry and local eviction are local
 storage work; they are listed here because eviction must respect the registration watermark
 step 2 writes. But every other step is publishing work, and a log may go a long time
-between syncs — so expiry and eviction are owned by `maintain()` (§12), which reads that same
-watermark to enforce I4 and runs whether or not a sync has.
+between publishes — so expiry and eviction are owned by `maintain()` (§12), which reads that same
+watermark to enforce I4 and runs whether or not a publish has.
 
 ---
 
@@ -1026,7 +1027,7 @@ undersized — every file a seal writes is already the size it was asked to be, 
 is exact and there is no timer to cut early — but because the seal size and the file size
 are two different targets (§12). `target_compact_size` defaults to eight times
 `target_seal_size`, so eight sealed files become one, and that conversion is on **with no
-archive configured**: file count is a read cost locally too, measured at 1.0 ms to read the
+published table configured**: file count is a read cost locally too, measured at 1.0 ms to read the
 offset boundary over one file against 44 ms over 64.
 
 It picks up the deliberate exceptions on the way — an explicit `seal()`, which cuts short by
@@ -1051,7 +1052,7 @@ from the seal that measured it, added up across a merge, and dropped when the fi
 unlinked. It cannot be recovered from the file afterwards: on data compressing
 8:1 a file holding a full target is an eighth of it on disk, so a rule reading sizes off disk
 merges eight already-full files into one holding eight times the memory the target allows —
-and, since `sync` refuses anything compaction may still rewrite, archives nothing at all in the
+and, since `publish` refuses anything compaction may still rewrite, published tables nothing at all in the
 meantime. A file whose size was never recorded counts as full, so an unmeasured file is never
 rewritten on a guess.
 
@@ -1061,7 +1062,7 @@ rewritten on a guess.
 2. Scan them into one Arrow table; re-sort by `sort_by`.
 3. Verify row count and per-column min/max against the sources.
 4. local.overwrite(table, overwrite_filter=(offset >= lo) & (offset <= hi))  -- one snapshot
-5. Upload the compacted file; replicate the same overwrite to the archive.
+5. Upload the compacted file; replicate the same overwrite to the published table.
 ```
 
 Using the offset range as the filter is what makes this safe without partitions: the
@@ -1135,9 +1136,9 @@ cannot attach a pyiceberg `SqlCatalog`. Path-based scanning fails for the same r
 always did — `SqlCatalog` keeps the current metadata pointer in the catalog rather than in a
 `version-hint.text` file the way a filesystem catalog would.
 
-**The ARCHIVE is the exception, and deliberately so.** Every archive commit writes that hint
+**The PUBLISHED table is the exception, and deliberately so.** Every published commit writes that hint
 beside its metadata (§5), which is what makes a re-point reversible and lets an engine with
-no catalog read the prefix directly. The local table publishes none: its catalog sits in the
+no catalog read the prefix directly. The staging table publishes none: its catalog sits in the
 same directory as its warehouse, so nothing can be in a position to have one without the
 other.
 
@@ -1199,13 +1200,13 @@ what makes this load-bearing rather than a note about developer laptops.
 ### Hot read — local, bounded, offline-capable
 
 ```sql
-SELECT * FROM <local iceberg table>  WHERE <predicates>
+SELECT * FROM <staging table>        WHERE <predicates>
 UNION ALL
 SELECT * FROM buffer                 WHERE offset > :boundary AND <predicates>
 ```
 
 **The boundary is derived from the Iceberg table, not from a flag:**
-`boundary = max(offset)` over the local table's current snapshot, read from manifest column
+`boundary = max(offset)` over the staging table's current snapshot, read from manifest column
 statistics.
 
 This is self-consistent at every instant, which is why the seal needs no `sealed` column:
@@ -1219,7 +1220,7 @@ Neither window double-counts or drops.
 
 ### Cost, measured
 
-1.02M rows (16 files x 64k) in the local table, 400-byte payloads, against a SQLite buffer
+1.02M rows (16 files x 64k) in the staging table, 400-byte payloads, against a SQLite buffer
 of varying size:
 
 ```
@@ -1279,7 +1280,7 @@ plain DuckDB-on-Parquet does not provide. "Real-time" means fresh, not point-loo
 **What it is not:** an OLTP or key-value store. Measured against an indexed row store, a
 point lookup is ~1,600x slower, and no configuration closes that gap.
 
-1.02M rows in the local table, 1,000 in the buffer, results fully materialised:
+1.02M rows in the staging table, 1,000 in the buffer, results fully materialised:
 
 ```
 count(*) / group-by over the whole window          22 - 26 ms
@@ -1350,11 +1351,11 @@ fsync is 20-50 us against ~1 ms here.
 ### Full-stream read — all three tiers
 
 **Decided per query, from per-tier statistics (#90).** Every query reads the buffer. The
-local leg and the archive leg are added only when their tier's statistics could hold a row the
+local leg and the published leg are added only when their tier's statistics could hold a row the
 query matches. Neither source is on the network, so I5 holds for any query bounded inside the
-local window:
+staging window:
 
-- **Local:** the rollup of the snapshot the read resolved, from the local table's own Iceberg
+- **Local:** the rollup of the snapshot the read resolved, from the staging table's own Iceberg
   manifests. The process that commits a new version stores its rollup in `buffer.db` after
   the commit, stamped with the version (its metadata file) and written forward only, so every
   other process reads it rather than rolling the same version up. A read uses a stored row
@@ -1362,15 +1363,15 @@ local window:
   itself (`LogTable.statistics_at`, cached per process by version). The stamp makes a late,
   missing or out-of-order store cost a rollup and never a wrong answer. Only the latest
   version is kept: a read misses it only in the milliseconds around a commit.
-- **Archive:** a row in `buffer.db` describing what the archive holds **below** the local
-  table. The archive leg reads only offsets under the local table's `lo`, and the archive's
-  copy of the local window would put its maximum timestamp at "minutes ago" and send every hot
+- **Published table:** a row in `buffer.db` describing what the published table holds **below** the staging
+  table. The published leg reads only offsets under the staging table's `lo`, and the published table's
+  copy of the staging window would put its maximum timestamp at "minutes ago" and send every hot
   query to the network. Stored because its statistics otherwise live on S3, and eviction —
   usually in another process — is the last moment they are on local disk.
 
 **`litelink_offset` prunes every tier, the buffer included, by range.** It is the log's
 sequence, dense and monotonic across the tiers, so each tier's `[start_offset, end_offset)`
-says exactly where it sits — local from its snapshot's extent, archive from `tier_offsets`,
+says exactly where it sits — local from its snapshot's extent, published table from `tier_offsets`,
 kept apart from its statistics in `tier_statistics`. The buffer's starts at its lowest offset
 and is open above. It is decided before the buffer is read, from that one indexed `min`, which
 only rises: rows arrive above it and leave as a prefix, so a query below it now matches
@@ -1388,57 +1389,57 @@ compares it against that column — to FLOAT for a float32 column, to DOUBLE for
 kept exact for an integer column — because the pruner compares in Python and must agree with
 the engine.
 
-**The archive row changes when the local floor moves, not when the archive does.** Eviction
+**The published row changes when the local floor moves, not when the published table does.** Eviction
 widens it by the rows it moves, from their local manifest statistics, before its commit — so a
-read resolving the new, higher floor finds the row already covering what went below it. `sync`
-adds only copies of rows the local table still holds and `rewrite_archive` re-cuts rows the
-archive has, so neither touches it; hydrate lowers the floor and leaves it overstating, which
-is safe. The one write that narrows is an exact rollup from the archive's manifests, run only
-under the whole-log maintenance claim, which eviction cannot hold beside: at the first `sync`,
+read resolving the new, higher floor finds the row already covering what went below it. `publish`
+adds only copies of rows the staging table still holds and `rewrite_published` re-cuts rows the
+published table has, so neither touches it; hydrate lowers the floor and leaves it overstating, which
+is safe. The one write that narrows is an exact rollup from the published table's manifests, run only
+under the whole-log maintenance claim, which eviction cannot hold beside: at the first `publish`,
 on a re-point (which drops the row first), at `restore`, and at `open` for a log written before
-the row existed. With no row, the archive is read.
+the row existed. With no row, the published table is read.
 
 This reverses 0.4.0, which fixed a handle's tiers at assembly (`include_archive`,
 `with_archive()`) so that a read would not start touching the network because eviction ran.
 That rule bought predictability at the price of the caller naming a tier and a handle
-without the archive answering short. Now a query's latency follows its predicates: a bounded
+without the published table answering short. Now a query's latency follows its predicates: a bounded
 hot query stays local, and an unbounded one reads history because the whole log is the right
 answer to it.
 
-The archive overlaps the local window, so the tiers cannot simply be unioned. Bound each by
+The published table overlaps the staging window, so the tiers cannot simply be unioned. Bound each by
 its neighbour's **actual extent**, read at query time:
 
 ```
-lo = min(offset) in the local table's current snapshot
-hi = max(offset) in the local table's current snapshot
+lo = min(offset) in the staging table's current snapshot
+hi = max(offset) in the staging table's current snapshot
 
-SELECT * FROM <remote iceberg>  WHERE offset <  lo   AND <predicates>
+SELECT * FROM <published table> WHERE offset <  lo   AND <predicates>
 UNION ALL
-SELECT * FROM <local iceberg>                        WHERE <predicates>
+SELECT * FROM <staging table>                        WHERE <predicates>
 UNION ALL
 SELECT * FROM buffer            WHERE offset >  hi   AND <predicates>
 ```
 
 Correct at every instant regardless of transient overlap, because `litelink_offset` is monotonic and
-the local window is a contiguous range over it. This is the §7 hot-read boundary
+the staging window is a contiguous range over it. This is the §7 hot-read boundary
 generalised, and it is why **no atomic handoff between the two catalogs is required** —
 which matters, since two Iceberg commits cannot be made atomic with each other.
 
 Both `lo` and `hi` come from manifest column statistics; neither requires opening a data
-file. If the local table is empty (everything evicted), it drops out and the read becomes
-archive plus buffer bounded by the archive's max offset — on a handle that reads the
-archive. On one that does not, the same state is a refusal.
+file. If the staging table is empty (everything evicted), it drops out and the read becomes
+published table plus buffer bounded by the published table's max offset — on a handle that reads the
+published table. On one that does not, the same state is a refusal.
 
 ### Historical read
 
-Query the archive table directly. Ordinary Iceberg — any engine, no custom logic, no
-knowledge of the local tier.
+Query the published table directly. Ordinary Iceberg — any engine, no custom logic, no
+knowledge of the staging tier.
 
 ### Who reads what
 
 - The **writing machine** uses its local catalog, always.
-- **Other machines and engines** attach to the archive catalog. Whether a file happens to sit
-  on some machine's disk is not modelled and not published; the archive describes what is in
+- **Other machines and engines** attach to the published catalog. Whether a file happens to sit
+  on some machine's disk is not modelled and not published; the published table describes what is in
   S3.
 
 ---
@@ -1447,37 +1448,37 @@ knowledge of the local tier.
 
 | knob | governs | too low means |
 |---|---|---|
-| `local_retention` | how much history the local table keeps | hot reads reach the archive |
+| `staging_retention` | how much history the staging table keeps | hot reads reach the published table |
 | `snapshot_retention` | how long expired snapshots survive | long scans hit deleted files |
 
-`local_retention` must exceed the longest hot-path lookback **with margin** — equal leaves
+`staging_retention` must exceed the longest hot-path lookback **with margin** — equal leaves
 nothing for seal delay.
 
-**`local_retention = 0` is valid**: files are evicted from the local table as soon as they
-are registered in the archive, and the local table holds only what has not yet been
-uploaded. Hot reads are then limited to the buffer, and anything older goes to the archive
+**`staging_retention = 0` is valid**: files are evicted from the staging table as soon as they
+are registered in the published table, and the staging table holds only what has not yet been
+uploaded. Hot reads are then limited to the buffer, and anything older goes to the published table
 over the network. That is the right setting for pure archival capture — litelink as a
 durable staging area into Iceberg — and the wrong one wherever a hot reader looks back
 further than the buffer holds. It does not weaken I4: eviction still never precedes registration.
 
-**Retention is never deletion** (#98). It used to be, on a log with no archive: I4 was
-vacuous there, so `local_retention` became a retention policy over the only copy. That made
-DETACHING an archive a silent conversion into it — the clamp retired for every process at
+**Retention is never deletion** (#98). It used to be, on a log with no published table: I4 was
+vacuous there, so `staging_retention` became a retention policy over the only copy. That made
+DETACHING a published table a silent conversion into it — the clamp retired for every process at
 once, and a maintainer the operator never invoked deleted 4,025 acknowledged offsets of
 8,000 — and it left a local-only log with no output table for compaction and sizing to
 shape.
 
-Now every log has an archive: on S3 when one is given, otherwise a local directory under the
-log's own. Eviction drops only what it holds, `set_archive(None)` re-points to the local
-default rather than detaching, and `local_retention = 0` means "evict on publish" on every
-log. The cost moves to the archive: a local one keeps everything until truncation by offset
+Now every log has a published table: on S3 when one is given, otherwise a local directory under the
+log's own. Eviction drops only what it holds, `set_published(None)` re-points to the local
+default rather than detaching, and `staging_retention = 0` means "evict on publish" on every
+log. The cost moves to the published table: a local one keeps everything until truncation by offset
 or age lands, which is a follow-up.
 
-Raising it is an operation, not a config change: `hydrate(since=…)` fetches archived files
-and re-registers them into the local table. Without it, a raised setting applies only to
+Raising it is an operation, not a config change: `hydrate(since=…)` fetches published files
+and re-registers them into the staging table. Without it, a raised setting applies only to
 data captured afterwards.
 
-Buffer rows are deleted once something off-box holds them — at seal, or at sync with
+Buffer rows are deleted once something off-box holds them — at seal, or at publish with
 `wal_replication` (§3a). There is no SQLite retention knob.
 
 ---
@@ -1487,25 +1488,25 @@ Buffer rows are deleted once something off-box holds them — at seal, or at syn
 **A log's schema is fixed when it is created, for life. To change it, start a new log** (#93).
 litelink is a storage engine, not a query engine, and an immutable log is the storage-engine
 shape: every file in a log has every column, so there is no field-ID bookkeeping, no file
-that predates a column, and no operation that spans the archive, the local table and the
+that predates a column, and no operation that spans the published table, the staging table and the
 buffer's DDL at once.
 
-Changing a schema is therefore a new name — and so a new archive table — starting where the
+Changing a schema is therefore a new name — and so a new published table — starting where the
 old log ended:
 
 ```python
-old.retire()                                  # everything archived, nothing local
-new = litelink.new(root, "trades-v2", schema=widened, archive=prefix,
+old.retire()                                  # everything published, nothing local
+new = litelink.new(root, "trades-v2", schema=widened, published=prefix,
                    start_offset=old.end_offset())
 ```
 
 Offsets stay dense across the two logs, and any engine reads `<prefix>/trades` and
 `<prefix>/trades-v2` as one sequence. streamcast's `Stream.migrate` does exactly this. Reusing
-the old name against the same archive is refused by the archive guard, as it should be: two
+the old name against the same published table is refused by the foreign-table guard, as it should be: two
 logs would put the same offsets in one table.
 
-**What this replaced.** Through 0.5, `add_column` widened a log in place: the archive first,
-then the local table, then the buffer's DDL, with an intent recorded in SQLite before it began
+**What this replaced.** Through 0.5, `add_column` widened a log in place: the published table first,
+then the staging table, then the buffer's DDL, with an intent recorded in SQLite before it began
 and replayed on recovery, because the Iceberg commits and the SQLite writes cannot be made
 atomic. `rename_column` and `drop_column` were specified and never built. All three are gone.
 A log a 0.5 release left mid-`add_column` is refused, naming the release that can finish it,
@@ -1552,11 +1553,11 @@ Each needs a test.
 |---|---|---|
 | **I1** | The Parquet file is written and fsynced before the Iceberg commit. | The reverse publishes a manifest entry for a file that may not exist. |
 | **I2** | The seal range and its path are persisted before the file is written. | No file can exist that this database cannot name. |
-| **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The archive overlaps the local window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
-| **I4** | A file is never evicted from the local table while the archive still lacks it. Every log has one (#98): on S3, or a local directory. | Eviction before registration is data loss. It used to be vacuous for a log with no archive, which made `local_retention` a deletion policy over the only copy — and made detaching an archive a silent conversion into one (§8). |
-| **I5** | Reads served from within `local_retention` never touch the network or require sync to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `local_retention = 0` is a valid archival configuration (§8) in which the local window is empty by choice. |
+| **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The published table overlaps the staging window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
+| **I4** | A file is never evicted from the staging table while the published table still lacks it. Every log has one (#98): on S3, or a local directory. | Eviction before registration is data loss. It used to be vacuous for a log with no published table, which made `staging_retention` a deletion policy over the only copy — and made detaching a published table a silent conversion into one (§8). |
+| **I5** | Reads served from within `staging_retention` never touch the network or require publish to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `staging_retention = 0` is a valid archival configuration (§8) in which the staging window is empty by choice. |
 | **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
-| **I7** | *Retired with schema changes (#93).* Schema changes reached the archive before the local table. | Logs are immutable (§9), so there is no schema change to order. |
+| **I7** | *Retired with schema changes (#93).* Schema changes reached the published table before the staging table. | Logs are immutable (§9), so there is no schema change to order. |
 | **I11** | `litelink_offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
 | **I17** | An append names only columns the log declares, supplies a value for every non-nullable one, and gives each a value of its declared type, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. The type clause closes the same two outcomes reached through a value rather than a name: SQLite has affinities, not types, so it stores whatever it is given and the declared schema is not consulted again until the read. A value Arrow cannot parse (`"x"` into an int64) wedges every scan; one it can parse but not preserve (`1.5` into an int64, `12345` into a string, `True` into an int64) is silently rewritten, so what is read back is not what was appended and nothing raises at all. Magnitude is checked with it: `2**40` IS an int and `1e300` IS a float, and they fail the same two ways — the int32 wedges every scan, the float32 reads back as `inf`. **Enforced by the buffer's DDL, not by Python.** Every column is declared `ANY` with a `typeof` CHECK, and that is the whole design: a STRICT column of a declared type does not refuse a wrong value, it CONVERTS one. An INTEGER column given `'77'` stores 77 and `'007'` stores 7; a REAL column given `'1e999'` stores `inf`; a TEXT column given `12345` stores `'12345'`. The conversion happens before any CHECK could see it, so a constraint on a typed column would be asked about a value that had already been changed. `ANY` stores the value exactly as given, which is what lets `typeof` tell the truth about it; STRICT is still declared, because it is what makes `ANY` mean "no conversion". `NOT NULL` carries the nullability half — absent and explicitly-None reach SQLite identically — and the range tests ride in the same CHECK. An integer is a legal value for a FLOAT column — `{"price": 5}` is too natural to refuse — but only within the range where every integer converts exactly (2**53 for float64, 2**24 for float32). Past it the value stays an integer in the buffer, since `ANY` performs no conversion, and Arrow then cannot build the column at all: one such value makes every scan and every seal raise for ever while appends keep succeeding. The bound is a range rather than a per-value test because a SQL CHECK cannot ask whether one particular integer is representable, so some that would convert exactly are refused too. Python is left with the one question SQLite cannot be asked, an unknown column: the insert names the schema's columns, so a key the log does not have is dropped before any SQL exists. One leniency is deliberate — `True` into an integer column stores 1, because the driver converts it before SQLite sees it, and it is lossless. A `fixed_size_binary(n)` column adds `length() = n` to its CHECK. **A float must be finite** (#87): the CHECK refuses ±inf, and NaN — which SQLite stores as NULL before any CHECK sees it — is refused in Python, as are non-finite values in a nested column and in `ingest`'s Arrow. NaN because readers disagree about it: Iceberg's file bounds and Parquet's row-group statistics leave it out, so whether DuckDB returns a stored NaN depends on what else shares its file. ±inf because the layer above speaks JSON, which has no infinity. **Nested columns are the one place Python enforces I17.** A `struct`, `map` or `list` value is stored as JSON text, which no CHECK can see into, and Arrow is no check either: it drops a struct key the type does not declare, silently, and accepts `None` for a non-nullable child. So `Nested` walks the declared type before the insert and refuses the same classes — wrong type, out of range, inexact integer into a float, unknown struct field, null where the field is not nullable — naming the path to the value. |
 | **I9** | `litelink_offset` is strictly monotonic for the life of a stream and never reused, including after the buffer empties. | Rowid reuse after a delete silently invalidates every tier boundary in §7. |
@@ -1574,9 +1575,9 @@ Each needs a test.
 | Crash between Parquet write and Iceberg commit | `sealing` row survives; recovery redoes the commit against the same path. |
 | Crash between Iceberg commit and buffer delete | The boundary has already advanced, so reads stay correct; recovery drops the stale rows. |
 | Network unavailable indefinitely | Capture, seal, compaction and hot reads all continue. Unregistered files accumulate; local eviction stalls (I4). Fails only when local disk fills. |
-| Two sync passes race | The Iceberg catalog commit is atomic; the loser refreshes and retries. |
+| Two publish passes race | The Iceberg catalog commit is atomic; the loser refreshes and retries. |
 | Local disk fills | Backpressure — §13.3. |
-| Machine lost | Exposure is whatever was unregistered. The archive is intact and independently readable. |
+| Machine lost | Exposure is whatever was unregistered. The published table is intact and independently readable. |
 | Compaction crashes mid-write | No snapshot was committed; the orphaned file is unreferenced and swept. |
 | A second process opens a live log | **Currently unsafe.** Opening runs recovery, and recovery does not know which operations belong to the opener — see below. |
 
@@ -1619,78 +1620,78 @@ target_seal_size       Arrow bytes per SEAL               (size it for READ late
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
                                                           whatever compression achieved)
-local_retention        local table window, by TIME        (> longest hot lookback, with margin; 0 = evict on upload)
-local_rows             local table window, by ROWS        (floor: keep at least this many recent rows)
+staging_retention      staging window, by TIME            (> longest hot lookback, with margin; 0 = evict on upload)
+staging_rows           staging window, by ROWS            (floor: keep at least this many recent rows)
 snapshot_retention     snapshot expiry floor              (> longest scan)
 compact_min_files      minimum adjacent files to compact  (default 4; below 2 is refused —
                                                           every run would look mergeable)
-wal_replication        ship the WAL with a sidecar        (needs an archive; also decides
+wal_replication        ship the WAL with a sidecar        (needs a published table; also decides
                                                           whether a seal keeps its rows)
 wal_retention          how far back a restore may go      (None = litestream's own default)
 ```
 
 `sort_by` is NOT in here. Everything above governs future work only, so `set_config` needs
-no rewrite; the sort order is a read-shape decision that re-clusters every file the local
+no rewrite; the sort order is a read-shape decision that re-clusters every file the staging
 table owns, so it is set at `litelink.new` and changed by `set_sort_by`. It lives in `meta` beside the
 schema, not in `LogConfig`.
 
 `maintain()` runs compaction, eviction **and** expiry together, in that order, and needs no
-archive. Each is a no-op or a regression without the others: compaction alone increases
+published table. Each is a no-op or a regression without the others: compaction alone increases
 storage, since superseded files stay referenced until their snapshots expire; eviction alone
 frees no disk, since it removes a file from the current snapshot while the previous one still
 references it; and expiry is what actually deletes bytes, held back by `snapshot_retention`
 so a running scan does not lose files underneath it (I6).
 
 The consequence worth planning for is that local disk holds roughly
-`local_retention + snapshot_retention` of data, not `local_retention`.
+`staging_retention + snapshot_retention` of data, not `staging_retention`.
 
 ---
 
 ## 13. Open questions
 
-0. **The archive's identity is local, and re-pointing has to reconcile it.** Seven
+0. **The published table's identity is local, and re-pointing has to reconcile it.** Seven
    consecutive review rounds found defects in one seam, each fix adding a guard on top
    of the last. That is a design signal, and it is recorded here rather than patched
    again.
 
-   The shape of the problem: `archive.db` is a LOCAL catalog keyed by table id, naming a
+   The shape of the problem: `published.db` is a LOCAL catalog keyed by table id, naming a
    REMOTE table. Nothing in the entry says which prefix it belongs to, so "is this entry
    mine?" is answered by comparing its metadata location against the configured prefix —
-   a string comparison standing in for an identity. Meanwhile `set_archive` changes
+   a string comparison standing in for an identity. Meanwhile `set_published` changes
    durable state that every other process cached at open, and the watermark it resets is
    the thing eviction deletes on.
 
    What has accumulated as a result: the entry is validated at open; only a lease holder
-   may repair it; `set_archive` takes the maintenance lease; `sync` re-reads the location
+   may repair it; `set_published` takes the maintenance lease; `publish` re-reads the location
    under that lease and re-checks it before writing a watermark; a failed repair restores
    the entry it displaced; `drain` refuses to delete outside the configured prefix. Each
    is correct and each was found the hard way.
 
-   What would replace them: give the archive an IDENTITY the entry carries — a token
-   written into the archive's own table properties at creation and recorded beside the
+   What would replace them: give the published table an IDENTITY the entry carries — a token
+   written into the published table's own table properties at creation and recorded beside the
    URI locally, so "is this mine?" is an equality check on a value rather than an
    inference from a path. Prefix comparison then stops being load-bearing and a re-point
    becomes one durable fact to change rather than three that can disagree.
 
-   Re-attaching to an archive that already holds data no longer waits on that: the
-   archive publishes `version-hint.text` at every commit and `open_archive` registers
+   Re-attaching to a published table that already holds data no longer waits on that: the
+   published table publishes `version-hint.text` at every commit and `open_published` registers
    from it. What the token would add is a CHECK. The hint says where this log left the
-   metadata, and adopting it trusts that nothing else wrote the archive in between —
+   metadata, and adopting it trusts that nothing else wrote the published table in between —
    true under the one-writer-per-log contract, and unverifiable without an identity.
 
    **The deferral has a measured cost, and this paragraph used to understate it.** It
    claimed the guards above were sufficient for the operations the library supports —
    attach, detach, re-point to a fresh prefix. A later round disproved that. It found
    four more defects in this seam, and unlike their predecessors two of them needed no
-   race, no crash and no lease lapse: attaching an archive to a log a maintainer already
+   race, no crash and no lease lapse: attaching a published table to a log a maintainer already
    had open let that maintainer go on deleting the only copy of every row past
-   `local_retention`, because `evict` asked its own memory whether I4 was owed; and
-   re-asserting an archive from a process whose memory had gone stale read as a move and
+   `staging_retention`, because `evict` asked its own memory whether I4 was owed; and
+   re-asserting a published table from a process whose memory had gone stale read as a move and
    zeroed the watermarks of a bucket that held the data. The findings got *less*
    contrived, which is the opposite of what a converging seam does.
 
-   The reason is now legible. The archive's identity lives in four places — the `meta`
-   row, each process's `Archive` object, the `archive.db` catalog row, and each captured
+   The reason is now legible. The published table's identity lives in four places — the `meta`
+   row, each process's `Published` object, the `published.db` catalog row, and each captured
    pyiceberg handle — and every guard listed above synchronises one read-write pair. Each
    round finds the next pair nobody has synchronised yet. The four latest fixes (pin the
    URI per push, compare-and-set the re-point against the durable value, refresh `evict`
@@ -1715,9 +1716,9 @@ The consequence worth planning for is that local disk holds roughly
    things.
 
    The correctness item it was also going to fix is fixed by a different mechanism: a merge
-   can no longer include files sync has archived, because compaction and `sync` both read
-   the per-segment archive records rather than a watermark, and `archived_prefix` excludes
-   anything an archive holds.
+   can no longer include files publish has published, because compaction and `publish` both read
+   the per-segment published records rather than a watermark, and `published_prefix` excludes
+   anything a published table holds.
 
 1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
    data naturally clustered by ingest time, so `litelink_offset` and `ingest_ts` statistics are tight
@@ -1733,12 +1734,12 @@ The consequence worth planning for is that local disk holds roughly
    deferrable.
 2. **`payload` encoding.** Binary JSON is the simplest default. msgpack or Arrow IPC
    would be smaller. Measure on real payloads first — this is a one-way door once data
-   exists, since re-encoding means rewriting the archive.
+   exists, since re-encoding means rewriting the published table.
 3. **Local disk backpressure.** The failure that used to be "object storage is down" is now
    "local disk fills." Bound the buffer on **bytes**, not row count — a row-count bound can
    exceed a byte-based memory limit, letting the OOM killer win the race against the policy
    meant to prevent it.
-4. **Bulk ingest.** Loading an existing corpus — a backfill, an archive import — through
+4. **Bulk ingest.** Loading an existing corpus — a backfill, a published table import — through
    `append()` row by row wastes the point of already having Parquet. The wanted path is to
    lock writes, reserve a contiguous offset range, materialise `litelink_offset` into the file, and
    commit. Four things it meets, none blocking, none free.
@@ -1787,7 +1788,7 @@ The consequence worth planning for is that local disk holds roughly
    function that writes buffer rows to Parquet, needs a fourth read.
 
    **The orphan sweep does not transfer.** §15.4 sweeps by offset against the §7 boundary,
-   which works because every staged blob has a buffer row carrying `{name}_staged`. A bulk
+   which works because every spilled blob has a buffer row carrying `{name}_spilled`. A bulk
    file has no buffer row and sits *above* the boundary until it commits, so an abandoned
    ingest reads as still-referenced forever. It needs a table parallel to `sealing`, holding
    `(lo, hi, rel_path)` — not a row in `buffer`, which §7's hot read would union into reader
@@ -1795,7 +1796,7 @@ The consequence worth planning for is that local disk holds roughly
    length of a rewrite.
 
    That table already exists: `compacting` holds exactly `(lo, hi, rel_path)`, takes several
-   rows because an archive rewrite claims one object at a time, and its recovery already
+   rows because a published rewrite claims one object at a time, and its recovery already
    does the right thing for an abandoned ingest — queue every claimed path, and let `drain`
    refuse the ones the table turned out to reference. A second table of the same shape would
    be a second mechanism for one fact. What ingest must NOT reuse is `claim_seal`: on reopen
@@ -1996,7 +1997,7 @@ The consequence worth planning for is that local disk holds roughly
    event loop would rather own. A capture feed arriving over a websocket is asyncio by
    construction, so the wrapper is worth having.
 
-   Deliberately deferred rather than forgotten. It is a surface decision — sync core with
+   Deliberately deferred rather than forgotten. It is a surface decision — publish core with
    an async facade, or async all the way down — and it should be made when the API has
    users to be broken, not stacked onto the change that made the core coherent.
 
@@ -2149,7 +2150,7 @@ The consequence worth planning for is that local disk holds roughly
    a published meaning nobody agreed on. It does not obviously reach bookkeeping the library
    keeps for itself.
 
-   §15.3 already settled the analogous case in that direction. The staged bit is
+   §15.3 already settled the analogous case in that direction. The spilled bit is
    *"deliberately **not** `{name}_size`, and not any column in the published schema"* —
    internal state stays in the buffer, because *"overloading a caller-facing column with
    internal state constrains it"*. A `litelink_ts` in the buffer table only, never in the
@@ -2226,7 +2227,7 @@ The consequence worth planning for is that local disk holds roughly
    `target_compact_size`, so a file compaction has already produced at or above that size is
    never revisited — compaction bounds how many *small* files exist and cannot reduce the
    total. Eviction is the only mechanism that removes a large file, and §8 makes
-   `local_retention = None` the default, so a local-only capture that keeps its history still
+   `staging_retention = None` the default, so a local-only capture that keeps its history still
    degrades. Less steeply than this entry first claimed, and for a reason now named.
 
    Worth measuring before choosing a fix, since the options differ in shape: raising
@@ -2247,7 +2248,7 @@ The consequence worth planning for is that local disk holds roughly
    provides is used, not reimplemented"*, and the distinction that principle turns on is worth
    stating: using the **format** is the commitment, using the **library** is an implementation
    choice. Files that conform are still Iceberg. The real risk is drift — hand-written metadata
-   that is subtly wrong still opens locally and breaks the external readers the archive exists
+   that is subtly wrong still opens locally and breaks the external readers the published table exists
    for, and it breaks them later, in someone else's engine.
 
    Two cheaper things should be ruled out first, because both are small and neither risks the
@@ -2266,16 +2267,16 @@ The consequence worth planning for is that local disk holds roughly
    requirement: an external engine must read the result. That is a test before it is a design —
    attach something that is not pyiceberg and assert it sees what litelink says is there.
 
-   **The archive has the same commit cost and it does not matter in the same way.** Its file
+   **The published table has the same commit cost and it does not matter in the same way.** Its file
    count is unbounded by design — it is the full history — so registering into it rewrites
    manifests against a table that only grows. But that happens in §5, which is lazy,
    restartable and arbitrarily far behind, and no read depends on it. The same work that
-   stalls an append when a seal does it is absorbed by a background pass when sync does. That
+   stalls an append when a seal does it is absorbed by a background pass when publish does. That
    is the argument for eviction as the bounding mechanism: it does not remove the cost, it
    moves it to the tier that can wait.
 
    One coupling survives the move, and it closes a loop worth watching. Eviction may not
-   precede registration (I4), so if archive commits slow enough that sync falls behind,
+   precede registration (I4), so if published commits slow enough that publish falls behind,
    eviction stalls, the local file count grows, and local seals degrade — the write path
    feeling a cost that was supposed to have been moved off it. The remote table wants the same
    manifest-merge properties as the local one for that reason, and §5's throughput is worth a
@@ -2323,15 +2324,15 @@ Beyond §10:
   leaves no orphan.
 - Kill between Iceberg commit and buffer delete; assert a read in that window returns each
   row exactly once (I3).
-- With the archive deliberately overlapping the local window, assert a full three-tier read
+- With the published table deliberately overlapping the staging window, assert a full three-tier read
   returns every row exactly once (I3).
-- Evict the local table to empty; assert a full read still returns everything, from archive
+- Evict the staging table to empty; assert a full read still returns everything, from published table
   plus buffer alone.
 - Seal until the buffer is empty, insert again, and assert the new offsets exceed every
   offset already committed to Iceberg (I9). This fails with a bare `INTEGER PRIMARY KEY`.
-- Assert an unregistered file is never evicted locally, even past `local_retention` (I4).
+- Assert an unregistered file is never evicted locally, even past `staging_retention` (I4).
 - Expire snapshots during a long scan; assert the scan completes (I6).
-- Attach an external engine to the archive; assert it sees exactly the expected rows with no
+- Attach an external engine to the published table; assert it sees exactly the expected rows with no
   custom logic.
 - Assert written files are sorted by `sort_by`, and that an `event_ts` predicate over a
   backfilling stream reads strictly fewer row groups than the same file written unsorted.
@@ -2368,7 +2369,7 @@ Beyond §10:
   become unreadable too.
 - Commit twice, then assert a reader that cached `metadata_location` from the first commit
   is detectably stale -- the reason §7 requires resolving it per query.
-- Run with `local_retention = 0`; assert seal, upload, archive reads and compaction all work
+- Run with `staging_retention = 0`; assert seal, upload, published reads and compaction all work
   and that eviction still never precedes registration (I4).
 - Restore a WAL replica taken before a seal; assert the read returns each row exactly once
   despite the restored buffer holding already-sealed rows.
@@ -2404,14 +2405,14 @@ staging path costs more than it saves.
 same shape in both tiers: a plain Iceberg `binary` column holding the bytes themselves.
 
 There is no pointer in the schema. The hot-side staging path is derived from `litelink_offset` and
-the field name, so it exists only on the write side and never reaches the table. The archive
+the field name, so it exists only on the write side and never reaches the table. The published table
 is therefore ordinary Iceberg with a binary column, readable by any engine with no
 convention to know about and no dereference step.
 
 This is the one design decision worth stating explicitly, because the obvious alternative
 looks cheaper and is not. A sidecar object store with a `(path, offset, length)` struct
 column avoids inflating the Parquet files, but it puts a reference in the published schema,
-makes the archive unreadable without library-specific logic, and creates a class of object
+makes the published table unreadable without library-specific logic, and creates a class of object
 that Iceberg does not manage. Snapshot expiry, orphan cleanup and compaction all ignore
 files that no manifest references, so blob lifetime becomes a refcount the library maintains
 by hand across crashes. Inlining at seal removes that entire category: the bytes are inside a
@@ -2467,13 +2468,13 @@ Amends §3. The buffer row never carries blob bytes.
 
 ```
 1. BEGIN. INSERT the buffer row (no blob column); take `litelink_offset` from lastrowid.
-2. Write bytes to {root}/staging/{offset}.{field}.bin
+2. Write bytes to {root}/blobs/{offset}.{field}.bin
 3. fsync the file AND the directory entry
-4. Set {name}_staged = 1 on the row. COMMIT.
+4. Set {name}_spilled = 1 on the row. COMMIT.
 ```
 
 **Step 3 before step 4 is correctness, not durability hygiene (I12).** A committed row whose
-staging file did not survive the crash is a row pointing at nothing, and it is unrecoverable
+blob file did not survive the crash is a row pointing at nothing, and it is unrecoverable
 because the bytes were never anywhere else. Syncing the directory entry matters as much as
 the file: on most filesystems the file can be durable while the name that reaches it is not.
 
@@ -2495,12 +2496,12 @@ offset *N*, then rolls back, is followed by an `INSERT` that also receives *N*. 
 harmless for I9, which governs *committed* offsets and therefore the tier boundaries — but
 it is not harmless here, because step 2 has already put a file on disk at that name.
 
-The failure it would cause: a crash after step 3 leaves `staging/N.payload.bin` with no
+The failure it would cause: a crash after step 3 leaves `blobs/N.payload.bin` with no
 committed row. A later row takes offset *N* again with **no** blob, and a seal that inferred
 "does this row have a blob?" from file existence would attach the stale bytes to it.
 
 **So blob presence is recorded on the row, never inferred from the filesystem** — by
-`{name}_staged`, a bit **in the buffer table only**. It is set in step 4, inside the same
+`{name}_spilled`, a bit **in the buffer table only**. It is set in step 4, inside the same
 commit that makes the row visible, so it is true exactly when the bytes are durable.
 
 It is deliberately **not** `{name}_size`, and not any column in the published schema:
@@ -2509,11 +2510,11 @@ It is deliberately **not** `{name}_size`, and not any column in the published sc
   indicate, so it has no business in a table other engines read.
 - Overloading a caller-facing column with internal state constrains it. If `size=True` is
   declared, the caller reasonably expects to query it — and now its nulls carry two meanings
-  (no blob / not yet staged) that have to be disentangled forever.
+  (no blob / not yet spilled) that have to be disentangled forever.
 - `{name}_size` is optional, so it would have to be silently forced on to serve as the
   sentinel, which is the sort of surprise that shows up as a schema diff nobody asked for.
 
-A staging file whose row has `{name}_staged = 0`, or no row at all, is an orphan by
+A blob file whose row has `{name}_spilled = 0`, or no row at all, is an orphan by
 definition, and the §15.4 sweep removes it.
 
 Staging is local, buffer-scoped, and never uploaded.
@@ -2526,20 +2527,20 @@ Amends §4. One additional step, between choosing the range and writing Parquet:
 
 ```
 1. SQLite txn: choose [start, end), write it to `sealing`
-2. Read buffer rows; for each row with {name}_staged = 1, read staging/{offset}.{field}.bin
-3. Write Parquet locally with bytes inline; commit to the local Iceberg table
+2. Read buffer rows; for each row with {name}_spilled = 1, read blobs/{offset}.{field}.bin
+3. Write Parquet locally with bytes inline; commit to the staging table
 4. SQLite txn: delete buffer rows < end; clear `sealing`
-5. Delete staging files for offsets < end
+5. Delete blob files for offsets < end
 ```
 
-**Step 5 is garbage collection, not correctness**, exactly like step 4. A staging file whose
-offset is below the local table's committed max offset is unreferenced by construction,
+**Step 5 is garbage collection, not correctness**, exactly like step 4. A blob file whose
+offset is below the staging table's committed max offset is unreferenced by construction,
 because the bytes are now in a data file. The sweep is therefore idempotent and can run at
-any time, including on startup: delete every staging file whose offset is below the boundary
+any time, including on startup: delete every blob file whose offset is below the boundary
 that §7 already computes.
 
 That derivation is why no orphan window needs a time heuristic. A crash anywhere leaves
-staging files that are either still referenced (offset above the boundary, keep) or already
+blob files that are either still referenced (offset above the boundary, keep) or already
 materialized or orphaned (below it, sweep). There is no third state.
 
 **Sorting now moves bytes.** §4 sorts rows by `sort_by` before writing, which with inline
@@ -2558,7 +2559,7 @@ not tuning.
 `row_group_size` in **rows** and has no byte-based parameter; the default is unset, falling
 back to roughly a million rows. At 10 MB blobs that is a ten-terabyte row group, meaning
 every projection of the blob column reads the entire file. Derive a row count from the sizes of the
-staged files themselves — which the library always knows, whether or not `{name}_size` was
+spilled files themselves — which the library always knows, whether or not `{name}_size` was
 declared — so a row group holds roughly 10 to 50 blobs. The row group is also the
 unit a reader materializes in memory, so it doubles as the per-reader allocation bound.
 
@@ -2604,7 +2605,7 @@ push a tight row filter rather than materializing a scan.
 Both §7 reads with a blob field resolved. Expressible entirely in DuckDB, using `sqlite` to
 attach the buffer, `iceberg` to scan the tables, and `read_blob` for staging.
 
-`lo` and `hi` are §7's names: the min and max of `litelink_offset` over the local table's current
+`lo` and `hi` are §7's names: the min and max of `litelink_offset` over the staging table's current
 snapshot, read from manifest column statistics. The hot read needs only `hi`, which is the
 value §7's hot-read prose calls `boundary`; it is the same number and this section uses `hi`
 throughout so one value carries one name.
@@ -2614,7 +2615,7 @@ one that forced it. `offset` is a plausible application column — a byte offset
 offset, an offset from a reference time — and reserving it taxes every caller. More
 decisively, **`offset` is a reserved word in DuckDB**: `SELECT offset FROM t` and
 `max(offset)` are both parser errors, so every query the library wrote and every query a
-reader wrote against the archive would have to quote it, forever, with the failure being a
+reader wrote against the published table would have to quote it, forever, with the failure being a
 syntax error rather than anything that says why. Verified in both directions —
 `max(litelink_offset)` parses unquoted, `max(offset)` does not.
 
@@ -2631,10 +2632,10 @@ CREATE OR REPLACE TEMP VIEW staging AS
   SELECT
     regexp_extract(filename, '(\d+)\.payload\.bin$', 1)::BIGINT AS "offset",
     content AS payload
-  FROM read_blob('staging/*.payload.bin');
+  FROM read_blob('blobs/*.payload.bin');
 ```
 
-**Hot read** (local table plus buffer):
+**Hot read** (staging table plus buffer):
 
 ```sql
 SELECT "offset", event_ts, key, payload
@@ -2649,12 +2650,12 @@ LEFT JOIN staging s USING ("offset")
 WHERE b."offset" > $hi AND <predicates>;
 ```
 
-**Full-stream read** (archive plus local plus buffer). The archive holds no staging tier, so
+**Full-stream read** (published table plus local plus buffer). The published table holds no staging tier, so
 its blob column is read directly:
 
 ```sql
 SELECT "offset", event_ts, key, payload
-FROM iceberg_scan('<archive metadata json>')
+FROM iceberg_scan('<published metadata json>')
 WHERE "offset" < $lo AND <predicates>
 
 UNION ALL
@@ -2742,8 +2743,8 @@ justifies.
 
 | Section | Change |
 |---|---|
-| §2 Layout | Buffer holds no blob bytes. Adds an internal `{name}_staged` bit per blob field, in the buffer table only — never in the Iceberg schema. |
-| §3 Write path | Adds the staging write and the fsync ordering (§15.3). |
+| §2 Layout | Buffer holds no blob bytes. Adds an internal `{name}_spilled` bit per blob field, in the buffer table only — never in the Iceberg schema. |
+| §3 Write path | Adds the blob write and the fsync ordering (§15.3). |
 | §4 Seal | Adds materialization (step 2), the staging sweep (step 5), and sort-by-key-then-permute. |
 | §6 Compaction | Unchanged in logic; needs a separate size bound for blob streams. |
 | §7 Read path | Unchanged in shape. Hot reads resolve staging by derivation; `litelink_offset` must be quoted. |
@@ -2758,9 +2759,9 @@ Extends §10.
 
 | # | Invariant | Why |
 |---|---|---|
-| **I12** | The staging file and its directory entry are fsynced before the buffer row commits. | A committed row whose bytes did not survive is unrecoverable. The bytes exist nowhere else. |
-| **I13** | A staging file is deleted only when its offset is below the local table's committed max offset. | Above the boundary it is still the only copy. |
-| **I14** | Blob presence is read from `{name}_staged` in the buffer, never inferred from a staging file existing, and never from a column in the published schema. | AUTOINCREMENT reuses an offset after a rollback, so a stale staging file can sit at an offset a later row legitimately takes. Keeping the bit internal also stops a caller-facing column carrying two meanings for null. |
+| **I12** | The blob file and its directory entry are fsynced before the buffer row commits. | A committed row whose bytes did not survive is unrecoverable. The bytes exist nowhere else. |
+| **I13** | A blob file is deleted only when its offset is below the staging table's committed max offset. | Above the boundary it is still the only copy. |
+| **I14** | Blob presence is read from `{name}_spilled` in the buffer, never inferred from a blob file existing, and never from a column in the published schema. | AUTOINCREMENT reuses an offset after a rollback, so a stale blob file can sit at an offset a later row legitimately takes. Keeping the bit internal also stops a caller-facing column carrying two meanings for null. |
 | **I15** | Blob bytes are never written to any object storage location that no Iceberg manifest references. | The moment they are, lifetime becomes a hand-maintained refcount and expiry stops working. |
 
 I15 is a design constraint rather than a runtime check, and it is the one to revisit
@@ -2774,22 +2775,22 @@ Extends §11.
 
 | Failure | Outcome |
 |---|---|
-| Crash between staging write and buffer commit | Orphaned staging file at an offset with no committed row. Swept by the §15.4 rule; never mis-attached, because presence comes from `{name}_staged` (I14). |
-| Crash between buffer commit and seal | Staging file survives; the row is durable and readable. This is the case I12 protects. |
-| Staging file missing for a row with `{name}_staged = 1` | Unrecoverable data loss for that row. Detectable at seal; fail loudly rather than writing a null. |
-| Crash mid-seal after Parquet commit | Staging files below the boundary are now redundant; recovery sweeps them. |
+| Crash between blob write and buffer commit | Orphaned blob file at an offset with no committed row. Swept by the §15.4 rule; never mis-attached, because presence comes from `{name}_spilled` (I14). |
+| Crash between buffer commit and seal | Blob file survives; the row is durable and readable. This is the case I12 protects. |
+| Blob file missing for a row with `{name}_spilled = 1` | Unrecoverable data loss for that row. Detectable at seal; fail loudly rather than writing a null. |
+| Crash mid-seal after Parquet commit | Blob files below the boundary are now redundant; recovery sweeps them. |
 | Local disk fills | Blobs dominate the bound, so §13's byte-based backpressure must count staging, not only buffer rows. |
 
 ---
 
 ## 15.11 Tests
 
-- Kill between staging write and buffer commit; assert the orphan is swept and no row
+- Kill between blob write and buffer commit; assert the orphan is swept and no row
   references a missing file.
-- **Force an offset reuse**: roll back an insert that staged bytes, then insert a blob-less
+- **Force an offset reuse**: roll back an insert that spilled bytes, then insert a blob-less
   row that takes the same offset; assert the stale bytes are never attached (I14).
 - Kill between buffer commit and seal; assert the row reads back with correct bytes.
-- Delete a staging file behind a row with `{name}_staged = 1`; assert seal fails loudly
+- Delete a blob file behind a row with `{name}_spilled = 1`; assert seal fails loudly
   rather than writing a null or a short value.
 - Declare a blob field with `size=False`; assert the published schema contains no
   `{name}_size`, that the staging bit appears nowhere in the Iceberg table, and that seal
@@ -2800,9 +2801,9 @@ Extends §11.
 - Assert `{name}_size` and `{name}_hash` prune and verify without materializing the payload.
 - Compact a blob-bearing offset range; assert byte-for-byte identity of every payload,
   alongside the existing row count and bounds checks.
-- Assert an external engine reads the archive's blob column with no library-specific logic.
+- Assert an external engine reads the published table's blob column with no library-specific logic.
 - Run a stream with a blob field declared but never populated; assert nulls throughout and no
-  staging files.
+  blob files.
 
 ---
 

@@ -1,12 +1,12 @@
 """Statistics manifests: one row of per-column bounds per unit, and pruning on them.
 
 A manifest is a Parquet table with one row per unit a reader might skip — a
-tier of one log in litelink (`local`, `archive`), a sealed log of a stream in
+tier of one log in litelink (`staging`, `published`), a sealed log of a stream in
 streamcast — and one struct column per prunable column:
 
-    tier     start_offset  end_offset  record_count  price                     side
-    local    3001          4001        1000          {min, max, null_count, …} {min, max, …}
-    archive  1             3001        3000          {min, max, null_count, …} {min, max, …}
+    tier       start_offset  end_offset  record_count  price                     side
+    staging    3001          4001        1000          {min, max, null_count, …} {min, max, …}
+    published  1             3001        3000          {min, max, null_count, …} {min, max, …}
 
 Named for Iceberg's own: an Iceberg manifest is per-file statistics for
 skipping files, and this is the same thing one level up. **Wide**, one struct

@@ -48,7 +48,7 @@ def filesystem(s3: S3Options):  # noqa: ANN201  — s3fs is an optional import
         "s3fs",
         reason=(
             "s3fs is missing — it is a dev dependency used by the test "
-            "fixtures, not by litelink. Run `uv sync`."
+            "fixtures, not by litelink. Run `uv publish`."
         ),
     )
 
@@ -65,7 +65,7 @@ def s3() -> S3Options:
 
     A connection error means no endpoint is running and the tier is untestable
     here; anything else is a real failure and must not be swallowed into a
-    skip, or a broken archive would look like an absent one.
+    skip, or a broken published table would look like an absent one.
     """
     resolved = options()
     fs = filesystem(resolved)
@@ -74,7 +74,7 @@ def s3() -> S3Options:
     except Exception as exc:  # noqa: BLE001
         if os.environ.get("LITELINK_REQUIRE_S3"):
             # CI sets this. A skip there is not a neutral outcome — it is ~91
-            # tests silently not running, which is how the archive tier went
+            # tests silently not running, which is how the published tier went
             # unchecked for the life of that workflow.
             pytest.fail(
                 f"LITELINK_REQUIRE_S3 is set but the endpoint at "

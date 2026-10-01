@@ -22,10 +22,10 @@ reader a half-finished state.
 append() ──► SQLite buffer          durable on commit
                    │  seal: sorted Parquet at target_seal_size
                    ▼
-             local Iceberg table    compacted to target size, evicted once archived
-                   │  sync: upload, register
+             staging Iceberg table  compacted to target size, evicted once published
+                   │  publish: upload, register
                    ▼
-             archive Iceberg table  full history, on S3
+             published Iceberg table  full history, on S3 or in a local directory
 
 scan() / sql() ──► one relation across all three tiers, each row once
 ```
@@ -52,8 +52,8 @@ routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
 
 The usual shape is a write path in one system and an analytical store in another, with a job
 copying between them. Here they are one log: rows land in the SQLite buffer, seal into a
-local Iceberg table, and are published to the log's one output — an Iceberg table on S3, or
-in a local directory for a log with no S3 archive. litelink reads across all three, so **no
+staging table, and are published to the log's one output — an Iceberg table on S3, or
+in a local directory for a log with no S3 published table. litelink reads across all three, so **no
 read on the hot path touches the network**. Everything else reads the published table with
 any Iceberg engine, through its `version-hint.text`, with no catalog and no litelink:
 
@@ -66,7 +66,7 @@ log = litelink.open("data", "trades")
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076})
 
-# Read on the same box, across the buffer and the local table.
+# Read on the same box, across the buffer and the staging table.
 log.sql("SELECT count(*), max(price) FROM log").read_all()
 
 # Read the published table with any Iceberg engine, and litelink not installed at all —
@@ -78,7 +78,7 @@ duckdb.sql("""
 """)
 ```
 
-The published table holds what `sync` has pushed, which trails the buffer by the sync
+The published table holds what `publish` has pushed, which trails the buffer by the publish
 interval; rows newer than that are readable through litelink on the writer's machine.
 
 ## How it works
@@ -117,36 +117,36 @@ That costs ~124 MB. Run `python -m litelink` to check a machine before you rely 
 ## API
 
 ```python
-litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
+litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
              s3=None, start_offset=1)                            -> WriteHandle
 litelink.open(root, name, *, s3=None)                              -> WriteHandle
 litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
-litelink.restore(root, name, *, archive, s3=None, ...)             -> WriteHandle
+litelink.restore(root, name, *, published, s3=None, ...)             -> WriteHandle
 litelink.validate_row(schema, row)                                 # raises as append would
 litelink.preflight(...)                                            # what python -m litelink runs
 
 # Every handle reads:
-    log.scan(*, columns=None, where=None, start_offset=None, end_offset=None, archive=True)
-    log.sql(query, *, archive=True)                 # the log is `log`; both stream Arrow
-    log.column_statistics(*, tier=None) · log.coverage(*, archive=True)   # tier: local|archive|buffer|None
-    log.end_offset() · buffered_rows() · table_rows() · table_files() · archived_through()
-    log.schema · sort_by · config · archive
+    log.scan(*, columns=None, where=None, start_offset=None, end_offset=None, published=True)
+    log.sql(query, *, published=True)                 # the log is `log`; both stream Arrow
+    log.column_statistics(*, tier=None) · log.coverage(*, published=True)   # tier: local|published|buffer|None
+    log.end_offset() · buffered_rows() · staging_rows() · staging_files() · published_through()
+    log.schema · sort_by · config · published
 
 # A WriteHandle also writes:
     log.append(row) -> int                          # durable on return
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
     log.ingest(table_or_reader)                     # Arrow straight to Parquet
     log.seal_due() · log.maintain()                 # seal; compact, evict, expire
-    log.sync(*, push_unsettled=False)               # push to the archive
-    log.retire()                                    # end the log: all archived, none local
-    log.set_config(...) · set_archive(...) · set_sort_by(..., rewrite=True)
+    log.publish(*, push_unsettled=False)               # push to the published table
+    log.retire()                                    # end the log: all published, none local
+    log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
 ```
 
 The deliberate choices:
 
 - **Handles, not logs.** A read handle has no write methods at all, rather than ones that
   raise, and `open(..., read_only=True)` is typed so misuse is caught before it runs.
-- **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and archive
+- **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
   live in the log, so nothing at the call site can disagree with what is on disk.
 - **The library owns no thread.** Nothing seals unless you call `seal_due()` or `maintain()`;
   your loop is the schedule.
@@ -187,30 +187,30 @@ return a `pa.RecordBatchReader` rather than a table, so materialising is yours t
 reader can open the same log alongside a live writer with
 `litelink.open("data", "trades", read_only=True)`.
 
-**litelink decides which tiers a query reads.** Every query reads the buffer and the local
-table; the archive is read only when some archived file below the local table could hold a
-matching row. That is decided from per-column bounds for each tier — the local table's from
-its own Iceberg manifests, the archive's kept in `buffer.db` — so the decision itself never
+**litelink decides which tiers a query reads.** Every query reads the buffer and the staging
+table; the published table is read only when some published file below the staging table could hold a
+matching row. That is decided from per-column bounds for each tier — the staging table's from
+its own Iceberg manifests, the published table's kept in `buffer.db` — so the decision itself never
 touches the network:
 
 ```python
 log.scan(where="event_ts > 1787772000000000")   # recent: local disk only
-log.scan(where="event_ts < 1700000000000000")   # history: reads the archive too
+log.scan(where="event_ts < 1700000000000000")   # history: reads the published table too
 log.scan()                                      # the whole log
-log.scan(archive=False)                         # local disk only, whatever it asks
+log.scan(published=False)                         # local disk only, whatever it asks
 ```
 
 So a query's latency follows its predicates. Bound it on a leading column of `sort_by` and a
 recent window stays local; leave it unbounded and it reads every tier, because the whole log
 is the right answer. Anything the decision cannot read — an OR, a subquery, a comparison with
-something other than a constant — reads the archive rather than risk skipping a row. The
+something other than a constant — reads the published table rather than risk skipping a row. The
 buffer keeps no column statistics, so only an offset bound (`scan(start_offset=…,
 end_offset=…)`) can skip it.
 `column_statistics(tier=…)` gives every column's bounds and counts without opening a data
-file, per tier (`"local"`, `"archive"` below it, `"buffer"`) or for the whole log.
+file, per tier (`"staging"`, `"published"` below it, `"buffer"`) or for the whole log.
 
-**`retire()` ends a log for good.** It pushes every row to the archive, empties the local
-table, and records the retirement by giving the buffer an end and marking the archive table.
+**`retire()` ends a log for good.** It pushes every row to the published table, empties the staging
+table, and records the retirement by giving the buffer an end and marking the published table.
 After that the log
 opens for reading only, and `append`, a writer `open` and `restore` all refuse, naming the
 offset the next log should start at.
@@ -218,7 +218,7 @@ offset the next log should start at.
 ## Reading from another machine
 
 litelink reads on the primary: every handle is on the host that holds the log's root. Off that
-host, the archive **is** the interface. It is an ordinary Iceberg table that publishes
+host, the published table **is** the interface. It is an ordinary Iceberg table that publishes
 `version-hint.text` at every commit, so an engine pointed at the prefix resolves the current
 metadata itself. No catalog service, no local root, no litelink install:
 
@@ -235,7 +235,7 @@ table = con.execute("""
 """).arrow().read_all()
 ```
 
-Point it at the table DIRECTORY — `<archive>/<name>` — not at a metadata JSON.
+Point it at the table DIRECTORY — `<published>/<name>` — not at a metadata JSON.
 **`version_name_format` is not optional**: DuckDB defaults to the Hadoop `v%s%s.metadata.json`
 while pyiceberg names its metadata `00003-<uuid>.metadata.json`, so the format has to stop
 prepending the `v`. `credential_chain` is the ordinary AWS resolution — profile, instance
@@ -244,13 +244,13 @@ metadata, SSO; against another endpoint pass `KEY_ID`, `SECRET`, `ENDPOINT` and
 and `httpfs` when a query names them, and `just bootstrap` provisions them ahead of time so the
 first read is not a download.
 
-It reads what the archive holds, which on a quiet stream can lag the writer indefinitely
-rather than by the sync interval, because `sync` holds back a trailing run under
-`target_compact_size`. Rows still in the primary's buffer or local table are only readable on
+It reads what the published table holds, which on a quiet stream can lag the writer indefinitely
+rather than by the publish interval, because `publish` holds back a trailing run under
+`target_compact_size`. Rows still in the primary's buffer or staging table are only readable on
 the primary.
 
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
-asks for what came after — which is how you poll the archive as it grows.
+asks for what came after — which is how you poll the published table as it grows.
 
 ## Versioned data
 
@@ -272,14 +272,14 @@ ones at compaction, and there is no index, so that query is a scan.
 just demo-websocket    # a live public feed, one process, ~30 seconds
 just demo-capture      # a synthetic feed, driven as hard as you like
 just demo-maintain     # in another terminal: seal, compact, evict, expire
-just rustfs            # object storage in a container, to add the archive tier
+just rustfs            # object storage in a container, to add the published tier
 just demo-replicate    # ship the SQLite WAL, to survive losing the machine
 ```
 
 Clone the repo for these; `just bootstrap` sets up the toolchain. Credentials are never
 written to the log directory — the library reads them from the environment through the
 ordinary AWS chain, so a profile, instance metadata or SSO all work untouched.
-`litelink.restore(root, name, archive=...)` rebuilds a log on another box, reserving an offset
+`litelink.restore(root, name, published=...)` rebuilds a log on another box, reserving an offset
 window so nothing the dead machine served is reissued.
 
 litelink emits the litestream config; your supervisor runs the binary. Full walkthrough in
@@ -287,15 +287,15 @@ litelink emits the litestream config; your supervisor runs the binary. Full walk
 
 ## On disk
 
-One directory per stream, holding everything that stream owns — and the archive prefix
+One directory per stream, holding everything that stream owns — and the published prefix
 mirrors it, so a stream can be copied, replicated or deleted whole in either tier:
 
 ```
 data/trades/                     s3://bucket/prefix/trades/
     buffer.db                        _wal/
     catalog.db                           buffer.db/
-    archive.db                           catalog.db/
-    litestream.yml                       archive.db/
+    published.db                         catalog.db/
+    litestream.yml                       published.db/
     data/                            data/
         *.parquet                        *.parquet
         compacted/*.parquet              compacted/*.parquet
@@ -322,10 +322,10 @@ Upgrading a log written by 0.1.0: see [Migrating from 0.1](docs/RUNTIME.md#migra
 
 - **Not a schema that changes.** A log keeps the schema it was created with. To change it,
   `retire()` the log and start a new one where it ended:
-  `new(root, "trades-v2", schema=…, archive=…, start_offset=old.end_offset())`. Offsets stay
-  dense across the two, and any engine reads both archives as one sequence.
+  `new(root, "trades-v2", schema=…, published=…, start_offset=old.end_offset())`. Offsets stay
+  dense across the two, and any engine reads both published tables as one sequence.
 
-- **Not an unbounded local archive.** A seal's cost tracks what the table's metadata holds, so
+- **Not an unbounded staging table.** A seal's cost tracks what the table's metadata holds, so
   a log that never runs `maintain()` and never evicts gets slower on the write path over time.
   `maintain()` arrests the larger factor; a retention bounds the rest. Numbers and the
   reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
