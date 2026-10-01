@@ -1,6 +1,6 @@
 [project]
 name = "litelink"
-version = "0.6.0"
+version = "0.6.1"
 description = "An embedded Iceberg storage engine for append-only data."
 readme = "README.md"
 authors = [
