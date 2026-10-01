@@ -302,9 +302,6 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
 
 ## What it is not
 
-- **Not a key-value store.** It is a local, in-process analytics store: rows are queryable
-  sub-second after a durable append, and fresh is what "real-time" means here.
-
 - **Not a mutable store.** Rows are only appended, never updated or deleted in place, and a
   log's schema is fixed when it is created. To change the schema, `retire()` the log and start
   a new one where it ended: `new(root, "trades-v2", schema=…, start_offset=old.end_offset())`.
