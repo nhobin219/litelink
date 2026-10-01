@@ -252,20 +252,6 @@ the primary.
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
 asks for what came after — which is how you poll the published table as it grows.
 
-## Versioned data
-
-A log can also hold versioned data the way many databases' storage does: append every version
-of a record, and a delete as a tombstone, and `litelink_offset` (monotonic and never reused)
-orders them, so the current state is one query:
-
-```sql
-SELECT * FROM log
-QUALIFY row_number() OVER (PARTITION BY account ORDER BY "litelink_offset" DESC) = 1
-```
-
-What it doesn't do is the rest of MVCC. Nothing merges versions on read or drops superseded
-ones at compaction, and there is no index, so that query is a scan.
-
 ## Demos and recovery
 
 ```bash
@@ -316,17 +302,13 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
 
 ## What it is not
 
-- **Not an OLTP or key-value store.** It is append-only, with no update or delete, and a point
-  lookup is ~1,600x slower than an indexed row store, because there is no index to look up: a
-  lookup scans, pruned only by min/max statistics, which are tight on `sort_by`'s leading column
-  and loose elsewhere. Indexes are [not implemented yet](#not-implemented-yet). It is a local,
-  in-process, real-time analytics store: freshness is sub-second *with* durability, but
-  "real-time" means fresh, not point-lookup fast.
+- **Not a key-value store.** It is a local, in-process analytics store: rows are queryable
+  sub-second after a durable append, and fresh is what "real-time" means here.
 
-- **Not a schema that changes.** A log keeps the schema it was created with. To change it,
-  `retire()` the log and start a new one where it ended:
-  `new(root, "trades-v2", schema=…, published=…, start_offset=old.end_offset())`. Offsets stay
-  dense across the two, and any engine reads both published tables as one sequence.
+- **Not a mutable store.** Rows are only appended, never updated or deleted in place, and a
+  log's schema is fixed when it is created. To change the schema, `retire()` the log and start
+  a new one where it ended: `new(root, "trades-v2", schema=…, start_offset=old.end_offset())`.
+  Offsets stay dense across the two, and any engine reads both as one sequence.
 
 - **Not an unbounded staging table.** A seal's cost tracks what the table's metadata holds, so
   a log that never runs `maintain()` and never evicts gets slower on the write path over time.
@@ -342,8 +324,6 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
 - **Blob fields** — large payloads that bypass the buffer — are specified and unbuilt;
   `binary` columns are carried, for ids and other small values rather than payloads
   ([SPEC](docs/SPEC.md) §15).
-
-- **Payload encoding and local-disk backpressure** are open ([SPEC](docs/SPEC.md) §13).
 
 ## Documentation
 

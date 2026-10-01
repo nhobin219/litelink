@@ -211,7 +211,7 @@ def test_an_unprovisioned_extension_names_the_command_that_fixes_it(
     assert "per DuckDB version and platform" in message
 
     # `remote=True` earns its keep by saying who can ignore this.
-    assert "Only the published tier needs this" in message
+    assert "Only an S3 published table needs this" in message
     # DuckDB's own error is kept as the cause rather than swallowed: it names
     # the exact path that was searched, which is the only way to tell a missing
     # extension from one installed under a different HOME.
