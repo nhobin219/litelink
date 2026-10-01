@@ -341,37 +341,6 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
         assert reopened.sort_by == ("key",), "the new order must survive a reopen"
 
 
-def test_the_reserved_column_is_refused_at_schema_change_time(tmp_path: Path) -> None:
-    """I11 has two doors, not one.
-
-    `validate` covers creation. A schema change is the other way a caller could
-    introduce or retire the library's column, and monotonicity and non-reuse
-    cannot be enforced on a column the application controls.
-    """
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="litelink_offset"):
-            log.add_column("litelink_offset", pa.int64())
-
-        with pytest.raises(ValueError, match="litelink_offset"):
-            log.rename_column("event_ts", "litelink_offset", breaking_ok=True)
-
-        with pytest.raises(ValueError, match="litelink_offset"):
-            log.drop_column("litelink_offset", breaking_ok=True)
-
-        # An ordinary column reaches the body — `add_column` is implemented,
-        # so the refusal above is I11 and not the stub. The other two are
-        # still unimplemented: both are BREAKING for consumers (I10).
-        log.add_column("extra", pa.int64())
-
-        assert "extra" in log._buffer.shape().columns
-
-        with pytest.raises(NotImplementedError):
-            log.rename_column("key", "renamed", breaking_ok=True)
-
-        with pytest.raises(NotImplementedError):
-            log.drop_column("key", breaking_ok=True)
-
-
 def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
     """Why it is not called `offset`.
 
@@ -1534,3 +1503,49 @@ def test_maintain_reclaims_only_when_the_ratio_is_set(
         log.maintain()
 
         assert calls == [0.25], "the configured ratio did not reach the reclaim"
+
+
+# -- immutable logs (#93) -------------------------------------------------------
+
+
+def test_a_log_has_no_way_to_change_its_schema() -> None:
+    """A log's schema is fixed at creation (§9): to change it, start a new log.
+
+    Absent rather than refusing, so a caller finds out from a type checker.
+    """
+    for gone in ("add_column", "rename_column", "drop_column"):
+        assert not hasattr(WriteHandle, gone), f"WriteHandle still has {gone}"
+
+
+def test_a_log_an_older_release_left_mid_add_column_is_refused(tmp_path: Path) -> None:
+    """The change cannot be finished here, so the refusal says where it can be.
+
+    An `add_column` interrupted under 0.5 leaves its intent in `meta`; this
+    release has no schema changes to finish it with, and opening the log
+    anyway would serve it under a schema the table may not agree with.
+
+    Falsify by removing the intent check from `_declared_schema`: the log
+    opens as though nothing were outstanding.
+    """
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        log._buffer.set_meta(  # noqa: SLF001
+            "schema_intent", json.dumps({"add": "late", "type": "00"})
+        )
+
+    with pytest.raises(ValueError, match=r"older release.*litelink 0\.5\.1"):
+        litelink.open(tmp_path, "s")
+
+
+def test_a_pre_02_log_names_the_release_that_can_migrate_it(tmp_path: Path) -> None:
+    """The 0.1 migration is gone from this release; the refusal points at the
+    last one that carries it, and at the command to run there.
+
+    Falsify by restoring the old message, which named a `litelink.migrate`
+    this release no longer has.
+    """
+    layout = Layout(tmp_path, "s")
+    layout.legacy_catalog_db.parent.mkdir(parents=True, exist_ok=True)
+    layout.legacy_catalog_db.touch()
+
+    with pytest.raises(FileNotFoundError, match=r"(?s)litelink 0\.5\.1.*--apply"):
+        litelink.open(tmp_path, "s")

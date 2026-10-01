@@ -74,25 +74,23 @@ range claimed skips it and finds the work still there next pass.
 
 ## Migrating from 0.1
 
-0.1.0 put `catalog.db` and `archive.db` at the root, shared
-by every stream, and Iceberg metadata under `<root>/litelink/<name>/metadata` — outside the
-data it described. `open` detects the old tree and names the fix:
+0.1.0 put `catalog.db` and `archive.db` at the root, shared by every stream, and Iceberg
+metadata under `<root>/litelink/<name>/metadata` — outside the data it described. `open`
+detects the old tree and refuses it.
+
+**The migration ships with litelink 0.5.1 and no later release** (#93). Run it with 0.5.1, then
+open the log with the current one:
 
 ```bash
+pip install 'litelink==0.5.1'
 python -m litelink.migrate --root ./data --name trades              # dry run
 python -m litelink.migrate --root ./data --name trades --apply
 ```
 
-Data files are not touched or rewritten; only pointers move. Pass `--archive s3://...` to
-move the archive's metadata too, then restart the sidecar so it replicates to the new
-`<prefix>/<name>/_wal` before dropping the old one with `--drop-legacy-wal`.
-
-A root holding several streams migrates one at a time. `catalog.db`, `archive.db`,
-`litestream.yml` and `<prefix>/_wal` are shared until the last stream has moved — leave the
-old sidecar running until then, since it is still replicating the streams that have not.
-`--drop-legacy-wal` is run once per stream and refuses until every stream in the root has
-migrated and a fresh replica has landed — that old replica holds the only off-box copy of
-unsealed rows, which are in no Parquet file and no archive manifest.
+Data files are not touched or rewritten; only pointers move. 0.5.1's
+[RUNTIME.md](https://github.com/nhobin219/litelink/blob/v0.5.1/docs/RUNTIME.md#migrating-from-01)
+covers moving the archive's metadata, the shared WAL replica, and roots holding several
+streams.
 
 ## End to end
 

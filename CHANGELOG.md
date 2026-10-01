@@ -36,6 +36,15 @@ minor version carries breaking changes.
   `tier="buffer"` completes them, so `"local"` + `"archive"` + `"buffer"` is
   `tier=None`. For the whole log, use `tier=None`. A log with nothing local
   (retired, or evicted dry) still gets the whole archive from `"archive"`.
+- **Logs are immutable: `add_column`, `rename_column` and `drop_column` are
+  removed** (#93). A log keeps the schema it was created with; to change it,
+  `retire()` the log and `new()` one at `start_offset=old.end_offset()` under
+  a new name. A log a 0.5 release widened stays readable. One a 0.5 release
+  left mid-`add_column` is refused, naming 0.5.1 as the release to finish it
+  with.
+- **The 0.1 → 0.2 migration is removed** (`litelink.migrate`). A log still in
+  the pre-0.2 layout is refused with the command to run under litelink 0.5.1,
+  the last release that carries it.
 - **Regenerate the litestream config** (`write_replication_config()`) and
   restart the sidecar: it now enables the control socket `retire()` flushes
   the replica through.

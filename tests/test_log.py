@@ -359,7 +359,6 @@ def test_a_reader_has_no_mutation_to_refuse(tmp_path: Path) -> None:
             "set_config",
             "set_sort_by",
             "set_archive",
-            "add_column",
             "recover",
         ):
             assert not hasattr(reader, absent), f"a reader exposes {absent}"
@@ -816,39 +815,6 @@ def test_append_refuses_a_string_that_sqlite_would_convert(
                 log.append(row)
 
         assert log.end_offset() == 1
-
-
-def test_a_column_added_later_is_validated_like_any_other(
-    tmp_path: Path,
-) -> None:
-    """`ALTER TABLE ADD COLUMN` must carry the same DDL as `CREATE TABLE`.
-
-    It did not, and `_create` is `CREATE TABLE IF NOT EXISTS`, so the gap
-    survived every reopen: a column added by `add_column` was unvalidated for
-    the life of the log. An int32 given 2**40 was stored, `append` returned an
-    offset, and then every scan AND every seal raised for ever while appends
-    kept succeeding — the buffer could never drain.
-
-    Falsify by building the ALTER from the affinity alone: all three rows
-    below are accepted, and the seal at the end raises `ArrowInvalid`.
-    """
-    log = litelink.new(tmp_path, "s", schema=TYPED)
-    with log:
-        log.extend([{"event_ts": i} for i in range(5)])
-        log.add_column("late", pa.int32())
-
-        for row in (
-            {"event_ts": 9, "late": 2**40},
-            {"event_ts": 9, "late": "5"},
-            {"event_ts": 9, "late": 1.5},
-        ):
-            with pytest.raises(ValueError, match="wrong type|cannot hold"):
-                log.append(row)
-
-        log.append({"event_ts": 9, "late": 7})
-        log.seal()
-
-        assert log.scan().read_all().num_rows == 6
 
 
 def test_append_refuses_an_integer_a_float_column_cannot_hold(

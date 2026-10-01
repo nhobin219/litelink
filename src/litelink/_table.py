@@ -734,9 +734,10 @@ class LogTable:
             # catalog gets, which is the safe direction.
             msg = (
                 f"the log at {layout.root}/{layout.name} uses the pre-0.2 "
-                f"layout, whose catalogs sit at the root. Move it with:\n"
-                f"  python -m litelink.migrate --root {layout.root} "
-                f"--name {layout.name}"
+                f"layout, whose catalogs sit at the root. Migrate it with "
+                f"litelink 0.5.1 (`python -m litelink.migrate --root "
+                f"{layout.root} --name {layout.name} --apply`), the last release "
+                f"that carries the migration"
             )
             raise LookupError(msg)
 
@@ -791,28 +792,6 @@ class LogTable:
         that `meta` rather than this declaration is what `open` reads.
         """
         self._commit(lambda: self._apply_sort_order(sort_by))
-
-    def add_column(self, schema: pa.Schema) -> None:
-        """Widen this table to `schema`, which must be a SUPERSET of its own.
-
-        `union_by_name` rather than `update_schema().add_column`, and the
-        difference is the whole crash story. Recovery replays this step by
-        probing the table, and a probe cannot be made atomic with the commit
-        it checks — so the replay must be safe to run against a table where it
-        has ALREADY landed. `union_by_name` is a no-op there; `add_column`
-        raises `Cannot add column, name already exists` and, because
-        `recover()` is unguarded in `open`, would leave the log unopenable by
-        every writer while a read-only handle kept working.
-
-        It stays strict where it matters: a column whose type genuinely
-        conflicts is refused with `ValidationError: Cannot change column
-        type`, verified against a live table.
-        """
-        self._commit(lambda: self._apply_union(schema))
-
-    def _apply_union(self, schema: pa.Schema) -> None:
-        with self._table.update_schema() as update:
-            update.union_by_name(schema)
 
     def _apply_sort_order(self, sort_by: Sequence[str]) -> None:
         with self._table.update_sort_order() as update:

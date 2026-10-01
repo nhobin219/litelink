@@ -49,11 +49,6 @@ OFFSET = "litelink_offset"
 # could not read it without importing the module that names it.
 SCHEMA_KEY = "arrow_schema"
 
-# Where a schema change records what it set out to do, before it does any of
-# it (I16). Cleared only when the change is complete — §9: a schema change is
-# finished when SQLite says so, not when Iceberg does.
-INTENT_KEY = "schema_intent"
-
 # Where a log records the offset it was created to start at, or nothing if it
 # started at 1. Durable because a future backfill needs to tell the RESERVE
 # below it — deliberate, empty, safe to fill — from a `litelink.restore` fence,
@@ -827,39 +822,6 @@ class Buffer:
     # across #84's grid of row shapes — see `_measurer`. It is a policy
     # trigger and compaction's sense of how full a file is, so an undercount
     # is the harmful direction: it seals files past the target.
-
-    def table_columns(self) -> tuple[str, ...]:
-        """The buffer table's ACTUAL columns, asked of SQLite.
-
-        The probe recovery settles step 6 with. `_create` is
-        `CREATE TABLE IF NOT EXISTS`, so a reopened buffer keeps whatever
-        columns it already had — the declared schema saying otherwise proves
-        nothing about this table.
-        """
-        with self._lock:
-            rows = self._con.execute("PRAGMA table_info(buffer)").fetchall()
-
-        return tuple(str(r[1]) for r in rows)
-
-    def add_table_column(self, name: str, type_: pa.DataType) -> None:
-        """Widen the buffer table. Idempotent, like every step of a change.
-
-        SQLite cannot add a NOT NULL column without a default, which is not a
-        limitation here but the same rule Iceberg enforces: rows that predate
-        the column have no value for it, so it must be nullable. `add_column`
-        refuses a non-nullable field before reaching this.
-        """
-        if name in self.table_columns():
-            return
-
-        # The SAME DDL a column created with the table gets. Building this
-        # from the affinity alone left every column added by `add_column`
-        # with no constraints at all — unvalidated for the life of the log,
-        # since `_create` is `CREATE TABLE IF NOT EXISTS` and never revisits
-        # it. `ALTER TABLE ADD COLUMN` accepts a CHECK, and it fires.
-        ddl = _column_ddl(name, pa.field(name, type_))
-        with self._lock:
-            self._con.execute(f"ALTER TABLE buffer ADD COLUMN {ddl}")
 
     def _seed_group(self) -> None:
         """Ensure exactly one open group, seeded from whatever is buffered.
