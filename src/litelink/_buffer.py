@@ -45,7 +45,7 @@ OFFSET = "litelink_offset"
 
 # Where the log records its declared schema. Beside `CONFIG_KEY` and for the
 # same reason: this object owns `meta`, and `meta` is the one place the schema
-# exists. It used to live in `log.py`, which meant the module that OWNS the row
+# exists. It used to live in `_handle.py`, which meant the module that OWNS the row
 # could not read it without importing the module that names it.
 SCHEMA_KEY = "arrow_schema"
 
@@ -353,7 +353,7 @@ class Shape:
     def table(self) -> pa.Schema:
         """The caller's columns with `offset` in front — the TABLE's schema.
 
-        Here rather than in `log.py` so the published table can ask the buffer for it
+        Here rather than in `_handle.py` so the published table can ask the buffer for it
         without importing the module that owns the log. It is the shape
         `create_table` is handed, and a published table born from a stale copy of it
         is the one holder that cannot be repaired afterwards: nothing in

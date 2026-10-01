@@ -14,10 +14,10 @@ from pyiceberg.catalog.sql import SqlCatalog
 import litelink
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import COMPACT_MULTIPLE
+from litelink._handle import LogConfig, WriteHandle, validate
 from litelink._layout import Layout
 from litelink._maintenance import _covered, runs, stable_prefix
 from litelink._table import DataFile
-from litelink.log import LogConfig, WriteHandle, validate
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
 

@@ -1,6 +1,6 @@
 """Building logs and readers.
 
-`log.py` owns what the handles *do*; this module owns how they come to exist.
+`_handle.py` owns what the handles *do*; this module owns how they come to exist.
 
 Every factory here builds its object's collaborators and hands them over
 complete. `open` builds a writer or, with `read_only=True`, a reader on the same
@@ -20,12 +20,7 @@ from litelink._buffer import (
     CONFIG_KEY,
     Buffer,
 )
-from litelink._layout import Layout
-from litelink._maintenance import Maintenance
-from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import Reader, duckdb_connection
-from litelink._table import LogTable
-from litelink.log import (
+from litelink._handle import (
     LocalReadHandle,
     LogConfig,
     LogHandle,
@@ -34,6 +29,11 @@ from litelink.log import (
     application_schema,
     legacy_layout,
 )
+from litelink._layout import Layout
+from litelink._maintenance import Maintenance
+from litelink._published import PUBLISHED_KEY, Published
+from litelink._read import Reader, duckdb_connection
+from litelink._table import LogTable
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

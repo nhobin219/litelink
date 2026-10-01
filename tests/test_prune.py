@@ -19,11 +19,11 @@ import pyarrow as pa
 import pytest
 
 import litelink
+from litelink import OFFSET, LogHandle
 from litelink._layout import Layout
 from litelink._prune import terms
 from litelink._read import Reader
 from litelink._tiers import PublishedTier, Stored
-from litelink.log import OFFSET, LogHandle
 from litelink.manifest import build, prune
 from tests.test_manifest import row
 from tests.test_publish import ROWS, published_log, rows

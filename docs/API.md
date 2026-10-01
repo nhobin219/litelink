@@ -107,6 +107,11 @@ rather than only watching, and a reader could only watch.
 
 Most deployments use six: `new`/`open`, `extend`, `scan`, `seal_due`, `maintain`, `publish`.
 
+**Import everything from `litelink`.** The package root and `litelink.manifest` are the
+public modules; every other module is private (`_handle`, `_buffer`, …). `litelink.OFFSET` is
+the name of the one column litelink owns, `"litelink_offset"`, for code that bounds or reads it
+without spelling the string.
+
 **Every offset range litelink reports is half-open, `[start, end)`**: `coverage()`,
 `staging_extent()`, what `ingest()` returns, `recovery().skipped`, the tier offsets
 `litelink.manifest` prunes on. `end` is the offset after the last one, so a range's length is

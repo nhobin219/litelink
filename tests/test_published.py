@@ -17,11 +17,10 @@ import duckdb
 import pytest
 
 import litelink
-from litelink import LogConfig, RetiredError, WriteHandle
+from litelink import OFFSET, LogConfig, RetiredError, WriteHandle
 from litelink._layout import Layout
 from litelink._read import Reader
 from litelink._table import VERSION_HINT
-from litelink.log import OFFSET
 from tests.test_publish import ROWS, SCHEMA, rows
 
 
@@ -307,8 +306,8 @@ def test_restating_the_published_table_takes_no_claim_and_opens_nothing(
     Falsify by removing the early return in `set_published`: the refused claim
     raises.
     """
+    from litelink._handle import WriteHandle as Handle
     from litelink._table import LogTable
-    from litelink.log import WriteHandle as Handle
 
     def refuse(*_: object, **__: object) -> None:
         msg = "a restatement must not claim or open anything"

@@ -38,10 +38,8 @@ from importlib.metadata import PackageNotFoundError, version
 from litelink import manifest
 from litelink._assembly import new, open, restore  # noqa: A004
 from litelink._buffer import RetiredError
-from litelink._preflight import Check, Report, preflight
-from litelink._s3 import S3Options
-from litelink._statistics import ColumnStatistics, Tier, TierStatistics
-from litelink.log import (
+from litelink._handle import (
+    OFFSET,
     Coverage,
     LocalReadHandle,
     LogConfig,
@@ -50,6 +48,9 @@ from litelink.log import (
     WriteHandle,
     validate_row,
 )
+from litelink._preflight import Check, Report, preflight
+from litelink._s3 import S3Options
+from litelink._statistics import ColumnStatistics, Tier, TierStatistics
 
 try:
     __version__ = version("litelink")
@@ -57,6 +58,7 @@ except PackageNotFoundError:  # a source tree that was never installed
     __version__ = "0.0.0"
 
 __all__ = [
+    "OFFSET",
     "Check",
     "ColumnStatistics",
     "Coverage",

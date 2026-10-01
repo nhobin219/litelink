@@ -21,8 +21,8 @@ import pytest
 import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._claim import Claim, new_owner
+from litelink._handle import EVERYTHING
 from litelink._layout import Layout
-from litelink.log import EVERYTHING
 
 if TYPE_CHECKING:
     from pathlib import Path

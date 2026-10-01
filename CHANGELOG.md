@@ -66,6 +66,10 @@ minor version carries breaking changes.
   `"published"` + `"buffer"` is `tier=None`. For the whole log, use
   `tier=None`. A log with nothing in staging (retired, or evicted dry) still
   gets the whole published table from `"published"`.
+- **`litelink.log` is now private (`litelink._handle`).** Everything public is
+  exported from `litelink` itself, and `litelink.manifest` stays public. The
+  one name callers took from `litelink.log`, `OFFSET`, is now `litelink.OFFSET`:
+  `from litelink import OFFSET`.
 - **Every offset range litelink reports is half-open, `[start, end)`**, the
   convention its stored tier offsets and `litelink.manifest` already used:
   `coverage()`, `staging_extent()` (was `table_extent()`), and

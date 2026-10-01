@@ -24,6 +24,7 @@ import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._buffer import SORT_KEY, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
+from litelink._handle import table_schema, validate
 from litelink._layout import Layout, validate_published
 from litelink._maintenance import Maintenance
 from litelink._published import Published
@@ -31,7 +32,6 @@ from litelink._read import Reader, duckdb_connection, secret_sql
 from litelink._replication import WAL_PREFIX
 from litelink._s3 import S3Options
 from litelink._table import LogTable
-from litelink.log import table_schema, validate
 
 if TYPE_CHECKING:
     import json

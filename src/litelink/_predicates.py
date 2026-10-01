@@ -1,7 +1,7 @@
 """Offset predicates for the Iceberg maintenance passes.
 
 Isolated in their own module so the `ty` suppression in pyproject.toml covers
-these five lines rather than the whole of log.py. pyiceberg's
+these five lines rather than the whole of _handle.py. pyiceberg's
 `LiteralPredicate.__init__` accepts `(term, literal)` at runtime — verified —
 but ty resolves a different `__init__` through the expression hierarchy and
 reports every construction as missing arguments.

@@ -77,8 +77,8 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
 
     Two names failed this. `S3Options` appears in the signatures of `new`,
     `open`, `restore` and `replication_config_for`, and reaching it meant
-    `from litelink.log import S3Options` — an import that works because
-    `log.py` happens to import the name, rather than an interface. `Row` was
+    `from litelink._handle import S3Options` — an import that works because
+    `_handle.py` happens to import the name, rather than an interface. `Row` was
     worse: an alias under `if TYPE_CHECKING`, named by `append` and `extend`
     and importable from nowhere at all, because it existed to a type checker
     and to nothing else.
@@ -91,7 +91,7 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
     got wrong. It read runtime namespaces, and `inspect.isclass` over an
     imported module cannot see a `TYPE_CHECKING` alias at all — so the check
     passed over `Row` while claiming to cover exactly it. Parsing also lets the
-    annotations stay source text, which they have to: `log.py` keeps its typing
+    annotations stay source text, which they have to: `_handle.py` keeps its typing
     imports under `TYPE_CHECKING`, so resolving them at runtime fails on names
     that were never imported.
 
@@ -162,3 +162,26 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
         f"public parameters name types that are not importable from litelink: "
         f"{ {call: sorted(types) for call, types in leaked.items()} }"
     )
+
+
+def test_only_the_root_and_the_manifest_are_public_modules() -> None:
+    """Everything else is private, and the root exports what callers need.
+
+    `litelink.log` was importable for no reason but its name, and streamcast
+    reached into it for `OFFSET` — so making it private meant exporting that
+    first. Pinned so a new module cannot quietly become API.
+
+    Falsify by renaming `_handle.py` back to `log.py`: a public module appears.
+    """
+    import pkgutil
+
+    import litelink
+
+    public = {
+        name
+        for _, name, _ in pkgutil.iter_modules(litelink.__path__)
+        if not name.startswith("_")
+    }
+    assert public == {"manifest"}
+    assert litelink.OFFSET == "litelink_offset"
+    assert "OFFSET" in litelink.__all__
