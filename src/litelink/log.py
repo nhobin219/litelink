@@ -36,7 +36,6 @@ from pyiceberg.exceptions import TableAlreadyExistsError
 from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import (
     INTENT_KEY,
-    RETIRED_KEY,
     SCHEMA_KEY,
     SORT_KEY,
     START_OFFSET_KEY,
@@ -78,7 +77,9 @@ from litelink._table import (
     archive_retired,
     forget_archive_entry,
 )
+from litelink._tiers import UNKNOWN as UNKNOWN_TIER
 from litelink._tiers import ArchiveTier, empty
+from litelink._tiers import encode as encode_tier
 from litelink._types import NON_FINITE, column_type, validate_schema
 
 if TYPE_CHECKING:
@@ -351,7 +352,7 @@ def _foreign_archive(archive: str) -> ValueError:
 
 
 def _now() -> str:
-    """A timestamp for a marker a person will read."""
+    """A timestamp a person will read."""
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
@@ -1131,9 +1132,11 @@ class WriteHandle(LocalReadHandle):
         # trace once the sequence has moved, and the recovered count is
         # indistinguishable from ordinary buffered rows a second later.
         self._restored_from: _Recovery | None = None
-        # The tier manifest (#90): the archive's row, which eviction widens
-        # and a rollup under the whole-log claim replaces.
+        # The tier rows (#90): the archive's, which eviction widens and a
+        # rollup under the whole-log claim replaces, and the local one this
+        # handle stores after each commit it makes to the local table.
         self._tiers = ArchiveTier(buffer)
+        table.after_commit = self._store_local_statistics
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: Log mutating several
         # objects at once, in `set_config`, `set_archive` and `set_sort_by`,
@@ -1719,12 +1722,13 @@ class WriteHandle(LocalReadHandle):
         # republishes the hint over it, destroying the pointer this recovery
         # depends on. Dropped so adoption is the only path.
         # Retired logs are not taken over. Both records are asked, because each
-        # can be missing where the other is not: the replica's marker ships
+        # can be missing where the other is not: the replica's closed buffer
+        # ships
         # only when the sidecar does, and a log retired before the archive
         # property existed has only the marker.
-        marker = Buffer.peek_meta(layout.buffer_db, RETIRED_KEY)
+        marker = Buffer.peek_retired(layout.buffer_db)
         if marker is not None:
-            raise RetiredError.of(json.loads(marker), name)
+            raise RetiredError.of(marker, name)
 
         recorded_retirement = archive_retired(layout, archive, options)
         if recorded_retirement is not None:
@@ -3923,6 +3927,24 @@ class WriteHandle(LocalReadHandle):
         if not self._discard_on_seal():
             self._buffer.release_archived(last.hi)
 
+    def _store_local_statistics(self) -> None:
+        """Store the rollup of the local table's current version, for everyone.
+
+        Run after each local commit this process makes. The rollup is 2–3 ms
+        (measured at 1–64 files), paid once here rather than once per process
+        that queries the new version. Stamped with the version and written
+        forward only — see `Buffer.store_local_statistics`.
+        """
+        location, extent = self._table.snapshot()
+        statistics = self._table.statistics_at(location)
+        if statistics is None:
+            return
+
+        offsets = (0, 0) if extent is None else (extent[0], extent[1] + 1)
+        self._buffer.store_local_statistics(
+            location, offsets, encode_tier(self._buffer.shape().table, statistics)
+        )
+
     def _record_archive_row(self, archive: LogTable) -> None:
         """The archive's tier row, exactly, from its manifests.
 
@@ -4161,16 +4183,23 @@ class WriteHandle(LocalReadHandle):
         Steps, each safe to re-run — a crash leaves the log `retiring`, and
         calling this again finishes it:
 
-        1. mark it retiring in `meta`, and flush the WAL replica. From this
-           commit no append lands (the buffer's trigger), so nothing can
-           arrive after the final push;
+        1. give the buffer an end — the offset the next append would have
+           taken — and flush the WAL replica. From this commit no append lands
+           (the buffer's trigger keys on that end), so nothing can arrive after
+           the final push;
         2. seal everything buffered;
         3. `sync(push_unsettled=True)`, which also releases the rows a
            `wal_replication` seal was holding;
         4. evict the whole local table, and check nothing is left local;
         5. record the retirement on the archive table (`litelink.retired`), so
            `restore` refuses whatever a replica says;
-        6. mark it retired in `meta`, and flush the WAL replica again.
+        6. narrow the buffer's range to `[end, end)`, empty, and flush the WAL
+           replica again. That empty range is what reads as `retired` rather
+           than `retiring`, and what lets every read skip the buffer.
+
+        One fact records it, not a separate marker: a buffer with an end is a
+        log that takes no more rows. `retired()` derives the state from it, and
+        `restore` finds it in the replica.
 
         Needs an archive: emptying the local table of a local-only log would
         delete the only copy.
@@ -4192,12 +4221,10 @@ class WriteHandle(LocalReadHandle):
         if marker is not None and marker.get("state") == "retired":
             return
 
-        archive_uri = self._archive.uri
-        if marker is None:
-            self._buffer.set_meta(
-                RETIRED_KEY, json.dumps({"state": "retiring", "at": _now()})
-            )
-
+        # Step 1: the buffer gets an end, which is what refuses every append
+        # from here on (its trigger). A no-op when resuming.
+        schema = self._buffer.shape().table
+        self._buffer.close_buffer(encode_tier(schema, UNKNOWN_TIER))
         self._flush_replica()
 
         while self.buffered_rows():
@@ -4221,26 +4248,18 @@ class WriteHandle(LocalReadHandle):
         archive.reload()
         covered = archive.extent()
         through = None if covered is None else covered[1]
-        at = _now()
         claim = self._claim_settings()
         try:
             archive.set_properties(
-                {RETIRED_PROPERTY: json.dumps({"through": through, "at": at})}
+                {RETIRED_PROPERTY: json.dumps({"through": through, "at": _now()})}
             )
         finally:
             claim.release()
 
-        self._buffer.set_meta(
-            RETIRED_KEY,
-            json.dumps(
-                {
-                    "state": "retired",
-                    "at": at,
-                    "through": through,
-                    "archive": archive_uri,
-                }
-            ),
-        )
+        # Last: the buffer's range narrowed to `[end, end)` with a record count
+        # of 0 — which is what makes the log read as retired rather than
+        # retiring, and lets every read skip the buffer without reading it.
+        self._buffer.empty_buffer_range(encode_tier(schema, empty(schema)))
         self._flush_replica()
 
     def _flush_replica(self) -> None:

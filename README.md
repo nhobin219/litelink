@@ -204,7 +204,8 @@ something other than a constant — reads the archive rather than risk skipping 
 file, per tier (`"local"`, `"archive"` below it, `"buffer"`) or for the whole log.
 
 **`retire()` ends a log for good.** It pushes every row to the archive, empties the local
-table, and records the retirement in `buffer.db` and on the archive table. After that the log
+table, and records the retirement by giving the buffer an end and marking the archive table.
+After that the log
 opens for reading only, and `append`, a writer `open` and `restore` all refuse, naming the
 offset the next log should start at.
 

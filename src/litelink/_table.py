@@ -7,6 +7,7 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import random
 import sqlite3
@@ -419,6 +420,10 @@ class LogTable:
         # reads, and are computed once per commit rather than per query.
         self._statistics_at: str | None = None
         self._statistics: TierStatistics | None = None
+        # Run after every commit that lands, on the table the writer holds —
+        # which stores the new version's rollup for every other process (#90).
+        # None on the archive table and on a reader's.
+        self.after_commit: Callable[[], None] | None = None
         self._file_count = 0
         self._record_count = 0
 
@@ -1180,6 +1185,12 @@ class LogTable:
                 # After the reload, so it names the metadata this commit
                 # actually produced rather than the one it was built from.
                 self.publish_pointer()
+                if self.after_commit is not None:
+                    # Best effort: the commit has landed, and what follows is a
+                    # cache other processes can do without — a reader with no
+                    # stored row for its version rolls it up itself.
+                    with contextlib.suppress(Exception):
+                        self.after_commit()
 
                 return
 

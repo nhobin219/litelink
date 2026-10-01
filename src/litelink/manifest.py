@@ -19,6 +19,13 @@ with no symptom. So every rule here fails towards include, and the tests check
 every exclusion against DuckDB over generated data — NULLs, NaN, infinity,
 all-null columns and units missing a column.
 
+**`litelink_offset` is not a statistic.** It is the log's own sequence, dense
+and monotonic across every unit — a log's tiers, a stream's logs — so each
+unit's `[start_offset, end_offset)` says exactly where it sits, and a term on
+the offset column is judged against that range rather than a struct. That is
+also what lets a unit with no statistics at all — the buffer, a stream's live
+log — still be skipped by offset (streamcast#32).
+
 This began as streamcast's per-log manifest (streamcast#27) and moved here so
 both use one implementation: `key` names the unit column, `"tier"` for litelink
 and `"log"` for a stream.
@@ -49,6 +56,9 @@ DuckDB's byte order exactly. Binary and nested columns have no useful order.
 OPERATORS: Final = frozenset({"==", "<", "<=", ">", ">=", "in"})
 """What a term may use. Anything else cannot decide, and so includes."""
 
+OFFSET: Final = "litelink_offset"
+"""The column pruned by each unit's `[start_offset, end_offset)`, never a struct."""
+
 Term = tuple[str, str, object]
 """`(column, operator, value)` — one conjunct of the predicate being pruned for.
 
@@ -61,14 +71,16 @@ terms — dropping a conjunct can only include more, never fewer.
 class Row(NamedTuple):
     """One unit's row: its name, offsets, declared columns and statistics.
 
-    `end_offset` is exclusive, as it is on every extent in litelink. `schema`
+    `end_offset` is exclusive, as it is on every extent in litelink, and None
+    for a unit still growing — the buffer, a stream's live log — which is then
+    never skipped for a term above it. `schema`
     is what decides each struct column's type, so a column with no statistics
     in this unit still gets a typed NULL rather than none at all.
     """
 
     name: str
     start_offset: int
-    end_offset: int
+    end_offset: int | None
     schema: pa.Schema
     statistics: TierStatistics
 
@@ -78,12 +90,13 @@ def columns(schemas: Iterable[pa.Schema]) -> dict[str, pa.DataType]:
 
     Every name keeps one type across the units (a log's schema is fixed, and a
     stream fixes a column's type for its life), so a union keyed by name is
-    well defined. First occurrence fixes the order.
+    well defined. First occurrence fixes the order. `litelink_offset` is left
+    out: its range is each unit's `start_offset`/`end_offset`.
     """
     found: dict[str, pa.DataType] = {}
     for schema in schemas:
         for field in schema:
-            if field.type in PRUNABLE:
+            if field.type in PRUNABLE and field.name != OFFSET:
                 found.setdefault(field.name, field.type)
 
     return found
@@ -113,7 +126,7 @@ def build(rows: Sequence[Row], *, key: str = "tier") -> pa.Table:
         [
             pa.field(key, pa.string(), nullable=False),
             pa.field("start_offset", pa.int64(), nullable=False),
-            pa.field("end_offset", pa.int64(), nullable=False),
+            pa.field("end_offset", pa.int64()),
             pa.field("record_count", pa.int64()),
             *(pa.field(name, _struct(kind)) for name, kind in kinds.items()),
         ]
@@ -217,7 +230,12 @@ def prune(
             # A unit known to hold no rows holds no match, whatever the terms.
             # Unknown (None) is not zero.
             row.get("record_count") != 0
-            and all(_may_match(row, term, kinds) for term in terms)
+            and all(
+                _offset_may_match(row, term)
+                if term[0] == OFFSET
+                else _may_match(row, term, kinds)
+                for term in terms
+            )
         )
     ]
 
@@ -268,6 +286,38 @@ def _may_match(
         return True
 
 
+def _offset_may_match(row: Mapping[str, object], term: Term) -> bool:
+    """Whether a unit's `[start_offset, end_offset)` can hold an offset `term` matches.
+
+    Exact, since offsets are dense: the unit holds every offset in its range
+    and none outside it. An empty range holds nothing. A None end is a unit
+    still growing, bounded below only.
+    """
+    _, operator, value = term
+    start, end = row.get("start_offset"), row.get("end_offset")
+    if operator not in OPERATORS or not isinstance(start, int):
+        return True
+
+    if end is None:
+        high: object = math.inf
+    elif isinstance(end, int):
+        if end <= start:
+            return False
+
+        high = end - 1
+    else:
+        return True
+
+    values = value if operator == "in" else [value]
+    if not isinstance(values, (list, tuple)):
+        return True
+
+    try:
+        return any(_compare(operator, start, high, v) for v in values)
+    except TypeError:
+        return True
+
+
 def _compare(operator: str, low: object, high: object, value: object) -> bool:
     """Whether some value in `[low, high]` satisfies `operator value`."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -289,6 +339,7 @@ def _compare(operator: str, low: object, high: object, value: object) -> bool:
 
 
 __all__ = [
+    "OFFSET",
     "OPERATORS",
     "PRUNABLE",
     "Row",

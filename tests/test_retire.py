@@ -20,7 +20,7 @@ import pytest
 
 import litelink
 from litelink import LogConfig, RetiredError, WriteHandle
-from litelink._buffer import RETIRED_KEY, Buffer
+from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._replication import control_socket, litestream_binary
 from litelink._table import RETIRED_PROPERTY
@@ -157,7 +157,7 @@ def test_restore_refuses_on_the_archive_alone(
         backup(Layout(primary, "s").buffer_db, Layout(second, "s").buffer_db)
         log.retire()
 
-    assert Buffer.peek_meta(Layout(second, "s").buffer_db, RETIRED_KEY) is None
+    assert Buffer.peek_retired(Layout(second, "s").buffer_db) is None
     with pytest.raises(RetiredError, match="retired"):
         litelink.restore(second, "s", archive=where, s3=s3)
 
@@ -168,7 +168,7 @@ def test_restore_refuses_on_the_replica_marker_alone(
     """The other guard on its own: the archive property hidden, the marker in
     the replica still refuses.
 
-    Falsify by removing the `peek_meta(RETIRED_KEY)` check from `restore`.
+    Falsify by removing the `peek_retired` check from `restore`.
     """
     where = f"s3://{bucket}/prefix"
     primary = tmp_path / "primary"
@@ -308,9 +308,9 @@ def test_retire_flushes_the_replica_through_the_running_sidecar(
             sidecar.terminate()
             sidecar.wait(timeout=10)
 
-    marker = Buffer.peek_meta(restored, RETIRED_KEY)
+    marker = Buffer.peek_retired(restored)
     assert marker is not None
-    assert json.loads(marker)["state"] == "retired"
+    assert marker["state"] == "retired"
 
 
 def test_retire_refuses_to_guess_when_no_sidecar_answers(
@@ -330,3 +330,35 @@ def test_retire_refuses_to_guess_when_no_sidecar_answers(
 
         marker = log._buffer.retired()  # noqa: SLF001
         assert marker is not None and marker["state"] == "retiring"
+
+
+def test_a_retired_log_never_reads_its_buffer(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retirement closes the buffer's range at the log's end — empty, since it
+    never grows again — so no read converts its rows, whatever it asks.
+
+    Falsify by skipping `empty_buffer_range` at the end of `retire()`: the
+    range still spans the offsets the buffer held, so a read reaching into them
+    reads the (empty) buffer.
+    """
+    with written(tmp_path, bucket, s3) as log:
+        through = log.end_offset() - 1
+        log.retire()
+        _, rows = log._buffer.tiers()  # noqa: SLF001
+        assert rows["buffer"][0] == (through + 1, through + 1)
+
+    read: list[object] = []
+    original = Buffer.rows_above
+
+    def counted(buffer: Buffer, boundary: int | None):  # noqa: ANN202
+        read.append(boundary)
+        return original(buffer, boundary)
+
+    monkeypatch.setattr(Buffer, "rows_above", counted)
+    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+        assert reader.scan().read_all().num_rows == through
+        assert reader.scan(where="event_ts < 10").read_all().num_rows == 10
+        assert reader.scan(start_offset=through - 3).read_all().num_rows == 4
+
+    assert read == []

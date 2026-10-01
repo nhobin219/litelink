@@ -3,9 +3,13 @@
 A read decides per query which tiers it needs, with `litelink.manifest.prune`
 over two rows keyed by `tier`:
 
-- **`local`** — the local Iceberg table, rolled up from the snapshot the read
-  resolved (`LogTable.statistics_at`). Its statistics are Iceberg's own, on
-  local disk, so nothing is stored for it.
+- **`local`** — the local Iceberg table, rolled up from its manifests. The
+  process that commits a new version stores that version's rollup, stamped
+  with the version, so every other process reads it rather than rolling it up
+  again; a reader uses it only when the stamp is the version it resolved, and
+  otherwise rolls the version up itself (`LogTable.statistics_at`, cached in
+  memory per version). A late or missing store costs a rollup, never a wrong
+  answer.
 - **`archive`** — what the archive holds BELOW the local table: the rows
   eviction moved there. Not the whole archive, whose copy of the local window
   would put its maximum timestamp at "a few minutes ago" and send every hot
@@ -36,7 +40,7 @@ the whole of it.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pyarrow as pa
 
@@ -48,6 +52,7 @@ if TYPE_CHECKING:
 
 LOCAL = "local"
 ARCHIVE = "archive"
+BUFFER = "buffer"
 TIERS = (LOCAL, ARCHIVE)
 
 OFFSET = "litelink_offset"
@@ -56,38 +61,67 @@ OFFSET = "litelink_offset"
 KEY = "tier"
 
 
-class ArchiveTier:
-    """The archive's tier row, kept in `buffer.db`."""
+class Stored(NamedTuple):
+    """A stored tier: where it sits in the log, its columns' statistics, and —
+    for the local tier — the version of the table they were rolled up from."""
+
+    offsets: tuple[int, int]
+    statistics: TierStatistics
+    version: str | None
+
+
+class StoredTiers:
+    """Every stored tier row, decoded, as a reader consults them per query.
+
+    One SQLite statement per call. The decoded rows are kept against the
+    generation counter every write bumps, so a query with no write since the
+    last decodes nothing.
+    """
 
     def __init__(self, buffer: Buffer) -> None:
         self._buffer = buffer
-        # `(generation, decoded)` — a reader asks per query, and decodes only
-        # when a write has moved the generation on.
-        self._cache: tuple[str | None, TierStatistics | None] | None = None
+        self._cache: tuple[str, dict[str, Stored]] | None = None
 
-    def load(self) -> TierStatistics | None:
-        """The row, or None when the log has none yet."""
-        generation, raw = self._buffer.archive_tier()
+    def load(self) -> dict[str, Stored]:
+        generation, raw = self._buffer.tiers()
         cached = self._cache
-        if cached is not None and cached[0] == generation and generation is not None:
+        if cached is not None and generation is not None and cached[0] == generation:
             return cached[1]
 
-        decoded = None if raw is None else decode(raw)
-        self._cache = (generation, decoded)
+        decoded = {
+            tier: Stored(offsets, decode(statistics), version)
+            for tier, (offsets, statistics, version) in raw.items()
+        }
+        if generation is not None:
+            self._cache = (generation, decoded)
 
         return decoded
 
+
+class ArchiveTier:
+    """The archive's tier row, kept in `buffer.db` (`tier_offsets` and
+    `tier_statistics`)."""
+
+    def __init__(self, buffer: Buffer) -> None:
+        self._buffer = buffer
+        self._stored = StoredTiers(buffer)
+
+    def load(self) -> Stored | None:
+        """The row, or None when the log has none yet."""
+        return self._stored.load().get(ARCHIVE)
+
     def has(self) -> bool:
-        return self._buffer.archive_tier()[1] is not None
+        return self.load() is not None
 
     def replace(self, schema: pa.Schema, statistics: TierStatistics) -> None:
         """Make the row exactly `statistics` — the one write that narrows.
 
         Only under the whole-log claim, where eviction cannot widen it between
-        `statistics` being taken and this landing.
+        `statistics` being taken and this landing. The range is taken from the
+        statistics' own offset bounds.
         """
-        encoded = encode(schema, statistics)
-        self._buffer.update_archive_tier(lambda _: encoded)
+        stored = (offsets(statistics), encode(schema, statistics))
+        self._buffer.update_tier(ARCHIVE, lambda *_: stored)
 
     def widen(self, schema: pa.Schema, statistics: TierStatistics) -> None:
         """Add `statistics` to the row, before the commit that evicts them.
@@ -95,25 +129,37 @@ class ArchiveTier:
         A missing row stays missing: it is "no statistics", and a row made of
         only the rows being added would claim the archive holds nothing else.
         """
+        added = offsets(statistics)
 
-        def change(current: str | None) -> str | None:
-            if current is None:
+        def change(
+            current: tuple[int, int] | None, raw: str | None
+        ) -> tuple[tuple[int, int], str] | None:
+            if current is None or raw is None:
                 return None
 
-            return encode(schema, _union(schema, decode(current), statistics))
+            merged = _union(schema, decode(raw), statistics)
+            if added[1] <= added[0]:
+                span = current
+            elif current[1] <= current[0]:
+                span = added
+            else:
+                span = (min(current[0], added[0]), max(current[1], added[1]))
 
-        self._buffer.update_archive_tier(change)
+            return span, encode(schema, merged)
+
+        self._buffer.update_tier(ARCHIVE, change)
 
     def drop(self) -> None:
         """Forget the row, so reads include the archive until it is rebuilt."""
-        self._buffer.update_archive_tier(lambda _: None)
+        self._buffer.update_tier(ARCHIVE, lambda *_: None)
 
 
 def encode(schema: pa.Schema, statistics: TierStatistics) -> str:
     """The stored form: the prunable columns' bounds and counts, as JSON.
 
     JSON round-trips every prunable type exactly — Python writes a float as its
-    shortest repr, which reads back as the same double.
+    shortest repr, which reads back as the same double. `litelink_offset` is
+    not among them: its range is stored apart, in `tier_offsets`.
     """
     kinds = columns([schema])
     return json.dumps(
@@ -148,11 +194,18 @@ def decode(raw: str) -> TierStatistics:
     )
 
 
-def row(tier: str, schema: pa.Schema, statistics: TierStatistics) -> Row:
-    """`statistics` as a manifest row, offsets taken from its own bounds."""
-    lo, end = offsets(statistics)
+def row(
+    tier: str,
+    span: tuple[int, int | None],
+    schema: pa.Schema,
+    statistics: TierStatistics,
+) -> Row:
+    """A tier as a manifest row: `span` is its `[start, end)`."""
+    return Row(tier, span[0], span[1], schema, statistics)
 
-    return Row(tier, lo, end, schema, statistics)
+
+# The buffer's statistics: none. It is pruned by its offset range alone.
+UNKNOWN = TierStatistics(tier=None, record_count=None, file_count=0, columns={})
 
 
 def offsets(statistics: TierStatistics) -> tuple[int, int]:

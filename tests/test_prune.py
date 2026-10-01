@@ -22,8 +22,7 @@ import litelink
 from litelink._layout import Layout
 from litelink._prune import terms
 from litelink._read import Reader
-from litelink._statistics import TierStatistics
-from litelink._tiers import ArchiveTier
+from litelink._tiers import ArchiveTier, Stored
 from litelink.log import OFFSET, LogHandle
 from litelink.manifest import build, prune
 from tests.test_archive import ROWS, archived_log, rows
@@ -144,10 +143,11 @@ def test_a_log_without_an_archive_knows_the_archive_holds_nothing(
     """Known empty from birth, so no query ever includes a leg it cannot read."""
     schema = pa.schema([pa.field("x", pa.int64())])
     with litelink.new(tmp_path, "trades", schema=schema) as log:
-        found = log._tiers.load()  # noqa: SLF001
+        stored = log._tiers.load()  # noqa: SLF001
 
-    assert found is not None
-    assert found.record_count == 0
+    assert stored is not None
+    assert stored.statistics.record_count == 0
+    assert stored.offsets[1] <= stored.offsets[0], "an empty range"
 
 
 def test_local_statistics_are_of_the_snapshot_a_read_resolved(
@@ -181,6 +181,153 @@ def test_local_statistics_are_of_the_snapshot_a_read_resolved(
         after = table.statistics_at(table.metadata_location)
         assert after is not None
         assert after["x"].max == 19
+
+
+def buffered_log(tmp_path: Path) -> WriteHandle:
+    """Offsets 1–100 sealed into the local table, 101–150 still buffered."""
+    schema = pa.schema([pa.field("x", pa.int64())])
+    log = litelink.new(tmp_path, "s", schema=schema)
+    log.extend({"x": i} for i in range(100))
+    log.seal()
+    log.extend({"x": i} for i in range(100, 150))
+
+    return log
+
+
+def test_a_read_below_the_buffer_does_not_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The buffer is pruned by offset alone: a scan that ends below its lowest
+    offset never converts its rows, and still returns every row it should.
+
+    Falsify by returning True from `Reader._buffer_could_match`: the tail is
+    read for the scan that cannot use it.
+    """
+    from litelink._buffer import Buffer
+
+    read: list[int | None] = []
+    original = Buffer.rows_above
+
+    def counted(buffer: Buffer, boundary: int | None) -> pa.Table:
+        read.append(boundary)
+        return original(buffer, boundary)
+
+    with buffered_log(tmp_path) as log:
+        monkeypatch.setattr(Buffer, "rows_above", counted)
+
+        below = log.scan(end_offset=51).read_all()
+        assert below.column(OFFSET).to_pylist() == list(range(1, 51))
+        assert read == [], "the buffer holds nothing below 101"
+
+        into = log.scan(start_offset=120).read_all()
+        assert into.column(OFFSET).to_pylist() == list(range(120, 151))
+        assert len(read) == 1
+
+        # A term on another column says nothing about offsets: read.
+        log.sql("SELECT count(*) FROM log WHERE x < 10").read_all()
+        assert len(read) == 2
+
+
+def test_an_unfiltered_read_skips_the_local_rollup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no terms nothing but an empty tier can be skipped, and a local table
+    with an extent is not empty — so the rollup is not worth computing.
+
+    Falsify by dropping the `and found` from `Reader._tiers`: the unfiltered
+    scan computes the rollup too.
+    """
+    from litelink._table import LogTable
+
+    asked: list[str] = []
+    original = LogTable.statistics_at
+
+    def counted(table: LogTable, location: str):  # noqa: ANN202
+        asked.append(location)
+        return original(table, location)
+
+    with buffered_log(tmp_path) as log:
+        # No stored row, so a read that needs the rollup has to compute it.
+        with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
+            forged.execute("DELETE FROM tier_statistics WHERE tier = 'local'")
+
+        monkeypatch.setattr(LogTable, "statistics_at", counted)
+
+        assert log.scan().read_all().num_rows == 150
+        assert asked == []
+
+        assert log.scan(where="x >= 140").read_all().num_rows == 10
+        assert len(asked) == 1
+
+
+def test_the_committer_stores_the_local_rollup_for_every_other_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a seal the local row is in `buffer.db`, stamped with the version it
+    describes, and a reader in another handle uses it rather than rolling the
+    version up again.
+
+    Falsify by removing the `after_commit` call from `LogTable._commit`: the
+    reader has no stored row and rolls the version up itself.
+    """
+    import litelink._table as table_module
+
+    with buffered_log(tmp_path) as log:
+        table = log._table  # noqa: SLF001
+        table.reload()
+        _, found = log._buffer.tiers()  # noqa: SLF001
+        stored = found.get("local")
+        assert stored is not None
+        assert stored[2] == table.metadata_location, "stamped with its version"
+        assert stored[0] == (1, 101)
+
+        with litelink.open(tmp_path, "s", read_only=True) as reader:
+
+            def refuse(*_: object) -> None:
+                msg = "the stored rollup should have been used"
+                raise AssertionError(msg)
+
+            monkeypatch.setattr(table_module, "rollup", refuse)
+            assert reader.scan(where="x >= 140").read_all().num_rows == 10
+
+
+def test_a_stored_rollup_for_another_version_is_not_used(tmp_path: Path) -> None:
+    """The stamp is the guard: a row for a version other than the one a read
+    resolved is ignored, and the reader rolls its own version up.
+
+    Falsify by dropping the version comparison in `Reader._tiers`: the forged
+    row, claiming the local tier holds nothing matching, skips it and the
+    read comes back short.
+    """
+    from litelink._tiers import empty, encode
+
+    with buffered_log(tmp_path) as log:
+        schema = log._buffer.shape().table  # noqa: SLF001
+        with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
+            forged.execute(
+                "UPDATE tier_statistics SET statistics = ?, version = ?"
+                " WHERE tier = 'local'",
+                (encode(schema, empty(schema)), "99999-other.metadata.json"),
+            )
+
+        assert log.scan(where="x < 10").read_all().num_rows == 10
+
+
+def test_the_stored_local_rollup_only_moves_forward(tmp_path: Path) -> None:
+    """Two commits' stores can land in either order; the older one arriving last
+    does not replace the newer.
+
+    Falsify by removing the sequence comparison from
+    `Buffer.store_local_statistics`: the older version overwrites the newer.
+    """
+    with buffered_log(tmp_path) as log:
+        buffer = log._buffer  # noqa: SLF001
+        newer = "/x/metadata/00012-aaa.metadata.json"
+        older = "/x/metadata/00011-bbb.metadata.json"
+
+        assert buffer.store_local_statistics(newer, (1, 5), "{}")
+        assert not buffer.store_local_statistics(older, (1, 3), "{}")
+        assert buffer.tiers()[1]["local"][2] == newer
 
 
 # -- against a real archive ---------------------------------------------------
@@ -224,8 +371,8 @@ class Remote:
         monkeypatch.setattr(Reader, "_prepare_remote", counted)
 
 
-def archive_row(log: LogHandle) -> TierStatistics | None:
-    """The archive's stored tier row, as statistics — or None."""
+def archive_row(log: LogHandle) -> Stored | None:
+    """The archive's stored tier row — its range and statistics — or None."""
     return ArchiveTier(log._buffer).load()  # noqa: SLF001
 
 
@@ -345,9 +492,10 @@ def test_the_archive_row_describes_what_eviction_moved_below_the_local_table(
         found = archive_row(log)
         assert found is not None
 
-        assert found[OFFSET].min == 1
-        assert found[OFFSET].max >= extent[0] - 1, "covers every evicted row"
-        assert found["event_ts"].max < ROWS - 1, "not the archive's local copies"
+        assert found.offsets[0] == 1
+        assert found.offsets[1] >= extent[0], "covers every evicted row"
+        assert OFFSET not in found.statistics.columns, "the range is stored apart"
+        assert found.statistics["event_ts"].max < ROWS - 1, "not the local copies"
 
 
 @pytest.mark.s3
@@ -370,12 +518,13 @@ def test_a_log_without_an_archive_row_reads_the_archive_until_backfilled(
         low = extent[0]
 
     with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
-        forged.execute("DELETE FROM meta WHERE k = 'archive_tier'")
+        forged.execute("DELETE FROM tier_offsets")
+        forged.execute("DELETE FROM tier_statistics")
 
     remote = Remote(monkeypatch, refuse=False)
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         assert reader.scan(start_offset=low).read_all().num_rows == ROWS - low + 1
-        assert remote.calls == 1, "no manifest must read the archive"
+        assert remote.calls == 1, "no archive row must read the archive"
 
     with litelink.open(tmp_path, "s", s3=s3) as writer:
         assert writer._tiers.has()  # noqa: SLF001
@@ -401,15 +550,15 @@ def test_repointing_forgets_the_archive_row(
         assert original is not None
 
         before = archive_row(log)
-        assert before is not None and before.record_count
+        assert before is not None and before.statistics.record_count
 
         log.set_archive(f"s3://{bucket}/elsewhere")
         fresh = archive_row(log)
-        assert fresh is not None and fresh.record_count == 0
+        assert fresh is not None and fresh.statistics.record_count == 0
 
         log.set_archive(original)
         again = archive_row(log)
-        assert again is not None and again[OFFSET] == before[OFFSET]
+        assert again is not None and again.offsets == before.offsets
         assert log.scan().read_all().num_rows == ROWS
 
         log.set_archive(f"s3://{bucket}-nonexistent/prefix")
@@ -452,6 +601,42 @@ def test_a_restore_computes_the_archive_row_from_the_archive(
     with litelink.restore(second, "s", archive=where, s3=s3) as revived:
         found = archive_row(revived)
         assert found is not None
-        assert found[OFFSET].max == archived
+        assert found.offsets[1] == archived + 1
         late = revived.scan(where=f"event_ts >= {ROWS}").read_all()
         assert late.num_rows == 50
+
+
+@pytest.mark.s3
+def test_eviction_widens_the_archive_row_before_it_commits(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering that keeps the archive row from ever lagging the local
+    table: at the moment eviction commits, the row already covers what it is
+    evicting — so a read resolving the new, higher floor finds it covered.
+
+    Falsify by moving the `widen` in `Maintenance.evict` after
+    `evict_through`: at the commit the row still stops below the new floor.
+    """
+    from litelink._table import LogTable
+
+    seen: list[tuple[int, int | None]] = []
+    original = LogTable.evict_through
+
+    def checked(table: LogTable, boundary: int) -> None:
+        stored = ArchiveTier(log._buffer).load()  # noqa: SLF001
+        seen.append((boundary, None if stored is None else stored.offsets[1]))
+        original(table, boundary)
+
+    log = archived_log(
+        tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000
+    )
+    with log:
+        log.extend(rows(ROWS))
+        log.seal()
+        log.sync(push_unsettled=True)
+        monkeypatch.setattr(LogTable, "evict_through", checked)
+        log.maintain()
+
+    assert seen, "the fixture must evict"
+    for boundary, covered_until in seen:
+        assert covered_until is not None and covered_until > boundary

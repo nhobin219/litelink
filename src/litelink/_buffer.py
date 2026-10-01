@@ -65,18 +65,39 @@ INTENT_KEY = "schema_intent"
 # reserve. The recorded value is the only thing that separates the two.
 START_OFFSET_KEY = "start_offset"
 
-# The archive's tier row (#90): what the archive holds below the local table, as
-# JSON, and a counter a reader keys its decoded copy on. See `_tiers`.
-ARCHIVE_TIER_KEY = "archive_tier"
-ARCHIVE_TIER_GENERATION = "archive_tier_generation"
+# Bumped at every change to a stored tier (#90), so a reader's decoded copy is
+# never kept past a write. See `_tiers`.
+TIER_GENERATION = "tier_generation"
 
-# Set by `retire()`, and what the buffer's trigger refuses appends on. JSON:
-# `{"state": "retiring" | "retired", "at": …, "through": …, "archive": …}`.
-RETIRED_KEY = "retired"
 
 # What the trigger raises with, so the append path can tell its refusal from a
 # CHECK constraint's and explain it.
 RETIRED_REFUSAL = "litelink: this log is retired"
+
+
+def _metadata_sequence(version: str) -> int:
+    """The sequence number at the front of an Iceberg metadata file's name.
+
+    -1 for a name without one, which any real version supersedes.
+    """
+    prefix = version.rsplit("/", 1)[-1].split("-", 1)[0]
+
+    return int(prefix) if prefix.isdigit() else -1
+
+
+# The key the archive's location is recorded under — `_archive.ARCHIVE_KEY`,
+# spelled here because that module imports this one.
+ARCHIVE_META_KEY = "archive"
+
+
+def _retirement(end: int, statistics: str, archive: str | None) -> dict[str, object]:
+    """What a closed buffer row says about the log, for `RetiredError`."""
+    count = json.loads(statistics).get("record_count")
+    return {
+        "state": "retired" if count == 0 else "retiring",
+        "through": end - 1,
+        "archive": archive,
+    }
 
 
 class RetiredError(RuntimeError):
@@ -98,7 +119,7 @@ class RetiredError(RuntimeError):
         after = f"after offset {through}" if through is not None else "holding no rows"
         nxt = "" if through is None else f" at start_offset={int(str(through)) + 1}"
         return cls(
-            f"log {name!r} was retired at {marker.get('at', '?')} {after}; its rows "
+            f"log {name!r} was retired {after}; its rows "
             f"are in the archive at {marker.get('archive', '?')}. Read it with "
             f"open(..., read_only=True) or any Iceberg engine, and write to a new "
             f"log{nxt}"
@@ -719,13 +740,42 @@ class Buffer:
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
+        # A stored tier's offset range and its column statistics (#90), in two
+        # tables rather than one: `litelink_offset` is the log's own sequence,
+        # dense and monotonic across every tier, so a tier's `[start, end)` is
+        # a fact about where it sits in the log rather than a statistic — and
+        # it prunes on its own, as streamcast prunes whole logs by offset
+        # (streamcast#32). Only the archive is stored: the local tier's come
+        # from its Iceberg snapshot and the buffer's from its rows.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS tier_offsets (
+              tier         TEXT PRIMARY KEY,
+              start_offset INTEGER NOT NULL,
+              end_offset   INTEGER NOT NULL
+            )
+        """)
+        # `version` is which version of the table a row describes — the path of
+        # its Iceberg metadata file — and only the LOCAL row has one: it is a
+        # cache of one version's rollup, valid for exactly that version. The
+        # archive's row has none, because it is kept a superset of what the
+        # archive holds below the local table at every moment (eviction widens
+        # it before its commit), whatever version the archive is at.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS tier_statistics (
+              tier       TEXT PRIMARY KEY,
+              statistics TEXT NOT NULL,
+              version    TEXT
+            )
+        """)
         # A retired log takes no rows, from any process — including a writer
-        # that opened before `retire()` ran and never looks at `meta` again. In
-        # SQLite rather than in `append`, so it costs the write path nothing it
-        # would notice and no handle can be stale about it.
+        # that opened before `retire()` ran and never looks again. In SQLite
+        # rather than in `append`, so it costs the write path nothing it would
+        # notice and no handle can be stale about it. What it checks is the
+        # buffer's closed range (see `close_buffer`): a buffer with an end is
+        # a log that takes no more rows, one fact recorded once.
         self._con.execute(f"""
             CREATE TRIGGER IF NOT EXISTS refuse_retired BEFORE INSERT ON buffer
-            WHEN (SELECT v FROM meta WHERE k = '{RETIRED_KEY}') IS NOT NULL
+            WHEN EXISTS (SELECT 1 FROM tier_offsets WHERE tier = 'buffer')
             BEGIN SELECT RAISE(ABORT, '{RETIRED_REFUSAL}'); END
         """)
         # Who owns which operation, across processes (§13.6). A Python lock
@@ -2154,58 +2204,281 @@ class Buffer:
                 (key, value),
             )
 
-    # -- the archive's tier row (#90) -------------------------------------
+    # -- stored tiers (#90) ------------------------------------------------
 
-    def archive_tier(self) -> tuple[str | None, str | None]:
-        """`(generation, row)` in one statement, so the two cannot disagree.
+    def tiers(
+        self,
+    ) -> tuple[str | None, dict[str, tuple[tuple[int, int], str, str | None]]]:
+        """`(generation, {tier: ((start, end), statistics, version)})`, in ONE statement.
 
-        `row` is `_tiers`' JSON, or None when the log has none yet — which a
-        read takes as "the archive could hold anything".
+        What a read consults per query: every stored tier row and the counter
+        that says whether any changed since, so a reader decodes only after a
+        write. A buffer opened read-only before any writer created the tables
+        has none.
         """
-        with self._lock:
-            found = dict(
-                self._con.execute(
-                    "SELECT k, v FROM meta WHERE k IN (?, ?)",
-                    (ARCHIVE_TIER_KEY, ARCHIVE_TIER_GENERATION),
+        try:
+            with self._lock:
+                rows = self._con.execute(
+                    "SELECT (SELECT v FROM meta WHERE k = ?), s.tier,"
+                    " o.start_offset, o.end_offset, s.statistics, s.version"
+                    " FROM (SELECT 1) LEFT JOIN tier_statistics s"
+                    " LEFT JOIN tier_offsets o ON o.tier = s.tier",
+                    (TIER_GENERATION,),
                 ).fetchall()
+        except sqlite3.OperationalError:
+            return None, {}
+
+        generation = None if rows[0][0] is None else str(rows[0][0])
+        found = {
+            str(tier): ((int(start), int(end)), str(statistics), version)
+            for _, tier, start, end, statistics, version in rows
+            if tier is not None and start is not None
+        }
+
+        return generation, found
+
+    def update_tier(
+        self,
+        tier: str,
+        change: Callable[
+            [tuple[int, int] | None, str | None], tuple[tuple[int, int], str] | None
+        ],
+    ) -> None:
+        """Replace a tier's row with `change(offsets, statistics)`, in one transaction.
+
+        The read and the write together, so two writers cannot each drop the
+        other's change. None removes the row. The generation moves on every
+        call.
+        """
+        with self._transaction():
+            offsets = self._con.execute(
+                "SELECT start_offset, end_offset FROM tier_offsets WHERE tier = ?",
+                (tier,),
+            ).fetchone()
+            statistics = self._con.execute(
+                "SELECT statistics FROM tier_statistics WHERE tier = ?", (tier,)
+            ).fetchone()
+            updated = change(
+                None if offsets is None else (int(offsets[0]), int(offsets[1])),
+                None if statistics is None else str(statistics[0]),
             )
+            if updated is None:
+                self._con.execute("DELETE FROM tier_offsets WHERE tier = ?", (tier,))
+                self._con.execute("DELETE FROM tier_statistics WHERE tier = ?", (tier,))
+            else:
+                (start, end), encoded = updated
+                self._con.execute(
+                    "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
+                    " VALUES (?, ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                    " start_offset = excluded.start_offset,"
+                    " end_offset = excluded.end_offset",
+                    (tier, start, end),
+                )
+                self._con.execute(
+                    "INSERT INTO tier_statistics (tier, statistics) VALUES (?, ?)"
+                    " ON CONFLICT(tier) DO UPDATE SET statistics = excluded.statistics",
+                    (tier, encoded),
+                )
 
-        return found.get(ARCHIVE_TIER_GENERATION), found.get(ARCHIVE_TIER_KEY)
+            self._bump_tiers()
 
-    def update_archive_tier(self, change: Callable[[str | None], str | None]) -> None:
-        """Replace the row with `change(current)`, in one write transaction.
+    def store_local_statistics(
+        self, version: str, offsets: tuple[int, int], statistics: str
+    ) -> bool:
+        """Store the local tier's rollup for `version`, unless a newer one is stored.
 
-        The read and the write in one transaction, so two writers cannot each
-        drop the other's change. None removes the row. The generation moves on
-        every call, so a reader's decoded copy is never kept past a write.
+        Written by whichever process committed `version`, after the commit — the
+        local row is a cache, stamped with the version it describes, so a reader
+        uses it only for exactly that version and a late or missing write can
+        cost a recompute but never a wrong answer.
+
+        **Forward only**, compared in the same transaction as the write. Two
+        commits' stores can land in either order, and an older one arriving last
+        would leave every process recomputing until the next commit. Versions
+        compare by the sequence number Iceberg puts at the front of each
+        metadata file's name (`00012-<uuid>.metadata.json`).
+
+        **Only the latest version is kept**, deliberately. A reader misses the
+        stored row in two ways: its version is newer (the commit landed, its
+        store has not yet — a few milliseconds), or older (a newer commit stored
+        its row between this reader resolving its version and looking it up —
+        well under a millisecond). History would help only the second, commits
+        come seconds apart, and a miss costs one 2–3 ms rollup that the
+        process then caches for itself. An expiry pass kept in step with
+        snapshot retention is not worth that.
+
+        Returns whether it wrote.
         """
         with self._transaction():
             row = self._con.execute(
-                "SELECT v FROM meta WHERE k = ?", (ARCHIVE_TIER_KEY,)
+                "SELECT version FROM tier_statistics WHERE tier = 'local'"
             ).fetchone()
-            updated = change(None if row is None else str(row[0]))
-            if updated is None:
-                self._con.execute("DELETE FROM meta WHERE k = ?", (ARCHIVE_TIER_KEY,))
-            else:
-                self._con.execute(
-                    "INSERT INTO meta (k, v) VALUES (?, ?)"
-                    " ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                    (ARCHIVE_TIER_KEY, updated),
-                )
+            if (
+                row is not None
+                and row[0] is not None
+                and _metadata_sequence(str(row[0])) >= _metadata_sequence(version)
+            ):
+                return False
 
             self._con.execute(
-                "INSERT INTO meta (k, v) VALUES (?, '1')"
-                " ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
-                (ARCHIVE_TIER_GENERATION,),
+                "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
+                " VALUES ('local', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                " start_offset = excluded.start_offset,"
+                " end_offset = excluded.end_offset",
+                offsets,
             )
+            self._con.execute(
+                "INSERT INTO tier_statistics (tier, statistics, version)"
+                " VALUES ('local', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                " statistics = excluded.statistics, version = excluded.version",
+                (statistics, version),
+            )
+            self._bump_tiers()
+
+            return True
+
+    def _bump_tiers(self) -> None:
+        """Inside the caller's transaction: a new generation for readers' caches."""
+        self._con.execute(
+            "INSERT INTO meta (k, v) VALUES (?, '1')"
+            " ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
+            (TIER_GENERATION,),
+        )
+
+    def lowest_offset(self) -> int | None:
+        """The lowest offset buffered, or None when the buffer is empty.
+
+        Only ever rises — rows arrive above it and leave as a prefix — so a
+        value read a moment early is still a lower bound on every row a later
+        read can find here. One B-tree edge seek; see `extent`.
+        """
+        with self._lock:
+            row = self._con.execute(
+                'SELECT min("litelink_offset") FROM buffer'
+            ).fetchone()
+
+        return None if row is None or row[0] is None else int(row[0])
+
+    def no_rows(self) -> pa.Table:
+        """A buffer tail with no rows, shaped as `rows_above` shapes one.
+
+        For a read that has ruled the buffer out: its leg stays in the union,
+        empty, so nothing about the query's shape changes. Read on the reader
+        connection like any tail, without touching the tail cache.
+        """
+        with self._tail_lock:
+            return self._rows("> ?", (_NO_ROW_LIMIT,))
 
     # -- retirement -------------------------------------------------------
 
-    def retired(self) -> dict[str, object] | None:
-        """The retirement marker, or None for a live log."""
-        raw = self.get_meta(RETIRED_KEY)
+    def close_buffer(self, statistics: str) -> None:
+        """Give the buffer an end: the log takes no more rows (`retire()`, step 1).
 
-        return None if raw is None else json.loads(raw)
+        The buffer's `end_offset` is otherwise unknown — it grows. Closed, it
+        is the offset the next append would have taken, read INSIDE this write
+        transaction so no append can land between reading it and closing: the
+        trigger refuses every append from the commit on, so the end is final.
+        Its start is the lowest offset still buffered; rows only leave from
+        here, so the range stays a superset of what the buffer holds.
+
+        **This row is authoritative, unlike the other tier rows**, which are
+        caches routing can rebuild. Only `retire()` writes it and nothing drops
+        or recomputes it. A no-op when the buffer is already closed.
+        """
+        with self._transaction():
+            if self._con.execute(
+                "SELECT 1 FROM tier_offsets WHERE tier = 'buffer'"
+            ).fetchone():
+                return
+
+            seq = self._con.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone()
+            end = (seq[0] if seq else 0) + 1
+            lowest = self._con.execute(
+                'SELECT min("litelink_offset") FROM buffer'
+            ).fetchone()[0]
+            start = end if lowest is None else int(lowest)
+            self._write_buffer_row(start, end, statistics)
+
+    def empty_buffer_range(self, statistics: str) -> None:
+        """Narrow the closed range to `[end, end)`, empty: `retire()` is done.
+
+        Only once the buffer holds nothing; the record count in `statistics`
+        (0) is what tells a retired log from one still retiring.
+        """
+        with self._transaction():
+            row = self._con.execute(
+                "SELECT end_offset FROM tier_offsets WHERE tier = 'buffer'"
+            ).fetchone()
+            if row is None:
+                msg = "the buffer has no end to narrow to; close it first"
+                raise RuntimeError(msg)
+
+            end = int(row[0])
+            self._write_buffer_row(end, end, statistics)
+
+    def _write_buffer_row(self, start: int, end: int, statistics: str) -> None:
+        """Inside the caller's transaction."""
+        self._con.execute(
+            "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
+            " VALUES ('buffer', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+            " start_offset = excluded.start_offset,"
+            " end_offset = excluded.end_offset",
+            (start, end),
+        )
+        self._con.execute(
+            "INSERT INTO tier_statistics (tier, statistics) VALUES ('buffer', ?)"
+            " ON CONFLICT(tier) DO UPDATE SET statistics = excluded.statistics",
+            (statistics,),
+        )
+        self._bump_tiers()
+
+    def retired(self) -> dict[str, object] | None:
+        """The log's retirement, read from the buffer's closed range, or None.
+
+        `retiring` while the range can still hold rows (its record count is
+        not known to be 0), `retired` once `retire()` has emptied it.
+        """
+        try:
+            with self._lock:
+                row = self._con.execute(
+                    "SELECT o.start_offset, o.end_offset, s.statistics"
+                    " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
+                    " WHERE o.tier = 'buffer'"
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+
+        if row is None:
+            return None
+
+        return _retirement(int(row[1]), str(row[2]), self.get_meta(ARCHIVE_META_KEY))
+
+    @classmethod
+    def peek_retired(cls, path: Path) -> dict[str, object] | None:
+        """`retired()` for a database file no handle holds open — a replica."""
+        con = cls._connect_readonly(path)
+        try:
+            row = con.execute(
+                "SELECT o.end_offset, s.statistics"
+                " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
+                " WHERE o.tier = 'buffer'"
+            ).fetchone()
+            archive = con.execute(
+                "SELECT v FROM meta WHERE k = ?", (ARCHIVE_META_KEY,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            con.close()
+
+        if row is None:
+            return None
+
+        return _retirement(
+            int(row[0]), str(row[1]), None if archive is None else str(archive[0])
+        )
 
     def retired_error(self) -> RetiredError:
         """The refusal for anything that would add rows to a retired log."""

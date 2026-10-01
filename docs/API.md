@@ -317,8 +317,10 @@ what make each row appear exactly once.
 Every query reads the buffer. The local table and the archive are read only when their
 per-column bounds say they could hold a row the query matches:
 
-- **the local table's** come from the snapshot the read resolved, rolled up from its Iceberg
-  manifests (2–3 ms once per new snapshot, measured at 1–64 files);
+- **the local table's** are the rollup of the snapshot the read resolved. The process that
+  commits a new version stores its rollup in `buffer.db`, stamped with the version, so other
+  processes read it instead of rolling it up (2–3 ms at 1–64 files). A read uses it only
+  when the stamp is the version it resolved, and rolls its own version up otherwise;
 - **the archive's** describe what it holds **below** the local table — what eviction moved
   there — and are kept in `buffer.db`, because on S3 they would cost the round trip the
   decision exists to avoid. The whole archive's bounds would include its copy of the local
@@ -327,6 +329,14 @@ per-column bounds say they could hold a row the query matches:
 Neither touches the network, so a read bounded inside the local window stays there (I5).
 The two rows are in streamcast's manifest format (streamcast#27) with `tier` as the key, and
 the decision is `litelink.manifest.prune`, public so streamcast uses the same one.
+
+**`litelink_offset` is each tier's range, not a statistic.** It is the log's own sequence,
+dense and monotonic across the tiers, so a term on it is judged against each tier's
+`[start_offset, end_offset)`. The archive's range is stored in its own table (`tier_offsets`),
+apart from its column statistics. It is also what prunes **the buffer**, which has no
+statistics: its range starts at its lowest offset and is open above, so a scan that ends below
+the buffer never converts its rows. Without a term on a column the local tier's rollup is not
+computed at all, since only a tier known to be empty could be skipped.
 
 It reads the query's WHERE, and narrows on one shape only: a single `SELECT … FROM log`, no
 joins, CTEs, set operations or subqueries, with comparisons (`=`, `<`, `<=`, `>`, `>=`,
@@ -549,7 +559,8 @@ log.retire() -> None
 ```
 
 Ends the log for good: every row goes to the archive, the local table and buffer are emptied,
-and the retirement is recorded in `buffer.db` and on the archive table (`litelink.retired`).
+and the retirement is recorded twice: the buffer gets an end (its `end_offset`, until now
+open), and the archive table gets a `litelink.retired` property.
 Afterwards:
 
 | Operation | On a retired log |
@@ -557,19 +568,23 @@ Afterwards:
 | `append`, `extend`, `ingest` | `RetiredError`, naming when it retired, its last offset and the `start_offset` for the next log |
 | `open(root, name)` | `RetiredError`, the same message |
 | `open(root, name, read_only=True)` | allowed; reads come from the archive |
-| `restore(...)` | `RetiredError`, from the archive property or the replica's marker |
+| `restore(...)` | `RetiredError`, from the archive property or the replica's closed buffer |
 | `hydrate(since)` | allowed; it adds no rows, only brings files back to local disk |
 | `column_statistics(tier="archive")` | the whole log |
 
-**Appends are refused by SQLite**, with a trigger on the buffer, so a writer that opened
-before `retire()` ran is refused too, at no cost to the append path.
+**Appends are refused by SQLite**: a trigger on the buffer refuses every insert once the
+buffer has an end, so a writer that opened before `retire()` ran is refused too, at no cost
+to the append path. A buffer with an end is the one fact that says the log takes no more
+rows; there is no separate marker.
 
-**It is resumable.** It marks the log `retiring` before its final seal and push, so no row can
-arrive after them; a crash leaves it `retiring`, taking no rows, and a writer can still open it
-to call `retire()` again. It needs an archive.
+**It is resumable.** The buffer gets its end first — the offset the next append would have
+taken, read in the same transaction — so no row can arrive after the final seal and push. A
+crash leaves the log `retiring`, taking no rows, and a writer can still open it to call
+`retire()` again. The last step narrows the range to empty, which is what reads as `retired`
+and lets every read skip the buffer without reading it. It needs an archive.
 
 **With `wal_replication`, it flushes the replica** through the running sidecar
-(`litestream sync -wait` on its control socket) after each marker, so a restore from the
+(`litestream sync -wait` on its control socket) after each of those two steps, so a restore from the
 replica sees the retirement. It never starts a litestream of its own — two processes
 replicating one database is corruption — so if the sidecar does not answer, it raises and
 says to regenerate the config (see RUNTIME.md).

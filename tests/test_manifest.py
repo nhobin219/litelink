@@ -381,3 +381,55 @@ class TestTheTable:
 
         assert table["tier"].to_pylist() == ["a"]
         assert prune(table, ["a"], [("x", "==", 1)]) == []
+
+
+class TestTheOffsetIsTheUnitsRange:
+    """`litelink_offset` is judged against `[start_offset, end_offset)`."""
+
+    def unit(self, name: str, start: int, end: int | None) -> Row:
+        empty = TierStatistics(tier=None, record_count=None, file_count=0, columns={})
+        return Row(name, start, end, pa.schema([pa.field("x", pa.int64())]), empty)
+
+    def test_a_unit_is_skipped_by_its_range_alone(self):
+        """No statistics at all, and still skipped — the buffer, a live log.
+
+        Falsify by routing offset terms through `_may_match`: with no struct
+        for the offset column, every unit is kept.
+        """
+        table = build([self.unit("old", 1, 101), self.unit("new", 101, 201)])
+
+        assert prune(table, ["old", "new"], [("litelink_offset", "<", 101)]) == ["old"]
+        assert prune(table, ["old", "new"], [("litelink_offset", ">=", 101)]) == ["new"]
+        assert prune(table, ["old", "new"], [("litelink_offset", "==", 100)]) == ["old"]
+        assert prune(table, ["old", "new"], [("litelink_offset", "in", [5, 150])]) == [
+            "old",
+            "new",
+        ]
+
+    def test_the_end_is_exclusive(self):
+        table = build([self.unit("u", 1, 101)])
+
+        assert prune(table, ["u"], [("litelink_offset", ">=", 101)]) == []
+        assert prune(table, ["u"], [("litelink_offset", ">=", 100)]) == ["u"]
+
+    def test_a_unit_with_no_end_is_never_skipped_from_above(self):
+        """None is a unit still growing — the buffer, a live log."""
+        table = build([self.unit("buffer", 500, None)])
+
+        assert prune(table, ["buffer"], [("litelink_offset", ">", 10**12)]) == [
+            "buffer"
+        ]
+        assert prune(table, ["buffer"], [("litelink_offset", "<", 500)]) == []
+
+    def test_an_empty_range_holds_nothing(self):
+        table = build([self.unit("u", 7, 7)])
+
+        assert prune(table, ["u"], [("litelink_offset", "<", 100)]) == []
+
+    def test_the_offset_is_not_a_statistics_column(self):
+        schema = pa.schema(
+            [pa.field("litelink_offset", pa.int64()), pa.field("x", pa.int64())]
+        )
+        table = build([Row("u", 1, 3, schema, statistics(pa.table({"x": [1, 2]})))])
+
+        assert "litelink_offset" not in table.column_names

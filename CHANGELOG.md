@@ -48,15 +48,22 @@ minor version carries breaking changes.
   rows eviction had just moved there.
 - **`WriteHandle.retire()`** ends a log for good: every row to the archive,
   the local table and buffer emptied, and the retirement recorded in
-  `buffer.db` and on the archive table (`litelink.retired`). Afterwards
+  the buffer's range (it gets an end) and on the archive table
+  (`litelink.retired`). Afterwards
   appends, a writer `open`, `ingest` and `restore` raise `RetiredError`,
   naming the offset the next log should start at; read-only opens and
   `hydrate` still work. Appends are refused by a SQLite trigger, so a writer
   opened before `retire()` is refused too. It is resumable after a crash, and
   with `wal_replication` it flushes the replica through the running sidecar.
+- **A scan bounded below the buffer skips it.** `litelink_offset` is judged
+  against each tier's `[start_offset, end_offset)`, the buffer's included, so
+  a history scan no longer converts the buffered rows to Arrow.
 - **`litelink.manifest`**: the statistics manifest and its pruning, public, so
   streamcast uses the same implementation for its sealed logs (`build`,
-  `extend`, `prune`, with the key column a parameter).
+  `extend`, `prune`, with the key column a parameter). A term on
+  `litelink_offset` is judged against each unit's `[start_offset, end_offset)`,
+  so a unit with no statistics — a live log, the buffer — still prunes by
+  offset; an `end_offset` of None marks a range still growing.
 
 ## 0.5.1 — 2026-09-29
 

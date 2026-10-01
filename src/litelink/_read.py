@@ -18,9 +18,18 @@ import pyarrow as pa
 from litelink._archive import Archive
 from litelink._prune import terms
 from litelink._s3 import S3Options
-from litelink._tiers import ARCHIVE, KEY, LOCAL, TIERS, ArchiveTier, row
+from litelink._tiers import (
+    ARCHIVE,
+    BUFFER,
+    KEY,
+    LOCAL,
+    TIERS,
+    UNKNOWN,
+    StoredTiers,
+    row,
+)
 from litelink._types import column_type
-from litelink.manifest import build, prune
+from litelink.manifest import Term, build, prune
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -264,7 +273,7 @@ class Reader:
         self._remote_ready = False
         # Which tiers a query needs, per tier (#90). Read from disk per query;
         # it re-parses only when the file changed.
-        self._archive_tier = ArchiveTier(buffer)
+        self._stored = StoredTiers(buffer)
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -361,14 +370,26 @@ class Reader:
         # The floor here only bounds how much is read — §7's point about a
         # deferred delete not inflating a query. It is not the boundary; that
         # is decided after, against a snapshot that cannot then move.
-        self._table.reload()
-        floor = self._table.extent()
-        tail = self._buffer.rows_above(None if floor is None else floor[1])
-
         with self._lock:
             # The lock covers building the cursor, not the query. Creating one
-            # touches the shared connection; running on it does not.
+            # touches the shared connection; running on it does not. Built
+            # first now, because the query's terms are parsed on it and they
+            # decide whether the buffer is read at all.
             cursor = self._connect().cursor()
+
+        found = terms(cursor, sql, self._schema)
+
+        self._table.reload()
+        floor = self._table.extent()
+        # The buffer is ruled out only by offset, from its lowest offset, and
+        # only BEFORE its rows are read — skipping that read is the point.
+        # Sound whenever it is taken: the lowest offset only rises, so a
+        # query below it now matches nothing the buffer can later hold.
+        tail = (
+            self._buffer.rows_above(None if floor is None else floor[1])
+            if self._buffer_could_match(found)
+            else self._buffer.no_rows()
+        )
 
         cursor.register(BUFFER_REL, tail)
 
@@ -389,7 +410,7 @@ class Reader:
         # After, it cannot happen. I4 means nothing is evicted before it is
         # registered, so an archive snapshot taken later than the local one
         # holds everything the local one has given up.
-        local, archive = self._tiers(cursor, sql, location, extent)
+        local, archive = self._tiers(found, location, extent)
         remote = self._prepare_remote(cursor) if archive else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
@@ -403,14 +424,39 @@ class Reader:
 
         return _cast_to(reader, self._schema)
 
+    def _buffer_could_match(self, found: tuple[Term, ...]) -> bool:
+        """Whether the buffer could hold a row matching `found`, by offset alone.
+
+        The buffer has no column statistics — computing them would cost the
+        read this avoids — but `litelink_offset` is the log's sequence, so its
+        range is known: from its lowest offset up, open-ended, since rows keep
+        arriving. A query entirely below that range cannot match it.
+        """
+        # Closed by `retire()`: an empty range at the log's end, which no
+        # query needs, with offset terms or without.
+        closed = self._stored.load().get(BUFFER)
+        if closed is not None:
+            unit = row(BUFFER, closed.offsets, self._schema, closed.statistics)
+            return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
+
+        if not any(column == OFFSET for column, _, _ in found):
+            return True
+
+        lowest = self._buffer.lowest_offset()
+        if lowest is None:
+            return True
+
+        unit = row(BUFFER, (lowest, None), self._schema, UNKNOWN)
+
+        return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
+
     def _tiers(
         self,
-        cursor: duckdb.DuckDBPyConnection,
-        sql: str,
+        found: tuple[Term, ...],
         location: str,
         extent: tuple[int, int] | None,
     ) -> tuple[bool, bool]:
-        """`(local, archive)`: which of the two tiers `sql` needs (#90).
+        """`(local, archive)`: which of the two tiers the query needs (#90).
 
         The local tier's row is the rollup of the snapshot this read resolved
         (`location`), so the decision and the data are one version. The
@@ -419,20 +465,29 @@ class Reader:
         a row read later covers everything the resolved snapshot has given up.
         Neither touches the network.
 
-        A tier with no row, or a query `_prune.terms` cannot narrow, is read —
-        except a tier known to hold no rows, which no query needs.
+        With no terms, only a tier known to be empty is skipped, and a local
+        table with an extent is not empty — so the local rollup, 2–3 ms after
+        each commit, is not computed for a query it cannot narrow.
         """
         configured = self._archive.configured()
-        found = terms(cursor, sql, self._schema)
         rows = []
-        archive = self._archive_tier.load()
+        stored = self._stored.load()
+        archive = stored.get(ARCHIVE)
         if archive is not None:
-            rows.append(row(ARCHIVE, self._schema, archive))
+            rows.append(row(ARCHIVE, archive.offsets, self._schema, archive.statistics))
 
-        if extent is not None:
-            local = self._table.statistics_at(location)
+        if extent is not None and found:
+            # The stored rollup when it is of exactly the version this read
+            # resolved; else this process's own, computed once per version.
+            cached = stored.get(LOCAL)
+            local = (
+                cached.statistics
+                if cached is not None and cached.version == location
+                else self._table.statistics_at(location)
+            )
             if local is not None:
-                rows.append(row(LOCAL, self._schema, local))
+                span = (extent[0], extent[1] + 1)
+                rows.append(row(LOCAL, span, self._schema, local))
 
         table = build(rows, key=KEY) if rows else None
         kept = prune(table, TIERS, found, key=KEY)
