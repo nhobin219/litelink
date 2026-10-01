@@ -460,7 +460,7 @@ class Buffer:
         # view would be self-correcting there anyway, and structurally so —
         # offsets come from AUTOINCREMENT under one serialised writer and
         # deletions are prefix-only, so what a stale snapshot lacks is always a
-        # SUFFIX, and `_rows("> _tail_hi")` cannot skip it.
+        # SUFFIX, and `_rows(">= _tail_end")` cannot skip it.
         #
         # **This isolates the seal from READERS.** What keeps seals off each
         # other is the CLAIM: `Claim.acquire` filters on range overlap and
@@ -546,22 +546,24 @@ class Buffer:
         # so invalidating from inside `shape()` hangs the reader on itself.
         # Found by stack-dumping a suite that had sat idle for 29 minutes.
         self._tail_shape: Shape | None = None
-        self._tail_lo = 0
-        self._tail_hi = 0
-        # The lowest boundary this cache is COMPLETE for — the floor it was
-        # fetched above, not the offset it happens to start at.
+        # The offsets the cached table holds, `[_tail_start, _tail_end)`, taken
+        # from its rows. `_tail_end` is where the next fetch starts.
+        self._tail_start = 0
+        self._tail_end = 0
+        # The lowest `start` this cache is COMPLETE for — the `start` it was
+        # fetched from, not the offset its first row happens to have.
         #
-        # `_tail_lo` is `first_offset - 1`, which on a log whose offsets start
-        # high is far above any boundary a reader asks for before the first
-        # seal: `Reader.query` passes 0 while the staging table has no extent, so
-        # gating on `_tail_lo <= floor` missed on EVERY read and re-converted
-        # the whole buffer per query. Measured at the default 8 MiB first-seal
+        # On a log whose offsets start high, `_tail_start` is far above any
+        # `start` a reader asks for before the first seal: `Reader.query`
+        # passes None while the staging table has no span, so gating on
+        # `_tail_start <= start` missed on EVERY read and re-converted the
+        # whole buffer per query. Measured at the default 8 MiB first-seal
         # window: 4.2 ms/read against 42.
         #
         # Two distinct facts, and conflating them is what cost that. Where the
-        # cache STARTS bounds the slice arithmetic; what it is complete FOR
+        # cache STARTS bounds the slice arithmetic; what it is complete FROM
         # decides whether it can answer at all.
-        self._tail_from = 0
+        self._tail_complete_from = 0
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -1404,9 +1406,8 @@ class Buffer:
         Measured at a full 8 MiB buffer: 29.4 ms rebuilt, and two thirds of
         that is `fetchall` turning 120,000 values into Python objects.
         """
-        # The tail cache below counts in single offsets — the last row before
-        # the slice, the last row in it — so the range converts once, here.
-        floor = 0 if start is None else start - 1
+        # Offsets start at 1, so "no boundary" is a `start` of 0.
+        start = 0 if start is None else start
         with self._tail_lock:
             # The tail is an Arrow table under the schema in force when it was
             # built, so a schema change has to discard it. Loud rather than
@@ -1416,15 +1417,15 @@ class Buffer:
             shape = self.shape()
             if self._tail_shape is not shape:
                 self._tail = None
-                self._tail_lo = self._tail_hi = self._tail_from = 0
+                self._tail_start = self._tail_end = self._tail_complete_from = 0
                 self._tail_shape = shape
 
-            cached = self._reusable(floor)
+            cached = self._reusable(start)
             if cached is None:
-                table = self._rows("> ?", (floor,))
-                self._tail_from = floor
+                table = self._rows(">= ?", (start,))
+                self._tail_complete_from = start
             else:
-                fresh = self._rows("> ?", (self._tail_hi,))
+                fresh = self._rows(">= ?", (self._tail_end,))
                 table = (
                     cached if fresh.num_rows == 0 else pa.concat_tables([cached, fresh])
                 )
@@ -1433,65 +1434,72 @@ class Buffer:
                     # copy, so it is amortised rather than paid every time.
                     table = table.combine_chunks()
 
-                # A hit implies `_tail_from <= floor`, so this only ever
-                # raises — the guard above is what makes that true, and a
+                # A hit implies `_tail_complete_from <= start`, so this only
+                # ever raises — the guard above is what makes that true, and a
                 # `max()` here would be dead.
                 #
                 # Conservative in one direction and never wrong in the other:
-                # when `floor` is below where the cache STARTS the slice prunes
+                # when `start` is below where the cache STARTS the slice prunes
                 # nothing, so the cache is still complete from where it was,
                 # and raising loses a later hit rather than serving short. That
                 # costs nothing in practice because the boundary is the staging
-                # table's extent, which only rises.
-                self._tail_from = floor
+                # table's span end, which only rises.
+                self._tail_complete_from = start
 
             self._tail = table
-            # Taken from the DATA, never from `floor`. They are not the same
-            # number: `floor` is the table's boundary, and the first buffered
-            # row above it can be higher still if a seal deleted the rows
-            # between while this was being read. Recording `floor` as though it
-            # were the row before the first made the slice arithmetic below
-            # count from a row that no longer existed, and the miscount hid
-            # buffered rows from every subsequent query — silently, because an
-            # over-long slice comes back empty rather than raising.
+            # Taken from the DATA, never from `start`. They are not the same
+            # number: `start` is the table's boundary, and the first buffered
+            # row at or above it can be higher still if a seal deleted the rows
+            # between while this was being read. Recording `start` as though it
+            # were the first cached row made the slice arithmetic below count
+            # from a row that no longer existed, and the miscount hid buffered
+            # rows from every subsequent query — silently, because an over-long
+            # slice comes back empty rather than raising.
             if table.num_rows:
-                self._tail_lo = int(table.column(OFFSET)[0].as_py()) - 1
-                self._tail_hi = int(table.column(OFFSET)[-1].as_py())
+                self._tail_start = int(table.column(OFFSET)[0].as_py())
+                self._tail_end = int(table.column(OFFSET)[-1].as_py()) + 1
             else:
-                self._tail_lo = self._tail_hi = floor
+                self._tail_start = self._tail_end = start
 
             return table
 
-    def _reusable(self, floor: int) -> pa.Table | None:
-        """The cached tail with everything through `floor` dropped, or None.
+    def _reusable(self, start: int) -> pa.Table | None:
+        """The cached tail with everything below `start` dropped, or None.
+
+        Usable when the cache is complete from at or below `start` and
+        `start` is within what it has fetched: `_tail_complete_from <= start
+        <= _tail_end`.
 
         The slice index is arithmetic — cached offsets are contiguous from
-        `_tail_lo + 1`, so dropping through the clamped `base` drops exactly
-        `base - _tail_lo` rows — and then checked, because that contiguity is
-        a property of AUTOINCREMENT and prefix-only deletion rather than
-        something enforced here. A failed check costs a rebuild, which is what
-        the code did unconditionally before.
+        `_tail_start`, so dropping everything below the clamped `base` drops
+        exactly `base - _tail_start` rows — and then checked, because that
+        contiguity is a property of AUTOINCREMENT and prefix-only deletion
+        rather than something enforced here. A reserved range (`ingest`,
+        `restore`) is a hole no buffered row fills, so a cache spanning one
+        fails the check and is rebuilt; a failed check costs only that.
 
         Both directions are checked. A wrong non-empty slice starts at the
         wrong offset; a wrong EMPTY slice is the dangerous one, because it
-        looks exactly like "nothing buffered above the boundary" and would be
-        returned as an answer. `_tail_hi > floor` says the last cached row
+        looks exactly like "nothing buffered from the boundary" and would be
+        returned as an answer. `_tail_end > start` says the last cached row
         qualifies, so an empty result contradicts the cache itself.
         """
-        if self._tail is None or not (self._tail_from <= floor <= self._tail_hi):
+        if self._tail is None or not (
+            self._tail_complete_from <= start <= self._tail_end
+        ):
             return None
 
-        # Clamped, because a floor BELOW where the cache starts drops nothing
+        # Clamped, because a `start` BELOW where the cache starts drops nothing
         # rather than a negative number of rows. That is the ordinary case on a
-        # log whose offsets start high — every buffered row is already above
-        # the boundary — and the unclamped subtraction is why the guard could
-        # not simply be widened.
-        base = max(floor, self._tail_lo)
-        kept = self._tail.slice(base - self._tail_lo)
+        # log whose offsets start high — every buffered row is already at or
+        # above the boundary — and the unclamped subtraction is why the guard
+        # could not simply be widened.
+        base = max(start, self._tail_start)
+        kept = self._tail.slice(base - self._tail_start)
         if kept.num_rows:
-            if int(kept.column(OFFSET)[0].as_py()) != base + 1:
+            if int(kept.column(OFFSET)[0].as_py()) != base:
                 return None
-        elif self._tail_hi > floor:
+        elif self._tail_end > start:
             return None
 
         return kept
@@ -2900,7 +2908,7 @@ class Buffer:
     def _drop_tail(self) -> None:
         with self._tail_lock:
             self._tail = None
-            self._tail_lo = self._tail_hi = self._tail_from = 0
+            self._tail_start = self._tail_end = self._tail_complete_from = 0
 
     def close(self) -> None:
         # The cache goes too. It is bounded by the unsealed tail and falls to

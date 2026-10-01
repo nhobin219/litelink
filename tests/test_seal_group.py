@@ -343,6 +343,9 @@ def test_the_read_cache_never_hides_rows_a_seal_raced_past(tmp_path: Path) -> No
     arithmetic count from a row that no longer existed — and an over-long Arrow
     slice comes back EMPTY rather than raising, so the miscount was returned as
     "nothing buffered" and every row above the boundary vanished from queries.
+
+    Falsify by recording `_tail_start = start` in `rows_from` instead of the
+    first row's offset: the second read comes back short.
     """
     with open_log(tmp_path, quiet()) as log:
         buffer = log._buffer
@@ -353,13 +356,11 @@ def test_the_read_cache_never_hides_rows_a_seal_raced_past(tmp_path: Path) -> No
         buffer.finish_seal(201, "sealed")
 
         # A reader whose boundary was still 100 when it looked.
-        assert buffer.rows_from(100 + 1).num_rows == 100
+        assert buffer.rows_from(101).num_rows == 100
 
         # The next query, with the boundary caught up.
-        assert (
-            buffer.rows_from(200 + 1).num_rows == buffer._rows("> ?", (200,)).num_rows
-        )
-        assert buffer.rows_from(200 + 1).num_rows == 100, "the cache hid buffered rows"
+        assert buffer.rows_from(201).num_rows == buffer._rows(">= ?", (201,)).num_rows
+        assert buffer.rows_from(201).num_rows == 100, "the cache hid buffered rows"
 
 
 def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> None:

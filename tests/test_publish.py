@@ -2847,13 +2847,13 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         # Committed, not retired: the crash lands between the two.
         log._write_and_commit(start, end, rel_path)
 
-        held = log._buffer.count_from(0 + 1)  # noqa: SLF001
+        held = log._buffer.count_from(1)  # noqa: SLF001
 
         assert held > 0
 
         log.recover()
 
-        assert log._buffer.count_from(0 + 1) == held, (  # noqa: SLF001
+        assert log._buffer.count_from(1) == held, (  # noqa: SLF001
             "recovery deleted rows the published table has not been sent"
         )
 
@@ -4137,7 +4137,7 @@ def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
         log.extend(rows(500))
         log.seal()
 
-        assert log._buffer.count_from(0 + 1) == 500, "the fixture must keep sealed rows"
+        assert log._buffer.count_from(1) == 500, "the fixture must keep sealed rows"
         assert log.buffered_rows() == 0
         assert log.staging_rows() == 500
 
