@@ -120,9 +120,9 @@ litelink.validate_row(schema, row)                                 # raises as a
 litelink.preflight(...)                                            # what python -m litelink runs
 
 # Every handle reads:
-    log.scan(*, columns=None, where=None, start_offset=None, end_offset=None)
-    log.sql(query)                                  # the log is `log`; both stream Arrow
-    log.column_statistics(*, tier=None) · log.coverage()   # tier: local|archive|buffer|None
+    log.scan(*, columns=None, where=None, start_offset=None, end_offset=None, archive=True)
+    log.sql(query, *, archive=True)                 # the log is `log`; both stream Arrow
+    log.column_statistics(*, tier=None) · log.coverage(*, archive=True)   # tier: local|archive|buffer|None
     log.end_offset() · buffered_rows() · table_rows() · table_files() · archived_through()
     log.schema · sort_by · config · archive
 
@@ -191,6 +191,7 @@ touches the network:
 log.scan(where="event_ts > 1787772000000000")   # recent: local disk only
 log.scan(where="event_ts < 1700000000000000")   # history: reads the archive too
 log.scan()                                      # the whole log
+log.scan(archive=False)                         # local disk only, whatever it asks
 ```
 
 So a query's latency follows its predicates. Bound it on a leading column of `sort_by` and a

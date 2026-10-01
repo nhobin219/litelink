@@ -640,3 +640,177 @@ def test_eviction_widens_the_archive_row_before_it_commits(
     assert seen, "the fixture must evict"
     for boundary, covered_until in seen:
         assert covered_until is not None and covered_until > boundary
+
+
+# -- coverage -------------------------------------------------------------------
+
+
+def coverage_log(tmp_path: Path, bucket: str, s3: S3Options) -> WriteHandle:
+    """Archive below, local table in the middle, a buffered tail on top."""
+    log = evicted(tmp_path, bucket, s3)
+    log.extend({"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(7))
+
+    return log
+
+
+def covered(coverage: litelink.Coverage) -> list[int]:
+    return [
+        offset
+        for span in (coverage.archive, coverage.local, coverage.buffer)
+        if span is not None
+        for offset in range(span[0], span[1] + 1)
+    ]
+
+
+@pytest.mark.s3
+def test_coverage_partitions_the_log_without_the_network(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three ranges, each offset in exactly one, and the archive never asked.
+
+    Falsify by reading the archive's own extent for `archive` (its whole
+    range, overlapping the local copy): offsets repeat across tiers, and the
+    refused archive raises.
+    """
+    from litelink._archive import Archive
+
+    with coverage_log(tmp_path, bucket, s3) as log:
+        extent = log.table_extent()
+        assert extent is not None
+
+        def refuse(*_: object) -> None:
+            msg = "coverage must not open the archive"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(Archive, "table", refuse)
+        coverage = log.coverage()
+
+        assert coverage.archive == (1, extent[0] - 1)
+        assert coverage.local == extent
+        assert coverage.buffer == (ROWS + 1, ROWS + 7)
+        assert covered(coverage) == list(range(1, ROWS + 8)), "each offset once"
+
+
+@pytest.mark.s3
+def test_coverage_reads_the_archive_only_when_no_row_is_stored(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A log not yet backfilled gets the same answer, from the manifests.
+
+    Falsify by returning None for `archive` when there is no stored row: the
+    archive's range goes missing, and with it where the log starts.
+    """
+    with coverage_log(tmp_path, bucket, s3) as log:
+        expected = log.coverage()
+        with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
+            forged.execute("DELETE FROM tier_offsets WHERE tier = 'archive'")
+            forged.execute("DELETE FROM tier_statistics WHERE tier = 'archive'")
+
+        assert log.coverage() == expected
+
+
+@pytest.mark.s3
+def test_coverage_without_the_archive_never_opens_it(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`archive=False` answers a log with no stored archive row from local disk.
+
+    That is the one case the full answer reads the archive's manifests, so a
+    replay held to the local floor would otherwise pay — or fail on — S3.
+
+    Falsify by ignoring `archive` in the fallback: the refused archive raises.
+    """
+    from litelink._archive import Archive
+
+    with coverage_log(tmp_path, bucket, s3) as log:
+        expected = log.coverage()
+        with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
+            forged.execute("DELETE FROM tier_offsets WHERE tier = 'archive'")
+            forged.execute("DELETE FROM tier_statistics WHERE tier = 'archive'")
+
+        def refuse(*_: object) -> None:
+            msg = "coverage(archive=False) must not open the archive"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(Archive, "table", refuse)
+        coverage = log.coverage(archive=False)
+
+        assert coverage.archive is None, "not asked"
+        assert (coverage.local, coverage.buffer) == (expected.local, expected.buffer)
+
+
+def test_a_stored_local_range_for_another_version_is_not_used(
+    tmp_path: Path,
+) -> None:
+    """The local range is the stamped one only for the version the table is at.
+
+    Falsify by dropping the version comparison in `coverage`: the forged row's
+    range is reported.
+    """
+    with buffered_log(tmp_path) as log:
+        with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
+            forged.execute(
+                "UPDATE tier_offsets SET start_offset = 500, end_offset = 600"
+                " WHERE tier = 'local'"
+            )
+            forged.execute(
+                "UPDATE tier_statistics SET version = '99999-other.metadata.json'"
+                " WHERE tier = 'local'"
+            )
+
+        coverage = log.coverage()
+
+        assert coverage.local == (1, 100)
+        assert coverage.buffer == (101, 150)
+        assert coverage.archive is None, "no archive configured"
+
+
+@pytest.mark.s3
+def test_coverage_leaves_rows_a_seal_kept_to_the_local_table(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """With `wal_replication` a seal keeps its rows in the buffer until `sync`;
+    they are reported once, as local, and the buffer only above.
+
+    Falsify by reporting the buffer's own extent without clipping it: the
+    buffer starts at 1 and every sealed offset is counted twice.
+    """
+    with archived_log(tmp_path, bucket, s3, wal_replication=True) as log:
+        log.extend(rows(100))
+        log.seal()
+        log.extend({"event_ts": 100 + i, "key": "t", "payload": "y"} for i in range(5))
+        assert log.buffered_rows() == 5
+        coverage = log.coverage()
+
+        assert coverage.local == (1, 100)
+        assert coverage.buffer == (101, 105)
+        assert covered(coverage) == list(range(1, 106)), "each offset once"
+
+
+@pytest.mark.s3
+def test_a_read_without_the_archive_stops_at_the_local_floor(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`archive=False` serves the local table and the buffer, and only them —
+    from the floor `coverage(archive=False)` reports, with no network.
+
+    The reads here reach below the local table, so without the flag each one
+    reads the archive. Falsify by ignoring `archive` in `Reader.query`: the
+    refused archive raises.
+    """
+    with coverage_log(tmp_path, bucket, s3) as log:
+        coverage = log.coverage(archive=False)
+        assert coverage.local is not None
+        assert coverage.buffer is not None
+        floor = coverage.local[0]
+        assert floor > 1, "the fixture must evict part of the log"
+        Remote(monkeypatch, refuse=True)
+
+        scanned = log.scan(archive=False).read_all()[OFFSET].to_pylist()
+        assert scanned == list(range(floor, coverage.buffer[1] + 1))
+
+        below = log.scan(end_offset=floor, archive=False).read_all()
+        assert below.num_rows == 0, "only the archive holds these"
+
+        counted = log.sql("SELECT count(*) AS n FROM log", archive=False)
+        assert counted.read_all()["n"][0].as_py() == len(scanned)

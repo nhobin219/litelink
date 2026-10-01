@@ -42,6 +42,19 @@ minor version carries breaking changes.
   a new name. A log a 0.5 release widened stays readable. One a 0.5 release
   left mid-`add_column` is refused, naming 0.5.1 as the release to finish it
   with.
+- **`coverage()` reports each tier's offset range: `Coverage(archive, local,
+  buffer)`**, each an inclusive `(lo, hi)` or None, partitioning the log like
+  `column_statistics`' tiers. `archive` is now what only the archive holds,
+  below the local table, rather than the whole archive; `buffered` is renamed
+  `buffer`; `gap` and `wal_replication` are removed. It is read from the
+  offsets kept in `buffer.db` for routing, so it no longer opens the archive,
+  except for a log with no stored archive row yet — and
+  `coverage(archive=False)` skips even that, for a caller that only needs the
+  local floor, `min(local[0], buffer[0])`.
+- **`scan(archive=False)` and `sql(..., archive=False)`** read the local table
+  and the buffer only, never the archive, whatever the query asks — what
+  `include_archive=False` did, per read rather than per handle. Rows only the
+  archive holds are left out, not refused.
 - **The 0.1 → 0.2 migration is removed** (`litelink.migrate`). A log still in
   the pre-0.2 layout is refused with the command to run under litelink 0.5.1,
   the last release that carries it.

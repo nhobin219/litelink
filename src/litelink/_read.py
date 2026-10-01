@@ -333,7 +333,7 @@ class Reader:
 
         return location, covered
 
-    def query(self, sql: str) -> pa.RecordBatchReader:
+    def query(self, sql: str, *, archive: bool = True) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
 
         **Which tiers it reads is decided here, per query.** The buffer always;
@@ -358,6 +358,9 @@ class Reader:
         A DuckDB cursor is an independent connection over the same database,
         with its own registrations and temp views, so one query cannot reach
         into another's. Verified directly rather than assumed.
+
+        `archive=False` drops the archive leg whatever the terms say: the
+        caller has asked for the local table and the buffer only.
         """
         # Buffer first, table second, and the order is the correctness
         # argument. A seal commits its file and THEN deletes the rows it
@@ -410,8 +413,8 @@ class Reader:
         # After, it cannot happen. I4 means nothing is evicted before it is
         # registered, so an archive snapshot taken later than the local one
         # holds everything the local one has given up.
-        local, archive = self._tiers(found, location, extent)
-        remote = self._prepare_remote(cursor) if archive else None
+        local, needed = self._tiers(found, location, extent)
+        remote = self._prepare_remote(cursor) if archive and needed else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW

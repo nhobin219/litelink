@@ -76,8 +76,10 @@ from litelink._table import (
     archive_retired,
     forget_archive_entry,
 )
+from litelink._tiers import ARCHIVE as ARCHIVE_TIER
+from litelink._tiers import LOCAL as LOCAL_TIER
 from litelink._tiers import UNKNOWN as UNKNOWN_TIER
-from litelink._tiers import ArchiveTier, empty
+from litelink._tiers import ArchiveTier, StoredTiers, empty
 from litelink._tiers import encode as encode_tier
 from litelink._types import NON_FINITE, column_type, validate_schema
 
@@ -373,6 +375,13 @@ def legacy_layout(layout: Layout, why: str = "") -> str:
     )
 
 
+def _inclusive(span: tuple[int, int]) -> tuple[int, int] | None:
+    """A stored `[start, end)` as an inclusive range, or None when empty."""
+    start, end = span
+
+    return None if end <= start else (start, end - 1)
+
+
 def _now() -> str:
     """A timestamp a person will read."""
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -428,18 +437,19 @@ def _scan_query(
 
 @dataclass(frozen=True, slots=True)
 class Coverage:
-    """What a reader holds, and any offsets in neither tier.
+    """Where each tier sits in the log, as inclusive `(lo, hi)` offset ranges.
 
-    Reported rather than enforced. `gap` is a range the reader cannot serve;
-    whether that is lost data or a never-issued reserve is a question only the
-    caller can answer — see `LogHandle.coverage`. `archive` is None when the
-    log has no archive configured.
+    The ranges partition the log, as `column_statistics`' tiers do: `archive`
+    is what only the archive holds — below the local table — `local` is the
+    local table, and `buffer` is the buffered rows above every file. None for a
+    tier holding nothing. The lowest offset any of them reports is where the
+    log starts; the lowest of `local` and `buffer` is how far back a read can
+    go without the archive.
     """
 
     archive: tuple[int, int] | None
-    buffered: tuple[int, int] | None
-    gap: tuple[int, int] | None
-    wal_replication: bool
+    local: tuple[int, int] | None
+    buffer: tuple[int, int] | None
 
 
 class LogHandle:
@@ -533,6 +543,7 @@ class LogHandle:
         where: str | None = None,
         start_offset: int | None = None,
         end_offset: int | None = None,
+        archive: bool = True,
     ) -> pa.RecordBatchReader:
         """Read the log as one relation, newest data included.
 
@@ -551,6 +562,11 @@ class LogHandle:
         reads it. A `where` on any other column still reads it. The same holds
         for a `litelink_offset` comparison in `where` or in `sql`.
 
+        `archive=False` never reads the archive: the result is what the local
+        table and the buffer hold, and rows only the archive has are left out
+        rather than refused. `coverage(archive=False)` says where that floor
+        is, without the network either.
+
         Always bound on a LEADING column of `sort_by`. §7 measures a
         non-leading predicate at 119 ms against 13 ms for the same predicate
         with a leading bound.
@@ -566,10 +582,11 @@ class LogHandle:
                 where=where,
                 start_offset=start_offset,
                 end_offset=end_offset,
-            )
+            ),
+            archive=archive,
         )
 
-    def sql(self, query: str) -> pa.RecordBatchReader:
+    def sql(self, query: str, *, archive: bool = True) -> pa.RecordBatchReader:
         """Run arbitrary DuckDB SQL against the log, exposed as `log`.
 
         The escape hatch for what `scan` cannot express. Quote
@@ -579,11 +596,13 @@ class LogHandle:
         `LogHandle`. Only a single SELECT over `log` with AND-ed comparisons
         in its WHERE is narrowed — any other shape reads every tier, which is
         always correct and only slower.
+
+        `archive=False` never reads the archive, as for `scan`.
         """
         try:
             # No lock. `Reader` guards its own connection and `LogTable` its
             # own cache, both briefly.
-            return self._reader.query(query)
+            return self._reader.query(query, archive=archive)
         except FileNotFoundError as exc:
             # Narrow: the race where a concurrent `sync` sweeps the metadata
             # JSON this read resolved before it loaded it. pyiceberg raises
@@ -691,7 +710,7 @@ class LogHandle:
 
         The log's own cached watermark, not a network read — the same `meta`
         row eviction consults so it can ask a keyed read instead of a round
-        trip. `coverage()` is the one that asks the bucket.
+        trip. `coverage()` gives the archive's range below the local table.
         """
         recorded = self._buffer.get_meta(Maintenance.ARCHIVED_KEY)
 
@@ -821,66 +840,83 @@ class LogHandle:
             columns=statistics.columns,
         )
 
-    def coverage(self) -> Coverage:
-        """What this reader can serve, and where it cannot.
+    def coverage(self, *, archive: bool = True) -> Coverage:
+        """Each tier's offset range, from the offsets the log keeps — no network.
 
-        A reader assembled from a replica cannot ask the primary anything, so
-        it reports rather than adjudicates — the failure to avoid is SILENCE,
-        not incompleteness.
+        `litelink_offset` is the log's own sequence, dense and monotonic across
+        the tiers, so each tier is fully described by where it starts and ends.
+        Those are kept already, for routing (#90): the archive's range and the
+        local table's are stored in `buffer.db`, and the buffer's are its own
+        indexed `min` and `max`. So this is one SQLite read and two edge seeks,
+        against `column_statistics`' walk of every manifest.
 
-        **A gap is not necessarily loss.** The gap sits above the archive's
-        frontier and below the next thing this knows of: the buffer's first
-        offset when it holds rows, and the sequence's end when it does not. A
-        range there is either a band the buffer lost, since rows sealed while
-        `wal_replication` was off are discarded at seal and gone, or a
-        `litelink.restore` fence, which burns 2**20 offsets in exactly that
-        position. Nothing distinguishes them locally: the fence "leaves no
-        trace once the sequence has moved". A caller who knows whether their
-        log has failed over can read a gap that this cannot.
+        The local range is the stored one when it was stamped with the
+        version the table is at, and the snapshot's own extent otherwise —
+        cached per version, so a commit costs one manifest walk per process at
+        most. The archive's range is read from its manifests only when the log
+        has no stored row yet: a log written before the row existed and not
+        yet backfilled, or one just re-pointed. That is the one case this
+        touches the network, and it is never answered wrongly instead.
 
-        A `start_offset` reserve is NOT among them. It lies BELOW the archive's
-        low end, which nothing here compares against, so it never surfaces.
+        `archive=False` is for a caller that will not read the archive — a
+        replay held to the local floor, `min(local[0], buffer[0])`. Its
+        `archive` is None, meaning "not asked" rather than "empty", and nothing
+        but local disk is opened, so the fallback above cannot reach the network.
 
-        **An EMPTY buffer is the case that must not report `gap=None`**, and an
-        earlier version did: the comparison was against `buffered[0]`, so with
-        no buffered rows there was no lower bound and the whole band above the
-        archive went unexamined — a reader serving 864 rows of 1,500 reporting
-        itself gap-free. The sequence closes it, because it counts every offset
-        ever assigned and never lowers.
-
-        What this does NOT model is a second, disjoint band above the buffer's
-        own top: `gap` is one range, and it reports the one adjoining the
-        archive.
+        A gap — offsets assigned but in no tier — is not reported. On the
+        primary the only one is a `litelink.restore` fence, which `recovery()`
+        reports on the handle that made it.
         """
-        archive = self._archive_extent()
-        buffered = self._buffer.extent()
-        gap: tuple[int, int] | None = None
-        if archive is not None:
-            self._table.reload()
-            # ALL THREE TIERS. This arrived for a replica-restored reader,
-            # whose local table was empty by construction, so "archive frontier to the
-            # buffer's first offset" described everything it could serve. A
-            # local log has a third tier in between, and leaving it out
-            # reported every offset sealed-but-not-yet-synced as unservable —
-            # measured, a healthy log with `archive=(1, 432)` and a local table
-            # of `(1, 10000)` reported `gap=(433, 10000)` while serving all
-            # 9,568 of those rows. Sync lagging the table is the design rather
-            # than an error, so that was wrong on nearly every archived log.
-            starts = [
-                extent[0]
-                for extent in (self._table.extent(), buffered)
-                if extent is not None
-            ]
-            above = min(starts) if starts else self._buffer.next_offset()
-            if above > archive[1] + 1:
-                gap = (archive[1] + 1, above - 1)
+        stored = StoredTiers(self._buffer).load()
+        self._table.reload()
+        location, extent = self._table.snapshot()
 
-        return Coverage(
-            archive=archive,
-            buffered=buffered,
-            gap=gap,
-            wal_replication=self.config.wal_replication,
+        cached = stored.get(LOCAL_TIER)
+        if cached is not None and cached.version == location:
+            local = _inclusive(cached.offsets)
+        else:
+            local = extent
+
+        archive_row = stored.get(ARCHIVE_TIER)
+        if archive_row is not None:
+            below = _inclusive(archive_row.offsets)
+        elif archive and self._archive.configured():
+            below = self._archive_below(local)
+        else:
+            below = None
+
+        held = self._buffer.extent()
+        ceiling = max((r[1] for r in (below, local) if r is not None), default=0)
+        buffer = (
+            None
+            if held is None or held[1] <= ceiling
+            else (max(held[0], ceiling + 1), held[1])
         )
+
+        return Coverage(archive=below if archive else None, local=local, buffer=buffer)
+
+    def _archive_below(self, local: tuple[int, int] | None) -> tuple[int, int] | None:
+        """The archive's range below the local table, read from its manifests.
+
+        The fallback for a log with no stored archive row. A file straddling the
+        local table's first offset counts whole, as everywhere else.
+        """
+        try:
+            archive = self._archive.table()
+            if archive is None:
+                return None
+
+            archive.reload()
+            schema, files = archive.live_files()
+        except FileNotFoundError as exc:
+            raise self._swept(exc) from exc
+
+        spans = [_offsets(schema, f) for f in files]
+        below = [s for s in spans if local is None or s[0] < local[0]]
+        if not below:
+            return None
+
+        return min(lo for lo, _ in below), max(hi for _, hi in below)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -991,8 +1027,8 @@ class LogHandle:
         **The re-read is not optional.** Both caches short-circuit —
         `Archive.table` on a live handle and `LogTable.extent` on an unchanged
         `metadata_location` — so without `reload()` a long-lived reader would
-        answer from the pointer it last saw, and `coverage()` would report an
-        archive another process has since committed past.
+        answer from the pointer it last saw, and `end_offset()` would report
+        an archive another process has since committed past.
 
         The archive carries `previous-versions-max: 10`, so a pointer eleven
         archive commits old names deleted metadata. That is `_swept`: on the
