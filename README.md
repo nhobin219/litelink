@@ -325,8 +325,6 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
   `binary` columns are carried, for ids and other small values rather than payloads
   ([SPEC](docs/SPEC.md) §15).
 
-- **Payload encoding and local-disk backpressure** are open ([SPEC](docs/SPEC.md) §13).
-
 ## Documentation
 
 - [`docs/API.md`](docs/API.md) — every public call, on one page
