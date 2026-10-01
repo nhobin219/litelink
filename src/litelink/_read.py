@@ -224,17 +224,38 @@ def load_extension(
         raise ExtensionMissing(msg) from exc
 
 
-def duckdb_connection() -> duckdb.DuckDBPyConnection:
-    """A connection with the read path's extensions loaded.
+def duckdb_connection(
+    s3: S3Options | None = None, *, remote: bool = False
+) -> duckdb.DuckDBPyConnection:
+    """A DuckDB connection provisioned to read a published table (#108).
 
-    Provisioned, not autoinstalled — see scripts/install_duckdb_extensions.py
-    and §7 on why the first read must not be a network read.
+    `avro` and `iceberg` are loaded from the extensions litelink's platform
+    wheels bundle, or from this machine's DuckDB home — never fetched: §7 makes
+    provisioning a build or deploy step, and the first read must not be a
+    network read. A missing one raises `ExtensionMissing`, saying how to
+    provision it.
 
-    A module function rather than something `Reader` does for itself, so a
-    caller can hand it a different one. It stays a factory rather than a
-    connection because building one costs ~140 ms, which a log that only ever
-    appends should not pay at `open`.
+    `remote=True` also loads `httpfs` and creates the S3 secret, from `s3` or,
+    with none given, from the environment (`S3Options()`), which falls back to
+    the AWS credential chain. That is what reading a published table on S3 from
+    another machine needs:
+
+        con = litelink.duckdb_connection(remote=True)
+        con.sql("SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/trades',"
+                " version_name_format = '%s%s.metadata.json')")
+
+    `s3` without `remote=True` is refused rather than ignored: credentials
+    nobody installs read as anonymous, and that fails as a 403 at the first
+    query rather than here.
+
+    A new connection per call, which the caller owns. Building one costs about
+    half a second, nearly all of it `LOAD iceberg` (#102), so hold on to it.
+    It is also the factory every log's reader is built with.
     """
+    if s3 is not None and not remote:
+        msg = "s3 options are for a remote connection; pass remote=True as well"
+        raise ValueError(msg)
+
     connection = duckdb.connect()
     # `avro` BEFORE `iceberg`, and quietly: `iceberg`'s init auto-installs it
     # otherwise, which needs the network and defeats the point of bundling.
@@ -247,6 +268,9 @@ def duckdb_connection() -> duckdb.DuckDBPyConnection:
     # No ATTACH of the buffer database. `Buffer.rows_from` records what that
     # cost: two SQLite libraries in one process is silent corruption, not a
     # slow path.
+    if remote:
+        load_extension(connection, "httpfs", remote=True)
+        connection.execute(secret_sql((s3 or S3Options()).resolved()))
 
     return connection
 

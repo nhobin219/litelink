@@ -7,6 +7,18 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`litelink.duckdb_connection(s3=None, *, remote=False)`**: a DuckDB
+  connection provisioned to read a published table on another machine
+  (#108). It loads `avro` and `iceberg` from the extensions litelink bundles;
+  `remote=True` also loads `httpfs` and creates the S3 secret. A missing
+  extension raises the now-public `litelink.ExtensionMissing`. It replaces
+  reaching into `litelink._read` for `duckdb_connection`, `load_extension` and
+  `secret_sql`.
+
 ## 0.6.0 — 2026-10-01
 
 ### Changed — breaking
