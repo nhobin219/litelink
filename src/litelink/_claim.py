@@ -95,8 +95,7 @@ class Claim:
     connection: sqlite3.Connection
     lock: threading.RLock
     kind: str
-    # The claimed offsets, `[start, end)`. Stored in the `lo` and `hi`
-    # columns, which kept their names.
+    # The claimed offsets, `[start, end)`.
     start: int
     end: int
     owner: str
@@ -120,7 +119,7 @@ class Claim:
                 # when a < d and b > c.
                 clash = self.connection.execute(
                     "SELECT 1 FROM claim WHERE expires_at > ? AND owner <> ? "
-                    "AND lo < ? AND hi > ? LIMIT 1",
+                    "AND start_offset < ? AND end_offset > ? LIMIT 1",
                     (now, self.owner, self.end, self.start),
                 ).fetchone()
                 if clash is not None:
@@ -134,11 +133,13 @@ class Claim:
                 # and a lapsed holder would still find its own row and renew
                 # itself back to life over the range someone else now owns.
                 self.connection.execute(
-                    "DELETE FROM claim WHERE expires_at <= ? AND lo < ? AND hi > ?",
+                    "DELETE FROM claim WHERE expires_at <= ?"
+                    " AND start_offset < ? AND end_offset > ?",
                     (now, self.end, self.start),
                 )
                 cursor = self.connection.execute(
-                    "INSERT INTO claim (owner, expires_at, kind, lo, hi, rel_path) "
+                    "INSERT INTO claim"
+                    " (owner, expires_at, kind, start_offset, end_offset, rel_path) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         self.owner,

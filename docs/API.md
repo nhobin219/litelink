@@ -110,8 +110,13 @@ Most deployments use six: `new`/`open`, `extend`, `scan`, `seal_due`, `maintain`
 **Every offset range litelink reports is half-open, `[start, end)`**: `coverage()`,
 `staging_extent()`, what `ingest()` returns, `recovery().skipped`, the tier offsets
 `litelink.manifest` prunes on. `end` is the offset after the last one, so a range's length is
-`end - start` and an empty one is `start == end`. A single offset, like
-`published_through()`, is the last offset held.
+`end - start` and an empty one is `start == end`.
+
+**The names carry the convention.** `start`/`end` is a half-open range: an `end` is never an
+offset you hold, which is why `end_offset()` is the offset the next append gets. `through` is a
+single offset you do hold, the last one: `published_through()`, and the `through` a retirement
+records. Nothing is named `lo`/`hi` or `min`/`max` for a range, because those read as two values
+the range contains.
 
 ## Lifecycle
 

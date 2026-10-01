@@ -657,6 +657,17 @@ class Buffer:
 
         return buffer
 
+    def _rename_range_columns(self, table: str) -> None:
+        """`lo`/`hi` → `start_offset`/`end_offset` on `table`, once."""
+        columns = {
+            str(row[1]) for row in self._con.execute(f"PRAGMA table_info({table})")
+        }
+        if "lo" in columns:
+            self._con.execute(f"ALTER TABLE {table} RENAME COLUMN lo TO start_offset")
+
+        if "hi" in columns:
+            self._con.execute(f"ALTER TABLE {table} RENAME COLUMN hi TO end_offset")
+
     @staticmethod
     def _connect_readonly(path: Path) -> sqlite3.Connection:
         return sqlite3.connect(
@@ -687,7 +698,7 @@ class Buffer:
         # path this database does not already hold — see `pending_delete`.
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS compacting (
-              lo INTEGER, hi INTEGER, rel_path TEXT
+              start_offset INTEGER, end_offset INTEGER, rel_path TEXT
             )
         """)
         # The deletion queue. A file leaves the current snapshot long before it
@@ -817,17 +828,25 @@ class Buffer:
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               owner      TEXT NOT NULL,
               expires_at INTEGER NOT NULL,
-              kind       TEXT NOT NULL,
-              lo         INTEGER NOT NULL,
-              hi         INTEGER NOT NULL,
-              rel_path   TEXT
+              kind         TEXT NOT NULL,
+              start_offset INTEGER NOT NULL,
+              end_offset   INTEGER NOT NULL,
+              rel_path     TEXT
             )
         """)
+        # Both tables named their range `lo`/`hi` before every range became
+        # half-open, and those names read as inclusive. Renamed in place, as
+        # every other table names a range; SQLite carries `claim_live` along.
+        # The values need no conversion: a claim lives 30 s, and recovery
+        # reads only the path from a `compacting` row.
+        self._rename_range_columns("claim")
+        self._rename_range_columns("compacting")
         # Every acquisition asks the same question — is a live claim covering
         # this range — and asks it inside a write transaction, so it is the one
         # query that must not degrade into a scan as claims accumulate.
         self._con.execute("""
-            CREATE INDEX IF NOT EXISTS claim_live ON claim (expires_at, lo, hi)
+            CREATE INDEX IF NOT EXISTS claim_live
+            ON claim (expires_at, start_offset, end_offset)
         """)
         # A buffer carrying the old `lease` table was last written by a build
         # that coordinated through it, and this one coordinates through
@@ -2548,8 +2567,8 @@ class Buffer:
         # clears its own.
         with self._lock:
             self._con.execute(
-                # `[start, end)`, in the columns' pre-existing names.
-                "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
+                "INSERT INTO compacting (start_offset, end_offset, rel_path)"
+                " VALUES (?, ?, ?)",
                 (start, end, rel_path),
             )
 
@@ -2564,15 +2583,15 @@ class Buffer:
         """
         with self._lock:
             self._con.execute(
-                # `[start, end)`, in the columns' pre-existing names.
-                "INSERT INTO compacting (lo, hi, rel_path) VALUES (?, ?, ?)",
+                "INSERT INTO compacting (start_offset, end_offset, rel_path)"
+                " VALUES (?, ?, ?)",
                 (start, end, rel_path),
             )
 
     def pending_compaction(self) -> tuple[int, int, str] | None:
         with self._lock:
             row = self._con.execute(
-                "SELECT lo, hi, rel_path FROM compacting"
+                "SELECT start_offset, end_offset, rel_path FROM compacting"
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
@@ -2582,7 +2601,8 @@ class Buffer:
         several for an interrupted published rewrite."""
         with self._lock:
             rows = self._con.execute(
-                "SELECT lo, hi, rel_path FROM compacting ORDER BY rowid"
+                "SELECT start_offset, end_offset, rel_path FROM compacting"
+                " ORDER BY rowid"
             ).fetchall()
 
         return [(int(start), int(end), str(path)) for start, end, path in rows]
