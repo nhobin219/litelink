@@ -121,8 +121,7 @@ class LogConfig:
     # compacted file, once.
     #
     # None means `COMPACT_MULTIPLE` times the seal size, and the conversion is
-    # therefore ON by default even with no archive. A local-only log gets the
-    # same benefit at read time: file count is a measured cost here, not a
+    # therefore ON by default. A log gets the benefit at read time too: file count is a measured cost here, not a
     # reputation — reading the offset boundary from manifest statistics
     # measured 1.0 ms over one file and 44 ms over 64.
     #

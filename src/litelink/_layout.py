@@ -130,6 +130,17 @@ class Layout:
         """
         return f"file://{self.directory}"
 
+    @property
+    def default_archive(self) -> str:
+        """Where a log with no remote archive publishes: a local directory (#98).
+
+        Computed rather than stored, so `meta` records only a location the
+        caller chose, and an empty row — what a log written before #98 holds —
+        means this one. Under the log's own directory, so a log stays one
+        directory; the table itself is `<this>/<name>`, as on S3.
+        """
+        return f"{LOCAL_SCHEME}{self.directory / 'published'}"
+
     def archive_table_location(self, prefix: str) -> str:
         """The same, in the archive prefix.
 
@@ -289,10 +300,19 @@ class Layout:
         self.directory.mkdir(parents=True, exist_ok=True)
 
 
-# The only scheme an archive prefix may carry. Not a general URI parser: the
+# The schemes an archive prefix may carry. Not a general URI parser: a remote
 # archive is object storage, everything downstream builds `s3://` paths from
-# it, and `litestream_config` emits a `type: s3` replica.
+# it, and `litestream_config` emits a `type: s3` replica. A local one is a
+# directory, and every log has one — the default, under the log's own
+# directory, when no remote archive is given (#98).
 ARCHIVE_SCHEME = "s3://"
+LOCAL_SCHEME = "file://"
+
+
+def is_remote(archive: str) -> bool:
+    """Whether an archive location is object storage rather than a directory."""
+    return archive.startswith(ARCHIVE_SCHEME)
+
 
 # What may appear in a bucket name. Deliberately laxer than AWS's own rule —
 # litelink is tested against rustfs and MinIO, which accept names AWS would
@@ -305,7 +325,8 @@ _BUCKET_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456
 
 
 def validate_archive(archive: str) -> None:
-    """Refuse an archive prefix that is not `s3://bucket[/prefix]`.
+    """Refuse an archive prefix that is not `s3://bucket[/prefix]` or
+    `file:///directory`.
 
     Checked where the caller hands one over, because nothing downstream can
     tell a malformed prefix from a deliberate one — every consumer parses it
@@ -329,6 +350,16 @@ def validate_archive(archive: str) -> None:
     anything. Nothing here touches the network — whether the bucket EXISTS is a
     different question, answered by the operation that needs it.
     """
+    if archive.startswith(LOCAL_SCHEME):
+        if not archive.startswith(LOCAL_SCHEME + "/"):
+            msg = (
+                f"archive={archive!r} is not an absolute path. A local archive "
+                f"is `file:///absolute/directory`."
+            )
+            raise ValueError(msg)
+
+        return
+
     if not archive.startswith(ARCHIVE_SCHEME):
         # The near-miss first and by name. A caller who typed one slash is not
         # helped by being told the general rule; they are helped by being shown
@@ -346,7 +377,8 @@ def validate_archive(archive: str) -> None:
             f"prefix a log's data is published under — `s3://bucket` or "
             f"`s3://bucket/prefix` — and the log's own name is appended to it, "
             f"so the prefix names the DIRECTORY that holds the logs, not one "
-            f"log. A local-only log takes archive=None."
+            f"log. A local one is `file:///directory`, and archive=None "
+            f"publishes under the log's own directory."
         )
         raise ValueError(msg)
 

@@ -52,12 +52,6 @@ def test_sort_by_must_name_real_columns() -> None:
         validate(SCHEMA, ("nonexistent",), LogConfig(), None)
 
 
-def test_zero_retention_without_an_archive_is_refused() -> None:
-    """§8: it means 'evict on upload', and there is nothing to upload to."""
-    with pytest.raises(ValueError, match="archive"):
-        validate(SCHEMA, (), LogConfig(local_retention=timedelta(0)), None)
-
-
 def test_zero_retention_is_fine_with_an_archive() -> None:
     validate(SCHEMA, (), LogConfig(local_retention=timedelta(0)), "s3://bucket/x")
 
@@ -271,8 +265,8 @@ def test_set_config_persists(tmp_path: Path) -> None:
 
 def test_set_config_validates(tmp_path: Path) -> None:
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="archive"):
-            log.set_config(LogConfig(local_retention=timedelta(0)))
+        with pytest.raises(ValueError, match="remote archive"):
+            log.set_config(LogConfig(wal_replication=True))
 
         assert log.config == LogConfig(), "a rejected config must not be applied"
 
@@ -286,7 +280,7 @@ def test_set_archive_persists(tmp_path: Path) -> None:
         reopened.set_archive(None)
 
     with litelink.open(tmp_path, "s") as detached:
-        assert detached._archive.uri is None
+        assert detached._archive.uri == Layout(tmp_path, "s").default_archive
 
 
 def test_sort_by_is_declared_on_the_table(tmp_path: Path) -> None:
@@ -751,23 +745,6 @@ def test_compact_min_files_below_two_is_refused(tmp_path: Path) -> None:
             )
 
 
-def test_local_rows_zero_without_an_archive_is_refused(tmp_path: Path) -> None:
-    """The same intent, refused on one knob and accepted on its twin.
-
-    `local_retention=0` was refused on a local-only log as "would delete each
-    file as it sealed", and `local_rows=0` means exactly that — keep the newest
-    zero rows — and was accepted, evicting every sealed file as the only copy.
-    """
-    with pytest.raises(ValueError, match="evict on upload"):
-        litelink.new(
-            tmp_path,
-            "s",
-            schema=SCHEMA,
-            sort_by=("event_ts",),
-            config=LogConfig(local_rows=0),
-        )
-
-
 def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
     """The rename is an offline upgrade, and silence would be the dangerous part.
 
@@ -850,11 +827,11 @@ def test_two_processes_cannot_assemble_the_pair_validate_refuses(
         archive="s3://bucket/prefix",
     )
     with log, litelink.open(tmp_path, "s") as other:
-        # `other` opened while an archive was configured and a normal policy
-        # was in force; it still remembers both.
-        log.set_config(LogConfig(local_rows=0))
+        # `other` opened while a remote archive was configured and a normal
+        # policy was in force; it still remembers both.
+        log.set_config(LogConfig(wal_replication=True))
 
-        with pytest.raises(ValueError, match="evict on upload"):
+        with pytest.raises(ValueError, match="remote archive"):
             other.set_archive(None)
 
 
@@ -1028,14 +1005,14 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
     )
     with first, litelink.open(tmp_path, "s") as second:
         assert second.config.local_rows is None
-        assert not second._archive.configured()
+        assert not second._archive.remote()
 
         first.set_config(LogConfig(local_rows=4242))
         first.set_archive("s3://bucket/prefix")
 
         # `second` was never told, and never asked.
         assert second.config.local_rows == 4242
-        assert second._archive.configured()
+        assert second._archive.remote()
         assert second._archive.uri == "s3://bucket/prefix"
         assert second._maintenance.config.local_rows == 4242
         assert second._buffer.config().local_rows == 4242
@@ -1324,7 +1301,9 @@ def test_repointing_a_log_at_a_malformed_archive_is_refused(tmp_path: Path) -> N
         with pytest.raises(ValueError, match="missing a slash"):
             log.set_archive("s3:/bucket/prefix")
 
-        assert log.archive is None, "a refused repoint was stored anyway"
+        assert log.archive == Layout(tmp_path, "s").default_archive, (
+            "a refused repoint was stored anyway"
+        )
 
 
 def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(

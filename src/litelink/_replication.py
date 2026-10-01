@@ -127,6 +127,13 @@ def litestream_config(
     the generated config is safe to commit, copy and hand around — the same
     reason `S3Options` is not part of `LogConfig`.
     """
+    if not archive.startswith("s3://"):
+        msg = (
+            f"replication needs a remote archive (s3://), not {archive!r}: the "
+            f"WAL replica exists to get unsealed rows off this machine"
+        )
+        raise ValueError(msg)
+
     target = destination(archive, layout.name)
     bucket, _, prefix = target.removeprefix("s3://").rstrip("/").partition("/")
     resolved = s3.resolved()

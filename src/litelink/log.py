@@ -46,7 +46,7 @@ from litelink._buffer import (
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
 from litelink._fs import write_parquet
-from litelink._layout import Layout, validate_archive
+from litelink._layout import Layout, is_remote, validate_archive
 from litelink._maintenance import (
     CONFIG_KEY,
     Maintenance,
@@ -526,8 +526,9 @@ class LogHandle:
         return self._buffer.schema
 
     @property
-    def archive(self) -> str | None:
-        """Where the archive is, or None for a local-only log.
+    def archive(self) -> str:
+        """Where the archive is: `s3://…`, or a `file://` directory — by
+        default under the log's own, for a log given no remote one (#98).
 
         Read from `meta` on every access, so a caller cannot disagree with the
         log about it.
@@ -717,7 +718,7 @@ class LogHandle:
         return 0 if recorded is None else int(recorded)
 
     def archive_files(self) -> int:
-        """How many data files the archive holds, or 0 with no archive.
+        """How many data files the archive holds, or 0 before its first sync.
 
         A network round trip, unlike `table_files()`.
         """
@@ -790,7 +791,7 @@ class LogHandle:
         local_schema, local_files = self._table.live_files()
         span = local_span(local_schema, local_files)
 
-        if tier == "buffer" and (span is not None or not self._archive.configured()):
+        if tier == "buffer" and span is not None:
             # With local files, nothing in the archive reaches above them, so
             # the buffer's part needs no network read.
             ceiling = 0 if span is None else span[1]
@@ -880,7 +881,7 @@ class LogHandle:
         archive_row = stored.get(ARCHIVE_TIER)
         if archive_row is not None:
             below = _inclusive(archive_row.offsets)
-        elif archive and self._archive.configured():
+        elif archive:
             below = self._archive_below(local)
         else:
             below = None
@@ -1003,15 +1004,7 @@ class LogHandle:
         docstring explains that getting it wrong leaves "rows silently missing
         from the answer". Revisit if a workload ever shows it.
         """
-        # Cheapest first, and the order is load-bearing for I5. `configured()`
-        # is a keyed `meta` read and opens nothing, so a local-only log answers
-        # here without resolving anything — measured at 4.3 ms saved per read,
-        # against a 37 ms scan, purely from not reloading a catalog whose
-        # answer could not have mattered.
-        if not self._archive.configured():
-            return False
-
-        # Then the local table, which is manifest statistics and no network.
+        # The local table first, which is manifest statistics and no network.
         # Reloaded because the dangerous direction is a stale "the table has
         # files" on one another process has just evicted — that would drop the
         # archive leg and serve short with no error.
@@ -1119,10 +1112,11 @@ class LocalReadHandle(LogHandle):
         made the guard unnecessary — there is nothing to call.
         """
         archive = self.archive
-        if archive is None:
+        if not self._archive.remote():
             msg = (
-                f"{self.root}/{self.name} has no archive, so there is nowhere to "
-                f"ship its WAL — replication needs one"
+                f"{self.root}/{self.name} publishes to a local archive "
+                f"({archive}), so there is nowhere off this machine to ship its "
+                f"WAL — replication needs a remote (s3://) one"
             )
             raise ValueError(msg)
 
@@ -1293,19 +1287,18 @@ class WriteHandle(LocalReadHandle):
         sequential and needs a sort after reading. For a log, replay is the
         primary access pattern, which makes that the expensive half.
 
-        `archive` is the remote warehouse prefix (e.g. `s3://bucket/prefix`).
-        None means local-only: capture, seal, compaction, retention and reads
-        all work with no network, forever (§11).
+        `archive` is where the log publishes: a warehouse prefix on S3
+        (`s3://bucket/prefix`) or a local directory (`file:///directory`).
+        None publishes under the log's own directory, and then capture, seal,
+        compaction, publishing, retention and reads all work with no network,
+        forever (§11).
         """
         # `None` and `()` mean the same thing — offset order — so nothing
         # downstream has to distinguish "unset" from "explicitly unsorted".
         order = tuple(sort_by or ())
         settings = config or LogConfig()
-        # Same normalisation as `set_archive`, and for the same reason: an
-        # empty string is not None to `validate`, so every rule that
-        # presupposes an archive was skipped while `configured()` came back
-        # False — `litelink.new(archive="", config=LogConfig(local_retention=0))`
-        # was accepted, which is exactly the pair `validate` exists to refuse.
+        # Same normalisation as `set_archive`: an empty string and None both
+        # mean the local default, which `validate` sees as None.
         archive = (archive or "").rstrip("/") or None
         validate(schema, order, settings, archive)
         # The type as well as the range, because this one is written to `meta`
@@ -1385,7 +1378,9 @@ class WriteHandle(LocalReadHandle):
             {
                 _CONFIG_KEY: settings.to_json(),
                 _SORT_KEY: json.dumps(list(order)),
-                **({_ARCHIVE_KEY: archive} if archive is not None else {}),
+                # Always recorded (#98): the local default when none is given,
+                # so the location the sync fences compare is the stored one.
+                _ARCHIVE_KEY: (archive or "").rstrip("/") or layout.default_archive,
                 # Recorded only when there IS a reserve. Absent means
                 # "started at 1", which a backfill must read as "no reserve"
                 # rather than "a reserve of nothing" — a log created at 1 and
@@ -1415,9 +1410,9 @@ class WriteHandle(LocalReadHandle):
             archive=remote,
         )
 
-        # With no archive there is nothing below the local table, known at
-        # birth. With one, the check above may have been unable to reach it,
-        # so its row waits for the first sync.
+        # A fresh local default holds nothing below the local table, known at
+        # birth. A given one may already hold rows, and the check above may
+        # have been unable to reach it, so its row waits for the first sync.
         if archive is None:
             table_schema_ = buffer.shape().table
             log._tiers.replace(table_schema_, empty(table_schema_))
@@ -1602,6 +1597,14 @@ class WriteHandle(LocalReadHandle):
         # as a YAML parse error from the litestream subprocess, after the root
         # has already been created.
         validate_archive(archive)
+        if not is_remote(archive):
+            msg = (
+                f"restore needs a remote archive (s3://), not {archive!r}: it "
+                f"recovers a log from the WAL replica beside it, and only a "
+                f"remote archive has one"
+            )
+            raise ValueError(msg)
+
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
         # its last write, not a log. Refusing it would leave the root in a
@@ -2055,7 +2058,8 @@ class WriteHandle(LocalReadHandle):
         return self._restored_from
 
     def set_archive(self, archive: str | None) -> None:
-        """Point the log at an archive, or detach it (§5).
+        """Point the log at another archive, or back at its local default
+        with None (§5). There is no detached state (#98).
 
         Takes the whole-log claim, so it cannot interleave with a sync, a
         merge, an eviction or the other setter — `validate` refuses a PAIR, so
@@ -2098,14 +2102,19 @@ class WriteHandle(LocalReadHandle):
         naming it, eviction keeps asking about the archive that is configured
         now, and compaction keeps refusing to merge across any of them.
         """
-        # NORMALISED here, not in `_repoint`. Every guard below tests
-        # `archive is None`, and `_repoint` used to be the only place that
-        # turned an empty string into None — so `set_archive("")` was non-None
-        # to `validate`, to `_refuse_archive_ahead` and to
-        # `_refuse_lossy_detach`, and None to the write. It detached with none
-        # of the three applying. Measured: 7,828 acknowledged rows lost, the
-        # same magnitude as the case those guards exist for.
-        archive = (archive or "").rstrip("/") or None
+        # NORMALISED here, not in `_repoint`, so every guard below and the
+        # write see the same location. `set_archive("")` once detached past
+        # guards that saw it as non-None — 7,828 acknowledged rows lost. None
+        # and "" now both mean the local default (#98): there is no detached
+        # state, so nothing for a guard to miss.
+        archive = (archive or "").rstrip("/") or self._layout.default_archive
+
+        # Re-stating where the log already points does nothing: no claim, no
+        # write, no network. A writer that declares its archive on every
+        # restart must not wait for maintenance, or fail during an outage, to
+        # be told what it already knew.
+        if archive == self._archive.location():
+            return
 
         with self._lock:
             lease = self._claim_settings()
@@ -2127,59 +2136,24 @@ class WriteHandle(LocalReadHandle):
                 validate(self._schema, self._buffer.sort_by(), self.config, archive)
                 self._refuse_archive_ahead(archive)
                 self._refuse_archive_behind(archive)
-                self._refuse_lossy_detach(archive)
+                # Asked again under the claim: another process may have made
+                # the same move meanwhile, and then there is nothing to do.
+                if archive == self._archive.location():
+                    return
+
+                # A MOVE opens — or creates, or adopts through its
+                # `version-hint.text` — the table at the new location before
+                # anything is written, and fails the call if it cannot. Best
+                # effort, it reported success while the catalog still named
+                # the old table, and every other process refused the archive
+                # until a maintenance pass repaired it.
+                self._archive.adopt(archive)
+
                 # The other half of the same rule; see `set_config`.
                 checkpoint(lease.renew)
                 self._repoint(archive)
             finally:
                 lease.release()
-
-    def _refuse_lossy_detach(self, archive: str | None) -> None:
-        """Refuse a detach that could expose unarchived files to eviction.
-
-        I4 — never delete a local file the archive lacks — is enforced by a
-        clamp in `evict` that runs only while an archive is CONFIGURED. So
-        detaching does not merely stop using the archive: it retires the clamp,
-        for every process at once, and the next maintenance pass treats the
-        files still waiting to be pushed as ordinary retention candidates. A
-        maintainer already looping elsewhere does it without the operator
-        calling anything.
-
-        Measured: sync 4,550 rows behind, one detach, one pass, 4,025
-        acknowledged offsets unreadable. Nothing recovers them — `hydrate`
-        restores only what the archive holds, and `sync` cannot push files that
-        have left the table.
-
-        §8's "with no archive, `local_retention` is a deletion policy over the
-        only copy" is the contract a local-only log asked for. A log that HAD
-        an archive did not ask for it, and was getting it as a side effect.
-
-        **A blunt refusal, deliberately.** The precise question is "is there an
-        unarchived file that retention would reach", and answering it is not
-        the hard part — keeping the clamp alive across a detach is, since the
-        per-file `extent` rows outlive `_repoint` and could carry it. That is a
-        change to eviction, and it is tracked separately. Until then this
-        refuses the whole shape rather than pretending to a precision it does
-        not have: with no floors set, eviction does nothing and a detach is
-        safe; with one set, it may not be, and the library says so instead of
-        guessing.
-        """
-        if archive is not None or not self._archive.configured():
-            return
-
-        config = self.config
-        if config.local_retention is None and config.local_rows is None:
-            return
-
-        msg = (
-            "refusing to detach: this log has a retention floor set, and "
-            "detaching retires the I4 clamp that keeps eviction off files the "
-            "archive has not taken yet — so the next maintenance pass, in this "
-            "process or any other, could delete them. Nothing recovers them.\n"
-            "Clear local_retention and local_rows with set_config to say you "
-            "accept that, then detach."
-        )
-        raise ValueError(msg)
 
     def _refuse_archive_behind(self, archive: str | None) -> None:
         """Refuse an archive missing a column this log has.
@@ -2314,7 +2288,7 @@ class WriteHandle(LocalReadHandle):
         # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same archive
         # everywhere except here — where the difference would read as a move
         # and reset the watermarks of an archive that genuinely holds data.
-        normalised = (archive or "").rstrip("/") or None
+        normalised = (archive or "").rstrip("/") or self._layout.default_archive
         # ONE transaction, because the three facts are only true together.
         #
         # Where the archive is, and the two watermarks describing what the
@@ -2339,12 +2313,12 @@ class WriteHandle(LocalReadHandle):
         # for the new one. A restatement keeps it — the shipped writer calls
         # this on every restart. Compared against the durable location, which
         # nothing else can move while this holds the claim.
-        if (self._archive.location() or None) != normalised:
+        if self._archive.location() != normalised:
             self._tiers.drop()
 
         self._buffer.set_meta_moved(
             _ARCHIVE_KEY,
-            normalised or "",
+            normalised,
             {Maintenance.ARCHIVED_KEY: "0"},
         )
 
@@ -2353,29 +2327,14 @@ class WriteHandle(LocalReadHandle):
         # that stopped at `WriteHandle` would leave the maintainer deleting the only
         # copy of rows an archive was just configured to receive.
 
-        # Repaired here as well as at open, and the difference is who waits.
-        # The catalog entry still names the previous archive until something
-        # replaces it, and only a lease holder may — so without this, ordinary
-        # re-pointing left every read of the archive raising until a
-        # maintenance pass happened to run.
-        #
-        # Best effort: the archive may not be reachable at all, and
-        # configuring one is a statement of intent, not a claim that the bucket
-        # exists yet. `sync` raises loudly the moment the location is used, and
-        # the check at open heals what this misses.
-        if self._archive.configured():
-            with contextlib.suppress(Exception):
-                repaired = self._archive.table(repair=True)
-                # And the new archive's tier row, while the claim is held, so
-                # reads stop fetching it for every query. Best effort like the
-                # repair: the first sync does it otherwise.
-                if repaired is not None and not self._tiers.has():
-                    self._record_archive_row(repaired)
-
-        if not self._archive.configured() and not self._tiers.has():
-            # Detached: no archive leg is read, and a later attach drops this.
-            schema = self._buffer.shape().table
-            self._tiers.replace(schema, empty(schema))
+        # The new archive's tier row, while the claim is held, so reads stop
+        # fetching it for every query — from the table `set_archive` already
+        # adopted, so nothing is repaired here. Best effort: the first sync
+        # records it otherwise.
+        with contextlib.suppress(Exception):
+            adopted = self._archive.table()
+            if adopted is not None and not self._tiers.has():
+                self._record_archive_row(adopted)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, re-clustering every file the local table owns.
@@ -2764,7 +2723,7 @@ class WriteHandle(LocalReadHandle):
         # `push_unsettled`, because the trailing run is precisely what has no
         # second copy — `stable_prefix` holds a load's short last file back for
         # a merge that a quiet stream never earns.
-        if loaded is not None and sync and self._archive.configured():
+        if loaded is not None and sync:
             try:
                 # COMPACT first, and it is not tidiness. The push below takes
                 # the whole trailing run, so every undersized seal still sitting
@@ -3227,7 +3186,7 @@ class WriteHandle(LocalReadHandle):
         `set_archive` both change the answer from another process, and §4a's
         rule is that a decision reads the log rather than its own memory.
         """
-        return not (self.config.wal_replication and self._archive.configured())
+        return not (self.config.wal_replication and self._archive.remote())
 
     def _write_and_commit(
         self, start: int, end: int, rel_path: str, lease: Claim | None = None
@@ -3508,16 +3467,11 @@ class WriteHandle(LocalReadHandle):
         pushing to keep the count to what a run genuinely cannot fill.
 
         DEVIATES from §5, which also lists snapshot expiry (step 4) and local
-        eviction (step 5). Both are local storage work and belong to `maintain`;
-        leaving them here makes `local_retention` silently inert on a local-only
-        log, because every step of §5 is archive work and the whole pass is
-        skipped. Sync's remaining obligation to eviction is the registration
-        watermark it records in `meta`, which is what lets `maintain` enforce I4.
+        eviction (step 5). Both are local storage work and belong to `maintain`,
+        which runs whether or not a sync has. Sync's remaining obligation to
+        eviction is the registration watermark it records in `meta`, which is
+        what lets `maintain` enforce I4.
         """
-        if not self._archive.configured():
-            msg = "sync() needs an archive; this log is local-only"
-            raise ValueError(msg)
-
         # Re-read where the archive IS before pushing to it. `set_archive` is
         # a durable change made by whichever process runs it, and every other
         # process cached the old value when it opened — so a maintainer started
@@ -3541,10 +3495,6 @@ class WriteHandle(LocalReadHandle):
             # new one. `_push` would reconcile the old archive's extent into
             # the watermark with no network call at all, and eviction believes
             # a watermark whatever earned it.
-            if not self._archive.configured():
-                msg = "sync() needs an archive; this log is local-only"
-                raise ValueError(msg)
-
             # PINNED here, and every fence downstream compares against this
             # string rather than re-reading the object. `Archive` is shared by
             # the log, the reader and the maintainer precisely so a re-point
@@ -3952,13 +3902,9 @@ class WriteHandle(LocalReadHandle):
             return
 
         try:
-            if not self._archive.configured():
-                schema = self._buffer.shape().table
-                self._tiers.replace(schema, empty(schema))
-            else:
-                archive = self._archive.table()
-                if archive is not None:
-                    self._record_archive_row(archive)
+            archive = self._archive.table()
+            if archive is not None:
+                self._record_archive_row(archive)
         except Exception:  # noqa: BLE001
             # Unreachable is the ordinary case this tolerates — a box whose
             # credentials arrive after the log is opened. A row not written is
@@ -3976,25 +3922,12 @@ class WriteHandle(LocalReadHandle):
         costs do, now that conversion reads and rewrites files while the other
         two are metadata commits.
 
-        Runs with or without an archive — this is the call that makes
-        `local_retention` mean something on a local-only log.
-
-        **Eviction is bounded by I4 when an archive is configured**: a file that
-        sync has not yet registered is never evicted, however old. So on a
+        **Eviction is bounded by I4 on every log**: a file that sync has not
+        yet registered in the archive is never evicted, however old. So on a
         partitioned-off machine, this compacts and expires but leaves the window
-        growing — §11's "local eviction stalls".
-
-        **With no archive, eviction is deletion.** I4 is vacuous because nothing
-        is owed to an archive, so `local_retention` becomes an ordinary
-        retention policy and data past it is gone for good. That is the contract
-        a local-only log with a retention asks for; `None` keeps everything and
-        grows without bound.
-
-        **And DETACHING is the operation that makes a log local-only**, which
-        is the part nothing used to say. A log that had an archive never asked
-        for that contract, so `set_archive(None)` now refuses while a retention
-        floor is set rather than silently converting files awaiting upload into
-        ordinary retention candidates. See `_refuse_lossy_detach` and issue #21.
+        growing — §11's "local eviction stalls" — and on a local-only log,
+        `local_retention` takes effect as `sync` publishes to its local archive.
+        Eviction never deletes data (#98).
 
         Whether a stalled or partial pass should be reported rather than silent
         is open — §11 treats stalled eviction as an operational condition, and
@@ -4122,10 +4055,6 @@ class WriteHandle(LocalReadHandle):
         lease as `maintain` and `sync`, and it rewrites the same files they
         would.
         """
-        if not self._archive.configured():
-            msg = "rewrite_archive() needs an archive; this log is local-only"
-            raise ValueError(msg)
-
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
             msg = "another owner holds a claim over this range"
@@ -4167,22 +4096,12 @@ class WriteHandle(LocalReadHandle):
         log that takes no more rows. `retired()` derives the state from it, and
         `restore` finds it in the replica.
 
-        Needs an archive: emptying the local table of a local-only log would
-        delete the only copy.
-
         **The flush asks the running sidecar; it never starts one.** Two
         litestream processes replicating one database is corruption, so with
         `wal_replication` on and no sidecar answering on its control socket,
         this raises and says to regenerate the config — a config from before
         the socket existed is the usual cause.
         """
-        if not self._archive.configured():
-            msg = (
-                "retire() needs an archive: it empties the local table, which "
-                "on a local-only log is the only copy of its rows"
-            )
-            raise ValueError(msg)
-
         marker = self._buffer.retired()
         if marker is not None and marker.get("state") == "retired":
             return
@@ -4261,9 +4180,16 @@ class WriteHandle(LocalReadHandle):
         compaction will not merge it and `sync` will not push it back to the
         archive it just came from. Eviction still applies to it, which is the
         point: this is temporary unless `local_retention` is raised too.
+
+        Needs a remote archive, like `restore` and `replication_config`: a
+        local one is on this disk already, so copying from it buys nothing.
         """
-        if not self._archive.configured():
-            msg = "hydrate() needs an archive; this log is local-only"
+        if not self._archive.remote():
+            msg = (
+                f"hydrate() needs a remote archive (s3://); this log publishes to "
+                f"{self.archive}, which is on this disk already — reads below "
+                f"the local table get its rows from there"
+            )
             raise ValueError(msg)
 
         # The maintenance lease, because this writes the local table and copies
@@ -4492,40 +4418,16 @@ def validate(
         # The same check its twin above has always had, and the reason it
         # matters more here: eviction computes `now - local_retention`, so a
         # negative one puts the cutoff in the FUTURE and every file in the log
-        # is stale. On a local-only log that is silent deletion of the only
-        # copy of everything, at every negative value, from one sign slip.
+        # is stale, and eviction drops everything the archive holds, from one
+        # sign slip.
         msg = f"local_retention must not be negative: {config.local_retention}"
         raise ValueError(msg)
 
-    # Both floors, and how eviction actually combines them. It takes the LOWER
-    # boundary — the policy that retains MORE wins (§12) — so a config is only
-    # "evict on upload" when EVERY floor it states is one. Stating one such
-    # floor beside a generous one is safe, and the previous version of this
-    # rule refused it with a message that was false for that pair.
-    floors = [
-        config.local_retention is not None and config.local_retention <= timedelta(0),
-        config.local_rows is not None and config.local_rows == 0,
-    ]
-    stated = [
-        config.local_retention is not None,
-        config.local_rows is not None,
-    ]
-    if (
-        archive is None
-        and any(stated)
-        and all(drops for drops, given in zip(floors, stated, strict=True) if given)
-    ):
+    if config.wal_replication and (archive is None or not is_remote(archive)):
         msg = (
-            "local_retention=0 and local_rows=0 both mean 'evict on upload' "
-            "and presuppose an archive; with archive=None this config would "
-            "delete each file as it sealed"
-        )
-        raise ValueError(msg)
-
-    if config.wal_replication and archive is None:
-        msg = (
-            "wal_replication needs an archive: WAL segments go beside the "
-            "archived data, and a local-only log has nowhere to ship them"
+            "wal_replication needs a remote archive (s3://): the WAL replica "
+            "exists to get unsealed rows off this machine, and a local "
+            "archive is on it"
         )
         raise ValueError(msg)
 

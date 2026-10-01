@@ -730,8 +730,8 @@ class Maintenance:
         bug that silently stopped reclaiming anything, because expiry retires
         the snapshot the age was being read from.
 
-        With no archive this is deletion of the only copy. That is the contract
-        a local-only log with a retention asks for; see §8.
+        Never deletion: every log has an archive (#98), and I4 keeps a file
+        until it holds it.
         """
         # The POLICY re-read first, because it decides everything below. Read
         # again under the claim as well: this one only decides whether there is
@@ -801,18 +801,13 @@ class Maintenance:
         # only one only once sync says so. Clamped rather than skipped, so a
         # sync that is arbitrarily far behind delays eviction instead of
         # stopping it — §5's "lazy, restartable" applies here too.
-        #
-        # With no archive there is nothing owed: §8 says `local_retention` is
-        # then a deletion policy over the only copy, which is the contract the
-        # operator asked for.
-        if self._archive.configured():
-            boundary = min(
-                boundary,
-                # I4 asks whether the archive HAS it, so intents are excluded:
-                # deleting the only local copy on the strength of an intended
-                # one is the loss this whole record exists to prevent.
-                self.archived_prefix(files, self._archive.uri, include_intents=False),
-            )
+        boundary = min(
+            boundary,
+            # I4 asks whether the archive HAS it, so intents are excluded:
+            # deleting the only local copy on the strength of an intended
+            # one is the loss this whole record exists to prevent.
+            self.archived_prefix(files, self._archive.uri, include_intents=False),
+        )
 
         # Snapped DOWN to a file boundary, against the list as it is now. The
         # age limit is already one — some file's `hi` — and so is the archive
@@ -852,25 +847,24 @@ class Maintenance:
             # expiry drops the snapshots naming it, nothing can name it again.
             checkpoint(removal.renew)
             dropped = [f.path for f in files if f.hi <= boundary]
-            if self._archive.configured():
-                # The archive's tier row describes what it holds below the
-                # local table, and these rows are about to be exactly that —
-                # so it grows BEFORE they leave, or a read between the two
-                # would skip the archive for rows no local file still has.
-                schema, live = self._table.live_files()
-                leaving = set(dropped)
-                self._tiers.widen(
-                    self._buffer.shape().table,
-                    rollup(
-                        None,
-                        schema,
-                        [
-                            f
-                            for f in live
-                            if str(f.file_path).removeprefix("file://") in leaving
-                        ],
-                    ),
-                )
+            # The archive's tier row describes what it holds below the
+            # local table, and these rows are about to be exactly that —
+            # so it grows BEFORE they leave, or a read between the two
+            # would skip the archive for rows no local file still has.
+            schema, live = self._table.live_files()
+            leaving = set(dropped)
+            self._tiers.widen(
+                self._buffer.shape().table,
+                rollup(
+                    None,
+                    schema,
+                    [
+                        f
+                        for f in live
+                        if str(f.file_path).removeprefix("file://") in leaving
+                    ],
+                ),
+            )
 
             self._enqueue(dropped)
             self._table.evict_through(boundary)
@@ -934,8 +928,8 @@ class Maintenance:
         # maintenance pass would fix it — which they are.
         archive = self._archive.table(repair=True)
         if archive is None:
-            msg = "rewrite_archive() needs an archive; this log is local-only"
-            raise ValueError(msg)
+            # Nothing published yet, so nothing to re-cut.
+            return
 
         archive.reload()
         stale = self._badly_sized(archive)
@@ -1314,9 +1308,6 @@ class Maintenance:
         any snapshot still references, and until the snapshot that named it
         expires, one always does.
         """
-        if not self._archive.configured():
-            return
-
         if not any(is_remote(p) for p in self._buffer.queued_deletions()):
             return
 
@@ -1398,9 +1389,11 @@ class Maintenance:
             # unreferenced. Every other cost in this pass dwarfs a catalog resolve.
             self._table.reload()
             referenced = self._table.referenced_paths()
-            # Only if the queue holds something remote, so an ordinary drain on a
-            # local-only log still opens nothing. `rewrite_archive` is what puts
-            # remote entries here, and it is an operation somebody ran on purpose.
+            # Only if the queue holds an archive object, so an ordinary drain
+            # opens nothing. `rewrite_archive` is what puts them here, and it is
+            # an operation somebody ran on purpose. An archive object is named
+            # by its URI — `file://` for a local archive — so "remote" here
+            # means "the archive's", wherever it is.
             remote = (
                 self._archive.table(repair=True)
                 if any(is_remote(p) for p in due)

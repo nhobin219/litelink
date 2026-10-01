@@ -219,18 +219,6 @@ def test_retire_resumes_after_a_crash(
         assert again._buffer.retired()["state"] == "retired"  # ty: ignore[not-subscriptable]  # noqa: SLF001
 
 
-def test_retire_needs_an_archive(tmp_path: Path) -> None:
-    """Emptying the local table of a local-only log would delete its rows."""
-    import pyarrow as pa
-
-    with litelink.new(tmp_path, "s", schema=pa.schema([("x", pa.int64())])) as log:
-        log.append({"x": 1})
-        with pytest.raises(ValueError, match="needs an archive"):
-            log.retire()
-
-        assert log._buffer.retired() is None  # noqa: SLF001
-
-
 def test_hydrate_works_on_a_retired_log(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:

@@ -9,11 +9,11 @@
 
 # An embedded Iceberg storage engine for append-only data
 
-litelink takes high-throughput transactional appends and turns them into well-sized Iceberg
-tables, on local disk and in object storage. `append()` commits to a SQLite buffer and returns
-once the row is durable. Behind it, the library seals rows into sorted Parquet, compacts small
-files up to a target size, pushes settled files to an Iceberg archive on S3, and evicts from
-local disk what the archive already holds. Through all of it the log stays one queryable
+litelink takes high-throughput transactional appends and turns them into one well-sized
+Iceberg table per log — on S3, or in a local directory. `append()` commits to a SQLite buffer
+and returns once the row is durable. Behind it, the library seals rows into sorted Parquet,
+compacts small files up to a target size, publishes settled files to that table, and evicts
+from local disk what it already holds. Through all of it the log stays one queryable
 unit: a read sees every row exactly once, whichever tier holds it, and maintenance runs beside
 appends rather than in front of them, so no pass blocks appends for its duration or shows a
 reader a half-finished state.

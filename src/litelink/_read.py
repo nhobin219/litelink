@@ -322,6 +322,11 @@ class Reader:
         if covered is None:
             return None
 
+        if not self._archive.remote():
+            # A local archive is read like the local table: no extension to
+            # load and no credentials to install.
+            return location, covered
+
         if not self._remote_ready:
             # Once per connection. `httpfs` is not in the local read path, so a
             # log whose queries never need the archive never pays for it — §7's
@@ -472,7 +477,6 @@ class Reader:
         table with an extent is not empty — so the local rollup, 2–3 ms after
         each commit, is not computed for a query it cannot narrow.
         """
-        configured = self._archive.configured()
         rows = []
         stored = self._stored.load()
         archive = stored.get(ARCHIVE)
@@ -495,7 +499,7 @@ class Reader:
         table = build(rows, key=KEY) if rows else None
         kept = prune(table, TIERS, found, key=KEY)
 
-        return LOCAL in kept, configured and ARCHIVE in kept
+        return LOCAL in kept, ARCHIVE in kept
 
     def _union(
         self,

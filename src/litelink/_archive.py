@@ -17,13 +17,10 @@ keep in step. That the fan-out is gone is not only tidiness: the cached handle
 lives here too, so re-pointing the archive drops it, where before the Log
 changed the URI and went on serving reads from the table it had already opened.
 
-A local-only log gets one of these too, rather than the three
-holders each taking `Archive | None`. It is the difference between "there is no
-archive" and "there is nowhere to look yet", and only the second survives
-`set_archive`: attaching one to a log that started local has to reach the
-reader and the maintainer, and with an optional they would each be holding a
-None that nothing can update. This object is the slot, and the slot always
-exists — `configured()` is the question about what is in it.
+Every log has an archive (#98): a remote one on S3, or a local directory —
+by default under the log's own. `remote()` is the one question about which,
+and it decides only what object storage needs: httpfs and credentials on a
+read, and a target for the WAL replica.
 """
 
 from __future__ import annotations
@@ -32,6 +29,7 @@ import contextlib
 import threading
 from typing import TYPE_CHECKING
 
+from litelink._layout import is_remote
 from litelink._s3 import S3Options
 from litelink._table import ArchiveAbsent, LogTable
 
@@ -138,18 +136,24 @@ class Archive:
             if handle is not None:
                 handle.set_sort_order(sort_by)
 
-    def location(self) -> str | None:
+    def location(self) -> str:
         """Where the archive is, according to the log.
 
-        `or None` because detaching writes an empty string to `meta` rather
-        than deleting the row, and an empty archive is no archive.
+        Every log has one (#98). An empty or missing row — what `set_archive
+        (None)` writes, and what a log created without one holds — means the
+        local default under the log's directory.
         """
-        return self._buffer.get_meta(ARCHIVE_KEY) or None
+        return self._buffer.get_meta(ARCHIVE_KEY) or self._layout.default_archive
 
     @property
-    def uri(self) -> str | None:
+    def uri(self) -> str:
         """The location, for callers that read it as an attribute."""
         return self.location()
+
+    def remote(self) -> bool:
+        """Whether the archive is object storage — what httpfs, credentials
+        and the WAL replica need — rather than a local directory."""
+        return is_remote(self.location())
 
     @property
     def s3(self) -> S3Options:
@@ -159,10 +163,6 @@ class Archive:
         and must not carry a key with it.
         """
         return self._s3
-
-    def configured(self) -> bool:
-        """Whether the log has an archive at all. Opens nothing."""
-        return self.location() is not None
 
     def table(self, *, repair: bool = False) -> LogTable | None:
         """The remote table, or None when the log has no archive.
@@ -176,12 +176,6 @@ class Archive:
         """
         with self._lock:
             uri = self.location()
-            if uri is None:
-                self._handle = None
-                self._handle_uri = None
-
-                return None
-
             if self._handle is None or self._handle_uri != uri:
                 try:
                     self._handle = LogTable.open_archive(
@@ -196,6 +190,28 @@ class Archive:
                     return None
 
                 self._handle_uri = uri
+
+            return self._handle
+
+    def adopt(self, uri: str) -> LogTable:
+        """Open the table at `uri` with repair on — creating it, or adopting
+        it through its `version-hint.text` — and point the catalog at it.
+
+        For `set_archive`, BEFORE the log records `uri`: a move that cannot
+        reach its new table fails with nothing written, rather than leaving
+        the catalog naming the old one. The handle is cached against `uri`, so
+        once the location is recorded every caller gets it.
+        """
+        with self._lock:
+            self._handle = LogTable.open_archive(
+                self._layout,
+                uri,
+                self._s3,
+                self._buffer.shape().table,
+                self._buffer.sort_by(),
+                repair=True,
+            )
+            self._handle_uri = uri
 
             return self._handle
 

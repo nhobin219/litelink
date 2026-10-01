@@ -55,6 +55,29 @@ minor version carries breaking changes.
   and the buffer only, never the archive, whatever the query asks — what
   `include_archive=False` did, per read rather than per handle. Rows only the
   archive holds are left out, not refused.
+- **Every log has an archive; with none given it is a local directory** (#98).
+  `litelink.new(archive=None)` publishes to `<root>/<name>/published`, and
+  `archive="file:///directory"` names a local archive anywhere. The pipeline
+  is the same as on S3: `sync` publishes, eviction drops only what the
+  archive holds, and `retire`, `rewrite_archive` and tier selection work on
+  local-only logs. Any Iceberg engine reads the local
+  table through `version-hint.text`.
+  - **`local_retention` and `local_rows` no longer delete.** On a local-only
+    log they used to be a deletion policy over the only copy; now nothing
+    leaves the local table until `sync` has published it, so a local-only
+    log that relied on retention to bound disk must call `sync()`, and its
+    local archive then grows (truncation is a follow-up).
+  - **`set_archive(None)` points back at the local default** instead of
+    detaching, so the refusal to detach under a retention floor is gone, as
+    is the refusal of `local_retention=0` with no archive.
+  - **A move opens its new table before recording it** and raises with
+    nothing changed if it cannot. Re-stating the current location is a no-op:
+    no claim, no write, no network.
+  - **`log.archive` is always a string** (`s3://…` or `file://…`).
+  - `wal_replication`, `replication_config()`, `restore` and `hydrate` need
+    an `s3://` archive; a local one is on this disk already.
+  - An existing local-only log records the default at its next writer
+    `open`; its first `sync()` publishes everything it holds.
 - **The 0.1 → 0.2 migration is removed** (`litelink.migrate`). A log still in
   the pre-0.2 layout is refused with the command to run under litelink 0.5.1,
   the last release that carries it.
