@@ -167,7 +167,7 @@ def test_a_warning_is_visible_without_failing_the_report() -> None:
     the host clock: a VM on the `tsc` clocksource CAN crash-loop the sidecar,
     but plenty of such guests never do, so failing would be a false alarm — and
     burying it in a PASS line would be missed, which is the whole problem with
-    this failure. It logs successful publishes right up to each panic.
+    this failure. It logs successful syncs right up to each panic.
 
     Falsify by making `warning` fail the report, or by rendering it as PASS.
     """
