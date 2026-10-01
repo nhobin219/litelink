@@ -9,9 +9,10 @@ from litelink import LogConfig, LogHandle, Row, S3Options, WriteHandle, __versio
 ```
 
 Those are the names most code takes; `litelink` also exports `new`, `open`, `restore`,
-`validate_row`, `preflight`, `LocalReadHandle`, `Coverage`, `RetiredError`, `OFFSET`, the
-statistics types (`ColumnStatistics`, `TierStatistics`, `Tier`), the preflight report types
-(`Check`, `Report`) and the `manifest` module. The handles are the whole object model — there
+`validate_row`, `preflight`, `duckdb_connection`, `install_s3_secret`, `LocalReadHandle`,
+`Coverage`, `RetiredError`, `ExtensionMissing`, `OFFSET`, the statistics types
+(`ColumnStatistics`, `TierStatistics`, `Tier`), the preflight report types (`Check`, `Report`)
+and the `manifest` module. The handles are the whole object model — there
 is no session, no client, no catalog handle to hold. A log is a directory under a root, named
 at `litelink.new` and opened by that name for ever after.
 
@@ -412,6 +413,34 @@ SELECT count(*), max(litelink_offset)
 FROM iceberg_scan('s3://bucket/prefix/trades',
                   version_name_format = '%s%s.metadata.json');
 ```
+
+**With litelink installed, `litelink.duckdb_connection` does the provisioning** — from the
+extensions litelink's platform wheels bundle, so the first read is not a network fetch (§7):
+
+```python
+litelink.duckdb_connection(s3: S3Options | None = None, *, remote: bool = False)
+    -> duckdb.DuckDBPyConnection
+
+con = litelink.duckdb_connection(remote=True)     # credentials from the environment
+con.sql("SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/trades',"
+        " version_name_format = '%s%s.metadata.json')")
+```
+
+It loads `avro` and `iceberg`; `remote=True` also loads `httpfs` and creates the S3 secret,
+from `s3` or, with none given, from the environment and then the AWS credential chain. A
+missing extension raises `ExtensionMissing`, naming how to provision it rather than DuckDB's
+`INSTALL` advice, and a machine with no credentials at all raises `RuntimeError` naming the
+three ways to supply them. Each call builds a new connection, about half a second of
+`LOAD iceberg`, so hold on to one.
+
+```python
+litelink.install_s3_secret(connection, s3: S3Options | None = None) -> None
+```
+
+The S3 half on its own, for a connection litelink did not build — one database handing out
+`cursor()`s to many readers, which skips the half-second per reader — and for rotated keys.
+Secrets belong to the database, so one call covers every cursor. A credential-chain secret is
+created with `REFRESH auto`, so an expiring STS token refreshes without calling it again.
 
 The table sits at `<published prefix>/<log name>` — its data and metadata together, since
 0.2. **`version_name_format` is not

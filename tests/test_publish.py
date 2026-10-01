@@ -30,7 +30,7 @@ from litelink._handle import OFFSET, RESTORE_RESERVE, LogHandle, table_schema
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import load_extension, secret_sql
+from litelink._read import secret_sql
 from litelink._s3 import S3Options
 from litelink._table import (
     VERSION_HINT,
@@ -1738,7 +1738,6 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
     Hadoop name would remove the parameter and add an object per commit that
     nothing collects — see `VERSION_HINT`.
     """
-    duckdb = pytest.importorskip("duckdb")
     where = f"s3://{bucket}/standalone"
     config = replace(
         LogConfig(),
@@ -1760,10 +1759,8 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
 
     assert published > 0, "nothing reached the published table to read back"
 
-    connection = duckdb.connect()
-    load_extension(connection, "iceberg", remote=False)
-    load_extension(connection, "httpfs", remote=True)
-    connection.execute(secret_sql(s3))
+    # The documented way another machine provisions DuckDB for this (#108).
+    connection = litelink.duckdb_connection(s3, remote=True)
     # `{prefix}/{name}`, which is the table location itself now. It used to be
     # `{prefix}/litelink/{name}` — pyiceberg's `<warehouse>/<namespace>/<table>`
     # default — while the data files sat at `{prefix}/{name}/data`, so an engine
