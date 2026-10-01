@@ -362,6 +362,12 @@ streaming reader rather than a table: a full-window read with a 400-byte payload
 **Always bound on a leading column of `sort_by`.** §7 measures a non-leading predicate at
 119 ms against 13 ms for the same predicate with a leading bound.
 
+**Offset bounds are the only ones that can skip the buffer.** `start_offset`/`end_offset` (or
+a `litelink_offset` comparison in `where` or `sql`) are judged against the buffer's offset
+range, from its lowest buffered offset up, so a scan ending below it never reads the buffered
+rows. The buffer keeps no column statistics, so a bound on any other column still reads it;
+the local table and the archive are skipped by either kind.
+
 Other machines do not use this API at all — see below.
 
 ## Reading from another machine

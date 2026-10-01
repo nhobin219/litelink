@@ -199,7 +199,9 @@ log.scan()                                      # the whole log
 So a query's latency follows its predicates. Bound it on a leading column of `sort_by` and a
 recent window stays local; leave it unbounded and it reads every tier, because the whole log
 is the right answer. Anything the decision cannot read — an OR, a subquery, a comparison with
-something other than a constant — reads the archive rather than risk skipping a row.
+something other than a constant — reads the archive rather than risk skipping a row. The
+buffer keeps no column statistics, so only an offset bound (`scan(start_offset=…,
+end_offset=…)`) can skip it.
 `column_statistics(tier=…)` gives every column's bounds and counts without opening a data
 file, per tier (`"local"`, `"archive"` below it, `"buffer"`) or for the whole log.
 

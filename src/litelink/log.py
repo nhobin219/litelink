@@ -532,6 +532,12 @@ class LogHandle:
         from `where` and the offset bounds: the archive is read only when a
         file of it below the local table could hold a matching row.
 
+        **`start_offset`/`end_offset` are the only bounds that can skip the
+        buffer.** It keeps no column statistics, but its offsets are a known
+        range — from its lowest up — so a scan ending below that range never
+        reads it. A `where` on any other column still reads it. The same holds
+        for a `litelink_offset` comparison in `where` or in `sql`.
+
         Always bound on a LEADING column of `sort_by`. §7 measures a
         non-leading predicate at 119 ms against 13 ms for the same predicate
         with a leading bound.
