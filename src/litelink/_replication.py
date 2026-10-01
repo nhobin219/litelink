@@ -13,7 +13,7 @@ What the library owns is what the config has to SAY: which files carry the
 log's state, and where they go. Both are things only the log knows, and both
 are silently wrong when written by hand.
 
-`archive.db` is in the set, though the archive can now name its own metadata
+`published.db` is in the set, though the published table can now name its own metadata
 (`version-hint.text`) and a FAILOVER deliberately does not restore it — a
 stale copy wins over the bucket's own pointer. It is replicated for the
 same-machine case, where it saves a round trip. See `litelink.restore`.
@@ -21,7 +21,7 @@ same-machine case, where it saves a round trip. See `litelink.restore`.
 **One sidecar per ROOT, not per log.** `catalog.db` and `archive.db` live at the
 root and are shared by every log under it, so two logs each running their own
 sidecar would have two litestream instances replicating those two files — the
-one thing litestream says never to do — and, under a shared archive prefix,
+one thing litestream says never to do — and, under a shared published prefix,
 shipping them to one replica path. Only the buffer is per log. A root holding
 several logs therefore wants one config naming every buffer under it, which
 this does not generate: it describes the log it was asked about. Until it does,
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from litelink._layout import Layout
     from litelink._s3 import S3Options
 
-# Where the WAL goes inside the archive prefix. INSIDE the log's own directory,
+# Where the WAL goes inside the published prefix. INSIDE the log's own directory,
 # beside `data/` and `metadata/`, so a stream is one self-contained prefix that
 # can be replicated, restored or deleted whole.
 #
@@ -61,14 +61,14 @@ if TYPE_CHECKING:
 WAL_PREFIX = "_wal"
 
 
-def destination(archive: str, name: str) -> str:
-    """Where a stream's WAL segments go, given the archive prefix.
+def destination(published: str, name: str) -> str:
+    """Where a stream's WAL segments go, given the published prefix.
 
     Derived rather than configured. A second setting for it would be a second
     bucket to provision, and the failure it invites is replicating the WAL
     somewhere nobody backs up — which looks fine until the restore.
     """
-    return f"{archive.rstrip('/')}/{name}/{WAL_PREFIX}"
+    return f"{published.rstrip('/')}/{name}/{WAL_PREFIX}"
 
 
 def snapshot_block(retention: timedelta) -> list[str]:
@@ -107,7 +107,7 @@ def snapshot_block(retention: timedelta) -> list[str]:
 
 def litestream_config(
     layout: Layout,
-    archive: str,
+    published: str,
     s3: S3Options,
     retention: timedelta | None = None,
 ) -> str:
@@ -127,14 +127,14 @@ def litestream_config(
     the generated config is safe to commit, copy and hand around — the same
     reason `S3Options` is not part of `LogConfig`.
     """
-    if not archive.startswith("s3://"):
+    if not published.startswith("s3://"):
         msg = (
-            f"replication needs a remote archive (s3://), not {archive!r}: the "
+            f"replication needs a remote published table (s3://), not {published!r}: the "
             f"WAL replica exists to get unsealed rows off this machine"
         )
         raise ValueError(msg)
 
-    target = destination(archive, layout.name)
+    target = destination(published, layout.name)
     bucket, _, prefix = target.removeprefix("s3://").rstrip("/").partition("/")
     resolved = s3.resolved()
 
@@ -155,7 +155,7 @@ def litestream_config(
         # `target`; repeating it here would nest it twice.
         #
         # It has to stay a derived name rather than `database.name`: two logs
-        # sharing an archive prefix must not flatten to one replica path — two
+        # sharing a published prefix must not flatten to one replica path — two
         # sidecars writing one replica is the corruption litestream is explicit
         # about, and a restore that hands back the other log's WAL.
         name = database.relative_to(layout.directory).as_posix()
@@ -209,7 +209,7 @@ def flush(layout: Layout, binary: str | None = None, timeout: int = 60) -> None:
     """Ship `buffer.db` to its replica now, and return once the replica has it.
 
     `litestream sync -wait` through the running sidecar's control socket:
-    measured on 0.5.16 against rustfs with the periodic sync at 1 h, a restore
+    measured on 0.5.16 against rustfs with the periodic publish at 1 h, a restore
     before it had none of 5 new rows, the command returned in 29 ms, and a
     restore after it had all 5. It is a CLIENT of the sidecar — it opens no
     database and writes no replica — so it never makes a second writer.

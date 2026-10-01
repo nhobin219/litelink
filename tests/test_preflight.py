@@ -2,7 +2,7 @@
 
 Every tier past local disk needs something the wheel cannot carry, and each
 one goes missing quietly: litestream is not needed until a restore, `httpfs`
-is not compiled into the duckdb wheel, and an archive can be configured
+is not compiled into the duckdb wheel, and a published table can be configured
 against credentials that do not work. None of the three is visible in code and
 all three are checkable in about a second.
 """
@@ -56,7 +56,7 @@ def test_a_report_is_readable_and_actionable() -> None:
     assert "a: fine" not in str(caught.value)
 
 
-def test_the_local_tier_needs_nothing_beyond_the_wheel() -> None:
+def test_the_staging_tier_needs_nothing_beyond_the_wheel() -> None:
     """The claim the README makes, asserted.
 
     `iceberg` is the only extension a local-first log loads, and it is the one
@@ -86,19 +86,21 @@ def test_it_finds_litestream_and_reports_the_version() -> None:
     assert "0.5" in check.detail, "the version has to be reported, not just presence"
 
 
-def test_it_reports_an_archive_it_cannot_read(bucket: str, s3: S3Options) -> None:
+def test_it_reports_a_published_table_it_cannot_read(
+    bucket: str, s3: S3Options
+) -> None:
     """The case `new` deliberately cannot refuse.
 
-    Configuring an archive is a statement of intent — credentials commonly
+    Configuring a published table is a statement of intent — credentials commonly
     attach to a box after the log is configured — so `new` lets bad ones
-    through and nothing on the write path finds out until the first `sync`.
+    through and nothing on the write path finds out until the first `publish`.
     Here there is a human asking, so a refusal is reportable.
     """
     where = f"s3://{bucket}/prefix"
     wrong = replace(s3, access_key="wrong-key", secret_key="wrong-secret")
 
-    report = preflight(archive=where, s3=wrong, replication=False)
-    check = next(c for c in report.checks if c.name.startswith("archive"))
+    report = preflight(published=where, s3=wrong, replication=False)
+    check = next(c for c in report.checks if c.name.startswith("published table"))
 
     assert not check.ok
     assert not report.ok
@@ -107,15 +109,19 @@ def test_it_reports_an_archive_it_cannot_read(bucket: str, s3: S3Options) -> Non
     )
 
 
-def test_it_passes_an_archive_that_is_merely_empty(bucket: str, s3: S3Options) -> None:
+def test_it_passes_a_published_table_that_is_merely_empty(
+    bucket: str, s3: S3Options
+) -> None:
     """Empty is not broken, and conflating them would make the check useless.
 
-    An archive nothing has been pushed to yet is the ordinary state of a log
-    on its first day. `archive_extent` answers None there and raises only when
+    A published table nothing has been pushed to yet is the ordinary state of a log
+    on its first day. `published_extent` answers None there and raises only when
     the bucket answers with a refusal, which is the distinction this reports.
     """
-    report = preflight(archive=f"s3://{bucket}/never-written", s3=s3, replication=False)
-    check = next(c for c in report.checks if c.name.startswith("archive"))
+    report = preflight(
+        published=f"s3://{bucket}/never-written", s3=s3, replication=False
+    )
+    check = next(c for c in report.checks if c.name.startswith("published table"))
 
     assert check.ok, check.detail
     assert "nothing published" in check.detail
@@ -161,7 +167,7 @@ def test_a_warning_is_visible_without_failing_the_report() -> None:
     the host clock: a VM on the `tsc` clocksource CAN crash-loop the sidecar,
     but plenty of such guests never do, so failing would be a false alarm — and
     burying it in a PASS line would be missed, which is the whole problem with
-    this failure. It logs successful syncs right up to each panic.
+    this failure. It logs successful publishes right up to each panic.
 
     Falsify by making `warning` fail the report, or by rendering it as PASS.
     """
@@ -214,7 +220,7 @@ def test_the_clock_check_does_not_sample_and_does_not_fail() -> None:
         assert "persistent" in check.detail
 
 
-def test_it_reports_a_malformed_archive_uri_without_touching_the_network() -> None:
+def test_it_reports_a_malformed_published_uri_without_touching_the_network() -> None:
     """The check most likely to fire here, and the one that needs no endpoint.
 
     This prefix comes from a shell, where a missing slash survives every layer
@@ -227,12 +233,12 @@ def test_it_reports_a_malformed_archive_uri_without_touching_the_network() -> No
     this must be answerable with nothing reachable — which is also the state a
     machine is in when the prefix is the reason nothing is reachable.
 
-    Falsify by moving `validate_archive` out of `_archive`: the check comes
+    Falsify by moving `validate_published` out of `_published`: the check comes
     back with whatever pyarrow says about a bucket named `s3:`, or hangs on a
     DNS lookup for it.
     """
-    report = preflight(archive="s3:/bucket/prefix", replication=False)
-    check = next(c for c in report.checks if c.name.startswith("archive"))
+    report = preflight(published="s3:/bucket/prefix", replication=False)
+    check = next(c for c in report.checks if c.name.startswith("published table"))
 
     assert not check.ok
     assert not report.ok

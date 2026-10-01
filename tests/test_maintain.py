@@ -39,7 +39,7 @@ def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
 
         assert len(log._table.data_files()) == 1
         assert len(read_all(log)) == 16
-        assert log.table_extent() == (1, 16)
+        assert log.staging_extent() == (1, 17)
 
 
 def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
@@ -66,7 +66,7 @@ def test_compaction_leaves_full_files_alone(tmp_path: Path) -> None:
         target_seal_size=2048,
         # Equal, which is what makes this test about "already full" rather than
         # about conversion. The default is eight times the seal size, and under
-        # that these files WOULD merge — correctly, into one archive-shaped
+        # that these files WOULD merge — correctly, into one published-shaped
         # file. See `test_compaction_converts_sealed_files_into_larger_ones`.
         target_compact_size=2048,
         compact_min_files=2,
@@ -113,19 +113,19 @@ def test_compaction_preserves_every_row(tmp_path: Path) -> None:
         assert read_all(log) == before
 
 
-def test_eviction_drops_files_past_local_retention(tmp_path: Path) -> None:
+def test_eviction_drops_files_past_staging_retention(tmp_path: Path) -> None:
     """§8. Eviction drops what the published table holds, and the rows stay
-    readable from there — a local-only log's archive is a local table (#98)."""
+    readable from there — a local-only log publishes to a local directory (#98)."""
     config = LogConfig(
         compact_min_files=99,  # isolate eviction from compaction
-        local_retention=timedelta(microseconds=1),
+        staging_retention=timedelta(microseconds=1),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.extend(rows(2, start=12))
         assert len(log._table.data_files()) == 3
 
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log.maintain()
 
         assert log._table.data_files() == []
@@ -137,12 +137,14 @@ def test_eviction_drops_files_past_local_retention(tmp_path: Path) -> None:
 
 def test_eviction_never_drops_what_is_not_published(tmp_path: Path) -> None:
     """I4 holds for every log (#98): a local-only log's retention used to
-    delete the only copy, and now waits for `sync` like any other.
+    delete the only copy, and now waits for `publish` like any other.
 
-    Falsify by skipping the archive clamp in `Maintenance.evict`: every sealed
+    Falsify by skipping the published table clamp in `Maintenance.evict`: every sealed
     file leaves, and twelve rows with it.
     """
-    config = LogConfig(compact_min_files=99, local_retention=timedelta(microseconds=1))
+    config = LogConfig(
+        compact_min_files=99, staging_retention=timedelta(microseconds=1)
+    )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.maintain()
@@ -151,7 +153,7 @@ def test_eviction_never_drops_what_is_not_published(tmp_path: Path) -> None:
         assert len(read_all(log)) == 12
 
 
-def test_no_eviction_without_local_retention(tmp_path: Path) -> None:
+def test_no_eviction_without_staging_retention(tmp_path: Path) -> None:
     with open_log(tmp_path, LogConfig(compact_min_files=99)) as log:
         seal_files(log, 3)
         log.maintain()
@@ -175,42 +177,44 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
         assert len(read_all(log)) == 12
 
 
-def test_eviction_waits_for_the_archive_to_hold_the_file(tmp_path: Path) -> None:
+def test_eviction_waits_for_the_published_table_to_hold_the_file(
+    tmp_path: Path,
+) -> None:
     """I4, and the only line of `maintain` that is correctness (§5, §8).
 
-    With an archive configured the local copy stops being the only one once the
-    archive holds that FILE — a row `sync` writes when the copy exists, naming
+    With a published table configured the local copy stops being the only one once the
+    published table holds that FILE — a row `publish` writes when the copy exists, naming
     the bucket it went to (§4a). Not a watermark: one summarised the same facts
     and was the only boundary in the log that could move backwards.
     """
-    config = LogConfig(local_retention=timedelta(0))
+    config = LogConfig(staging_retention=timedelta(0))
     log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     try:
         seal_files(log, 3)
-        before = log.table_files()
+        before = log.staging_files()
 
         assert before == 3
 
-        # Nothing archived yet: retention says evict everything, I4 says none.
+        # Nothing published yet: retention says evict everything, I4 says none.
         log.maintain()
 
-        assert log.table_files() == before, "evicted with an empty archive"
+        assert log.staging_files() == before, "evicted with an empty published table"
 
-        # The archive now holds the first file, and only that one.
+        # The published table now holds the first file, and only that one.
         first = min(log._table.data_files(), key=lambda f: f.lo)
         log._buffer.record_file(
             f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
         )
         log.maintain()
 
-        assert log.table_files() == before - 1, "did not evict what was archived"
+        assert log.staging_files() == before - 1, "did not evict what was published"
     finally:
         log.close()
 
@@ -230,7 +234,7 @@ def test_reads_stay_correct_across_a_compaction(tmp_path: Path) -> None:
 
 
 def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
-    """§12: local disk holds local_retention + snapshot_retention of data.
+    """§12: local disk holds staging_retention + snapshot_retention of data.
 
     Eviction removes a file from the current snapshot; the bytes stay on disk,
     referenced by the previous snapshot, until expiry deletes them. Conflating
@@ -239,7 +243,7 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
     """
     config = LogConfig(
         compact_min_files=99,
-        local_retention=timedelta(microseconds=1),
+        staging_retention=timedelta(microseconds=1),
         snapshot_retention=timedelta(days=365),  # nothing may expire
     )
     with open_log(tmp_path, config) as log:
@@ -248,7 +252,7 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
         on_disk = {p.name for p in local.rglob("*.parquet")}
         assert len(on_disk) == 3
 
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log.maintain()
 
         assert log._table.data_files() == [], "evicted from the table"
@@ -386,7 +390,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
     config = LogConfig(
         target_seal_size=1 << 30,
         compact_min_files=2,
-        local_retention=timedelta(days=365),
+        staging_retention=timedelta(days=365),
         snapshot_retention=timedelta(days=365),
     )
     with open_log(tmp_path, config) as log:
@@ -484,7 +488,7 @@ def test_metadata_properties_are_applied_to_an_existing_table(tmp_path: Path) ->
     # before these defaults existed.
     layout = Layout(tmp_path, "s")
     catalog = SqlCatalog(
-        "local", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
+        "staging", uri=layout.catalog_uri, warehouse=layout.warehouse_uri
     )
     table = catalog.load_table("litelink.s")
     with table.transaction() as transaction:
@@ -514,7 +518,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
     config = LogConfig(
         target_seal_size=1 << 40,
         compact_min_files=2,
-        local_retention=timedelta(microseconds=1),
+        staging_retention=timedelta(microseconds=1),
     )
 
     with open_log(tmp_path, config) as log:
@@ -540,7 +544,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
         log.seal()
         agrees("seal after compaction")
 
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log._maintenance.evict()
         agrees("after eviction")
 
@@ -565,7 +569,7 @@ def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
         assert snapshot is not None
         manifests = snapshot.manifests(table.io)
 
-        assert log.table_files() == 8, "eight seals, eight data files"
+        assert log.staging_files() == 8, "eight seals, eight data files"
         assert len(manifests) < 8, (
             f"{len(manifests)} manifests for 8 files — not merging"
         )
@@ -650,7 +654,7 @@ def test_an_unmeasured_file_counts_as_full() -> None:
 
 def test_the_trailing_run_is_never_settled() -> None:
     """It is under budget, so a file that has not been written yet can still
-    join it — pushing it now would archive something compaction will replace.
+    join it — pushing it now would published table something compaction will replace.
 
     Two files short of `min_files`, so compaction leaves them alone today; it
     is room in the budget, not the merge, that makes them unsettled.
@@ -669,14 +673,14 @@ def test_a_full_trailing_run_is_settled() -> None:
 
 def test_nothing_before_a_mergeable_run_is_settled() -> None:
     """Compaction is about to rewrite it, and the watermark is a prefix, so the
-    files ahead of it cannot be archived past it either."""
+    files ahead of it cannot be published past it either."""
     files, memory = sized(200, 200, 10, 10, 10)
 
     assert stable_prefix(files, 100, 2, memory) == 2
 
 
 def test_a_stranded_small_file_is_still_settled() -> None:
-    """The regression that made a single explicit seal block the archive
+    """The regression that made a single explicit seal block the published table
     forever. A small file between larger neighbours can never be merged — no
     run containing it fits the budget — so waiting for it to grow waits
     forever, and the watermark never advances past it again."""
@@ -691,8 +695,8 @@ def test_sizing_does_not_depend_on_how_well_the_data_compressed() -> None:
     These files each hold a full target's worth of rows and compressed to an
     eighth of it. Judged by their size on disk they all look starved, and
     compaction merged eight at a time into a file holding eight times the
-    memory the target allows — while `sync`, asking whether a file had reached
-    half the target, found none and left the archive empty. Judged by what they
+    memory the target allows — while `publish`, asking whether a file had reached
+    half the target, found none and left the published table empty. Judged by what they
     hold, each is already full: nothing to merge, everything archivable.
     """
     target = 64 * 1024
@@ -703,14 +707,14 @@ def test_sizing_does_not_depend_on_how_well_the_data_compressed() -> None:
 
 
 def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> None:
-    """`local_retention` must not depend on `snapshot_retention`.
+    """`staging_retention` must not depend on `snapshot_retention`.
 
     A file's age came from the snapshot that added it, and expiry deletes that
     snapshot — after which the file was in no age map at all, `evict` could not
     classify it as stale, and it stayed on local disk for ever.
 
     The two settings are sized by unrelated things: §6 says `snapshot_retention`
-    must exceed the longest SCAN, §8 says `local_retention` must exceed the
+    must exceed the longest SCAN, §8 says `staging_retention` must exceed the
     longest hot LOOKBACK. So the ordinary configuration has expiry running in
     minutes and retention in days — and every file lost its age long before it
     was old enough to evict. Retention silently did nothing.
@@ -718,14 +722,14 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
     config = LogConfig(
         target_seal_size=1 << 30,
         compact_min_files=2,
-        local_retention=timedelta(microseconds=1),
+        staging_retention=timedelta(microseconds=1),
         snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
         files = log._table.data_files()
         assert len(files) == 4
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
 
         # A commit AFTER the last seal, which is what makes every remaining
         # file's adding snapshot expirable. Iceberg always keeps the current
@@ -749,21 +753,21 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         )
 
 
-def test_local_rows_keeps_recent_data_a_time_window_would_drop(
+def test_staging_rows_keeps_recent_data_a_time_window_would_drop(
     tmp_path: Path,
 ) -> None:
     """The case a window alone cannot express.
 
     An hour of a quiet stream is a handful of rows. A retention window sized
     for a busy stream then evicts almost everything the moment it goes quiet,
-    and the next hot read — the thing `local_retention` exists to serve — goes
+    and the next hot read — the thing `staging_retention` exists to serve — goes
     to the network for data written minutes ago.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
         compact_min_files=2,
-        local_retention=timedelta(microseconds=1),
-        local_rows=8,
+        staging_retention=timedelta(microseconds=1),
+        staging_rows=8,
         snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
@@ -788,9 +792,9 @@ def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> N
         target_seal_size=1 << 30,
         compact_min_files=2,
         # Retains everything: nothing is an hour old.
-        local_retention=timedelta(hours=1),
+        staging_retention=timedelta(hours=1),
         # Retains almost nothing on its own.
-        local_rows=1,
+        staging_rows=1,
         snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
@@ -803,18 +807,18 @@ def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> N
 
 
 def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
-    """`local_retention=None` used to mean "never evict", full stop. With a row
+    """`staging_retention=None` used to mean "never evict", full stop. With a row
     floor set it means "no limit from TIME", and the floor still applies."""
     config = LogConfig(
         target_seal_size=1 << 30,
         compact_min_files=2,
-        local_retention=None,
-        local_rows=4,
+        staging_retention=None,
+        staging_rows=4,
         snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log._maintenance.evict()
 
         kept = log._table.data_files()
@@ -859,12 +863,14 @@ def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> No
         assert log.scan().read_all().num_rows == 1200
 
 
-def test_only_compacted_files_are_eligible_for_the_archive(tmp_path: Path) -> None:
+def test_only_compacted_files_are_eligible_for_the_published_table(
+    tmp_path: Path,
+) -> None:
     """Eligibility falls out of the existing rule, with nothing added.
 
-    `sync` pushes what compaction has finished with. Raise the compaction
+    `publish` pushes what compaction has finished with. Raise the compaction
     target above the seal size and a freshly sealed file is a merge candidate
-    by definition — so it is not settled, and not archived, until it has been
+    by definition — so it is not settled, and not published, until it has been
     converted. No separate eligibility flag, and no way for the two to disagree
     about which files are still in play.
     """
@@ -889,14 +895,14 @@ def test_only_compacted_files_are_eligible_for_the_archive(tmp_path: Path) -> No
         )
 
         assert settled == 0, (
-            "sealed files are merge candidates, so none may be archived yet"
+            "sealed files are merge candidates, so none may be published yet"
         )
 
 
 def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
     tmp_path: Path,
 ) -> None:
-    """Conversion is on by default, including with no archive.
+    """Conversion is on by default, including with no published table.
 
     File count is a measured read cost here rather than a reputation: reading
     the offset boundary from manifest statistics measured 1.0 ms over one file
@@ -916,7 +922,7 @@ def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
         log.maintain()
 
         assert len(log._table.data_files()) < before, (
-            "the conversion must run without an archive configured"
+            "the conversion must run without a published table configured"
         )
         assert log.scan().read_all().num_rows == 1200
 
@@ -954,7 +960,7 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         target_seal_size=4096,
         target_compact_size=8 * 4096,
         compact_min_files=2,
-        local_retention=timedelta(microseconds=1),
+        staging_retention=timedelta(microseconds=1),
         snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
@@ -967,7 +973,7 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         converted = len(log._table.data_files())
         assert converted < before, "compaction must run on its own"
 
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         log.evict()
         log.expire()
 
@@ -1062,17 +1068,17 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
     design refuses directory scans, so it is unreclaimable for good.
 
     The age limit is already file-aligned — it is some file's `hi` — and so is
-    the archive clamp. Only the row floor is arbitrary, which is why it arrived
-    with `local_rows`.
+    the published table clamp. Only the row floor is arbitrary, which is why it arrived
+    with `staging_rows`.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
         target_compact_size=1 << 30,
         compact_min_files=2,
-        local_retention=timedelta(microseconds=1),
+        staging_retention=timedelta(microseconds=1),
         # Deliberately not a multiple of the 4 rows each sealed file holds, so
         # the raw boundary falls inside one.
-        local_rows=6,
+        staging_rows=6,
         snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
@@ -1093,16 +1099,18 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
         assert all(f.rows == 4 for f in after), "a file was split by the boundary"
 
 
-def test_compaction_will_not_merge_a_file_the_archive_holds(tmp_path: Path) -> None:
-    """A merge spanning the archive's extent is a duplicate that cannot be undone.
+def test_compaction_will_not_merge_a_file_the_published_table_holds(
+    tmp_path: Path,
+) -> None:
+    """A merge spanning the published table's extent is a duplicate that cannot be undone.
 
     Its inputs would include files already pushed, so the merged file covers a
-    range partially overlapping one the archive holds — and `register` declines
+    range partially overlapping one the published table holds — and `register` declines
     only a range that is ENTIRELY covered, so the partial one is admitted and
-    the same offsets sit in two archive files for ever.
+    the same offsets sit in two published files for ever.
 
-    Compaction therefore skips a file the archive holds, asked per file (§4a).
-    That is also what keeps the two tiers' ranges aligned: a file the archive
+    Compaction therefore skips a file the published table holds, asked per file (§4a).
+    That is also what keeps the two tiers' ranges aligned: a file the published table
     holds is never rewritten locally, so the ranges stay comparable at all.
     """
     config = LogConfig(
@@ -1117,7 +1125,7 @@ def test_compaction_will_not_merge_a_file_the_archive_holds(tmp_path: Path) -> N
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     try:
         log.extend(rows(1200))
@@ -1126,7 +1134,7 @@ def test_compaction_will_not_merge_a_file_the_archive_holds(tmp_path: Path) -> N
 
         assert len(files) >= 4
 
-        # The archive holds the first two.
+        # The published table holds the first two.
         for data_file in files[:2]:
             log._buffer.record_file(
                 f"s3://bucket/prefix/data/{data_file.lo}.parquet",
@@ -1141,7 +1149,7 @@ def test_compaction_will_not_merge_a_file_the_archive_holds(tmp_path: Path) -> N
         merged = log._table.data_files()
 
         assert all(f.lo > boundary or f.hi <= boundary for f in merged), (
-            "no file may span the archive's extent, or the archive gets it twice"
+            "no file may span the published table's extent, or the published table gets it twice"
         )
         assert log.scan().read_all().num_rows == 1200
     finally:
@@ -1152,7 +1160,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
     """A re-point changes where the NEXT file goes, and nothing else (§4a).
 
     The frontier this replaces had to be reset, because it named ranges of the
-    archive being left — and that reset was the only backwards boundary move in
+    published table being left — and that reset was the only backwards boundary move in
     the log, which is what made every reader that had cached the old position
     wrong at once. Per segment there is nothing to reset: files already pushed
     keep naming the bucket that holds them.
@@ -1162,7 +1170,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive=f"file://{tmp_path}/prefix",
+        published=f"file://{tmp_path}/prefix",
     )
     with log:
         seal_files(log, 2)
@@ -1176,47 +1184,49 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
         local = log._table.data_files()
 
         assert (
-            log._maintenance.archived_prefix(
-                local, log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                local, log._published.uri, include_intents=False
             )
             == first.hi
         )
 
-        log.set_archive(f"file://{tmp_path}/elsewhere")
+        log.set_published(f"file://{tmp_path}/elsewhere")
 
         assert (
-            log._maintenance.archived_prefix(
-                local, log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                local, log._published.uri, include_intents=False
             )
             == 0
-        ), "the new archive holds nothing, and says so without any reset"
+        ), "the new published table holds nothing, and says so without any reset"
 
-        log.set_archive(f"file://{tmp_path}/prefix")
+        log.set_published(f"file://{tmp_path}/prefix")
 
         assert (
-            log._maintenance.archived_prefix(
-                local, log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                local, log._published.uri, include_intents=False
             )
             == first.hi
         ), "pointing back finds the copies still recorded where they are"
 
 
-def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) -> None:
+def test_rewriting_the_published_table_does_not_strand_staging_eviction(
+    tmp_path: Path,
+) -> None:
     """The two tiers cut the same rows independently, and I4 must not care.
 
-    `rewrite_archive` re-cuts the archive to different boundaries — that is its
-    whole job. Asking whether a local file's range EQUALS an archived one then
+    `rewrite_published` re-cuts the published table to different boundaries — that is its
+    whole job. Asking whether a local file's range EQUALS a published one then
     failed for every local file, permanently: eviction clamped to zero and
-    stopped, and compaction stopped treating archived files as the archive's
+    stopped, and compaction stopped treating published files as the published table's
     business and merged across its extent. Neither heals, because nothing ever
-    re-cuts the archive back.
+    re-cuts the published table back.
     """
     log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     with log:
         seal_files(log, 3, per_file=4)
@@ -1224,7 +1234,7 @@ def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) ->
 
         assert len(files) == 3
 
-        # The archive holds every row of all three, cut its own way: two files
+        # The published table holds every row of all three, cut its own way: two files
         # whose boundaries line up with none of the local ones.
         lo, hi = files[0].lo, files[-1].hi
         middle = files[1].lo + 1
@@ -1232,21 +1242,21 @@ def test_rewriting_the_archive_does_not_strand_local_eviction(tmp_path: Path) ->
         log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, hi + 1, 1)
 
         assert (
-            log._maintenance.archived_prefix(
-                files, log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                files, log._published.uri, include_intents=False
             )
             == hi
-        ), "the archive holds every row; how it cut them is not I4's business"
+        ), "the published table holds every row; how it cut them is not I4's business"
 
 
-def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
+def test_a_gap_in_the_published_table_stops_the_walk(tmp_path: Path) -> None:
     """Coverage must join adjacent files without inventing rows between them."""
     log = litelink.new(
         tmp_path,
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     with log:
         seal_files(log, 3, per_file=4)
@@ -1261,11 +1271,11 @@ def test_a_gap_in_the_archive_stops_the_walk(tmp_path: Path) -> None:
         )
 
         assert (
-            log._maintenance.archived_prefix(
-                files, log._archive.uri, include_intents=False
+            log._maintenance.published_prefix(
+                files, log._published.uri, include_intents=False
             )
             == files[0].hi
-        ), "a range the archive does not hold must stop the walk"
+        ), "a range the published table does not hold must stop the walk"
 
 
 def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
@@ -1305,10 +1315,10 @@ def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
 def test_the_coverage_walk_agrees_with_the_offsets_it_stands_for() -> None:
     """`_covered` is an optimisation of a set membership test; prove it is one.
 
-    I4 asks whether the archive holds a local file's rows. The honest way to
-    answer is to build the set of offsets the archive holds and test the file's
+    I4 asks whether the published table holds a local file's rows. The honest way to
+    answer is to build the set of offsets the published table holds and test the file's
     against it, which is unaffordable; the walk is what makes it affordable, so
-    it has to give the same answer for every shape — overlapping archived
+    it has to give the same answer for every shape — overlapping published
     ranges, duplicates, gaps, ranges reaching in from below.
     """
     random.seed(20260822)
@@ -1339,11 +1349,11 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
     still live — and then this commit removes them while the merge, whose claim
     is valid throughout, commits them back.
     """
-    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.sync(push_unsettled=True)
-        before = log.table_files()
+        log.publish(push_unsettled=True)
+        before = log.staging_files()
 
         assert before == 3
 
@@ -1383,7 +1393,7 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
             for taker in rival:
                 taker.release()
 
-        assert log.table_files() == before, "committed without holding the claim"
+        assert log.staging_files() == before, "committed without holding the claim"
 
 
 def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
@@ -1425,8 +1435,8 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
     The deletion that follows it is not. Consulting the table without declaring
     anything leaves the window every other pass here was built to close:
     `hydrate` re-registers a file under the very name the queue still holds,
-    deliberately reusing the archived key, and can commit that between the veto
-    being read and the file being unlinked. The local table then references a
+    deliberately reusing the published key, and can commit that between the veto
+    being read and the file being unlinked. The staging table then references a
     file that is not there.
     """
     config = LogConfig(
@@ -1470,11 +1480,11 @@ def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
     """The unlink is this pass's commit, so the claim is asked again at it.
 
     Everything slow in a drain sits between the veto being read and the
-    deletions — opening the archive, walking its manifests, one remote round
+    deletions — opening the published table, walking its manifests, one remote round
     trip per queued object. Past the TTL another owner may lawfully take the
     whole log, `hydrate` a file under the very name still queued here, and
     release; a drain holding a dead claim would then unlink it against a stale
-    veto and leave the local table pointing at a file that is not there.
+    veto and leave the staging table pointing at a file that is not there.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
@@ -1527,36 +1537,36 @@ def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
         )
 
 
-def test_eviction_reads_the_archive_under_its_own_claim(tmp_path: Path) -> None:
+def test_eviction_reads_the_published_table_under_its_own_claim(tmp_path: Path) -> None:
     """Everything that decides a deletion is read under the claim, or it is a
     statement about the past.
 
-    `sync` learned this for itself — under the claim, not before it — and
-    eviction acts on the same fact. The window is not narrow: `set_archive` is
+    `publish` learned this for itself — under the claim, not before it — and
+    eviction acts on the same fact. The window is not narrow: `set_published` is
     documented as something the shipped writer calls on every restart, and it
     takes the whole log, which is free precisely while eviction holds nothing.
-    Attaching an archive between the read and the acquire left eviction
-    deleting the only copy of every aged row the new archive was configured to
-    receive — and sync can never push them afterwards, because they have left
+    Attaching a published table between the read and the acquire left eviction
+    deleting the only copy of every aged row the new published table was configured to
+    receive — and publish can never push them afterwards, because they have left
     the table.
     """
-    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        # Published to the local default, so the archive eviction reads first
+        # Published to the local default, so the published table eviction reads first
         # holds every file and would let it drop all but the newest.
-        log.sync(push_unsettled=True)
-        before = log.table_files()
+        log.publish(push_unsettled=True)
+        before = log.staging_files()
 
         assert before == 3
 
-        # The log is re-pointed between eviction's read and its claim, at an
-        # archive holding nothing.
+        # The log is re-pointed between eviction's read and its claim, at a
+        # published table holding nothing.
         original = Claim.acquire
 
         def attaching(self: Claim) -> bool:
             if self.kind == "evict":
-                log._buffer.set_meta("archive", "s3://bucket/prefix")
+                log._buffer.set_meta("published", "s3://bucket/prefix")
 
             return original(self)
 
@@ -1567,61 +1577,61 @@ def test_eviction_reads_the_archive_under_its_own_claim(tmp_path: Path) -> None:
         finally:
             Claim.acquire = original
 
-        assert log.table_files() == before, (
-            "evicted on the strength of an archive the log had just left"
+        assert log.staging_files() == before, (
+            "evicted on the strength of a published table the log had just left"
         )
 
 
 def test_eviction_reads_the_policy_the_log_records(tmp_path: Path) -> None:
     """`set_config` writes durable state; a maintainer has to hear about it.
 
-    The same reasoning the archive location already earned, applied to the
+    The same reasoning the published location already earned, applied to the
     settings beside it. Eviction is where it shows: it decides deletions from
-    `local_retention` and `local_rows`, so a process holding the copy it read
+    `staging_retention` and `staging_rows`, so a process holding the copy it read
     at open goes on deleting the only copy of rows the durable policy now says
     to keep — and §8 reads as an obligation, not a hint.
     """
-    with open_log(tmp_path, LogConfig(local_rows=1, target_seal_size=1 << 30)) as log:
+    with open_log(tmp_path, LogConfig(staging_rows=1, target_seal_size=1 << 30)) as log:
         seal_files(log, 3)
-        before = log.table_files()
+        before = log.staging_files()
 
         assert before == 3
 
         # Another process raises the floor to cover everything.
-        log._buffer.set_meta("config", LogConfig(local_rows=10_000).to_json())
+        log._buffer.set_meta("config", LogConfig(staging_rows=10_000).to_json())
         log.evict()
 
-        assert log.table_files() == before, (
+        assert log.staging_files() == before, (
             "evicted against the policy this process happened to read at open"
         )
 
 
-def test_a_refreshed_policy_reaches_compaction_sync_and_the_buffer(
+def test_a_refreshed_policy_reaches_compaction_publish_and_the_buffer(
     tmp_path: Path,
 ) -> None:
-    """One owner, or compaction and sync can disagree about what is in play.
+    """One owner, or compaction and publish can disagree about what is in play.
 
     `WriteHandle` used to keep its own copy of the policy beside `Maintenance`'s, kept
     in step by `set_config` writing both. Refreshing only one of them left
-    compaction reading the new policy while `sync` read the old — and `runs`
-    exists precisely so those two cannot disagree, because a file `sync`
+    compaction reading the new policy while `publish` read the old — and `runs`
+    exists precisely so those two cannot disagree, because a file `publish`
     settles under one grouping and compaction merges under another leaves the
-    archive holding rows rewritten underneath it. The buffer's seal target is
+    published table holding rows rewritten underneath it. The buffer's seal target is
     the third copy, and a stale one sizes every file the log writes.
     """
-    with open_log(tmp_path, LogConfig(local_rows=1, target_seal_size=4096)) as log:
+    with open_log(tmp_path, LogConfig(staging_rows=1, target_seal_size=4096)) as log:
         seal_files(log, 2)
         raised = LogConfig(
-            local_rows=10_000, target_seal_size=1 << 20, target_compact_size=1 << 23
+            staging_rows=10_000, target_seal_size=1 << 20, target_compact_size=1 << 23
         )
         log._buffer.set_meta("config", raised.to_json())
 
         log.evict()
 
         assert log.config.target_compact_size == raised.target_compact_size, (
-            "sync reads the policy through WriteHandle; it must be the refreshed one"
+            "publish reads the policy through WriteHandle; it must be the refreshed one"
         )
-        assert log._maintenance.config.local_rows == raised.local_rows
+        assert log._maintenance.config.staging_rows == raised.staging_rows
         assert log._buffer.config().target_seal_size == raised.target_seal_size, (
             "the buffer sizes every file the log writes; it reads the same row"
         )
@@ -1639,12 +1649,12 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
     a badly-sized file, not a wrong one.
 
     The one place it could have been an invariant is `runs`, which compaction
-    and `sync` share so they cannot disagree about what is in play — and per
-    segment I4 closes that: a file the archive holds is never merged again, so
-    a disagreement costs an undersized archive file, which `_push` already
+    and `publish` share so they cannot disagree about what is in play — and per
+    segment I4 closes that: a file the published table holds is never merged again, so
+    a disagreement costs an undersized published file, which `_push` already
     documents as tolerated.
     """
-    config = LogConfig(target_seal_size=4096, compact_min_files=2, local_rows=200)
+    config = LogConfig(target_seal_size=4096, compact_min_files=2, staging_rows=200)
     with open_log(tmp_path, config) as log:
         stop = threading.Event()
         churned = 0
@@ -1666,8 +1676,8 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
                             # torn read of two ints is merely an odd size. A
                             # field seen as an int by the guard and as None by
                             # the arithmetic after it is `int - None`.
-                            local_rows=None if churned % 2 else 200,
-                            local_retention=None
+                            staging_rows=None if churned % 2 else 200,
+                            staging_retention=None
                             if churned % 3
                             else timedelta(seconds=30),
                         )
@@ -1709,7 +1719,7 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
 
     Each `self.config` is now an independent read of the durable row, so two
     of them inside one decision can disagree — and here they did arithmetic on
-    each other: `local_rows` seen as an int by the guard and as None by the
+    each other: `staging_rows` seen as an int by the guard and as None by the
     subtraction after it is `int - None`, a TypeError out of `maintain()`. The
     shipped maintainer catches RuntimeError and CommitFailedException, so that
     stopped maintenance entirely.
@@ -1719,7 +1729,9 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
     of the code — the first attempt at this passed against the broken version
     because the values happened to line up harmlessly.
     """
-    config = LogConfig(target_seal_size=1 << 30, local_rows=200, local_retention=None)
+    config = LogConfig(
+        target_seal_size=1 << 30, staging_rows=200, staging_retention=None
+    )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         original = log._buffer.config
@@ -1745,16 +1757,16 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
         )
 
 
-def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
+def test_the_published_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
     """What `_push`'s arithmetic rests on.
 
-    It splits `pending` at `archived_prefix` and counts the part below as
+    It splits `pending` at `published_prefix` and counts the part below as
     settled, which is only a prefix count if the split lands on a file edge —
     otherwise `pending[:settled]` names a different set than the one the split
     described, and the watermark is written from the wrong file.
 
     Files are ordered by offset and the walk stops at the first file the
-    archive does not fully hold, so the answer is either 0 or some file's `hi`,
+    published table does not fully hold, so the answer is either 0 or some file's `hi`,
     and everything at or below it is a prefix. Asserted over random coverage
     rather than argued.
     """
@@ -1764,7 +1776,7 @@ def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     with log:
         seal_files(log, 5, per_file=4)
@@ -1779,7 +1791,7 @@ def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
                 )
                 log._buffer._con.commit()
 
-            # A random subset of the files gets an archive copy.
+            # A random subset of the files gets a published copy.
             for index, data_file in enumerate(files):
                 if random.random() < 0.6:
                     log._buffer.record_file(
@@ -1789,7 +1801,7 @@ def test_the_archived_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
                         1,
                     )
 
-            frozen = log._maintenance.archived_prefix(
+            frozen = log._maintenance.published_prefix(
                 files, "s3://bucket/prefix", include_intents=False
             )
             below = [f for f in files if f.lo <= frozen]
@@ -1830,7 +1842,7 @@ def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
         # wrapped.
         log._buffer._con.set_trace_callback(watching)
         try:
-            log._buffer.archived_ranges("s3://bucket/prefix", 0, include_intents=True)
+            log._buffer.published_ranges("s3://bucket/prefix", 0, include_intents=True)
 
         finally:
             log._buffer._con.set_trace_callback(None)
@@ -1885,23 +1897,23 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
     without any failure at all.
 
     `hydrate` re-registers a file under the very rel_path the deletion queue
-    still holds — deliberately, it reuses the archived key — and drain's
+    still holds — deliberately, it reuses the published key — and drain's
     reference veto then preserves that entry rather than draining it. When the
-    hydrated file is evicted again, `local_retention` later, the re-enqueue is
+    hydrated file is evicted again, `staging_retention` later, the re-enqueue is
     an `INSERT OR IGNORE` that keeps the FIRST eviction's stamp, so the file
     leaves the table already overdue and drain takes it out from under any
     reader streaming it. Measured by review: unlinked 0.078 s after leaving the
     table, against a three-second grace.
 
     Asserted at the stamp rather than by staging the hydrate, because the
-    reader's safety rests on the stamp and staging it takes a live archive plus
-    an eviction the archive coverage permits — conditions that make the test
+    reader's safety rests on the stamp and staging it takes a live published table plus
+    an eviction the published table coverage permits — conditions that make the test
     about its own setup.
     """
-    config = LogConfig(local_rows=1, target_seal_size=1 << 30)
+    config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         dropped = [log._maintenance._key(f.path) for f in log._table.data_files()]
 
         assert len(dropped) == 3
@@ -1966,28 +1978,28 @@ def test_expiry_restamps_the_metadata_it_supersedes(tmp_path: Path) -> None:
         )
 
 
-def test_local_rows_counts_rows_rather_than_differencing_offsets(
+def test_staging_rows_counts_rows_rather_than_differencing_offsets(
     tmp_path: Path,
 ) -> None:
     """§8's floor has to survive a hole in the offset space.
 
-    It used to be `next_offset() - 1 - local_rows`, which reads naturally and
+    It used to be `next_offset() - 1 - staging_rows`, which reads naturally and
     assumes offsets are dense. A rollback's occasional gap makes that retain
     slightly MORE than asked — the safe direction. A reservation does the
     opposite: a restore skips 2**20 offsets to keep I9, so the subtraction puts
     the boundary far above every local file and the first `maintain()` evicts
-    the entire local window.
+    the entire staging window.
 
     Simulated here by seeding the sequence forward, which is what a restore
     does. The rows already sealed must stay.
     """
     config = replace(
-        LogConfig(), target_seal_size=2048, compact_min_files=2, local_rows=1_000_000
+        LogConfig(), target_seal_size=2048, compact_min_files=2, staging_rows=1_000_000
     )
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(400))
         log.seal_due()
-        before = log.table_rows()
+        before = log.staging_rows()
 
         assert before > 0, "nothing sealed, so there is nothing to evict"
 
@@ -1999,6 +2011,6 @@ def test_local_rows_counts_rows_rather_than_differencing_offsets(
         log._buffer.seed_offsets(log._buffer.next_offset() + (1 << 20))  # noqa: SLF001
         log.maintain()
 
-        assert log.table_rows() == before, (
+        assert log.staging_rows() == before, (
             "the reserved hole was read as a million rows and evicted the window"
         )

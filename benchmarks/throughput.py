@@ -91,7 +91,7 @@ def bench_reads(
         # §7 calls this the architecture overhead: resolve the catalog, read the
         # tier boundary from manifest statistics. Fixed, not proportional, and
         # paid by every read — so it is worth knowing before reading the rest.
-        overhead = best_of(5, log.table_extent) * 1000
+        overhead = best_of(5, log.staging_extent) * 1000
 
         print("\nREAD   every read merges two places: Parquet files, already sealed,")
         print("       and the SQLite buffer, not yet. the buffer is the variable cost.")

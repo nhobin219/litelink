@@ -10,14 +10,14 @@ itself, and each one goes missing quietly in its own way:
   user unit that will actually run the restore, because user units do not
   inherit a login shell's PATH.
 - The DuckDB `httpfs` extension is not compiled into the duckdb wheel and an
-  explicit `LOAD` does not fetch it, so an archive read fails on a machine
+  explicit `LOAD` does not fetch it, so a published read fails on a machine
   where every other check passed. Extensions are built per DuckDB version AND
   platform, so one provisioned for a different duckdb will not load either.
-- An archive can be configured against credentials that do not work. `new`
+- A published table can be configured against credentials that do not work. `new`
   deliberately allows that — credentials commonly attach to a box after the log
   is configured, and an attempt to refuse it here broke sixteen tests doing
   exactly that legitimately — so nothing on the write path finds out until the
-  first `sync`.
+  first `publish`.
 
 None of those is checkable by looking at the code, and all of them are
 checkable in about a second. Run this from the process and the user that will
@@ -36,11 +36,11 @@ from typing import TYPE_CHECKING
 
 import duckdb
 
-from litelink._layout import Layout, validate_archive
+from litelink._layout import Layout, validate_published
 from litelink._read import ExtensionMissing, duckdb_connection, load_extension
 from litelink._replication import litestream_binary
 from litelink._s3 import S3Options
-from litelink._table import archive_extent
+from litelink._table import published_extent
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -189,12 +189,12 @@ def _extension(name: str, *, required: bool) -> Check:
     )
 
 
-def _archive(prefix: str, name: str, s3: S3Options | None) -> Check:
-    """Can this machine READ that archive with the credentials it has?
+def _published(prefix: str, name: str, s3: S3Options | None) -> Check:
+    """Can this machine READ that published table with the credentials it has?
 
-    Through `archive_extent`, which is the same call `new` and `restore` make,
+    Through `published_extent`, which is the same call `new` and `restore` make,
     so this checks what they will actually do rather than something adjacent.
-    It reads the published hint from the bucket alone — no `archive.db`, no
+    It reads the published hint from the bucket alone — no `published.db`, no
     catalog — and it separates the two answers an operator needs told apart:
     `None` for "nothing published there", and a raise for "answered with a
     refusal".
@@ -211,24 +211,26 @@ def _archive(prefix: str, name: str, s3: S3Options | None) -> Check:
         # traceback out of argv is the least useful form that answer can take.
         # It is also the check most likely to fire here — the prefix arrives
         # from a shell, where a missing slash survives every other layer.
-        validate_archive(prefix)
-        extent = archive_extent(layout, prefix, (s3 or S3Options()).resolved())
+        validate_published(prefix)
+        extent = published_extent(layout, prefix, (s3 or S3Options()).resolved())
     except Exception as exc:  # noqa: BLE001
         return Check(
-            f"archive {prefix}",
+            f"published table {prefix}",
             ok=False,
             detail=f"{type(exc).__name__}: {exc}"[:240],
         )
 
     if extent is None:
         return Check(
-            f"archive {prefix}",
+            f"published table {prefix}",
             ok=True,
             detail=f"reachable; nothing published for log {name!r} yet",
         )
 
     return Check(
-        f"archive {prefix}", ok=True, detail=f"reachable, holds offsets {extent}"
+        f"published table {prefix}",
+        ok=True,
+        detail=f"reachable, holds offsets {extent}",
     )
 
 
@@ -241,7 +243,7 @@ def _clocksource() -> Check:
     `Restart=always` that is a crash loop. Reported upstream as
     benbjohnson/litestream#1488.
 
-    The symptom lies. The sidecar logs successful syncs and uploads right up
+    The symptom lies. The sidecar logs successful publishes and uploads right up
     to each panic, so a minute of watching the log shows healthy replication;
     the damage is only visible in the restart count. And this is a durability
     failure rather than an inconvenience, because on a stream that never
@@ -302,7 +304,7 @@ def _clocksource() -> Check:
         detail=(
             f"clocksource tsc on a {virtual} guest. If CLOCK_MONOTONIC regresses "
             f"here, litestream panics and crash-loops — and it logs successful "
-            f"syncs up to each panic, so check restarts, not log lines."
+            f"publishes up to each panic, so check restarts, not log lines."
             f"{remedy}"
         ),
     )
@@ -327,7 +329,7 @@ def _virtualised() -> str | None:
 
 def preflight(
     *,
-    archive: str | None = None,
+    published: str | None = None,
     name: str = "s",
     s3: S3Options | None = None,
     replication: bool = True,
@@ -337,17 +339,17 @@ def preflight(
     Run it from the process and the user that will own the log — the whole
     point is the gap between a login shell and a service unit.
 
-        python -m litelink                             # local tier only
-        python -m litelink s3://bucket/prefix trades   # and the archive
+        python -m litelink                             # staging tier only
+        python -m litelink s3://bucket/prefix trades   # and the published table
 
     `replication` skips the litestream check for a deployment that genuinely
     never restores or follows. Everything else is always checked, because a
     log that only writes locally still reads through DuckDB.
     """
     checks: list[Check] = [_read_path()]
-    if archive is not None:
+    if published is not None:
         checks.append(_extension("httpfs", required=False))
-        checks.append(_archive(archive, name, s3))
+        checks.append(_published(published, name, s3))
 
     if replication:
         checks.append(_litestream())
@@ -357,12 +359,12 @@ def preflight(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """`python -m litelink [archive-uri]`."""
+    """`python -m litelink [published-uri]`."""
     import sys
 
     args = list(sys.argv[1:] if argv is None else argv)
     report = preflight(
-        archive=args[0] if args else None,
+        published=args[0] if args else None,
         name=args[1] if len(args) > 1 else "s",
     )
     print(report)  # noqa: T201

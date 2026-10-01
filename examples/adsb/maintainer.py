@@ -1,11 +1,11 @@
 """One storage role, one process.
 
-    uv run python examples/adsb/maintainer.py --role seal|compact|reclaim|sync|all
+    uv run python examples/adsb/maintainer.py --role seal|compact|reclaim|publish|all
 
 The **writer** appends and does nothing else. Everything else is storage work,
 and this runs one piece of it: sealing the buffer into Parquet, converting
-sealed files into archive-shaped ones, reclaiming local disk, or pushing to the
-archive. `just demo-maintain` starts all four.
+sealed files into published-shaped ones, reclaiming local disk, or pushing to the
+published table. `just demo-maintain` starts all four.
 
 **Why one process each.** A seal is CPU-bound pure Python — most of its commit
 is pyiceberg copying table metadata — so it starves a thread sharing its
@@ -44,7 +44,7 @@ when the costs do not justify four processes.
 
 The claims are what make any of this safe. Each pass claims the offset RANGE it
 is about to work on, so passes on disjoint ranges run at once and only real
-overlap serialises — a compaction merging one run and a sync pushing another
+overlap serialises — a compaction merging one run and a publish pushing another
 have nothing to say to each other. An owner is minted per attempt, so two
 processes and two threads are refused on identical terms, and the expiry on a
 claim is what tells recovery whether an interrupted operation is live work or a
@@ -85,58 +85,58 @@ def seal_pass(log: WriteHandle) -> str | None:
     Silence is the healthy state: the queue is usually empty, and a line every
     quarter second saying so would bury the ones that matter.
     """
-    before = log.table_files()
+    before = log.staging_files()
     sealed = log.seal_due()
     if sealed is None:
         return None
 
     return (
         f"sealed through {sealed:,}  "
-        f"local files {before} -> {log.table_files()}  "
+        f"staging files {before} -> {log.staging_files()}  "
         f"buffer {log.buffered_rows():,} rows"
     )
 
 
 def compact_pass(log: WriteHandle) -> str | None:
     """Convert sealed files into `target_compact_size` ones."""
-    before = log.table_files()
+    before = log.staging_files()
     log.compact()
-    after = log.table_files()
+    after = log.staging_files()
     if after == before:
         return None
 
-    return f"converted {before} files -> {after}  local {log.table_rows():,} rows"
+    return f"converted {before} files -> {after}  local {log.staging_rows():,} rows"
 
 
 def reclaim_pass(log: WriteHandle, root: Path) -> str | None:
-    """Settle, evict past `local_retention`, expire, delete what came due.
+    """Settle, evict past `staging_retention`, expire, delete what came due.
 
     Settling first because eviction never goes above the watermark (§4a), and
-    on a log with no archive nothing else moves it — `sync` is the step that
+    on a log with no published table nothing else moves it — `publish` is the step that
     moves it when there is one, and does not run here.
     """
-    before = log.table_files()
+    before = log.staging_files()
     log.evict()
     log.expire()
-    after = log.table_files()
+    after = log.staging_files()
     if after == before:
         return None
 
     return (
-        f"released {before - after} files  local {log.table_rows():,} rows  "
+        f"released {before - after} files  local {log.staging_rows():,} rows  "
         f"disk {_disk(root) / 1e6:.1f} MB"
     )
 
 
-def sync_pass(log: WriteHandle) -> str | None:
+def publish_pass(log: WriteHandle) -> str | None:
     """Push what compaction has finished with, and record the watermark."""
-    before = log.archived_through()
-    log.sync()
-    after = log.archived_through()
+    before = log.published_through()
+    log.publish()
+    after = log.published_through()
     if after == before:
         return None
 
-    return f"archived through {after:,}  archive files {log.archive_files():,}"
+    return f"published through {after:,}  published files {log.published_files():,}"
 
 
 def all_passes(log: WriteHandle, root: Path) -> str | None:
@@ -145,12 +145,11 @@ def all_passes(log: WriteHandle, root: Path) -> str | None:
     them the other way round only makes files wait a cycle."""
     log.maintain()
     report = (
-        f"local {log.table_rows():,} rows in {log.table_files()} files  "
+        f"local {log.staging_rows():,} rows in {log.staging_files()} files  "
         f"buffer {log.buffered_rows():,} rows  disk {_disk(root) / 1e6:.1f} MB"
     )
-    if log.archive:
-        log.sync()
-        report += f"  archived through {log.archived_through():,}"
+    log.publish()
+    report += f"  published through {log.published_through():,}"
 
     return report
 
@@ -162,7 +161,7 @@ ROLES = {
     "seal": 0.25,
     "compact": 10.0,
     "reclaim": 30.0,
-    "sync": 10.0,
+    "publish": 10.0,
     "all": 10.0,
 }
 
@@ -186,20 +185,11 @@ def main() -> None:
     # for, which is the library's business and not the caller's.
     try:
         # Credentials from the environment, never from the log — see
-        # `capture.py`. Harmless when there is no archive: nothing resolves
-        # them unless a push actually happens.
+        # `capture.py`. Harmless for a local published table: nothing resolves
+        # them unless a push to S3 actually happens.
         log = litelink.open(args.root, NAME, s3=S3Options())
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
-
-    if args.role == "sync" and not log.archive:
-        # Not an error: `just demo-maintain` starts every role, and a
-        # local-only log simply has nothing for this one to do. Exiting quietly
-        # beats an error the reader has to learn to ignore.
-        print("[   sync] no archive configured, nothing to push", flush=True)
-        log.close()
-
-        return
 
     label = f"[{args.role:>7}]"
     print(f"{label} pid {os.getpid()}, every {every:g}s", flush=True)
@@ -214,11 +204,11 @@ def main() -> None:
     # testing before this was here.
     signal.signal(signal.SIGTERM, _stop)
 
-    # The sidecar belongs to whichever process is already archive-facing, so it
+    # The sidecar belongs to whichever process is already published-facing, so it
     # is not started four times over.
     sidecar = (
         Sidecar(log)
-        if log.config.wal_replication and args.role in {"sync", "all"}
+        if log.config.wal_replication and args.role in {"publish", "all"}
         else None
     )
     if sidecar is not None and sidecar.owner:
@@ -230,7 +220,7 @@ def main() -> None:
         "seal": lambda: seal_pass(log),
         "compact": lambda: compact_pass(log),
         "reclaim": lambda: reclaim_pass(log, args.root),
-        "sync": lambda: sync_pass(log),
+        "publish": lambda: publish_pass(log),
         "all": lambda: all_passes(log, args.root),
     }
     run = passes[args.role]
@@ -410,7 +400,7 @@ class Sidecar:
             if not self.owner:
                 return
 
-            print("[   sync] took over WAL replication", flush=True)
+            print("[   publish] took over WAL replication", flush=True)
 
         if self._process is not None and self._process.poll() is None:
             return
@@ -455,8 +445,8 @@ def _maintain(log: WriteHandle, root: Path) -> None:
     `log.maintain()` does all of this in one call and is what most deployments
     want. It is split here because the phases cost wildly different amounts and
     a single number hides which one was slow — conversion reads and rewrites
-    whole files, eviction and expiry are metadata commits, and sync is the only
-    one that can block on a network. An 83 s sync went unnoticed inside a
+    whole files, eviction and expiry are metadata commits, and publish is the only
+    one that can block on a network. An 83 s publish went unnoticed inside a
     combined figure until the buffer had grown to 170,540 rows.
 
     `seal` reads 0 ms in a healthy log and that is the point: the loop above
@@ -480,23 +470,21 @@ def _maintain(log: WriteHandle, root: Path) -> None:
         print(f"  skipped: {exc}")
         return
 
-    # After the local passes, not before. Eviction reads the archive watermark
+    # After the local passes, not before. Eviction reads the published watermark
     # to decide what it is allowed to drop (I4), so a push landing first is
     # what lets the NEXT pass reclaim the disk it freed up.
-    archived_rows = archived_files = sync_column = ""
-    if log.archive:
-        pushed = time.monotonic()
-        log.sync()
-        archived_rows = f" {log.archived_through():>14,}"
-        archived_files = f" {log.archive_files():>14,}"
-        sync_column = f" {(time.monotonic() - pushed) * 1000:>7.0f}ms"
+    pushed = time.monotonic()
+    log.publish()
+    published_rows = f" {log.published_through():>14,}"
+    published_files = f" {log.published_files():>14,}"
+    publish_column = f" {(time.monotonic() - pushed) * 1000:>7.0f}ms"
 
     print(
-        f"{log.table_rows():>13,} {log.buffered_rows():>13,}{archived_rows}"
-        f" {log.table_files():>12,}{archived_files}"
+        f"{log.staging_rows():>13,} {log.buffered_rows():>13,}{published_rows}"
+        f" {log.staging_files():>12,}{published_files}"
         f" {_disk(root) / 1e6:>7.1f}MB"
         f" {timings['seal']:>6.0f}ms {timings['compact']:>8.0f}ms"
-        f" {timings['reclaim']:>8.0f}ms{sync_column}"
+        f" {timings['reclaim']:>8.0f}ms{publish_column}"
     )
 
 

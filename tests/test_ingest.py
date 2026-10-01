@@ -138,7 +138,7 @@ def table(n: int, *, start: int = 0) -> pa.Table:
 
 def test_ingest_writes_rows_that_read_back_once(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
-        assert log.ingest(table(2000)) == (1, 2000)
+        assert log.ingest(table(2000)) == (1, 2001)
 
         assert log._table.extent() == (1, 2000)
         assert log.scan().read_all().num_rows == 2000
@@ -160,7 +160,7 @@ def test_ingest_returns_none_for_a_source_with_no_rows(tmp_path: Path) -> None:
 def test_ingest_accepts_a_record_batch_reader(tmp_path: Path) -> None:
     """A Table is a reader that ends after one pull, so there is no branch."""
     with open_log(tmp_path) as log:
-        assert log.ingest(table(500).to_reader(max_chunksize=64)) == (1, 500)
+        assert log.ingest(table(500).to_reader(max_chunksize=64)) == (1, 501)
         assert log.scan().read_all().num_rows == 500
 
 
@@ -217,7 +217,7 @@ def test_ingest_lands_above_a_frontier_a_seal_left(tmp_path: Path) -> None:
         log.seal()
         log.await_seal()
 
-        assert log.ingest(table(100, start=5)) == (6, 105)
+        assert log.ingest(table(100, start=5)) == (6, 106)
         assert log.scan().read_all().num_rows == 105
         assert log.append(rows(1)[0]) == 106
 
@@ -275,10 +275,10 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     it stripped the off-box copy from rows that were.
 
     The load now pushes its own output, so the scope statement is narrower than
-    it was: WAL still cannot carry a bulk range, but the archive has it before
+    it was: WAL still cannot carry a bulk range, but the published table has it before
     `ingest` returns. Note the knock-on asserted below — the push is a PREFIX,
-    so it takes the captured rows as well, and `release_archived` then drops
-    what the archive holds. The rows move from buffer to bucket; they are never
+    so it takes the captured rows as well, and `release_published` then drops
+    what the published table holds. The rows move from buffer to bucket; they are never
     in neither.
     """
     config = LogConfig(
@@ -293,36 +293,36 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     ) as log:
         log.extend(rows(300))
         log.seal()
         log.await_seal()
         # A seal RETAINS its rows here: with replication on the buffer is the
-        # off-box copy until the archive has the range (§3a).
+        # off-box copy until the published table has the range (§3a).
         retained = buffered(log)
         assert retained == 300
 
         lo, hi = log.ingest(table(500, start=300)) or (0, 0)
 
-        assert (lo, hi) == (301, 800)
+        assert (lo, hi) == (301, 801), "[start, end)"
         assert log.scan().read_all().num_rows == 800
         # The captured rows still have an off-box copy — the load did not strip
         # it, which is the whole of what refusing got wrong. They have MOVED,
-        # though: the load's own sync pushed them, and `release_archived` then
-        # dropped what the archive had taken. Buffer or bucket, never neither.
-        assert log.archived_through() >= retained
+        # though: the load's own publish pushed them, and `release_published` then
+        # dropped what the published table had taken. Buffer or bucket, never neither.
+        assert log.published_through() >= retained
         # And the loaded range is second-copied too, which is the point of
-        # syncing from inside `ingest`: nothing WAL ships holds these rows, so
+        # publishing from inside `ingest`: nothing WAL ships holds these rows, so
         # without this they would be on local disk alone.
-        assert log.archived_through() >= hi
+        assert log.published_through() >= hi - 1
         # Still not in the buffer, which is the honest scope claim about WAL.
-        assert buffered(log) < hi - lo + 1
+        assert buffered(log) < hi - lo
 
-        log.sync()
+        log.publish()
 
-        assert log.archived_through() >= 300
+        assert log.published_through() >= 300
 
 
 def test_ingest_is_refused_while_another_owner_holds_the_log(tmp_path: Path) -> None:
@@ -477,7 +477,7 @@ def test_a_lost_reservation_leaves_a_gap_the_log_reads_across(
             log.ingest(table(100))
 
         monkeypatch.undo()
-        assert log.ingest(table(50)) == (101, 150)
+        assert log.ingest(table(50)) == (101, 151)
         log.extend(rows(3))
         log.seal()
         log.await_seal()
@@ -517,10 +517,10 @@ def test_files_are_registered_several_per_commit(
     assert len(commits) < len(files)
 
 
-def test_an_ingested_range_survives_the_whole_archive_cycle(
+def test_an_ingested_range_survives_the_whole_published_table_cycle(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The reservation is upward, so every tier boundary keeps holding: `sync`
+    """The reservation is upward, so every tier boundary keeps holding: `publish`
     pushes it, `evict` clamps to it, and a merged read serves it once."""
     with litelink.new(
         tmp_path,
@@ -531,33 +531,33 @@ def test_an_ingested_range_survives_the_whole_archive_cycle(
             target_seal_size=4096,
             target_compact_size=8192,
             compact_min_files=2,
-            local_retention=timedelta(seconds=0),
+            staging_retention=timedelta(seconds=0),
             snapshot_retention=timedelta(seconds=0),
         ),
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     ) as log:
-        assert log.ingest(table(3000)) == (1, 3000)
+        assert log.ingest(table(3000)) == (1, 3001)
         log.extend(rows(400, start=3000))
         log.seal()
         log.await_seal()
 
-        log.sync()
-        assert log._archive.require().extent() is not None
+        log.publish()
+        assert log._published.require().extent() is not None
         log.maintain()
 
         assert log.scan().read_all().num_rows == 3400
         assert log.append(rows(1)[0]) == 3401
 
 
-def test_a_loaded_range_reaches_the_archive_whole(
+def test_a_loaded_range_reaches_the_published_table_whole(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """No tail left behind, which is the whole point of loading under an archive.
+    """No tail left behind, which is the whole point of loading under a published table.
 
     A load's rows never enter the buffer, so WAL replication cannot carry them
-    and the archive is their ONLY second copy. This used to assert the opposite
-    — that one `sync()` reached everything except the short last file, because
+    and the published table is their ONLY second copy. This used to assert the opposite
+    — that one `publish()` reached everything except the short last file, because
     `stable_prefix` holds a trailing run still under the compaction budget. The
     lag was documented and was said to terminate once roughly another budget of
     rows arrived above it.
@@ -567,7 +567,7 @@ def test_a_loaded_range_reaches_the_archive_whole(
     for as long as the stream stayed slow. So `ingest` now pushes its own output
     with `push_unsettled=True`, and the assertion flips.
 
-    Falsify by passing `sync=False`: `archived_through()` drops back below `hi`
+    Falsify by passing `publish=False`: `published_through()` drops back below `hi`
     and the tail file is local-only again.
     """
     with litelink.new(
@@ -581,19 +581,21 @@ def test_a_loaded_range_reaches_the_archive_whole(
             compact_min_files=2,
             snapshot_retention=timedelta(seconds=0),
         ),
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     ) as log:
         _, hi = log.ingest(table(3000)) or (0, 0)
 
-        # No explicit sync: the load pushed its own output, tail included.
-        assert log.archived_through() >= hi, "the loaded range is not second-copied"
+        # No explicit publish: the load pushed its own output, tail included.
+        assert log.published_through() >= hi - 1, (
+            "the loaded range is not second-copied"
+        )
         assert log.buffered_rows() == 0
 
         # And the opt-out still leaves it behind, which is what the flag means.
-        _, hi2 = log.ingest(table(500, start=hi), sync=False) or (0, 0)
+        _, hi2 = log.ingest(table(500, start=hi), publish=False) or (0, 0)
 
-        assert log.archived_through() < hi2
+        assert log.published_through() < hi2 - 1
 
 
 # -- the codec (§12) -----------------------------------------------------------
@@ -677,26 +679,26 @@ def test_a_log_reads_across_files_written_with_different_codecs(
 def test_a_load_pushes_the_undersized_seals_beneath_it_too(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The cost of syncing from inside `ingest`, pinned so it is not a surprise.
+    """The cost of publishing from inside `ingest`, pinned so it is not a surprise.
 
     `stable_prefix` holds back a trailing run, and a deployment may rely on that
-    to keep undersized files out of its archive. A load cannot honour that rule
+    to keep undersized files out of its published table. A load cannot honour that rule
     and still second-copy itself: `_push` takes a PREFIX, because the watermark
     it records has to stay contiguous for eviction to trust it (I4). So an
     unsettled SEAL below the load is pushed as well.
 
     Measured while trying the narrow version — extending the push only through
     bulk-loaded files never advances past a seal sitting at index 0, and
-    `archived_through()` stays 0 with the load unarchived.
+    `published_through()` stays 0 with the load unpublished.
 
     The trade is deliberate, and cheap because of WHEN a load happens: `ingest`
     claims the whole log, so it is a backfill-time operation with live capture
     typically stopped, and the trailing run is the load's own. Against that, not
     pushing leaves rows that never entered the buffer on a single disk.
-    `sync=False` opts out for a caller who would rather sequence it themselves.
+    `publish=False` opts out for a caller who would rather sequence it themselves.
 
     Falsify by reverting `push_unsettled` to the ordinary `stable_prefix` gate:
-    `archived_through()` drops below the load's `hi`.
+    `published_through()` drops below the load's `hi`.
     """
     config = LogConfig(
         target_seal_size=4096,
@@ -711,26 +713,28 @@ def test_a_load_pushes_the_undersized_seals_beneath_it_too(
         schema=SCHEMA,
         sort_by=("event_ts",),
         config=config,
-        archive=f"s3://{bucket}/prefix",
+        published=f"s3://{bucket}/prefix",
         s3=s3,
     ) as log:
         # Far below the compact target, so it lands in the trailing run.
         log.extend(rows(200))
         log.seal()
         log.await_seal()
-        log.sync()
+        log.publish()
 
-        assert log.archived_through() == 0, "an ordinary sync pushed an undersized seal"
+        assert log.published_through() == 0, (
+            "an ordinary publish pushed an undersized seal"
+        )
 
         _, hi = log.ingest(table(300, start=200)) or (0, 0)
 
         # The load is second-copied, and the seal beneath it went with it.
-        assert log.archived_through() >= hi
+        assert log.published_through() >= hi - 1
 
         # And opting out leaves the next load where it was.
-        _, hi2 = log.ingest(table(50, start=hi), sync=False) or (0, 0)
+        _, hi2 = log.ingest(table(50, start=hi), publish=False) or (0, 0)
 
-        assert log.archived_through() < hi2
+        assert log.published_through() < hi2 - 1
 
 
 NON_FINITE_LOADS = [
@@ -810,5 +814,5 @@ def test_a_nan_under_a_null_struct_is_not_a_stored_value(tmp_path: Path) -> None
     source = pa.Table.from_arrays([pa.array([1], pa.int64()), hidden], schema=schema)
 
     with litelink.new(tmp_path, "s", schema=schema, sort_by=("k",)) as log:
-        assert log.ingest(source) == (1, 1)
+        assert log.ingest(source) == (1, 2)
         assert log.scan().read_all()["x"].to_pylist() == [None]

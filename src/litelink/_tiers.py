@@ -1,39 +1,40 @@
-"""The archive's tier row: what a read consults to skip the archive (#90).
+"""The published table's tier row: what a read consults to skip the published table (#90).
 
 A read decides per query which tiers it needs, with `litelink.manifest.prune`
 over two rows keyed by `tier`:
 
-- **`local`** — the local Iceberg table, rolled up from its manifests. The
+- **`staging`** — the staging table, rolled up from its manifests. The
   process that commits a new version stores that version's rollup, stamped
   with the version, so every other process reads it rather than rolling it up
   again; a reader uses it only when the stamp is the version it resolved, and
   otherwise rolls the version up itself (`LogTable.statistics_at`, cached in
   memory per version). A late or missing store costs a rollup, never a wrong
   answer.
-- **`archive`** — what the archive holds BELOW the local table: the rows
-  eviction moved there. Not the whole archive, whose copy of the local window
+- **`published`** — what the published table holds BELOW the staging table:
+  the rows
+  eviction moved there. Not the whole published table, whose copy of the staging window
   would put its maximum timestamp at "a few minutes ago" and send every hot
-  query to the network. The archive leg of a read covers exactly this range —
-  offsets under the local table's first — so this is the row that decides it.
+  query to the network. The published leg of a read covers exactly this range —
+  offsets under the staging table's first — so this is the row that decides it.
 
-The archive's row is the one stored, in `buffer.db`, because its statistics
-otherwise live in the archive's manifests on S3 and the decision must not
+The published table's row is the one stored, in `buffer.db`, because its statistics
+otherwise live in the published table's manifests on S3 and the decision must not
 cost the round trip it exists to avoid. Eviction is the last moment those rows'
 statistics are on local disk, and it usually runs in another process than the
 reader, so the row is written by the writer side and read by everyone.
 
-**Overstating is the safe direction.** A row that claims more than the archive
-holds below the local table costs a read that finds nothing; one that claims
+**Overstating is the safe direction.** A row that claims more than the published table
+holds below the staging table costs a read that finds nothing; one that claims
 less loses rows. So eviction WIDENS the row before the commit that moves rows
-below the local table, and the one write that narrows — an exact rollup from
-the archive's manifests — runs only under the whole-log maintenance claim,
-where eviction cannot run beside it. `sync` and `rewrite_archive` never change
-it: one adds copies of rows the local table still holds, the other re-cuts
-rows the archive already has.
+below the staging table, and the one write that narrows — an exact rollup from
+the published table's manifests — runs only under the whole-log maintenance claim,
+where eviction cannot run beside it. `publish` and `rewrite_published` never change
+it: one adds copies of rows the staging table still holds, the other re-cuts
+rows the published table already has.
 
 **A missing row means "no statistics", and nothing turns it into a row but an
 exact rollup.** Widening a row that is not there would describe only the rows
-being added, so it does nothing; the archive is read until something computes
+being added, so it does nothing; the published table is read until something computes
 the whole of it.
 """
 
@@ -50,10 +51,10 @@ from litelink.manifest import Row, columns
 if TYPE_CHECKING:
     from litelink._buffer import Buffer
 
-LOCAL = "local"
-ARCHIVE = "archive"
+STAGING = "staging"
+PUBLISHED = "published"
 BUFFER = "buffer"
-TIERS = (LOCAL, ARCHIVE)
+TIERS = (STAGING, PUBLISHED)
 
 OFFSET = "litelink_offset"
 
@@ -63,7 +64,7 @@ KEY = "tier"
 
 class Stored(NamedTuple):
     """A stored tier: where it sits in the log, its columns' statistics, and —
-    for the local tier — the version of the table they were rolled up from."""
+    for the staging tier — the version of the table they were rolled up from."""
 
     offsets: tuple[int, int]
     statistics: TierStatistics
@@ -98,8 +99,8 @@ class StoredTiers:
         return decoded
 
 
-class ArchiveTier:
-    """The archive's tier row, kept in `buffer.db` (`tier_offsets` and
+class PublishedTier:
+    """The published table's tier row, kept in `buffer.db` (`tier_offsets` and
     `tier_statistics`)."""
 
     def __init__(self, buffer: Buffer) -> None:
@@ -108,7 +109,7 @@ class ArchiveTier:
 
     def load(self) -> Stored | None:
         """The row, or None when the log has none yet."""
-        return self._stored.load().get(ARCHIVE)
+        return self._stored.load().get(PUBLISHED)
 
     def has(self) -> bool:
         return self.load() is not None
@@ -121,13 +122,13 @@ class ArchiveTier:
         statistics' own offset bounds.
         """
         stored = (offsets(statistics), encode(schema, statistics))
-        self._buffer.update_tier(ARCHIVE, lambda *_: stored)
+        self._buffer.update_tier(PUBLISHED, lambda *_: stored)
 
     def widen(self, schema: pa.Schema, statistics: TierStatistics) -> None:
         """Add `statistics` to the row, before the commit that evicts them.
 
         A missing row stays missing: it is "no statistics", and a row made of
-        only the rows being added would claim the archive holds nothing else.
+        only the rows being added would claim the published table holds nothing else.
         """
         added = offsets(statistics)
 
@@ -147,11 +148,11 @@ class ArchiveTier:
 
             return span, encode(schema, merged)
 
-        self._buffer.update_tier(ARCHIVE, change)
+        self._buffer.update_tier(PUBLISHED, change)
 
     def drop(self) -> None:
-        """Forget the row, so reads include the archive until it is rebuilt."""
-        self._buffer.update_tier(ARCHIVE, lambda *_: None)
+        """Forget the row, so reads include the published table until it is rebuilt."""
+        self._buffer.update_tier(PUBLISHED, lambda *_: None)
 
 
 def encode(schema: pa.Schema, statistics: TierStatistics) -> str:

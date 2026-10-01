@@ -1,7 +1,7 @@
 """`retire()`: a log ended for good, and everything that must refuse after it.
 
-Against a real archive, because retirement is defined by where the rows end
-up — all in the archive, none local — and by what `restore` finds there.
+Against a real published table, because retirement is defined by where the rows end
+up — all in the published table, none local — and by what `restore` finds there.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from litelink._layout import Layout
 from litelink._replication import control_socket, litestream_binary
 from litelink._table import RETIRED_PROPERTY
 from litelink.log import OFFSET
-from tests.test_archive import ROWS, archived_log, rows
+from tests.test_publish import ROWS, published_log, rows
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -38,13 +38,18 @@ pytestmark = pytest.mark.s3
 def written(
     tmp_path: Path, bucket: str, s3: S3Options, **overrides: object
 ) -> WriteHandle:
-    """A log with rows in every tier: archived and evicted, local, buffered."""
-    log = archived_log(
-        tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000, **overrides
+    """A log with rows in every tier: published and evicted, local, buffered."""
+    log = published_log(
+        tmp_path,
+        bucket,
+        s3,
+        staging_retention=timedelta(0),
+        staging_rows=1000,
+        **overrides,
     )
     log.extend(rows(ROWS))
     log.seal()
-    log.sync(push_unsettled=True)
+    log.publish(push_unsettled=True)
     log.maintain()
     log.extend({"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(7))
 
@@ -61,40 +66,40 @@ def backup(source: Path, target: Path) -> None:
     dst.close()
 
 
-def test_a_retired_log_is_all_archive_and_nothing_local(
+def test_a_retired_log_is_all_published_and_nothing_in_staging(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Every row in the archive, none local, and both records say so.
+    """Every row in the published table, none local, and both records say so.
 
-    Falsify by removing the `evict(everything=True)` from `retire`: the local
+    Falsify by removing the `evict(everything=True)` from `retire`: the staging
     table keeps its files and `retire` refuses to mark the log retired.
     """
     with written(tmp_path, bucket, s3) as log:
         total = log.end_offset() - 1
         log.retire()
 
-        assert log.table_rows() == 0
+        assert log.staging_rows() == 0
         assert log._buffer.extent() is None  # noqa: SLF001
         marker = log._buffer.retired()  # noqa: SLF001
         assert marker is not None
         assert (marker["state"], marker["through"]) == ("retired", total)
 
-        archive = log._archive.require()  # noqa: SLF001
-        archive.reload()
-        recorded = json.loads(archive.properties[RETIRED_PROPERTY])
+        published = log._published.require()  # noqa: SLF001
+        published.reload()
+        recorded = json.loads(published.properties[RETIRED_PROPERTY])
         assert recorded["through"] == total
 
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         offsets = reader.scan(columns=[OFFSET]).read_all().column(0).to_pylist()
         assert sorted(offsets) == list(range(1, total + 1))
-        archived = reader.column_statistics(tier="archive")
-        assert archived.record_count == total, "nothing local, so it is the log"
+        held = reader.column_statistics(tier="published")
+        assert held.record_count == total, "nothing in staging, so it is the log"
         coverage = reader.coverage()
-        assert (coverage.archive, coverage.local, coverage.buffer) == (
-            (1, total),
+        assert (coverage.published, coverage.staging, coverage.buffer) == (
+            (1, total + 1),
             None,
             None,
-        ), "a retired log is all archive"
+        ), "a retired log is all published"
 
 
 def test_a_retired_log_takes_no_rows_from_any_handle(
@@ -123,7 +128,7 @@ def test_a_retired_log_takes_no_rows_from_any_handle(
 def pa_table(count: int):  # noqa: ANN201
     import pyarrow as pa
 
-    from tests.test_archive import SCHEMA
+    from tests.test_publish import SCHEMA
 
     return pa.Table.from_pylist(rows(count), schema=SCHEMA)
 
@@ -147,13 +152,13 @@ def test_a_retired_log_opens_for_reading_only(
         assert reader.scan().read_all().num_rows == through
 
 
-def test_restore_refuses_on_the_archive_alone(
+def test_restore_refuses_on_the_published_table_alone(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A replica shipped BEFORE retirement carries no marker; the archive's
+    """A replica shipped BEFORE retirement carries no marker; the published table's
     `litelink.retired` property refuses it anyway.
 
-    Falsify by removing the `archive_retired` check from `restore`: the old
+    Falsify by removing the `published_retired` check from `restore`: the old
     buffer brings the retired log back as a writer.
     """
     where = f"s3://{bucket}/prefix"
@@ -165,13 +170,13 @@ def test_restore_refuses_on_the_archive_alone(
 
     assert Buffer.peek_retired(Layout(second, "s").buffer_db) is None
     with pytest.raises(RetiredError, match="retired"):
-        litelink.restore(second, "s", archive=where, s3=s3)
+        litelink.restore(second, "s", published=where, s3=s3)
 
 
 def test_restore_refuses_on_the_replica_marker_alone(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The other guard on its own: the archive property hidden, the marker in
+    """The other guard on its own: the published property hidden, the marker in
     the replica still refuses.
 
     Falsify by removing the `peek_retired` check from `restore`.
@@ -183,9 +188,9 @@ def test_restore_refuses_on_the_replica_marker_alone(
         log.retire()
         backup(Layout(primary, "s").buffer_db, Layout(second, "s").buffer_db)
 
-    monkeypatch.setattr("litelink.log.archive_retired", lambda *_: None)
+    monkeypatch.setattr("litelink.log.published_retired", lambda *_: None)
     with pytest.raises(RetiredError, match="retired"):
-        litelink.restore(second, "s", archive=where, s3=s3)
+        litelink.restore(second, "s", published=where, s3=s3)
 
 
 def test_retire_resumes_after_a_crash(
@@ -198,13 +203,13 @@ def test_retire_resumes_after_a_crash(
     it: the append between the crash and the resume lands.
     """
     with written(tmp_path, bucket, s3) as log:
-        original = WriteHandle.sync
+        original = WriteHandle.publish
 
         def failing(self: WriteHandle, **_: object) -> None:
-            msg = "the archive went away"
+            msg = "the published table went away"
             raise OSError(msg)
 
-        monkeypatch.setattr(WriteHandle, "sync", failing)
+        monkeypatch.setattr(WriteHandle, "publish", failing)
         with pytest.raises(OSError, match="went away"):
             log.retire()
 
@@ -213,7 +218,7 @@ def test_retire_resumes_after_a_crash(
         with pytest.raises(RetiredError, match="being retired"):
             log.append({"event_ts": 1, "key": "k", "payload": "p"})
 
-    monkeypatch.setattr(WriteHandle, "sync", original)
+    monkeypatch.setattr(WriteHandle, "publish", original)
     with litelink.open(tmp_path, "s", s3=s3) as again:
         again.retire()
         assert again._buffer.retired()["state"] == "retired"  # ty: ignore[not-subscriptable]  # noqa: SLF001
@@ -225,11 +230,11 @@ def test_hydrate_works_on_a_retired_log(
     """It adds no rows and assigns no offsets, so retirement allows it."""
     with written(tmp_path, bucket, s3) as log:
         log.retire()
-        assert log.table_rows() == 0
+        assert log.staging_rows() == 0
 
         log.hydrate(since=timedelta(hours=1))
 
-        assert log.table_rows() > 0
+        assert log.staging_rows() > 0
 
 
 # -- the WAL replica ------------------------------------------------------------
@@ -246,7 +251,7 @@ def sidecar_binary() -> str:
 def test_retire_flushes_the_replica_through_the_running_sidecar(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """With the periodic sync an hour away, the replica still has the marker the
+    """With the periodic publish an hour away, the replica still has the marker the
     moment `retire()` returns — because it asked the running sidecar to ship,
     through its control socket, and waited.
 
@@ -260,7 +265,7 @@ def test_retire_flushes_the_replica_through_the_running_sidecar(
         path = log.write_replication_config()
         text = path.read_text().replace(
             "      force-path-style: true\n",
-            "      force-path-style: true\n      sync-interval: 1h\n",
+            "      force-path-style: true\n      publish-interval: 1h\n",
         )
         path.write_text(text)
         environment = dict(os.environ)

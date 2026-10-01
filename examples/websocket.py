@@ -107,7 +107,7 @@ async def main() -> None:
         while log.seal() is not None:
             pass
 
-        print(f"  {log.end_offset() - 1:,} trades, {log.table_files()} file(s)")
+        print(f"  {log.end_offset() - 1:,} trades, {log.staging_files()} file(s)")
         summary = log.sql(
             "SELECT count(*) AS trades, min(price) AS low, max(price) AS high,"
             " round(sum(amount), 4) AS btc FROM log"

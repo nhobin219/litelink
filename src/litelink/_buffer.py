@@ -80,18 +80,52 @@ def _metadata_sequence(version: str) -> int:
     return int(prefix) if prefix.isdigit() else -1
 
 
-# The key the archive's location is recorded under — `_archive.ARCHIVE_KEY`,
+# The key the published table's location is recorded under — `_published.PUBLISHED_KEY`,
 # spelled here because that module imports this one.
-ARCHIVE_META_KEY = "archive"
+PUBLISHED_META_KEY = "published"
+
+# Names a log written before #98 stored, under the name each now has. Every
+# read falls back to the old name when the new one is absent, and every write
+# stores the new one and deletes the old in the same transaction — so an old
+# log opens unchanged, and each row takes the new name the first time it is
+# written. Tier rows have to move rather than merely be read either way:
+# eviction widens the published row by name, and an old-named row left beside
+# a new one would be a stale, narrower range a reader could fall back to.
+LEGACY_META = {"published": "archive", "published_through": "archive_through"}
+LEGACY_TIERS = {"staging": "local", "published": "archive"}
+_CURRENT_TIER = {old: new for new, old in LEGACY_TIERS.items()}
 
 
-def _retirement(end: int, statistics: str, archive: str | None) -> dict[str, object]:
+def _meta_value(con: sqlite3.Connection, key: str) -> str | None:
+    """`meta[key]`, or the value under its pre-#98 name."""
+    row = con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+    legacy = LEGACY_META.get(key)
+    if row is None and legacy is not None:
+        row = con.execute("SELECT v FROM meta WHERE k = ?", (legacy,)).fetchone()
+
+    return None if row is None else str(row[0])
+
+
+def _write_meta(con: sqlite3.Connection, pairs: Mapping[str, str]) -> None:
+    """Upsert `pairs` under their current names, dropping any old-named row."""
+    con.executemany(
+        "INSERT INTO meta (k, v) VALUES (?, ?) "
+        "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        list(pairs.items()),
+    )
+    con.executemany(
+        "DELETE FROM meta WHERE k = ?",
+        [(LEGACY_META[k],) for k in pairs if k in LEGACY_META],
+    )
+
+
+def _retirement(end: int, statistics: str, published: str | None) -> dict[str, object]:
     """What a closed buffer row says about the log, for `RetiredError`."""
     count = json.loads(statistics).get("record_count")
     return {
         "state": "retired" if count == 0 else "retiring",
         "through": end - 1,
-        "archive": archive,
+        "published": published,
     }
 
 
@@ -99,7 +133,7 @@ class RetiredError(RuntimeError):
     """The log was retired (`WriteHandle.retire`), or is being retired.
 
     Raised by anything that would add rows to it or bring it back as a writer.
-    Its rows are all in the archive, which reads still reach.
+    Its rows are all in the published table, which reads still reach.
     """
 
     @classmethod
@@ -115,7 +149,7 @@ class RetiredError(RuntimeError):
         nxt = "" if through is None else f" at start_offset={int(str(through)) + 1}"
         return cls(
             f"log {name!r} was retired {after}; its rows "
-            f"are in the archive at {marker.get('archive', '?')}. Read it with "
+            f"are in the published table at {marker.get('published', '?')}. Read it with "
             f"open(..., read_only=True) or any Iceberg engine, and write to a new "
             f"log{nxt}"
         )
@@ -148,7 +182,7 @@ _CONTAINS = frozenset.__contains__
 _BEGIN = "BEGIN IMMEDIATE"
 
 # Dead space below this is not worth an exclusive lock, whatever the ratio
-# says: a young log crosses any ratio on its first archive pass, and reclaiming
+# says: a young log crosses any ratio on its first published pass, and reclaiming
 # a few hundred KB there costs a write stall to save a rounding error on the
 # wire. Not configurable, because it is not a policy — it is the point below
 # which the policy cannot pay for itself. Sized to stay invisible against the
@@ -319,9 +353,9 @@ class Shape:
     def table(self) -> pa.Schema:
         """The caller's columns with `offset` in front — the TABLE's schema.
 
-        Here rather than in `log.py` so the archive can ask the buffer for it
+        Here rather than in `log.py` so the published table can ask the buffer for it
         without importing the module that owns the log. It is the shape
-        `create_table` is handed, and an archive born from a stale copy of it
+        `create_table` is handed, and a published table born from a stale copy of it
         is the one holder that cannot be repaired afterwards: nothing in
         `src/` ever re-declares an existing table.
         """
@@ -460,7 +494,7 @@ class Buffer:
         # What `shape()` falls back to when `meta` has no schema row yet. Two
         # callers need that and both would otherwise fail at construction:
         # `_create` runs inside `Buffer.open` BEFORE `litelink.new` writes the row,
-        # and the scratch buffer an archive rewrite cuts through is handed a
+        # and the scratch buffer a published rewrite cuts through is handed a
         # schema directly and only ever has `CONFIG_KEY` written into it.
         #
         # A fallback, not the value. Everything reads `shape()`, so a schema
@@ -519,7 +553,7 @@ class Buffer:
         #
         # `_tail_lo` is `first_offset - 1`, which on a log whose offsets start
         # high is far above any boundary a reader asks for before the first
-        # seal: `Reader.query` passes 0 while the local table has no extent, so
+        # seal: `Reader.query` passes 0 while the staging table has no extent, so
         # gating on `_tail_lo <= floor` missed on EVERY read and re-converted
         # the whole buffer per query. Measured at the default 8 MiB first-seal
         # window: 4.2 ms/read against 42.
@@ -577,8 +611,8 @@ class Buffer:
         any number of these alongside the single writer (§1).
 
         `durable=False` is for a buffer whose contents are derived from
-        something that still exists — the scratch buffer an archive rewrite
-        re-cuts through, whose every row came from the archive and is still
+        something that still exists — the scratch buffer a published rewrite
+        re-cuts through, whose every row came from the published table and is still
         there until the rewrite's final commit. A crash costs a re-run rather
         than data, so the fsync per commit is paying for a guarantee nothing
         depends on. Never for a log's own buffer: there, the fsync IS the
@@ -703,17 +737,19 @@ class Buffer:
             CREATE INDEX IF NOT EXISTS extent_unsealed ON extent (group_id)
             WHERE rel_path IS NULL
         """)
-        # I4 per segment (§4a) reads the archive copies covering what the local
+        # I4 per segment (§4a) reads the published copies covering what the staging
         # table still holds. Without this the lookup is a scan of one row per
-        # file ever archived, which grows without limit — the local file count
+        # file ever published, which grows without limit — the local file count
         # does not.
         self._con.execute("""
-            CREATE INDEX IF NOT EXISTS extent_archived ON extent (start_offset)
+            CREATE INDEX IF NOT EXISTS extent_published ON extent (start_offset)
             WHERE rel_path IS NOT NULL
         """)
+        # Its pre-#98 name, which an old log carries: one index, not two.
+        self._con.execute("DROP INDEX IF EXISTS extent_archived")
         # A copy that was INTENDED, beside `extent`'s copies that exist. The
         # two are read by collaborators whose safe directions are opposite:
-        # compaction must not merge across a range some archive may hold, so it
+        # compaction must not merge across a range some published table may hold, so it
         # is safe when coverage is OVERSTATED; eviction must not delete the only
         # copy, so it is safe only when coverage is UNDERSTATED. One record
         # cannot be both, and collapsing them into one is what left a crash
@@ -740,7 +776,7 @@ class Buffer:
         # dense and monotonic across every tier, so a tier's `[start, end)` is
         # a fact about where it sits in the log rather than a statistic — and
         # it prunes on its own, as streamcast prunes whole logs by offset
-        # (streamcast#32). Only the archive is stored: the local tier's come
+        # (streamcast#32). Only the published table is stored: the staging tier's come
         # from its Iceberg snapshot and the buffer's from its rows.
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS tier_offsets (
@@ -752,9 +788,9 @@ class Buffer:
         # `version` is which version of the table a row describes — the path of
         # its Iceberg metadata file — and only the LOCAL row has one: it is a
         # cache of one version's rollup, valid for exactly that version. The
-        # archive's row has none, because it is kept a superset of what the
-        # archive holds below the local table at every moment (eviction widens
-        # it before its commit), whatever version the archive is at.
+        # published table's row has none, because it is kept a superset of what the
+        # published table holds below the staging table at every moment (eviction widens
+        # it before its commit), whatever version the published table is at.
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS tier_statistics (
               tier       TEXT PRIMARY KEY,
@@ -999,7 +1035,7 @@ class Buffer:
                 # Whichever is reached FIRST. Both are ceilings on one file —
                 # bytes bound memory, rows bound the read latency §7 sizes for
                 # — so the tighter one wins, which is the opposite of how
-                # `local_retention` and `local_rows` combine.
+                # `staging_retention` and `staging_rows` combine.
                 if (
                     group.bytes >= target
                     or offset - (group.start_offset or offset) + 1 >= target_rows
@@ -1126,14 +1162,14 @@ class Buffer:
     @property
     def schema(self) -> pa.Schema:
         """The declared Arrow schema, for building a second buffer like this
-        one — an archive rewrite re-ingests through a scratch buffer and must
+        one — a published rewrite re-ingests through a scratch buffer and must
         cast the rows exactly as this one would."""
         return self.shape().schema
 
     def seed_offsets(self, first: int) -> None:
         """Make the next appended row take offset `first`.
 
-        Only for the scratch buffer an archive rewrite re-ingests through. Rows
+        Only for the scratch buffer a published rewrite re-ingests through. Rows
         being re-cut keep the offsets they already have — they are the same
         rows, and §4's contiguous non-overlapping ranges are stated in them —
         so the sequence has to resume where the range starts rather than at 1.
@@ -1286,7 +1322,7 @@ class Buffer:
     def group_bytes(self, end: int) -> int:
         """What the extent ending at `end` holds, before a file claims it.
 
-        Read out so it can be recorded against the archive's copy: the scratch
+        Read out so it can be recorded against the published table's copy: the scratch
         buffer measured these rows exactly as the appender would have, and that
         count is the whole reason the rewrite goes through a buffer at all.
         """
@@ -1304,15 +1340,15 @@ class Buffer:
         **Bounded at BOTH ends, and the lower one is load-bearing.** A seal used
         to be able to take everything below its cut, because `finish_seal`
         deleted those rows immediately: the buffer's minimum was always the next
-        group's start. Once the delete is deferred until the archive holds the
+        group's start. Once the delete is deferred until the published table holds the
         range (§3a), that stops being true — and an unbounded read then writes
-        every row from the archive frontier upward into the new file.
+        every row from the published frontier upward into the new file.
 
         Nothing catches that at seal time. The local `register` passes no `lo`,
         so `_refuse_straddle` returns early; what fails is later and elsewhere.
         The manifest's own ranges stop being non-overlapping (§4, §6), the local
         leg of a read is an unfiltered `iceberg_scan` so every overlapped row
-        comes back twice, the next `sync` refuses the straddle for ever, and
+        comes back twice, the next `publish` refuses the straddle for ever, and
         compaction's row-count verification fails.
 
         `start` costs nothing to supply: `pending_group` and `pending_seal` both
@@ -1326,7 +1362,7 @@ class Buffer:
     def rows_above(self, boundary: int | None) -> pa.Table:
         """Buffered rows with `offset > boundary`, as Arrow. The read's input.
 
-        `boundary` is the local table's committed extent, so this is §7's
+        `boundary` is the staging table's committed extent, so this is §7's
         unsealed tail — the rows the Iceberg leg does not already carry.
 
         Read here rather than by the query engine, and that is a correctness
@@ -1384,7 +1420,7 @@ class Buffer:
                 # when `floor` is below where the cache STARTS the slice prunes
                 # nothing, so the cache is still complete from where it was,
                 # and raising loses a later hit rather than serving short. That
-                # costs nothing in practice because the boundary is the local
+                # costs nothing in practice because the boundary is the staging
                 # table's extent, which only rises.
                 self._tail_from = floor
 
@@ -1561,7 +1597,7 @@ class Buffer:
         same end, and `finish_seal` then hits the `rel_path` UNIQUE after the
         Iceberg commit has already landed.
 
-        Unreachable until `litelink.restore` began releasing archived rows out from
+        Unreachable until `litelink.restore` began releasing published rows out from
         under a knowingly-stale group (§3a), which is one transaction away from
         the reseed that fixes it.
 
@@ -1632,13 +1668,13 @@ class Buffer:
         **`discard=False` keeps them, and that is I4 one tier up.** A seal moves
         rows from SQLite into a Parquet file that no sidecar replicates, so
         with WAL shipping on, deleting here removes the only off-box copy of a
-        range the archive does not have yet — and the machine dying in that
+        range the published table does not have yet — and the machine dying in that
         window loses them, silently, from the middle of the offset space
         (§3a). The caller passes False when replication is on and something is
-        owed to an archive; `release_archived` is what removes them afterwards.
+        owed to a published table; `release_published` is what removes them afterwards.
 
         Only the CALLER can decide that, which is why it is a parameter rather
-        than a check here: this object knows nothing about archives.
+        than a check here: this object knows nothing about published tables.
 
         Returns whether this caller's claim was the live one. False means it
         was superseded while it worked, and finishing belongs to whoever holds
@@ -1686,16 +1722,16 @@ class Buffer:
         """What every known data file holds in memory, keyed by location.
 
         Root-relative for local files, so a log directory stays movable; the
-        full URI for archived ones, which have no root to be relative to. A
+        full URI for published ones, which have no root to be relative to. A
         named extent is a file; an unnamed one is still buffered.
 
-        All of it at once: the callers are compaction, sync and the archive
+        All of it at once: the callers are compaction, publish and the published table
         rewrite, all of which walk the whole file list, and one indexed read
         beats a query per file.
 
         A file missing from this is not an error. It means the log has files
         this database never recorded — one written by a version that did not
-        keep them, or an archive whose local extents were lost — and the
+        keep them, or a published table whose local extents were lost — and the
         callers treat an unknown size as "full", so an unmeasured file is never
         merged on a guess about what it holds.
         """
@@ -1712,12 +1748,12 @@ class Buffer:
         A log's own record of its files' ages, because Iceberg's does not
         survive. A file's age used to be read off the snapshot that added it,
         and `expire` deletes that snapshot — after which the file appeared in
-        no age map, `evict` could not call it stale, and `local_retention`
+        no age map, `evict` could not call it stale, and `staging_retention`
         silently stopped reclaiming anything.
 
         The two settings are sized by unrelated things: §6 wants
         `snapshot_retention` above the longest scan, §8 wants
-        `local_retention` above the longest hot lookback. Any deployment where
+        `staging_retention` above the longest hot lookback. Any deployment where
         the second is longer than the first — which is the ordinary one — has
         every file losing its Iceberg age before it is old enough to evict.
         """
@@ -1732,7 +1768,7 @@ class Buffer:
     def record_file(self, rel_path: str, start: int, end: int, held: int) -> None:
         """Record a second file holding an extent the log already has.
 
-        What `sync` calls when it pushes: the archive's copy covers the same
+        What `publish` calls when it pushes: the published table's copy covers the same
         offsets and holds the same bytes, so it gets its own row under its own
         URI rather than a measurement of its own. It could not be measured
         again anyway — nothing recoverable from a Parquet file is the
@@ -1769,9 +1805,9 @@ class Buffer:
 
         The register that follows can land while the row recording it does not,
         and compaction decides what it may merge from those rows — so without
-        this, a compaction-target change before the next sync regroups the
+        this, a compaction-target change before the next publish regroups the
         pushed-but-unrecorded files and commits a local file straddling the
-        archive's extent. Nothing re-cuts a local straddler, so every later
+        published table's extent. Nothing re-cuts a local straddler, so every later
         push is refused and the log stops advancing.
 
         An UPSERT, and the difference is not cosmetic: a holder that stalled
@@ -1795,7 +1831,7 @@ class Buffer:
         """Intended copies under `prefix`: `(rel_path, start, end, bytes)`.
 
         Unbounded by offset, deliberately. Reconciliation drops an intent the
-        archive's manifest does not name, and one below the local window has to
+        published table's manifest does not name, and one below the staging window has to
         be reachable to be dropped — bounding this read would leave those rows
         beyond judgement for ever.
         """
@@ -1811,14 +1847,14 @@ class Buffer:
             if str(r[0]).startswith(boundary)
         ]
 
-    def archive_records(
+    def published_records(
         self, prefix: str, floor: int
     ) -> list[tuple[str, int, int, int]]:
         """Landed copies under `prefix`, keyed by PATH: `(rel_path, lo, hi, bytes)`.
 
-        Reconciliation matches by path, and `archived_ranges` answers in bare
+        Reconciliation matches by path, and `published_ranges` answers in bare
         offsets — so it cannot serve. Bounded by `floor` like the manifest walk
-        beside it, or it grows with the archive and runs on every sync.
+        beside it, or it grows with the published table and runs on every publish.
         """
         boundary = prefix.rstrip("/") + "/"
         with self._lock:
@@ -1849,7 +1885,7 @@ class Buffer:
         That keeps the number in the same currency as the seal that first
         measured it, however many rewrites later — which is the whole reason it
         is carried rather than derived from whatever the merged file compresses
-        to. It is also what lets the archive rewrite build its extents with the
+        to. It is also what lets the published rewrite build its extents with the
         same arithmetic a local compaction uses.
         """
         paths = list(sources)
@@ -1900,49 +1936,43 @@ class Buffer:
         """
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
-            row = connection.execute(
-                "SELECT v FROM meta WHERE k = ?", (key,)
-            ).fetchone()
+            return _meta_value(connection, key)
         finally:
             connection.close()
 
-        return None if row is None else str(row[0])
-
     def get_meta(self, key: str) -> str | None:
         with self._lock:
-            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+            return _meta_value(self._con, key)
 
-        return None if row is None else str(row[0])
-
-    def archived_ranges(
+    def published_ranges(
         self, prefix: str | None, floor: int, *, include_intents: bool
     ) -> list[tuple[int, int]]:
-        """Offset ranges an archive holds or is about to, under `prefix`.
+        """Offset ranges a published table holds or is about to, under `prefix`.
 
         `include_intents` is keyword-only and has no default, so every caller
-        states which question it is asking. Compaction asks whether ANY archive
+        states which question it is asking. Compaction asks whether ANY published table
         might hold a range, and is safe overstating it; eviction asks whether
         one DOES, and is safe only understating. Getting that backwards at one
         call site would be silent, which is the whole reason this parameter is
         awkward to pass.
 
-        I4 asked of segments rather than of a watermark (§4a). `sync` records
-        where each pushed file's copy went, so the archive's contents are
+        I4 asked of segments rather than of a watermark (§4a). `publish` records
+        where each pushed file's copy went, so the published table's contents are
         already durable here per file — a watermark summarising them is a
         second copy of the same fact, and the only boundary in the log that can
         move backwards.
 
-        Bounded by `floor` rather than by the prefix alone: the archive grows
-        without limit and this only ever asks about ranges the local table
+        Bounded by `floor` rather than by the prefix alone: the published table grows
+        without limit and this only ever asks about ranges the staging table
         still holds, which compaction bounds. The prefix match is applied in
         Python because SQLite's `LIKE` would not use the index that `floor`
         selects on.
         """
-        # `None` means ANY archive, not the configured one. Two questions ask
-        # this and they are not the same question. I4 asks whether THIS archive
+        # `None` means ANY published table, not the configured one. Two questions ask
+        # this and they are not the same question. I4 asks whether THIS published table
         # holds a file, because it authorises a deletion. Compaction asks
-        # whether ANY archive does, because it decides whether merging could
-        # create a range no archive's cuts line up with — and detaching does
+        # whether ANY published table does, because it decides whether merging could
+        # create a range no published table's cuts line up with — and detaching does
         # not make those copies stop existing.
         boundary = None if prefix is None else prefix.rstrip("/") + "/"
         # ONE statement, so one snapshot. Read as two, the tables are two
@@ -1979,27 +2009,21 @@ class Buffer:
         The question "is this a change?" is answered against the durable value,
         inside the transaction that acts on the answer. Asked of a process's
         memory instead, both answers are wrong in a two-process deployment,
-        because nothing refreshes that memory except a sync:
+        because nothing refreshes that memory except a publish:
 
-        * memory stale, argument current — re-asserting the archive the log
+        * memory stale, argument current — re-asserting the published table the log
           already has reads as a move and zeroes the watermarks of a bucket
           that genuinely holds the data;
-        * memory stale, argument stale — re-pointing BACK to an archive reads
-          as a restatement, and the log keeps the other archive's watermark
+        * memory stale, argument stale — re-pointing BACK to a published table reads
+          as a restatement, and the log keeps the other published table's watermark
           over a bucket whose extent is lower. Eviction believes it (I4).
 
         Returns whether it was a move.
         """
         with self._transaction():
-            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
-            current = (row[0] if row is not None else None) or None
+            current = _meta_value(self._con, key) or None
             moved = current != (value or None)
-            pairs = {key: value, **(dict(reset) if moved else {})}
-            self._con.executemany(
-                "INSERT INTO meta (k, v) VALUES (?, ?) "
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                list(pairs.items()),
-            )
+            _write_meta(self._con, {key: value, **(dict(reset) if moved else {})})
             return moved
 
     def set_meta_if(
@@ -2010,9 +2034,9 @@ class Buffer:
         Compare-and-set, in ONE write transaction, for the guards that decide
         whether a fact still belongs to the log it was computed for. Read and
         write as separate statements, the check is only ever a statement about
-        the past: `sync` re-reads which archive it is pushing to before
-        recording a watermark, and a `set_archive` landing between the read and
-        the write leaves the log pointed at the NEW archive holding the OLD
+        the past: `publish` re-reads which published table it is pushing to before
+        recording a watermark, and a `set_published` landing between the read and
+        the write leaves the log pointed at the NEW published table holding the OLD
         one's extent — which eviction believes (I4) and nothing ever lowers.
 
         The lease does not close that window, because the window opens when the
@@ -2026,16 +2050,11 @@ class Buffer:
         record something they no longer have the right to record.
         """
         with self._transaction():
-            row = self._con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
-            current = (row[0] if row is not None else None) or None
+            current = _meta_value(self._con, key) or None
             if current != (expected or None):
                 return False
 
-            self._con.executemany(
-                "INSERT INTO meta (k, v) VALUES (?, ?) "
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                list(pairs.items()),
-            )
+            _write_meta(self._con, pairs)
             return True
 
     def shape(self) -> Shape:
@@ -2113,7 +2132,7 @@ class Buffer:
 
         The rule `config` follows, for the reason `config` follows it (§4a).
         This used to live in four places — `meta`, `WriteHandle`, `Maintenance` and
-        `Archive` — kept in step by `set_sort_by` writing each. That is a
+        `Published` — kept in step by `set_sort_by` writing each. That is a
         fan-out, and a fan-out is only correct in the process that ran it: a
         maintainer already open elsewhere went on sorting by the key IT opened
         with while both tables declared the new one, and compaction, the pass
@@ -2145,26 +2164,18 @@ class Buffer:
     def set_meta_all(self, pairs: Mapping[str, str]) -> None:
         """Write several `meta` values in ONE transaction.
 
-        For facts that are only true together. Re-pointing an archive writes
+        For facts that are only true together. Re-pointing a published table writes
         where it is and resets the two watermarks that describe the previous
         one, and as separate autocommit statements a crash lands between them:
         either order leaves a log whose parts disagree, and both disagreements
         have cost a defect. One transaction has no between.
         """
         with self._transaction():
-            self._con.executemany(
-                "INSERT INTO meta (k, v) VALUES (?, ?) "
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                list(pairs.items()),
-            )
+            _write_meta(self._con, pairs)
 
     def set_meta(self, key: str, value: str) -> None:
-        with self._lock:
-            self._con.execute(
-                "INSERT INTO meta (k, v) VALUES (?, ?) "
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                (key, value),
-            )
+        with self._transaction():
+            _write_meta(self._con, {key: value})
 
     # -- stored tiers (#90) ------------------------------------------------
 
@@ -2191,13 +2202,20 @@ class Buffer:
             return None, {}
 
         generation = None if rows[0][0] is None else str(rows[0][0])
-        found = {
-            str(tier): ((int(start), int(end)), str(statistics), version)
-            for _, tier, start, end, statistics, version in rows
-            if tier is not None and start is not None
-        }
+        found: dict[str, tuple[tuple[int, int], str, str | None]] = {}
+        legacy: dict[str, tuple[tuple[int, int], str, str | None]] = {}
+        for _, tier, start, end, statistics, version in rows:
+            if tier is None or start is None:
+                continue
 
-        return generation, found
+            stored = ((int(start), int(end)), str(statistics), version)
+            if str(tier) in _CURRENT_TIER:
+                legacy[_CURRENT_TIER[str(tier)]] = stored
+            else:
+                found[str(tier)] = stored
+
+        # A pre-#98 row stands in only where no current one exists.
+        return generation, {**legacy, **found}
 
     def update_tier(
         self,
@@ -2213,17 +2231,12 @@ class Buffer:
         call.
         """
         with self._transaction():
-            offsets = self._con.execute(
-                "SELECT start_offset, end_offset FROM tier_offsets WHERE tier = ?",
-                (tier,),
-            ).fetchone()
-            statistics = self._con.execute(
-                "SELECT statistics FROM tier_statistics WHERE tier = ?", (tier,)
-            ).fetchone()
+            stored = self._tier_row(tier)
             updated = change(
-                None if offsets is None else (int(offsets[0]), int(offsets[1])),
-                None if statistics is None else str(statistics[0]),
+                None if stored is None else stored[0],
+                None if stored is None else stored[1],
             )
+            self._drop_legacy_tier(tier)
             if updated is None:
                 self._con.execute("DELETE FROM tier_offsets WHERE tier = ?", (tier,))
                 self._con.execute("DELETE FROM tier_statistics WHERE tier = ?", (tier,))
@@ -2244,10 +2257,10 @@ class Buffer:
 
             self._bump_tiers()
 
-    def store_local_statistics(
+    def store_staging_statistics(
         self, version: str, offsets: tuple[int, int], statistics: str
     ) -> bool:
-        """Store the local tier's rollup for `version`, unless a newer one is stored.
+        """Store the staging tier's rollup for `version`, unless a newer one is stored.
 
         Written by whichever process committed `version`, after the commit — the
         local row is a cache, stamped with the version it describes, so a reader
@@ -2272,32 +2285,99 @@ class Buffer:
         Returns whether it wrote.
         """
         with self._transaction():
-            row = self._con.execute(
-                "SELECT version FROM tier_statistics WHERE tier = 'local'"
-            ).fetchone()
+            stored = self._tier_row("staging")
             if (
-                row is not None
-                and row[0] is not None
-                and _metadata_sequence(str(row[0])) >= _metadata_sequence(version)
+                stored is not None
+                and stored[2] is not None
+                and _metadata_sequence(stored[2]) >= _metadata_sequence(version)
             ):
                 return False
 
+            self._drop_legacy_tier("staging")
             self._con.execute(
                 "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
-                " VALUES ('local', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                " VALUES ('staging', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
                 " start_offset = excluded.start_offset,"
                 " end_offset = excluded.end_offset",
                 offsets,
             )
             self._con.execute(
                 "INSERT INTO tier_statistics (tier, statistics, version)"
-                " VALUES ('local', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                " VALUES ('staging', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
                 " statistics = excluded.statistics, version = excluded.version",
                 (statistics, version),
             )
             self._bump_tiers()
 
             return True
+
+    def adopt_current_names(self) -> None:
+        """Move every pre-#98 `meta` key and tier row to its current name.
+
+        For a writer's `open`, so an old log stores the new names from then
+        on rather than one row at a time as each is written. One transaction,
+        and the values are untouched: the fences compare values, so a process
+        that read a location before this sees the same one after.
+        """
+        with self._transaction():
+            for new, old in LEGACY_META.items():
+                value = self._con.execute(
+                    "SELECT v FROM meta WHERE k = ?", (old,)
+                ).fetchone()
+                if value is not None:
+                    self._con.execute(
+                        "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING",
+                        (new, value[0]),
+                    )
+                    self._con.execute("DELETE FROM meta WHERE k = ?", (old,))
+
+            moved = False
+            for new, old in LEGACY_TIERS.items():
+                for table in ("tier_offsets", "tier_statistics"):
+                    held = self._con.execute(
+                        f"SELECT 1 FROM {table} WHERE tier = ?",  # noqa: S608
+                        (new,),
+                    ).fetchone()
+                    if held is None:
+                        cursor = self._con.execute(
+                            f"UPDATE {table} SET tier = ? WHERE tier = ?",  # noqa: S608
+                            (new, old),
+                        )
+                    else:
+                        cursor = self._con.execute(
+                            f"DELETE FROM {table} WHERE tier = ?",  # noqa: S608
+                            (old,),
+                        )
+
+                    moved = moved or cursor.rowcount > 0
+
+            if moved:
+                self._bump_tiers()
+
+    def _tier_row(self, tier: str) -> tuple[tuple[int, int], str, str | None] | None:
+        """Inside the caller's transaction: `tier`'s row, or its pre-#98 one."""
+        for name in (tier, LEGACY_TIERS.get(tier)):
+            if name is None:
+                continue
+
+            row = self._con.execute(
+                "SELECT o.start_offset, o.end_offset, s.statistics, s.version"
+                " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
+                " WHERE o.tier = ?",
+                (name,),
+            ).fetchone()
+            if row is not None:
+                version = None if row[3] is None else str(row[3])
+                return (int(row[0]), int(row[1])), str(row[2]), version
+
+        return None
+
+    def _drop_legacy_tier(self, tier: str) -> None:
+        """Inside the caller's transaction: remove `tier`'s pre-#98 row."""
+        legacy = LEGACY_TIERS.get(tier)
+        if legacy is not None:
+            self._con.execute("DELETE FROM tier_offsets WHERE tier = ?", (legacy,))
+            self._con.execute("DELETE FROM tier_statistics WHERE tier = ?", (legacy,))
 
     def _bump_tiers(self) -> None:
         """Inside the caller's transaction: a new generation for readers' caches."""
@@ -2415,7 +2495,7 @@ class Buffer:
         if row is None:
             return None
 
-        return _retirement(int(row[1]), str(row[2]), self.get_meta(ARCHIVE_META_KEY))
+        return _retirement(int(row[1]), str(row[2]), self.get_meta(PUBLISHED_META_KEY))
 
     @classmethod
     def peek_retired(cls, path: Path) -> dict[str, object] | None:
@@ -2427,9 +2507,7 @@ class Buffer:
                 " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
                 " WHERE o.tier = 'buffer'"
             ).fetchone()
-            archive = con.execute(
-                "SELECT v FROM meta WHERE k = ?", (ARCHIVE_META_KEY,)
-            ).fetchone()
+            published = _meta_value(con, PUBLISHED_META_KEY)
         except sqlite3.OperationalError:
             return None
         finally:
@@ -2438,9 +2516,7 @@ class Buffer:
         if row is None:
             return None
 
-        return _retirement(
-            int(row[0]), str(row[1]), None if archive is None else str(archive[0])
-        )
+        return _retirement(int(row[0]), str(row[1]), published)
 
     def retired_error(self) -> RetiredError:
         """The refusal for anything that would add rows to a retired log."""
@@ -2463,7 +2539,7 @@ class Buffer:
         name down first.
         """
         # Inserted, never replacing what is already there. Clearing first
-        # destroyed the claims of an operation that had CRASHED — an archive
+        # destroyed the claims of an operation that had CRASHED — a published table
         # rewrite accumulates one per uploaded object, and recovery only runs
         # at `open`, so a long-lived maintainer starting its next merge wiped
         # them and left those objects referenced by nothing. Each operation
@@ -2478,7 +2554,7 @@ class Buffer:
         """Record one more output path, without clearing the others.
 
         A compaction writes one file and `claim_compaction` says so by
-        replacing whatever was there. An archive rewrite writes several before
+        replacing whatever was there. A published rewrite writes several before
         a single commit swaps them all in, and every one of them needs its name
         recorded before it exists (I2) — so they accumulate, and recovery
         removes each that the commit never claimed.
@@ -2499,7 +2575,7 @@ class Buffer:
 
     def pending_outputs(self) -> list[tuple[int, int, str]]:
         """Every claimed output, for recovery. One row for a compaction,
-        several for an interrupted archive rewrite."""
+        several for an interrupted published rewrite."""
         with self._lock:
             rows = self._con.execute(
                 "SELECT lo, hi, rel_path FROM compacting ORDER BY rowid"
@@ -2607,7 +2683,7 @@ class Buffer:
         - **`extent` rows naming LOCAL files** go. They name Parquet on the
           machine that died, so `file_bytes` — and through it `memory`, which
           sizes merges — would describe files nothing can open. Rows naming
-          ARCHIVE copies stay: that is the coverage I4 acts on, and it is still
+          PUBLISHED copies stay: that is the coverage I4 acts on, and it is still
           true.
 
           Narrower than it first looks, and worth saying so: compaction decides
@@ -2624,9 +2700,9 @@ class Buffer:
           box's UNSEALED floor, above the band, so the band would fall into no
           leg of a read and be lost at the first seal after recovery.
         - **`pending_delete` rows naming local files** go; REMOTE ones stay,
-          and that half is required. `rewrite_archive` is the only thing that
+          and that half is required. `rewrite_published` is the only thing that
           queues a remote entry, and this design refuses directory listing, so
-          dropping them leaks archive objects nothing can ever find again.
+          dropping them leaks published objects nothing can ever find again.
         - **`claim` rows** go. They carry the dead box's owners and a future
           expiry, so keeping them makes this one wait out a TTL for processes
           that do not exist.
@@ -2647,7 +2723,7 @@ class Buffer:
           them exactly once.
 
         - **`compacting` stays.** It only queues deletions, and its outputs
-          are archive objects this machine never wrote.
+          are published objects this machine never wrote.
 
         Finally the offset sequence is raised by `reserve`. See `litelink.restore`.
         """
@@ -2692,7 +2768,7 @@ class Buffer:
         left the buffer changes nothing. This drops the stale row first.
 
         For the restore path, where the group was seeded from a replica's view
-        of the archive and the archive has since moved on: see `litelink.restore`.
+        of the published table and the published table has since moved on: see `litelink.restore`.
         """
         with self._transaction():
             self._con.execute(
@@ -2701,18 +2777,18 @@ class Buffer:
 
         self._seed_group()
 
-    def release_archived(self, boundary: int) -> int:
-        """Drop buffer rows the archive now holds. Returns how many.
+    def release_published(self, boundary: int) -> int:
+        """Drop buffer rows the published table now holds. Returns how many.
 
         The other half of `finish_seal(discard=False)`: those rows stayed
-        because the archive did not have them yet, and this is what notices
+        because the published table did not have them yet, and this is what notices
         that it does.
 
-        Bounded by the ARCHIVE's frontier, never by the seal's. That is the
+        Bounded by the PUBLISHED table's frontier, never by the seal's. That is the
         whole point — the seal moves rows to a file nothing replicates, and
-        only the archive makes them safe off-box.
+        only the published table makes them safe off-box.
 
-        Idempotent, and it has to be. Driven from the archive's own extent at
+        Idempotent, and it has to be. Driven from the published table's own extent at
         the start of a pass rather than from the tail of a push, because a push
         has three early returns before its watermark: a crash between the
         register and this call would otherwise leave the rows held, and the
@@ -2735,7 +2811,7 @@ class Buffer:
         log's `vacuum_free_ratio` instead.
 
         SQLite puts pages freed by a DELETE on a free list and never shrinks the
-        file, so a buffer that seals and archives for months keeps every page it
+        file, so a buffer that seals and publishes for months keeps every page it
         has ever needed. That is invisible locally — the free list is reused —
         and expensive off-box, because litestream replicates the FILE: a
         `restore` downloads and applies the dead space. Measured
@@ -2762,9 +2838,9 @@ class Buffer:
         data rather than an implicit rowid SQLite may renumber: values keep their
         gaps and are never rewritten. `sqlite_sequence` survives too, including
         across a VACUUM of a FULLY DRAINED buffer — the ordinary state after
-        `release_archived` on a log the archive has caught up with, and the case
+        `release_published` on a log the published table has caught up with, and the case
         that would matter: were that counter lost, AUTOINCREMENT would restart
-        at 1 and reissue offsets the archive already holds. Verified both
+        at 1 and reissue offsets the published table already holds. Verified both
         directly.
 
         Not in `_transaction`: SQLite refuses `VACUUM` inside one. The lock is

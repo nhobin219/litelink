@@ -22,11 +22,11 @@ from pyiceberg.catalog.sql import SqlCatalog
 
 import litelink
 from litelink import LogConfig, WriteHandle
-from litelink._archive import Archive
 from litelink._buffer import SORT_KEY, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
-from litelink._layout import Layout, validate_archive
+from litelink._layout import Layout, validate_published
 from litelink._maintenance import Maintenance
+from litelink._published import Published
 from litelink._read import Reader, duckdb_connection, secret_sql
 from litelink._replication import WAL_PREFIX
 from litelink._s3 import S3Options
@@ -52,8 +52,8 @@ def test_sort_by_must_name_real_columns() -> None:
         validate(SCHEMA, ("nonexistent",), LogConfig(), None)
 
 
-def test_zero_retention_is_fine_with_an_archive() -> None:
-    validate(SCHEMA, (), LogConfig(local_retention=timedelta(0)), "s3://bucket/x")
+def test_zero_retention_is_fine_with_a_published_table() -> None:
+    validate(SCHEMA, (), LogConfig(staging_retention=timedelta(0)), "s3://bucket/x")
 
 
 def test_table_schema_puts_offset_first() -> None:
@@ -76,17 +76,17 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     config = LogConfig()
     # Local-only, and still a real object: the reader, the maintainer and the
     # WriteHandle are handed the same one. It stores no location — it reads the log's,
-    # so `set_archive` reaches all three by writing one row.
+    # so `set_published` reaches all three by writing one row.
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    archive = Archive(layout, buffer, S3Options())
+    published = Published(layout, buffer, S3Options())
     log = WriteHandle(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, duckdb_connection, archive),
-        maintenance=Maintenance(table, buffer, layout, archive),
+        reader=Reader(layout, table, buffer, duckdb_connection, published),
+        maintenance=Maintenance(table, buffer, layout, published),
         config=config,
-        archive=archive,
+        published=published,
     )
 
     assert log.name == "s"
@@ -112,16 +112,16 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     buffer = StubBuffer.open(layout.buffer_db, SCHEMA)
     config = LogConfig()
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    archive = Archive(layout, buffer, S3Options())
+    published = Published(layout, buffer, S3Options())
 
     log = WriteHandle(
         layout=layout,
         table=table,
         buffer=buffer,
-        reader=Reader(layout, table, buffer, duckdb_connection, archive),
-        maintenance=Maintenance(table, buffer, layout, archive),
+        reader=Reader(layout, table, buffer, duckdb_connection, published),
+        maintenance=Maintenance(table, buffer, layout, published),
         config=config,
-        archive=archive,
+        published=published,
     )
 
     assert log.end_offset() == 4_242
@@ -214,7 +214,7 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
     """`open` takes none of the shape, so all of it must be persisted.
 
     Schema comes from the Iceberg table, sort order from its declared sort
-    order (§4), config and archive from the buffer's `meta` table (§2).
+    order (§4), config and published table from the buffer's `meta` table (§2).
     """
     config = LogConfig(target_seal_size=4096, compact_min_files=7)
     with litelink.new(
@@ -223,13 +223,13 @@ def test_open_recovers_the_shape_from_the_log(tmp_path: Path) -> None:
         schema=SCHEMA,
         sort_by=("key", "event_ts"),
         config=config,
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     ) as created:
         created.append({"event_ts": 1, "key": "a"})
 
     with litelink.open(tmp_path, "s") as reopened:
         assert reopened.sort_by == ("key", "event_ts")
-        assert reopened._archive.uri == "s3://bucket/prefix"
+        assert reopened._published.uri == "s3://bucket/prefix"
         assert reopened.config == config
         # Logically the same schema, not byte-identical: Iceberg has one string
         # type, so `string` comes back as `large_string`.
@@ -265,22 +265,22 @@ def test_set_config_persists(tmp_path: Path) -> None:
 
 def test_set_config_validates(tmp_path: Path) -> None:
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="remote archive"):
+        with pytest.raises(ValueError, match="remote published table"):
             log.set_config(LogConfig(wal_replication=True))
 
         assert log.config == LogConfig(), "a rejected config must not be applied"
 
 
-def test_set_archive_persists(tmp_path: Path) -> None:
+def test_set_published_persists(tmp_path: Path) -> None:
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.set_archive(f"file://{tmp_path}/x")
+        log.set_published(f"file://{tmp_path}/x")
 
     with litelink.open(tmp_path, "s") as reopened:
-        assert reopened._archive.uri == f"file://{tmp_path}/x"
-        reopened.set_archive(None)
+        assert reopened._published.uri == f"file://{tmp_path}/x"
+        reopened.set_published(None)
 
     with litelink.open(tmp_path, "s") as detached:
-        assert detached._archive.uri == Layout(tmp_path, "s").default_archive
+        assert detached._published.uri == Layout(tmp_path, "s").default_published
 
 
 def test_sort_by_is_declared_on_the_table(tmp_path: Path) -> None:
@@ -339,7 +339,7 @@ def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
     """Why it is not called `offset`.
 
     `SELECT offset` and `max(offset)` are DuckDB parser errors, so the old name
-    forced every query — the library's and any reader's against the archive —
+    forced every query — the library's and any reader's against the published table —
     to quote it forever, failing with a syntax error that says nothing about
     why.
     """
@@ -416,8 +416,8 @@ def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
 def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
     """For a buffer whose rows still exist somewhere else.
 
-    The archive rewrite re-cuts through a scratch buffer whose every row came
-    from the archive and is still in it until the rewrite's final commit, so a
+    The published rewrite re-cuts through a scratch buffer whose every row came
+    from the published table and is still in it until the rewrite's final commit, so a
     crash there costs a re-run rather than data. 0 is OFF. WAL stays either
     way: the read-only handle is a second connection to the same file, which is
     what WAL is for here — not durability.
@@ -444,7 +444,7 @@ def test_a_config_written_without_a_setting_still_opens() -> None:
 
     assert recovered.target_seal_size == 4096
     assert recovered.compact_min_files == 2
-    assert recovered.local_rows == LogConfig().local_rows
+    assert recovered.staging_rows == LogConfig().staging_rows
     assert recovered.snapshot_retention == LogConfig().snapshot_retention
 
 
@@ -461,11 +461,11 @@ def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:
 
     All three, and the set is the library's to know rather than an operator's
     to guess. `buffer.db` holds rows no Parquet file has yet — the one everyone
-    remembers. `catalog.db` says which files the local table is made of.
-    `archive.db` says the same for the archive, so omitting it leaves the
+    remembers. `catalog.db` says which files the staging table is made of.
+    `published.db` says the same for the published table, so omitting it leaves the
     objects in S3 intact with nothing able to say what they are.
 
-    The rewrite scratch is excluded: it is derived from the archive and deleted
+    The rewrite scratch is excluded: it is derived from the published table and deleted
     at the end of the operation that creates it, so replicating it would ship a
     temporary file to object storage to no purpose.
     """
@@ -474,7 +474,7 @@ def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:
     assert set(layout.databases) == {
         layout.buffer_db,
         layout.catalog_db,
-        layout.archive_db,
+        layout.published_db,
     }
     assert layout.rewrite_db not in layout.databases
     assert all(path.suffix == ".db" for path in layout.databases)
@@ -486,7 +486,7 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
     """§3a, derived rather than restated.
 
     Everything in the config comes from the log: the file set, the destination
-    beside the archived data, and the endpoint from the credentials it was
+    beside the published data, and the endpoint from the credentials it was
     opened with. A config written by hand knows what someone remembered.
     """
     s3 = S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1")
@@ -495,7 +495,7 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
         "s",
         schema=SCHEMA,
         config=LogConfig(wal_replication=True),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
         s3=s3,
     ) as log:
         rendered = log.replication_config()
@@ -504,7 +504,7 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
             assert f"path: {database}" in rendered
             # The replica path carries the stream name once, in the prefix —
             # `prefix/<name>/_wal/<db>` — because all three databases now live
-            # in the stream's own directory. Two logs sharing an archive prefix
+            # in the stream's own directory. Two logs sharing a published prefix
             # still cannot collide, which is the property that matters: the
             # name is in the destination rather than in the key.
             relative = database.relative_to(tmp_path / "s").as_posix()
@@ -543,7 +543,7 @@ def test_the_config_uses_litestreams_current_single_replica_key(
         "s",
         schema=SCHEMA,
         config=LogConfig(wal_replication=True),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
         s3=S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1"),
     ) as log:
         rendered = log.replication_config()
@@ -568,12 +568,12 @@ def test_the_config_uses_litestreams_current_single_replica_key(
 def test_wal_retention_writes_a_snapshot_window_the_sidecar_can_act_on(
     tmp_path: Path,
 ) -> None:
-    """§3a. The un-archived window, stated as the only thing litestream takes.
+    """§3a. The un-published window, stated as the only thing litestream takes.
 
-    "Retain WAL above the archived offset" is the way to say what this is for
+    "Retain WAL above the published offset" is the way to say what this is for
     and it is not expressible: litestream v0.5.16's knobs are all durations —
     `snapshot.interval`, `snapshot.retention`, `l0-retention` — and its CLI has
-    no `snapshot` verb to force one after a sync and make a duration behave
+    no `snapshot` verb to force one after a publish and make a duration behave
     like an offset.
 
     **`interval` must come out SHORTER than `retention`.** litestream keeps
@@ -591,7 +591,7 @@ def test_wal_retention_writes_a_snapshot_window_the_sidecar_can_act_on(
         "s",
         schema=SCHEMA,
         config=LogConfig(wal_replication=True, wal_retention=timedelta(hours=6)),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     ) as log:
         rendered = log.replication_config()
         databases = len(log.databases)
@@ -632,7 +632,7 @@ def test_wal_retention_survives_the_round_trip_through_meta(tmp_path: Path) -> N
 
 
 def test_replication_needs_somewhere_to_ship_to(tmp_path: Path) -> None:
-    """WAL segments go beside the archived data, so a local-only log has
+    """WAL segments go beside the published data, so a local-only log has
     nowhere to put them — refused at construction rather than at the first
     attempt to write a config nothing could act on."""
     with pytest.raises(ValueError, match="wal_replication"):
@@ -647,7 +647,7 @@ def test_the_replication_config_is_written_beside_the_log(tmp_path: Path) -> Non
         "s",
         schema=SCHEMA,
         config=LogConfig(wal_replication=True),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     ) as log:
         written = log.write_replication_config()
 
@@ -657,13 +657,13 @@ def test_the_replication_config_is_written_beside_the_log(tmp_path: Path) -> Non
         assert written.read_text() == log.replication_config()
 
 
-def test_the_archive_read_falls_back_to_the_aws_credential_chain() -> None:
+def test_the_published_read_falls_back_to_the_aws_credential_chain() -> None:
     """The bug a local endpoint cannot catch.
 
     On an ordinary AWS host the credentials are in a profile, in instance
     metadata, or behind SSO — never in the arguments. pyiceberg and s3fs
     resolve those themselves, so writes worked; DuckDB got a secret with no
-    keys, treated it as anonymous, and answered every read of the archive
+    keys, treated it as anonymous, and answered every read of the published table
     with 403. Against rustfs it never appeared, because a local endpoint always
     has explicit keys to pass.
     """
@@ -705,8 +705,8 @@ def test_two_logs_under_one_root_get_distinct_replica_paths(tmp_path: Path) -> N
     """
     shared = "s3://bucket/prefix"
     with (
-        litelink.new(tmp_path, "one", schema=SCHEMA, archive=shared) as first,
-        litelink.new(tmp_path, "two", schema=SCHEMA, archive=shared) as second,
+        litelink.new(tmp_path, "one", schema=SCHEMA, published=shared) as first,
+        litelink.new(tmp_path, "two", schema=SCHEMA, published=shared) as second,
     ):
         # The REPLICA path, not the database path — both spell themselves
         # `path:`. Told apart by indentation: the database's sits at the list
@@ -730,8 +730,8 @@ def test_compact_min_files_below_two_is_refused(tmp_path: Path) -> None:
     The floor is TWO, not one, and the difference is the whole defect: a run
     always holds at least one file, so at one every run looks mergeable,
     nothing is ever settled, and `stable_prefix` returns zero permanently.
-    Sync pushes nothing, the watermark stands still, eviction pins on it and
-    the local table grows without bound — while every pass rewrites every file
+    Publish pushes nothing, the watermark stands still, eviction pins on it and
+    the staging table grows without bound — while every pass rewrites every file
     to no purpose. Merging a run of one is a no-op rewrite in any case.
     """
     for value in (0, 1):
@@ -766,22 +766,22 @@ def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
         litelink.open(tmp_path, "s")
 
 
-def test_negative_local_retention_is_refused(tmp_path: Path) -> None:
+def test_negative_staging_retention_is_refused(tmp_path: Path) -> None:
     """The sign check its twin has always had.
 
-    Eviction computes `now - local_retention`, so a negative one puts the
+    Eviction computes `now - staging_retention`, so a negative one puts the
     cutoff in the FUTURE and every file in the log is stale. On a local-only
     log that is silent deletion of the only copy of everything, at every
     negative value, from one sign slip — and the zero rule never caught it
     because it tests equality.
     """
-    with pytest.raises(ValueError, match="local_retention must not be negative"):
+    with pytest.raises(ValueError, match="staging_retention must not be negative"):
         litelink.new(
             tmp_path,
             "s",
             schema=SCHEMA,
             sort_by=("event_ts",),
-            config=LogConfig(local_retention=timedelta(hours=-1)),
+            config=LogConfig(staging_retention=timedelta(hours=-1)),
         )
 
 
@@ -789,7 +789,7 @@ def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> N
     """Eviction takes the LOWER boundary, so the policy retaining more wins.
 
     A config is only "evict on upload" when every floor it states is one.
-    Refusing `local_retention=0` beside `local_rows=1_000_000` would refuse a
+    Refusing `staging_retention=0` beside `staging_rows=1_000_000` would refuse a
     config that keeps a million rows regardless of age, with a message that is
     false for it.
     """
@@ -798,7 +798,7 @@ def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> N
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        config=LogConfig(local_retention=timedelta(0), local_rows=1_000_000),
+        config=LogConfig(staging_retention=timedelta(0), staging_rows=1_000_000),
     )
     with log:
         log.extend([{"event_ts": i, "key": "k"} for i in range(8)])
@@ -815,8 +815,8 @@ def test_two_processes_cannot_assemble_the_pair_validate_refuses(
 
     Each setter checked its own new half against this process's memory of the
     other, so two handles could assemble the refused combination between them:
-    one attaches an evict-on-upload policy while an archive is configured, the
-    other detaches the archive against a policy it read before that. The next
+    one attaches an evict-on-upload policy while a published table is configured, the
+    other detaches the published table against a policy it read before that. The next
     maintenance pass then executes it and deletes the only copy of everything.
     """
     log = litelink.new(
@@ -824,15 +824,15 @@ def test_two_processes_cannot_assemble_the_pair_validate_refuses(
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     with log, litelink.open(tmp_path, "s") as other:
-        # `other` opened while a remote archive was configured and a normal
+        # `other` opened while a remote published table was configured and a normal
         # policy was in force; it still remembers both.
         log.set_config(LogConfig(wal_replication=True))
 
-        with pytest.raises(ValueError, match="remote archive"):
-            other.set_archive(None)
+        with pytest.raises(ValueError, match="remote published table"):
+            other.set_published(None)
 
 
 def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) -> None:
@@ -853,7 +853,7 @@ def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) ->
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     with log:
         log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
@@ -865,7 +865,7 @@ def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) ->
             # Bounded: it waits for maintenance rather than refusing outright,
             # and reports rather than hanging when the wait runs out.
             with pytest.raises(RuntimeError, match="has held a claim"):
-                log.set_config(LogConfig(local_rows=0))
+                log.set_config(LogConfig(staging_rows=0))
 
         finally:
             held.release()
@@ -924,10 +924,10 @@ def test_a_configuration_change_waits_for_maintenance(tmp_path: Path) -> None:
         thread = threading.Thread(target=let_go)
         thread.start()
         try:
-            log.set_config(LogConfig(local_rows=500))
+            log.set_config(LogConfig(staging_rows=500))
 
             assert released.is_set(), "returned before the holder let go"
-            assert log.config.local_rows == 500
+            assert log.config.staging_rows == 500
         finally:
             thread.join(timeout=5)
 
@@ -948,17 +948,17 @@ def test_a_setter_that_lost_its_claim_does_not_write(tmp_path: Path) -> None:
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        published="s3://bucket/prefix",
     )
     with log:
-        before = log.config.local_rows
+        before = log.config.staging_rows
         original = log._buffer.get_meta
         rivals: list[Claim] = []
 
         def losing(key: str) -> str | None:
             # Between the read of the other half and the write: the claim
             # lapses and another owner takes it.
-            if key == "archive" and not rivals:
+            if key == "published" and not rivals:
                 with log._buffer._lock:
                     log._buffer._con.execute("UPDATE claim SET expires_at = 1")
 
@@ -978,18 +978,18 @@ def test_a_setter_that_lost_its_claim_does_not_write(tmp_path: Path) -> None:
         log._buffer.get_meta = losing  # ty: ignore[invalid-assignment]
         try:
             with pytest.raises(RuntimeError, match="lost the claim"):
-                log.set_config(LogConfig(local_rows=7))
+                log.set_config(LogConfig(staging_rows=7))
 
         finally:
             log._buffer.get_meta = original  # ty: ignore[invalid-assignment]
             for rival in rivals:
                 rival.release()
 
-        assert log.config.local_rows == before, "wrote without holding the claim"
+        assert log.config.staging_rows == before, "wrote without holding the claim"
 
 
 def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -> None:
-    """Neither the policy nor the archive location is copied into a process.
+    """Neither the policy nor the published location is copied into a process.
 
     This is the property that replaces twelve `refresh` calls. Each of them
     existed to drag a process-local copy back into agreement with the log, and
@@ -1004,18 +1004,18 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=LogConfig()
     )
     with first, litelink.open(tmp_path, "s") as second:
-        assert second.config.local_rows is None
-        default = second._archive.uri
+        assert second.config.staging_rows is None
+        default = second._published.uri
 
-        first.set_config(LogConfig(local_rows=4242))
-        first.set_archive(f"file://{tmp_path}/prefix")
+        first.set_config(LogConfig(staging_rows=4242))
+        first.set_published(f"file://{tmp_path}/prefix")
 
         # `second` was never told, and never asked.
-        assert second.config.local_rows == 4242
-        assert default != second._archive.uri
-        assert second._archive.uri == f"file://{tmp_path}/prefix"
-        assert second._maintenance.config.local_rows == 4242
-        assert second._buffer.config().local_rows == 4242
+        assert second.config.staging_rows == 4242
+        assert default != second._published.uri
+        assert second._published.uri == f"file://{tmp_path}/prefix"
+        assert second._maintenance.config.staging_rows == 4242
+        assert second._buffer.config().staging_rows == 4242
 
 
 def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
@@ -1023,11 +1023,11 @@ def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
 ) -> None:
     """§4's clustering has to survive a machine, and the catalog does not.
 
-    `sort_by` used to live only in the local Iceberg table, read back at open.
+    `sort_by` used to live only in the staging table, read back at open.
     `catalog.db` is replicated but records ABSOLUTE paths to local metadata no
-    sidecar ships, so a failover rebuilds the local table rather than restoring
-    it — and has to be told what order to declare. The archive could not answer
-    either: `open_archive` never declared one.
+    sidecar ships, so a failover rebuilds the staging table rather than restoring
+    it — and has to be told what order to declare. The published table could not answer
+    either: `open_published` never declared one.
 
     So `meta` carries it, and this proves `open` reads THAT rather than the
     table: the declaration is removed from under a closed log and the order
@@ -1037,7 +1037,7 @@ def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
         assert log._table.sort_by() == ("event_ts",)  # noqa: SLF001
 
     catalog = SqlCatalog(
-        "local",
+        "staging",
         uri=Layout(tmp_path, "s").catalog_uri,
         warehouse=Layout(tmp_path, "s").warehouse_uri,
     )
@@ -1171,7 +1171,7 @@ def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
     restore. Answering False when the catalog merely could not be READ tells it
     to resume over a LIVE log — and the resume path reserves 2**20 offsets on
     it, deletes every `extent` row including queued cuts, wipes `sealing` and
-    `claim`, drops the archive catalog row, and deletes buffered rows below the
+    `claim`, drops the published catalog row, and deletes buffered rows below the
     frontier.
 
     It is reachable without corruption: `catalog.db` runs in
@@ -1194,11 +1194,11 @@ def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
 
     # And the caller that matters treats it as "exists" rather than proceeding.
     with pytest.raises((LookupError, FileExistsError, ValueError, RuntimeError)):
-        litelink.restore(tmp_path, "s", archive="s3://bucket/prefix")
+        litelink.restore(tmp_path, "s", published="s3://bucket/prefix")
 
 
 @pytest.mark.parametrize(
-    ("archive", "expected"),
+    ("published", "expected"),
     [
         # The one that motivated the rule: a single missing slash. It reaches
         # `litestream_config` intact, splits at the first slash it finds, and
@@ -1221,24 +1221,24 @@ def test_an_unreadable_catalog_is_not_reported_as_an_absent_table(
         ("s3://a b/prefix", "cannot appear in one"),
     ],
 )
-def test_a_malformed_archive_uri_is_refused_with_its_own_shape(
-    archive: str, expected: str
+def test_a_malformed_published_uri_is_refused_with_its_own_shape(
+    published: str, expected: str
 ) -> None:
-    """Every consumer of `archive` parses it POSITIONALLY.
+    """Every consumer of `published` parses it POSITIONALLY.
 
     Which is why a malformed prefix cannot be left to fail downstream: it does
     not fail, it means something else. `s3:/bucket/prefix` is a valid string to
     every one of them, describing a bucket called `s3:`.
 
-    Falsify by deleting the `validate_archive` call in `validate`: every case
+    Falsify by deleting the `validate_published` call in `validate`: every case
     here is accepted, and the first four reach litestream as
     `yaml: line 5: mapping values are not allowed in this context`.
     """
     with pytest.raises(ValueError, match=expected):
-        validate_archive(archive)
+        validate_published(published)
 
 
-def test_a_well_formed_archive_uri_is_accepted() -> None:
+def test_a_well_formed_published_uri_is_accepted() -> None:
     """The control for the rule above, and the reason it is not stricter.
 
     Bucket naming is the endpoint's rule, not litelink's — rustfs and MinIO
@@ -1249,7 +1249,7 @@ def test_a_well_formed_archive_uri_is_accepted() -> None:
     Falsify by tightening `_BUCKET_CHARS` to AWS's own rule: the underscore
     and uppercase cases here start failing.
     """
-    for archive in (
+    for published in (
         "s3://bucket",
         "s3://bucket/prefix",
         "s3://bucket/prefix/nested",
@@ -1258,10 +1258,12 @@ def test_a_well_formed_archive_uri_is_accepted() -> None:
         "s3://Has-Upper/p",
         "s3://has.dots/p",
     ):
-        validate_archive(archive)
+        validate_published(published)
 
 
-def test_every_entry_point_taking_an_archive_checks_its_shape(tmp_path: Path) -> None:
+def test_every_entry_point_taking_a_published_table_checks_its_shape(
+    tmp_path: Path,
+) -> None:
     """`new` reaches it through `validate`; `restore` does not.
 
     `restore` takes no schema or config, so it never calls `validate` — and it
@@ -1269,16 +1271,16 @@ def test_every_entry_point_taking_an_archive_checks_its_shape(tmp_path: Path) ->
     check of its own, and asserting both together makes a third entry point
     without one visible here.
 
-    Falsify by removing `restore`'s explicit `validate_archive` call: it raises
+    Falsify by removing `restore`'s explicit `validate_published` call: it raises
     RuntimeError from the subprocess instead, after creating a root.
     """
     bad = "s3:/bucket/prefix"
 
     with pytest.raises(ValueError, match="missing a slash"):
-        litelink.new(tmp_path / "new", "s", schema=SCHEMA, archive=bad)
+        litelink.new(tmp_path / "new", "s", schema=SCHEMA, published=bad)
 
     with pytest.raises(ValueError, match="missing a slash"):
-        litelink.restore(tmp_path / "restore", "s", archive=bad)
+        litelink.restore(tmp_path / "restore", "s", published=bad)
 
     # And nothing was created on the way to refusing. A shape error is decided
     # from the argument alone, so it must land before any directory does.
@@ -1286,22 +1288,24 @@ def test_every_entry_point_taking_an_archive_checks_its_shape(tmp_path: Path) ->
     assert not (tmp_path / "restore").exists()
 
 
-def test_repointing_a_log_at_a_malformed_archive_is_refused(tmp_path: Path) -> None:
-    """`set_archive` goes through `validate` too, and must.
+def test_repointing_a_log_at_a_malformed_published_table_is_refused(
+    tmp_path: Path,
+) -> None:
+    """`set_published` goes through `validate` too, and must.
 
     A log that is already running is the worse place to accept one: the
-    location is written to `meta` and every later sync reads it back, so a
+    location is written to `meta` and every later publish reads it back, so a
     malformed prefix becomes durable state that fails at the next maintenance
     pass rather than at the call that set it.
 
-    Falsify by deleting the `validate_archive` call in `validate`: the repoint
+    Falsify by deleting the `validate_published` call in `validate`: the repoint
     succeeds and the string is stored.
     """
     with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
         with pytest.raises(ValueError, match="missing a slash"):
-            log.set_archive("s3:/bucket/prefix")
+            log.set_published("s3:/bucket/prefix")
 
-        assert log.archive == Layout(tmp_path, "s").default_archive, (
+        assert log.published == Layout(tmp_path, "s").default_published, (
             "a refused repoint was stored anyway"
         )
 
@@ -1311,7 +1315,7 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
 ) -> None:
     """Bounded free list, and I9 across the rewrite that bounds it.
 
-    SQLite never shrinks a file on its own, so a buffer that archives for months
+    SQLite never shrinks a file on its own, so a buffer that publishes for months
     keeps every page it has ever needed. Invisible locally — the free list is
     reused — and paid off-box by every follower, because litestream replicates
     the FILE. Measured on a real 1-day-old capture: 457 MB holding 20,658 live
@@ -1323,9 +1327,9 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
     with what is asserted.
 
     The second half matters more. `VACUUM` rebuilds the database, and this runs
-    where the archive may have taken every row, so if the rewrite disturbed
+    where the published table may have taken every row, so if the rewrite disturbed
     `litelink_offset` — its values, its gaps, or the AUTOINCREMENT counter
-    behind them — the log would reissue offsets the archive already holds (I9).
+    behind them — the log would reissue offsets the published table already holds (I9).
     Offsets are compared exactly, gaps included.
 
     Falsify by making `reclaim_free_pages` return 0 without vacuuming: the
@@ -1340,9 +1344,9 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
                 {"event_ts": i, "key": payload} for i in range(2000)
             )
 
-        # The archive takes all but a tail, which is `release_archived`'s shape.
+        # The published table takes all but a tail, which is `release_published`'s shape.
         boundary = issued[-300]
-        buffer.release_archived(boundary)
+        buffer.release_published(boundary)
         # Then punch holes in what is left, so a renumbering rewrite would show
         # up as closed gaps rather than having to be inferred.
         survivors = [o for o in issued if o > boundary and o % 3 == 0]
@@ -1383,7 +1387,7 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
 def test_reclaiming_a_small_buffer_does_nothing(tmp_path: Path) -> None:
     """The floor, and why it is not a policy knob.
 
-    A young log crosses any ratio on its first archive pass — delete most of a
+    A young log crosses any ratio on its first published pass — delete most of a
     few hundred KB and the free list is most of the file. Reclaiming there costs
     an exclusive lock, and stalls appends, to save a rounding error on the wire.
 
@@ -1395,7 +1399,7 @@ def test_reclaiming_a_small_buffer_does_nothing(tmp_path: Path) -> None:
         # Enough to leave a free list that is most of the file, and far enough
         # under the floor that reclaiming it would be pure cost.
         issued = buffer.append({"event_ts": i, "key": "k" * 400} for i in range(4000))
-        buffer.release_archived(issued[-1])
+        buffer.release_published(issued[-1])
         pages, free = _page_stats(buffer)
         page_size = int(buffer._con.execute("PRAGMA page_size").fetchone()[0])  # noqa: SLF001
 
@@ -1528,3 +1532,24 @@ def test_a_pre_02_log_names_the_release_that_can_migrate_it(tmp_path: Path) -> N
 
     with pytest.raises(FileNotFoundError, match=r"(?s)litelink 0\.5\.1.*--apply"):
         litelink.open(tmp_path, "s")
+
+
+def test_the_config_is_written_under_the_staging_names_and_reads_the_old_ones() -> None:
+    """New logs store `staging_retention` and `staging_rows` (#98); one written
+    before the rename stored `local_retention` and `local_rows`, and still opens
+    with its policy.
+
+    Falsify by dropping the fallback to `local_rows` in `from_json`: the old
+    record reads back with no row floor.
+    """
+    config = LogConfig(staging_retention=timedelta(hours=2), staging_rows=500)
+    written = json.loads(config.to_json())
+    assert written["staging_retention"] == 7200
+    assert written["staging_rows"] == 500
+    assert "local_retention" not in written
+    assert "local_rows" not in written
+
+    old = json.dumps({"local_retention": 7200, "local_rows": 500})
+    recovered = LogConfig.from_json(old)
+    assert recovered.staging_retention == timedelta(hours=2)
+    assert recovered.staging_rows == 500

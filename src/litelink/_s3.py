@@ -1,4 +1,4 @@
-"""Credentials for the archive tier (SPEC §5).
+"""Credentials for the published tier (SPEC §5).
 
 Deliberately NOT part of `LogConfig`. Everything in that object is persisted to
 the buffer's `meta` table so `open` can recover the log's policy, and secrets
@@ -31,7 +31,7 @@ _ENV = {
 
 @dataclass(frozen=True, slots=True)
 class S3Options:
-    """How to reach the archive's object store.
+    """How to reach the published table's object store.
 
     Every field optional, because AWS resolves all of them itself from instance
     metadata, a profile, or the environment. An endpoint is only needed to point
@@ -83,11 +83,11 @@ class S3Options:
 
 
 def filesystem(options: S3Options) -> Any:
-    """A pyarrow filesystem for the archive, from the same options as the log.
+    """A pyarrow filesystem for the published table, from the same options as the log.
 
     pyarrow rather than s3fs: `pyiceberg[pyarrow]` is already a runtime
     dependency and s3fs is not, so a caller that needed it would fail on
-    exactly the installs that have an archive to reach.
+    exactly the installs that have a published table to reach.
 
     Here rather than beside its first caller, because it now has two — the
     migration tool and the snapshot path — and a second spelling of "build a

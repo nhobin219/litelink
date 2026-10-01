@@ -98,11 +98,11 @@ def test_the_rollup_agrees_with_the_data(tmp_path: Path, seed: int) -> None:
     with _random_log(tmp_path, seed) as log:
         assert log.buffered_rows() == 0
         data = log.scan().read_all()
-        stats = log.column_statistics(tier="local")
+        stats = log.column_statistics(tier="staging")
 
-        assert stats.tier == "local"
+        assert stats.tier == "staging"
         assert stats.record_count == data.num_rows
-        assert stats.file_count == log.table_files()
+        assert stats.file_count == log.staging_files()
         assert set(stats) == {"litelink_offset", *SCHEMA.names}
 
         for name in stats:
@@ -204,7 +204,7 @@ def test_a_file_with_values_but_no_bound_makes_the_bounds_unknown() -> None:
     Falsify by skipping the `self.unknown = True` in `_Column.add`.
     """
     unbounded = _file(2, value_counts={1: 2}, null_value_counts={1: 1})
-    stats = rollup("local", _LONG, [_bounded(3, 5, 9), unbounded])
+    stats = rollup("staging", _LONG, [_bounded(3, 5, 9), unbounded])
 
     assert (stats["n"].min, stats["n"].max) == (None, None)
     assert stats["n"].null_count == 1
@@ -216,7 +216,7 @@ def test_an_all_null_file_adds_nothing_to_the_bounds() -> None:
     Falsify by treating every file without a bound as unknown.
     """
     all_null = _file(4, value_counts={1: 4}, null_value_counts={1: 4})
-    stats = rollup("local", _LONG, [_bounded(3, 5, 9), all_null, _bounded(2, -1, 6)])
+    stats = rollup("staging", _LONG, [_bounded(3, 5, 9), all_null, _bounded(2, -1, 6)])
 
     assert (stats["n"].min, stats["n"].max) == (-1, 9)
     assert stats["n"].null_count == 4
@@ -227,7 +227,7 @@ def test_an_all_null_file_adds_nothing_to_the_bounds() -> None:
 def test_a_file_missing_a_count_makes_that_sum_unknown() -> None:
     """A column added after a file was written has no counts there at all."""
     predates = _file(5)
-    stats = rollup("local", _LONG, [_bounded(3, 5, 9), predates])
+    stats = rollup("staging", _LONG, [_bounded(3, 5, 9), predates])
 
     assert stats["n"].null_count is None
     assert stats["n"].value_count is None
@@ -235,26 +235,30 @@ def test_a_file_missing_a_count_makes_that_sum_unknown() -> None:
 
 
 def test_an_empty_tier_counts_zero() -> None:
-    stats = rollup("archive", _LONG, [])
+    stats = rollup("published", _LONG, [])
 
     assert (stats.record_count, stats.file_count) == (0, 0)
     assert stats["n"].null_count == 0
     assert stats["n"].min is None
 
 
-def test_the_tier_must_be_named_and_the_archive_must_exist(tmp_path: Path) -> None:
+def test_the_tier_must_be_named_and_the_published_table_must_exist(
+    tmp_path: Path,
+) -> None:
     with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
-        with pytest.raises(ValueError, match="no archive"):
-            log.column_statistics(tier="archive")
+        with pytest.raises(ValueError, match="no published table"):
+            log.column_statistics(tier="published")
 
-        with pytest.raises(ValueError, match="'local', 'archive', 'buffer' or None"):
+        with pytest.raises(
+            ValueError, match="'staging', 'published', 'buffer' or None"
+        ):
             log.column_statistics(tier="nearline")  # ty: ignore[invalid-argument-type]
 
 
 def test_buffered_rows_are_their_own_tier(tmp_path: Path) -> None:
-    """Buffered rows are in `"buffer"`, not in `"local"`, until a seal writes
+    """Buffered rows are in `"buffer"`, not in `"staging"`, until a seal writes
     them — and the three tiers add up to the whole log. The case where a seal
-    KEEPS its rows in the buffer needs an archive; see
+    KEEPS its rows in the buffer needs a published table; see
     `test_the_statistics_tiers_partition_the_log`.
     """
     with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
@@ -262,7 +266,7 @@ def test_buffered_rows_are_their_own_tier(tmp_path: Path) -> None:
         log.seal()
         log.extend({"k": i} for i in range(10, 13))
 
-        local = log.column_statistics(tier="local")
+        local = log.column_statistics(tier="staging")
         buffered = log.column_statistics(tier="buffer")
         whole = log.column_statistics()
 
@@ -298,14 +302,14 @@ _NAMES = ("litelink_offset", "n")
 
 
 def test_the_whole_log_takes_each_file_once() -> None:
-    """An archive file local still holds is not counted twice.
+    """A published file local still holds is not counted twice.
 
-    Falsify by adding every archive file: the record count doubles for the
+    Falsify by adding every published file: the record count doubles for the
     overlapping range.
     """
     local = [_span(10, 19, 100, 200)]
-    archive = [_span(1, 9, 50, 60), _span(10, 19, 100, 200)]
-    stats = whole_log(_NAMES, (_WITH_OFFSET, local), (_WITH_OFFSET, archive), _EMPTY)
+    published = [_span(1, 9, 50, 60), _span(10, 19, 100, 200)]
+    stats = whole_log(_NAMES, (_WITH_OFFSET, local), (_WITH_OFFSET, published), _EMPTY)
 
     assert stats.record_count == 19
     assert stats.file_count == 2
@@ -313,15 +317,15 @@ def test_the_whole_log_takes_each_file_once() -> None:
     assert stats["n"].null_count == 0
 
 
-def test_a_straddling_archive_file_keeps_its_bounds_and_loses_the_counts() -> None:
+def test_a_straddling_published_file_keeps_its_bounds_and_loses_the_counts() -> None:
     """Rows on both sides of the local boundary cannot be counted once.
 
-    Only `rewrite_archive` re-cutting the archive makes one. Its bounds are
+    Only `rewrite_published` re-cutting the published table makes one. Its bounds are
     over rows the log holds, so they stand; every count is None, never doubled.
     """
     local = [_span(10, 19, 100, 200)]
-    archive = [_span(1, 14, 1, 5)]
-    stats = whole_log(_NAMES, (_WITH_OFFSET, local), (_WITH_OFFSET, archive), _EMPTY)
+    published = [_span(1, 14, 1, 5)]
+    stats = whole_log(_NAMES, (_WITH_OFFSET, local), (_WITH_OFFSET, published), _EMPTY)
 
     assert stats.record_count is None
     assert stats["n"].null_count is None

@@ -2,7 +2,7 @@
 
 Two halves. Turning a query into manifest terms — DuckDB's parse, and each
 constant converted the way DuckDB compares it — needs no object storage and is
-checked directly. The rest runs against a real archive, because the claims are
+checked directly. The rest runs against a real published table, because the claims are
 about when the network is and is not touched, and about the rows that come
 back either way.
 """
@@ -22,11 +22,11 @@ import litelink
 from litelink._layout import Layout
 from litelink._prune import terms
 from litelink._read import Reader
-from litelink._tiers import ArchiveTier, Stored
+from litelink._tiers import PublishedTier, Stored
 from litelink.log import OFFSET, LogHandle
 from litelink.manifest import build, prune
-from tests.test_archive import ROWS, archived_log, rows
 from tests.test_manifest import row
+from tests.test_publish import ROWS, published_log, rows
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -137,7 +137,7 @@ def test_a_value_is_what_duckdb_compares_against(
     assert (kept == ["unit"]) == bool(returned[0]), (found, returned)
 
 
-def test_a_log_without_an_archive_knows_the_archive_holds_nothing(
+def test_a_log_without_a_published_table_knows_the_published_table_holds_nothing(
     tmp_path: Path,
 ) -> None:
     """Known empty from birth, so no query ever includes a leg it cannot read."""
@@ -150,12 +150,12 @@ def test_a_log_without_an_archive_knows_the_archive_holds_nothing(
     assert stored.offsets[1] <= stored.offsets[0], "an empty range"
 
 
-def test_local_statistics_are_of_the_snapshot_a_read_resolved(
+def test_staging_statistics_are_of_the_snapshot_a_read_resolved(
     tmp_path: Path,
 ) -> None:
     """The local row comes from the snapshot being scanned, or not at all.
 
-    A read holding an older pointer gets None — "read the local tier" —
+    A read holding an older pointer gets None — "read the staging tier" —
     rather than a newer snapshot's rollup, which could leave out rows the
     older snapshot still serves.
 
@@ -184,7 +184,7 @@ def test_local_statistics_are_of_the_snapshot_a_read_resolved(
 
 
 def buffered_log(tmp_path: Path) -> WriteHandle:
-    """Offsets 1–100 sealed into the local table, 101–150 still buffered."""
+    """Offsets 1–100 sealed into the staging table, 101–150 still buffered."""
     schema = pa.schema([pa.field("x", pa.int64())])
     log = litelink.new(tmp_path, "s", schema=schema)
     log.extend({"x": i} for i in range(100))
@@ -228,10 +228,10 @@ def test_a_read_below_the_buffer_does_not_read_it(
         assert len(read) == 2
 
 
-def test_an_unfiltered_read_skips_the_local_rollup(
+def test_an_unfiltered_read_skips_the_staging_rollup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With no terms nothing but an empty tier can be skipped, and a local table
+    """With no terms nothing but an empty tier can be skipped, and a staging table
     with an extent is not empty — so the rollup is not worth computing.
 
     Falsify by dropping the `and found` from `Reader._tiers`: the unfiltered
@@ -249,7 +249,7 @@ def test_an_unfiltered_read_skips_the_local_rollup(
     with buffered_log(tmp_path) as log:
         # No stored row, so a read that needs the rollup has to compute it.
         with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
-            forged.execute("DELETE FROM tier_statistics WHERE tier = 'local'")
+            forged.execute("DELETE FROM tier_statistics WHERE tier = 'staging'")
 
         monkeypatch.setattr(LogTable, "statistics_at", counted)
 
@@ -260,7 +260,7 @@ def test_an_unfiltered_read_skips_the_local_rollup(
         assert len(asked) == 1
 
 
-def test_the_committer_stores_the_local_rollup_for_every_other_process(
+def test_the_committer_stores_the_staging_rollup_for_every_other_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After a seal the local row is in `buffer.db`, stamped with the version it
@@ -276,7 +276,7 @@ def test_the_committer_stores_the_local_rollup_for_every_other_process(
         table = log._table  # noqa: SLF001
         table.reload()
         _, found = log._buffer.tiers()  # noqa: SLF001
-        stored = found.get("local")
+        stored = found.get("staging")
         assert stored is not None
         assert stored[2] == table.metadata_location, "stamped with its version"
         assert stored[0] == (1, 101)
@@ -296,7 +296,7 @@ def test_a_stored_rollup_for_another_version_is_not_used(tmp_path: Path) -> None
     resolved is ignored, and the reader rolls its own version up.
 
     Falsify by dropping the version comparison in `Reader._tiers`: the forged
-    row, claiming the local tier holds nothing matching, skips it and the
+    row, claiming the staging tier holds nothing matching, skips it and the
     read comes back short.
     """
     from litelink._tiers import empty, encode
@@ -306,47 +306,47 @@ def test_a_stored_rollup_for_another_version_is_not_used(tmp_path: Path) -> None
         with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
             forged.execute(
                 "UPDATE tier_statistics SET statistics = ?, version = ?"
-                " WHERE tier = 'local'",
+                " WHERE tier = 'staging'",
                 (encode(schema, empty(schema)), "99999-other.metadata.json"),
             )
 
         assert log.scan(where="x < 10").read_all().num_rows == 10
 
 
-def test_the_stored_local_rollup_only_moves_forward(tmp_path: Path) -> None:
+def test_the_stored_staging_rollup_only_moves_forward(tmp_path: Path) -> None:
     """Two commits' stores can land in either order; the older one arriving last
     does not replace the newer.
 
     Falsify by removing the sequence comparison from
-    `Buffer.store_local_statistics`: the older version overwrites the newer.
+    `Buffer.store_staging_statistics`: the older version overwrites the newer.
     """
     with buffered_log(tmp_path) as log:
         buffer = log._buffer  # noqa: SLF001
         newer = "/x/metadata/00012-aaa.metadata.json"
         older = "/x/metadata/00011-bbb.metadata.json"
 
-        assert buffer.store_local_statistics(newer, (1, 5), "{}")
-        assert not buffer.store_local_statistics(older, (1, 3), "{}")
-        assert buffer.tiers()[1]["local"][2] == newer
+        assert buffer.store_staging_statistics(newer, (1, 5), "{}")
+        assert not buffer.store_staging_statistics(older, (1, 3), "{}")
+        assert buffer.tiers()[1]["staging"][2] == newer
 
 
-# -- against a real archive ---------------------------------------------------
+# -- against a real published table ---------------------------------------------------
 
 
 def evicted(tmp_path: Path, bucket: str, s3: S3Options) -> WriteHandle:
-    """A log whose archive holds every row and whose local table the last ~1000.
+    """A log whose published table holds every row and whose staging table the last ~1000.
 
     `event_ts` is the row's position, so `event_ts = offset - 1` and a
     predicate on either lands in a known tier.
     """
-    log = archived_log(
-        tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000
+    log = published_log(
+        tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
     )
     log.extend(rows(ROWS))
     log.seal()
-    log.sync(push_unsettled=True)
+    log.publish(push_unsettled=True)
     log.maintain()
-    extent = log.table_extent()
+    extent = log.staging_extent()
     assert extent is not None, "the fixture must keep part of the log local"
     assert 1 < extent[0] < ROWS, "the fixture must evict part of the log"
 
@@ -354,7 +354,7 @@ def evicted(tmp_path: Path, bucket: str, s3: S3Options) -> WriteHandle:
 
 
 class Remote:
-    """Counts archive resolutions, or refuses them."""
+    """Counts published table resolutions, or refuses them."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, *, refuse: bool) -> None:
         self.calls = 0
@@ -363,7 +363,7 @@ class Remote:
         def counted(reader: Reader, cursor: duckdb.DuckDBPyConnection):  # noqa: ANN202
             self.calls += 1
             if refuse:
-                msg = "this read must not touch the archive"
+                msg = "this read must not touch the published table"
                 raise AssertionError(msg)
 
             return original(reader, cursor)
@@ -371,19 +371,19 @@ class Remote:
         monkeypatch.setattr(Reader, "_prepare_remote", counted)
 
 
-def archive_row(log: LogHandle) -> Stored | None:
-    """The archive's stored tier row — its range and statistics — or None."""
-    return ArchiveTier(log._buffer).load()  # noqa: SLF001
+def published_row(log: LogHandle) -> Stored | None:
+    """The published table's stored tier row — its range and statistics — or None."""
+    return PublishedTier(log._buffer).load()  # noqa: SLF001
 
 
 @pytest.mark.s3
-def test_a_read_inside_the_local_window_never_touches_the_archive(
+def test_a_read_inside_the_staging_window_never_touches_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """I5 under per-query selection: bounded above what eviction took, local.
 
-    The archive holds every row, so each of these COULD be answered from it —
-    what keeps them local is the archive's tier row, which describes only what
+    The published table holds every row, so each of these COULD be answered from it —
+    what keeps them local is the published table's tier row, which describes only what
     eviction moved there. Refused rather than counted, so a regression fails
     at the read that reached out.
 
@@ -391,7 +391,7 @@ def test_a_read_inside_the_local_window_never_touches_the_archive(
     raises.
     """
     with evicted(tmp_path, bucket, s3) as log:
-        extent = log.table_extent()
+        extent = log.staging_extent()
         assert extent is not None
         low = extent[0]
         Remote(monkeypatch, refuse=True)
@@ -405,12 +405,12 @@ def test_a_read_inside_the_local_window_never_touches_the_archive(
         assert log.sql(
             f'SELECT count(*) FROM log WHERE "litelink_offset" > {ROWS - 5}'
         ).read_all().column(0).to_pylist() == [5]
-        # Nothing matches anywhere: the archive cannot, so it is not asked.
+        # Nothing matches anywhere: the published table cannot, so it is not asked.
         assert log.scan(where="event_ts > 1000000").read_all().num_rows == 0
 
 
 @pytest.mark.s3
-def test_a_read_reaching_below_the_local_window_reads_the_archive(
+def test_a_read_reaching_below_the_staging_window_reads_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The other half: history is read without the caller naming a tier.
@@ -438,12 +438,12 @@ def test_a_pruned_read_returns_what_reading_every_tier_returns(
     all: a subquery and a self-join over `log` would see the pruned rows too.
 
     Falsify by swapping `low` and `high` in `manifest._compare`'s `<` and `>`
-    rules: reads bounded on one side of the local window skip the tier on the
+    rules: reads bounded on one side of the staging window skip the tier on the
     other and come back short. Or by dropping the subquery check in
     `_prune._terms`: the scalar subquery counts only the local rows.
     """
     with evicted(tmp_path, bucket, s3) as log:
-        extent = log.table_extent()
+        extent = log.staging_extent()
         assert extent is not None
         edge = extent[0] - 1  # `event_ts` of the first local row
         queries = [
@@ -457,7 +457,7 @@ def test_a_pruned_read_returns_what_reading_every_tier_returns(
             f"SELECT count(*) FROM log WHERE event_ts < 5 OR event_ts > {ROWS - 5}",
             'SELECT count(*) FROM log WHERE "litelink_offset" = 1',
             f"SELECT count(*) FROM log WHERE event_ts > 5.5 AND event_ts < {edge}.5",
-            # The outer WHERE narrows to the local window; the subquery must
+            # The outer WHERE narrows to the staging window; the subquery must
             # still count the whole log.
             (
                 "SELECT (SELECT count(*) FROM log) FROM log"
@@ -478,18 +478,18 @@ def test_a_pruned_read_returns_what_reading_every_tier_returns(
 
 
 @pytest.mark.s3
-def test_the_archive_row_describes_what_eviction_moved_below_the_local_table(
+def test_the_published_row_describes_what_eviction_moved_below_the_staging_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Every evicted offset, and not the archive's copy of the local window.
+    """Every evicted offset, and not the published table's copy of the staging window.
 
-    Falsify by removing the `widen` in `Maintenance.evict`: the archive row
-    stays as the first sync computed it, before anything was evicted.
+    Falsify by removing the `widen` in `Maintenance.evict`: the published row
+    stays as the first publish computed it, before anything was evicted.
     """
     with evicted(tmp_path, bucket, s3) as log:
-        extent = log.table_extent()
+        extent = log.staging_extent()
         assert extent is not None
-        found = archive_row(log)
+        found = published_row(log)
         assert found is not None
 
         assert found.offsets[0] == 1
@@ -499,21 +499,21 @@ def test_the_archive_row_describes_what_eviction_moved_below_the_local_table(
 
 
 @pytest.mark.s3
-def test_a_log_without_an_archive_row_reads_the_archive_until_backfilled(
+def test_a_log_without_a_published_row_reads_the_published_table_until_backfilled(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A log written before the row existed: correct at once, local after the
     writer's next `open`.
 
     Forged by deleting the row. A reader cannot trust what is not there, so it
-    reads the archive for every query; the writer's `open` backfills from the
-    archive's manifests, and the same hot read is local again.
+    reads the published table for every query; the writer's `open` backfills from the
+    published table's manifests, and the same hot read is local again.
 
     Falsify by removing `_backfill_manifest` from `litelink.open`: the last
-    read reaches the archive.
+    read reaches the published table.
     """
     with evicted(tmp_path, bucket, s3) as log:
-        extent = log.table_extent()
+        extent = log.staging_extent()
         assert extent is not None
         low = extent[0]
 
@@ -524,7 +524,7 @@ def test_a_log_without_an_archive_row_reads_the_archive_until_backfilled(
     remote = Remote(monkeypatch, refuse=False)
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
         assert reader.scan(start_offset=low).read_all().num_rows == ROWS - low + 1
-        assert remote.calls == 1, "no archive row must read the archive"
+        assert remote.calls == 1, "no published row must read the published table"
 
     with litelink.open(tmp_path, "s", s3=s3) as writer:
         assert writer._tiers.has()  # noqa: SLF001
@@ -533,58 +533,58 @@ def test_a_log_without_an_archive_row_reads_the_archive_until_backfilled(
 
 
 @pytest.mark.s3
-def test_repointing_forgets_the_archive_row(
+def test_repointing_forgets_the_published_row(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A row describes one archive; a move must not carry it to another.
+    """A row describes one published table; a move must not carry it to another.
 
     Pointed at a fresh prefix, the row is recomputed there: nothing below the
-    local table. Pointed back, the original's again. A move to one that
+    staging table. Pointed back, the original's again. A move to one that
     cannot be reached is refused, and leaves the row as it was.
 
     Falsify by removing the `drop()` in `_repoint`: the fresh prefix keeps the
-    old archive's row.
+    old published table's row.
     """
     with evicted(tmp_path, bucket, s3) as log:
-        original = log.archive
+        original = log.published
         assert original is not None
 
-        before = archive_row(log)
+        before = published_row(log)
         assert before is not None and before.statistics.record_count
 
-        log.set_archive(f"s3://{bucket}/elsewhere")
-        fresh = archive_row(log)
+        log.set_published(f"s3://{bucket}/elsewhere")
+        fresh = published_row(log)
         assert fresh is not None and fresh.statistics.record_count == 0
 
-        log.set_archive(original)
-        again = archive_row(log)
+        log.set_published(original)
+        again = published_row(log)
         assert again is not None and again.offsets == before.offsets
         assert log.scan().read_all().num_rows == ROWS
 
         with pytest.raises(OSError):  # noqa: PT011
-            log.set_archive(f"s3://{bucket}-nonexistent/prefix")
+            log.set_published(f"s3://{bucket}-nonexistent/prefix")
 
-        assert log.archive == original
-        assert archive_row(log) == again
+        assert log.published == original
+        assert published_row(log) == again
 
 
 @pytest.mark.s3
-def test_a_restore_computes_the_archive_row_from_the_archive(
+def test_a_restore_computes_the_published_row_from_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """After a failover the local table is empty and the archive is all of
-    history, so the archive row must cover every archived offset — taken from
-    the archive, not from the replica's copy, which lags it.
+    """After a failover the staging table is empty and the published table is all of
+    history, so the published row must cover every published offset — taken from
+    the published table, not from the replica's copy, which lags it.
 
     Falsify by removing `_backfill_manifest` from `restore`: the row is
     dropped and nothing computes it.
     """
     where = f"s3://{bucket}/prefix"
     primary = tmp_path / "primary"
-    with archived_log(primary, bucket, s3) as log:
+    with published_log(primary, bucket, s3) as log:
         log.extend(rows(ROWS // 2))
         log.seal()
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
 
         second = tmp_path / "second"
         (second / "s").mkdir(parents=True)
@@ -598,22 +598,22 @@ def test_a_restore_computes_the_archive_row_from_the_archive(
             {"event_ts": ROWS + i, "key": "late", "payload": "z"} for i in range(50)
         )
         log.seal()
-        log.sync(push_unsettled=True)
-        archived = log.archived_through()
+        log.publish(push_unsettled=True)
+        published = log.published_through()
 
-    with litelink.restore(second, "s", archive=where, s3=s3) as revived:
-        found = archive_row(revived)
+    with litelink.restore(second, "s", published=where, s3=s3) as revived:
+        found = published_row(revived)
         assert found is not None
-        assert found.offsets[1] == archived + 1
+        assert found.offsets[1] == published + 1
         late = revived.scan(where=f"event_ts >= {ROWS}").read_all()
         assert late.num_rows == 50
 
 
 @pytest.mark.s3
-def test_eviction_widens_the_archive_row_before_it_commits(
+def test_eviction_widens_the_published_row_before_it_commits(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The ordering that keeps the archive row from ever lagging the local
+    """The ordering that keeps the published row from ever lagging the staging
     table: at the moment eviction commits, the row already covers what it is
     evicting — so a read resolving the new, higher floor finds it covered.
 
@@ -626,17 +626,17 @@ def test_eviction_widens_the_archive_row_before_it_commits(
     original = LogTable.evict_through
 
     def checked(table: LogTable, boundary: int) -> None:
-        stored = ArchiveTier(log._buffer).load()  # noqa: SLF001
+        stored = PublishedTier(log._buffer).load()  # noqa: SLF001
         seen.append((boundary, None if stored is None else stored.offsets[1]))
         original(table, boundary)
 
-    log = archived_log(
-        tmp_path, bucket, s3, local_retention=timedelta(0), local_rows=1000
+    log = published_log(
+        tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
     )
     with log:
         log.extend(rows(ROWS))
         log.seal()
-        log.sync(push_unsettled=True)
+        log.publish(push_unsettled=True)
         monkeypatch.setattr(LogTable, "evict_through", checked)
         log.maintain()
 
@@ -649,7 +649,7 @@ def test_eviction_widens_the_archive_row_before_it_commits(
 
 
 def coverage_log(tmp_path: Path, bucket: str, s3: S3Options) -> WriteHandle:
-    """Archive below, local table in the middle, a buffered tail on top."""
+    """Published table below, staging table in the middle, a buffered tail on top."""
     log = evicted(tmp_path, bucket, s3)
     log.extend({"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(7))
 
@@ -659,9 +659,9 @@ def coverage_log(tmp_path: Path, bucket: str, s3: S3Options) -> WriteHandle:
 def covered(coverage: litelink.Coverage) -> list[int]:
     return [
         offset
-        for span in (coverage.archive, coverage.local, coverage.buffer)
+        for span in (coverage.published, coverage.staging, coverage.buffer)
         if span is not None
-        for offset in range(span[0], span[1] + 1)
+        for offset in range(span[0], span[1])
     ]
 
 
@@ -669,77 +669,80 @@ def covered(coverage: litelink.Coverage) -> list[int]:
 def test_coverage_partitions_the_log_without_the_network(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Three ranges, each offset in exactly one, and the archive never asked.
+    """Three ranges, each offset in exactly one, and the published table never asked.
 
-    Falsify by reading the archive's own extent for `archive` (its whole
+    Falsify by reading the published table's own extent for `published` (its whole
     range, overlapping the local copy): offsets repeat across tiers, and the
-    refused archive raises.
+    refused published table raises.
     """
-    from litelink._archive import Archive
+    from litelink._published import Published
 
     with coverage_log(tmp_path, bucket, s3) as log:
-        extent = log.table_extent()
+        extent = log.staging_extent()
         assert extent is not None
 
         def refuse(*_: object) -> None:
-            msg = "coverage must not open the archive"
+            msg = "coverage must not open the published table"
             raise AssertionError(msg)
 
-        monkeypatch.setattr(Archive, "table", refuse)
+        monkeypatch.setattr(Published, "table", refuse)
         coverage = log.coverage()
 
-        assert coverage.archive == (1, extent[0] - 1)
-        assert coverage.local == extent
-        assert coverage.buffer == (ROWS + 1, ROWS + 7)
+        assert coverage.published == (1, extent[0])
+        assert coverage.staging == extent
+        assert coverage.buffer == (ROWS + 1, ROWS + 8)
         assert covered(coverage) == list(range(1, ROWS + 8)), "each offset once"
 
 
 @pytest.mark.s3
-def test_coverage_reads_the_archive_only_when_no_row_is_stored(
+def test_coverage_reads_the_published_table_only_when_no_row_is_stored(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A log not yet backfilled gets the same answer, from the manifests.
 
-    Falsify by returning None for `archive` when there is no stored row: the
-    archive's range goes missing, and with it where the log starts.
+    Falsify by returning None for `published` when there is no stored row: the
+    published table's range goes missing, and with it where the log starts.
     """
     with coverage_log(tmp_path, bucket, s3) as log:
         expected = log.coverage()
         with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
-            forged.execute("DELETE FROM tier_offsets WHERE tier = 'archive'")
-            forged.execute("DELETE FROM tier_statistics WHERE tier = 'archive'")
+            forged.execute("DELETE FROM tier_offsets WHERE tier = 'published'")
+            forged.execute("DELETE FROM tier_statistics WHERE tier = 'published'")
 
         assert log.coverage() == expected
 
 
 @pytest.mark.s3
-def test_coverage_without_the_archive_never_opens_it(
+def test_coverage_without_the_published_table_never_opens_it(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`archive=False` answers a log with no stored archive row from local disk.
+    """`published=False` answers a log with no stored published row from local disk.
 
-    That is the one case the full answer reads the archive's manifests, so a
+    That is the one case the full answer reads the published table's manifests, so a
     replay held to the local floor would otherwise pay — or fail on — S3.
 
-    Falsify by ignoring `archive` in the fallback: the refused archive raises.
+    Falsify by ignoring `published` in the fallback: the refused published table raises.
     """
-    from litelink._archive import Archive
+    from litelink._published import Published
 
     with coverage_log(tmp_path, bucket, s3) as log:
         expected = log.coverage()
         with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
-            forged.execute("DELETE FROM tier_offsets WHERE tier = 'archive'")
-            forged.execute("DELETE FROM tier_statistics WHERE tier = 'archive'")
+            forged.execute("DELETE FROM tier_offsets WHERE tier = 'published'")
+            forged.execute("DELETE FROM tier_statistics WHERE tier = 'published'")
 
         def refuse(*_: object) -> None:
-            msg = "coverage(archive=False) must not open the archive"
+            msg = "coverage(published=False) must not open the published table"
             raise AssertionError(msg)
 
-        monkeypatch.setattr(Archive, "table", refuse)
-        coverage = log.coverage(archive=False)
+        monkeypatch.setattr(Published, "table", refuse)
+        coverage = log.coverage(published=False)
 
-        assert coverage.archive is None, "not asked"
-        assert (coverage.local, coverage.buffer) == (expected.local, expected.buffer)
+        assert coverage.published is None, "not asked"
+        assert (coverage.staging, coverage.buffer) == (
+            expected.staging,
+            expected.buffer,
+        )
 
 
 def test_a_stored_local_range_for_another_version_is_not_used(
@@ -754,66 +757,66 @@ def test_a_stored_local_range_for_another_version_is_not_used(
         with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as forged:
             forged.execute(
                 "UPDATE tier_offsets SET start_offset = 500, end_offset = 600"
-                " WHERE tier = 'local'"
+                " WHERE tier = 'staging'"
             )
             forged.execute(
                 "UPDATE tier_statistics SET version = '99999-other.metadata.json'"
-                " WHERE tier = 'local'"
+                " WHERE tier = 'staging'"
             )
 
         coverage = log.coverage()
 
-        assert coverage.local == (1, 100)
-        assert coverage.buffer == (101, 150)
-        assert coverage.archive is None, "no archive configured"
+        assert coverage.staging == (1, 101)
+        assert coverage.buffer == (101, 151)
+        assert coverage.published is None, "no published table configured"
 
 
 @pytest.mark.s3
-def test_coverage_leaves_rows_a_seal_kept_to_the_local_table(
+def test_coverage_leaves_rows_a_seal_kept_to_the_staging_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """With `wal_replication` a seal keeps its rows in the buffer until `sync`;
+    """With `wal_replication` a seal keeps its rows in the buffer until `publish`;
     they are reported once, as local, and the buffer only above.
 
     Falsify by reporting the buffer's own extent without clipping it: the
     buffer starts at 1 and every sealed offset is counted twice.
     """
-    with archived_log(tmp_path, bucket, s3, wal_replication=True) as log:
+    with published_log(tmp_path, bucket, s3, wal_replication=True) as log:
         log.extend(rows(100))
         log.seal()
         log.extend({"event_ts": 100 + i, "key": "t", "payload": "y"} for i in range(5))
         assert log.buffered_rows() == 5
         coverage = log.coverage()
 
-        assert coverage.local == (1, 100)
-        assert coverage.buffer == (101, 105)
+        assert coverage.staging == (1, 101)
+        assert coverage.buffer == (101, 106)
         assert covered(coverage) == list(range(1, 106)), "each offset once"
 
 
 @pytest.mark.s3
-def test_a_read_without_the_archive_stops_at_the_local_floor(
+def test_a_read_without_the_published_table_stops_at_the_staging_floor(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`archive=False` serves the local table and the buffer, and only them —
-    from the floor `coverage(archive=False)` reports, with no network.
+    """`published=False` serves the staging table and the buffer, and only them —
+    from the floor `coverage(published=False)` reports, with no network.
 
-    The reads here reach below the local table, so without the flag each one
-    reads the archive. Falsify by ignoring `archive` in `Reader.query`: the
-    refused archive raises.
+    The reads here reach below the staging table, so without the flag each one
+    reads the published table. Falsify by ignoring `published` in `Reader.query`: the
+    refused published table raises.
     """
     with coverage_log(tmp_path, bucket, s3) as log:
-        coverage = log.coverage(archive=False)
-        assert coverage.local is not None
+        coverage = log.coverage(published=False)
+        assert coverage.staging is not None
         assert coverage.buffer is not None
-        floor = coverage.local[0]
+        floor = coverage.staging[0]
         assert floor > 1, "the fixture must evict part of the log"
         Remote(monkeypatch, refuse=True)
 
-        scanned = log.scan(archive=False).read_all()[OFFSET].to_pylist()
-        assert scanned == list(range(floor, coverage.buffer[1] + 1))
+        scanned = log.scan(published=False).read_all()[OFFSET].to_pylist()
+        assert scanned == list(range(floor, coverage.buffer[1]))
 
-        below = log.scan(end_offset=floor, archive=False).read_all()
-        assert below.num_rows == 0, "only the archive holds these"
+        below = log.scan(end_offset=floor, published=False).read_all()
+        assert below.num_rows == 0, "only the published table holds these"
 
-        counted = log.sql("SELECT count(*) AS n FROM log", archive=False)
+        counted = log.sql("SELECT count(*) AS n FROM log", published=False)
         assert counted.read_all()["n"][0].as_py() == len(scanned)

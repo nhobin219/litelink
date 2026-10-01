@@ -17,7 +17,7 @@ def fsync(path: Path) -> None:
     """Fsync a file AND the directory entry that reaches it (I1).
 
     On most filesystems the contents can be durable while the name that reaches
-    them is not, so syncing only the file leaves a manifest entry pointing at a
+    them is not, so publishing only the file leaves a manifest entry pointing at a
     path that may not exist after a crash.
     """
     descriptor = os.open(path, os.O_RDONLY)
@@ -37,7 +37,7 @@ def write_parquet(table: pa.Table, path: Path, compression: str) -> None:
     """Write a data file and make it durable, in the one place that does it.
 
     Every data file this library creates goes through here — a seal, a
-    compaction, an archive rewrite, a bulk ingest — because the pair of calls
+    compaction, a published rewrite, a bulk ingest — because the pair of calls
     is the same pair every time and the codec is a setting that must not have
     four homes. It had none: all four sites called `pq.write_table` with no
     `compression`, taking pyarrow's Snappy default, and on a JSON payload

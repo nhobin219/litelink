@@ -91,7 +91,7 @@ class LogConfig:
     #
     # Bytes bound memory; rows bound read latency. Both are CEILINGS on one
     # file, so the seal cuts at whichever is reached FIRST — the mirror of
-    # `local_retention` and `local_rows`, which are floors and take whichever
+    # `staging_retention` and `staging_rows`, which are floors and take whichever
     # retains more.
     #
     # None means no row limit, which is the right default: a narrow-row stream
@@ -102,16 +102,16 @@ class LogConfig:
     # much may sit in the buffer, and the two pull in opposite directions.
     #
     # §7 wants the seal SMALL: the buffer is what a hot read scans, so its size
-    # is read latency. The archive wants files LARGE: measured against S3, a
+    # is read latency. The published table wants files LARGE: measured against S3, a
     # 9 kB file takes 648 ms to upload and almost all of that is the round
-    # trip, so halving file size doubles the cost of archiving the same stream.
+    # trip, so halving file size doubles the cost of publishing the same stream.
     # One knob cannot serve both — it did, and compaction could therefore never
     # produce a file bigger than a seal, which is why it was a no-op.
     #
     # Splitting them gives compaction a job: converting sealed chunks into
-    # archive-shaped ones. Eligibility follows for free — `sync` only takes
+    # published-shaped ones. Eligibility follows for free — `publish` only takes
     # files compaction has finished with, so raising this above the seal size
-    # means a freshly sealed file is a merge candidate and is not archived
+    # means a freshly sealed file is a merge candidate and is not published
     # until it has been converted.
     #
     # The price is write amplification, and it is bounded rather than ongoing:
@@ -160,10 +160,10 @@ class LogConfig:
     #
     # None keeps everything locally and grows without bound. Zero means "evict
     # on upload" — pure archival capture, hot reads limited to the buffer — and
-    # presupposes an archive: with `archive=None` it would delete each file as
+    # presupposes a published table: with `published=None` it would delete each file as
     # soon as it sealed, so the pair is rejected at construction rather than
     # honoured.
-    local_retention: timedelta | None = None
+    staging_retention: timedelta | None = None
     # §8, the other half of the same policy. A window in time and a count of
     # rows bound different things, and which one binds depends on a rate the
     # library cannot know: an hour of a quiet stream is a handful of rows, and
@@ -192,17 +192,17 @@ class LogConfig:
     # `min` below, because a cap evicts MORE and can therefore violate both
     # floors. It would measure on-disk size (`DataFile.size`), one of the few
     # places where that is the right unit. And it could not be honoured at all
-    # while sync is behind, since I4 forbids evicting what the archive lacks —
+    # while publish is behind, since I4 forbids evicting what the published table lacks —
     # a log breaching its floors to stay under a cap is misconfigured and
     # should say so rather than quietly serving every read from object storage.
-    local_rows: int | None = None
+    staging_rows: int | None = None
 
     # §3a. Continuous WAL shipping, which is the ONLY thing bounding RPO now
     # that the seal has no timer: a stream that goes quiet holds its last
     # partial file's worth of rows indefinitely.
     #
     # A declaration rather than a supervisor. It is read — `_discard_on_seal`
-    # consults it on every seal, and validation refuses it without an archive
+    # consults it on every seal, and validation refuses it without a published table
     # to replicate to — but litelink never starts the sidecar. That is a separate
     # process reading the WAL, which is exactly why replication does not put
     # the network in the write path, and litestream is explicit that two
@@ -224,7 +224,7 @@ class LogConfig:
     #
     # **What it buys is paid by FAILOVER, not by this process.** SQLite never
     # returns freed pages to the OS, and litestream replicates the FILE — so a
-    # log that seals and archives for months makes every `restore` download and
+    # log that seals and publishes for months makes every `restore` download and
     # apply its dead space. Measured on a 1-day-old capture: 457 MB holding
     # 20,658 live rows, 92% of its pages free, restoring in 12.5 s against 0.8 s
     # for the same content vacuumed. A log without `wal_replication` is never
@@ -243,18 +243,18 @@ class LogConfig:
     # the LATEST replicated state; retention bounds point-in-time depth and
     # never endangers the current point. So the question it answers is "how old
     # a moment might I want to restore to", and the answer follows from the
-    # archive: once sync has pushed a range, that range is recoverable from
-    # object storage, and WAL history older than the un-archived window is
+    # published table: once publish has pushed a range, that range is recoverable from
+    # object storage, and WAL history older than the un-published window is
     # covering something that is covered twice.
     #
     # **A duration, because litestream has nothing else.** The obvious spelling
-    # is "retain WAL above the archived offset" and it is not expressible:
+    # is "retain WAL above the published offset" and it is not expressible:
     # v0.5.16's knobs are `snapshot.interval`, `snapshot.retention` and
     # `l0-retention`, all durations, and its CLI has no `snapshot` verb to
-    # force one after a sync and make a duration behave like an offset. So this
-    # is the un-archived window stated as time.
+    # force one after a publish and make a duration behave like an offset. So this
+    # is the un-published window stated as time.
     #
-    # That window is append -> seal -> compact -> sync, which no library can
+    # That window is append -> seal -> compact -> publish, which no library can
     # know in advance: it depends on the arrival rate and on how often a
     # maintainer runs. `examples/adsb/tail.py` reports the lag it actually is. Set
     # this from that, with margin.
@@ -270,7 +270,7 @@ class LogConfig:
     compact_min_files: int = 4
 
     # The Parquet codec every data file is written with — a seal, a compaction,
-    # an archive rewrite, a bulk ingest.
+    # a published rewrite, a bulk ingest.
     #
     # **A setting rather than a constant, because the right answer is a
     # property of the payload.** §15.5 requires NONE for blob columns: sensor
@@ -281,18 +281,18 @@ class LogConfig:
     # to call `pq.write_table` with no codec at all, taking pyarrow's Snappy —
     # measured on a 200k-row JSON payload column, sorted as this library writes
     # it: Snappy 97 bytes/row at 2.07x, zstd 51 bytes/row at 3.93x. On a real
-    # 177M-row archive that is 34.8 GB against roughly 15 GB.
+    # 177M-row published table that is 34.8 GB against roughly 15 GB.
     #
     # It is not a size-for-speed trade, which is why this is a default and not
     # advice. The same measurement put zstd's full-scan read at 0.65x Snappy's,
     # because there is less to read and decompressing it is cheap; the cost is
-    # write CPU, 1.9x, against a write path that is fsync-bound and an archive
+    # write CPU, 1.9x, against a write path that is fsync-bound and a published table
     # push that is network-bound.
     #
     # Changing it is safe at any time and rewrites nothing. Parquet records the
     # codec per column chunk, so a table holding both reads correctly —
     # verified across `scan` and `sql` — and existing files are never touched.
-    # `rewrite_archive` is what re-cuts history into the new one, when the size
+    # `rewrite_published` is what re-cuts history into the new one, when the size
     # is worth the transfer.
     compression: str = "zstd"
 
@@ -309,12 +309,12 @@ class LogConfig:
                 "target_compact_size": self.target_compact_size,
                 "target_seal_rows": self.target_seal_rows,
                 "target_compact_rows": self.target_compact_rows,
-                "local_retention": (
+                "staging_retention": (
                     None
-                    if self.local_retention is None
-                    else self.local_retention.total_seconds()
+                    if self.staging_retention is None
+                    else self.staging_retention.total_seconds()
                 ),
-                "local_rows": self.local_rows,
+                "staging_rows": self.staging_rows,
                 "wal_replication": self.wal_replication,
                 "vacuum_free_ratio": self.vacuum_free_ratio,
                 "wal_retention": (
@@ -345,7 +345,11 @@ class LogConfig:
         """
         raw = json.loads(encoded)
         defaults = cls()
-        retention = raw.get("local_retention", defaults.local_retention)
+        # Written under the #98 names; a config written before them used
+        # `local_retention` and `local_rows`, read when the new key is absent.
+        retention = raw.get(
+            "staging_retention", raw.get("local_retention", defaults.staging_retention)
+        )
         wal = raw.get("wal_retention", defaults.wal_retention)
         snapshots = raw.get("snapshot_retention")
 
@@ -358,12 +362,14 @@ class LogConfig:
             target_compact_rows=raw.get(
                 "target_compact_rows", defaults.target_compact_rows
             ),
-            local_retention=(
+            staging_retention=(
                 retention
                 if isinstance(retention, timedelta) or retention is None
                 else timedelta(seconds=retention)
             ),
-            local_rows=raw.get("local_rows", defaults.local_rows),
+            staging_rows=raw.get(
+                "staging_rows", raw.get("local_rows", defaults.staging_rows)
+            ),
             wal_replication=raw.get("wal_replication", defaults.wal_replication),
             vacuum_free_ratio=raw.get("vacuum_free_ratio", defaults.vacuum_free_ratio),
             wal_retention=(

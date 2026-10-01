@@ -5,7 +5,7 @@
 Every factory here builds its object's collaborators and hands them over
 complete. `open` builds a writer or, with `read_only=True`, a reader on the same
 host; `new` and `restore` build writers. Every handle reads on the primary —
-reading a log from another machine is any Iceberg engine over its archive, not
+reading a log from another machine is any Iceberg engine over its published table, not
 something litelink assembles (#90).
 """
 
@@ -16,13 +16,13 @@ from typing import TYPE_CHECKING, Literal, overload
 
 import pyarrow as pa
 
-from litelink._archive import ARCHIVE_KEY, Archive
 from litelink._buffer import (
     CONFIG_KEY,
     Buffer,
 )
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
+from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import Reader, duckdb_connection
 from litelink._table import LogTable
 from litelink.log import (
@@ -83,7 +83,7 @@ def open(  # noqa: A001
     misuse was invisible until it ran. Here read-only returns a class that has
     no write methods at all.
 
-    Takes none of the log's shape: columns, config, archive and sort order all
+    Takes none of the log's shape: columns, config, published table and sort order all
     come from the log itself, so nothing at the call site can disagree with
     what is on disk.
 
@@ -95,7 +95,7 @@ def open(  # noqa: A001
     table read-only, so this cannot advance the log even by accident.
 
     Reading sees the writer's commits as they land: `catalog.db` and
-    `archive.db` live at the root and both processes read the same rows.
+    `published.db` live in the log's directory and both processes read the same rows.
     """
     layout = Layout(Path(root), name)
     table, schema = _existing(layout, name, readonly=read_only)
@@ -109,14 +109,14 @@ def open(  # noqa: A001
             raise buffer.retired_error()
 
         config = _validated_shape(layout, buffer, name)
-        remote = Archive(layout, buffer, s3)
-        reader = Reader(layout, table, buffer, duckdb_connection, archive=remote)
+        remote = Published(layout, buffer, s3)
+        reader = Reader(layout, table, buffer, duckdb_connection, published=remote)
         if read_only:
             return LocalReadHandle(
                 layout=layout,
                 table=table,
                 buffer=buffer,
-                archive=remote,
+                published=remote,
                 reader=reader,
             )
 
@@ -127,18 +127,21 @@ def open(  # noqa: A001
             reader=reader,
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
-            archive=remote,
+            published=remote,
         )
     except BaseException:
         buffer.close()
 
         raise
 
-    # A log written before #98 with no archive records none; it publishes to
-    # the local default now, recorded so the stored location is the one every
-    # fence compares against.
-    if not buffer.get_meta(ARCHIVE_KEY):
-        buffer.set_meta(ARCHIVE_KEY, layout.default_archive)
+    # A log written before #98 stores its `meta` keys and tier rows under the
+    # old names; a writer moves them to the new ones (its catalog files and
+    # names are kept, and found by `Layout` and `catalog_name`). One with no
+    # published location records none; it publishes to the local default now,
+    # recorded so the stored location is the one every fence compares against.
+    buffer.adopt_current_names()
+    if not buffer.get_meta(PUBLISHED_KEY):
+        buffer.set_meta(PUBLISHED_KEY, layout.default_published)
 
     handle.recover()
     handle._backfill_manifest()  # noqa: SLF001
@@ -207,7 +210,7 @@ def new(
     schema: pa.Schema,
     sort_by: Sequence[str] | None = None,
     config: LogConfig | None = None,
-    archive: str | None = None,
+    published: str | None = None,
     s3: S3Options | None = None,
     start_offset: int = 1,
 ) -> WriteHandle:
@@ -218,7 +221,7 @@ def new(
         schema=schema,
         sort_by=sort_by,
         config=config,
-        archive=archive,
+        published=published,
         s3=s3,
         start_offset=start_offset,
     )
@@ -228,7 +231,7 @@ def restore(
     root: PathLike[str] | str,
     name: str,
     *,
-    archive: str,
+    published: str,
     s3: S3Options | None = None,
     binary: str | None = None,
 ) -> WriteHandle:
@@ -237,7 +240,7 @@ def restore(
     return WriteHandle.restore(
         root,
         name,
-        archive=archive,
+        published=published,
         s3=s3,
         binary=binary,
     )

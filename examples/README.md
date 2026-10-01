@@ -35,7 +35,7 @@ first thing to fix, and the fix is `adsb/` below.
 ## `adsb/` — the shape a deployment wants
 
 A synthetic ADS-B position feed, driven as hard as you like, with one process
-per storage role. None of it needs an archive, a service, or a network.
+per storage role. None of it needs a published table, a service, or a network.
 
 ```
 just demo-capture      # terminal 1: append, and nothing else
@@ -43,7 +43,7 @@ just demo-maintain     # terminal 2: one process per storage role
 just demo-tail         # terminal 3: watch where the rows are
 ```
 
-`demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `sync` —
+`demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `publish` —
 and one command stops them all. They are separate processes rather than one,
 because a seal is CPU-bound pure Python and so is compaction, only more of it:
 run together, sealing waits on compaction through the interpreter and the buffer
@@ -62,23 +62,23 @@ The feed is synthetic on purpose. A demo you can turn up to a hundred thousand
 rows a second is the one that shows what the tiers are for; a real feed arrives
 at whatever rate it arrives at.
 
-## Adding the archive tier
+## Adding the published tier
 
 Everything above is local. To push sealed files to object storage and read across both
 tiers, add a bucket:
 
 ```
 just rustfs            # a local S3-compatible store, in one container
-just demo-archive      # terminal 1: capture, with an archive configured
+just demo-published      # terminal 1: capture, with a published table configured
 just demo-maintain     # terminal 2: also pushes, and evicts what it has pushed
-just demo-tail         # terminal 3: `in table` falls as `archived` rises
+just demo-tail         # terminal 3: `in table` falls as `published` rises
 ```
 
 **Against a real AWS bucket instead**, nothing changes but the environment:
 
 ```
-cp .env.example .env      # then set LITELINK_DEMO_ARCHIVE=s3://your-bucket/prefix
-just demo-archive
+cp .env.example .env      # then set LITELINK_DEMO_PUBLISHED=s3://your-bucket/prefix
+just demo-published
 just demo-maintain
 ```
 
@@ -88,14 +88,14 @@ chain, so a profile, instance metadata or SSO all work untouched. That is delibe
 credentials never enter `LogConfig`, because a log directory gets copied, backed up and
 attached elsewhere, and a key inside it travels with all of that.
 
-The reader needs the same environment whenever a query reaches back into the archive. A
-query bounded inside the local window reads local disk only and needs no credentials, which
+The reader needs the same environment whenever a query reaches back into the published table. A
+query bounded inside the staging window reads local disk only and needs no credentials, which
 is what makes a hot read a hot read.
 
 ## Continuous RPO
 
-Add `--replicate` to `demo-archive` and the maintainer runs litestream alongside itself,
-shipping the SQLite WAL to `_wal` beside the archived data. Needs an archive to ship to and
+Add `--replicate` to `demo-published` and the maintainer runs litestream alongside itself,
+shipping the SQLite WAL to `_wal` beside the published data. Needs a published table to ship to and
 the binary — `just litestream` fetches a checksum-verified pinned build into `.bin/`, which
 both the maintainer and `just demo-replicate` prefer over whatever is on PATH, because the
 config format is version-dependent.
@@ -134,7 +134,7 @@ just demo-clean        # delete the captured data when you are done
 ```
 
 That removes both demo roots — `litelink-data` here and `litelink-ws` from the websocket
-capture — plus whatever this log pushed to the archive, so one command covers every demo
+capture — plus whatever this log pushed to the published table, so one command covers every demo
 in this directory.
 
 Benchmarks live in [`benchmarks/`](../benchmarks/).
@@ -147,7 +147,7 @@ produces none. Data files are never affected either way; those go through `pendi
 transactionally.
 
 The demo keeps its data on purpose — `adsb/tail.py` reads it after the writer stops, and it is
-there to poke at — so nothing removes it automatically, and `local_retention` is left unset
+there to poke at — so nothing removes it automatically, and `staging_retention` is left unset
 so the window grows without bound. Roughly 25 MB per 30 seconds at the default rate. A real
 deployment sets a retention and lets `maintain()` hold the size; the benchmarks, which have
 nothing to inspect afterwards, run in a temp directory and clean up on exit.
@@ -192,4 +192,4 @@ legs derive from one committed extent (§7, I3). It counts in DuckDB rather than
 materialising rows, which is what §7 means about a query over `litelink_offset` never
 touching the columns it did not ask for.
 
-None of them needs an archive, a service, or a network.
+None of them needs a published table, a service, or a network.

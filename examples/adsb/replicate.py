@@ -3,12 +3,12 @@
     uv run python examples/adsb/replicate.py [--root DIR]
 
 Everything in it is derived: which SQLite files carry the log's state, where
-they go (`<prefix>/<name>/_wal`, beside the archived data), and the endpoint
+they go (`<prefix>/<name>/_wal`, beside the published data), and the endpoint
 they go through.
 That is the point of asking the log rather than writing the file by hand — the
 set is not obvious and getting it wrong is silent. `buffer.db` holds rows no
 Parquet file has yet, the one everybody remembers. `catalog.db` says which
-files the local table is made of. `archive.db` says the same for the archive,
+files the staging table is made of. `published.db` says the same for the published table,
 so omitting it leaves the objects in S3 intact and nothing able to say what
 they are.
 
@@ -72,7 +72,7 @@ def main() -> None:
 
         written = log.write_replication_config()
     except ValueError as exc:
-        raise SystemExit(f"{exc}\nrun the capture with --archive") from exc
+        raise SystemExit(f"{exc}\nrun the capture with --published table") from exc
     finally:
         log.close()
 

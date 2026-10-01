@@ -11,73 +11,111 @@ minor version carries breaking changes.
 
 ### Changed — breaking
 
+- **The tiers are renamed for their roles: buffer → staging → published**
+  (#98). The local Iceberg table is the staging tier, and the archive is the
+  log's published table. Every public name follows, with no aliases:
+
+  | Before | After |
+  | --- | --- |
+  | `archive=` (`new`, `restore`, `replication_config_for`) | `published=` |
+  | `log.archive` · `set_archive()` | `log.published` · `set_published()` |
+  | `sync()` · `ingest(sync=)` | `publish()` · `ingest(publish=)` |
+  | `archived_through()` · `archive_files()` | `published_through()` · `published_files()` |
+  | `rewrite_archive()` | `rewrite_published()` |
+  | `table_rows()` · `table_files()` · `table_extent()` | `staging_rows()` · `staging_files()` · `staging_extent()` |
+  | `LogConfig(local_retention=, local_rows=)` | `LogConfig(staging_retention=, staging_rows=)` |
+  | tiers `"local"` · `"archive"` | `"staging"` · `"published"` |
+  | `Coverage.archive` · `Coverage.local` | `Coverage.published` · `Coverage.staging` |
+  | `scan/sql/coverage(archive=False)` | `…(published=False)` |
+
+  `hydrate()` and the `litelink.retired` property keep their names.
+
+  **Stored names follow, and old logs still open.** A new log stores
+  `published` and `published_through` in `meta`, tier rows `staging` and
+  `published`, config keys `staging_retention` and `staging_rows`, and its
+  catalog as `published.db` with catalogs named `staging` and `published`.
+  Every old name is still read. A writer's `open` moves an old log's `meta`
+  keys and tier rows to the new names; its catalog files and catalog names
+  are kept (they are replicated, and are found by name), and its config keys
+  move the next time the config is written. The entries below use the new
+  names.
+
 - **litelink reads on the primary only: `snapshot` and `RemoteReadHandle` are
   removed**, in both modes — archive-only and `include_wal=True` (#90). Every
   handle is built from a root on the machine that holds the log, and still
-  reads the buffer, the local table and, when asked, the archive. Another
-  machine reads the archive with any Iceberg engine, as it already could
-  without litelink installed: `iceberg_scan('<archive>/<name>',
+  reads the buffer, the staging table and, when asked, the published table. Another
+  machine reads the published table with any Iceberg engine, as it already could
+  without litelink installed: `iceberg_scan('<published prefix>/<name>',
   version_name_format = '%s%s.metadata.json')` in DuckDB. Rows newer than the
-  last `sync` are readable on the primary alone. The WAL replica stays, for
+  last `publish` are readable on the primary alone. The WAL replica stays, for
   `restore`.
 - **litelink decides which tiers a query reads; `include_archive` and
   `with_archive()` are removed** (#90). Every query reads the buffer, and
-  reads the local table and the archive only when their statistics could hold
-  a matching row: the local table's from the snapshot the read resolved, the
-  archive's — what it holds below the local table — from a row kept in
-  `buffer.db`. Neither is on the network, so a query bounded inside the local
+  reads the staging table and the published table only when their statistics could hold
+  a matching row: the staging table's from the snapshot the read resolved, the
+  published table's — what it holds below the staging table — from a row kept in
+  `buffer.db`. Neither is on the network, so a query bounded inside the staging
   window never touches it, and an unbounded one reads the whole log without
   the caller naming a tier. This reverses 0.4.0's tiers-fixed-at-assembly
   rule: a query's latency now follows its predicates rather than its handle.
   Only a single `SELECT … FROM log` with AND-ed column-to-literal comparisons
   is narrowed; anything else reads every tier.
-- **`column_statistics(tier="archive")` is the archive below the local
-  table**, not the whole archive: the tiers now partition the log, and a new
-  `tier="buffer"` completes them, so `"local"` + `"archive"` + `"buffer"` is
-  `tier=None`. For the whole log, use `tier=None`. A log with nothing local
-  (retired, or evicted dry) still gets the whole archive from `"archive"`.
+- **`column_statistics(tier="published")` is the published table below the
+  staging table**, not the whole published table: the tiers now partition the
+  log, and a new `tier="buffer"` completes them, so `"staging"` +
+  `"published"` + `"buffer"` is `tier=None`. For the whole log, use
+  `tier=None`. A log with nothing in staging (retired, or evicted dry) still
+  gets the whole published table from `"published"`.
+- **Every offset range litelink reports is half-open, `[start, end)`**, the
+  convention its stored tier offsets and `litelink.manifest` already used:
+  `coverage()`, `staging_extent()` (was `table_extent()`), and
+  `recovery().skipped`. **`ingest()` changes silently**: it keeps its name and
+  now returns `(start, end)` with `end` one past the last offset it assigned,
+  so a caller treating the second value as the last offset is off by one.
+  A single offset (`published_through()`) is still the last one held.
 - **Logs are immutable: `add_column`, `rename_column` and `drop_column` are
   removed** (#93). A log keeps the schema it was created with; to change it,
   `retire()` the log and `new()` one at `start_offset=old.end_offset()` under
   a new name. A log a 0.5 release widened stays readable. One a 0.5 release
   left mid-`add_column` is refused, naming 0.5.1 as the release to finish it
   with.
-- **`coverage()` reports each tier's offset range: `Coverage(archive, local,
-  buffer)`**, each an inclusive `(lo, hi)` or None, partitioning the log like
-  `column_statistics`' tiers. `archive` is now what only the archive holds,
-  below the local table, rather than the whole archive; `buffered` is renamed
+- **`coverage()` reports each tier's offset range: `Coverage(published,
+  staging, buffer)`**, each a half-open `[start, end)` or None — the
+  convention of the stored tier offsets and `litelink.manifest` — partitioning the log like
+  `column_statistics`' tiers. `published` is now what only the published table holds,
+  below the staging table, rather than the whole published table; `buffered` is renamed
   `buffer`; `gap` and `wal_replication` are removed. It is read from the
-  offsets kept in `buffer.db` for routing, so it no longer opens the archive,
-  except for a log with no stored archive row yet — and
-  `coverage(archive=False)` skips even that, for a caller that only needs the
-  local floor, `min(local[0], buffer[0])`.
-- **`scan(archive=False)` and `sql(..., archive=False)`** read the local table
-  and the buffer only, never the archive, whatever the query asks — what
+  offsets kept in `buffer.db` for routing, so it no longer opens the published table,
+  except for a log with no stored published row yet — and
+  `coverage(published=False)` skips even that, for a caller that only needs the
+  staging floor, `min(staging[0], buffer[0])`.
+- **`scan(published=False)` and `sql(..., published=False)`** read the staging table
+  and the buffer only, never the published table, whatever the query asks — what
   `include_archive=False` did, per read rather than per handle. Rows only the
-  archive holds are left out, not refused.
-- **Every log has an archive; with none given it is a local directory** (#98).
-  `litelink.new(archive=None)` publishes to `<root>/<name>/published`, and
-  `archive="file:///directory"` names a local archive anywhere. The pipeline
-  is the same as on S3: `sync` publishes, eviction drops only what the
-  archive holds, and `retire`, `rewrite_archive` and tier selection work on
+  published table holds are left out, not refused.
+- **Every log has a published table; with none given it is a local directory** (#98).
+  `litelink.new(published=None)` publishes to `<root>/<name>/published`, and
+  `published="file:///directory"` names a local published table anywhere. The pipeline
+  is the same as on S3: `publish` copies settled files, eviction drops only what the
+  published table holds, and `retire`, `rewrite_published` and tier selection work on
   local-only logs. Any Iceberg engine reads the local
   table through `version-hint.text`.
-  - **`local_retention` and `local_rows` no longer delete.** On a local-only
+  - **`staging_retention` and `staging_rows` no longer delete.** On a local-only
     log they used to be a deletion policy over the only copy; now nothing
-    leaves the local table until `sync` has published it, so a local-only
-    log that relied on retention to bound disk must call `sync()`, and its
-    local archive then grows (truncation is a follow-up).
-  - **`set_archive(None)` points back at the local default** instead of
+    leaves the staging table until `publish` has published it, so a local-only
+    log that relied on retention to bound disk must call `publish()`, and its
+    local published table then grows (truncation is a follow-up).
+  - **`set_published(None)` points back at the local default** instead of
     detaching, so the refusal to detach under a retention floor is gone, as
-    is the refusal of `local_retention=0` with no archive.
+    is the refusal of `staging_retention=0` with no published table.
   - **A move opens its new table before recording it** and raises with
     nothing changed if it cannot. Re-stating the current location is a no-op:
     no claim, no write, no network.
-  - **`log.archive` is always a string** (`s3://…` or `file://…`).
+  - **`log.published` is always a string** (`s3://…` or `file://…`).
   - `wal_replication`, `replication_config()`, `restore` and `hydrate` need
-    an `s3://` archive; a local one is on this disk already.
+    an `s3://` published table; a local one is on this disk already.
   - An existing local-only log records the default at its next writer
-    `open`; its first `sync()` publishes everything it holds.
+    `open`; its first `publish()` publishes everything it holds.
 - **The 0.1 → 0.2 migration is removed** (`litelink.migrate`). A log still in
   the pre-0.2 layout is refused with the command to run under litelink 0.5.1,
   the last release that carries it.
@@ -85,15 +123,15 @@ minor version carries breaking changes.
   restart the sidecar: it now enables the control socket `retire()` flushes
   the replica through.
 
-  Existing logs get the archive's row at the writer's next `open` (or the
-  first `sync`, if the archive cannot be read then); until then every query
-  reads the archive, which is correct and only slower. **Upgrade every
+  Existing logs get the published table's row at the writer's next `open` (or the
+  first `publish`, if the published table cannot be read then); until then every query
+  reads the published table, which is correct and only slower. **Upgrade every
   process on a log together:** a maintainer still on 0.5 would evict without
-  widening the archive's row, and a read on the new version could then skip
+  widening the published table's row, and a read on the new version could then skip
   rows eviction had just moved there.
-- **`WriteHandle.retire()`** ends a log for good: every row to the archive,
-  the local table and buffer emptied, and the retirement recorded in
-  the buffer's range (it gets an end) and on the archive table
+- **`WriteHandle.retire()`** ends a log for good: every row to the published table,
+  the staging table and buffer emptied, and the retirement recorded in
+  the buffer's range (it gets an end) and on the published table
   (`litelink.retired`). Afterwards
   appends, a writer `open`, `ingest` and `restore` raise `RetiredError`,
   naming the offset the next log should start at; read-only opens and
