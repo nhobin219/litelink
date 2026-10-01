@@ -1162,13 +1162,16 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
         "s",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        archive="s3://bucket/prefix",
+        archive=f"file://{tmp_path}/prefix",
     )
     with log:
         seal_files(log, 2)
         first = min(log._table.data_files(), key=lambda f: f.lo)
         log._buffer.record_file(
-            f"s3://bucket/prefix/data/{first.lo}.parquet", first.lo, first.hi + 1, 1
+            f"file://{tmp_path}/prefix/data/{first.lo}.parquet",
+            first.lo,
+            first.hi + 1,
+            1,
         )
         local = log._table.data_files()
 
@@ -1179,7 +1182,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
             == first.hi
         )
 
-        log.set_archive("s3://bucket/elsewhere")
+        log.set_archive(f"file://{tmp_path}/elsewhere")
 
         assert (
             log._maintenance.archived_prefix(
@@ -1188,7 +1191,7 @@ def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None
             == 0
         ), "the new archive holds nothing, and says so without any reset"
 
-        log.set_archive("s3://bucket/prefix")
+        log.set_archive(f"file://{tmp_path}/prefix")
 
         assert (
             log._maintenance.archived_prefix(

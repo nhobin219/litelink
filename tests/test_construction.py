@@ -273,10 +273,10 @@ def test_set_config_validates(tmp_path: Path) -> None:
 
 def test_set_archive_persists(tmp_path: Path) -> None:
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.set_archive("s3://bucket/x")
+        log.set_archive(f"file://{tmp_path}/x")
 
     with litelink.open(tmp_path, "s") as reopened:
-        assert reopened._archive.uri == "s3://bucket/x"
+        assert reopened._archive.uri == f"file://{tmp_path}/x"
         reopened.set_archive(None)
 
     with litelink.open(tmp_path, "s") as detached:
@@ -1005,15 +1005,15 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
     )
     with first, litelink.open(tmp_path, "s") as second:
         assert second.config.local_rows is None
-        assert not second._archive.remote()
+        default = second._archive.uri
 
         first.set_config(LogConfig(local_rows=4242))
-        first.set_archive("s3://bucket/prefix")
+        first.set_archive(f"file://{tmp_path}/prefix")
 
         # `second` was never told, and never asked.
         assert second.config.local_rows == 4242
-        assert second._archive.remote()
-        assert second._archive.uri == "s3://bucket/prefix"
+        assert default != second._archive.uri
+        assert second._archive.uri == f"file://{tmp_path}/prefix"
         assert second._maintenance.config.local_rows == 4242
         assert second._buffer.config().local_rows == 4242
 

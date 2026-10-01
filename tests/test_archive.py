@@ -2481,18 +2481,18 @@ def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
         assert log.archive == f"s3://{bucket}/never-written-to"
 
 
-def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
+def test_a_hint_naming_unreadable_metadata_refuses_the_move(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The guard reads the network in TWO steps, and either can fail.
+    """A move adopts the table at its new location before recording it, and a
+    hint naming metadata that cannot be read is a broken archive: refused, with
+    the log left where it was and the hint not written over.
 
-    An unreachable endpoint is already absorbed — `_published_location`
-    swallows and answers None — so this exercises the other half: a hint that
-    IS readable, naming metadata that is not. The guard has to treat that as
-    "cannot tell" rather than "refuse", because `set_archive` runs on every
-    writer restart and configuring an archive is a statement of intent. A real
-    problem there surfaces loudly at the first `sync`, which is where it can
-    be acted on.
+    It used to be accepted as a statement of intent, leaving the first `sync`
+    to fail. A move that reports success has to have a table to point at.
+
+    Falsify by making the adopt in `set_archive` best effort: the move is
+    recorded.
     """
     prefix = f"s3://{bucket}/corrupt"
     fs = filesystem(s3)
@@ -2501,9 +2501,13 @@ def test_a_hint_naming_unreadable_metadata_does_not_block_attaching(
 
     with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
         log.extend(rows(10))
-        log.set_archive(prefix)
+        before = log.archive
 
-        assert log.archive == prefix
+        with pytest.raises(FileNotFoundError):
+            log.set_archive(prefix)
+
+        assert log.archive == before
+        assert fs.cat(hint) == b"00042-does-not-exist", "the hint was written over"
 
 
 def test_a_log_is_recovered_onto_another_machine(
