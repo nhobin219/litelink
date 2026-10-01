@@ -146,8 +146,9 @@ minor version carries breaking changes.
   against each tier's `[start_offset, end_offset)`, the buffer's included, so
   a history scan no longer converts the buffered rows to Arrow.
 - **`litelink.manifest`**: the statistics manifest and its pruning, public, so
-  streamcast uses the same implementation for its sealed logs (`build`,
-  `extend`, `prune`, with the key column a parameter). A term on
+  streamcast uses the same implementation for its sealed logs (`Entry`, one
+  unit with its offsets and statistics; `build`, `extend`, `prune`, with the
+  key column a parameter). A term on
   `litelink_offset` is judged against each unit's `[start_offset, end_offset)`,
   so a unit with no statistics — a live log, the buffer — still prunes by
   offset; an `end_offset` of None marks a range still growing.

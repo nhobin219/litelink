@@ -26,7 +26,7 @@ from litelink._tiers import (
     TIERS,
     UNKNOWN,
     StoredTiers,
-    row,
+    entry,
 )
 from litelink._types import column_type
 from litelink.manifest import Term, build, prune
@@ -446,7 +446,7 @@ class Reader:
         # query needs, with offset terms or without.
         closed = self._stored.load().get(BUFFER)
         if closed is not None:
-            unit = row(BUFFER, closed.offsets, self._schema, closed.statistics)
+            unit = entry(BUFFER, closed.offsets, self._schema, closed.statistics)
             return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
 
         if not any(column == OFFSET for column, _, _ in found):
@@ -456,7 +456,7 @@ class Reader:
         if lowest is None:
             return True
 
-        unit = row(BUFFER, (lowest, None), self._schema, UNKNOWN)
+        unit = entry(BUFFER, (lowest, None), self._schema, UNKNOWN)
 
         return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
 
@@ -479,12 +479,12 @@ class Reader:
         table with an extent is not empty — so the staging rollup, 2–3 ms after
         each commit, is not computed for a query it cannot narrow.
         """
-        rows = []
+        entries = []
         stored = self._stored.load()
         published = stored.get(PUBLISHED)
         if published is not None:
-            rows.append(
-                row(PUBLISHED, published.offsets, self._schema, published.statistics)
+            entries.append(
+                entry(PUBLISHED, published.offsets, self._schema, published.statistics)
             )
 
         if extent is not None and found:
@@ -497,9 +497,9 @@ class Reader:
                 else self._table.statistics_at(location)
             )
             if local is not None:
-                rows.append(row(STAGING, extent, self._schema, local))
+                entries.append(entry(STAGING, extent, self._schema, local))
 
-        table = build(rows, key=KEY) if rows else None
+        table = build(entries, key=KEY) if entries else None
         kept = prune(table, TIERS, found, key=KEY)
 
         return STAGING in kept, PUBLISHED in kept

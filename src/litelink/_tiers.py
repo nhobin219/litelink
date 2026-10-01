@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import pyarrow as pa
 
 from litelink._statistics import ColumnStatistics, TierStatistics, _merge
-from litelink.manifest import Row, columns
+from litelink.manifest import Entry, columns
 
 if TYPE_CHECKING:
     from litelink._buffer import Buffer
@@ -197,14 +197,14 @@ def decode(raw: str) -> TierStatistics:
     )
 
 
-def row(
+def entry(
     tier: str,
     span: tuple[int, int | None],
     schema: pa.Schema,
     statistics: TierStatistics,
-) -> Row:
-    """A tier as a manifest row: `span` is its `[start, end)`."""
-    return Row(tier, span[0], span[1], schema, statistics)
+) -> Entry:
+    """A tier as a manifest entry: `span` is its `[start, end)`."""
+    return Entry(tier, span[0], span[1], schema, statistics)
 
 
 # The buffer's statistics: none. It is pruned by its offset range alone.
