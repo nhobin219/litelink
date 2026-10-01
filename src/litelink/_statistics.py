@@ -11,6 +11,12 @@ these metrics into the manifests at every commit, so nothing new is written
 and nothing has to be kept in step with seals, compaction, eviction or sync —
 a stored rollup would be a second home for a fact the manifests already hold.
 
+The one exception is deliberate and lives elsewhere: `buffer.db` keeps each
+ARCHIVE file's bounds (`_prune`), because deciding whether a query needs the
+archive must not cost the network round trip it exists to avoid. This module
+still reads the manifests, so it answers from what the archive says rather
+than from that copy.
+
 What pyiceberg records for litelink's files, measured, decides most of it:
 
 - **No NaN counts in the manifests.** Files are registered with `add_files`,
@@ -49,7 +55,7 @@ if TYPE_CHECKING:
     from pyiceberg.schema import Schema
     from pyiceberg.types import IcebergType
 
-Tier = Literal["local", "archive"]
+Tier = Literal["local", "archive", "buffer"]
 
 OFFSET = "litelink_offset"
 
@@ -212,6 +218,64 @@ def _offsets(schema: Schema, data_file: DataFile) -> tuple[int, int]:
     )
 
 
+def local_span(schema: Schema, files: Sequence[DataFile]) -> tuple[int, int] | None:
+    """The offset range the local files cover, or None when there are none."""
+    covered = [_offsets(schema, data_file) for data_file in files]
+    if not covered:
+        return None
+
+    return min(lo for lo, _ in covered), max(hi for _, hi in covered)
+
+
+def below_local(
+    span: tuple[int, int] | None, schema: Schema, files: Sequence[DataFile]
+) -> tuple[list[DataFile], bool]:
+    """The archive files holding rows outside the local range, and whether any
+    of them straddles it.
+
+    What eviction moved out of the local table, and so what a read's archive
+    leg covers. A file that straddles the range — only `rewrite_archive` can
+    cut one — is included whole: its bounds overstate, but its rows cannot be
+    split from the local copies without opening it.
+    """
+    beyond = []
+    straddles = False
+    for data_file in files:
+        lo, hi = _offsets(schema, data_file)
+        if span is None or hi < span[0] or lo > span[1]:
+            beyond.append(data_file)
+        elif lo < span[0] or hi > span[1]:
+            beyond.append(data_file)
+            straddles = True
+
+    return beyond, straddles
+
+
+def above(buffered: pa.Table, ceiling: int) -> pa.Table:
+    """The buffered rows above every file: the ones no tier's file holds yet."""
+    offsets = buffered.column(OFFSET).to_pylist()
+
+    return buffered.slice(sum(1 for offset in offsets if offset <= ceiling))
+
+
+def uncounted(statistics: TierStatistics) -> TierStatistics:
+    """`statistics` with every count unknown, bounds kept.
+
+    For a part that includes a straddling file, whose rows are partly local
+    too: a bound over rows held twice is still a bound, but no count can be
+    taken without double counting.
+    """
+    return TierStatistics(
+        tier=statistics.tier,
+        record_count=None,
+        file_count=statistics.file_count,
+        columns={
+            name: ColumnStatistics(column.min, column.max, None, None, None)
+            for name, column in statistics.columns.items()
+        },
+    )
+
+
 def whole_log(
     names: Sequence[str],
     local: tuple[Schema, list[DataFile]],
@@ -222,7 +286,9 @@ def whole_log(
 
     The tiers overlap by design (I3) — the archive keeps what local still
     holds, and with `wal_replication` a seal keeps its rows in the buffer — so
-    this takes each row from one place, as a read does:
+    this takes each row from one place, as a read does, and the three parts
+    are exactly what `column_statistics` reports for `"local"`, `"archive"`
+    and `"buffer"`:
 
     - every **local** file;
     - every **archive** file outside the local offset range, which is what
@@ -239,50 +305,24 @@ def whole_log(
     """
     local_schema, local_files = local
     parts = [rollup(None, local_schema, local_files)]
-    covered = [_offsets(local_schema, data_file) for data_file in local_files]
-    span = (
-        (min(lo for lo, _ in covered), max(hi for _, hi in covered))
-        if covered
-        else None
-    )
+    span = local_span(local_schema, local_files)
+    ceiling = 0 if span is None else span[1]
 
     straddles = False
     if archive is not None:
         archive_schema, archive_files = archive
-        beyond = []
-        for data_file in archive_files:
-            lo, hi = _offsets(archive_schema, data_file)
-            if span is None or hi < span[0] or lo > span[1]:
-                beyond.append(data_file)
-                covered.append((lo, hi))
-            elif lo < span[0] or hi > span[1]:
-                beyond.append(data_file)
-                covered.append((lo, hi))
-                straddles = True
-
+        beyond, straddles = below_local(span, archive_schema, archive_files)
         parts.append(rollup(None, archive_schema, beyond))
+        ceiling = max([ceiling, *(_offsets(archive_schema, f)[1] for f in beyond)])
 
     # Above every file, rather than above the local table alone: with the
     # local table evicted dry the archive is the boundary, and a seal that
     # keeps its rows leaves them here too.
-    ceiling = max((hi for _, hi in covered), default=0)
-    offsets = buffered.column(OFFSET).to_pylist()
-    tail = buffered.slice(sum(1 for offset in offsets if offset <= ceiling))
-    parts.append(_from_rows(tail))
+    parts.append(_from_rows(above(buffered, ceiling)))
 
     merged = _merge(names, parts)
-    if not straddles:
-        return merged
 
-    return TierStatistics(
-        tier=None,
-        record_count=None,
-        file_count=merged.file_count,
-        columns={
-            name: ColumnStatistics(column.min, column.max, None, None, None)
-            for name, column in merged.columns.items()
-        },
-    )
+    return uncounted(merged) if straddles else merged
 
 
 def _from_rows(rows: pa.Table) -> TierStatistics:

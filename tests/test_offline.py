@@ -171,7 +171,7 @@ def test_an_unprovisioned_extension_names_the_command_that_fixes_it(
 ) -> None:
     """The traceback a fresh machine used to get, and what replaced it.
 
-    Reported from a working install: `log.scan(include_archive=True)` raised
+    Reported from a working install: a scan reaching the archive raised
     `IOException: Extension ".../httpfs.duckdb_extension" not found`, advising
     `INSTALL httpfs` — a remedy this repo does not use and §7 argues against.
 

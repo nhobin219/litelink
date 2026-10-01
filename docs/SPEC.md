@@ -1353,18 +1353,61 @@ fsync is 20-50 us against ~1 ms here.
 
 ### Full-stream read — all three tiers
 
-**Opt in at assembly, not per read.** `open(root, name)` reads local files and the buffer;
-`open(root, name, include_archive=True)` reads all three, and `log.with_archive()` derives a
-read-only view of an open handle without a second SQLite connection or catalog load. Which
-tiers a handle reads is fixed for its life, so two `scan()` calls on one handle can never
-disagree.
+**Decided per query, from per-tier statistics (#90).** Every query reads the buffer. The
+local leg and the archive leg are added only when their tier's statistics could hold a row the
+query matches. Neither source is on the network, so I5 holds for any query bounded inside the
+local window:
 
-It was derived from state once — the archive counted as load-bearing exactly when the local
-table held nothing and the archive held something — which meant the same call read local
-files before an eviction pass and object storage after it, with nothing at the call site
-saying so. A read that changes tier changes its latency, its failure modes and its cost; it
-should not do that on a retention schedule. A handle that cannot reach the archive and finds
-its local table empty **refuses** rather than serving the buffer alone.
+- **Local:** the rollup of the snapshot the read resolved, from the local table's own Iceberg
+  manifests. The process that commits a new version stores its rollup in `buffer.db` after
+  the commit, stamped with the version (its metadata file) and written forward only, so every
+  other process reads it rather than rolling the same version up. A read uses a stored row
+  only when its stamp is the version the read resolved; otherwise it rolls that version up
+  itself (`LogTable.statistics_at`, cached per process by version). The stamp makes a late,
+  missing or out-of-order store cost a rollup and never a wrong answer. Only the latest
+  version is kept: a read misses it only in the milliseconds around a commit.
+- **Archive:** a row in `buffer.db` describing what the archive holds **below** the local
+  table. The archive leg reads only offsets under the local table's `lo`, and the archive's
+  copy of the local window would put its maximum timestamp at "minutes ago" and send every hot
+  query to the network. Stored because its statistics otherwise live on S3, and eviction —
+  usually in another process — is the last moment they are on local disk.
+
+**`litelink_offset` prunes every tier, the buffer included, by range.** It is the log's
+sequence, dense and monotonic across the tiers, so each tier's `[start_offset, end_offset)`
+says exactly where it sits — local from its snapshot's extent, archive from `tier_offsets`,
+kept apart from its statistics in `tier_statistics`. The buffer's starts at its lowest offset
+and is open above. It is decided before the buffer is read, from that one indexed `min`, which
+only rises: rows arrive above it and leave as a prefix, so a query below it now matches
+nothing the buffer can later hold. streamcast prunes whole logs the same way (streamcast#32).
+
+The two rows are streamcast's per-log manifest format (streamcast#27) with `tier` as the key,
+and the decision is the same function, `litelink.manifest.prune`: `col > K` can match when
+`max(col) > K`, `col < K` when `min(col) < K`, `col = K` when K is within both, and anything
+it cannot decide — an unknown bound, a column the tier lacks, an operator not on the list —
+includes. A tier known to hold no rows is excluded. The query's WHERE becomes those terms
+through DuckDB's own parser: only a single SELECT over `log` alone is narrowed, and only its
+AND-ed comparisons between a column and a literal. A subquery or join over `log` would see
+the pruned relation, so those shapes read every tier. Each literal is converted the way DuckDB
+compares it against that column — to FLOAT for a float32 column, to DOUBLE for a float64 one,
+kept exact for an integer column — because the pruner compares in Python and must agree with
+the engine.
+
+**The archive row changes when the local floor moves, not when the archive does.** Eviction
+widens it by the rows it moves, from their local manifest statistics, before its commit — so a
+read resolving the new, higher floor finds the row already covering what went below it. `sync`
+adds only copies of rows the local table still holds and `rewrite_archive` re-cuts rows the
+archive has, so neither touches it; hydrate lowers the floor and leaves it overstating, which
+is safe. The one write that narrows is an exact rollup from the archive's manifests, run only
+under the whole-log maintenance claim, which eviction cannot hold beside: at the first `sync`,
+on a re-point (which drops the row first), at `restore`, and at `open` for a log written before
+the row existed. With no row, the archive is read.
+
+This reverses 0.4.0, which fixed a handle's tiers at assembly (`include_archive`,
+`with_archive()`) so that a read would not start touching the network because eviction ran.
+That rule bought predictability at the price of the caller naming a tier and a handle
+without the archive answering short. Now a query's latency follows its predicates: a bounded
+hot query stays local, and an unbounded one reads history because the whole log is the right
+answer to it.
 
 The archive overlaps the local window, so the tiers cannot simply be unioned. Bound each by
 its neighbour's **actual extent**, read at query time:
@@ -1408,7 +1451,7 @@ knowledge of the local tier.
 
 | knob | governs | too low means |
 |---|---|---|
-| `local_retention` | how much history the local table keeps | hot reads refuse, or need `include_archive=True` |
+| `local_retention` | how much history the local table keeps | hot reads reach the archive |
 | `snapshot_retention` | how long expired snapshots survive | long scans hit deleted files |
 
 `local_retention` must exceed the longest hot-path lookback **with margin** — equal leaves

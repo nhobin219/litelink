@@ -130,7 +130,7 @@ def test_sealed_file_is_sorted_by_sort_by(tmp_path: Path) -> None:
         scanned = log.scan(columns=["event_ts"]).read_all()["event_ts"].to_pylist()
         assert scanned == [300, 100, 200], "scan orders by offset, not by sort_by"
 
-    written = next(tmp_path.rglob("*.parquet"))
+    written = next(tmp_path.rglob("data/**/*.parquet"))
     assert pq.read_table(written)["event_ts"].to_pylist() == [100, 200, 300]
 
 
@@ -182,7 +182,7 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
         assert recovered._buffer.pending_seal() is None
         assert recovered.table_extent() == (1, 3)
         assert len(read_all(recovered)) == 3
-        assert len(list(tmp_path.rglob("*.parquet"))) == 1, "no orphaned file"
+        assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 1, "no orphaned file"
 
 
 def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None:

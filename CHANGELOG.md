@@ -20,6 +20,50 @@ minor version carries breaking changes.
   version_name_format = '%s%s.metadata.json')` in DuckDB. Rows newer than the
   last `sync` are readable on the primary alone. The WAL replica stays, for
   `restore`.
+- **litelink decides which tiers a query reads; `include_archive` and
+  `with_archive()` are removed** (#90). Every query reads the buffer, and
+  reads the local table and the archive only when their statistics could hold
+  a matching row: the local table's from the snapshot the read resolved, the
+  archive's — what it holds below the local table — from a row kept in
+  `buffer.db`. Neither is on the network, so a query bounded inside the local
+  window never touches it, and an unbounded one reads the whole log without
+  the caller naming a tier. This reverses 0.4.0's tiers-fixed-at-assembly
+  rule: a query's latency now follows its predicates rather than its handle.
+  Only a single `SELECT … FROM log` with AND-ed column-to-literal comparisons
+  is narrowed; anything else reads every tier.
+- **`column_statistics(tier="archive")` is the archive below the local
+  table**, not the whole archive: the tiers now partition the log, and a new
+  `tier="buffer"` completes them, so `"local"` + `"archive"` + `"buffer"` is
+  `tier=None`. For the whole log, use `tier=None`. A log with nothing local
+  (retired, or evicted dry) still gets the whole archive from `"archive"`.
+- **Regenerate the litestream config** (`write_replication_config()`) and
+  restart the sidecar: it now enables the control socket `retire()` flushes
+  the replica through.
+
+  Existing logs get the archive's row at the writer's next `open` (or the
+  first `sync`, if the archive cannot be read then); until then every query
+  reads the archive, which is correct and only slower. **Upgrade every
+  process on a log together:** a maintainer still on 0.5 would evict without
+  widening the archive's row, and a read on the new version could then skip
+  rows eviction had just moved there.
+- **`WriteHandle.retire()`** ends a log for good: every row to the archive,
+  the local table and buffer emptied, and the retirement recorded in
+  the buffer's range (it gets an end) and on the archive table
+  (`litelink.retired`). Afterwards
+  appends, a writer `open`, `ingest` and `restore` raise `RetiredError`,
+  naming the offset the next log should start at; read-only opens and
+  `hydrate` still work. Appends are refused by a SQLite trigger, so a writer
+  opened before `retire()` is refused too. It is resumable after a crash, and
+  with `wal_replication` it flushes the replica through the running sidecar.
+- **A scan bounded below the buffer skips it.** `litelink_offset` is judged
+  against each tier's `[start_offset, end_offset)`, the buffer's included, so
+  a history scan no longer converts the buffered rows to Arrow.
+- **`litelink.manifest`**: the statistics manifest and its pruning, public, so
+  streamcast uses the same implementation for its sealed logs (`build`,
+  `extend`, `prune`, with the key column a parameter). A term on
+  `litelink_offset` is judged against each unit's `[start_offset, end_offset)`,
+  so a unit with no statistics — a live log, the buffer — still prunes by
+  offset; an `end_offset` of None marks a range still growing.
 
 ## 0.5.1 — 2026-09-29
 

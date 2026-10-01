@@ -3,7 +3,7 @@
 Its own object because three collaborators need the same answer and none of
 them owns it. The Log decides whether an archive is attached, `Maintenance`
 asks whether I4 is owed anything before it evicts, and `Reader` needs a table
-handle when a query passes `include_archive`. Held on the Log and reached
+handle when a query needs the archive. Held on the Log and reached
 through it, that last one is a problem: a reader is constructed by `litelink.new`
 and `litelink.open` and injected into the handle, so at the moment the reader is built
 there is no Log to ask. The previous shape resolved it by mutating the reader

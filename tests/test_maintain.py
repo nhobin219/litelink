@@ -225,13 +225,13 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        on_disk = {p.name for p in tmp_path.rglob("*.parquet")}
+        on_disk = {p.name for p in tmp_path.rglob("data/**/*.parquet")}
         assert len(on_disk) == 3
 
         log.maintain()
 
         assert log._table.data_files() == [], "evicted from the table"
-        assert {p.name for p in tmp_path.rglob("*.parquet")} == on_disk, (
+        assert {p.name for p in tmp_path.rglob("data/**/*.parquet")} == on_disk, (
             "still on disk, held by the pre-eviction snapshot"
         )
 
@@ -241,7 +241,9 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
     ) as log:
         log.maintain()
 
-        assert list(tmp_path.rglob("*.parquet")) == [], "expiry is what deletes bytes"
+        assert list(tmp_path.rglob("data/**/*.parquet")) == [], (
+            "expiry is what deletes bytes"
+        )
 
 
 def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
@@ -345,7 +347,7 @@ def tracked_paths(log: WriteHandle) -> set[Path]:
 
 
 def assert_nothing_untracked(log: WriteHandle) -> set[Path]:
-    on_disk = set(log.root.rglob("*.parquet"))
+    on_disk = set(log.root.rglob("data/**/*.parquet"))
     untracked = on_disk - tracked_paths(log)
     assert untracked == set(), f"{len(untracked)} file(s) findable only by scanning"
 
@@ -389,7 +391,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
         seal_files(log, 3)
         log.maintain()
         assert len(log._buffer.queued_deletions()) == 3
-        assert len(list(tmp_path.rglob("*.parquet"))) == 4
+        assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 4
 
     # Reopen with a grace period short enough that the queue is due. The
     # deadline is evaluated against the CURRENT setting, not one frozen at
@@ -403,7 +405,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
         log.maintain()
 
         assert log._buffer.queued_deletions() == []
-        assert len(list(tmp_path.rglob("*.parquet"))) == 1
+        assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 1
         assert len(read_all(log)) == 12
 
 

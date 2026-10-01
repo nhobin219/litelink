@@ -1,7 +1,7 @@
 [project]
 name = "litelink"
 version = "0.5.1"
-description = "Durable append-only capture into Iceberg tables. Embedded and local-first."
+description = "An embedded Iceberg storage engine for append-only data."
 readme = "README.md"
 authors = [
     { name = "Nico Bautista Hobin", email = "nico@penca.io" }
@@ -98,6 +98,7 @@ dev = [
     "ruff>=0.15.0",
     "ty>=0.0.15",
     "websockets>=13",
+    "hypothesis>=6.100",
 ]
 
 [tool.ruff]

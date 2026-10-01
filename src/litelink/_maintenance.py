@@ -23,6 +23,8 @@ from litelink._archive import Archive
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._fs import write_parquet
+from litelink._statistics import rollup
+from litelink._tiers import ArchiveTier
 
 # Where the log records its settings. Beside `ARCHIVE_KEY` in spirit: not
 # `WriteHandle`'s private business, because eviction decides deletions from it.
@@ -263,6 +265,7 @@ class Maintenance:
         self._buffer = buffer
         self._layout = layout
         self._archive = archive
+        self._tiers = ArchiveTier(buffer)
         # Read once per eviction pass rather than once per file. Cleared at the
         # top of `evict`, so a pass never decides from what a previous one saw.
         self._age_cache: dict[str, int] | None = None
@@ -713,8 +716,12 @@ class Maintenance:
 
         return min(limits) if limits else 0
 
-    def evict(self) -> None:
+    def evict(self, *, everything: bool = False) -> None:
         """Drop files older than `local_retention` from the local table (§8).
+
+        `everything` drops every file the archive holds, whatever the policy —
+        what `retire()` ends with. I4 still clamps it: a file the archive has
+        not registered stays.
 
         Age comes from `extent.named_at` — the log's own record of when the
         file was named — falling back to the Iceberg snapshot that added it
@@ -730,7 +737,11 @@ class Maintenance:
         # again under the claim as well: this one only decides whether there is
         # work, and the one that decides the deletion has to be the guarded one.
         config = self.config
-        if config.local_retention is None and config.local_rows is None:
+        if (
+            not everything
+            and config.local_retention is None
+            and config.local_rows is None
+        ):
             return
 
         # Same reason as `compact`: this decides what to drop from the ages a
@@ -741,8 +752,12 @@ class Maintenance:
         # Provisional: enough to decide whether there is work at all, and what
         # range to claim. The answer that gets acted on is recomputed below,
         # under the claim.
-        boundary = self._retention_boundary()
         files = self._table.data_files()
+        boundary = (
+            max((f.hi for f in files), default=0)
+            if everything
+            else self._retention_boundary()
+        )
         boundary = max((f.hi for f in files if f.hi <= boundary), default=0)
         if boundary <= 0:
             return
@@ -778,7 +793,8 @@ class Maintenance:
         self._table.reload()
         self._age_cache = None
         files = self._table.data_files()
-        boundary = min(boundary, self._retention_boundary())
+        if not everything:
+            boundary = min(boundary, self._retention_boundary())
 
         # I4: a file the archive still lacks must not leave the local table,
         # because with an archive configured the local copy stops being the
@@ -836,6 +852,26 @@ class Maintenance:
             # expiry drops the snapshots naming it, nothing can name it again.
             checkpoint(removal.renew)
             dropped = [f.path for f in files if f.hi <= boundary]
+            if self._archive.configured():
+                # The archive's tier row describes what it holds below the
+                # local table, and these rows are about to be exactly that —
+                # so it grows BEFORE they leave, or a read between the two
+                # would skip the archive for rows no local file still has.
+                schema, live = self._table.live_files()
+                leaving = set(dropped)
+                self._tiers.widen(
+                    self._buffer.shape().table,
+                    rollup(
+                        None,
+                        schema,
+                        [
+                            f
+                            for f in live
+                            if str(f.file_path).removeprefix("file://") in leaving
+                        ],
+                    ),
+                )
+
             self._enqueue(dropped)
             self._table.evict_through(boundary)
             # Re-dated to the commit, like every other supersession. Eviction

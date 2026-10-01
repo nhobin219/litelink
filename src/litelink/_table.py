@@ -7,6 +7,8 @@ pyiceberg's own behaviour needed working around — each says which.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import random
 import sqlite3
 import threading
@@ -28,6 +30,7 @@ from pyiceberg.transforms import IdentityTransform
 from litelink._fs import fsync
 from litelink._predicates import offset_at_or_below, offset_between
 from litelink._s3 import S3Options
+from litelink._statistics import TierStatistics, rollup
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -301,6 +304,30 @@ def archive_extent(
     return LogTable(None, layout, table, prefix).extent()  # ty: ignore
 
 
+# The archive table property `retire()` sets: JSON `{"through": …, "at": …}`.
+RETIRED_PROPERTY = "litelink.retired"
+
+
+def archive_retired(
+    layout: Layout, prefix: str, options: S3Options
+) -> dict[str, object] | None:
+    """The retirement the archive at `prefix` records, read from the bucket alone.
+
+    Like `archive_extent`: the published pointer, then the metadata it names,
+    with no catalog involved — so `restore` can ask before it builds anything.
+    None when the archive has no hint or records no retirement.
+    """
+    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    raw = table.properties.get(RETIRED_PROPERTY)
+
+    return None if raw is None else json.loads(raw)
+
+
 def archive_columns(
     layout: Layout, prefix: str, options: S3Options
 ) -> tuple[str, ...] | None:
@@ -388,6 +415,15 @@ class LogTable:
         # list, and a `maintain` pass asks three times over.
         self._files_at: str | None = None
         self._files: list[DataFile] = []
+        # Every column's rollup, for tier selection (#90), against the same
+        # pointer — so the statistics a read decides on are the snapshot it
+        # reads, and are computed once per commit rather than per query.
+        self._statistics_at: str | None = None
+        self._statistics: TierStatistics | None = None
+        # Run after every commit that lands, on the table the writer holds —
+        # which stores the new version's rollup for every other process (#90).
+        # None on the archive table and on a reader's.
+        self.after_commit: Callable[[], None] | None = None
         self._file_count = 0
         self._record_count = 0
 
@@ -547,7 +583,7 @@ class LogTable:
             if not repair:
                 # Only a caller holding the maintenance lease may fix it.
                 # Dropping and recreating is a mutation of shared state, and it
-                # was reachable from any `include_archive` read — two processes
+                # was reachable from any read of the archive — two processes
                 # cold-opening after a re-point would both find the mismatch,
                 # and the second's drop could land after the first had already
                 # created, uploaded and committed, taking the live entry with
@@ -576,7 +612,7 @@ class LogTable:
             if not repair:
                 # Absent, not wrong. A log configured with an archive that
                 # nothing has pushed to yet is an ordinary state, and a reader
-                # asking for `include_archive` before the first sync should get
+                # that needs the archive before the first sync should get
                 # a union without that leg — not an error, and not a table
                 # created as a side effect of reading.
                 msg = f"no archive table at {prefix!r} yet"
@@ -988,6 +1024,24 @@ class LogTable:
 
         return None if not lows else (min(lows), max(highs))
 
+    def statistics_at(self, location: str) -> TierStatistics | None:
+        """Every column's rollup over the snapshot at `location`, or None.
+
+        None when the table has moved past `location`: the statistics a read
+        decides on must be of the snapshot it reads, and a caller holding an
+        older pointer gets "unknown" rather than a newer snapshot's rollup.
+        Unknown includes the tier, which is the safe answer.
+        """
+        with self._lock:
+            if self.metadata_location != location:
+                return None
+
+            if self._statistics_at != location:
+                self._statistics = rollup("local", *self.live_files())
+                self._statistics_at = location
+
+            return self._statistics
+
     def live_files(self) -> tuple[Schema, list[IcebergDataFile]]:
         """The current snapshot's schema and live data files, with metrics.
 
@@ -1131,6 +1185,12 @@ class LogTable:
                 # After the reload, so it names the metadata this commit
                 # actually produced rather than the one it was built from.
                 self.publish_pointer()
+                if self.after_commit is not None:
+                    # Best effort: the commit has landed, and what follows is a
+                    # cache other processes can do without — a reader with no
+                    # stored row for its version rolls it up itself.
+                    with contextlib.suppress(Exception):
+                        self.after_commit()
 
                 return
 
@@ -1444,6 +1504,10 @@ class LogTable:
             return
 
         self._commit(lambda: self._set_properties(missing))
+
+    def set_properties(self, properties: dict[str, str]) -> None:
+        """Commit table properties, publishing the pointer like any commit."""
+        self._commit(lambda: self._set_properties(properties))
 
     def _set_properties(self, properties: dict[str, str]) -> None:
         with self._table.transaction() as transaction:

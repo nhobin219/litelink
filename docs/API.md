@@ -74,8 +74,8 @@ Iceberg engine; see [Reading from another machine](#reading-from-another-machine
 # On the writer's box: a live second view. No archive argument — the log
 # already records where its archive is, and reads come off local disk.
 with litelink.open("data", "trades", read_only=True) as r:
-    r.scan(where="side = 0")          # local: buffer + local Iceberg table
-    r.with_archive().scan()           # the whole history, including the archive
+    r.scan(start_offset=r.end_offset() - 100)   # recent: local disk only
+    r.scan()                          # the whole history, including the archive
     r.coverage()                      # what each tier holds
     r.write_replication_config()      # its replica key IS the primary's
 ```
@@ -98,7 +98,7 @@ Each row is what that class **adds** to the one above it. A test pins every set 
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal_due` · `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `maintain` · `compact` · `evict` · `expire` |
-| **`+ WriteHandle`** — archive | `sync` · `hydrate` · `rewrite_archive` |
+| **`+ WriteHandle`** — archive | `sync` · `hydrate` · `rewrite_archive` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` · `set_archive` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
 | **`+ WriteHandle`** — schema | `add_column`; `rename_column`/`drop_column` raise `NotImplementedError` |
@@ -305,17 +305,55 @@ re-cut by `rewrite_archive`.
 
 ```python
 log.scan(*, columns=None, where=None, start_offset=None,
-         end_offset=None, include_archive=None) -> pa.RecordBatchReader
-log.sql(query, *, include_archive=False) -> pa.RecordBatchReader
+         end_offset=None) -> pa.RecordBatchReader
+log.sql(query) -> pa.RecordBatchReader
 ```
 
 `scan` unions the tiers and bounds each by its neighbour's committed offset extent, resolved
 from manifest statistics at query time (§7, I3). The tiers overlap by design; the bounds are
 what make each row appear exactly once.
 
-**`include_archive` defaults to `None`, meaning "decide from the tiers".** That resolves to
-False whenever the local table holds files, because a hot read is local disk only and must stay
-that way (I5). Opting in is opting into network I/O.
+**Which tiers a query reads is decided per query, and the caller never names one** (#90).
+Every query reads the buffer. The local table and the archive are read only when their
+per-column bounds say they could hold a row the query matches:
+
+- **the local table's** are the rollup of the snapshot the read resolved. The process that
+  commits a new version stores its rollup in `buffer.db`, stamped with the version, so other
+  processes read it instead of rolling it up (2–3 ms at 1–64 files). A read uses it only
+  when the stamp is the version it resolved, and rolls its own version up otherwise;
+- **the archive's** describe what it holds **below** the local table — what eviction moved
+  there — and are kept in `buffer.db`, because on S3 they would cost the round trip the
+  decision exists to avoid. The whole archive's bounds would include its copy of the local
+  window and send every hot query to the network.
+
+Neither touches the network, so a read bounded inside the local window stays there (I5).
+The two rows are in streamcast's manifest format (streamcast#27) with `tier` as the key, and
+the decision is `litelink.manifest.prune`, public so streamcast uses the same one.
+
+**`litelink_offset` is each tier's range, not a statistic.** It is the log's own sequence,
+dense and monotonic across the tiers, so a term on it is judged against each tier's
+`[start_offset, end_offset)`. The archive's range is stored in its own table (`tier_offsets`),
+apart from its column statistics. It is also what prunes **the buffer**, which has no
+statistics: its range starts at its lowest offset and is open above, so a scan that ends below
+the buffer never converts its rows. Without a term on a column the local tier's rollup is not
+computed at all, since only a tier known to be empty could be skipped.
+
+It reads the query's WHERE, and narrows on one shape only: a single `SELECT … FROM log`, no
+joins, CTEs, set operations or subqueries, with comparisons (`=`, `<`, `<=`, `>`, `>=`,
+`BETWEEN`, `IN`) between a column and a constant, AND-ed together. Integer, float and boolean
+columns have bounds; strings, bytes and nested columns do not. Any other part of the WHERE
+constrains nothing, and any other shape reads the archive — correct, and only slower. `scan`
+builds that shape, with `start_offset`/`end_offset` as offset comparisons.
+
+**This reverses 0.4.0**, which fixed the tiers at assembly with `include_archive` and
+`with_archive()`. Both are gone. The trade is stated plainly: latency now follows the
+predicate rather than the handle, so the same unbounded query reads the archive once eviction
+has moved its rows there. A bounded hot query stays local however much has been evicted.
+
+The archive's row changes when eviction moves rows below the local table: eviction widens it
+before its commit. `sync` and `rewrite_archive` leave it alone. It is recomputed from the
+archive's manifests at the first `sync`, on a re-point, at `restore`, and at `open` for a log
+written before it existed. With no row, the archive is read.
 
 `sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. Both return a
 streaming reader rather than a table: a full-window read with a 400-byte payload column is
@@ -323,6 +361,12 @@ streaming reader rather than a table: a full-window read with a 400-byte payload
 
 **Always bound on a leading column of `sort_by`.** §7 measures a non-leading predicate at
 119 ms against 13 ms for the same predicate with a leading bound.
+
+**Offset bounds are the only ones that can skip the buffer.** `start_offset`/`end_offset` (or
+a `litelink_offset` comparison in `where` or `sql`) are judged against the buffer's offset
+range, from its lowest buffered offset up, so a scan ending below it never reads the buffered
+rows. The buffer keeps no column statistics, so a bound on any other column still reads it;
+the local table and the archive are skipped by either kind.
 
 Other machines do not use this API at all — see below.
 
@@ -475,7 +519,7 @@ so a stalled sync stalls eviction, and the local file count grows until seals fe
 ### Per-column statistics: `column_statistics`
 
 ```python
-log.column_statistics(*, tier=None) -> TierStatistics   # tier: None | "local" | "archive"
+log.column_statistics(*, tier=None) -> TierStatistics   # None | "local" | "archive" | "buffer"
 stats.record_count, stats.file_count
 stats["price"]    # ColumnStatistics(min, max, null_count, value_count, nan_count)
 ```
@@ -483,15 +527,24 @@ stats["price"]    # ColumnStatistics(min, max, null_count, value_count, nan_coun
 Every column's bounds and counts, computed when asked from what Iceberg already keeps in its
 manifests, so no data file is opened and nothing extra is written or synced.
 
-**`tier=None`, the default, is the whole log**: the local table, what the archive holds beyond
-it, and the buffer. The tiers overlap by design, so each row is counted from one place, as a
-read takes it. The one layout whose rows can't be separated is an archive file straddling the
-local boundary, which only `rewrite_archive` produces; its bounds still hold, and every count
-comes back `None` rather than doubled. Buffered rows are counted from the rows themselves.
+**The tiers partition the log**, each row counted in exactly one, and together they are
+`tier=None`, the default:
 
-`"local"` and `"archive"` are one tier's current snapshot alone, without the buffer.
-Eviction drops files from the local table, so `"local"` lacks every evicted range. A
-`snapshot` handle answers all three.
+| `tier` | What it counts | Reads |
+| --- | --- | --- |
+| `"local"` | the local table's current snapshot | local manifests |
+| `"archive"` | what the archive holds below the local table — the rows eviction moved there | the archive's manifests, over the network |
+| `"buffer"` | buffered rows above every file, counted from the rows | the buffer (about 10 ms at a full 8 MiB window) |
+| `None` | the whole log | all three |
+
+The tiers overlap in storage by design — the archive keeps a copy of the local window, and a
+`wal_replication` seal keeps its rows in the buffer — so each row is counted from one place, as
+a read takes it. The one layout whose rows can't be separated is an archive file straddling
+the local boundary, which only `rewrite_archive` produces; its bounds still hold, and every
+count in `"archive"` and `None` comes back `None` rather than doubled.
+
+**`"archive"` changed meaning in 0.6.** It used to be the whole archive, overlapping the local
+window. A log with nothing local — retired, or evicted dry — still gets the whole archive.
 
 A consumer prunes on this, so missing information is `None`, never a narrower bound:
 
@@ -504,6 +557,43 @@ A consumer prunes on this, so missing information is `None`, never a narrower bo
   to 16 bytes, so they are not values. Nested columns keep no statistics of their own.
 - **Counts are sums, and None when any file lacks the count.** `value_count` includes NULLs,
   as Iceberg defines it.
+
+## Retiring a log: `retire()`
+
+```python
+log.retire() -> None
+```
+
+Ends the log for good: every row goes to the archive, the local table and buffer are emptied,
+and the retirement is recorded twice: the buffer gets an end (its `end_offset`, until now
+open), and the archive table gets a `litelink.retired` property.
+Afterwards:
+
+| Operation | On a retired log |
+| --- | --- |
+| `append`, `extend`, `ingest` | `RetiredError`, naming when it retired, its last offset and the `start_offset` for the next log |
+| `open(root, name)` | `RetiredError`, the same message |
+| `open(root, name, read_only=True)` | allowed; reads come from the archive |
+| `restore(...)` | `RetiredError`, from the archive property or the replica's closed buffer |
+| `hydrate(since)` | allowed; it adds no rows, only brings files back to local disk |
+| `column_statistics(tier="archive")` | the whole log |
+
+**Appends are refused by SQLite**: a trigger on the buffer refuses every insert once the
+buffer has an end, so a writer that opened before `retire()` ran is refused too, at no cost
+to the append path. A buffer with an end is the one fact that says the log takes no more
+rows; there is no separate marker.
+
+**It is resumable.** The buffer gets its end first — the offset the next append would have
+taken, read in the same transaction — so no row can arrive after the final seal and push. A
+crash leaves the log `retiring`, taking no rows, and a writer can still open it to call
+`retire()` again. The last step narrows the range to empty, which is what reads as `retired`
+and lets every read skip the buffer without reading it. It needs an archive.
+
+**With `wal_replication`, it flushes the replica** through the running sidecar
+(`litestream sync -wait` on its control socket) after each of those two steps, so a restore from the
+replica sees the retirement. It never starts a litestream of its own — two processes
+replicating one database is corruption — so if the sidecar does not answer, it raises and
+says to regenerate the config (see RUNTIME.md).
 
 ## Configuration
 

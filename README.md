@@ -7,27 +7,33 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
 [![Iceberg](https://img.shields.io/badge/Apache%20Iceberg-v2-4B8BBE)](https://iceberg.apache.org/)
 
-# An embedded storage engine for append-only data
+# An embedded Iceberg storage engine for append-only data
 
-**In your process like DuckDB, and what it writes is an Iceberg table.**
-
-`append()` returns once the row is durable, and a query a moment later sees it.
-
-litelink is an open-source **embedded storage engine**: what DuckDB is to query execution,
-litelink is to the durable write path. It runs inside your process, with no server, daemon or
-catalog service, and the files it writes are the product. They're Iceberg v2 tables on local
-disk and in object storage: the Parquet a row is sealed into is the Parquet DuckDB, or any
-other Iceberg engine, reads, with no export step in between.
+litelink takes high-throughput transactional appends and turns them into well-sized Iceberg
+tables, on local disk and in object storage. `append()` commits to a SQLite buffer and returns
+once the row is durable. Behind it, the library seals rows into sorted Parquet, compacts small
+files up to a target size, pushes settled files to an Iceberg archive on S3, and evicts from
+local disk what the archive already holds. Through all of it the log stays one queryable
+unit: a read sees every row exactly once, whichever tier holds it, and maintenance runs beside
+appends rather than in front of them, so no pass blocks appends for its duration or shows a
+reader a half-finished state.
 
 ```
-SQLite buffer          durable on commit. unsealed rows only.
-      │  seal at target_seal_size
-      ▼
-local Iceberg table    a rolling window. reads land here.
-      │  sync: upload data files, register into the archive
-      ▼
-remote Iceberg table   full history, on S3.
+append() ──► SQLite buffer          durable on commit
+                   │  seal: sorted Parquet at target_seal_size
+                   ▼
+             local Iceberg table    compacted to target size, evicted once archived
+                   │  sync: upload, register
+                   ▼
+             archive Iceberg table  full history, on S3
+
+scan() / sql() ──► one relation across all three tiers, each row once
 ```
+
+It runs inside your process, like DuckDB, with no server, daemon or catalog service: what
+DuckDB is to query execution, litelink is to the durable write path. The files it writes are
+the product. The Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg
+engine, reads, with no export step in between.
 
 |  | DuckDB | litelink |
 |---|---|---|
@@ -50,7 +56,7 @@ routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
 The usual shape is a write path in one system and an analytical store in another, with a job
 copying between them. Here they are one store with tiers: rows land in the SQLite buffer,
 seal into Parquet behind it, and reads span both, so **no read on the hot path touches the
-network**. Every other machine reads the archive, with litelink or with nothing from it:
+network**. Every other machine reads the archive with any Iceberg engine:
 
 ```python
 import duckdb
@@ -109,8 +115,8 @@ That costs ~124 MB. Run `python -m litelink` to check a machine before you rely 
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, archive=None,
-             s3=None, include_archive=False, start_offset=1)     -> WriteHandle
-litelink.open(root, name, *, s3=None, include_archive=False)       -> WriteHandle
+             s3=None, start_offset=1)                            -> WriteHandle
+litelink.open(root, name, *, s3=None)                              -> WriteHandle
 litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
 litelink.restore(root, name, *, archive, s3=None, ...)             -> WriteHandle
 litelink.validate_row(schema, row)                                 # raises as append would
@@ -119,7 +125,7 @@ litelink.preflight(...)                                            # what python
 # Every handle reads:
     log.scan(*, columns=None, where=None, start_offset=None, end_offset=None)
     log.sql(query)                                  # the log is `log`; both stream Arrow
-    log.with_archive() · log.column_statistics(*, tier=None) · log.coverage()
+    log.column_statistics(*, tier=None) · log.coverage()   # tier: local|archive|buffer|None
     log.end_offset() · buffered_rows() · table_rows() · table_files() · archived_through()
     log.schema · sort_by · config · archive
 
@@ -129,6 +135,7 @@ litelink.preflight(...)                                            # what python
     log.ingest(table_or_reader)                     # Arrow straight to Parquet
     log.seal_due() · log.maintain()                 # seal; compact, evict, expire
     log.sync(*, push_unsettled=False)               # push to the archive
+    log.retire()                                    # end the log: all archived, none local
     log.set_config(...) · set_archive(...) · set_sort_by(..., rewrite=True) · add_column(...)
 ```
 
@@ -177,18 +184,32 @@ return a `pa.RecordBatchReader` rather than a table, so materialising is yours t
 reader can open the same log alongside a live writer with
 `litelink.open("data", "trades", read_only=True)`.
 
-**A handle reads local files unless you say otherwise.** `include_archive=True` on the
-open (or `log.with_archive()`, which derives a read-only view of an open handle without a
-second connection) is what reaches object storage:
+**litelink decides which tiers a query reads.** Every query reads the buffer and the local
+table; the archive is read only when some archived file below the local table could hold a
+matching row. That is decided from per-column bounds for each tier — the local table's from
+its own Iceberg manifests, the archive's kept in `buffer.db` — so the decision itself never
+touches the network:
 
 ```python
-log.scan(...)                       # local files and the buffer
-log.with_archive().scan(...)        # the whole history, including the archive
+log.scan(where="event_ts > 1787772000000000")   # recent: local disk only
+log.scan(where="event_ts < 1700000000000000")   # history: reads the archive too
+log.scan()                                      # the whole log
 ```
 
-A handle that cannot reach the archive and finds its local table empty refuses rather than
-returning the buffer alone. `column_statistics()` gives every column's bounds and
-counts from the manifests, without opening a data file.
+So a query's latency follows its predicates. Bound it on a leading column of `sort_by` and a
+recent window stays local; leave it unbounded and it reads every tier, because the whole log
+is the right answer. Anything the decision cannot read — an OR, a subquery, a comparison with
+something other than a constant — reads the archive rather than risk skipping a row. The
+buffer keeps no column statistics, so only an offset bound (`scan(start_offset=…,
+end_offset=…)`) can skip it.
+`column_statistics(tier=…)` gives every column's bounds and counts without opening a data
+file, per tier (`"local"`, `"archive"` below it, `"buffer"`) or for the whole log.
+
+**`retire()` ends a log for good.** It pushes every row to the archive, empties the local
+table, and records the retirement by giving the buffer an end and marking the archive table.
+After that the log
+opens for reading only, and `append`, a writer `open` and `restore` all refuse, naming the
+offset the next log should start at.
 
 ## Reading from another machine
 

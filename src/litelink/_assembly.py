@@ -48,7 +48,6 @@ def open(  # noqa: A001
     *,
     read_only: Literal[False] = False,
     s3: S3Options | None = None,
-    include_archive: bool = False,
 ) -> WriteHandle: ...
 
 
@@ -59,7 +58,6 @@ def open(  # noqa: A001
     *,
     read_only: Literal[True],
     s3: S3Options | None = None,
-    include_archive: bool = False,
 ) -> LocalReadHandle: ...
 
 
@@ -69,7 +67,6 @@ def open(  # noqa: A001
     *,
     read_only: bool = False,
     s3: S3Options | None = None,
-    include_archive: bool = False,
 ) -> LogHandle:
     """Open an existing log, for writing or for reading beside its writer.
 
@@ -97,14 +94,19 @@ def open(  # noqa: A001
     table read-only, so this cannot advance the log even by accident.
 
     Reading sees the writer's commits as they land: `catalog.db` and
-    `archive.db` live at the root and both processes read the same rows. That
-    is the difference from `snapshot`, which reads a replica captured at a point
-    in time.
+    `archive.db` live at the root and both processes read the same rows.
     """
     layout = Layout(Path(root), name)
     table, schema = _existing(layout, name, readonly=read_only)
     buffer = Buffer.open(layout.buffer_db, schema, readonly=read_only)
     try:
+        # A retired log opens for reading only. One still RETIRING opens as a
+        # writer, so `retire()` can be called again to finish it — its buffer
+        # takes no rows meanwhile.
+        retired = buffer.retired()
+        if not read_only and retired is not None and retired.get("state") == "retired":
+            raise buffer.retired_error()
+
         config = _validated_shape(layout, buffer, name)
         remote = Archive(layout, buffer, s3)
         reader = Reader(layout, table, buffer, duckdb_connection, archive=remote)
@@ -115,7 +117,6 @@ def open(  # noqa: A001
                 buffer=buffer,
                 archive=remote,
                 reader=reader,
-                include_archive=include_archive,
             )
 
         handle = WriteHandle(
@@ -126,7 +127,6 @@ def open(  # noqa: A001
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
             archive=remote,
-            include_archive=include_archive,
         )
     except BaseException:
         buffer.close()
@@ -134,6 +134,7 @@ def open(  # noqa: A001
         raise
 
     handle.recover()
+    handle._backfill_manifest()  # noqa: SLF001
 
     return handle
 
@@ -206,7 +207,6 @@ def new(
     config: LogConfig | None = None,
     archive: str | None = None,
     s3: S3Options | None = None,
-    include_archive: bool = False,
     start_offset: int = 1,
 ) -> WriteHandle:
     """Create a log. See `litelink.new` for the shape it fixes and why."""
@@ -219,7 +219,6 @@ def new(
         archive=archive,
         s3=s3,
         start_offset=start_offset,
-        include_archive=include_archive,
     )
 
 
@@ -230,7 +229,6 @@ def restore(
     archive: str,
     s3: S3Options | None = None,
     binary: str | None = None,
-    include_archive: bool = False,
 ) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
     assigned. See `litelink.restore`."""
@@ -240,7 +238,6 @@ def restore(
         archive=archive,
         s3=s3,
         binary=binary,
-        include_archive=include_archive,
     )
 
 

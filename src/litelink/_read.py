@@ -16,8 +16,20 @@ import duckdb
 import pyarrow as pa
 
 from litelink._archive import Archive
+from litelink._prune import terms
 from litelink._s3 import S3Options
+from litelink._tiers import (
+    ARCHIVE,
+    BUFFER,
+    KEY,
+    LOCAL,
+    TIERS,
+    UNKNOWN,
+    StoredTiers,
+    row,
+)
 from litelink._types import column_type
+from litelink.manifest import Term, build, prune
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -42,7 +54,7 @@ def secret_sql(options: S3Options) -> str:
 
     Separate from the query path so it can be tested without object storage —
     the fault it exists to prevent only appeared against real AWS, where writes
-    worked and every `include_archive` read came back 403.
+    worked and every read of the archive came back 403.
     """
     parts = ["TYPE s3"]
     if options.access_key is not None and options.secret_key is not None:
@@ -254,11 +266,14 @@ class Reader:
         self._buffer = buffer
         self._connect_to = connect
         # The shared archive object, not a table handle: it opens the table on
-        # first use, so a reader that never passes `include_archive` never
+        # first use, so a reader whose queries the archive cannot answer never
         # touches the network (I5), and `Log.set_archive` re-points this same
         # object rather than leaving the reader holding a stale one.
         self._archive = archive
         self._remote_ready = False
+        # Which tiers a query needs, per tier (#90). Read from disk per query;
+        # it re-parses only when the file changed.
+        self._stored = StoredTiers(buffer)
         self._connection: duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the Log's, because a query must not wait
@@ -309,8 +324,8 @@ class Reader:
 
         if not self._remote_ready:
             # Once per connection. `httpfs` is not in the local read path, so a
-            # log that never opts in never pays for it — §7's rule that a hot
-            # read is offline.
+            # log whose queries never need the archive never pays for it — §7's
+            # rule that a hot read is offline.
             load_extension(self._connect(), "httpfs", remote=True)
             self._remote_ready = True
 
@@ -318,8 +333,14 @@ class Reader:
 
         return location, covered
 
-    def query(self, sql: str, *, include_archive: bool = False) -> pa.RecordBatchReader:
+    def query(self, sql: str) -> pa.RecordBatchReader:
         """Run `sql` against a freshly built `log` relation.
+
+        **Which tiers it reads is decided here, per query.** The buffer always;
+        the local table and the archive only when the log's tier manifest says
+        they could hold a row `sql` matches — see `_tiers`. So a query bounded
+        inside the local window never touches the network, and one that asks
+        for history reads it.
 
         The relation is rebuilt per call and cannot be held across calls.
         Resolving the table per query is §7's rule, not an optimisation: every
@@ -349,14 +370,26 @@ class Reader:
         # The floor here only bounds how much is read — §7's point about a
         # deferred delete not inflating a query. It is not the boundary; that
         # is decided after, against a snapshot that cannot then move.
-        self._table.reload()
-        floor = self._table.extent()
-        tail = self._buffer.rows_above(None if floor is None else floor[1])
-
         with self._lock:
             # The lock covers building the cursor, not the query. Creating one
-            # touches the shared connection; running on it does not.
+            # touches the shared connection; running on it does not. Built
+            # first now, because the query's terms are parsed on it and they
+            # decide whether the buffer is read at all.
             cursor = self._connect().cursor()
+
+        found = terms(cursor, sql, self._schema)
+
+        self._table.reload()
+        floor = self._table.extent()
+        # The buffer is ruled out only by offset, from its lowest offset, and
+        # only BEFORE its rows are read — skipping that read is the point.
+        # Sound whenever it is taken: the lowest offset only rises, so a
+        # query below it now matches nothing the buffer can later hold.
+        tail = (
+            self._buffer.rows_above(None if floor is None else floor[1])
+            if self._buffer_could_match(found)
+            else self._buffer.no_rows()
+        )
 
         cursor.register(BUFFER_REL, tail)
 
@@ -377,24 +410,97 @@ class Reader:
         # After, it cannot happen. I4 means nothing is evicted before it is
         # registered, so an archive snapshot taken later than the local one
         # holds everything the local one has given up.
-        remote = self._prepare_remote(cursor) if include_archive else None
+        local, archive = self._tiers(found, location, extent)
+        remote = self._prepare_remote(cursor) if archive else None
         # Built every query now rather than cached against its own text. The
         # cache existed to skip reinstalling an identical view on a shared
         # connection; a fresh cursor has no view to reuse, and a CREATE VIEW
         # over an already-registered relation is cheap.
         cursor.execute(
             f"CREATE OR REPLACE TEMP VIEW {VIEW} AS "
-            f"{self._union(location, extent, remote)}"
+            f"{self._union(location, extent, remote, local=local)}"
         )
         reader = cursor.execute(sql).to_arrow_reader()
 
         return _cast_to(reader, self._schema)
+
+    def _buffer_could_match(self, found: tuple[Term, ...]) -> bool:
+        """Whether the buffer could hold a row matching `found`, by offset alone.
+
+        The buffer has no column statistics — computing them would cost the
+        read this avoids — but `litelink_offset` is the log's sequence, so its
+        range is known: from its lowest offset up, open-ended, since rows keep
+        arriving. A query entirely below that range cannot match it.
+        """
+        # Closed by `retire()`: an empty range at the log's end, which no
+        # query needs, with offset terms or without.
+        closed = self._stored.load().get(BUFFER)
+        if closed is not None:
+            unit = row(BUFFER, closed.offsets, self._schema, closed.statistics)
+            return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
+
+        if not any(column == OFFSET for column, _, _ in found):
+            return True
+
+        lowest = self._buffer.lowest_offset()
+        if lowest is None:
+            return True
+
+        unit = row(BUFFER, (lowest, None), self._schema, UNKNOWN)
+
+        return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
+
+    def _tiers(
+        self,
+        found: tuple[Term, ...],
+        location: str,
+        extent: tuple[int, int] | None,
+    ) -> tuple[bool, bool]:
+        """`(local, archive)`: which of the two tiers the query needs (#90).
+
+        The local tier's row is the rollup of the snapshot this read resolved
+        (`location`), so the decision and the data are one version. The
+        archive's is the row in `buffer.db`, read AFTER that snapshot: eviction
+        widens it before the commit that moves rows below the local table, so
+        a row read later covers everything the resolved snapshot has given up.
+        Neither touches the network.
+
+        With no terms, only a tier known to be empty is skipped, and a local
+        table with an extent is not empty — so the local rollup, 2–3 ms after
+        each commit, is not computed for a query it cannot narrow.
+        """
+        configured = self._archive.configured()
+        rows = []
+        stored = self._stored.load()
+        archive = stored.get(ARCHIVE)
+        if archive is not None:
+            rows.append(row(ARCHIVE, archive.offsets, self._schema, archive.statistics))
+
+        if extent is not None and found:
+            # The stored rollup when it is of exactly the version this read
+            # resolved; else this process's own, computed once per version.
+            cached = stored.get(LOCAL)
+            local = (
+                cached.statistics
+                if cached is not None and cached.version == location
+                else self._table.statistics_at(location)
+            )
+            if local is not None:
+                span = (extent[0], extent[1] + 1)
+                rows.append(row(LOCAL, span, self._schema, local))
+
+        table = build(rows, key=KEY) if rows else None
+        kept = prune(table, TIERS, found, key=KEY)
+
+        return LOCAL in kept, configured and ARCHIVE in kept
 
     def _union(
         self,
         location: str,
         extent: tuple[int, int] | None,
         remote: tuple[str, tuple[int, int]] | None = None,
+        *,
+        local: bool = True,
     ) -> str:
         """The hot read: the local table, plus the buffer above its extent.
 
@@ -448,7 +554,12 @@ class Reader:
                 f' WHERE "{OFFSET}" < {extent[0]}'
             )
 
-        legs.append(f"SELECT {projection} FROM iceberg_scan('{location}')")
+        if local:
+            # Skipped when the tier manifest rules the local table out. Its
+            # extent still bounds the other two legs, so they cover exactly
+            # what they would have beside it.
+            legs.append(f"SELECT {projection} FROM iceberg_scan('{location}')")
+
         # The buffer bound is applied here as well as pushed into SQLite. The
         # registered tail was read against an earlier floor, so it can still
         # hold rows this snapshot has since taken ownership of; without this
