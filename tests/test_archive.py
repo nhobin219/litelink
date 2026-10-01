@@ -3739,65 +3739,6 @@ def test_an_evicted_log_serves_everything_across_a_re_point(
         # And a separate reader process agrees, opened the same way.
         with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
             assert view.scan().read_all().num_rows == ROWS
-            assert view.coverage().gap is None
-
-
-@pytest.mark.slow
-def test_coverage_counts_the_local_tier_between_archive_and_buffer(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """`gap` means "cannot serve", and the local table is a tier too.
-
-    `coverage()` arrived for a followed log, whose local table is empty by
-    construction — so "archive frontier up to the buffer's first offset"
-    described everything it could serve. A local log has a third tier in
-    between, and leaving it out reported every offset sealed-but-not-yet-synced
-    as unservable.
-
-    That is not an error state, it is the design: `sync` pushes only
-    well-sized files and eviction closes the distance afterwards, so a healthy
-    archived log is almost always in it. Measured before this fix, a log with
-    `archive=(1, 432)` and a local table of `(1, 10000)` reported
-    `gap=(433, 10000)` while serving all 9,568 of those rows — and a consumer
-    that trusts `gap` and skips it skips rows that exist.
-
-    Falsify by taking `above` from the buffer alone: the gap reappears and
-    covers rows the very next assertion reads back.
-    """
-    with archived_log(tmp_path, bucket, s3) as log:
-        log.extend(rows(ROWS))
-        log.seal_due()
-        log.sync()
-
-        # Sealed locally, deliberately NOT synced: the band that used to be
-        # reported as a gap.
-        log.extend(rows(ROWS))
-        log.seal_due()
-
-        archived = log.archived_through()
-        table = log.table_extent()
-        assert archived > 0, "the fixture must publish an archive to compare against"
-        assert table is not None and table[1] > archived, (
-            "the fixture must leave the local table ahead of the archive"
-        )
-
-        coverage = log.coverage()
-        assert coverage.archive is not None
-        assert coverage.gap is None, (
-            f"reported {coverage.gap} unservable while the local table holds "
-            f"{table} — sync lagging the table is the design, not a hole"
-        )
-
-        # The claim under test: it serves every offset it declines to call a
-        # gap, contiguously, including the whole band the old arithmetic
-        # reported as unservable.
-        served = log.scan().read_all().column(OFFSET).to_pylist()
-        assert sorted(served) == list(range(1, max(served) + 1))
-        assert max(served) >= table[1]
-        assert set(range(archived + 1, table[1] + 1)) <= set(served), (
-            "the band between the archive frontier and the local table's top "
-            "is exactly what used to be reported as a gap"
-        )
 
 
 def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:

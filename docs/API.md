@@ -304,15 +304,15 @@ re-cut by `rewrite_archive`.
 
 ```python
 log.scan(*, columns=None, where=None, start_offset=None,
-         end_offset=None) -> pa.RecordBatchReader
-log.sql(query) -> pa.RecordBatchReader
+         end_offset=None, archive=True) -> pa.RecordBatchReader
+log.sql(query, *, archive=True) -> pa.RecordBatchReader
 ```
 
 `scan` unions the tiers and bounds each by its neighbour's committed offset extent, resolved
 from manifest statistics at query time (§7, I3). The tiers overlap by design; the bounds are
 what make each row appear exactly once.
 
-**Which tiers a query reads is decided per query, and the caller never names one** (#90).
+**Which tiers a query reads is decided per query, and the caller need not name one** (#90).
 Every query reads the buffer. The local table and the archive are read only when their
 per-column bounds say they could hold a row the query matches:
 
@@ -326,6 +326,11 @@ per-column bounds say they could hold a row the query matches:
   window and send every hot query to the network.
 
 Neither touches the network, so a read bounded inside the local window stays there (I5).
+
+**`archive=False` keeps a read off the archive whatever it asks for.** It reads the local
+table and the buffer only, and rows only the archive holds are left out rather than refused —
+for a caller holding replays to the local floor, which `coverage(archive=False)` reports
+without the network either.
 The two rows are in streamcast's manifest format (streamcast#27) with `tier` as the key, and
 the decision is `litelink.manifest.prune`, public so streamcast uses the same one.
 
@@ -499,11 +504,26 @@ log.table_files() -> int                     # what compaction is bringing down
 log.table_extent() -> tuple[int, int] | None # (lo, hi) from manifest statistics
 log.archived_through() -> int                # highest offset the archive holds, 0 if none
 log.archive_files() -> int
+log.coverage(*, archive=True) -> Coverage    # each tier's (lo, hi), inclusive
 ```
+
+`coverage()` says where each tier sits in the log: `archive` (what only the archive holds,
+below the local table), `local` and `buffer` (the rows above every file), each an inclusive
+`(lo, hi)` or None when the tier holds nothing. They partition the log the way
+`column_statistics`' tiers do, so each offset is in exactly one. It reads the offsets the log
+already keeps for routing — one SQLite read and the buffer's two edges — so it is local and
+cheap. The lowest `lo` is where the log starts; the lowest of `local` and `buffer` is how far
+back a read can go without the archive, which is the floor to enforce for a replay that must
+not reach it.
+
+The archive's range is read from its manifests only for a log with no stored archive row yet
+(written before 0.6 and not yet opened by a writer, or just re-pointed). `archive=False` skips
+that: `archive` is None, meaning "not asked", and nothing but local disk is opened — for a
+caller that only wants the local floor.
 
 All local and none of them opens a data file, with one exception: on a **read** handle whose
 local table holds nothing while its archive holds rows — a log evicted dry —
-`end_offset()` and `coverage()` read the archive's metadata, because the buffer's sequence is
+`end_offset()` reads the archive's metadata, because the buffer's sequence is
 not authoritative there: `sqlite_sequence` never lowers, so it keeps counting rows a seal
 moved out of the buffer.
 

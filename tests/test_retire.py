@@ -89,6 +89,12 @@ def test_a_retired_log_is_all_archive_and_nothing_local(
         assert sorted(offsets) == list(range(1, total + 1))
         archived = reader.column_statistics(tier="archive")
         assert archived.record_count == total, "nothing local, so it is the log"
+        coverage = reader.coverage()
+        assert (coverage.archive, coverage.local, coverage.buffer) == (
+            (1, total),
+            None,
+            None,
+        ), "a retired log is all archive"
 
 
 def test_a_retired_log_takes_no_rows_from_any_handle(
