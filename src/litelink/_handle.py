@@ -4030,8 +4030,8 @@ class WriteHandle(LocalReadHandle):
         not this (#118). Each declares its own exclusion — a claim on the
         offsets it touches, or none — so running them apart is safe.
 
-        **Every log publishes** (#98): to S3, or by default to a directory
-        beside it. **A publish that fails raises, after local maintenance**: on
+        **Every log publishes** (#98): to S3, or by default to a table inside
+        the log's own directory (`<root>/<name>/published/`). **A publish that fails raises, after local maintenance**: on
         a machine cut off from a remote published table, steps 4-7 still run —
         eviction has nothing new to take, which is §11's "local eviction
         stalls", but expiry and the staging sweep keep reclaiming — then the

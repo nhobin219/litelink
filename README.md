@@ -176,7 +176,7 @@ rows travel, then cleans up behind them, each table after the last step that can
                 │  3. publish    what compaction is finished with       flush: everything
                 ▼
   ┌───────────────────────────┐
-  │ published        Iceberg  │   a directory beside the log by default, or s3://
+  │ published        Iceberg  │   inside the log's directory by default (published/), or s3://
   └───────────────────────────┘
 
   then, behind the rows:
