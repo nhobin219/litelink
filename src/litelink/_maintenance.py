@@ -355,6 +355,7 @@ class Maintenance:
         checkpoint(heartbeat)
         self.expire()
         checkpoint(heartbeat)
+        self.sweep_staging()
 
     # -- compaction ---------------------------------------------------------
 
@@ -1346,13 +1347,13 @@ class Maintenance:
             (self._key(p) for p in doomed), int(datetime.now(UTC).timestamp())
         )
         self.drain()
-        self._sweep("staging", self._table, self.config.staging_snapshot_retention)
 
     def tidy_published(self, claim: Claim) -> None:
         """The published table's half of expiry, drain and sweep (§5, #113).
 
         Called by `publish` at the end of a pass, under the lease it already
-        holds, rather than by `maintain`. Two reasons, both about what
+        holds, rather than by `maintain`. The sweep is not part of it: `publish`
+        runs `sweep_published` after releasing the lease. Two reasons, both about what
         `maintain` must not do:
 
         - **No network.** `maintain` keeps a partitioned machine's local
@@ -1391,12 +1392,28 @@ class Maintenance:
 
         checkpoint(claim.renew)
         self._drain_published(published, claim.renew)
-        self._sweep(
-            "published",
-            published,
-            self.config.published_snapshot_retention,
-            claim.renew,
-        )
+
+    def sweep_staging(self) -> None:
+        """One pass of the staging table's stranded-metadata sweep (`_sweep`).
+
+        Called with no claim held, by design: it needs none, and a backlog
+        pass is slow on the published side's object storage. Holding a lease
+        through it would refuse every other process's maintenance meanwhile.
+        """
+        self._sweep("staging", self._table, self.config.staging_snapshot_retention)
+
+    def sweep_published(self) -> None:
+        """One pass of the published table's sweep, after `publish` has
+        released its lease (`sweep_staging` says why).
+
+        Opens without `repair`: only a claim holder may repair, and `publish`
+        has just opened and repaired it under one, so this finds it cached.
+        """
+        published = self._published.table()
+        if published is not None:
+            self._sweep(
+                "published", published, self.config.published_snapshot_retention
+            )
 
     def drain(self) -> None:
         """Delete staging files whose grace period has passed.

@@ -3565,12 +3565,18 @@ class WriteHandle(LocalReadHandle):
             # table that never received it.
             self._push(lease, self._published.uri, push_unsettled=push_unsettled)
             # The published table's own housekeeping, after the push and under
-            # the same lease: expire its snapshots, delete what has come due,
-            # sweep stranded metadata (#113). Here rather than in `maintain`,
-            # which must keep working with no network (§11).
+            # the same lease: expire its snapshots and delete what has come due
+            # (#113). Here rather than in `maintain`, which must keep working
+            # with no network (§11).
             self._maintenance.tidy_published(lease)
         finally:
             lease.release()
+
+        # The sweep AFTER the release. It needs no claim, and a pass through a
+        # backlog on object storage is ~25 s of deletes; under the lease, every
+        # other process's `maintain` and `publish` would be refused for all of
+        # it. Never raises.
+        self._maintenance.sweep_published()
 
     def _push(
         self, lease: Claim, pinned: str | None, *, push_unsettled: bool = False
@@ -4098,6 +4104,8 @@ class WriteHandle(LocalReadHandle):
         what has come due, and sweep stranded metadata (§6, §8). The published
         table's are `publish`'s (#113)."""
         self._pass(lambda _: self._maintenance.expire(), heartbeat)
+        # Outside the pass's lease, for the reason `publish` gives.
+        self._maintenance.sweep_staging()
 
     def _pass(
         self,

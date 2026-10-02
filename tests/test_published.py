@@ -513,3 +513,32 @@ def test_retire_deletes_stranded_metadata_in_both_tables(tmp_path: Path) -> None
 
     with litelink.open(tmp_path, "s", read_only=True) as retired:
         assert retired.scan().read_all().num_rows == ROWS
+
+
+def test_the_published_sweep_runs_after_publish_releases_its_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep needs no claim, and a backlog pass on object storage is tens
+    of seconds of deletes; under `publish`'s lease every other process's
+    `maintain` and `publish` would be refused for all of it.
+
+    Falsify by running `sweep_published` inside the `try` that holds the
+    lease: the lease cannot be taken during the sweep.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        maintenance = log._maintenance  # noqa: SLF001
+        real = maintenance._sweep  # noqa: SLF001
+        free: list[bool] = []
+
+        def sweep(*args: object, **kwargs: object) -> None:
+            lease = log._lease("maintain")  # noqa: SLF001
+            free.append(lease.acquire())
+            lease.release()
+            real(*args, **kwargs)  # ty: ignore[invalid-argument-type]
+
+        monkeypatch.setattr(maintenance, "_sweep", sweep)
+        log.publish()
+
+        assert free == [True]

@@ -33,7 +33,8 @@ minor version carries breaking changes.
   the staging table) and `publish()` (for the published one) list `metadata/`
   at their first pass in a process and every four hours after, and delete
   files that nothing references and that are older than an hour and the
-  table's retention, at most 500 a pass. This also clears the manifests
+  table's retention, at most 500 a pass. It runs after the pass has released
+  its lease, so a slow backlog pass never holds up another process. This also clears the manifests
   orphaned before #112. A sweep failure is logged, never raised. `retire()`
   also sweeps both tables completely, with 32 deletes in flight, before it
   marks the log retired, since a retired log takes no more passes.
