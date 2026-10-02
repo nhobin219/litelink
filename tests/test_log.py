@@ -254,51 +254,67 @@ def test_rows_stay_readable_across_a_seal(tmp_path: Path) -> None:
 
 
 def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """What the lock split actually guarantees (§13.6).
+    """What the lock split actually guarantees (§13.6): the buffer lock is
+    free while the seal writes its file and commits it (step 2).
 
-    Deliberately measures lock-hold time rather than append latency. The append
-    stall is dominated by the GIL — a seal is CPU-bound in pure Python, so the
-    sealing thread starves the appending one whether or not it holds a lock —
-    and a test that asserted on end-to-end latency would be asserting something
-    this change cannot deliver on its own.
+    Probed rather than timed. While the file is being written, another thread
+    tries the lock; an `RLock` held by the sealing thread refuses it. A timing
+    ratio instead depends on how the fsyncs under the lock compare with the
+    Parquet write, which is a property of the disk, not of the seal.
     """
     import threading
-    import time
 
-    # The wrapper times from BEFORE acquire, so it counts waiting as holding.
-    # Nothing else seals in this process, so there is nothing to wait behind.
+    from litelink import _handle
+
     config = LogConfig(target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         log.extend(rows(400))
+        real_lock = log._buffer._lock
+        taken: list[bool] = []
+        probes: list[bool] = []
 
-        held: list[float] = []
-        buffer = log._buffer
-        real_lock = buffer._lock
-
-        class Timed:
+        class Counted:
             def __enter__(self) -> None:
-                self._at = time.perf_counter()
                 real_lock.acquire()
+                taken.append(True)
 
             def __exit__(self, *_: object) -> None:
                 real_lock.release()
-                held.append((time.perf_counter() - self._at) * 1000)
 
-        buffer._lock = cast("threading.RLock", Timed())
-        started = time.perf_counter()
-        log.seal(flush=True)
-        total = (time.perf_counter() - started) * 1000
-        buffer._lock = real_lock
+        def probe() -> None:
+            result: list[bool] = []
 
-    locked = sum(held)
-    assert held, "the seal never took the buffer lock, so this measured nothing"
+            def attempt() -> None:
+                got = real_lock.acquire(timeout=0)
+                if got:
+                    real_lock.release()
 
-    assert total > 5.0, "seal was too fast to say anything about"
-    assert locked < total / 2, (
-        f"lock held {locked:.1f} ms of a {total:.1f} ms seal — step 2 is not lock-free"
-    )
+                result.append(got)
+
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            thread.join()
+            probes.append(result[0])
+
+        real_write = _handle.write_parquet
+
+        def write_parquet(*args: Any, **kwargs: Any) -> None:
+            probe()
+            real_write(*args, **kwargs)
+            probe()
+
+        monkeypatch.setattr(_handle, "write_parquet", write_parquet)
+        log._buffer._lock = cast("threading.RLock", Counted())
+        try:
+            log.seal(flush=True)
+        finally:
+            log._buffer._lock = real_lock
+
+    assert taken, "the seal never took the buffer lock, so this probed nothing"
+    assert probes, "the seal never wrote a file, so this probed nothing"
+    assert all(probes), "the buffer lock was held while the seal wrote its file"
 
 
 def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
