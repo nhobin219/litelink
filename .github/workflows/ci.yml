@@ -87,7 +87,7 @@ jobs:
           schema = pa.schema([pa.field("event_ts", pa.int64(), nullable=False)])
           with litelink.new(Path(tempfile.mkdtemp()), "cold", schema=schema) as log:
               log.extend([{"event_ts": i} for i in range(500)])
-              log.seal_due()
+              log.seal()
               assert log.scan().read_all().num_rows == 500
               assert log.sql("SELECT count(*) c FROM log").read_all()["c"][0].as_py() == 500
 
