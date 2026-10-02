@@ -98,8 +98,8 @@ minor version carries breaking changes.
   `duckdb_connection`, `new`, `open` and `restore` take `memory_cache=True`
   (DuckDB's external file cache, for the connection's lifetime),
   `disk_cache=True` (the `cache_httpfs` extension on disk, surviving
-  restarts), `disk_cache_path=None` (default `$XDG_CACHE_HOME/litelink/duckdb`,
-  shared by every log and process on the machine) and
+  restarts), `disk_cache_path=None` (default `$XDG_CACHE_HOME/litelink/<log
+  name>`, one per log, shared by every process reading it) and
   `disk_cache_volume_limit=0.8` (the cache evicts once its VOLUME is that full,
   counting everything on it). `cache_httpfs` is bundled in the platform wheels
   and installed by `just duckdb-extensions --remote`; without it a

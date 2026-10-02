@@ -1434,7 +1434,11 @@ class WriteHandle(LocalReadHandle):
                 duckdb_connection,
                 published=remote,
                 cache=ReadCache(
-                    memory_cache, disk_cache, disk_cache_path, disk_cache_volume_limit
+                    memory_cache,
+                    disk_cache,
+                    disk_cache_path,
+                    disk_cache_volume_limit,
+                    name=name,
                 ),
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
@@ -1550,7 +1554,11 @@ class WriteHandle(LocalReadHandle):
                 duckdb_connection,
                 published=remote,
                 cache=ReadCache(
-                    memory_cache, disk_cache, disk_cache_path, disk_cache_volume_limit
+                    memory_cache,
+                    disk_cache,
+                    disk_cache_path,
+                    disk_cache_volume_limit,
+                    name=name,
                 ),
             ),
             maintenance=Maintenance(table, buffer, layout, remote),

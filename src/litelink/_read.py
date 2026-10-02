@@ -284,19 +284,27 @@ def install_s3_secret(
 _COMMUNITY = frozenset({"cache_httpfs"})
 
 
-def default_cache_path() -> Path:
-    """Where the reader's disk cache lives unless told otherwise (#118).
+def default_cache_path(name: str | None = None) -> Path:
+    """Where the reader's disk cache lives unless told otherwise (#118):
+    `$XDG_CACHE_HOME/litelink/<log name>`, or `~/.cache/litelink/<log name>`.
 
-    Per user, and deliberately not inside any log: one cache serves every log
-    and every process on the machine. Sharing is safe because Iceberg never
-    reuses a file name — a data file or manifest is immutable and every commit
-    writes new ones — so a block cached under a path is never stale.
-    `cache_httpfs`'s own default is under `/tmp`, which many systems clear at
-    boot, so litelink always sets one.
+    **One directory per log**, shared by every process that reads it — which
+    is the only sharing that ever paid, since different logs never read the
+    same files. Per log, one log's cache can be found and cleared on its own,
+    and each shrinks independently when its volume fills. A connection not
+    tied to a log (`duckdb_connection`) uses `duckdb` in place of the name.
+
+    Two logs of the same name — different roots or buckets — share a
+    directory, harmlessly: blocks are keyed by their full object path, so they
+    sit side by side and never collide. Sharing within one is safe because
+    Iceberg never reuses a file name, so a cached block is never stale.
+
+    Per user, not inside the log, and never `cache_httpfs`'s own default under
+    `/tmp`, which many systems clear at boot.
     """
     base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
 
-    return Path(base) / "litelink" / "duckdb"
+    return Path(base) / "litelink" / (name or "duckdb")
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +320,10 @@ class ReadCache:
     disk_cache: bool = True
     disk_cache_path: str | PathLike[str] | None = None
     disk_cache_volume_limit: float = 0.8
+    # The log this reader serves, which names the default directory; None for
+    # a connection not tied to one. Resolved when the cache is installed, so
+    # the environment is read at the point of use.
+    name: str | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.disk_cache_volume_limit <= 1:
@@ -357,7 +369,7 @@ def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) 
     """
     if cache.disk_cache:
         load_extension(connection, "cache_httpfs", remote=True)
-        directory = Path(cache.disk_cache_path or default_cache_path())
+        directory = Path(cache.disk_cache_path or default_cache_path(cache.name))
         directory.mkdir(parents=True, exist_ok=True)
         floor = int(
             shutil.disk_usage(directory).total * (1 - cache.disk_cache_volume_limit)
@@ -413,8 +425,8 @@ def duckdb_connection(
     **Reads from S3 are cached** (#118), with `remote=True`, in two layers:
     `memory_cache` for this connection's lifetime, and `disk_cache` in
     `disk_cache_path` (default `$XDG_CACHE_HOME/litelink/duckdb`, else
-    `~/.cache/litelink/duckdb`), shared by every log and every process and
-    surviving restarts. The disk cache evicts once its VOLUME is
+    `~/.cache/litelink/duckdb`; a log's own reader uses its name in place of
+    `duckdb`), shared by every process and surviving restarts. The disk cache evicts once its VOLUME is
     `disk_cache_volume_limit` full — counting everything on that volume, not
     just the cache. See `install_read_cache`. `disk_cache` needs the
     `cache_httpfs` extension, bundled in the platform wheels; without it this

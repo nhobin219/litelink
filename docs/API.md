@@ -449,9 +449,10 @@ restarts.
 | `memory_cache` | DuckDB's external file cache | the connection's |
 | `disk_cache` | the `cache_httpfs` extension, on disk, in `disk_cache_path` | across restarts and processes |
 
-- **The disk cache is shared.** The default path, `$XDG_CACHE_HOME/litelink/duckdb` (or
-  `~/.cache/litelink/duckdb`), serves every log and every process on the machine. That is safe
-  because Iceberg never reuses a file name: a cached block is never stale.
+- **One disk cache per log, shared by every process reading it.** A log's reader defaults to
+  `$XDG_CACHE_HOME/litelink/<log name>` (or `~/.cache/litelink/<log name>`), so one log's cache
+  can be found and cleared on its own. A bare `duckdb_connection` uses `duckdb` in place of the
+  name. Sharing is safe because Iceberg never reuses a file name: a cached block is never stale.
 - **`disk_cache_volume_limit` bounds it by how full its VOLUME may get**, not by its own size:
   the cache evicts once the volume is 80% full, counting everything on that volume. If other
   data fills the disk, the cache shrinks, possibly to nothing, so the log's own writes come

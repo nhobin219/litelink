@@ -4165,3 +4165,30 @@ def test_a_reader_caches_published_reads_on_disk_and_shares_them(
     elsewhere = tmp_path / "elsewhere"
     read(elsewhere)
     assert cached(elsewhere) == filled
+
+
+def test_a_logs_default_disk_cache_is_named_after_it(
+    tmp_path: Path, bucket: str, s3: S3Options, isolated_read_cache: Path
+) -> None:
+    """With no `disk_cache_path`, a log's reader caches under
+    `$XDG_CACHE_HOME/litelink/<log name>`: one directory per log, findable and
+    clearable on its own, and shared by every process reading it (#118).
+
+    Falsify by dropping `name` from the reader's `ReadCache`: the blocks land
+    in the connection default, `.../litelink/duckdb`.
+    """
+    root = tmp_path / "log"
+    with published_log(
+        root, bucket, s3, staging_retention=timedelta(0), staging_rows=0
+    ) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+
+    with litelink.open(root, "s", read_only=True, s3=s3) as reader:
+        assert reader.scan().read_all().num_rows == ROWS
+
+    mine = isolated_read_cache / "litelink" / "s"
+    assert any(files for _, _, files in os.walk(mine)), (
+        "nothing cached under the log's name"
+    )
+    assert not (isolated_read_cache / "litelink" / "duckdb").exists()
