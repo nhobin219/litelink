@@ -7,7 +7,7 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
-## Unreleased
+## 0.7.0 — 2026-10-02
 
 > **⚠️ `seal()` CHANGED MEANING — CHECK EVERY CALL.** A bare `seal()` used
 > to cut and seal *everything* buffered. It now writes only what the size
