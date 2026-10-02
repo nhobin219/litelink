@@ -185,7 +185,9 @@ def test_a_warning_is_visible_without_failing_the_report() -> None:
     assert "NOT READY" in str(broken)
 
 
-def test_the_clock_check_does_not_sample_and_does_not_fail() -> None:
+def test_the_clock_check_does_not_sample_and_does_not_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """It reports a COMBINATION, because sampling cannot prove absence.
 
     The obvious implementation — spin for a second counting backwards steps —
@@ -200,14 +202,33 @@ def test_the_clock_check_does_not_sample_and_does_not_fail() -> None:
     """
     from litelink._preflight import _clocksource
 
-    started = time.monotonic()
-    check = _clocksource()
-    elapsed = time.monotonic() - started
+    reads: list[str] = []
 
-    assert elapsed < 1.0, (
-        f"the clock check took {elapsed:.2f}s — it must not be sampling, "
-        f"because sampling cannot prove the clock is well behaved"
-    )
+    def sampled(*_: object) -> float:
+        # Recorded as well as raised: the check catches what goes wrong
+        # inside it, and would swallow the raise.
+        reads.append("read")
+        msg = "the clock check read the clock"
+        raise AssertionError(msg)
+
+    for clock in (
+        "monotonic",
+        "monotonic_ns",
+        "perf_counter",
+        "perf_counter_ns",
+        "time",
+        "time_ns",
+        "clock_gettime",
+        "clock_gettime_ns",
+        "sleep",
+    ):
+        monkeypatch.setattr(time, clock, sampled)
+
+    check = _clocksource()
+    monkeypatch.undo()
+
+    assert not reads, "the clock check read the clock; sampling cannot prove it"
+
     assert check.ok, "a clock risk must never fail provisioning"
 
     # Whatever this host is, the detail has to say which clocksource it saw.
