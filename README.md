@@ -25,37 +25,6 @@ already holds. Through all of it the log stays one queryable unit: a read sees e
 exactly once, whichever tier holds it, and maintenance runs beside appends rather than in
 front of them.
 
-**The Iceberg table is the product.** The usual shape is a write path in one system and an
-analytical store in another, with a job copying between them. Here they are one log, and the
-Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg engine, reads. litelink
-reads across every tier, so **no read on the hot path touches the network**; everything else
-reads the published table through its `version-hint.text`, with no catalog and no litelink:
-
-```python
-import duckdb
-import litelink
-
-# Written, durable on return.
-log = litelink.open("data", "trades")
-log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
-            "price": 78501.62, "amount": 0.0076})
-
-# Read on the same box, across whichever tiers could hold a match. Inside sql(), the log
-# is always the relation `log`, whatever it is named.
-log.sql("SELECT count(*), max(price) FROM log").read_all()
-
-# Read the published table with any Iceberg engine, and litelink not installed at all —
-# from S3, or for a local-only log from data/trades/published/trades.
-duckdb.sql("""
-    SELECT count(*), max(price)
-    FROM iceberg_scan('s3://bucket/prefix/trades',
-                      version_name_format = '%s%s.metadata.json')
-""")
-```
-
-The published table holds what `publish` has pushed, which trails the buffer by the publish
-interval; rows newer than that are readable through litelink on the writer's machine.
-
 Rows move through three tables: buffer, staging and published. `advance()` runs steps 1–3 to
 move them along, then steps 4–10 to clean up what they left behind:
 
@@ -115,6 +84,37 @@ later `reclaim` deletes it.
 writes straight into staging at `target_compact_size`, then publishes. Eviction, reclaiming and
 the sweeps are left to the next `advance()`, which a log that only ever ingests still needs.
 [SPEC §1](docs/SPEC.md#the-pipeline) diagrams both paths.
+
+**The Iceberg table is the product.** The usual shape is a write path in one system and an
+analytical store in another, with a job copying between them. Here they are one log, and the
+Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg engine, reads. litelink
+reads across every tier, so **no read on the hot path touches the network**; everything else
+reads the published table through its `version-hint.text`, with no catalog and no litelink:
+
+```python
+import duckdb
+import litelink
+
+# Written, durable on return.
+log = litelink.open("data", "trades")
+log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
+            "price": 78501.62, "amount": 0.0076})
+
+# Read on the same box, across whichever tiers could hold a match. Inside sql(), the log
+# is always the relation `log`, whatever it is named.
+log.sql("SELECT count(*), max(price) FROM log").read_all()
+
+# Read the published table with any Iceberg engine, and litelink not installed at all —
+# from S3, or for a local-only log from data/trades/published/trades.
+duckdb.sql("""
+    SELECT count(*), max(price)
+    FROM iceberg_scan('s3://bucket/prefix/trades',
+                      version_name_format = '%s%s.metadata.json')
+""")
+```
+
+The published table holds what `publish` has pushed, which trails the buffer by the publish
+interval; rows newer than that are readable through litelink on the writer's machine.
 
 ## Install
 
