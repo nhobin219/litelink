@@ -9,32 +9,6 @@
 
 # An embedded Iceberg storage engine for append-only data
 
-litelink takes high-throughput transactional appends and turns them into one well-sized
-Iceberg table per log — on S3, or in a local directory. `append()` commits to a SQLite buffer
-and returns once the row is durable. Behind it, the library seals rows into sorted Parquet,
-compacts small files up to a target size, publishes settled files to that table, and evicts
-from local disk what it already holds. Through all of it the log stays one queryable
-unit: a read sees every row exactly once, whichever tier holds it, and maintenance runs beside
-appends rather than in front of them, so no pass blocks appends for its duration or shows a
-reader a half-finished state.
-
-```
-append() ──► SQLite buffer          durable on commit
-                   │  seal: sorted Parquet at target_seal_size
-                   ▼
-             staging Iceberg table  compacted to target size, evicted once published
-                   │  publish: upload, register
-                   ▼
-             published Iceberg table  full history, on S3 or in a local directory
-
-scan() / sql() ──► one relation across all three tiers, each row once
-```
-
-It runs inside your process, like DuckDB, with no server, daemon or catalog service: what
-DuckDB is to query execution, litelink is to the durable write path. The files it writes are
-the product. The Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg
-engine, reads, with no export step in between.
-
 |  | DuckDB | litelink |
 |---|---|---|
 | runs | in your process | in your process |
@@ -42,20 +16,26 @@ engine, reads, with no export step in between.
 | owns | the query | the durable write path |
 | speaks | SQL over Parquet and Arrow | Iceberg v2, on disk and in object storage |
 
+What DuckDB is to query execution, litelink is to the durable write path. It takes
+high-throughput transactional appends and turns them into one well-sized Iceberg table per
+log — on S3, or in a local directory. `append()` commits to a SQLite buffer and returns once
+the row is durable. Behind it, the library seals rows into sorted Parquet, compacts small files
+up to a target size, publishes settled files to that table, and evicts from local disk what it
+already holds. Through all of it the log stays one queryable unit: a read sees every row
+exactly once, whichever tier holds it, and maintenance runs beside appends rather than in
+front of them.
+
 It's built for the thing every capture pipeline hand-rolls badly: getting a stream of
 observations onto disk durably, into well-sized Parquet, and eventually into object storage.
 Doing that by hand goes wrong the same way every time: one production capture system had
 125,884 objects, 62.5% of them under 16 KiB, Parquet files at 2 rows each, a compaction
 routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
 
-## The Iceberg table is the product
-
-The usual shape is a write path in one system and an analytical store in another, with a job
-copying between them. Here they are one log: rows land in the SQLite buffer, seal into a
-staging table, and are published to the log's one output — an Iceberg table on S3, or
-in a local directory for a log with no S3 published table. litelink reads across all three, so **no
-read on the hot path touches the network**. Everything else reads the published table with
-any Iceberg engine, through its `version-hint.text`, with no catalog and no litelink:
+**The Iceberg table is the product.** The usual shape is a write path in one system and an
+analytical store in another, with a job copying between them. Here they are one log, and the
+Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg engine, reads. litelink
+reads across every tier, so **no read on the hot path touches the network**; everything else
+reads the published table through its `version-hint.text`, with no catalog and no litelink:
 
 ```python
 import duckdb
@@ -66,7 +46,8 @@ log = litelink.open("data", "trades")
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076})
 
-# Read on the same box, across whichever tiers could hold a match.
+# Read on the same box, across whichever tiers could hold a match. Inside sql(), the log
+# is always the relation `log`, whatever it is named.
 log.sql("SELECT count(*), max(price) FROM log").read_all()
 
 # Read the published table with any Iceberg engine, and litelink not installed at all —
@@ -80,83 +61,6 @@ duckdb.sql("""
 
 The published table holds what `publish` has pushed, which trails the buffer by the publish
 interval; rows newer than that are readable through litelink on the writer's machine.
-
-## How it works
-
-- **Iceberg is used, not reimplemented.** Manifests, per-file column statistics, schema with
-  field IDs, and atomic snapshot commits all come from it.
-- **The library owns exactly one column**, `litelink_offset` — monotonic, never reused. It is
-  the boundary mechanism between tiers. Everything else is the caller's schema.
-- **Parts are sealed once and never rewritten.** Rewriting a growing partition costs ~144x
-  write amplification and buys nothing, because the local WAL already made the row durable.
-- **Read boundaries come from committed table state**, never from a stored flag — so no seal
-  window can double-count or drop.
-- **Sizing is two targets, not one.** A seal wants to be small, because the buffer is what a
-  hot read scans; a file wants to be large, because per-file overhead dominates scans and
-  uploads. Compaction bridges them, on local disk, at 8× the seal size by default.
-
-Read performance is the cost of reading Parquet, plus ~4 ms of fixed overhead. The reasoning
-and the measurements are in [`docs/SPEC.md`](docs/SPEC.md); `just bench` reruns them on your
-hardware.
-
-## Install
-
-```bash
-pip install litelink        # or: uv add litelink
-```
-
-**Nothing else is required** — no producer, no credentials, no maintainer process, no
-container. Object storage and WAL replication are opt-in, and each is one setting; another
-machine reads the published table with no litelink at all.
-
-Wheels for Linux and macOS on x86-64 and arm64 carry a checksum-verified litestream and the
-DuckDB extensions litelink loads, so a box with no egress still reads, writes and restores.
-That costs ~124 MB. Run `python -m litelink` to check a machine before you rely on it; see
-[`docs/RUNTIME.md`](docs/RUNTIME.md) for anywhere else.
-
-## API
-
-```python
-litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
-             s3=None, start_offset=1)                            -> WriteHandle
-litelink.open(root, name, *, s3=None)                              -> WriteHandle
-litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
-litelink.restore(root, name, *, published, s3=None, ...)             -> WriteHandle
-litelink.validate_row(schema, row)                                 # raises as append would
-litelink.preflight(...)                                            # what python -m litelink runs
-
-# Every handle reads:
-    log.scan(*, columns=None, where=None, start_offset=None, end_offset=None, published=True)
-    log.sql(query, *, published=True)                 # the log is `log`; both stream Arrow
-    log.column_statistics(*, tier=None) · log.coverage(*, published=True)   # tier: staging|published|buffer|None
-    log.end_offset() · buffered_rows() · staging_rows() · staging_files() · published_through()
-    log.schema · sort_by · config · published
-
-# A WriteHandle also writes:
-    log.append(row) -> int                          # durable on return
-    log.extend(rows) -> list[int]                   # ONE transaction, one fsync
-    log.ingest(table_or_reader)                     # Arrow straight to Parquet, then published
-    log.advance(*, flush=False)                     # the whole pipeline below, in order
-    log.seal(*, flush=False) · compact() · publish(*, flush=False)
-    log.evict(table=None) · reclaim(table=None) · sweep(table=None) # its steps: clean up
-    log.retire()                                    # end the log: all published, none local
-    log.set_config(...)                             # the policy; schema, sort_by, published are fixed
-```
-
-The deliberate choices:
-
-- **Handles, not logs.** A read handle has no write methods at all, rather than ones that
-  raise, and `open(..., read_only=True)` is typed so misuse is caught before it runs.
-- **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
-  live in the log, so nothing at the call site can disagree with what is on disk.
-- **The library owns no thread.** Nothing seals unless you call `seal()` or `advance()`;
-  your loop is the schedule.
-- **Which tiers a query reads is decided per query**, from its predicates. A query bounded
-  inside the staging window never touches the network, however much has been evicted.
-
-Full reference in [`docs/API.md`](docs/API.md).
-
-## The pipeline
 
 Rows move through three tables, and `advance()` moves them. It runs every step in the order
 rows travel, then cleans up behind them, each table after the last step that can change it:
@@ -213,25 +117,67 @@ later `reclaim` deletes it.
 - **A publish that fails stops only the published steps.** Steps 4–8 still run, so a machine
   cut off from S3 keeps reclaiming local storage; then the error is raised.
 
-`ingest()` loads data that is already durable, a Parquet corpus say, so it skips the buffer:
+`ingest()` loads data that is already durable, a Parquet corpus say: it skips the buffer and
+writes straight into staging at `target_compact_size`, then publishes. Eviction, reclaiming and
+the sweeps are left to the next `advance()`, which a log that only ever ingests still needs.
+[SPEC §1](docs/SPEC.md#the-pipeline) diagrams both paths.
 
-```
-  log.ingest(arrow_table_or_reader)         the source is already durable: no buffer, no per-row fsync
-                │  reserve offsets, sort, write files at target_compact_size, register in batches
-                ▼
-  ┌───────────────────────────┐
-  │ staging                   │   the whole log is claimed for the load
-  └───────────────────────────┘
-                │  compact()            merges only small files already in staging
-                │  publish(flush=True)  the load's only second copy, last short file included
-                ▼
-  ┌───────────────────────────┐
-  │ published                 │   skip with ingest(..., publish=False)
-  └───────────────────────────┘
+## Install
+
+```bash
+pip install litelink        # or: uv add litelink
 ```
 
-It runs only what a load needs to be safe. Eviction, reclaiming and the sweeps are left to
-the next `advance()`, which a log that only ever ingests still needs, or its snapshots accumulate.
+**Nothing else is required** — no producer, no credentials, no maintainer process, no
+container. Object storage and WAL replication are opt-in, and each is one setting; another
+machine reads the published table with no litelink at all.
+
+Wheels for Linux and macOS on x86-64 and arm64 carry a checksum-verified litestream and the
+DuckDB extensions litelink loads, so a box with no egress still reads, writes and restores.
+That costs ~124 MB. Run `python -m litelink` to check a machine before you rely on it; see
+[`docs/RUNTIME.md`](docs/RUNTIME.md) for anywhere else.
+
+## API
+
+```python
+litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
+             s3=None, start_offset=1)                            -> WriteHandle
+litelink.open(root, name, *, s3=None)                              -> WriteHandle
+litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
+litelink.restore(root, name, *, published, s3=None, ...)             -> WriteHandle
+litelink.validate_row(schema, row)                                 # raises as append would
+litelink.preflight(...)                                            # what python -m litelink runs
+
+# Every handle reads:
+    log.scan(*, columns=None, where=None, start_offset=None, end_offset=None, published=True)
+    log.sql(query, *, published=True)                 # the log is `log`; both stream Arrow
+    log.column_statistics(*, tier=None) · log.coverage(*, published=True)   # tier: staging|published|buffer|None
+    log.end_offset() · buffered_rows() · staging_rows() · staging_files() · published_through()
+    log.schema · sort_by · config · published
+
+# A WriteHandle also writes:
+    log.append(row) -> int                          # durable on return
+    log.extend(rows) -> list[int]                   # ONE transaction, one fsync
+    log.ingest(table_or_reader)                     # Arrow straight to Parquet, then published
+    log.advance(*, flush=False)                     # the whole pipeline above, in order
+    log.seal(*, flush=False) · compact() · publish(*, flush=False)
+    log.evict(table=None) · reclaim(table=None) · sweep(table=None) # its steps: clean up
+    log.retire()                                    # end the log: all published, none local
+    log.set_config(...)                             # the policy; schema, sort_by, published are fixed
+```
+
+The deliberate choices:
+
+- **Handles, not logs.** A read handle has no write methods at all, rather than ones that
+  raise, and `open(..., read_only=True)` is typed so misuse is caught before it runs.
+- **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
+  live in the log, so nothing at the call site can disagree with what is on disk.
+- **The library owns no thread.** Nothing seals unless you call `seal()` or `advance()`;
+  your loop is the schedule.
+- **Which tiers a query reads is decided per query**, from its predicates. A query bounded
+  inside the staging window never touches the network, however much has been evicted.
+
+Full reference in [`docs/API.md`](docs/API.md).
 
 ## Writing
 

@@ -35,6 +35,57 @@ still downloads them on first use, which is what `just bootstrap` discharges. Se
 statistics, schema with field IDs, atomic snapshot commits. The catalog is a SQLite file,
 not a service, so this costs no daemon.
 
+### The pipeline
+
+Every step a row goes through, in the order `advance()` runs them (§12), and the cleanup that
+follows each table after the last step that can change it:
+
+```
+  log.append(row) · log.extend(rows)        durable on return: SQLite, synchronous=FULL
+                │
+                ▼
+  ┌───────────────────────────┐
+  │ buffer         buffer.db  │   rows wait until a file's worth has arrived
+  └───────────────────────────┘
+                │  1. seal       writes what the size trigger cut       flush: everything
+                ▼
+  ┌───────────────────────────┐ ◄──┐
+  │ staging    local Iceberg  │    │  2. compact   merges runs of small files
+  └───────────────────────────┘ ───┘
+                │  3. publish    what compaction is finished with       flush: everything
+                ▼
+  ┌───────────────────────────┐
+  │ published        Iceberg  │   local by default, or s3://
+  └───────────────────────────┘
+
+  then, behind the rows, each table after the last step that can change it:
+     4. evict("buffer")        rows staging holds (published, with wal_replication)
+     5. evict("staging")       files published holds, never before (I4)
+     6. reclaim("buffer")      VACUUM buffer.db         only with vacuum_free_ratio
+     7. reclaim("staging")     expire old snapshots, then delete files past their grace
+     8. sweep("staging")       files a lost or crashed commit left behind
+     9. reclaim("published")   the same, on the published table
+    10. sweep("published")
+```
+
+`ingest()` (§13.4) loads data that is already durable, so it skips the buffer and claims the
+whole log for the load. Eviction, reclaiming and the sweeps are left to the next `advance()`:
+
+```
+  log.ingest(arrow_table_or_reader)         the source is already durable: no buffer, no per-row fsync
+                │  reserve offsets, sort, write files at target_compact_size, register in batches
+                ▼
+  ┌───────────────────────────┐
+  │ staging                   │   the whole log is claimed for the load
+  └───────────────────────────┘
+                │  compact()            merges only small files already in staging
+                │  publish(flush=True)  the load's only second copy, last short file included
+                ▼
+  ┌───────────────────────────┐
+  │ published                 │   skip with ingest(..., publish=False)
+  └───────────────────────────┘
+```
+
 ### Scope
 
 | Not doing | Why |
