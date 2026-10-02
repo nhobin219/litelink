@@ -137,8 +137,8 @@ litelink.preflight(...)                                            # what python
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
     log.ingest(table_or_reader)                     # Arrow straight to Parquet, then published
     log.advance(*, flush=False)                     # the whole pipeline below, in order
-    log.seal(*, flush=False) · compact() · publish(*, flush=False) · evict()
-    log.expire(table=None) · sweep(table=None) · reclaim_buffer()   # its steps, one at a time
+    log.seal(*, flush=False) · compact() · publish(*, flush=False)   # its steps: move data
+    log.evict(table=None) · reclaim(table=None) · sweep(table=None) # its steps: clean up
     log.retire()                                    # end the log: all published, none local
     log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
 ```
@@ -179,14 +179,27 @@ rows travel, then cleans up behind them, each table after the last step that can
   │ published        Iceberg  │   local by default, or s3://
   └───────────────────────────┘
 
-  then, behind the rows:
-     4. reclaim_buffer        buffer.db's dead space          only with vacuum_free_ratio
-     5. evict                 staging drops what published holds, never before (I4)
-     6. expire("staging")     old snapshots, then deletes what they alone used
-     7. sweep("staging")      files a lost or crashed commit left behind
-     8. expire("published")   the same, on the published table
-     9. sweep("published")
+  then, behind the rows, each table after the last step that can change it:
+     4. evict("buffer")        rows staging holds (published, with wal_replication)
+     5. evict("staging")       files published holds, never before (I4)
+     6. reclaim("buffer")      VACUUM buffer.db         only with vacuum_free_ratio
+     7. reclaim("staging")     expire old snapshots, then delete files past their grace
+     8. sweep("staging")       files a lost or crashed commit left behind
+     9. reclaim("published")   the same, on the published table
+    10. sweep("published")
 ```
+
+One set of verbs for every table, each taking the table as an argument:
+
+| | `evict`: drop what the next copy holds | `reclaim`: turn that into free disk | `sweep` |
+|---|---|---|---|
+| `"buffer"` | rows staging holds, or published with `wal_replication` | `VACUUM` | — |
+| `"staging"` | files published holds (I4) | expire snapshots, then delete | stranded metadata |
+| `"published"` | — (it is the durable copy) | expire snapshots, then delete | stranded metadata |
+
+`reclaim` on staging or published does not delete a file in the call that frees it: the file
+waits out its table's snapshot retention first, so a scan already reading it can finish. A
+later `reclaim` deletes it.
 
 - **`flush=True` means the same everywhere**: push everything through this stage now,
   regardless of thresholds. `advance(flush=True)` passes it to `seal` and `publish`, so one
@@ -197,7 +210,7 @@ rows travel, then cleans up behind them, each table after the last step that can
 - **Each step is a routine of its own** for an orchestrator that wants them on different
   schedules or in different processes. `advance()` is the one-process version, and raises if
   another process holds the lease.
-- **A publish that fails stops only the published steps.** Steps 4–7 still run, so a machine
+- **A publish that fails stops only the published steps.** Steps 4–8 still run, so a machine
   cut off from S3 keeps reclaiming local storage; then the error is raised.
 
 `ingest()` loads data that is already durable, a Parquet corpus say, so it skips the buffer:
@@ -217,8 +230,8 @@ rows travel, then cleans up behind them, each table after the last step that can
   └───────────────────────────┘
 ```
 
-It runs only what a load needs to be safe. Eviction, expiry and the sweeps are left to the
-next `advance()`, which a log that only ever ingests still needs, or its snapshots accumulate.
+It runs only what a load needs to be safe. Eviction, reclaiming and the sweeps are left to
+the next `advance()`, which a log that only ever ingests still needs, or its snapshots accumulate.
 
 ## Writing
 

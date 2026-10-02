@@ -101,10 +101,22 @@ def test_seal_then_read_returns_every_row_once(tmp_path: Path) -> None:
         assert offsets == list(range(1, 16))
 
 
-def test_seal_empties_the_buffer_but_not_the_log(tmp_path: Path) -> None:
+def test_a_seal_keeps_its_rows_until_the_buffer_is_evicted(tmp_path: Path) -> None:
+    """A seal only moves data; `evict("buffer")` drops what staging holds
+    (#122). Reads see each row exactly once either side of it, because the
+    read boundary is the staging table's committed end, not the buffer's
+    contents.
+
+    Falsify by deleting the rows in `finish_seal` again: the buffer is empty
+    straight after the seal.
+    """
     with open_log(tmp_path) as log:
         log.extend(rows(4))
         log.seal(flush=True)
+        assert log._buffer.span() is not None, "the seal must not delete"
+        assert len(read_all(log)) == 4
+
+        log.evict("buffer")
         assert log._buffer.span() is None
         assert len(read_all(log)) == 4
 
@@ -114,6 +126,7 @@ def test_offsets_never_reused_after_the_buffer_empties(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(3))
         log.seal(flush=True)
+        log.evict("buffer")
         assert log._buffer.span() is None
         assert log.extend(rows(1, start=3)) == [4]
         assert log.staging_extent() == (1, 4)
@@ -149,7 +162,8 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
     """Crash between the Iceberg commit and the buffer delete (§4, §11).
 
     The rows are in the table AND still in the buffer. A read in that window
-    must return each exactly once, and reopening must drop the stale rows.
+    must return each exactly once, and reopening must finish the seal without
+    sealing them twice. Dropping them is `evict("buffer")`'s (#122).
     """
     with open_log(tmp_path) as log:
         log.extend(rows(4))
@@ -165,6 +179,10 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
 
     with open_log(tmp_path) as recovered:
         assert recovered._buffer.pending_seal() is None
+        assert len(read_all(recovered)) == 4
+        assert recovered.staging_files() == 1, "recovery sealed it twice"
+
+        recovered.evict("buffer")
         assert recovered._buffer.span() is None
         assert len(read_all(recovered)) == 4
 

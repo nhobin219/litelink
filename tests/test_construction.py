@@ -1367,9 +1367,9 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
                 {"event_ts": i, "key": payload} for i in range(2000)
             )
 
-        # The published table takes all but a tail, which is `release_below`'s shape.
+        # The published table takes all but a tail, which is `evict("buffer")`'s shape.
         boundary = issued[-300]
-        buffer.release_below(boundary + 1)
+        buffer.evict_rows(0, boundary + 1)
         # Then punch holes in what is left, so a renumbering rewrite would show
         # up as closed gaps rather than having to be inferred.
         survivors = [o for o in issued if o > boundary and o % 3 == 0]
@@ -1422,7 +1422,7 @@ def test_reclaiming_a_small_buffer_does_nothing(tmp_path: Path) -> None:
         # Enough to leave a free list that is most of the file, and far enough
         # under the floor that reclaiming it would be pure cost.
         issued = buffer.append({"event_ts": i, "key": "k" * 400} for i in range(4000))
-        buffer.release_below(issued[-1] + 1)
+        buffer.evict_rows(0, issued[-1] + 1)
         pages, free = _page_stats(buffer)
         page_size = int(buffer._con.execute("PRAGMA page_size").fetchone()[0])  # noqa: SLF001
 

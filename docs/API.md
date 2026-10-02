@@ -102,7 +102,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
-| **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `evict` · `expire` · `sweep` · `reclaim_buffer` |
+| **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
 | **`+ WriteHandle`** — published table | `publish` · `hydrate` · `rewrite_published` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` · `set_published` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
@@ -305,8 +305,8 @@ its own process; concurrent `append` is excluded by §1, not by a lock.
 
 **WAL shipping does not carry a loaded range**, because these rows never enter the buffer.
 That is a fact about scope, and it is stated rather than enforced: `ingest` runs with
-`wal_replication` on, and turning it off to load would be worse, since `_discard_on_seal`
-reads the same flag and the next seal would drop the buffer's copy of everything already
+`wal_replication` on, and turning it off to load would be worse, since `evict("buffer")`
+reads the same flag and the next eviction would drop the buffer's copy of everything already
 captured.
 
 **The published table is a loaded range's only second copy.** When the push did not run, compare
@@ -497,14 +497,13 @@ whole time, but never reaching Parquet.
 ## Maintenance
 
 ```python
-log.advance() -> None
-log.seal() -> int | None
+log.advance(*, flush=False) -> None
+log.seal(*, flush=False) -> int | None
 log.compact() -> None
 log.publish(*, flush=False) -> None
-log.reclaim_buffer(min_free_ratio=0.0) -> int
-log.evict() -> None
-log.expire(table=None) -> None        # "staging" | "published" | None for both
-log.sweep(table=None) -> None         # the same
+log.evict(table=None, *, start_offset=None, end_offset=None) -> None  # "buffer" | "staging"
+log.reclaim(table=None, *, min_free_ratio=0.0) -> None  # "buffer" | "staging" | "published"
+log.sweep(table=None) -> None                           # "staging" | "published"
 ```
 
 `advance()` is the one call most deployments want: the whole pipeline, in the order rows move
@@ -513,17 +512,31 @@ from the buffer to the published table, each table swept after the last step tha
 1. `seal()`: buffer → staging.
 2. `compact()`: merges a run once it has `compact_min_files` files that fit the target.
 3. `publish()`: staging → published, only what compaction is finished with.
-4. `reclaim_buffer()`, when `vacuum_free_ratio` is set.
-5. `evict()`: staging drops what the published table now holds, in the same pass (I4).
-6. `expire("staging")`: staging snapshots past `staging_snapshot_retention`, then the
-   staging drain.
-7. `sweep("staging")`.
-8. `expire("published")`: published snapshots past `published_snapshot_retention`, then the
-   published drain.
-9. `sweep("published")`.
+4. `evict("buffer")`: rows the next durable copy holds — staging, or the published table
+   with `wal_replication`.
+5. `evict("staging")`: files the published table now holds, in the same pass (I4).
+6. `reclaim("buffer")`: `VACUUM`, only when `vacuum_free_ratio` is set.
+7. `reclaim("staging")`: expire snapshots past `staging_snapshot_retention`, then delete the
+   files whose grace has passed.
+8. `sweep("staging")`.
+9. `reclaim("published")`: the same against `published_snapshot_retention`.
+10. `sweep("published")`.
+
+**`seal` and `publish` only move data; every deletion is `evict`'s.** A seal leaves its rows in
+the buffer until `evict("buffer")`; reads see each row once either way, because the read
+boundary is the staging table's committed end. **`evict` takes optional half-open
+`[start_offset, end_offset)` bounds**, and chunking is the caller's: unbounded, a buffer
+eviction is one `DELETE` under SQLite's write lock and stalls appends while it runs. Staging
+eviction always removes a prefix, so a `start_offset` above the table's first offset raises.
+
+**`reclaim` on staging or published does not delete a file in the call that frees it.** Iceberg's
+expiry is metadata only; what it frees, and what compaction and eviction supersede, is queued
+with the time it stopped being referenced, and deleted only once its table's snapshot retention
+has passed since then — the grace that lets a scan already reading it finish (I6). A later
+`reclaim` deletes it; a retention of zero deletes it in the same call.
 
 **It is meant for a script or a single process, and raises on a second owner.** If another
-owner holds the publish lease, or the publish fails for any other reason, steps 4–7 still run
+owner holds the publish lease, or the publish fails for any other reason, steps 4–8 still run
 (local storage keeps being reclaimed on a machine cut off from a remote published table), then
 the published steps are skipped and the error is raised. Every log publishes (#98), to a local
 directory by default, so the pipeline needs the network only when the published table is
@@ -531,12 +544,12 @@ remote.
 
 **Each step is also a routine of its own**, for an orchestrator whose schedules differ because
 the costs do, or that wants the published side in another process or `sweep()` in a daemon
-thread. **`compact` reads and rewrites whole files, while `evict` and `expire` are metadata
-commits that finish in milliseconds, and `publish` is the only step that waits on the
+thread. **`compact` reads and rewrites whole files, while `evict` and `reclaim`'s expiry are
+metadata commits that finish in milliseconds, and `publish` is the only step that waits on the
 network.** Each takes only the exclusion it needs: a claim on the offsets it touches, or none
-(`expire`'s commit and `sweep`). A routine that works on both tables takes the table as an
-argument, `"staging"`, `"published"` or None for both, rather than one function per table; a
-misspelt table raises `ValueError`.
+(`reclaim`'s expiry and `sweep`). A routine that works on several tables takes the table as an
+argument, None meaning every table it acts on, rather than one function per table; a misspelt
+table, or one the routine does not act on, raises `ValueError`.
 
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
@@ -793,7 +806,7 @@ litestream replicates the FILE, so every `restore` downloads and applies the dea
 Measured on a 1-day-old capture: 457 MB holding 20,658 live rows with 92% of its pages free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
 
 Set it and `advance` reclaims once the free list reaches that share of the file;
-`WriteHandle.reclaim_buffer()` does it on demand. **Off by default, because the cost lands on
+`reclaim("buffer")` does it on demand. **Off by default, because the cost lands on
 the write path**: `VACUUM` takes an exclusive lock and stalls appends for as long as the live
 data takes to copy — 0.3 s at 35 MB — and only the deployment knows whether its arrival rate
 can absorb that. A writer with no WAL replica can leave it None for ever and lose nothing

@@ -173,7 +173,7 @@ def test_rewrite_published_works_on_a_local_published_table(tmp_path: Path) -> N
 
         time.sleep(1.1)
         # `expire_published`, which drains the published table's queue (#113).
-        log.expire("published")
+        log.reclaim("published")
         assert offsets(log) == expected
         assert not any(
             Path(key.removeprefix("file://")).exists() for key in superseded
@@ -571,13 +571,13 @@ def test_a_failed_publish_raises_after_local_maintenance(
     """On a machine cut off from its published table, local storage is still
     reclaimed, and the failure is not swallowed.
 
-    Falsify by letting the publish's error escape at once: `expire` never
+    Falsify by letting the publish's error escape at once: `evict` never
     runs and the call log ends at `publish`.
     """
     with local_log(tmp_path) as log:
         log.extend(rows(ROWS))
         ran: list[str] = []
-        for name in ("evict", "expire", "sweep"):
+        for name in ("evict", "reclaim", "sweep"):
             real = getattr(log, name)
 
             def record(*args: object, real=real, name=name) -> None:
@@ -595,45 +595,70 @@ def test_a_failed_publish_raises_after_local_maintenance(
         with pytest.raises(OSError, match="unreachable"):
             log.advance()
 
-        assert ran == ["publish", "evict", "expire staging", "sweep staging"], (
-            "local steps run, the published ones do not"
-        )
+        assert ran == [
+            "publish",
+            "evict buffer",
+            "evict staging",
+            "reclaim staging",
+            "sweep staging",
+        ], "local steps run, the published ones do not"
 
 
-def test_expire_and_sweep_take_the_table_they_act_on(
+def test_evict_reclaim_and_sweep_take_the_table_they_act_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One routine per operation, the table an argument: `"staging"`,
-    `"published"`, or None for both. A misspelt table is refused, not a call
-    that silently did nothing.
+    """One routine per operation, the table an argument, None for every table
+    it acts on. A misspelt table — or one the routine does not act on — is
+    refused, not a call that silently did nothing (#119, #122).
 
-    Falsify by treating an unknown table as None: the misspelling sweeps both.
+    Falsify by treating an unknown table as None: the misspelling acts on all.
     """
     with local_log(tmp_path) as log:
         maintenance = log._maintenance  # noqa: SLF001
         called: list[str] = []
-        for name in ("expire", "expire_published", "sweep_staging", "sweep_published"):
+        for name in (
+            "evict_buffer",
+            "evict",
+            "expire",
+            "expire_published",
+            "sweep_staging",
+            "sweep_published",
+        ):
             monkeypatch.setattr(
-                maintenance, name, lambda name=name: called.append(name)
+                maintenance, name, lambda *_, name=name, **__: called.append(name)
             )
 
-        log.expire("staging")
+        buffer = log._buffer  # noqa: SLF001
+        monkeypatch.setattr(
+            buffer, "reclaim_free_pages", lambda *_: called.append("vacuum")
+        )
+
+        log.evict("buffer")
+        log.reclaim("staging")
         log.sweep("published")
-        assert called == ["expire", "sweep_published"]
+        assert called == ["evict_buffer", "expire", "sweep_published"]
 
         called.clear()
-        log.expire()
+        log.evict()
+        log.reclaim()
         log.sweep()
         assert called == [
+            "evict_buffer",
+            "evict",
+            "vacuum",
             "expire",
             "expire_published",
             "sweep_staging",
             "sweep_published",
         ]
 
-        for routine in (log.expire, log.sweep):
+        for routine, wrong in (
+            (log.evict, "published"),
+            (log.reclaim, "stagin"),
+            (log.sweep, "buffer"),
+        ):
             with pytest.raises(ValueError, match="table must be"):
-                routine("stagin")  # ty: ignore[invalid-argument-type]
+                routine(wrong)  # ty: ignore[invalid-argument-type]
 
 
 def test_advance_flush_pushes_everything_to_the_published_table(tmp_path: Path) -> None:
@@ -654,3 +679,35 @@ def test_advance_flush_pushes_everything_to_the_published_table(tmp_path: Path) 
         assert log.buffered_rows() == 0
         assert log.published_through() == ROWS
         assert log.scan().read_all().num_rows == ROWS
+
+
+def test_evict_bounds_narrow_what_is_dropped(tmp_path: Path) -> None:
+    """`[start_offset, end_offset)` narrows an eviction and never widens it, so
+    a caller can chunk a large one (#122). Staging eviction removes a prefix,
+    so a `start_offset` above the staging table's first offset is refused
+    rather than evicting nothing.
+
+    Falsify by ignoring `end_offset` in `evict_buffer`: the whole sealed range
+    goes in the first call.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        buffer = log._buffer  # noqa: SLF001
+        assert buffer.span() == (1, ROWS + 1)
+
+        log.evict("buffer", end_offset=101)
+        assert buffer.span() == (101, ROWS + 1)
+
+        log.evict("buffer", start_offset=101, end_offset=201)
+        assert buffer.span() == (201, ROWS + 1)
+
+        log.evict("buffer")
+        assert buffer.span() is None
+        assert log.scan().read_all().num_rows == ROWS
+
+        with pytest.raises(ValueError, match="removes a prefix"):
+            log.evict("staging", start_offset=2)
+
+        with pytest.raises(ValueError, match="below start_offset"):
+            log.evict("buffer", start_offset=10, end_offset=5)

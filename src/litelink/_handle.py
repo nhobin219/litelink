@@ -648,9 +648,9 @@ class LogHandle:
         authoritative, and this is where a replica-restored reader once bit.
         `next_offset` reads a sequence its own docstring calls "the highest
         value ever assigned and never lowers", so it keeps counting rows the
-        replica no longer carries: a seal taken while `_discard_on_seal()` was
-        true deletes its rows and they reach the published table only at the
-        next `publish`. In between they are in neither tier.
+        replica no longer carries: without replication, `evict("buffer")` drops
+        rows once STAGING holds them, and they reach the published table only
+        at the next `publish`. In between they are in neither tier.
 
         Measured on such a reader in that window: it served 864 rows and
         reported 1,501, and a caller using this as a resume cursor skipped 636
@@ -1901,7 +1901,7 @@ class WriteHandle(LocalReadHandle):
             covered = None if adopted is None else adopted.span()
             frontier = 0 if covered is None else covered[1]
             if covered is not None:
-                released -= buffer.release_below(covered[1])
+                released -= buffer.evict_rows(0, covered[1])
                 buffer.reseed_group()
 
             # **And the fence has to clear the PUBLISHED table, not just the
@@ -2657,8 +2657,8 @@ class WriteHandle(LocalReadHandle):
 
         That is a true statement about SCOPE, and it was briefly turned into a
         refusal — load with replication off, turn it on afterwards. Which is
-        strictly worse, because `_discard_on_seal` reads the same flag: turn
-        replication off and the next seal stops retaining its rows, so the
+        strictly worse, because `evict("buffer")` reads the same flag: turn
+        replication off and the next eviction stops retaining its rows, so the
         buffer's copy of everything ALREADY captured is dropped. Measured on a
         replicated log with a published table: 300 sealed rows retained in the
         buffer, `set_config(wal_replication=False)`, one more seal, and all 300
@@ -2820,8 +2820,8 @@ class WriteHandle(LocalReadHandle):
         `seal()` while a maintainer holds the range is left with a FRESH empty
         open group and its rows sitting in a group already queued. Checking the
         open group alone passes; the rows are below `start`, in no file; the
-        maintainer drains its queue, `_covers` declines the file, and
-        `finish_seal(discard=True)` deletes them. The resulting table is
+        maintainer drains its queue, `_covers` declines the file, and the
+        next `evict("buffer")` deletes them. The resulting table is
         contiguous, non-overlapping and undetectably wrong.
 
         `pending_seal()` is the same shape one step later, and worse: `recover()`
@@ -3186,7 +3186,7 @@ class WriteHandle(LocalReadHandle):
                 raise RuntimeError(msg)
 
             self._write_and_commit(start, end, rel_path, lease)
-            self._buffer.finish_seal(end, rel_path, discard=self._discard_on_seal())
+            self._buffer.finish_seal(end, rel_path)
         finally:
             lease.release()
 
@@ -3227,33 +3227,6 @@ class WriteHandle(LocalReadHandle):
                 return False
 
             time.sleep(_AWAIT_POLL)
-
-    def _discard_on_seal(self) -> bool:
-        """Whether a seal may drop the rows it just wrote to Parquet (§3a).
-
-        The rule is I4 one tier up: never delete the only off-box copy. What
-        counts as another copy is a property of the deployment, so this is the
-        one question, asked in one place.
-
-        - **A local published table** — nothing is off-box either way, so
-          holding buys nothing. Discard.
-        - **A remote published table, no `wal_replication`** — the buffer and
-          the Parquet share a disk and die together, so holding buys nothing
-          and costs SQLite growth. Discard.
-        - **A remote published table and `wal_replication`** — the buffer IS
-          the off-box copy until the published table has the range. Hold, and
-          let `release_below` drop them once publish has pushed it.
-
-        `validate` refuses `wal_replication` without a remote published table,
-        so the last case is just the flag — but both halves are read, because
-        the flag alone would be a claim about the published table that this
-        does not check.
-
-        Read durably on every seal rather than cached: `set_config` and
-        `set_published` both change the answer from another process, and §4a's
-        rule is that a decision reads the log rather than its own memory.
-        """
-        return not (self.config.wal_replication and self._published.remote())
 
     def _write_and_commit(
         self, start: int, end: int, rel_path: str, lease: Claim | None = None
@@ -3416,7 +3389,7 @@ class WriteHandle(LocalReadHandle):
             # delete removed the only off-box copy of a range the published
             # table does not hold, with replication on. Measured: five buffered
             # rows before the crash, zero after the recovery.
-            self._buffer.finish_seal(end, rel_path, discard=self._discard_on_seal())
+            self._buffer.finish_seal(end, rel_path)
 
             return
 
@@ -3434,7 +3407,7 @@ class WriteHandle(LocalReadHandle):
         retry = self._layout.seal_path(start, end, uuid.uuid4().hex[:8])
         self._buffer.claim_seal(start, end, retry)
         self._write_and_commit(start, end, retry, lease)
-        self._buffer.finish_seal(end, retry, discard=self._discard_on_seal())
+        self._buffer.finish_seal(end, retry)
 
     def _recover_compaction(self) -> None:
         """Resolve a compaction interrupted before its commit (§11).
@@ -3648,30 +3621,6 @@ class WriteHandle(LocalReadHandle):
         # The published span's end: everything below it is in the bucket.
         covered = published.span()
         floor = 0 if covered is None else covered[1]
-
-        # RELEASED HERE, at the top of the pass, from the published table's own
-        # span.
-        # These are rows a seal held because nothing off-box had them yet
-        # (`_discard_on_seal`); the published table now does, so they can go.
-        #
-        # Not at the tail of this method, and that placement is the whole of
-        # its crash-safety. `_push` returns early in three places before its
-        # watermark — nothing to upload, a declined register, a re-point — so a
-        # crash between `register` and a trailing release leaves the rows held,
-        # and the NEXT pass finds nothing above `floor` to push and returns
-        # before reaching the release. On a log that has gone quiet, they are
-        # held indefinitely. Driven from the frontier instead, it is idempotent
-        # and every pass retries it for free.
-        if not self._discard_on_seal() and floor:
-            # The published table's own span, and that is sound only because
-            # `_refuse_published_ahead` has already established the published
-            # table is OURS. Two narrower bounds were tried here and neither
-            # works: the watermark is raised to `floor` by `confirmed` below on
-            # every pass, and this log's own `extent` rows are written for the
-            # published table's whole manifest by the backfill within one
-            # publish pass. Both are downstream of a contamination that has to
-            # be stopped at the point the log is pointed.
-            self._buffer.release_below(floor)
 
         # The watermark reconciled against the published table itself. It is a
         # cache of what the published table holds — kept for the push floor and
@@ -3914,20 +3863,6 @@ class WriteHandle(LocalReadHandle):
         ):
             raise _repointed_mid_push()
 
-        # Again, now that this push has landed and its `record_file` rows
-        # exist. The release at the top of the pass ran before them, so on its
-        # own it frees rows one whole publish pass late — safe, since holding is
-        # the safe direction, but a busy log would carry a pass's worth it no
-        # longer needs.
-        #
-        # This one is the promptness; that one is the correctness. A crash
-        # between the register above and this line leaves rows held, and the
-        # next pass frees them from the same rows without needing anything to
-        # have been uploaded. Neither placement alone is both.
-        #
-        if not self._discard_on_seal():
-            self._buffer.release_below(last.end)
-
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.
 
@@ -4011,18 +3946,20 @@ class WriteHandle(LocalReadHandle):
         staging and in the published table; `rewrite_published` re-cuts the
         published ones.
 
+        Data moves first, then cleanup follows behind it:
+
         1. `seal` — buffer to staging;
         2. `compact` — merges a run once it has `compact_min_files` files;
         3. `publish` — staging to published, the files compaction is done with;
-        4. `reclaim_buffer`, when `vacuum_free_ratio` is set — after the seal
-           and the publish, the two steps that free buffer rows;
-        5. `evict` — staging drops what the published table now holds, in the
-           same pass;
-        6. `expire("staging")` — staging snapshots, then the staging drain;
-        7. `sweep("staging")`;
-        8. `expire("published")` — published snapshots, then the published
-           drain;
-        9. `sweep("published")`.
+        4. `evict("buffer")` — rows the next durable copy holds;
+        5. `evict("staging")` — files the published table holds, in the same
+           pass (I4);
+        6. `reclaim("buffer")`, only when `vacuum_free_ratio` is set — the one
+           step that blocks appends;
+        7. `reclaim("staging")` — expire snapshots, delete what only they used;
+        8. `sweep("staging")`;
+        9. `reclaim("published")`;
+        10. `sweep("published")`.
 
         Each is callable on its own, and that is the point of listing them: an
         orchestrator with schedules that differ because the costs do, or that
@@ -4030,8 +3967,9 @@ class WriteHandle(LocalReadHandle):
         not this (#118). Each declares its own exclusion — a claim on the
         offsets it touches, or none — so running them apart is safe.
 
-        **Every log publishes** (#98): locally by default, or to S3. **A publish that fails raises, after local maintenance**: on
-        a machine cut off from a remote published table, steps 4-7 still run —
+        **Every log publishes** (#98): locally by default, or to S3. **A
+        publish that fails raises, after local maintenance**: on a machine cut
+        off from a remote published table, steps 4-8 still run —
         eviction has nothing new to take, which is §11's "local eviction
         stalls", but expiry and the staging sweep keep reclaiming — then the
         published steps are skipped and the publish's error is raised. That
@@ -4057,48 +3995,24 @@ class WriteHandle(LocalReadHandle):
         except Exception as exc:  # noqa: BLE001 — re-raised below
             failure = exc
 
-        # Off unless `vacuum_free_ratio` is set, because this is the one part of
-        # a maintenance pass that blocks appends; see `reclaim_buffer`.
+        # Buffer before staging: the buffer's boundary is proved by staging
+        # files, which staging eviction is about to remove.
+        self.evict("buffer")
+        self.evict("staging")
+
+        # Off unless `vacuum_free_ratio` is set, because this is the one step
+        # that blocks appends; see `reclaim`.
         ratio = self.config.vacuum_free_ratio
         if ratio is not None:
-            self.reclaim_buffer(ratio)
+            self.reclaim("buffer", min_free_ratio=ratio)
 
-        self.evict()
-        self.expire("staging")
+        self.reclaim("staging")
         self.sweep("staging")
         if failure is not None:
             raise failure
 
-        self.expire("published")
+        self.reclaim("published")
         self.sweep("published")
-
-    def reclaim_buffer(self, min_free_ratio: float = 0.0) -> int:
-        """Return `buffer.db`'s dead space to the OS. Bytes reclaimed, or 0.
-
-        SQLite puts pages freed by a DELETE on a free list and never shrinks the
-        file, so a buffer that seals and publishes for months keeps every page
-        it has ever needed. Locally that is invisible — the free list is reused
-        — and it is FAILOVER that pays, because litestream replicates the FILE:
-        every `restore` downloads and applies the dead space. Measured on a
-        1-day-old capture, 457 MB holding 20,658 live rows with 92% of its pages
-        free, restoring in 12.5 s against 0.8 s vacuumed.
-
-        **Manual, because the cost lands on the write path.** `VACUUM` takes an
-        exclusive lock and rebuilds the file, so appends stall for as long as
-        the LIVE data takes to copy — 0.3 s at 35 MB. Only the deployment knows
-        whether its arrival rate can absorb that, and a writer with no off-box
-        readers can decline for ever and lose nothing but disk. Set
-        `vacuum_free_ratio` to have `advance` do it on the ordinary pass.
-
-        Call it when appends can tolerate the pause: after a batch, on a quiet
-        period, or from the same schedule that runs `advance`. Cheap to call
-        and do nothing — the check is three PRAGMAs — so it is safe in a loop.
-
-        `litelink_offset` is untouched: values keep their gaps and the
-        AUTOINCREMENT counter survives, including on a buffer the published
-        table has fully drained (I9). See `Buffer.reclaim_free_pages`.
-        """
-        return self._buffer.reclaim_free_pages(min_free_ratio)
 
     def compact(self) -> None:
         """Convert sealed files into `target_compact_size` ones (§6).
@@ -4114,35 +4028,112 @@ class WriteHandle(LocalReadHandle):
         """
         self._maintenance.compact()
 
-    def evict(self) -> None:
-        """Drop files past `staging_retention` from the staging table (§8).
+    def evict(
+        self,
+        table: Literal["buffer", "staging"] | None = None,
+        *,
+        start_offset: int | None = None,
+        end_offset: int | None = None,
+    ) -> None:
+        """Drop data the next durable copy already holds (§8, #122). `table` is
+        `"buffer"`, `"staging"`, or None for both, buffer first.
 
-        Never past what the published table holds (I4), so a publish that is
-        behind delays this rather than losing data. Claims the prefix it
-        removes.
+        One rule for both: never drop data until the next durable copy has it.
+
+        - **`"buffer"`**: rows staging holds — or, with `wal_replication`, rows
+          the published table holds, since until then the buffer is their
+          off-box copy (§3a). A seal never deletes its own rows; this does.
+        - **`"staging"`**: files past `staging_retention` / `staging_rows` that
+          the published table holds (I4). Never past what it holds, so a
+          publish that is behind delays this rather than losing data.
+
+        `[start_offset, end_offset)` — half-open, like `scan` — narrows what is
+        eligible; it never widens it. **Chunking is the caller's.** Unbounded,
+        a buffer eviction is one `DELETE` under SQLite's write lock and stalls
+        appends for its duration; bounding the range is how to keep each
+        stall short. Staging eviction always removes a PREFIX of the table, so
+        a `start_offset` above its first offset is refused with `ValueError`
+        rather than evicting nothing.
         """
-        self._maintenance.evict()
+        valid = _covers(table, "buffer", ("buffer", "staging"))
+        if (
+            start_offset is not None
+            and end_offset is not None
+            and end_offset < start_offset
+        ):
+            msg = f"end_offset {end_offset} is below start_offset {start_offset}"
+            raise ValueError(msg)
 
-    def expire(self, table: Literal["staging", "published"] | None = None) -> None:
-        """Expire snapshots past the table's retention, then delete what has
-        come due (§6, §8).
+        if valid:
+            self._maintenance.evict_buffer(start_offset, end_offset)
 
-        `table` is `"staging"` (against `staging_snapshot_retention`),
-        `"published"` (against `published_snapshot_retention`), or None for
-        both, staging first. The expiry takes no claim — it is a metadata
-        commit the catalog's compare-and-swap orders — and the delete that
-        follows takes the claim `drain` does. A published table `publish` has
-        not created yet is skipped.
+        if _covers(table, "staging", ("buffer", "staging")):
+            if start_offset is not None:
+                self._table.reload()
+                span = self._table.span()
+                if span is not None and start_offset > span[0]:
+                    msg = (
+                        f"staging eviction removes a prefix of the table, which "
+                        f"starts at offset {span[0]}; a start_offset of "
+                        f"{start_offset} would leave a gap below it"
+                    )
+                    raise ValueError(msg)
+
+            self._maintenance.evict(end_offset=end_offset)
+
+    def reclaim(
+        self,
+        table: Literal["buffer", "staging", "published"] | None = None,
+        *,
+        min_free_ratio: float = 0.0,
+    ) -> None:
+        """Turn what eviction and expiry left behind into free disk (§3a, §6,
+        #122). `table` is `"buffer"`, `"staging"`, `"published"`, or None for
+        all three, in that order.
+
+        - **`"buffer"`**: `VACUUM`, returning `buffer.db`'s dead pages to the
+          OS — when the free list is at least `min_free_ratio` of the file.
+          SQLite never shrinks the file on its own, and litestream replicates
+          the FILE, so it is failover that pays: measured on a 1-day-old
+          capture, 457 MB holding 20,658 live rows with 92% of its pages free,
+          restoring in 12.5 s against 0.8 s vacuumed. **It blocks appends**
+          for as long as the live data takes to copy (0.3 s at 35 MB), which
+          is why `advance` runs it only when `vacuum_free_ratio` is set.
+          `litelink_offset` and the AUTOINCREMENT counter are untouched (I9).
+        - **`"staging"` / `"published"`**: two steps, and **a file is not
+          deleted by the call that frees it.**
+
+          1. *Expire*: drop snapshots older than the table's snapshot
+             retention. This is metadata only; Iceberg deletes no file. Every
+             file that no remaining snapshot uses — and every file a
+             compaction or eviction superseded — has its path queued in
+             `pending_delete`, stamped with when it stopped being referenced.
+          2. *Drain*: delete the queued files whose **grace period** has
+             passed — the same snapshot retention, counted from that stamp —
+             and that no live snapshot references. The grace is what keeps a
+             scan that resolved an older snapshot from losing files under it
+             (I6).
+
+          So what this call frees is deleted by a LATER call, one retention
+          after it stopped being referenced; a retention of zero deletes it in
+          the same call. Expiry takes no claim — a metadata commit the
+          catalog's compare-and-swap orders — and the delete takes the claim
+          `drain` does. A published table `publish` has not created yet is
+          skipped.
         """
-        if _covers(table, "staging"):
+        allowed = ("buffer", "staging", "published")
+        if _covers(table, "buffer", allowed):
+            self._buffer.reclaim_free_pages(min_free_ratio)
+
+        if _covers(table, "staging", allowed):
             self._maintenance.expire()
 
-        if _covers(table, "published"):
+        if _covers(table, "published", allowed):
             self._maintenance.expire_published()
 
     def sweep(self, table: Literal["staging", "published"] | None = None) -> None:
-        """One pass of the stranded-metadata sweep (§6). `table` as for
-        `expire`: `"staging"`, `"published"`, or None for both.
+        """One pass of the stranded-metadata sweep (§6). `table` is
+        `"staging"`, `"published"`, or None for both.
 
         What a commit that lost its pointer swap, or crashed before it, left
         behind. Lists each table's `metadata/` at the first call in a process
@@ -4151,10 +4142,11 @@ class WriteHandle(LocalReadHandle):
         can run anywhere beside anything, a daemon thread included. Never
         raises; a failure is logged and retried on the next call.
         """
-        if _covers(table, "staging"):
+        allowed = ("staging", "published")
+        if _covers(table, "staging", allowed):
             self._maintenance.sweep_staging()
 
-        if _covers(table, "published"):
+        if _covers(table, "published", allowed):
             self._maintenance.sweep_published()
 
     def rewrite_published(self) -> None:
@@ -4241,6 +4233,9 @@ class WriteHandle(LocalReadHandle):
             self.await_seal()
 
         self.publish(flush=True)
+        # Buffer first, while the staging files that prove the published
+        # table holds those rows are still there to ask.
+        self._maintenance.evict_buffer()
         self._maintenance.evict(everything=True)
 
         self._table.reload()
@@ -4654,17 +4649,16 @@ def validate(
         raise ValueError(msg)
 
 
-def _covers(
-    table: Literal["staging", "published"] | None,
-    which: Literal["staging", "published"],
-) -> bool:
-    """Whether a routine's `table` argument includes `which`; None is both.
+def _covers(table: str | None, which: str, allowed: tuple[str, ...]) -> bool:
+    """Whether a routine's `table` argument includes `which`; None is all of
+    `allowed`.
 
-    Refuses anything else, so a misspelt table is an error rather than a call
-    that silently did nothing.
+    Refuses anything else, so a misspelt table — or one this routine does not
+    act on — is an error rather than a call that silently did nothing.
     """
-    if table not in (None, "staging", "published"):
-        msg = f'table must be "staging", "published" or None, not {table!r}'
+    if table is not None and table not in allowed:
+        names = ", ".join(f'"{t}"' for t in allowed)
+        msg = f"table must be one of {names} or None, not {table!r}"
         raise ValueError(msg)
 
     return table is None or table == which

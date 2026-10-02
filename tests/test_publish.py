@@ -427,7 +427,7 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
                 published_snapshot_retention=timedelta(0),
             )
         )
-        log.expire("published")
+        log.reclaim("published")
 
         for path in superseded & queued:
             assert not fs.exists(path.removeprefix("s3://")), (
@@ -1686,7 +1686,7 @@ def test_expiring_the_published_table_will_not_repair_it_without_a_claim(
 
         log._published.table = watching  # ty: ignore[invalid-assignment]
         try:
-            log.expire()
+            log.reclaim()
 
         finally:
             log._published.table = original  # ty: ignore[invalid-assignment]
@@ -2343,15 +2343,19 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         assert log.scan().read_all().num_rows == 1200
 
 
-def test_without_replication_a_seal_still_drops_its_rows(
+def test_without_replication_eviction_does_not_wait_for_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A published table alone is not the trigger.
 
     Without a sidecar the buffer and the Parquet share a disk and die together,
-    so holding buys nothing and costs SQLite growth on every seal. The gate is
-    `wal_replication`, and this is the half that proves a published table by itself
-    does not flip it.
+    so holding buys nothing and costs SQLite growth. The gate is
+    `wal_replication`, and this is the half that proves a published table by
+    itself does not flip it: `evict("buffer")` drops what a seal committed to
+    staging, with nothing published yet (#122).
+
+    Falsify by having `evict_buffer` use the published table's coverage
+    whenever one is remote: nothing is published, so nothing is dropped.
     """
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
     with litelink.new(
@@ -2364,6 +2368,7 @@ def test_without_replication_a_seal_still_drops_its_rows(
     ) as log:
         log.extend(rows(1200))
         log.seal()
+        log.evict("buffer")
 
         sealed = log.staging_extent()
 
@@ -2843,7 +2848,8 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
     `_recover_seal` has two exits. The one that finds the file already
     committed retired the group with the default `discard=True`, so it deleted
     rows the published table had not taken — the only off-box copy — while the sibling
-    exit eighteen lines below passed the flag correctly.
+    exit eighteen lines below passed the flag correctly. A seal no longer
+    deletes rows on any exit (#122); this keeps both honest.
     """
     where = f"s3://{bucket}/recovered"
     config = replace(

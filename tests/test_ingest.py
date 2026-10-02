@@ -269,7 +269,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     """It used to refuse this, and refusing was strictly worse.
 
     WAL shipping genuinely cannot carry a bulk range — those rows never enter
-    the buffer. But `_discard_on_seal` reads the same flag, so the prescribed
+    the buffer. But `evict("buffer")` reads the same flag, so the prescribed
     workaround of turning replication off to load would drop the buffer's copy
     of everything already captured: to protect rows that cannot be replicated,
     it stripped the off-box copy from rows that were.
@@ -277,7 +277,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     The load now pushes its own output, so the scope statement is narrower than
     it was: WAL still cannot carry a bulk range, but the published table has it before
     `ingest` returns. Note the knock-on asserted below — the push is a PREFIX,
-    so it takes the captured rows as well, and `release_below` then drops
+    so it takes the captured rows as well, and `evict("buffer")` then drops
     what the published table holds. The rows move from buffer to bucket; they are never
     in neither.
     """
@@ -311,7 +311,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
         assert log.scan().read_all().num_rows == 800
         # The captured rows still have an off-box copy — the load did not strip
         # it, which is the whole of what refusing got wrong. They have MOVED,
-        # though: the load's own publish pushed them, and `release_below` then
+        # though: the load's own publish pushed them, and `evict("buffer")` then
         # dropped what the published table had taken. Buffer or bucket, never neither.
         assert log.published_through() >= retained
         # And the loaded range is second-copied too, which is the point of

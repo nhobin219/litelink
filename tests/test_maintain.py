@@ -1012,7 +1012,7 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
 
         log.publish(flush=True)
         log.evict()
-        log.expire()
+        log.reclaim()
 
         assert log._table.data_files() == [], "eviction must run on its own"
         # Every row still reads: the evicted ones from the published table,
@@ -1505,7 +1505,7 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
         assert other.acquire()
 
         try:
-            log.expire()
+            log.reclaim()
 
             # Expiry queues MORE as it goes, so what matters is that the
             # entries already due are still due: nothing was unlinked.
@@ -1515,7 +1515,7 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
         finally:
             other.release()
 
-        log.expire()
+        log.reclaim()
 
         assert not set(queued) & set(log._buffer.due_deletions(2**62)), (
             "never drained once the log was free"
@@ -1571,7 +1571,7 @@ def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
         Claim.acquire = losing
         try:
             with pytest.raises(RuntimeError, match="lost the"):
-                log.expire()
+                log.reclaim()
 
         finally:
             Claim.acquire = original

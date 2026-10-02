@@ -345,8 +345,8 @@ be the real crossing, and there is deliberately none.
 **`wal_replication` is a declaration, not a supervisor.** This paragraph used to say the
 opposite — that replication is not configured in `LogConfig`, because a boolean claiming a
 sidecar was running would be a setting nothing reads. The flag exists now, and it is read:
-`_discard_on_seal` consults it on every seal to decide whether the rows stay in SQLite until
-the published table has them, and `validate` refuses it without a remote (`s3://`) published
+`evict("buffer")` consults it to decide whether rows stay in SQLite until the published table
+has them, and `validate` refuses it without a remote (`s3://`) published
 table to ship to and refuses `wal_retention` without it. What it still does not do is assert
 that a sidecar is running, which the library cannot know. So it states an intent the deployment has to honour, and
 stating it falsely costs the growth without buying the durability that growth was traded
@@ -395,15 +395,16 @@ of a range the published table did not hold yet — and the machine dying in tha
 from the MIDDLE of the offset space: below the seal frontier so the buffer no longer had
 them, above the published frontier so the bucket did not either.
 
-**So a seal keeps its rows when `wal_replication` is on**, and `publish` drops them once the
-published table holds the range. It is I4 one tier up: never delete the only off-box copy. Reads
-are unaffected — the buffer leg is bounded by the staging table's committed extent (§7), so
-held rows never reach the engine — and the cost is that `buffer.db` grows with publish lag,
-which a stalled publish makes unbounded, like a stalled eviction (§11).
+**So a seal never deletes its rows; `evict("buffer")` does** (#122), and with `wal_replication`
+on it waits until the published table holds the range. It is I4 one tier up: never drop data
+until the next durable copy has it. Reads are unaffected — the buffer leg is bounded by the
+staging table's committed extent (§7), so held rows never reach the engine, and a scan that
+ends below that extent skips the buffer entirely — and the cost is that `buffer.db` grows with
+publish lag, which a stalled publish makes unbounded, like a stalled eviction (§11).
 
 The gate is `wal_replication`, not "a published table is configured": with no sidecar the buffer
-and the Parquet share a disk and die together, so holding buys nothing. With neither, a
-seal discards as it always did, because nothing would ever release the rows.
+and the Parquet share a disk and die together, so the next durable copy is staging, and
+`evict("buffer")` drops rows as soon as a seal has committed them there.
 
 ```
 RPO = WAL replication lag        (with wal_replication)
@@ -1022,7 +1023,7 @@ Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
    has finished with (`stable_prefix`), or every one with flush.
 2. published.add_files([...published paths...])  -- register, ONE commit; no data movement
 3. Record each file's published copy in `extent`, and the watermark in `meta`.
-4. (expire("published"), its own routine) Expire the published table's snapshots older than
+4. (reclaim("published"), its own routine) Expire the published table's snapshots older than
    published_snapshot_retention, delete what that frees once due; then sweep stranded
    metadata (§6).
 ```
@@ -1035,7 +1036,7 @@ never need the same overwrite applied twice. Re-cutting what is already publishe
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).
 
-**Step 4 is its own routine, `expire("published")`, not part of `publish`.** `advance()` runs it
+**Step 4 is its own routine, `reclaim("published")`, not part of `publish`.** `advance()` runs it
 right after `publish` (§12), and an orchestrator can run it on its own schedule. Until #113 the
 published table was expired only after `rewrite_published`, on the reasoning that `publish`
 never supersedes a file. True of data files and not of Iceberg's own: a table that was only
@@ -1532,8 +1533,8 @@ Raising it is an operation, not a config change: `hydrate(since=…)` fetches pu
 and re-registers them into the staging table. Without it, a raised setting applies only to
 data captured afterwards.
 
-Buffer rows are deleted once something off-box holds them — at seal, or at publish with
-`wal_replication` (§3a). There is no SQLite retention knob.
+Buffer rows are deleted by `evict("buffer")` once the next durable copy holds them — staging,
+or the published table with `wal_replication` (§3a). There is no SQLite retention knob.
 
 ---
 
@@ -1835,7 +1836,7 @@ The consequence worth planning for is that local disk holds roughly
    lease is not a failure — so a writer that appends and calls `seal()` while a maintainer
    holds the range is left with a FRESH empty open group and its rows in a group already
    queued. Asking only the open group passes; the rows are below `lo`, in no file; the
-   maintainer drains its queue, the register is declined, and `finish_seal(discard=True)`
+   maintainer drains its queue, the register is declined, and the next `evict("buffer")`
    deletes them into a table that is contiguous, non-overlapping and undetectably wrong.
    The check is three reads — `pending_group()`, `pending_seal()`, and the open group's
    `start_offset` — and they are complete because of the CALL GRAPH rather than because they

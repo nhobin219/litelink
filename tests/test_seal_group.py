@@ -341,7 +341,8 @@ def test_the_read_cache_never_hides_rows_a_seal_raced_past(tmp_path: Path) -> No
     """The boundary and the first buffered row are not the same number.
 
     A reader resolves the tier boundary, then reads the buffer above it. A seal
-    landing between those two steps deletes the rows in between, so the cache
+    and an `evict("buffer")` landing between those two steps delete the rows
+    in between, so the cache
     gets built from a boundary lower than its own first row. Recording the
     boundary as though it were the row before the first made the slice
     arithmetic count from a row that no longer existed — and an over-long Arrow
@@ -354,10 +355,12 @@ def test_the_read_cache_never_hides_rows_a_seal_raced_past(tmp_path: Path) -> No
     with open_log(tmp_path, quiet()) as log:
         buffer = log._buffer
         buffer.append(rows(300))
-        # A seal committed and dropped offsets 1..200. Claimed first, because
-        # `finish_seal` only clears the claim it is given.
+        # A seal committed offsets 1..200 and an eviction dropped them. Claimed
+        # first, because `finish_seal` only clears the claim it is given; the
+        # seal itself leaves the rows, which is `evict("buffer")`'s to drop.
         buffer.claim_seal(1, 201, "sealed")
         buffer.finish_seal(201, "sealed")
+        buffer.evict_rows(0, 201)
 
         # A reader whose boundary was still 100 when it looked.
         assert buffer.rows_from(101).num_rows == 100

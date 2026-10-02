@@ -469,9 +469,10 @@ class Reader:
         # only BEFORE its rows are read — skipping that read is the point.
         # Sound whenever it is taken: the lowest offset only rises, so a
         # query below it now matches nothing the buffer can later hold.
+        boundary = None if floor is None else floor[1]
         tail = (
-            self._buffer.rows_from(None if floor is None else floor[1])
-            if self._buffer_could_match(found)
+            self._buffer.rows_from(boundary)
+            if self._buffer_could_match(found, boundary)
             else self._buffer.no_rows()
         )
 
@@ -508,13 +509,23 @@ class Reader:
 
         return _cast_to(reader, self._schema)
 
-    def _buffer_could_match(self, found: tuple[Term, ...]) -> bool:
-        """Whether the buffer could hold a row matching `found`, by offset alone.
+    def _buffer_could_match(
+        self, found: tuple[Term, ...], boundary: int | None = None
+    ) -> bool:
+        """Whether the buffer's leg could hold a row matching `found`, by offset
+        alone.
 
         The buffer has no column statistics — computing them would cost the
-        read this avoids — but `litelink_offset` is the log's sequence, so its
-        range is known: from its lowest offset up, open-ended, since rows keep
-        arriving. A query entirely below that range cannot match it.
+        read this avoids — but `litelink_offset` is the log's sequence, so the
+        leg's range is known: from the higher of its lowest offset and
+        `boundary` (the staging table's end, below which the leg reads
+        nothing) up, open-ended, since rows keep arriving. A query entirely
+        below that cannot match it.
+
+        The boundary matters because a seal no longer deletes its rows (#122):
+        until `evict("buffer")` runs, the buffer's lowest offset is a sealed
+        row the leg will never return, and pruning on it alone stopped ruling
+        the buffer out for any scan below the tail.
         """
         # Closed by `retire()`: an empty range at the log's end, which no
         # query needs, with offset terms or without.
@@ -529,6 +540,9 @@ class Reader:
         lowest = self._buffer.lowest_offset()
         if lowest is None:
             return True
+
+        if boundary is not None:
+            lowest = max(lowest, boundary)
 
         unit = entry(BUFFER, (lowest, None), self._schema, UNKNOWN)
 

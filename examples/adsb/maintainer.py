@@ -109,15 +109,17 @@ def compact_pass(log: WriteHandle) -> str | None:
 
 
 def reclaim_pass(log: WriteHandle, root: Path) -> str | None:
-    """Settle, evict past `staging_retention`, expire, delete what came due.
+    """Evict what the next copy holds, then reclaim staging and published:
+    expire snapshots and delete what came due. Not the buffer's `VACUUM`,
+    which blocks appends and is `vacuum_free_ratio`'s to decide.
 
-    Settling first because eviction never goes above the watermark (§4a), and
-    on a log with no published table nothing else moves it — `publish` is the step that
-    moves it when there is one, and does not run here.
+    Staging eviction never goes past what the published table holds (I4), and
+    `publish` is the step that moves that, in its own role here.
     """
     before = log.staging_files()
     log.evict()
-    log.expire()
+    log.reclaim("staging")
+    log.reclaim("published")
     after = log.staging_files()
     if after == before:
         return None
@@ -493,7 +495,8 @@ def _reclaim(log: WriteHandle) -> Callable[[], None]:
 
     def run() -> None:
         log.evict()
-        log.expire()
+        log.reclaim("staging")
+        log.reclaim("published")
 
     return run
 

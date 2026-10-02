@@ -88,7 +88,7 @@ def test_the_cache_answers_exactly_what_an_uncached_read_would(
                 lowest = buffer.lowest_offset()
                 if lowest is not None:
                     cut = lowest + rng.randint(0, 15)
-                    buffer.release_below(cut)
+                    buffer.evict_rows(0, cut)
                     released = max(released, cut)
             elif roll < 0.5:
                 # A hole no buffered row will ever fill, as `ingest` leaves.

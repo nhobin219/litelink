@@ -124,17 +124,17 @@ streams.
   §4 step 1   with _lock:                   │    merge undersized runs
     lease.acquire() ─► lose? return         │    (intent → `compacting`)
     take (start, end) FROM THE QUEUE        │
-    claim_seal(start, end, path)            ├─ evict()   ← staging_retention
+    claim_seal(start, end, path)            ├─ evict()   ← buffer, then staging_retention
        └─ path recorded BEFORE the          │    drop files from the table,
           file exists  (I2)                 │    ENQUEUE their paths.
                                             │    never unlinks here
   §4 step 2   NO _lock  ← all the cost      │
-    rows_between(start,end) on 2nd conn      └─ expire() → drain()
+    rows_between(start,end) on 2nd conn      └─ reclaim() → drain()
     sort → write Parquet → fsync                 snapshots past
     commit to Iceberg ────────────────┐          staging_snapshot_retention,
                                       │          then unlink files whose grace
   §4 step 3   with _lock:             │          has passed, in the SAME
-    DELETE rows < end IF discarding   │          txn that clears the queue
+    rows STAY (evict("buffer") drops) │          txn that clears the queue
     NAME the extent's row             │
     lease.release()                   ▼
                     ┌─────────────────────────────┐
@@ -149,18 +149,17 @@ streams.
 
 Two different things get called "eviction". They happen in different roles:
 
-- **Buffer rows** are deleted by the **maintainer**, and WHEN depends on one setting.
-  Without `wal_replication` they go at step 3 of a seal, once the Iceberg commit has
-  landed. With it, the seal keeps them and `publish` drops them once the published table holds the
-  range — a seal moves rows into a Parquet file no sidecar replicates, so deleting them
-  earlier removes the only off-box copy (§3a). `WriteHandle._discard_on_seal` is the one place
-  that decides. The appending call never does either. The delete takes the write lock
-  briefly, so a concurrent append waits for it — but it is a delete by primary key, not
-  work proportional to the seal.
+- **Buffer rows** are deleted by `evict("buffer")`, never by a seal or a publish (#122), and
+  WHEN depends on one setting. Without `wal_replication` they go once a seal has committed
+  them to staging. With it, they stay until the published table holds the range — a seal
+  moves rows into a Parquet file no sidecar replicates, so deleting them earlier removes the
+  only off-box copy (§3a). `Maintenance.evict_buffer` is the one place that decides. The
+  delete is one statement under the write lock, so a concurrent append waits for it; its
+  `start_offset` / `end_offset` bounds are how a caller keeps each wait short.
 - **Parquet files** are removed from the table by the **maintainer** under
-  `staging_retention`, and *unlinked* only later by `drain()`, once
+  `staging_retention`, and *unlinked* only later by `reclaim("staging")`'s drain, once
   `staging_snapshot_retention` has passed. The published table's are expired and drained by
-  `publish`, against `published_snapshot_retention`.
+  `reclaim("published")`, against `published_snapshot_retention`.
 
 A file's path is written to SQLite **before** the file is created (`sealing`,
 `compacting`) and again before it is deleted (`pending_delete`). So no file can exist on
