@@ -720,6 +720,13 @@ whole-log operations that re-point or re-cut the published table. Two cases take
 instead: a publish that must write the tier row, since that exact rollup must not race
 eviction widening it, and a published table only a repairing open can reach.
 
+The range is chosen before it is claimed, so the tier row can vanish in between. A push holding
+only a range then cannot write the row, so it pushes nothing, **logs a warning**, and leaves the
+next publish to claim the whole log. Only something dropping the row concurrently reaches this,
+so it is a guard rather than a path, but a publish that silently did nothing would leave rows
+local a pass longer with no sign of why. Two publishes on disjoint ranges can also finish out
+of order, so the watermark write is a rising one: it never lowers what another recorded.
+
 **And everything a pass reads to decide a deletion is read under its claim, not before it.**
 `publish` learned this for itself and eviction did not, though it acts on the same facts: it
 read the published location, and the policy, before claiming anything. `set_published` is

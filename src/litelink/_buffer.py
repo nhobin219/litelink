@@ -2053,7 +2053,12 @@ class Buffer:
             return moved
 
     def set_meta_if(
-        self, key: str, expected: str | None, pairs: Mapping[str, str]
+        self,
+        key: str,
+        expected: str | None,
+        pairs: Mapping[str, str],
+        *,
+        rising: bool = False,
     ) -> bool:
         """Write `pairs`, but only while `meta[key]` still reads `expected`.
 
@@ -2075,11 +2080,23 @@ class Buffer:
 
         Returns whether the write happened, so callers can decline rather than
         record something they no longer have the right to record.
+
+        `rising` makes every value a watermark that only ever goes up: an
+        integer already stored above the one given is kept. In the same
+        transaction, because two publishes on disjoint ranges can finish out
+        of order (#118), and a read-then-write max would let the slower one
+        lower what the faster recorded.
         """
         with self._transaction():
             current = _meta_value(self._con, key) or None
             if current != (expected or None):
                 return False
+
+            if rising:
+                pairs = {
+                    name: str(max(int(value), int(_meta_value(self._con, name) or 0)))
+                    for name, value in pairs.items()
+                }
 
             _write_meta(self._con, pairs)
             return True

@@ -20,6 +20,7 @@ import contextlib
 import functools
 import itertools
 import json
+import logging
 import random
 import threading
 import time
@@ -113,6 +114,8 @@ _AWAIT_POLL = 0.05
 # gives up. Long enough to cover an ordinary merge, short enough that a wedged
 # log is reported rather than hung.
 _SETTINGS_WAIT_S = 10.0
+
+_log = logging.getLogger(__name__)
 
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
@@ -3591,7 +3594,14 @@ class WriteHandle(LocalReadHandle):
         if not self._tiers.has():
             return whole, None
 
-        published = self._published.table()
+        try:
+            published = self._published.table()
+        except ValueError:
+            # The catalog names another prefix — a re-point from before 0.7
+            # left it half done — and only a repairing open, under the whole
+            # log, may fix it. `_push` does, as every publish did before.
+            return whole, None
+
         if published is None:
             return whole, None
 
@@ -3695,9 +3705,27 @@ class WriteHandle(LocalReadHandle):
         # eviction does.
         if not self._tiers.has():
             if bound is not None:
-                # Dropped since the range was chosen — a `set_published`
-                # landed between the two — and computing it exactly needs the
-                # whole log. Nothing pushed; the next publish claims it.
+                # The row vanished between `_publish_lease` choosing a range
+                # and this claim being taken. Writing it is an exact rollup
+                # that must not race eviction's `widen` (`_tiers`), so it needs
+                # the whole log — and this push holds only a range. So it
+                # pushes NOTHING, and the next publish, finding no row, claims
+                # the whole log and writes it.
+                #
+                # Only something dropping the row concurrently reaches here: a
+                # re-point did, before the published location became fixed at
+                # creation (#118); `restore` drops it too, but before any
+                # publish on that machine. So this is a guard rather than a
+                # path — and a publish that silently did nothing is exactly
+                # what an operator wants to hear about, since every row it
+                # would have pushed stays local one pass longer.
+                _log.warning(
+                    "litelink: publish of %s pushed nothing: the published "
+                    "table's tier row was dropped while the push was claiming "
+                    "its range; the next publish claims the whole log and "
+                    "pushes",
+                    self._layout.directory,
+                )
                 return
 
             self._record_published_row(published)
@@ -3720,7 +3748,10 @@ class WriteHandle(LocalReadHandle):
         # Stored as the last offset held, so one below the span's end.
         confirmed = max(self._maintenance.published_through(), floor - 1)
         self._buffer.set_meta_if(
-            _PUBLISHED_KEY, pinned, {Maintenance.PUBLISHED_THROUGH_KEY: str(confirmed)}
+            _PUBLISHED_KEY,
+            pinned,
+            {Maintenance.PUBLISHED_THROUGH_KEY: str(confirmed)},
+            rising=True,
         )
 
         memory = self._maintenance.memory()
@@ -3948,6 +3979,9 @@ class WriteHandle(LocalReadHandle):
             _PUBLISHED_KEY,
             pinned,
             {Maintenance.PUBLISHED_THROUGH_KEY: str(last.end - 1)},
+            # Never lowered: another publish on a disjoint range (#118) can
+            # have recorded a higher one while this push was registering.
+            rising=True,
         ):
             raise _repointed_mid_push()
 

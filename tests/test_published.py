@@ -18,8 +18,9 @@ import pytest
 
 import litelink
 from litelink import OFFSET, LogConfig, RetiredError, WriteHandle
-from litelink._claim import Claim, new_owner
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._layout import Layout
+from litelink._published import PUBLISHED_KEY
 from litelink._read import Reader
 from litelink._table import VERSION_HINT
 from tests.test_publish import ROWS, SCHEMA, rows
@@ -850,3 +851,84 @@ def test_two_publishes_exclude_each_other_with_nothing_to_push(
                 log.publish()
         finally:
             lease.release()
+
+
+def test_a_push_whose_tier_row_vanished_warns_and_pushes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Case 3 (#118): the tier row dropped between `_publish_lease` choosing a
+    range and the claim being taken. Writing the row needs the whole log, so
+    the push does nothing — and says so, since every row it would have pushed
+    stays local a pass longer. The next publish claims the whole log and
+    pushes.
+
+    Falsify by returning silently: the warning is missing.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+
+        chosen = log._publish_lease  # noqa: SLF001
+
+        def dropping(*, flush: bool) -> tuple[Claim, int | None]:
+            lease, bound = chosen(flush=flush)
+            log._tiers.drop()  # noqa: SLF001 — the concurrent drop
+            return lease, bound
+
+        monkeypatch.setattr(log, "_publish_lease", dropping)
+        log.publish(flush=True)
+
+        assert "pushed nothing" in caplog.text
+        assert log.published_through() == ROWS
+
+        monkeypatch.undo()
+        log.publish(flush=True)
+        assert log.published_through() == 2 * ROWS
+
+
+def test_the_published_watermark_never_moves_down(tmp_path: Path) -> None:
+    """Two publishes on disjoint ranges can finish out of order (#118). The
+    slower one's write must not lower what the faster recorded — so the raise
+    is atomic, in the same transaction as its guard.
+
+    Falsify by dropping `rising` from `set_meta_if`: the watermark falls back
+    to the slower publish's end.
+    """
+    with local_log(tmp_path) as log:
+        buffer = log._buffer  # noqa: SLF001
+        where = buffer.get_meta(PUBLISHED_KEY)
+        assert buffer.set_meta_if(PUBLISHED_KEY, where, {"published_through": "12000"})
+        assert buffer.set_meta_if(
+            PUBLISHED_KEY, where, {"published_through": "8000"}, rising=True
+        )
+        assert buffer.get_meta("published_through") == "12000"
+
+
+def test_a_mismatched_catalog_sends_publish_to_the_whole_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog naming another prefix — a re-point from before 0.7 left half
+    done — can only be repaired by a whole-log claim holder. A range-claimed
+    publish would raise on every pass instead of repairing it, as publish did
+    before (#118).
+
+    Falsify by letting the `ValueError` out of `_publish_lease`: publish
+    raises "a maintenance pass repairs this".
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+
+        def mismatched(*, repair: bool = False) -> None:
+            msg = "the published catalog names another prefix"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(log._published, "table", mismatched)  # noqa: SLF001
+        lease, bound = log._publish_lease(flush=False)  # noqa: SLF001
+
+        assert bound is None
+        assert (lease.start, lease.end) == (0, EVERYTHING)
