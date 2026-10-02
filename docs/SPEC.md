@@ -37,8 +37,8 @@ not a service, so this costs no daemon.
 
 ### The pipeline
 
-Every step a row goes through, in the order `advance()` runs them (§12), and the cleanup that
-follows each table after the last step that can change it:
+Every step a row goes through, in the order `advance()` runs them (§12): steps 1–3 move rows
+along, and steps 4–10 clean up what they left behind.
 
 ```
   log.append(row) · log.extend(rows)        durable on return: SQLite, synchronous=FULL
@@ -58,7 +58,7 @@ follows each table after the last step that can change it:
   │ published        Iceberg  │   local by default, or s3://
   └───────────────────────────┘
 
-  then, behind the rows, each table after the last step that can change it:
+  then cleanup:
      4. evict("buffer")        rows staging holds (published, with wal_replication)
      5. evict("staging")       files published holds, never before (I4)
      6. reclaim("buffer")      VACUUM buffer.db         only with vacuum_free_ratio

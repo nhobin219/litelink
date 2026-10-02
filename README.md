@@ -56,8 +56,8 @@ duckdb.sql("""
 The published table holds what `publish` has pushed, which trails the buffer by the publish
 interval; rows newer than that are readable through litelink on the writer's machine.
 
-Rows move through three tables, and `advance()` moves them. It runs every step in the order
-rows travel, then cleans up behind them, each table after the last step that can change it:
+Rows move through three tables: buffer, staging and published. `advance()` runs steps 1–3 to
+move them along, then steps 4–10 to clean up what they left behind:
 
 ```
   log.append(row) · log.extend(rows)        durable on return: SQLite, synchronous=FULL
@@ -77,7 +77,7 @@ rows travel, then cleans up behind them, each table after the last step that can
   │ published        Iceberg  │   local by default, or s3://
   └───────────────────────────┘
 
-  then, behind the rows, each table after the last step that can change it:
+  then cleanup:
      4. evict("buffer")        rows staging holds (published, with wal_replication)
      5. evict("staging")       files published holds, never before (I4)
      6. reclaim("buffer")      VACUUM buffer.db         only with vacuum_free_ratio

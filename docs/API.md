@@ -535,8 +535,8 @@ log.reclaim(table=None, *, min_free_ratio=0.0) -> None  # "buffer" | "staging" |
 log.sweep(table=None) -> None                           # "staging" | "published"
 ```
 
-`advance()` is the one call most deployments want: the whole pipeline, in the order rows move
-from the buffer to the published table, each table swept after the last step that can change it.
+`advance()` is the one call most deployments want. It runs the whole pipeline: steps 1–3 move
+rows from the buffer to the published table, and steps 4–10 clean up what they left behind.
 
 1. `seal()`: buffer → staging.
 2. `compact()`: merges a run once it has `compact_min_files` files that fit the target.
