@@ -59,14 +59,14 @@ def test_the_websocket_example_builds_a_readable_log(tmp_path: Path) -> None:
     with litelink.new(tmp_path, "trades", schema=module.SCHEMA, config=config) as log:
         for index in range(400):
             log.append(module.row({**frame, "id": frame["id"] + index}))
-            log.seal_due()
+            log.seal()
 
-        while log.seal() is not None:
+        while log.seal(flush=True) is not None:
             pass
 
         # Reached Parquet rather than only SQLite, which is what calling
-        # `seal_due` in the loop is for — and the closing `seal()` is what gets
-        # the OPEN group there, which `seal_due` alone never does.
+        # `seal()` in the loop is for — and the closing `seal(flush=True)` is
+        # what gets the OPEN group there, which `seal()` alone never does.
         assert log.staging_files() > 0
         assert log.buffered_rows() == 0
         assert log.scan().read_all().num_rows == 400

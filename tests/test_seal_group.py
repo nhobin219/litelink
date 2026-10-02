@@ -72,7 +72,7 @@ def quiet(**kwargs: object) -> LogConfig:
     """The ordinary config. Nothing seals unless a test asks it to.
 
     There is no sealer to quieten any more: appending records cuts and
-    `seal`/`seal_due` are the only things that write files, so the queue stays
+    `seal`/`seal` are the only things that write files, so the queue stays
     exactly as the appends left it.
     """
     settings: dict[str, object] = {
@@ -154,8 +154,8 @@ def test_a_sealer_that_falls_behind_still_writes_sized_files(tmp_path: Path) -> 
 
         # One call drains the whole backlog: it cuts what is still open, then
         # seals everything up to that cut.
-        assert log.seal() is not None
-        assert log.seal() is None, "left work behind"
+        assert log.seal(flush=True) is not None
+        assert log.seal(flush=True) is None, "left work behind"
         assert log.staging_files() == len(queued) + 1, (
             f"{len(queued)} queued plus the open group, {log.staging_files()} files"
         )
@@ -191,14 +191,14 @@ def test_an_explicit_seal_cuts_its_own_rows_whatever_else_is_running(
 
         def maintain() -> None:
             while not stop.wait(0.001):
-                log.seal_due()
+                log.seal()
 
         draining = threading.Thread(target=maintain)
         draining.start()
         try:
             for i in range(8):
                 log.extend(rows(20, start=i * 20))
-                log.seal()
+                log.seal(flush=True)
         finally:
             stop.set()
             draining.join(30)
@@ -245,7 +245,7 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
         assert log._buffer.pending_group() == group, "the group was retired early"
 
         # The next sealer must finish it rather than redo it.
-        assert log.seal_due() == end
+        assert log.seal() == end
         assert log._buffer.pending_group() is None, "the queue never drained"
         assert log.staging_files() == 1, "the file was written twice"
         assert log.staging_rows() == 100
@@ -254,7 +254,7 @@ def test_a_seal_that_died_after_its_commit_does_not_wedge_the_queue(
 def test_an_empty_group_is_never_closed(tmp_path: Path) -> None:
     """`seal()` on an untouched log has nothing to write, not an empty file."""
     with open_log(tmp_path, quiet()) as log:
-        assert log.seal() is None
+        assert log.seal(flush=True) is None
         assert log._table.data_files() == []
 
 
@@ -272,7 +272,7 @@ def test_a_quiet_stream_keeps_its_rows_in_the_buffer(tmp_path: Path) -> None:
     with open_log(tmp_path, quiet()) as log:
         log.extend(rows(3))
 
-        assert log.seal_due() is None, "sealed without reaching target_seal_size"
+        assert log.seal() is None, "sealed without reaching target_seal_size"
         assert log._table.data_files() == [], "wrote an undersized file"
         assert log.buffered_rows() == 3, "the rows went somewhere else"
         assert len(log.scan().read_all()) == 3, "buffered rows must still read"
@@ -283,8 +283,8 @@ def test_only_an_explicit_seal_cuts_short(tmp_path: Path) -> None:
     with open_log(tmp_path, quiet()) as log:
         log.extend(rows(3))
 
-        assert log.seal_due() is None, "something cut without being asked"
-        assert log.seal() is not None, "an explicit seal must still cut"
+        assert log.seal() is None, "something cut without being asked"
+        assert log.seal(flush=True) is not None, "an explicit seal must still cut"
         assert log.staging_files() == 1
 
 
@@ -323,7 +323,7 @@ def test_the_read_cache_is_bounded_by_the_unsealed_tail(tmp_path: Path) -> None:
             assert log._buffer._tail is not None
             assert log._buffer._tail.num_rows > 0, "nothing was cached to release"
 
-            log.seal()
+            log.seal(flush=True)
             log.scan().read_all()
 
             assert log._buffer._tail is not None
@@ -443,7 +443,7 @@ def test_a_retried_seal_takes_a_new_name_and_queues_the_old(tmp_path: Path) -> N
         log._layout.absolute(abandoned).parent.mkdir(parents=True, exist_ok=True)
         log._layout.absolute(abandoned).write_bytes(b"half a parquet file")
 
-        assert log.seal_due() == end
+        assert log.seal() == end
 
         claimed = [f.path for f in log._table.data_files()]
 
@@ -475,7 +475,7 @@ def test_a_second_commit_for_a_sealed_range_is_declined(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(60))
-        end = log.seal()
+        end = log.seal(flush=True)
 
         assert end is not None
         assert log.staging_files() == 1
@@ -534,11 +534,11 @@ def test_a_row_capped_cut_is_not_undone_by_compaction(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(40))
-        log.seal_due()
+        log.seal()
         before = len(log._table.data_files())
         assert before >= 3, "the row cap must have produced several files"
 
-        log.maintain()
+        log.advance()
 
         after = log._table.data_files()
         assert len(after) == before, "compaction must not merge past the ceiling"

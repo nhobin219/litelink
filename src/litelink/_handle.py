@@ -1167,7 +1167,7 @@ class WriteHandle(LocalReadHandle):
     Single writer per log (§1): SQLite's write lock is per file, and one process
     per stream is the intended topology.
 
-    Threads within that process are fine, and scheduling `maintain()` on a
+    Threads within that process are fine, and scheduling `advance()` on a
     background thread is the expected shape — every public method takes one
     lock. A second *process* is not: maintenance commits to the catalog and
     writes the buffer database, so it is a writer, and two of those is the case
@@ -2440,7 +2440,7 @@ class WriteHandle(LocalReadHandle):
 
             # Under the maintain lease, because a rewrite IS a compaction —
             # same claim record, same deterministic output path, same commit.
-            # Without it this reached that path beside a running `maintain()`
+            # Without it this reached that path beside a running `advance()`
             # in another process: two writers to one `compaction_path`, and a
             # single-row `compacting` intent each would clear from under the
             # other, leaving a half-written file nothing could name.
@@ -2596,8 +2596,8 @@ class WriteHandle(LocalReadHandle):
         # No lock. `Buffer` serialises its own connection, which is the only
         # thing two appending threads share — and the append decides nothing
         # beyond the cut it records (see `extent`). It does not measure,
-        # compare, signal, or start anything: a maintainer calls `seal_due` and
-        # finds the work waiting, exactly as it calls `maintain` and finds
+        # compare, signal, or start anything: a maintainer calls `seal` and
+        # finds the work waiting, exactly as it calls `advance` and finds
         # files to compact.
         return self._buffer.append(rows)
 
@@ -2770,7 +2770,7 @@ class WriteHandle(LocalReadHandle):
         # it merges files the push would then take instead, which is the same
         # rows by another name.
         #
-        # `push_unsettled`, because the trailing run is precisely what has no
+        # `flush`, because the trailing run is precisely what has no
         # second copy — `stable_prefix` holds a load's short last file back for
         # a merge that a quiet stream never earns.
         if loaded is not None and publish:
@@ -2784,7 +2784,7 @@ class WriteHandle(LocalReadHandle):
                 # Measured on five small seals: six undersized objects pushed
                 # without this, one with it.
                 self.compact()
-                self.publish(push_unsettled=True)
+                self.publish(flush=True)
             except Exception as exc:
                 # The LOAD succeeded and its rows are durable in Parquet; only
                 # the second copy is missing. Saying so leading with that is the
@@ -2794,7 +2794,7 @@ class WriteHandle(LocalReadHandle):
                     f"loaded offsets [{loaded[0]}, {loaded[1]}) successfully, but "
                     f"could not push them to the published table: {exc}. The rows are in "
                     f"local Parquet and are NOT yet second-copied; retry with "
-                    f"publish(push_unsettled=True) rather than re-running the "
+                    f"publish(flush=True) rather than re-running the "
                     f"load, which would reserve a new range"
                 )
                 raise RuntimeError(msg) from exc
@@ -2994,8 +2994,28 @@ class WriteHandle(LocalReadHandle):
 
     # -- seal ---------------------------------------------------------------
 
-    def seal(self) -> int | None:
-        """Cut everything buffered into files. Returns the exclusive end offset.
+    def seal(self, *, flush: bool = False) -> int | None:
+        """Buffer → staging: write the groups the size trigger has cut. Returns
+        the exclusive end offset of the last group written, or None.
+
+        `flush=True` cuts and seals EVERYTHING buffered, however small — the
+        same flag `publish` and `advance` take, with the same meaning: push
+        everything through this stage now, regardless of thresholds. The cost
+        is a file smaller than `target_seal_size`, which compaction merges
+        later. Without it, a quiet stream's rows simply stay in the buffer —
+        durable, readable, and replicated by §3a — until enough arrive to fill
+        a file.
+
+        Cheap when there is nothing due — an indexed read of one row — so it
+        can be run far more often than `advance`. A group whose lease is held
+        elsewhere is left alone, not waited for; `await_seal` is for a caller
+        that needs the table to have moved.
+        """
+        return self._seal_all() if flush else self._seal_due()
+
+    def _seal_all(self) -> int | None:
+        """`seal(flush=True)`: cut everything buffered into files. Returns the
+        exclusive end offset.
 
         Deterministic in the only way that matters to the data: the cut lands
         where the caller asked, always, so a given sequence of appends and
@@ -3033,7 +3053,7 @@ class WriteHandle(LocalReadHandle):
         # drains a superset of its own rows, which is harmless. What must never
         # happen is failing to cut.
         #
-        # `seal_due` does NOT come through here — it drains queued groups only
+        # `_seal_due` does NOT come through here — it drains queued groups only
         # — or a quiet stream would emit a stub file every poll, which is the
         # pathology §6 exists to clean up after.
         self._buffer.close_open_group()
@@ -3315,15 +3335,15 @@ class WriteHandle(LocalReadHandle):
                 [rel_path], int(datetime.now(UTC).timestamp())
             )
 
-    def seal_due(self) -> int | None:
-        """Seal everything the policy says is ready. Returns the last end, or
-        None.
+    def _seal_due(self) -> int | None:
+        """`seal()`: seal everything the policy says is ready. Returns the last
+        end, or None.
 
-        The maintainer's frequent call, and the counterpart to `maintain`: both
+        The maintainer's frequent call, and the counterpart to `advance`: both
         are plain methods the caller runs on its own schedule, because the
         library has no business owning a thread or an interval. This one is
         cheap when there is nothing to do — an indexed read of one row — so it
-        can be run often; `maintain` reads table metadata and wants to be run
+        can be run often; `advance` reads table metadata and wants to be run
         rarely. That difference is the only reason they are two methods.
 
         "Due" means cut. `target_seal_size` is the only trigger and it needs
@@ -3421,7 +3441,7 @@ class WriteHandle(LocalReadHandle):
 
         Unlike a seal, an interrupted compaction is not redone. Its inputs are
         still live — the transaction that would have superseded them never
-        committed — so the table is already correct and the next `maintain()`
+        committed — so the table is already correct and the next `advance()`
         will pick the same run up again. All that is owed is the half-written
         output, and `compacting` names it, so removing it costs one unlink
         rather than a directory scan — or, for a published rewrite, one DELETE
@@ -3472,11 +3492,11 @@ class WriteHandle(LocalReadHandle):
 
     # -- maintenance -------------------------------------------------------
 
-    def publish(self, *, push_unsettled: bool = False) -> None:
+    def publish(self, *, flush: bool = False) -> None:
         """Push to the published table: upload, register, record the watermark
         (§5).
 
-        `push_unsettled=True` pushes EVERYTHING unpublished, including the
+        `flush=True` pushes EVERYTHING unpublished, including the
         trailing run `stable_prefix` normally holds back for compaction. It is
         not scoped to any subset — `_push` walks a prefix, because the watermark
         it records has to stay contiguous for eviction to trust it (I4), so
@@ -3505,7 +3525,7 @@ class WriteHandle(LocalReadHandle):
         line.
 
         There is therefore at most one undersized region in the system and it is
-        always the staging one — **as long as nobody passes `push_unsettled`**.
+        always the staging one — **as long as nobody passes `flush`**.
         That flag exists because a bulk load's rows never enter the buffer, so
         the trailing run holding its short last file has no second copy to wait
         behind, and the rule above would strand it on local disk for as long as
@@ -3520,12 +3540,12 @@ class WriteHandle(LocalReadHandle):
         **Publishing only**, a building block. Expiring the published table and
         sweeping it are routines of their own (`expire_published`, `sweep`),
         so an orchestrator can schedule them apart from this (#118);
-        `maintain` runs all of them.
+        `advance` runs all of them.
 
         DEVIATES from §5, which also lists local eviction (step 5). That is
         local storage work and belongs to `evict`. Publish's remaining obligation to eviction is the
         registration watermark it records in `meta`, which is what lets
-        `maintain` enforce I4.
+        `advance` enforce I4.
         """
         # Re-read where the published table IS before pushing to it.
         # `set_published` is a durable change made by whichever process runs
@@ -3559,16 +3579,14 @@ class WriteHandle(LocalReadHandle):
             # both sides of the comparison change together. The fence passes,
             # and the watermark this push earned is recorded against a published
             # table that never received it.
-            self._push(lease, self._published.uri, push_unsettled=push_unsettled)
+            self._push(lease, self._published.uri, flush=flush)
         finally:
             lease.release()
 
-    def _push(
-        self, lease: Claim, pinned: str | None, *, push_unsettled: bool = False
-    ) -> None:
+    def _push(self, lease: Claim, pinned: str | None, *, flush: bool = False) -> None:
         """Upload and register everything above the published table's span.
 
-        **`push_unsettled` pushes the trailing run too**, which `publish`
+        **`flush` pushes the trailing run too**, which `publish`
         otherwise holds back because compaction may still merge it. Holding it
         back is right when the rows have a second copy and wrong when they do
         not: a bulk load's last file is short unless the load divides evenly,
@@ -3779,7 +3797,7 @@ class WriteHandle(LocalReadHandle):
             memory,
             config.compact_rows,
         )
-        if push_unsettled:
+        if flush:
             # EVERYTHING unpublished, and that is forced rather than chosen.
             # `pending[:settled]` is a PREFIX because the watermark recorded
             # below has to stay contiguous — eviction trusts it for I4 — so
@@ -3876,7 +3894,7 @@ class WriteHandle(LocalReadHandle):
             )
 
         # After the register, never before: the watermark is a promise that the
-        # published table HAS the range, and I4 lets `maintain` delete the
+        # published table HAS the range, and I4 lets `advance` delete the
         # staging copy on the strength of it.
         #
         # And only if it is still a promise about the SAME published table.
@@ -3980,12 +3998,20 @@ class WriteHandle(LocalReadHandle):
         finally:
             lease.release()
 
-    def maintain(self) -> None:
-        """Every maintenance routine, in the order rows move: from the buffer to
-        the published table, each table swept after the last step that can
-        change it. The one call most deployments want (§5, §6, §8, §12).
+    def advance(self, *, flush: bool = False) -> None:
+        """Advance the log's rows: every maintenance routine, in the order rows
+        move from the buffer to the published table, each table swept after the
+        last step that can change it. The one call most deployments want (§5,
+        §6, §8, §12).
 
-        1. `seal_due` — buffer to staging;
+        `flush=True` pushes everything through, regardless of thresholds: it
+        passes `flush` to `seal` and `publish`, so every buffered row is sealed
+        and every staging file published in this pass — at shutdown, say, to
+        get everything off this machine. The cost is undersized files, in
+        staging and in the published table; `rewrite_published` re-cuts the
+        published ones.
+
+        1. `seal` — buffer to staging;
         2. `compact` — merges a run once it has `compact_min_files` files;
         3. `publish` — staging to published, the files compaction is done with;
         4. `reclaim_buffer`, when `vacuum_free_ratio` is set — after the seal
@@ -4021,14 +4047,14 @@ class WriteHandle(LocalReadHandle):
         # this pass rather than the next. Compaction only merges a run that is
         # ready and `publish` only takes what compaction is finished with, so
         # a file sealed a moment ago is never touched before its time.
-        self.seal_due()
+        self.seal(flush=flush)
         self.compact()
 
         # Held, not raised, so the local steps still run on a machine that
         # cannot reach a remote published table (§11).
         failure: Exception | None = None
         try:
-            self.publish()
+            self.publish(flush=flush)
         except Exception as exc:  # noqa: BLE001 — re-raised below
             failure = exc
 
@@ -4063,10 +4089,10 @@ class WriteHandle(LocalReadHandle):
         the LIVE data takes to copy — 0.3 s at 35 MB. Only the deployment knows
         whether its arrival rate can absorb that, and a writer with no off-box
         readers can decline for ever and lose nothing but disk. Set
-        `vacuum_free_ratio` to have `maintain` do it on the ordinary pass.
+        `vacuum_free_ratio` to have `advance` do it on the ordinary pass.
 
         Call it when appends can tolerate the pause: after a batch, on a quiet
-        period, or from the same schedule that runs `maintain`. Cheap to call
+        period, or from the same schedule that runs `advance`. Cheap to call
         and do nothing — the check is three PRAGMAs — so it is safe in a loop.
 
         `litelink_offset` is untouched: values keep their gaps and the
@@ -4078,11 +4104,11 @@ class WriteHandle(LocalReadHandle):
     def compact(self) -> None:
         """Convert sealed files into `target_compact_size` ones (§6).
 
-        The heavy step of `maintain`, and the reason its steps are callable
+        The heavy step of `advance`, and the reason its steps are callable
         separately: it reads and rewrites whole files, while eviction and
         expiry are metadata commits that finish in milliseconds. A deployment
         that wants them on different schedules — convert hourly, expire every
-        minute — can have that, and one that does not should call `maintain`.
+        minute — can have that, and one that does not should call `advance`.
 
         Claims each run it merges (§4a) and renews that claim as it works, so
         it excludes another maintainer only where their work overlaps.
@@ -4098,7 +4124,7 @@ class WriteHandle(LocalReadHandle):
         """
         self._maintenance.evict()
 
-    def expire(self, table: Table | None = None) -> None:
+    def expire(self, table: Literal["staging", "published"] | None = None) -> None:
         """Expire snapshots past the table's retention, then delete what has
         come due (§6, §8).
 
@@ -4115,7 +4141,7 @@ class WriteHandle(LocalReadHandle):
         if _covers(table, "published"):
             self._maintenance.expire_published()
 
-    def sweep(self, table: Table | None = None) -> None:
+    def sweep(self, table: Literal["staging", "published"] | None = None) -> None:
         """One pass of the stranded-metadata sweep (§6). `table` as for
         `expire`: `"staging"`, `"published"`, or None for both.
 
@@ -4138,7 +4164,7 @@ class WriteHandle(LocalReadHandle):
         An operation, not a policy. Nothing calls it on a schedule and normal
         operation does not need it: `publish` pushes only files compaction has
         finished with, so the published table is well-sized by construction —
-        except for what a bulk load pushed with `push_unsettled` to avoid
+        except for what a bulk load pushed with `flush` to avoid
         stranding rows that have no second copy. It exists for the three things
         that break that on purpose — an explicit `seal()` stranding a small
         file, a change to `target_compact_size`, which applies to the future
@@ -4146,7 +4172,7 @@ class WriteHandle(LocalReadHandle):
         undersized push.
 
         Run it when nothing else is maintaining the log: it takes the same
-        lease as `maintain` and `publish`, and it rewrites the same files they
+        lease as `advance` and `publish`, and it rewrites the same files they
         would.
         """
         lease = self._lease(MAINTAIN_ROLE)
@@ -4179,7 +4205,7 @@ class WriteHandle(LocalReadHandle):
            (the buffer's trigger keys on that end), so nothing can arrive after
            the final push;
         2. seal everything buffered;
-        3. `publish(push_unsettled=True)`, which also releases the rows a
+        3. `publish(flush=True)`, which also releases the rows a
            `wal_replication` seal was holding;
         4. evict the whole staging table, and check nothing is left local;
         5. record the retirement on the published table (`litelink.retired`),
@@ -4212,10 +4238,10 @@ class WriteHandle(LocalReadHandle):
         self._flush_replica()
 
         while self.buffered_rows():
-            self.seal()
+            self.seal(flush=True)
             self.await_seal()
 
-        self.publish(push_unsettled=True)
+        self.publish(flush=True)
         self._maintenance.evict(everything=True)
 
         self._table.reload()
@@ -4629,10 +4655,10 @@ def validate(
         raise ValueError(msg)
 
 
-Table = Literal["staging", "published"]
-
-
-def _covers(table: Table | None, which: Table) -> bool:
+def _covers(
+    table: Literal["staging", "published"] | None,
+    which: Literal["staging", "published"],
+) -> bool:
     """Whether a routine's `table` argument includes `which`; None is both.
 
     Refuses anything else, so a misspelt table is an error rather than a call

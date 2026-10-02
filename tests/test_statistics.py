@@ -76,7 +76,7 @@ def _random_log(root: Path, seed: int) -> litelink.WriteHandle:
             rows.append(row)
 
         log.extend(rows)
-        log.seal()
+        log.seal(flush=True)
 
     loaded = [
         {"k": key + 1, "f64": rng.uniform(-1e6, 1e6), "f32": None},
@@ -263,7 +263,7 @@ def test_buffered_rows_are_their_own_tier(tmp_path: Path) -> None:
     """
     with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
         log.extend({"k": i} for i in range(10))
-        log.seal()
+        log.seal(flush=True)
         log.extend({"k": i} for i in range(10, 13))
 
         local = log.column_statistics(tier="staging")

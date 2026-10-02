@@ -2855,7 +2855,7 @@ class Buffer:
 
         Reclaims when the free list is at least `min_free_ratio` of the file.
         The default reclaims whenever there is anything worth reclaiming, which
-        is what an explicit `reclaim_buffer()` asks for; `maintain` passes the
+        is what an explicit `reclaim_buffer()` asks for; `advance` passes the
         log's `vacuum_free_ratio` instead.
 
         SQLite puts pages freed by a DELETE on a free list and never shrinks the
@@ -2879,7 +2879,7 @@ class Buffer:
         happen to leave would put a background cost on the write path and take
         the decision away from the deployment that knows its append rate. It is
         a maintenance operation: `WriteHandle.reclaim_buffer` calls it, and
-        `maintain` does too when `vacuum_free_ratio` is set.
+        `advance` does too when `vacuum_free_ratio` is set.
 
         **Offsets are untouched, which is the property that matters (I9).**
         `litelink_offset` is an explicit `INTEGER PRIMARY KEY`, so it is column

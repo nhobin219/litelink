@@ -36,9 +36,9 @@ rather than pyiceberg's cleanup — so a cleanup that finds its file already gon
 has lost a race to do something that was done.
 
 **The library owns neither the thread nor the interval.** Each role here is a
-plain method on its own schedule. `seal_due` runs often because it is an
+plain method on its own schedule. `seal` runs often because it is an
 indexed read of one row when there is nothing to do; the rest run rarely
-because they read table metadata. `maintain()` still exists and runs the whole
+because they read table metadata. `advance()` still exists and runs the whole
 pipeline, publish included, in one call — `--role all` is that, and is the
 right shape when the costs do not justify four processes.
 
@@ -86,7 +86,7 @@ def seal_pass(log: WriteHandle) -> str | None:
     quarter second saying so would bury the ones that matter.
     """
     before = log.staging_files()
-    sealed = log.seal_due()
+    sealed = log.seal()
     if sealed is None:
         return None
 
@@ -140,10 +140,10 @@ def publish_pass(log: WriteHandle) -> str | None:
 
 
 def all_passes(log: WriteHandle, root: Path) -> str | None:
-    """`maintain()`: the whole pipeline, publish included, in the order rows
+    """`advance()`: the whole pipeline, publish included, in the order rows
     move — eviction queues deletions that expiry then drains, so running them
     the other way round only makes files wait a cycle."""
-    log.maintain()
+    log.advance()
     report = (
         f"local {log.staging_rows():,} rows in {log.staging_files()} files  "
         f"buffer {log.buffered_rows():,} rows  disk {_disk(root) / 1e6:.1f} MB"
@@ -441,7 +441,7 @@ class Sidecar:
 def _maintain(log: WriteHandle, root: Path) -> None:
     """One pass, phase by phase.
 
-    `log.maintain()` does all of this in one call and is what most deployments
+    `log.advance()` does all of this in one call and is what most deployments
     want. It is split here because the phases cost wildly different amounts and
     a single number hides which one was slow — conversion reads and rewrites
     whole files, eviction and expiry are metadata commits, and publish is the only
@@ -456,7 +456,7 @@ def _maintain(log: WriteHandle, root: Path) -> None:
     timings: dict[str, float] = {}
     try:
         for name, phase in (
-            ("seal", log.seal_due),
+            ("seal", log.seal),
             ("compact", log.compact),
             ("reclaim", _reclaim(log)),
         ):

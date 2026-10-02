@@ -50,9 +50,9 @@ def published(root: Path, *, at: str | None = None, **overrides: object) -> Writ
     }
     log = local_log(root, at=at, **settings)
     log.extend(rows(ROWS))
-    log.seal()
-    log.publish(push_unsettled=True)
-    log.maintain()
+    log.seal(flush=True)
+    log.publish(flush=True)
+    log.advance()
     log.extend({"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(7))
 
     return log
@@ -208,8 +208,8 @@ def test_an_explicit_local_published_table_is_used(tmp_path: Path) -> None:
     where = f"file://{tmp_path / 'shared'}"
     with litelink.new(tmp_path / "root", "s", schema=SCHEMA, published=where) as log:
         log.extend(rows(10))
-        log.seal()
-        log.publish(push_unsettled=True)
+        log.seal(flush=True)
+        log.publish(flush=True)
         assert log.published == where
         assert (tmp_path / "shared" / "s" / "metadata" / VERSION_HINT).exists()
 
@@ -226,7 +226,7 @@ def test_a_log_from_before_published_tables_gets_the_default(tmp_path: Path) -> 
     """
     with local_log(tmp_path) as log:
         log.extend(rows(500))
-        log.seal()
+        log.seal(flush=True)
 
     with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as old:
         old.execute("DELETE FROM meta WHERE k = 'published'")
@@ -235,7 +235,7 @@ def test_a_log_from_before_published_tables_gets_the_default(tmp_path: Path) -> 
         assert reader.published == Layout(tmp_path, "s").default_published
 
     with litelink.open(tmp_path, "s") as log:
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         assert log.published_through() == 500
 
 
@@ -248,9 +248,9 @@ def test_set_published_none_points_back_at_the_local_default(tmp_path: Path) -> 
     """
     with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
         log.extend(rows(500))
-        log.seal()
+        log.seal(flush=True)
         log.set_published(f"file://{tmp_path / 'away'}")
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         log.set_published(None)
 
         assert log._buffer.get_meta("published") == log.published  # noqa: SLF001
@@ -259,8 +259,8 @@ def test_set_published_none_points_back_at_the_local_default(tmp_path: Path) -> 
             "the default published table holds none of it yet"
         )
 
-        log.publish(push_unsettled=True)
-        log.maintain()
+        log.publish(flush=True)
+        log.advance()
         assert log.staging_rows() == 0
         assert offsets(log) == list(range(1, 501))
 
@@ -288,14 +288,14 @@ def test_a_move_the_new_published_table_cannot_take_is_refused_and_not_recorded(
 
     with local_log(tmp_path) as log:
         log.extend(rows(100))
-        log.seal()
+        log.seal(flush=True)
         before = log.published
 
         with pytest.raises(OSError):  # noqa: PT011
             log.set_published(f"file://{blocker}/published table")
 
         assert log.published == before, "a move that failed was recorded"
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         assert log.published_through() == 100
 
 
@@ -433,9 +433,9 @@ def test_a_log_with_the_old_names_opens_and_moves_to_the_new_ones(
     with litelink.open(tmp_path, "s") as log:
         assert offsets(log) == expected
         log.extend(rows(5))
-        log.seal()
-        log.publish(push_unsettled=True)
-        log.maintain()
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.advance()
         assert offsets(log) == [*expected, *range(expected[-1] + 1, expected[-1] + 6)]
 
     names = stored_names(tmp_path)
@@ -466,7 +466,7 @@ def test_publish_sweeps_a_local_published_table(
     monkeypatch.setattr(maintenance, "SWEEP_INTERVAL", timedelta(0))
     with local_log(tmp_path) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
 
         table = log._published.require()  # noqa: SLF001
@@ -494,7 +494,7 @@ def test_retire_deletes_stranded_metadata_in_both_tables(tmp_path: Path) -> None
     old = (datetime.now(UTC) - timedelta(hours=2)).timestamp()
     with local_log(tmp_path) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
 
         stranded = []
@@ -518,14 +518,14 @@ def test_the_published_sweep_runs_with_publishs_lease_released(
 ) -> None:
     """The sweep needs no claim, and a backlog pass on object storage is tens
     of seconds of deletes; under `publish`'s lease every other process's
-    `maintain` and `publish` would be refused for all of it.
+    `advance` and `publish` would be refused for all of it.
 
     Falsify by running `sweep_published` inside `publish`'s `try`, which
     holds the lease: the lease cannot be taken during the sweep.
     """
     with local_log(tmp_path) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         maintenance = log._maintenance  # noqa: SLF001
         real = maintenance._sweep  # noqa: SLF001
         free: list[bool] = []
@@ -537,7 +537,7 @@ def test_the_published_sweep_runs_with_publishs_lease_released(
             real(*args, **kwargs)  # ty: ignore[invalid-argument-type]
 
         monkeypatch.setattr(maintenance, "_sweep", sweep)
-        log.maintain()
+        log.advance()
 
         assert free == [True, True], "both sweeps, with the lease free"
 
@@ -546,13 +546,13 @@ def test_maintain_seals_publishes_and_evicts_in_one_pass(tmp_path: Path) -> None
     """The pipeline runs in lifecycle order: what a pass seals is published, and
     what it publishes is evicted, in the same pass (#117, #119).
 
-    Falsify by moving `publish` after `evict` in `maintain`: the staging table
+    Falsify by moving `publish` after `evict` in `advance`: the staging table
     still holds the files after one pass.
     """
     with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
         log.extend(rows(ROWS))
 
-        log.maintain()
+        log.advance()
 
         # The trailing run and the unsealed tail stay local until they settle;
         # everything that was published has already left staging.
@@ -593,7 +593,7 @@ def test_a_failed_publish_raises_after_local_maintenance(
         monkeypatch.setattr(log, "publish", unreachable)
 
         with pytest.raises(OSError, match="unreachable"):
-            log.maintain()
+            log.advance()
 
         assert ran == ["publish", "evict", "expire staging", "sweep staging"], (
             "local steps run, the published ones do not"
@@ -634,3 +634,23 @@ def test_expire_and_sweep_take_the_table_they_act_on(
         for routine in (log.expire, log.sweep):
             with pytest.raises(ValueError, match="table must be"):
                 routine("stagin")  # ty: ignore[invalid-argument-type]
+
+
+def test_advance_flush_pushes_everything_to_the_published_table(tmp_path: Path) -> None:
+    """`flush` means the same at every stage: push everything through now,
+    regardless of thresholds. On `advance` it reaches `seal` and `publish`, so
+    one pass leaves nothing buffered and nothing unpublished (#119).
+
+    Falsify by not passing `flush` to `publish` in `advance`: the trailing
+    run stays local and `published_through` falls short of the last row.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+
+        log.advance()
+        assert log.published_through() < ROWS, "without flush the tail waits"
+
+        log.advance(flush=True)
+        assert log.buffered_rows() == 0
+        assert log.published_through() == ROWS
+        assert log.scan().read_all().num_rows == ROWS

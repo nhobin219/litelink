@@ -67,7 +67,7 @@ def test_one_log_survives_being_passed_around_a_thread_pool(tmp_path: Path) -> N
             # .result() re-raises anything a worker hit, which is the assertion.
             counts = [f.result(timeout=60) for f in futures]
 
-        assert log.seal_due() is not None, "nothing was queued by 500 appends"
+        assert log.seal() is not None, "nothing was queued by 500 appends"
         assert log.staging_rows() + log.buffered_rows() == 500
         assert max(c for c in counts if isinstance(c, int)) <= 500
 
@@ -90,9 +90,9 @@ def test_appends_and_reads_interleave_without_loss(tmp_path: Path) -> None:
         def maintain() -> None:
             while not stop.wait(0.002):
                 try:
-                    log.seal_due()
+                    log.seal()
                 except Exception as exc:  # noqa: BLE001 - reported, not raised
-                    failures.append(f"seal_due: {exc!r}")
+                    failures.append(f"seal: {exc!r}")
                     return
 
         def read() -> None:
@@ -146,7 +146,7 @@ def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
         # Both legs must be non-empty, or the union takes its buffer-only
         # branch and the boundary never enters into it.
         log.extend(rows(200))
-        log.seal()
+        log.seal(flush=True)
         log.extend(rows(200, start=200))
         log.scan().read_all()  # warm the view and the tail cache
 
@@ -159,7 +159,7 @@ def test_a_seal_landing_mid_query_neither_loses_nor_duplicates(
         def seal_midway(boundary: int | None) -> object:
             tail = real(boundary)
             if not fired:
-                fired.append(log.seal_due())
+                fired.append(log.seal())
 
             return tail
 

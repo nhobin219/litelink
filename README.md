@@ -136,8 +136,8 @@ litelink.preflight(...)                                            # what python
     log.append(row) -> int                          # durable on return
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
     log.ingest(table_or_reader)                     # Arrow straight to Parquet
-    log.seal_due() · log.maintain()                 # seal; the whole pipeline, publish included
-    log.publish(*, push_unsettled=False)            # push to the published table
+    log.seal() · log.advance()                 # seal; the whole pipeline, publish included
+    log.publish(*, flush=False)            # push to the published table
     log.retire()                                    # end the log: all published, none local
     log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
 ```
@@ -148,7 +148,7 @@ The deliberate choices:
   raise, and `open(..., read_only=True)` is typed so misuse is caught before it runs.
 - **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
   live in the log, so nothing at the call site can disagree with what is on disk.
-- **The library owns no thread.** Nothing seals unless you call `seal_due()` or `maintain()`;
+- **The library owns no thread.** Nothing seals unless you call `seal()` or `advance()`;
   your loop is the schedule.
 - **Which tiers a query reads is decided per query**, from its predicates. A query bounded
   inside the staging window never touches the network, however much has been evicted.
@@ -173,7 +173,7 @@ log = litelink.new("data", "trades", schema=schema, sort_by=("event_ts",))
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076})     # durable on return
 log.extend(group_of_rows)                             # the throughput lever
-log.maintain()                                        # seal, compact, publish, evict, expire, sweep
+log.advance()                                        # seal, compact, publish, evict, expire, sweep
 ```
 
 `extend()` commits the whole group in one transaction, so it is one fsync for the batch
@@ -308,8 +308,8 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
   Offsets stay dense across the two, and any engine reads both as one sequence.
 
 - **Not an unbounded staging table.** A seal's cost tracks what the table's metadata holds, so
-  a log that never runs `maintain()` and never evicts gets slower on the write path over time.
-  `maintain()` arrests the larger factor; a retention, with `publish()` running, bounds the
+  a log that never runs `advance()` and never evicts gets slower on the write path over time.
+  `advance()` arrests the larger factor; a retention, with `publish()` running, bounds the
   rest. Numbers and the reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet

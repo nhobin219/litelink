@@ -120,9 +120,9 @@ MAINTAINER = """
     passes = 0
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
-        log.seal_due()
+        log.seal()
         try:
-            log.maintain()
+            log.advance()
             log.publish()
         except RuntimeError:
             pass
@@ -132,9 +132,9 @@ MAINTAINER = """
             # watermark, so it can only remove what the PREVIOUS publish pushed —
             # stopping the moment everything is sealed would leave the last
             # files local and the tier untested.
-            log.maintain()
+            log.advance()
             log.publish()
-            log.maintain()
+            log.advance()
             break
         time.sleep(0.05)
     log.close()

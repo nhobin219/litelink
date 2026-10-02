@@ -162,13 +162,13 @@ def test_the_extent_cache_follows_the_metadata_pointer(tmp_path: Path) -> None:
     assert table.span() is None, "nothing sealed yet"
 
     log.extend([{"event_ts": 1, "key": "a"}, {"event_ts": 2, "key": "b"}])
-    log.seal()
+    log.seal(flush=True)
     table.reload()
     first = table.metadata_location
     assert table.span() == (1, 3)
 
     log.extend([{"event_ts": 3, "key": "c"}])
-    log.seal()
+    log.seal(flush=True)
     table.reload()
 
     assert table.metadata_location != first, "a commit must move the pointer"
@@ -184,7 +184,7 @@ def test_the_extent_cache_is_reused_while_the_pointer_holds(tmp_path: Path) -> N
     """
     log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     log.extend([{"event_ts": 1, "key": "a"}])
-    log.seal()
+    log.seal(flush=True)
 
     table = log._table
     table.reload()
@@ -196,7 +196,7 @@ def test_the_extent_cache_is_reused_while_the_pointer_holds(tmp_path: Path) -> N
         assert table.span() is first, "recomputed with the pointer unchanged"
 
     log.extend([{"event_ts": 2, "key": "b"}])
-    log.seal()
+    log.seal(flush=True)
     table.reload()
 
     assert table.span() is not first, "a commit must force a re-read"
@@ -315,7 +315,7 @@ def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
                 {"event_ts": 2, "key": "b"},
             ]
         )
-        log.seal()
+        log.seal(flush=True)
 
         written = next(tmp_path.rglob("*/data/*.parquet"))
         assert pq.read_table(written)["event_ts"].to_pylist() == [1, 2, 3]
@@ -368,7 +368,7 @@ def test_a_relative_root_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         assert log._layout.catalog_uri.startswith("sqlite:////")
 
         log.extend([{"event_ts": 1, "key": "a"}, {"event_ts": 2, "key": "b"}])
-        log.seal()
+        log.seal(flush=True)
         log.append({"event_ts": 3, "key": "c"})
 
         # The seal is what breaks it: before one, the read never touches an
@@ -391,7 +391,7 @@ def test_a_relative_root_is_resolved_once(
     monkeypatch.chdir(tmp_path / "elsewhere")
 
     log.append({"event_ts": 1, "key": "a"})
-    log.seal()
+    log.seal(flush=True)
 
     assert log.root == root
     assert log.scan().read_all().num_rows == 1
@@ -822,8 +822,8 @@ def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> N
     )
     with log:
         log.extend([{"event_ts": i, "key": "k"} for i in range(8)])
-        log.seal()
-        log.maintain()
+        log.seal(flush=True)
+        log.advance()
 
         assert log.scan().read_all().num_rows == 8, "evicted under a generous floor"
 
@@ -1134,7 +1134,7 @@ def test_a_rewrite_finishes_a_re_sort_that_died_after_the_meta_write(
         # `key` descending as `event_ts` ascends, so the two clusterings are
         # distinguishable and neither is the insertion order by accident.
         log.extend([{"event_ts": i, "key": f"k{20 - i:02d}"} for i in range(20)])
-        while log.seal() is not None:
+        while log.seal(flush=True) is not None:
             pass
 
         # The state a crash after the `meta` write leaves: both declarations
@@ -1473,7 +1473,7 @@ def test_vacuum_free_ratio_survives_the_round_trip_and_is_bounded() -> None:
 def test_maintain_reclaims_only_when_the_ratio_is_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`maintain` is where a deployment opts into the pause, and the default is
+    """`advance` is where a deployment opts into the pause, and the default is
     to decline.
 
     `VACUUM` blocks appends for as long as the live data takes to copy, so it is
@@ -1481,7 +1481,7 @@ def test_maintain_reclaims_only_when_the_ratio_is_set(
     both directions, because a default that quietly reclaimed would put that
     pause on every existing deployment at upgrade.
 
-    Falsify by calling `reclaim_buffer` unconditionally in `maintain`: the
+    Falsify by calling `reclaim_buffer` unconditionally in `advance`: the
     `None` case records a call.
     """
     calls: list[float] = []
@@ -1491,7 +1491,7 @@ def test_maintain_reclaims_only_when_the_ratio_is_set(
             "reclaim_free_pages",
             lambda ratio=0.0: calls.append(ratio) or 0,
         )
-        log.maintain()
+        log.advance()
 
         assert calls == [], "reclaimed without being asked"
 
@@ -1506,7 +1506,7 @@ def test_maintain_reclaims_only_when_the_ratio_is_set(
             "reclaim_free_pages",
             lambda ratio=0.0: calls.append(ratio) or 0,
         )
-        log.maintain()
+        log.advance()
 
         assert calls == [0.25], "the configured ratio did not reach the reclaim"
 

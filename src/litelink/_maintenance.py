@@ -694,7 +694,7 @@ class Maintenance:
         # independent read of the durable row now, so two of them inside one
         # decision can disagree — and here they did arithmetic on each other:
         # `staging_rows` seen as an int by the test and as None by the
-        # subtraction is `int - None`, a TypeError out of `maintain()`. The
+        # subtraction is `int - None`, a TypeError out of `advance()`. The
         # shipped maintainer catches RuntimeError and CommitFailedException, so
         # that killed the process and stopped maintenance entirely.
         #
@@ -716,7 +716,7 @@ class Maintenance:
             # dense — true of a rollback's occasional gap, and false the moment
             # anything reserves a range. A restore skips 2**20 offsets to keep
             # I9 (§3a), so the subtraction would put the boundary 2**20 above
-            # every staging file, and the first `maintain()` after a failover
+            # every staging file, and the first `advance()` after a failover
             # would evict the whole staging window, clamped only by I4. The
             # comment here used to say the arithmetic errs toward retaining
             # MORE, which is the safe direction for a floor; across a large
@@ -917,7 +917,7 @@ class Maintenance:
         """Re-cut undersized published files to `target_compact_size` (§6,
         ad-hoc).
 
-        Not part of `maintain`, and not expected to be needed. The published
+        Not part of `advance`, and not expected to be needed. The published
         table is well-sized by construction: `publish` pushes only what
         compaction has finished with, so nothing undersized reaches it in normal
         operation. Two deliberate acts break that. An explicit `seal()` can
@@ -953,7 +953,7 @@ class Maintenance:
         """
         # `repair=True`: this holds the maintenance lease, which is what makes
         # replacing an entry that names another prefix safe. Opening with
-        # `repair=False` here meant `maintain` and `rewrite_published` failed
+        # `repair=False` here meant `advance` and `rewrite_published` failed
         # after a re-point with an error telling the operator that a
         # maintenance pass would fix it — which they are.
         published = self._published.table(repair=True)
@@ -1333,7 +1333,7 @@ class Maintenance:
 
         The published half of `expire`, and a routine of its own rather than a
         step inside `publish`, so an orchestrator can run it on its own
-        schedule or in its own process (#118). `maintain` runs it after
+        schedule or in its own process (#118). `advance` runs it after
         `publish`.
 
         **No claim for the expiry.** It is a metadata commit the catalog's

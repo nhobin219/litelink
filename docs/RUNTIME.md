@@ -50,17 +50,17 @@ also means splitting the role across two processes later needs no code change, i
 compaction ever delays sealing enough to matter. It costs latency, not file size — the
 cut was recorded when the rows arrived.
 
-**Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue;
-`maintain()` runs the whole pipeline, starting with `seal_due()`, so a caller running only
-`maintain()` in a loop is still correct, and what a pass seals is compacted and published in
+**Both are plain methods, and the caller owns the loop.** `seal()` drains the queue;
+`advance()` runs the whole pipeline, starting with `seal()`, so a caller running only
+`advance()` in a loop is still correct, and what a pass seals is compacted and published in
 the same pass. They are two methods rather than one only because their costs differ by an
-order of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
-often, while `maintain()` reads table metadata and wants to be run rarely.
+order of magnitude: `seal()` is an indexed read of one row when idle, so it can be run
+often, while `advance()` reads table metadata and wants to be run rarely.
 
 The library owns no thread and no interval. It used to: `extend()` quietly started a
 sealing thread and a `seal_mode` setting chose between "background", "inline" and "none".
 None of that survived the queue — once the cut is recorded by the append, sealing is just
-draining, which is what `maintain()` already was. A library that spawns threads on your
+draining, which is what `advance()` already was. A library that spawns threads on your
 behalf is also a library whose tests interfere with themselves, which is how two of the
 bugs above were found.
 
@@ -117,7 +117,7 @@ streams.
         │                                        │
  ═══════╧═══════════════ MAINTAINER PROCESS ══════╧══════════════════════
   ─────── seal claim ───────────           ─────── pass claim ────────────
-  poll extent (one indexed            maintain() in a loop
+  poll extent (one indexed            advance() in a loop
   row read; no lock taken if
   there is nothing queued)                a claim per pass
                                             ├─ compact()
@@ -408,7 +408,7 @@ calls:
 
 - `append` / `extend`
 - `scan` / `sql`
-- `seal` / `seal_due` / `maintain`
+- `seal` / `advance`
 - `await_seal`, `staging_rows`, `staging_files`, `staging_extent`, `end_offset`
 
 **Not** concurrency-safe — call them when nothing else is using the log:
@@ -573,7 +573,7 @@ and the metadata this library depends on is deleted through its own expiry queue
 
 **The passes are callable one at a time**, and worth doing when their costs diverge.
 Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
-finish in milliseconds; `publish` is the only one that can block on a network. `maintain()`
+finish in milliseconds; `publish` is the only one that can block on a network. `advance()`
 runs all of them, publish included, and is what most deployments want; the routines exist for
 the schedules it cannot express.
 
@@ -763,7 +763,7 @@ just demo-capture      # append continuously
 just demo-tail         # in another terminal: watch it accumulate
 ```
 
-A maintainer is not optional. Nothing seals unless something calls `seal_due()` or
-`maintain()`, so a writer running alone accumulates in SQLite indefinitely — durable and
+A maintainer is not optional. Nothing seals unless something calls `seal()` or
+`advance()`, so a writer running alone accumulates in SQLite indefinitely — durable and
 readable the whole time, but never reaching Parquet. `examples/adsb/maintainer.py` is the
 smallest thing that qualifies: one loop, two calls, two intervals.

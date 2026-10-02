@@ -165,7 +165,7 @@ def test_staging_statistics_are_of_the_snapshot_a_read_resolved(
     schema = pa.schema([pa.field("x", pa.int64())])
     with litelink.new(tmp_path, "trades", schema=schema) as log:
         log.extend({"x": i} for i in range(10))
-        log.seal()
+        log.seal(flush=True)
         table = log._table  # noqa: SLF001
         table.reload()
         first = table.metadata_location
@@ -174,7 +174,7 @@ def test_staging_statistics_are_of_the_snapshot_a_read_resolved(
         assert before["x"].max == 9
 
         log.extend({"x": i} for i in range(10, 20))
-        log.seal()
+        log.seal(flush=True)
         table.reload()
 
         assert table.statistics_at(first) is None
@@ -188,7 +188,7 @@ def buffered_log(tmp_path: Path) -> WriteHandle:
     schema = pa.schema([pa.field("x", pa.int64())])
     log = litelink.new(tmp_path, "s", schema=schema)
     log.extend({"x": i} for i in range(100))
-    log.seal()
+    log.seal(flush=True)
     log.extend({"x": i} for i in range(100, 150))
 
     return log
@@ -343,9 +343,9 @@ def evicted(tmp_path: Path, bucket: str, s3: S3Options) -> WriteHandle:
         tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
     )
     log.extend(rows(ROWS))
-    log.seal()
-    log.publish(push_unsettled=True)
-    log.maintain()
+    log.seal(flush=True)
+    log.publish(flush=True)
+    log.advance()
     extent = log.staging_extent()
     assert extent is not None, "the fixture must keep part of the log local"
     assert 1 < extent[0] < ROWS, "the fixture must evict part of the log"
@@ -583,8 +583,8 @@ def test_a_restore_computes_the_published_row_from_the_published_table(
     primary = tmp_path / "primary"
     with published_log(primary, bucket, s3) as log:
         log.extend(rows(ROWS // 2))
-        log.seal()
-        log.publish(push_unsettled=True)
+        log.seal(flush=True)
+        log.publish(flush=True)
 
         second = tmp_path / "second"
         (second / "s").mkdir(parents=True)
@@ -597,8 +597,8 @@ def test_a_restore_computes_the_published_row_from_the_published_table(
         log.extend(
             {"event_ts": ROWS + i, "key": "late", "payload": "z"} for i in range(50)
         )
-        log.seal()
-        log.publish(push_unsettled=True)
+        log.seal(flush=True)
+        log.publish(flush=True)
         published = log.published_through()
 
     with litelink.restore(second, "s", published=where, s3=s3) as revived:
@@ -635,10 +635,10 @@ def test_eviction_widens_the_published_row_before_it_commits(
     )
     with log:
         log.extend(rows(ROWS))
-        log.seal()
-        log.publish(push_unsettled=True)
+        log.seal(flush=True)
+        log.publish(flush=True)
         monkeypatch.setattr(LogTable, "evict_below", checked)
-        log.maintain()
+        log.advance()
 
     assert seen, "the fixture must evict"
     for boundary, covered_until in seen:
@@ -783,7 +783,7 @@ def test_coverage_leaves_rows_a_seal_kept_to_the_staging_table(
     """
     with published_log(tmp_path, bucket, s3, wal_replication=True) as log:
         log.extend(rows(100))
-        log.seal()
+        log.seal(flush=True)
         log.extend({"event_ts": 100 + i, "key": "t", "payload": "y"} for i in range(5))
         assert log.buffered_rows() == 5
         coverage = log.coverage()

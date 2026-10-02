@@ -215,7 +215,7 @@ def main() -> None:
     # Nothing deletes this on exit, deliberately: tail.py reads it after the
     # writer stops, and a demo you cannot inspect afterwards is not much of one.
     # Note the demo leaves staging_retention unset, so the window grows without
-    # bound; a real deployment sets it and lets maintain() hold the size.
+    # bound; a real deployment sets it and lets advance() hold the size.
     # Rows still queued or buffered here are not lost — they are durable, and
     # the next process to open the log finds the cuts already recorded.
 

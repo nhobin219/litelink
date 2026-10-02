@@ -56,9 +56,9 @@ WRITE = textwrap.dedent(
     ) as log:
         rows = int(os.environ["LITELINK_TEST_ROWS"])
         log.extend({"event_ts": i, "key": "k" * 64} for i in range(rows))
-        log.seal()
-        log.sync(push_unsettled=True)
-        log.maintain()
+        log.seal(flush=True)
+        log.sync(flush=True)
+        log.advance()
         print(json.dumps({"version": litelink.__version__,
                           "extent": log.table_extent()}))
     """

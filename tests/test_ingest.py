@@ -206,7 +206,7 @@ def test_ingested_files_are_born_past_compaction(tmp_path: Path) -> None:
         log.ingest(table(4000))
         before = {f.path for f in log._table.data_files()}
 
-        log.maintain()
+        log.advance()
 
         assert {f.path for f in log._table.data_files()} == before
 
@@ -214,7 +214,7 @@ def test_ingested_files_are_born_past_compaction(tmp_path: Path) -> None:
 def test_ingest_lands_above_a_frontier_a_seal_left(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(5))
-        log.seal()
+        log.seal(flush=True)
         log.await_seal()
 
         assert log.ingest(table(100, start=5)) == (6, 106)
@@ -298,7 +298,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
         s3=s3,
     ) as log:
         log.extend(rows(300))
-        log.seal()
+        log.seal(flush=True)
         log.await_seal()
         # A seal RETAINS its rows here: with replication on the buffer is the
         # off-box copy until the published table has the range (§3a).
@@ -480,12 +480,12 @@ def test_a_lost_reservation_leaves_a_gap_the_log_reads_across(
         monkeypatch.undo()
         assert log.ingest(table(50)) == (101, 151)
         log.extend(rows(3))
-        log.seal()
+        log.seal(flush=True)
         log.await_seal()
 
         assert log.scan().read_all().num_rows == 53
         assert log._table.span() == (101, 154)
-        log.maintain()
+        log.advance()
         assert log.scan().read_all().num_rows == 53
 
 
@@ -541,12 +541,12 @@ def test_an_ingested_range_survives_the_whole_published_table_cycle(
     ) as log:
         assert log.ingest(table(3000)) == (1, 3001)
         log.extend(rows(400, start=3000))
-        log.seal()
+        log.seal(flush=True)
         log.await_seal()
 
         log.publish()
         assert log._published.require().span() is not None
-        log.maintain()
+        log.advance()
 
         assert log.scan().read_all().num_rows == 3400
         assert log.append(rows(1)[0]) == 3401
@@ -567,7 +567,7 @@ def test_a_loaded_range_reaches_the_published_table_whole(
     On a stream that goes quiet it does not terminate. Measured on a real
     deployment: 113,399 loaded rows on one disk, `coverage()` reporting no gap,
     for as long as the stream stayed slow. So `ingest` now pushes its own output
-    with `push_unsettled=True`, and the assertion flips.
+    with `flush=True`, and the assertion flips.
 
     Falsify by passing `publish=False`: `published_through()` drops back below `hi`
     and the tail file is local-only again.
@@ -630,10 +630,10 @@ def test_every_write_path_uses_the_configured_codec(
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(400))
-        log.seal()
+        log.seal(flush=True)
         log.await_seal()
         log.ingest(table(2000, start=400))
-        log.maintain()
+        log.advance()
 
         assert codecs_of(log) == {written}
         assert log.scan().read_all().num_rows == 2400
@@ -700,7 +700,7 @@ def test_a_load_pushes_the_undersized_seals_beneath_it_too(
     pushing leaves rows that never entered the buffer on a single disk.
     `publish=False` opts out for a caller who would rather sequence it themselves.
 
-    Falsify by reverting `push_unsettled` to the ordinary `stable_prefix` gate:
+    Falsify by reverting `flush` to the ordinary `stable_prefix` gate:
     `published_through()` drops below the load's `hi`.
     """
     config = LogConfig(
@@ -722,7 +722,7 @@ def test_a_load_pushes_the_undersized_seals_beneath_it_too(
     ) as log:
         # Far below the compact target, so it lands in the trailing run.
         log.extend(rows(200))
-        log.seal()
+        log.seal(flush=True)
         log.await_seal()
         log.publish()
 

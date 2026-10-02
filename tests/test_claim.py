@@ -172,16 +172,16 @@ def test_maintain_does_nothing_while_another_owner_holds_the_range(
     The passes claim the ranges they work on (§4a), so compaction leaves
     claimed work for the next pass. A refused publish is not that: maintenance
     is meant to run in one process, so a second owner is a deployment error,
-    and `maintain` says so rather than quietly publishing nothing.
+    and `advance` says so rather than quietly publishing nothing.
 
-    Falsify by swallowing the refused publish in `maintain`: no raise.
+    Falsify by swallowing the refused publish in `advance`: no raise.
     """
     with open_log(
         tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
     ) as log:
         for i in range(3):
             log.extend(rows(4, start=i * 4))
-            log.seal()
+            log.seal(flush=True)
 
         before = len(log._table.data_files())
 
@@ -194,14 +194,14 @@ def test_maintain_does_nothing_while_another_owner_holds_the_range(
         assert other.acquire()
 
         with pytest.raises(RuntimeError, match="another owner"):
-            log.maintain()
+            log.advance()
 
         assert len(log._table.data_files()) == before, (
             "worked on a range another owner had claimed"
         )
 
         other.release()
-        log.maintain()
+        log.advance()
 
         assert len(log._table.data_files()) < before
 
@@ -243,12 +243,12 @@ def test_threads_in_one_process_still_exclude_each_other(tmp_path: Path) -> None
 
         def seal_twice() -> None:
             started.set()
-            results.append(log.seal())
+            results.append(log.seal(flush=True))
 
         first = threading.Thread(target=seal_twice)
         first.start()
         started.wait(5)
-        results.append(log.seal())
+        results.append(log.seal(flush=True))
         first.join(10)
 
         assert log.staging_files() == 1, "two threads each wrote a file"
@@ -281,7 +281,7 @@ def test_a_separate_process_can_seal(tmp_path: Path) -> None:
             textwrap.dedent(f"""
                 import litelink
                 with litelink.open({str(tmp_path)!r}, "s") as log:
-                    end = log.seal()
+                    end = log.seal(flush=True)
                     print("SEALED", end, log.staging_rows())
             """),
         ],
@@ -320,12 +320,12 @@ def test_a_writer_defers_to_a_sealer_in_another_process(tmp_path: Path) -> None:
 
         # The cut is recorded either way — that is `seal`'s promise and it does
         # not depend on who holds the lease. What the holder owns is the WRITE.
-        assert log.seal() == 401, "did not record the cut"
+        assert log.seal(flush=True) == 401, "did not record the cut"
         assert log.staging_files() == 0, "wrote a file while another held the role"
 
         elsewhere.release()
 
-        assert log.seal() == 401, "did not take the role back once free"
+        assert log.seal(flush=True) == 401, "did not take the role back once free"
         assert log.staging_files() == 1, "the queued cut was never written"
 
 
@@ -350,7 +350,7 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
         log._buffer.claim_seal(start, end, path)
         log._write_and_commit(start, end, path)
 
-        assert log.seal_due() == end, "the replay did not finish the seal"
+        assert log.seal() == end, "the replay did not finish the seal"
 
         # The role must be free again immediately, not in thirty seconds.
         taker = Claim(
@@ -364,14 +364,14 @@ def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
     """A rewrite IS a compaction, so it needs compaction's exclusion.
 
     Same claim record, same deterministic output path, same commit. Reaching
-    that path lease-free let it run beside a `maintain()` in another process:
+    that path lease-free let it run beside a `advance()` in another process:
     two writers to one `compaction_path`, and a single-row `compacting` intent
     each would clear from under the other — leaving a half-written file that
     nothing could name, which is the one thing §12's queue exists to prevent.
     """
     with open_log(tmp_path, config=LogConfig(target_seal_size=1 << 30)) as log:
         log.extend(rows(20))
-        log.seal()
+        log.seal(flush=True)
 
         held = Claim(
             log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()

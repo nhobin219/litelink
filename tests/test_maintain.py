@@ -28,7 +28,7 @@ def seal_files(log: WriteHandle, count: int, per_file: int = 4) -> None:
     """Produce `count` sealed files, each holding `per_file` rows."""
     for i in range(count):
         log.extend(rows(per_file, start=i * per_file))
-        log.seal()
+        log.seal(flush=True)
 
 
 def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
@@ -38,7 +38,7 @@ def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
         seal_files(log, 4)
         assert len(log._table.data_files()) == 4
 
-        log.maintain()
+        log.advance()
 
         assert len(log._table.data_files()) == 1
         assert len(read_all(log)) == 16
@@ -51,7 +51,7 @@ def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
         tmp_path, LogConfig(target_seal_size=1 << 30, compact_min_files=5)
     ) as log:
         seal_files(log, 4)
-        log.maintain()
+        log.advance()
 
         assert len(log._table.data_files()) == 4
 
@@ -76,11 +76,11 @@ def test_compaction_leaves_full_files_alone(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(200))
-        log.seal()
+        log.seal(flush=True)
         before = len(log._table.data_files())
         assert before >= 3, "the target must be crossed several times"
 
-        log.maintain()
+        log.advance()
 
         assert len(log._table.data_files()) == before
 
@@ -95,9 +95,9 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
     ) as log:
         for ts in (500, 100, 400, 200):
             log.append({"event_ts": ts, "key": "k", "payload": ""})
-            log.seal()
+            log.seal(flush=True)
 
-        log.maintain()
+        log.advance()
 
         merged = log._table.data_files()
         assert len(merged) == 1
@@ -111,7 +111,7 @@ def test_compaction_preserves_every_row(tmp_path: Path) -> None:
         seal_files(log, 5, per_file=3)
         before = read_all(log)
 
-        log.maintain()
+        log.advance()
 
         assert read_all(log) == before
 
@@ -128,8 +128,8 @@ def test_eviction_drops_files_past_staging_retention(tmp_path: Path) -> None:
         log.extend(rows(2, start=12))
         assert len(log._table.data_files()) == 3
 
-        log.publish(push_unsettled=True)
-        log.maintain()
+        log.publish(flush=True)
+        log.advance()
 
         assert log._table.data_files() == []
         # The buffer is untouched: retention governs the table, and buffer rows
@@ -150,7 +150,7 @@ def test_eviction_never_drops_what_is_not_published(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.maintain()
+        log.advance()
 
         assert len(log._table.data_files()) == 3, "nothing is published yet"
         assert len(read_all(log)) == 12
@@ -159,7 +159,7 @@ def test_eviction_never_drops_what_is_not_published(tmp_path: Path) -> None:
 def test_no_eviction_without_staging_retention(tmp_path: Path) -> None:
     with open_log(tmp_path, LogConfig(compact_min_files=99)) as log:
         seal_files(log, 3)
-        log.maintain()
+        log.advance()
 
         assert len(log._table.data_files()) == 3
         assert len(read_all(log)) == 12
@@ -173,7 +173,7 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
         seal_files(log, 3)
         assert log._table.snapshot_count() == 3
 
-        log.maintain()
+        log.advance()
 
         # The current snapshot is never expired, whatever its age.
         assert log._table.snapshot_count() == 1
@@ -183,7 +183,7 @@ def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
 def test_eviction_waits_for_the_published_table_to_hold_the_file(
     tmp_path: Path,
 ) -> None:
-    """I4, and the only line of `maintain` that is correctness (§5, §8).
+    """I4, and the only line of `advance` that is correctness (§5, §8).
 
     With a published table configured the local copy stops being the only one once the
     published table holds that FILE — a row `publish` writes when the copy exists, naming
@@ -206,7 +206,7 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
         assert before == 3
 
         # Nothing published yet: retention says evict everything, I4 says none.
-        # `evict`, the routine under test: `maintain` would also publish, to a
+        # `evict`, the routine under test: `advance` would also publish, to a
         # bucket this test never stands up.
         log.evict()
 
@@ -232,7 +232,7 @@ def test_reads_stay_correct_across_a_compaction(tmp_path: Path) -> None:
         log.extend(rows(4, start=12))
         before = read_all(log)
 
-        log.maintain()
+        log.advance()
 
         assert read_all(log) == before
         assert [r[0] for r in read_all(log)] == list(range(1, 17))
@@ -257,8 +257,8 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
         on_disk = {p.name for p in local.rglob("*.parquet")}
         assert len(on_disk) == 3
 
-        log.publish(push_unsettled=True)
-        log.maintain()
+        log.publish(flush=True)
+        log.advance()
 
         assert log._table.data_files() == [], "evicted from the table"
         assert {p.name for p in local.rglob("*.parquet")} == on_disk, (
@@ -271,7 +271,7 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
             compact_min_files=99, staging_snapshot_retention=timedelta(microseconds=1)
         ),
     ) as log:
-        log.maintain()
+        log.advance()
 
         assert list((tmp_path / "s" / "data").rglob("*.parquet")) == [], (
             "expiry is what deletes bytes"
@@ -283,7 +283,7 @@ def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
 
     A seal writes its Parquet before committing it, so between those two steps
     the file is on disk and no snapshot names it. `sealing` is what tells the
-    sweep it is not an orphan — without that guard, a maintain() interleaved
+    sweep it is not an orphan — without that guard, an advance() interleaved
     with a seal deletes the file the very next step is about to register.
     """
     config = LogConfig(
@@ -298,7 +298,7 @@ def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
         written.parent.mkdir(parents=True, exist_ok=True)
         written.write_bytes(b"not really parquet, but on disk and uncommitted")
 
-        log.maintain()
+        log.advance()
 
         assert written.exists(), "sweep deleted a file `sealing` had claimed"
 
@@ -406,7 +406,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
         seal_files(log, 4)
         assert_nothing_untracked(log)
 
-        log.maintain()  # compacts; sources are superseded but not yet deletable
+        log.advance()  # compacts; sources are superseded but not yet deletable
         on_disk = assert_nothing_untracked(log)
         assert len(on_disk) == 5, "4 sources awaiting deletion, plus the merge"
         assert len(log._buffer.queued_deletions()) == 4
@@ -447,7 +447,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.maintain()
+        log.advance()
         assert len(log._buffer.queued_deletions()) == 3
         assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 4
 
@@ -460,7 +460,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
         staging_snapshot_retention=timedelta(microseconds=1),
     )
     with open_log(tmp_path, impatient) as log:
-        log.maintain()
+        log.advance()
 
         assert log._buffer.queued_deletions() == []
         assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 1
@@ -479,7 +479,7 @@ def test_a_referenced_file_is_never_deleted_by_the_drain(tmp_path: Path) -> None
         # would happily let through.
         log._maintenance._enqueue([live.path])
 
-        log.maintain()
+        log.advance()
 
         assert Path(live.path).exists()
         assert len(read_all(log)) == 4
@@ -499,13 +499,13 @@ def test_iceberg_metadata_does_not_grow_without_bound(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 8)
-        # The staging table's, since `maintain` now publishes too.
+        # The staging table's, since `advance` now publishes too.
         staging = metadata_dir(log)
         avro_before = len(list(staging.glob("*.avro")))
         assert avro_before >= 8, "one manifest list per commit, at least"
 
-        log.maintain()
-        log.maintain()  # the second pass retires what the first only queued
+        log.advance()
+        log.advance()  # the second pass retires what the first only queued
 
         metadata = list(staging.glob("*.metadata.json"))
         assert len(metadata) <= 11, f"{len(metadata)} metadata files for 8 commits"
@@ -568,7 +568,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
 
         for i in range(4):
             log.extend(rows(50, start=i * 50))
-            log.seal()
+            log.seal(flush=True)
 
         agrees("after seals")
 
@@ -576,10 +576,10 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
         agrees("after compaction")
 
         log.extend(rows(50, start=200))
-        log.seal()
+        log.seal(flush=True)
         agrees("seal after compaction")
 
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         log._maintenance.evict()
         agrees("after eviction")
 
@@ -597,7 +597,7 @@ def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
     with open_log(tmp_path, config) as log:
         for i in range(8):
             log.extend(rows(20, start=i * 20))
-            log.seal()
+            log.seal(flush=True)
 
         table = log._table._table
         snapshot = table.current_snapshot()
@@ -623,7 +623,7 @@ def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> N
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.maintain()
+        log.advance()
 
         before = [f.path for f in log._table.data_files()]
 
@@ -764,7 +764,7 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         seal_files(log, 4)
         files = log._table.data_files()
         assert len(files) == 4
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
 
         # A commit AFTER the last seal, which is what makes every remaining
         # file's adding snapshot expirable. Iceberg always keeps the current
@@ -853,7 +853,7 @@ def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         log._maintenance.evict()
 
         kept = log._table.data_files()
@@ -878,13 +878,13 @@ def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> No
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(1200))
-        log.seal_due()
+        log.seal()
         sealed = log._table.data_files()
         held = log._maintenance.memory()
         assert len(sealed) >= 4, "several full seals to convert"
         assert all(held[f.path] <= 4096 * 1.5 for f in sealed), "seal-sized"
 
-        log.maintain()
+        log.advance()
 
         compacted = log._table.data_files()
         after = log._maintenance.memory()
@@ -917,7 +917,7 @@ def test_only_compacted_files_are_eligible_for_the_published_table(
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(200))
-        log.seal_due()
+        log.seal()
         sealed = log._table.data_files()
         memory = log._maintenance.memory()
 
@@ -952,11 +952,11 @@ def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
         tmp_path, replace(config, staging_snapshot_retention=timedelta(0))
     ) as log:
         log.extend(rows(1200))
-        log.seal_due()
+        log.seal()
         before = len(log._table.data_files())
         assert before >= 4
 
-        log.maintain()
+        log.advance()
 
         assert len(log._table.data_files()) < before, (
             "the conversion must run without a published table configured"
@@ -986,7 +986,7 @@ def test_a_compaction_target_under_the_seal_size_is_refused() -> None:
 
 
 def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
-    """`maintain` is one call for all three; the parts are callable alone.
+    """`advance` is one call for all three; the parts are callable alone.
 
     Their costs differ by orders of magnitude now that conversion reads and
     rewrites whole files while eviction and expiry are metadata commits, so a
@@ -1002,7 +1002,7 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(1200))
-        log.seal_due()
+        log.seal()
         before = len(log._table.data_files())
         assert before >= 4
 
@@ -1010,7 +1010,7 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         converted = len(log._table.data_files())
         assert converted < before, "compaction must run on its own"
 
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         log.evict()
         log.expire()
 
@@ -1166,7 +1166,7 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
     )
     try:
         log.extend(rows(1200))
-        log.seal_due()
+        log.seal()
         files = sorted(log._table.data_files(), key=lambda f: f.start)
 
         assert len(files) >= 4
@@ -1389,7 +1389,7 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
     config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         before = log.staging_files()
 
         assert before == 3
@@ -1601,7 +1601,7 @@ def test_eviction_reads_the_published_table_under_its_own_claim(tmp_path: Path) 
         seal_files(log, 3)
         # Published to the local default, so the published table eviction reads first
         # holds every file and would let it drop all but the newest.
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         before = log.staging_files()
 
         assert before == 3
@@ -1740,9 +1740,9 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
             for _ in range(12):
                 log.extend(rows(120, start=written))
                 written += 120
-                log.seal()
+                log.seal(flush=True)
                 try:
-                    log.maintain()
+                    log.advance()
                 except RuntimeError:
                     pass
         finally:
@@ -1766,7 +1766,7 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
     Each `self.config` is now an independent read of the durable row, so two
     of them inside one decision can disagree — and here they did arithmetic on
     each other: `staging_rows` seen as an int by the guard and as None by the
-    subtraction after it is `int - None`, a TypeError out of `maintain()`. The
+    subtraction after it is `int - None`, a TypeError out of `advance()`. The
     shipped maintainer catches RuntimeError and CommitFailedException, so that
     stopped maintenance entirely.
 
@@ -1959,7 +1959,7 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
     config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.publish(push_unsettled=True)
+        log.publish(flush=True)
         dropped = [log._maintenance._key(f.path) for f in log._table.data_files()]
 
         assert len(dropped) == 3
@@ -2033,7 +2033,7 @@ def test_staging_rows_counts_rows_rather_than_differencing_offsets(
     assumes offsets are dense. A rollback's occasional gap makes that retain
     slightly MORE than asked — the safe direction. A reservation does the
     opposite: a restore skips 2**20 offsets to keep I9, so the subtraction puts
-    the boundary far above every local file and the first `maintain()` evicts
+    the boundary far above every local file and the first `advance()` evicts
     the entire staging window.
 
     Simulated here by seeding the sequence forward, which is what a restore
@@ -2044,18 +2044,18 @@ def test_staging_rows_counts_rows_rather_than_differencing_offsets(
     )
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(400))
-        log.seal_due()
+        log.seal()
         before = log.staging_rows()
 
         assert before > 0, "nothing sealed, so there is nothing to evict"
 
-        # ROWS, not files: `maintain` also compacts, so a file count falls for
+        # ROWS, not files: `advance` also compacts, so a file count falls for
         # a reason that has nothing to do with this.
         #
         # The hole. `Buffer.seed_offsets` is what a restore uses; here it
         # stands in for one, moving `next_offset` far above every sealed row.
         log._buffer.seed_offsets(log._buffer.next_offset() + (1 << 20))  # noqa: SLF001
-        log.maintain()
+        log.advance()
 
         assert log.staging_rows() == before, (
             "the reserved hole was read as a million rows and evicted the window"
@@ -2107,7 +2107,7 @@ def test_the_sweep_deletes_stranded_metadata_and_nothing_live(
             strand(log, f"00099-{uuid.uuid4()}.metadata.json", age=timedelta(hours=2)),
         }
 
-        log.maintain()
+        log.advance()
 
         assert not any(p.exists() for p in stranded)
         live = {Path(p) for p in log._table.referenced_paths()} | {
@@ -2136,7 +2136,7 @@ def test_the_sweep_leaves_young_files_for_a_commit_in_flight(
         young = strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(minutes=5))
         old = strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(hours=2))
 
-        log.maintain()
+        log.advance()
 
         assert young.exists()
         assert not old.exists()
@@ -2160,13 +2160,13 @@ def test_the_sweep_works_a_backlog_down_in_batches(
             for _ in range(5)
         ]
 
-        log.maintain()
+        log.advance()
         assert sum(p.exists() for p in backlog) == 3
 
         monkeypatch.setattr(maintenance, "SWEEP_INTERVAL", timedelta(hours=4))
         late = strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(hours=2))
-        log.maintain()
-        log.maintain()
+        log.advance()
+        log.advance()
 
         assert not any(p.exists() for p in backlog)
         assert late.exists(), "listed again only once the interval passes"
@@ -2199,7 +2199,7 @@ def test_the_sweep_refuses_a_listing_that_names_files_differently(
         for path in before:
             os.utime(path, (old.timestamp(), old.timestamp()))
 
-        log.maintain()
+        log.advance()
 
         assert before <= set(metadata_dir(log).iterdir())
         assert len(read_all(log)) == 8
@@ -2213,7 +2213,7 @@ def test_a_failing_sweep_never_fails_the_pass(
 ) -> None:
     """Housekeeping: a failure is logged and the next pass lists again.
 
-    Falsify by letting the exception out of `_sweep`: `maintain` raises.
+    Falsify by letting the exception out of `_sweep`: `advance` raises.
     """
     config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
     with open_log(tmp_path, config) as log:
@@ -2226,13 +2226,13 @@ def test_a_failing_sweep_never_fails_the_pass(
             raise PermissionError(path)
 
         monkeypatch.setattr(table, "remove", refuse)
-        log.maintain()
+        log.advance()
 
         assert stranded.exists()
         assert "retried on the next pass" in caplog.text
 
         monkeypatch.setattr(table, "remove", real)
-        log.maintain()
+        log.advance()
 
         assert not stranded.exists()
 

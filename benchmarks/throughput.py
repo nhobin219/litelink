@@ -86,7 +86,7 @@ def bench_reads(
     source = observations(payload, seed=7)
     try:
         log.extend(itertools.islice(source, sealed_rows))
-        log.seal()
+        log.seal(flush=True)
 
         # §7 calls this the architecture overhead: resolve the catalog, read the
         # tier boundary from manifest statistics. Fixed, not proportional, and
