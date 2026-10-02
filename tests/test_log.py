@@ -94,17 +94,29 @@ def test_seal_then_read_returns_every_row_once(tmp_path: Path) -> None:
     """The union must not double-count across the boundary (I3)."""
     with open_log(tmp_path) as log:
         log.extend(rows(10))
-        assert log.seal() == 11
+        assert log.seal(flush=True) == 11
         log.extend(rows(5, start=10))
 
         offsets = [r[0] for r in read_all(log)]
         assert offsets == list(range(1, 16))
 
 
-def test_seal_empties_the_buffer_but_not_the_log(tmp_path: Path) -> None:
+def test_a_seal_keeps_its_rows_until_the_buffer_is_evicted(tmp_path: Path) -> None:
+    """A seal only moves data; `evict("buffer")` drops what staging holds
+    (#122). Reads see each row exactly once either side of it, because the
+    read boundary is the staging table's committed end, not the buffer's
+    contents.
+
+    Falsify by deleting the rows in `finish_seal` again: the buffer is empty
+    straight after the seal.
+    """
     with open_log(tmp_path) as log:
         log.extend(rows(4))
-        log.seal()
+        log.seal(flush=True)
+        assert log._buffer.span() is not None, "the seal must not delete"
+        assert len(read_all(log)) == 4
+
+        log.evict("buffer")
         assert log._buffer.span() is None
         assert len(read_all(log)) == 4
 
@@ -113,7 +125,8 @@ def test_offsets_never_reused_after_the_buffer_empties(tmp_path: Path) -> None:
     """I9. This is the assertion that fails with a bare INTEGER PRIMARY KEY."""
     with open_log(tmp_path) as log:
         log.extend(rows(3))
-        log.seal()
+        log.seal(flush=True)
+        log.evict("buffer")
         assert log._buffer.span() is None
         assert log.extend(rows(1, start=3)) == [4]
         assert log.staging_extent() == (1, 4)
@@ -125,7 +138,7 @@ def test_sealed_file_is_sorted_by_sort_by(tmp_path: Path) -> None:
         log.extend(
             [{"event_ts": ts, "key": "k", "payload": ""} for ts in (300, 100, 200)]
         )
-        log.seal()
+        log.seal(flush=True)
 
         scanned = log.scan(columns=["event_ts"]).read_all()["event_ts"].to_pylist()
         assert scanned == [300, 100, 200], "scan orders by offset, not by sort_by"
@@ -137,7 +150,7 @@ def test_sealed_file_is_sorted_by_sort_by(tmp_path: Path) -> None:
 def test_reopen_sees_committed_data(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(6))
-        log.seal()
+        log.seal(flush=True)
         log.extend(rows(2, start=6))
 
     with open_log(tmp_path) as reopened:
@@ -149,7 +162,8 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
     """Crash between the Iceberg commit and the buffer delete (§4, §11).
 
     The rows are in the table AND still in the buffer. A read in that window
-    must return each exactly once, and reopening must drop the stale rows.
+    must return each exactly once, and reopening must finish the seal without
+    sealing them twice. Dropping them is `evict("buffer")`'s (#122).
     """
     with open_log(tmp_path) as log:
         log.extend(rows(4))
@@ -165,6 +179,10 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
 
     with open_log(tmp_path) as recovered:
         assert recovered._buffer.pending_seal() is None
+        assert len(read_all(recovered)) == 4
+        assert recovered.staging_files() == 1, "recovery sealed it twice"
+
+        recovered.evict("buffer")
         assert recovered._buffer.span() is None
         assert len(read_all(recovered)) == 4
 
@@ -185,12 +203,12 @@ def test_recovery_redoes_a_seal_that_never_committed(tmp_path: Path) -> None:
         assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 1, "no orphaned file"
 
 
-def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None:
+def test_target_size_queues_a_cut_and_seal_writes_it(tmp_path: Path) -> None:
     """§4's size trigger, split across the two roles that own its halves.
 
     Crossing `target_seal_size` is the appender's business — it records the cut in
     the transaction that crosses it. Writing the file is the maintainer's, and
-    `seal_due` is the call it makes. Neither half guesses what the other did.
+    `seal()` is the call it makes. Neither half guesses what the other did.
     """
     with open_log(tmp_path, LogConfig(target_seal_size=512)) as log:
         log.extend(rows(40))
@@ -198,7 +216,7 @@ def test_target_size_queues_a_cut_and_seal_due_writes_it(tmp_path: Path) -> None
         assert log._buffer.pending_group() is not None, "the cut was not recorded"
         assert log.staging_extent() is None, "an append wrote a file"
 
-        assert log.seal_due() is not None, "seal_due found nothing queued"
+        assert log.seal() is not None, "seal found nothing queued"
         assert log.staging_extent() is not None, "should have sealed on size"
         assert len(read_all(log)) == 40
 
@@ -210,7 +228,7 @@ def test_a_synchronous_seal_is_available(tmp_path: Path) -> None:
 
         assert log.staging_extent() is None, "an append sealed on its own"
 
-        log.seal()
+        log.seal(flush=True)
 
         assert log.staging_extent() is not None, "seal() did not move the table"
         assert len(read_all(log)) == 40
@@ -229,7 +247,7 @@ def test_rows_stay_readable_across_a_seal(tmp_path: Path) -> None:
         for _ in range(10):
             assert len(read_all(log)) == 60, "a row went missing before the seal"
 
-        log.seal_due()
+        log.seal()
 
         for _ in range(10):
             assert len(read_all(log)) == 60, "a row went missing after the seal"
@@ -269,7 +287,7 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
 
         log._lock = cast("threading.RLock", Timed())
         started = time.perf_counter()
-        log.seal()
+        log.seal(flush=True)
         total = (time.perf_counter() - started) * 1000
         log._lock = real_lock
 
@@ -289,11 +307,11 @@ def test_only_one_seal_runs_at_a_time(tmp_path: Path) -> None:
         assert held.acquire(), "could not simulate a seal in flight"
 
         # Recording the cut is unconditional; writing the file is not.
-        assert log.seal() == 51
+        assert log.seal(flush=True) == 51
         assert log.staging_files() == 0, "sealed while another seal was in flight"
 
         held.release()
-        assert log.seal() == 51
+        assert log.seal(flush=True) == 51
         assert log.staging_files() == 1
 
 
@@ -319,7 +337,7 @@ def test_readonly_sees_a_writer_s_committed_rows(tmp_path: Path) -> None:
             writer.extend(rows(2, start=3))
             assert len(read_all(reader)) == 5, "reads are not pinned to open time"
 
-            writer.seal()
+            writer.seal(flush=True)
             assert len(read_all(reader)) == 5, "still exactly once across the seal"
 
 
@@ -372,7 +390,7 @@ def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
     """The shape examples/adsb/capture.py uses (§1: one process, threads within it).
 
     Python's sqlite3 defaults to check_same_thread=True, so without the
-    connection flag and the lock, every background maintain() raises and the
+    connection flag and the lock, every background advance() raises and the
     log grows forever while looking healthy.
     """
     import threading
@@ -386,7 +404,7 @@ def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
         def maintain_until_stopped() -> None:
             while not stop.wait(0.01):
                 try:
-                    log.maintain()
+                    log.advance()
                 except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
                     failures.append(exc)
                     return
@@ -487,7 +505,7 @@ def test_a_log_needs_no_sort_by(tmp_path: Path) -> None:
     """
     with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
         log.extend(rows(50))
-        log.seal()
+        log.seal(flush=True)
 
         assert log.sort_by == ()
         assert log.staging_files() == 1
@@ -524,7 +542,7 @@ def test_a_sort_key_correlated_with_the_offset_keeps_files_prunable(
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
         for batch in range(4):
             log.extend(rows(20, start=batch * 20))
-            log.seal()
+            log.seal(flush=True)
 
         files = log._table.data_files()
         assert len(files) == 4
@@ -856,7 +874,7 @@ def test_a_float_column_still_takes_an_integer_it_can_hold(
         log.append({"k": 2, "f64": 2**53})
         log.append({"k": 3, "f64": -(2**53)})
         log.append({"k": 4, "f32": 2**24})
-        log.seal()
+        log.seal(flush=True)
 
         got = log.scan().read_all().column("f64").to_pylist()
 
@@ -1015,7 +1033,7 @@ def test_start_offset_reserves_the_range_below_it(tmp_path: Path) -> None:
     with log:
         assert log.append({"event_ts": 1, "key": "a", "payload": "p"}) == 1000
         assert log.extend(rows(3)) == [1001, 1002, 1003]
-        log.seal()
+        log.seal(flush=True)
 
         assert log._table.span() == (1000, 1004)
         assert log.scan().read_all().num_rows == 4

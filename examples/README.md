@@ -18,17 +18,17 @@ The loop is two calls:
 
 ```python
 log.append(row(trade))
-log.seal_due()
+log.seal()
 ```
 
-`seal_due` is an indexed read of one row when there is nothing to do, so calling
+`seal` is an indexed read of one row when there is nothing to do, so calling
 it per message costs almost nothing; when a group is queued it writes that one
 file and returns. Nothing else seals, so leaving it out means rows accumulate in
 SQLite for ever — durable and readable the whole time, but never reaching
 Parquet.
 
 **It blocks the event loop, and it is the seal that does it**, not the append.
-Measured: an append runs at a 405 us median, a `seal_due` that actually writes a
+Measured: an append runs at a 405 us median, a `seal` that actually writes a
 file at 43 ms. At this feed's rate that is invisible. At real rates it is the
 first thing to fix, and the fix is `adsb/` below.
 
@@ -126,8 +126,8 @@ Nothing coordinates that but the `claim` table. The writer holds no lease and ne
 tries; the maintainer takes both when it starts, and if it dies they lapse and the next
 one takes over.
 
-`adsb/maintainer.py` is one loop calling plain methods at their own cadences — `seal_due()`
-often, `maintain()` and `publish()` less so. The library owns neither the thread nor the
+`adsb/maintainer.py` is one loop calling plain methods at their own cadences — `seal()`
+often, `advance()` and `publish()` less so. The library owns neither the thread nor the
 interval, so there is no `seal_mode` to set and nothing starts behind your back.
 
 ```
@@ -150,7 +150,7 @@ transactionally.
 The demo keeps its data on purpose — `adsb/tail.py` reads it after the writer stops, and it is
 there to poke at — so nothing removes it automatically, and `staging_retention` is left unset
 so the window grows without bound. Roughly 25 MB per 30 seconds at the default rate. A real
-deployment sets a retention and lets `maintain()` hold the size; the benchmarks, which have
+deployment sets a retention and lets `advance()` hold the size; the benchmarks, which have
 nothing to inspect afterwards, run in a temp directory and clean up on exit.
 
 The stream is a synthetic ADS-B position feed, generated in-process, parsed into columns rather than

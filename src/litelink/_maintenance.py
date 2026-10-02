@@ -694,7 +694,7 @@ class Maintenance:
         # independent read of the durable row now, so two of them inside one
         # decision can disagree — and here they did arithmetic on each other:
         # `staging_rows` seen as an int by the test and as None by the
-        # subtraction is `int - None`, a TypeError out of `maintain()`. The
+        # subtraction is `int - None`, a TypeError out of `advance()`. The
         # shipped maintainer catches RuntimeError and CommitFailedException, so
         # that killed the process and stopped maintenance entirely.
         #
@@ -716,7 +716,7 @@ class Maintenance:
             # dense — true of a rollback's occasional gap, and false the moment
             # anything reserves a range. A restore skips 2**20 offsets to keep
             # I9 (§3a), so the subtraction would put the boundary 2**20 above
-            # every staging file, and the first `maintain()` after a failover
+            # every staging file, and the first `advance()` after a failover
             # would evict the whole staging window, clamped only by I4. The
             # comment here used to say the arithmetic errs toward retaining
             # MORE, which is the safe direction for a floor; across a large
@@ -742,12 +742,59 @@ class Maintenance:
 
         return min(limits) if limits else 0
 
-    def evict(self, *, everything: bool = False) -> None:
+    def evict_buffer(
+        self, start_offset: int | None = None, end_offset: int | None = None
+    ) -> int:
+        """Drop buffer rows the next durable copy already holds (#122). Returns
+        how many.
+
+        The rule is eviction's, one tier up: never drop data until the next
+        durable copy has it.
+
+        - **Without `wal_replication`**, that copy is staging: every row below
+          the staging table's committed end is in a file there. The buffer and
+          the Parquet share a disk, so holding them longer buys nothing.
+        - **With it**, the buffer is the off-box copy until the published table
+          has the range (§3a), so the copy that counts is the published one —
+          read from the log's own record of what landed there
+          (`published_prefix`, without intents), the same authority staging
+          eviction acts on for I4. Local, so this never needs the network.
+
+        Rows below the staging table's first file were evicted from it, which
+        I4 allowed only once the published table held them, so the boundary is
+        the end of the longest prefix of staging files the copy holds. Run
+        before `evict("staging")` — as `advance` does — so the files that prove
+        it are still there.
+
+        `[start_offset, end_offset)` narrows what is eligible; it never widens
+        it. Unbounded, this is one `DELETE` under SQLite's write lock and
+        stalls appends for its duration — the bounds are how a caller chunks it.
+        """
+        self._table.reload()
+        files = self._table.data_files()
+        if self.config.wal_replication and self._published.remote():
+            boundary = self.published_prefix(
+                files, self._published.uri, include_intents=False
+            )
+        else:
+            boundary = max((f.end for f in files), default=0)
+
+        if end_offset is not None:
+            boundary = min(boundary, end_offset)
+
+        start = 0 if start_offset is None else start_offset
+        if boundary <= start:
+            return 0
+
+        return self._buffer.evict_rows(start, boundary)
+
+    def evict(self, *, everything: bool = False, end_offset: int | None = None) -> None:
         """Drop files older than `staging_retention` from the staging table (§8).
 
         `everything` drops every file the published table holds, whatever the
         policy — what `retire()` ends with. I4 still clamps it: a file the
-        published table has not registered stays.
+        published table has not registered stays. `end_offset` caps it too, so
+        a caller can evict in bounded steps; eviction always removes a prefix.
 
         Age comes from `extent.named_at` — the log's own record of when the
         file was named — falling back to the Iceberg snapshot that added it
@@ -784,6 +831,10 @@ class Maintenance:
             if everything
             else self._retention_boundary()
         )
+        # Only ever lowers it, and the claimed boundary below starts from here.
+        if end_offset is not None:
+            boundary = min(boundary, end_offset)
+
         boundary = max((f.end for f in files if f.end <= boundary), default=0)
         if boundary <= 0:
             return
@@ -917,7 +968,7 @@ class Maintenance:
         """Re-cut undersized published files to `target_compact_size` (§6,
         ad-hoc).
 
-        Not part of `maintain`, and not expected to be needed. The published
+        Not part of `advance`, and not expected to be needed. The published
         table is well-sized by construction: `publish` pushes only what
         compaction has finished with, so nothing undersized reaches it in normal
         operation. Two deliberate acts break that. An explicit `seal()` can
@@ -953,7 +1004,7 @@ class Maintenance:
         """
         # `repair=True`: this holds the maintenance lease, which is what makes
         # replacing an entry that names another prefix safe. Opening with
-        # `repair=False` here meant `maintain` and `rewrite_published` failed
+        # `repair=False` here meant `advance` and `rewrite_published` failed
         # after a re-point with an error telling the operator that a
         # maintenance pass would fix it — which they are.
         published = self._published.table(repair=True)
@@ -1333,7 +1384,7 @@ class Maintenance:
 
         The published half of `expire`, and a routine of its own rather than a
         step inside `publish`, so an orchestrator can run it on its own
-        schedule or in its own process (#118). `maintain` runs it after
+        schedule or in its own process (#118). `advance` runs it after
         `publish`.
 
         **No claim for the expiry.** It is a metadata commit the catalog's

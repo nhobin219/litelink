@@ -101,8 +101,8 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`LogHandle`** — lifecycle | `close` · context manager |
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
-| **`+ WriteHandle`** — seal | `seal_due` · `seal` · `await_seal` |
-| **`+ WriteHandle`** — maintain | `maintain` · `compact` · `evict` · `expire` · `reclaim_buffer` |
+| **`+ WriteHandle`** — seal | `seal` · `await_seal` |
+| **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
 | **`+ WriteHandle`** — published table | `publish` · `hydrate` · `rewrite_published` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` · `set_published` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
@@ -110,7 +110,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 `await_seal` is deliberately a `WriteHandle` method: it *helps* drain the queue each round
 rather than only watching, and a reader could only watch.
 
-Most deployments use six: `new`/`open`, `extend`, `scan`, `seal_due`, `maintain`, `publish`.
+Most deployments use six: `new`/`open`, `extend`, `scan`, `seal`, `advance`, `publish`.
 
 **Import everything from `litelink`.** The package root and `litelink.manifest` are the
 public modules; every other module is private (`_handle`, `_buffer`, …). `litelink.OFFSET` is
@@ -305,8 +305,8 @@ its own process; concurrent `append` is excluded by §1, not by a lock.
 
 **WAL shipping does not carry a loaded range**, because these rows never enter the buffer.
 That is a fact about scope, and it is stated rather than enforced: `ingest` runs with
-`wal_replication` on, and turning it off to load would be worse, since `_discard_on_seal`
-reads the same flag and the next seal would drop the buffer's copy of everything already
+`wal_replication` on, and turning it off to load would be worse, since `evict("buffer")`
+reads the same flag and the next eviction would drop the buffer's copy of everything already
 captured.
 
 **The published table is a loaded range's only second copy.** When the push did not run, compare
@@ -476,18 +476,19 @@ the writer's `published_through()`.
 ## Sealing
 
 ```python
-log.seal_due() -> int | None        # drain what the policy queued
-log.seal() -> int | None            # cut everything buffered, now
+log.seal(*, flush=False) -> int | None   # write what the size trigger cut; flush: everything
 log.await_seal(timeout=None) -> bool
 ```
 
 **The cut is chosen by the appender**, in the transaction that crosses `target_seal_size` or
-`target_seal_rows`, and queued. `seal_due` drains that queue and returns the last exclusive
+`target_seal_rows`, and queued. `seal()` drains that queue and returns the last exclusive
 end offset, or `None` if there was nothing. It is an indexed read of one row when idle, so it
 is cheap to call often.
 
-`seal()` cuts short by definition and leaves an undersized file for compaction to merge. It is
-for shutdown and for tests, not for a loop.
+`seal(flush=True)` cuts everything buffered, however little, and leaves an undersized file for
+compaction to merge. `flush` means the same on `seal`, `publish` and `advance`: push
+everything through this stage now, regardless of thresholds. It is for shutdown and for
+tests, not for a loop.
 
 **Nothing seals unless something calls one of these.** The library owns no thread and no
 interval; a writer running alone accumulates in SQLite indefinitely — durable and readable the
@@ -496,33 +497,46 @@ whole time, but never reaching Parquet.
 ## Maintenance
 
 ```python
-log.maintain() -> None
-log.seal_due() -> int | None
+log.advance(*, flush=False) -> None
+log.seal(*, flush=False) -> int | None
 log.compact() -> None
-log.publish(*, push_unsettled=False) -> None
-log.reclaim_buffer(min_free_ratio=0.0) -> int
-log.evict() -> None
-log.expire(table=None) -> None        # "staging" | "published" | None for both
-log.sweep(table=None) -> None         # the same
+log.publish(*, flush=False) -> None
+log.evict(table=None, *, start_offset=None, end_offset=None) -> None  # "buffer" | "staging"
+log.reclaim(table=None, *, min_free_ratio=0.0) -> None  # "buffer" | "staging" | "published"
+log.sweep(table=None) -> None                           # "staging" | "published"
 ```
 
-`maintain()` is the one call most deployments want: the whole pipeline, in the order rows move
+`advance()` is the one call most deployments want: the whole pipeline, in the order rows move
 from the buffer to the published table, each table swept after the last step that can change it.
 
-1. `seal_due()`: buffer → staging.
+1. `seal()`: buffer → staging.
 2. `compact()`: merges a run once it has `compact_min_files` files that fit the target.
 3. `publish()`: staging → published, only what compaction is finished with.
-4. `reclaim_buffer()`, when `vacuum_free_ratio` is set.
-5. `evict()`: staging drops what the published table now holds, in the same pass (I4).
-6. `expire("staging")`: staging snapshots past `staging_snapshot_retention`, then the
-   staging drain.
-7. `sweep("staging")`.
-8. `expire("published")`: published snapshots past `published_snapshot_retention`, then the
-   published drain.
-9. `sweep("published")`.
+4. `evict("buffer")`: rows the next durable copy holds — staging, or the published table
+   with `wal_replication`.
+5. `evict("staging")`: files the published table now holds, in the same pass (I4).
+6. `reclaim("buffer")`: `VACUUM`, only when `vacuum_free_ratio` is set.
+7. `reclaim("staging")`: expire snapshots past `staging_snapshot_retention`, then delete the
+   files whose grace has passed.
+8. `sweep("staging")`.
+9. `reclaim("published")`: the same against `published_snapshot_retention`.
+10. `sweep("published")`.
+
+**`seal` and `publish` only move data; every deletion is `evict`'s.** A seal leaves its rows in
+the buffer until `evict("buffer")`; reads see each row once either way, because the read
+boundary is the staging table's committed end. **`evict` takes optional half-open
+`[start_offset, end_offset)` bounds**, and chunking is the caller's: unbounded, a buffer
+eviction is one `DELETE` under SQLite's write lock and stalls appends while it runs. Staging
+eviction always removes a prefix, so a `start_offset` above the table's first offset raises.
+
+**`reclaim` on staging or published does not delete a file in the call that frees it.** Iceberg's
+expiry is metadata only; what it frees, and what compaction and eviction supersede, is queued
+with the time it stopped being referenced, and deleted only once its table's snapshot retention
+has passed since then — the grace that lets a scan already reading it finish (I6). A later
+`reclaim` deletes it; a retention of zero deletes it in the same call.
 
 **It is meant for a script or a single process, and raises on a second owner.** If another
-owner holds the publish lease, or the publish fails for any other reason, steps 4–7 still run
+owner holds the publish lease, or the publish fails for any other reason, steps 4–8 still run
 (local storage keeps being reclaimed on a machine cut off from a remote published table), then
 the published steps are skipped and the error is raised. Every log publishes (#98), to a local
 directory by default, so the pipeline needs the network only when the published table is
@@ -530,12 +544,12 @@ remote.
 
 **Each step is also a routine of its own**, for an orchestrator whose schedules differ because
 the costs do, or that wants the published side in another process or `sweep()` in a daemon
-thread. **`compact` reads and rewrites whole files, while `evict` and `expire` are metadata
-commits that finish in milliseconds, and `publish` is the only step that waits on the
+thread. **`compact` reads and rewrites whole files, while `evict` and `reclaim`'s expiry are
+metadata commits that finish in milliseconds, and `publish` is the only step that waits on the
 network.** Each takes only the exclusion it needs: a claim on the offsets it touches, or none
-(`expire`'s commit and `sweep`). A routine that works on both tables takes the table as an
-argument, `"staging"`, `"published"` or None for both, rather than one function per table; a
-misspelt table raises `ValueError`.
+(`reclaim`'s expiry and `sweep`). A routine that works on several tables takes the table as an
+argument, None meaning every table it acts on, rather than one function per table; a misspelt
+table, or one the routine does not act on, raises `ValueError`.
 
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
@@ -544,7 +558,7 @@ takes no claim and never raises.
 ## Published table
 
 ```python
-log.publish(*, push_unsettled: bool = False) -> None
+log.publish(*, flush: bool = False) -> None
 log.hydrate(since) -> None            # since: timedelta
 log.rewrite_published() -> None
 ```
@@ -552,7 +566,7 @@ log.rewrite_published() -> None
 `publish` uploads the staging files compaction is finished with, registers them into the
 published table in one commit, and records the watermark (§5). Compactions are never
 replicated: a file is pushed once it is settled, and compaction will not merge what the
-published table holds. `push_unsettled=True` also pushes the trailing run that
+published table holds. `flush=True` also pushes the trailing run that
 `stable_prefix` holds back for compaction — everything unpublished, not a subset, because the
 push walks a prefix and the watermark it records must stay contiguous. Use it to close a bulk
 load's tail on a log that has gone quiet; the cost is undersized objects the published table keeps
@@ -791,8 +805,8 @@ every page it has ever needed. Locally that is invisible — the free list is re
 litestream replicates the FILE, so every `restore` downloads and applies the dead space.
 Measured on a 1-day-old capture: 457 MB holding 20,658 live rows with 92% of its pages free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
 
-Set it and `maintain` reclaims once the free list reaches that share of the file;
-`WriteHandle.reclaim_buffer()` does it on demand. **Off by default, because the cost lands on
+Set it and `advance` reclaims once the free list reaches that share of the file;
+`reclaim("buffer")` does it on demand. **Off by default, because the cost lands on
 the write path**: `VACUUM` takes an exclusive lock and stalls appends for as long as the live
 data takes to copy — 0.3 s at 35 MB — and only the deployment knows whether its arrival rate
 can absorb that. A writer with no WAL replica can leave it None for ever and lose nothing
@@ -910,7 +924,7 @@ readable; one it left mid-change is refused with the release that can finish it 
 ## Rules that cut across
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
-`append`, `ingest`, `seal`, `seal_due`, `await_seal`, `maintain`, `compact`, `evict`, `expire`,
+`append`, `ingest`, `seal`, `await_seal`, `advance`, `compact`, `evict`, `expire`,
 `publish`, `hydrate`, `rewrite_published`, `retire`, `set_config`, `set_published` and
 `set_sort_by` are absent from `LogHandle`.
 Everything observational and both read paths are there.
@@ -924,7 +938,7 @@ with overloads, and so does this, so the misuse is caught before it runs.
 **One writer per log.** SQLite's write lock is per file and one process per stream is the
 intended topology; multiple machines write separate logs and readers union.
 
-**The claim decides who does the work, not the caller.** `maintain`, its three passes, `publish`,
+**The claim decides who does the work, not the caller.** `advance`, its routines, `publish`,
 `hydrate`, `rewrite_published`, `retire` and the three setters all coordinate through rows in
 SQLite, so a second caller is refused with `RuntimeError` rather than duplicating the work — and that holds
 between threads and between processes on identical terms.

@@ -345,8 +345,8 @@ be the real crossing, and there is deliberately none.
 **`wal_replication` is a declaration, not a supervisor.** This paragraph used to say the
 opposite — that replication is not configured in `LogConfig`, because a boolean claiming a
 sidecar was running would be a setting nothing reads. The flag exists now, and it is read:
-`_discard_on_seal` consults it on every seal to decide whether the rows stay in SQLite until
-the published table has them, and `validate` refuses it without a remote (`s3://`) published
+`evict("buffer")` consults it to decide whether rows stay in SQLite until the published table
+has them, and `validate` refuses it without a remote (`s3://`) published
 table to ship to and refuses `wal_retention` without it. What it still does not do is assert
 that a sidecar is running, which the library cannot know. So it states an intent the deployment has to honour, and
 stating it falsely costs the growth without buying the durability that growth was traded
@@ -395,15 +395,16 @@ of a range the published table did not hold yet — and the machine dying in tha
 from the MIDDLE of the offset space: below the seal frontier so the buffer no longer had
 them, above the published frontier so the bucket did not either.
 
-**So a seal keeps its rows when `wal_replication` is on**, and `publish` drops them once the
-published table holds the range. It is I4 one tier up: never delete the only off-box copy. Reads
-are unaffected — the buffer leg is bounded by the staging table's committed extent (§7), so
-held rows never reach the engine — and the cost is that `buffer.db` grows with publish lag,
-which a stalled publish makes unbounded, like a stalled eviction (§11).
+**So a seal never deletes its rows; `evict("buffer")` does** (#122), and with `wal_replication`
+on it waits until the published table holds the range. It is I4 one tier up: never drop data
+until the next durable copy has it. Reads are unaffected — the buffer leg is bounded by the
+staging table's committed extent (§7), so held rows never reach the engine, and a scan that
+ends below that extent skips the buffer entirely — and the cost is that `buffer.db` grows with
+publish lag, which a stalled publish makes unbounded, like a stalled eviction (§11).
 
 The gate is `wal_replication`, not "a published table is configured": with no sidecar the buffer
-and the Parquet share a disk and die together, so holding buys nothing. With neither, a
-seal discards as it always did, because nothing would ever release the rows.
+and the Parquet share a disk and die together, so the next durable copy is staging, and
+`evict("buffer")` drops rows as soon as a seal has committed them there.
 
 ```
 RPO = WAL replication lag        (with wal_replication)
@@ -979,7 +980,7 @@ and one of drift between blocks. Interleaving the runs is what settled it.
 **A decision reads the policy ONCE.** That is the hazard this trades for, and it is a real
 one: each read is now independent, so two of them inside a single decision can disagree. It
 bit immediately — `staging_rows` seen as an int by the guard and as None by the subtraction
-after it is `int - None`, a TypeError out of `maintain()`, which the shipped maintainer does
+after it is `int - None`, a TypeError out of `advance()`, which the shipped maintainer does
 not catch, so maintenance stopped entirely. The rule is not a lock; it is that every
 decision binds the policy to a local first: fresh per decision, coherent within it.
 
@@ -1019,10 +1020,10 @@ Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
 
 ```
 1. Upload the settled staging files not yet in the published table — those compaction
-   has finished with (`stable_prefix`), or every one with push_unsettled.
+   has finished with (`stable_prefix`), or every one with flush.
 2. published.add_files([...published paths...])  -- register, ONE commit; no data movement
 3. Record each file's published copy in `extent`, and the watermark in `meta`.
-4. (expire("published"), its own routine) Expire the published table's snapshots older than
+4. (reclaim("published"), its own routine) Expire the published table's snapshots older than
    published_snapshot_retention, delete what that frees once due; then sweep stranded
    metadata (§6).
 ```
@@ -1035,14 +1036,14 @@ never need the same overwrite applied twice. Re-cutting what is already publishe
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).
 
-**Step 4 is its own routine, `expire("published")`, not part of `publish`.** `maintain()` runs it
+**Step 4 is its own routine, `reclaim("published")`, not part of `publish`.** `advance()` runs it
 right after `publish` (§12), and an orchestrator can run it on its own schedule. Until #113 the
 published table was expired only after `rewrite_published`, on the reasoning that `publish`
 never supersedes a file. True of data files and not of Iceberg's own: a table that was only
 ever published kept every snapshot, manifest list and manifest it had ever had.
 
 **The staging table's expiry and eviction are not publishing work either.** They are their own
-routines, run by `maintain()` after `publish` (§12).
+routines, run by `advance()` after `publish` (§12).
 Eviction reads what step 3 records to enforce I4: **a file is never evicted locally before step 2 has registered
 it** — the one ordering in publishing that is correctness, not optimisation.
 
@@ -1125,7 +1126,7 @@ can report a file that no longer exists or miss one that does.
 writes its manifests, manifest list and `metadata.json`, then swaps the catalog pointer. One
 that loses the swap, or crashes before it, leaves those files under names nothing recorded;
 pyiceberg, unlike Java Iceberg, does not delete a losing attempt's files. So `sweep()` — run by
-`maintain()` after each table's last change — lists `metadata/` at their first pass
+`advance()` after each table's last change — lists `metadata/` at their first pass
 in a process and every four hours after, and delete what is unreferenced, not a
 `metadata.json` the table still names, not queued, and older than the table's retention (an
 hour at least, so a commit in flight keeps its files). The listing comes first and the live
@@ -1152,7 +1153,7 @@ single snapshot; only the first leaves the process knowing the filename in advan
 A file is then always in exactly one of four states — referenced by a live snapshot, claimed
 by an in-flight seal, claimed by an in-flight compaction, or queued for deletion — and each is
 a keyed read. Reclaiming space is draining `pending_delete` for rows superseded longer ago
-than their table's snapshot retention — staging rows by `maintain`, the published table's by
+than their table's snapshot retention — staging rows by `advance`, the published table's by
 `publish` — checking each against the live references, unlinking, and only then
 forgetting the row: a crash between the unlink and the forget retries a no-op, whereas the
 reverse order loses the path with the file still on disk.
@@ -1532,8 +1533,8 @@ Raising it is an operation, not a config change: `hydrate(since=…)` fetches pu
 and re-registers them into the staging table. Without it, a raised setting applies only to
 data captured afterwards.
 
-Buffer rows are deleted once something off-box holds them — at seal, or at publish with
-`wal_replication` (§3a). There is no SQLite retention knob.
+Buffer rows are deleted by `evict("buffer")` once the next durable copy holds them — staging,
+or the published table with `wal_replication` (§3a). There is no SQLite retention knob.
 
 ---
 
@@ -1690,7 +1691,7 @@ no rewrite; the sort order is a read-shape decision that re-clusters every file 
 table owns, so it is set at `litelink.new` and changed by `set_sort_by`. It lives in `meta` beside the
 schema, not in `LogConfig`.
 
-`maintain()` runs the whole pipeline in lifecycle order: seal, compact, publish, reclaim the
+`advance()` runs the whole pipeline in lifecycle order: seal, compact, publish, reclaim the
 buffer, evict, expire, sweep staging, expire the published table, sweep it. Eviction takes only
 what `publish` has put in the published table, so it runs after it, in the same pass. Each is
 a no-op or a regression without the others: compaction alone increases
@@ -1835,7 +1836,7 @@ The consequence worth planning for is that local disk holds roughly
    lease is not a failure — so a writer that appends and calls `seal()` while a maintainer
    holds the range is left with a FRESH empty open group and its rows in a group already
    queued. Asking only the open group passes; the rows are below `lo`, in no file; the
-   maintainer drains its queue, the register is declined, and `finish_seal(discard=True)`
+   maintainer drains its queue, the register is declined, and the next `evict("buffer")`
    deletes them into a table that is contiguous, non-overlapping and undetectably wrong.
    The check is three reads — `pending_group()`, `pending_seal()`, and the open group's
    `start_offset` — and they are complete because of the CALL GRAPH rather than because they
@@ -2006,7 +2007,7 @@ The consequence worth planning for is that local disk holds roughly
    recovery replays only what it owns — which is the hazard above, resolved.
 
    Nothing configures where the sealer runs, because nothing in the library runs one.
-   `seal_due()` drains the queue; `maintain()` calls it first, then runs the rest of the
+   `seal()` drains the queue; `advance()` calls it first, then runs the rest of the
    pipeline. Both are plain methods on their caller's schedule, and
    if another owner holds the lease the call is refused and returns rather than
    duplicating the work.
@@ -2015,7 +2016,7 @@ The consequence worth planning for is that local disk holds roughly
    with `extend()` starting a daemon thread. That existed only because sealing used to sit
    on the append path — "where does this expensive thing run" was a real question. Once the
    cut moved into the append transaction, sealing became draining, which is what
-   `maintain()` already was, and the asymmetry had no defence: there was never a
+   `advance()` already was, and the asymmetry had no defence: there was never a
    `maintain_mode` or a `maintain_poll`. Removing it also removed a library that started
    threads behind its caller, which is how two of §13.6's bugs stayed hidden.
 
@@ -2049,7 +2050,7 @@ The consequence worth planning for is that local disk holds roughly
    nothing here demands thread affinity.
 
    What is *not* built is the API that would make that ergonomic. `await log.append(...)`,
-   `await log.seal_due()`, and above all `await log.await_seal()` — whose name already
+   `await log.seal()`, and above all `await log.await_seal()` — whose name already
    describes an awaitable and whose current implementation is a sleep-poll loop that an
    event loop would rather own. A capture feed arriving over a websocket is asyncio by
    construction, so the wrapper is worth having.
@@ -2260,9 +2261,9 @@ The consequence worth planning for is that local disk holds roughly
                          240 files /   1 snapshot      86.3 ms
    ```
 
-   **The larger factor is snapshot accumulation, and expiry arrests it** — which `maintain()`
+   **The larger factor is snapshot accumulation, and expiry arrests it** — which `advance()`
    already does, bounded by `staging_snapshot_retention`. An earlier version of this entry blamed file
-   count alone, measured with `maintain()` never running so that every snapshot survived. That
+   count alone, measured with `advance()` never running so that every snapshot survived. That
    made the growth look both steeper and less fixable than it is.
 
    **The cause is not manifests**, which is the obvious suspect and worth ruling out. They cap

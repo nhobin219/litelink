@@ -85,7 +85,7 @@ def test_carried_types_survive_a_round_trip(tmp_path: Path, type_: pa.DataType) 
         expected = _as_read([sample, None], type_)
         assert log.scan().read_all()["c"].to_pylist() == expected, "from buffer"
 
-        log.seal()
+        log.seal(flush=True)
 
         assert log.scan().read_all()["c"].to_pylist() == expected, "from table"
 
@@ -160,7 +160,7 @@ def test_declared_types_come_back_as_declared(tmp_path: Path) -> None:
         assert from_buffer.field("key").type == pa.large_string()
         assert from_buffer.field("payload").type == pa.string()
 
-        log.seal()
+        log.seal(flush=True)
 
         from_table = log.scan().read_all().schema
         assert from_table.field("key").type == pa.large_string()
@@ -264,7 +264,7 @@ def test_extreme_values_survive_the_round_trip(
 
         assert log.scan().read_all()["c"].to_pylist() == expected, "from the buffer"
 
-        log.seal()
+        log.seal(flush=True)
 
         assert log.scan().read_all()["c"].to_pylist() == expected, "from the table"
 
@@ -301,7 +301,7 @@ def test_a_non_finite_float_is_refused_naming_its_column(
         assert log.end_offset() == 1, "the whole batch rolled back"
 
         log.append({"event_ts": 3, "c": 2.5})
-        log.seal()
+        log.seal(flush=True)
         assert log.scan().read_all()["c"].to_pylist() == [2.5]
 
 
@@ -371,7 +371,7 @@ def test_an_otel_log_round_trips_through_every_local_path(tmp_path: Path) -> Non
         log.extend(rows[:5])
         assert _read_back(log) == _expected(rows[:5]), "from the buffer"
 
-        log.seal()
+        log.seal(flush=True)
         log.extend(rows[5:])
         assert _read_back(log) == _expected(rows), "across table and buffer"
 
@@ -382,8 +382,8 @@ def test_an_otel_log_round_trips_through_every_local_path(tmp_path: Path) -> Non
         by_id = log.sql(f"SELECT ts FROM log WHERE trace_id = from_hex('{wanted}')")
         assert by_id.read_all().to_pylist() == [{"ts": 3}]
 
-        log.seal()
-        log.maintain()
+        log.seal(flush=True)
+        log.advance()
         assert log.staging_files() == 1, "compaction merged nested files"
         assert _read_back(log) == _expected(rows), "after compaction"
 
@@ -444,7 +444,7 @@ def test_a_nested_or_binary_value_the_column_cannot_hold_is_refused(
         assert log.end_offset() == 1, "the whole batch rolled back"
 
         log.append(otel_row(3))
-        log.seal()
+        log.seal(flush=True)
         assert _read_back(log) == _expected([otel_row(3)])
 
 
@@ -465,7 +465,7 @@ def test_a_nested_value_counts_its_stored_size_toward_the_seal(tmp_path: Path) -
     with litelink.new(tmp_path, "s", schema=schema, config=config) as log:
         log.extend([{"ts": i, "m": {"k": "x" * 1000}} for i in range(8)])
 
-        assert log.seal_due() is not None, "8 KB of maps crossed a 4 KB target"
+        assert log.seal() is not None, "8 KB of maps crossed a 4 KB target"
 
 
 def test_sort_by_cannot_name_a_nested_column(tmp_path: Path) -> None:

@@ -47,9 +47,9 @@ def written(
         **overrides,
     )
     log.extend(rows(ROWS))
-    log.seal()
-    log.publish(push_unsettled=True)
-    log.maintain()
+    log.seal(flush=True)
+    log.publish(flush=True)
+    log.advance()
     log.extend({"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(7))
 
     return log

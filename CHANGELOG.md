@@ -9,46 +9,78 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+> **⚠️ `seal()` CHANGED MEANING — CHECK EVERY CALL.** A bare `seal()` used
+> to cut and seal *everything* buffered. It now writes only what the size
+> trigger has cut, as `seal_due()` did. **Nothing raises**: a call that
+> relied on the old meaning silently stops producing files. Replace every bare
+> `seal()` meant as "seal everything now" with **`seal(flush=True)`**, and every
+> `seal_due()` with `seal()`.
+>
+> **⚠️ `seal()` and `publish()` no longer delete buffer rows.** `evict("buffer")`
+> does, and `advance()` runs it. A loop that calls `seal()` but never
+> `evict("buffer")` or `advance()` now grows `buffer.db` without bound.
+
 ### Changed
 
+- **Breaking: `evict(table)` and `reclaim(table)`, one set of verbs for every
+  table** (#122). `seal` and `publish` only move data; every deletion is
+  `evict`'s, and every return of disk is `reclaim`'s.
+  - `evict(table=None, *, start_offset=None, end_offset=None)` takes
+    `"buffer"` (new: rows the next durable copy holds — staging, or the
+    published table with `wal_replication`) and `"staging"` (as before). The
+    half-open bounds narrow what is eligible; chunking a large eviction is the
+    caller's, since an unbounded buffer eviction is one `DELETE` that stalls
+    appends while it runs.
+  - `reclaim(table=None, *, min_free_ratio=0.0)` replaces `expire(table)` and
+    `reclaim_buffer(min_free_ratio)`: `"buffer"` is `VACUUM`, `"staging"` and
+    `"published"` expire snapshots and then delete files whose grace period
+    has passed. **`reclaim()` with no argument now also vacuums the buffer**,
+    which blocks appends; name the tables to avoid it.
+  - `advance()` runs: seal, compact, publish, `evict("buffer")`,
+    `evict("staging")`, `reclaim("buffer")` (only with `vacuum_free_ratio`),
+    `reclaim("staging")`, `sweep("staging")`, `reclaim("published")`,
+    `sweep("published")`.
+- **Breaking: `seal(*, flush=False)` replaces `seal()` and `seal_due()`**
+  (#119). See the warning above.
+- **Breaking: `maintain()` is renamed `advance(*, flush=False)`** (#119). It
+  advances the log's rows from the buffer to the published table, which
+  "maintain" undersold. `advance(flush=True)` passes `flush` to `seal` and
+  `publish`, getting everything off this machine in one pass, e.g. at
+  shutdown.
+- **Breaking: `publish(push_unsettled=…)` is now `publish(flush=…)`** (#119).
+  `flush` means the same on `seal`, `publish` and `advance`: push everything
+  through this stage now, regardless of thresholds.
 - **Breaking: `LogConfig.snapshot_retention` is split in two** (#113).
   `staging_snapshot_retention` (default **15 minutes**, was 1 hour) and
   `published_snapshot_retention` (default 1 hour). Pass the new names; a stored
   config written by an older version fills both from its `snapshot_retention`.
   A scan of the staging table running longer than 15 minutes now needs the
   staging setting raised.
-- **Breaking: `maintain()` now runs the whole pipeline, publish included**
-  (#117, #119). It runs in the order rows move:
-  1. `seal_due()`;
-  2. `compact()`;
-  3. **`publish()`**;
-  4. `reclaim_buffer()`, when configured;
-  5. `evict()`;
-  6. `expire("staging")`;
-  7. `sweep("staging")`;
-  8. **`expire("published")`**;
-  9. `sweep("published")`.
+- **Breaking: `advance()` (formerly `maintain()`) now runs the whole
+  pipeline, publish included** (#117, #119, #122). Data moves first, then
+  cleanup follows behind it, in the order listed under the `evict` and
+  `reclaim` entry above.
 
-  #100 made every log publish, and `maintain()` should have published from
-  then on. A loop calling `maintain()` then `publish()` still works, but the
-  second call now finds nothing to do and can be dropped. **`maintain()` now
+  #100 made every log publish, and `advance()` should have published from
+  then on. A loop calling `advance()` then `publish()` still works, but the
+  second call now finds nothing to do and can be dropped. **`advance()` now
   raises** if the publish fails, including when another owner holds the
-  lease: it is meant for one process. Local maintenance (steps 4–7) still runs
+  lease: it is meant for one process. The buffer and staging steps still run
   first, so a machine cut off from a remote published table keeps reclaiming
   local storage.
-- **The published table is now expired** (#113). `expire("published")`, step 8
-  above, expires published snapshots older than `published_snapshot_retention`
+- **The published table is now expired** (#113). `reclaim("published")`
+  expires published snapshots older than `published_snapshot_retention`
   and deletes the objects that frees once due. Previously the published table
   was expired only after `rewrite_published`, so one that was only ever
   published kept every snapshot, manifest list and manifest.
-
-- **Breaking: one routine per operation, the table an argument** (#117).
-  `expire(table=None)` and `sweep(table=None)` take `"staging"`,
-  `"published"`, or None for both; a misspelt table raises `ValueError`.
-  **`expire()` with no argument now expires both tables**; it used to expire
-  staging only. Pass `"staging"` for the old behaviour.
+- **Breaking: one routine per operation, the table an argument** (#117,
+  #122). `evict`, `reclaim` and `sweep` take the table they act on, None
+  meaning every table that routine handles; a misspelt table, or one the
+  routine does not act on, raises `ValueError`. `expire()` and
+  `expire_published()` are gone: `reclaim("staging")` and `reclaim("published")`
+  replace them.
 - **Breaking: `heartbeat` is removed** from `compact()`, `evict()` and
-  `expire()`. Each pass takes and renews its own claim on the range it works
+  what was `expire()`. Each pass takes and renews its own claim on the range it works
   on (§4a), so a caller's callback had nothing left to do: on `evict()` and
   `expire()` it was already ignored, and on `compact()` it could only abort the
   pass. Drop the argument.
@@ -60,7 +92,7 @@ minor version carries breaking changes.
   daemon thread.
 - **A sweep for stranded Iceberg metadata** (#113). A commit that loses its
   pointer swap, or crashes before it, leaves its manifests, manifest list and
-  `metadata.json` behind, and pyiceberg does not delete them. `maintain()`
+  `metadata.json` behind, and pyiceberg does not delete them. `advance()`
   sweeps each table after its last change. A sweep lists `metadata/` at its
   first pass in a process and every four hours after, and deletes files that
   nothing references and that are older than both an hour and the table's

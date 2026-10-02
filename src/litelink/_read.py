@@ -469,9 +469,10 @@ class Reader:
         # only BEFORE its rows are read — skipping that read is the point.
         # Sound whenever it is taken: the lowest offset only rises, so a
         # query below it now matches nothing the buffer can later hold.
+        boundary = None if floor is None else floor[1]
         tail = (
-            self._buffer.rows_from(None if floor is None else floor[1])
-            if self._buffer_could_match(found)
+            self._buffer.rows_from(boundary)
+            if self._buffer_could_match(found, boundary)
             else self._buffer.no_rows()
         )
 
@@ -508,13 +509,47 @@ class Reader:
 
         return _cast_to(reader, self._schema)
 
-    def _buffer_could_match(self, found: tuple[Term, ...]) -> bool:
-        """Whether the buffer could hold a row matching `found`, by offset alone.
+    def _buffer_could_match(
+        self, found: tuple[Term, ...], boundary: int | None = None
+    ) -> bool:
+        """Whether the buffer's leg could hold a row matching `found`, by offset
+        alone. Decides only WHETHER to read the buffer; where its leg is cut
+        is `_union`'s, from exact resolved values.
 
         The buffer has no column statistics — computing them would cost the
-        read this avoids — but `litelink_offset` is the log's sequence, so its
-        range is known: from its lowest offset up, open-ended, since rows keep
-        arriving. A query entirely below that range cannot match it.
+        read this avoids — but `litelink_offset` is the log's sequence, so the
+        leg's range is known: from a floor up, open-ended, since rows keep
+        arriving. A query entirely below the floor cannot match it.
+
+        **The floor is `max(lowest buffered offset, boundary)`**, where
+        `boundary` is the staging table's end (None when staging is empty).
+        Neither alone is always the tighter, which is why both are read:
+
+        - **Sealed rows not yet evicted** — the ordinary state between passes,
+          since a seal no longer deletes its rows (#122). The lowest offset is
+          a sealed row BELOW the boundary that the leg will never return, so
+          the boundary is the floor. Pruning on the lowest offset alone was a
+          regression: the buffer stopped being ruled out for any scan below
+          the tail.
+        - **Just after `evict("buffer")`** — the lowest offset is the first
+          unsealed row, normally EQUAL to the boundary. Either serves.
+        - **A gap above staging** — offsets reserved and never filled, as a
+          failed `ingest` leaves (accepted, see `ingest`). The first buffered
+          row sits ABOVE the boundary, so the lowest offset is the floor, and
+          a scan falling inside the gap skips the buffer. This is why the
+          boundary alone is not enough.
+        - **No staging table** — no boundary, so the floor is the lowest
+          buffered offset. It may be a row the published table also holds
+          (a crash between `publish` and `evict("buffer")`, or a restored
+          log), which only costs a read: `_union` cuts the leg at the
+          published table's exact span, so nothing is returned twice.
+
+        **Not the tier manifest's `published` row**, though it looks like the
+        cutoff wanted in that last case. That row may OVERSTATE what the
+        published table holds — eviction widens it before its commit, and
+        overstating is its safe direction for skipping the published table.
+        For skipping the buffer it is the unsafe direction: a query under an
+        overstated bound would skip buffer rows the published table lacks.
         """
         # Closed by `retire()`: an empty range at the log's end, which no
         # query needs, with offset terms or without.
@@ -530,7 +565,9 @@ class Reader:
         if lowest is None:
             return True
 
-        unit = entry(BUFFER, (lowest, None), self._schema, UNKNOWN)
+        floor = lowest if boundary is None else max(lowest, boundary)
+
+        unit = entry(BUFFER, (floor, None), self._schema, UNKNOWN)
 
         return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
 

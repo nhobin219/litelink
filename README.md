@@ -135,9 +135,10 @@ litelink.preflight(...)                                            # what python
 # A WriteHandle also writes:
     log.append(row) -> int                          # durable on return
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
-    log.ingest(table_or_reader)                     # Arrow straight to Parquet
-    log.seal_due() · log.maintain()                 # seal; the whole pipeline, publish included
-    log.publish(*, push_unsettled=False)            # push to the published table
+    log.ingest(table_or_reader)                     # Arrow straight to Parquet, then published
+    log.advance(*, flush=False)                     # the whole pipeline below, in order
+    log.seal(*, flush=False) · compact() · publish(*, flush=False)   # its steps: move data
+    log.evict(table=None) · reclaim(table=None) · sweep(table=None) # its steps: clean up
     log.retire()                                    # end the log: all published, none local
     log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
 ```
@@ -148,12 +149,89 @@ The deliberate choices:
   raise, and `open(..., read_only=True)` is typed so misuse is caught before it runs.
 - **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
   live in the log, so nothing at the call site can disagree with what is on disk.
-- **The library owns no thread.** Nothing seals unless you call `seal_due()` or `maintain()`;
+- **The library owns no thread.** Nothing seals unless you call `seal()` or `advance()`;
   your loop is the schedule.
 - **Which tiers a query reads is decided per query**, from its predicates. A query bounded
   inside the staging window never touches the network, however much has been evicted.
 
 Full reference in [`docs/API.md`](docs/API.md).
+
+## The pipeline
+
+Rows move through three tables, and `advance()` moves them. It runs every step in the order
+rows travel, then cleans up behind them, each table after the last step that can change it:
+
+```
+  log.append(row) · log.extend(rows)        durable on return: SQLite, synchronous=FULL
+                │
+                ▼
+  ┌───────────────────────────┐
+  │ buffer         buffer.db  │   rows wait until a file's worth has arrived
+  └───────────────────────────┘
+                │  1. seal       writes what the size trigger cut       flush: everything
+                ▼
+  ┌───────────────────────────┐ ◄──┐
+  │ staging    local Iceberg  │    │  2. compact   merges runs of small files
+  └───────────────────────────┘ ───┘
+                │  3. publish    what compaction is finished with       flush: everything
+                ▼
+  ┌───────────────────────────┐
+  │ published        Iceberg  │   local by default, or s3://
+  └───────────────────────────┘
+
+  then, behind the rows, each table after the last step that can change it:
+     4. evict("buffer")        rows staging holds (published, with wal_replication)
+     5. evict("staging")       files published holds, never before (I4)
+     6. reclaim("buffer")      VACUUM buffer.db         only with vacuum_free_ratio
+     7. reclaim("staging")     expire old snapshots, then delete files past their grace
+     8. sweep("staging")       files a lost or crashed commit left behind
+     9. reclaim("published")   the same, on the published table
+    10. sweep("published")
+```
+
+One set of verbs for every table, each taking the table as an argument:
+
+| | `evict`: drop what the next copy holds | `reclaim`: turn that into free disk | `sweep` |
+|---|---|---|---|
+| `"buffer"` | rows staging holds, or published with `wal_replication` | `VACUUM` | — |
+| `"staging"` | files published holds (I4) | expire snapshots, then delete | stranded metadata |
+| `"published"` | — (it is the durable copy) | expire snapshots, then delete | stranded metadata |
+
+`reclaim` on staging or published does not delete a file in the call that frees it: the file
+waits out its table's snapshot retention first, so a scan already reading it can finish. A
+later `reclaim` deletes it.
+
+- **`flush=True` means the same everywhere**: push everything through this stage now,
+  regardless of thresholds. `advance(flush=True)` passes it to `seal` and `publish`, so one
+  pass leaves nothing buffered and nothing unpublished. Use it at shutdown, not in a loop: it
+  leaves undersized files behind.
+- **Nothing runs unless you call it.** The library owns no thread. Call `seal()` often (it is
+  one indexed read when there is nothing to do) and `advance()` rarely.
+- **Each step is a routine of its own** for an orchestrator that wants them on different
+  schedules or in different processes. `advance()` is the one-process version, and raises if
+  another process holds the lease.
+- **A publish that fails stops only the published steps.** Steps 4–8 still run, so a machine
+  cut off from S3 keeps reclaiming local storage; then the error is raised.
+
+`ingest()` loads data that is already durable, a Parquet corpus say, so it skips the buffer:
+
+```
+  log.ingest(arrow_table_or_reader)         the source is already durable: no buffer, no per-row fsync
+                │  reserve offsets, sort, write files at target_compact_size, register in batches
+                ▼
+  ┌───────────────────────────┐
+  │ staging                   │   the whole log is claimed for the load
+  └───────────────────────────┘
+                │  compact()            merges only small files already in staging
+                │  publish(flush=True)  the load's only second copy, last short file included
+                ▼
+  ┌───────────────────────────┐
+  │ published                 │   skip with ingest(..., publish=False)
+  └───────────────────────────┘
+```
+
+It runs only what a load needs to be safe. Eviction, reclaiming and the sweeps are left to
+the next `advance()`, which a log that only ever ingests still needs, or its snapshots accumulate.
 
 ## Writing
 
@@ -173,7 +251,7 @@ log = litelink.new("data", "trades", schema=schema, sort_by=("event_ts",))
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076})     # durable on return
 log.extend(group_of_rows)                             # the throughput lever
-log.maintain()                                        # seal, compact, publish, evict, expire, sweep
+log.advance()                                        # seal, compact, publish, evict, expire, sweep
 ```
 
 `extend()` commits the whole group in one transaction, so it is one fsync for the batch
@@ -308,8 +386,8 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
   Offsets stay dense across the two, and any engine reads both as one sequence.
 
 - **Not an unbounded staging table.** A seal's cost tracks what the table's metadata holds, so
-  a log that never runs `maintain()` and never evicts gets slower on the write path over time.
-  `maintain()` arrests the larger factor; a retention, with `publish()` running, bounds the
+  a log that never runs `advance()` and never evicts gets slower on the write path over time.
+  `advance()` arrests the larger factor; a retention, with `publish()` running, bounds the
   rest. Numbers and the reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet

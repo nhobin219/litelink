@@ -1694,23 +1694,15 @@ class Buffer:
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
-    def finish_seal(self, end: int, rel_path: str, *, discard: bool = True) -> bool:
-        """Retire the group, clear the intent, and drop the sealed rows.
+    def finish_seal(self, end: int, rel_path: str) -> bool:
+        """Retire the group and clear the intent. The sealed rows STAY.
 
-        Garbage collection, not correctness: the read boundary in §7 already
-        excludes these rows the moment the Iceberg commit lands, so the window
-        between that commit and this call is safe in both directions.
-
-        **`discard=False` keeps them, and that is I4 one tier up.** A seal moves
-        rows from SQLite into a Parquet file that no sidecar replicates, so with
-        WAL shipping on, deleting here removes the only off-box copy of a range
-        the published table does not have yet — and the machine dying in that
-        window loses them, silently, from the middle of the offset space (§3a).
-        The caller passes False when replication is on and something is owed to
-        the published table; `release_below` is what removes them afterwards.
-
-        Only the CALLER can decide that, which is why it is a parameter rather
-        than a check here: this object knows nothing about published tables.
+        Dropping them is `evict("buffer")`'s, not the seal's (#122): a seal only
+        moves data, and every deletion belongs to the cleanup half of the
+        pipeline. Leaving them is safe in both directions — the read boundary
+        in §7 excludes these rows the moment the Iceberg commit lands — and it
+        is what `wal_replication` always needed anyway: the buffer is the
+        off-box copy until the published table has the range (§3a).
 
         Returns whether this caller's claim was the live one. False means it
         was superseded while it worked, and finishing belongs to whoever holds
@@ -1732,11 +1724,6 @@ class Buffer:
             )
             if not cursor.rowcount:
                 return False
-
-            if discard:
-                self._con.execute(
-                    'DELETE FROM buffer WHERE "litelink_offset" < ?', (end,)
-                )
 
             # NAMED, not deleted. The row is the same fact before and after —
             # this range, these bytes — and sealing only settles where it
@@ -2759,8 +2746,9 @@ class Buffer:
           belonged to is deleted above, so `finish_seal`'s naming UPDATE
           (keyed `end_offset = ? AND rel_path IS NULL`) matches nothing and
           returns True anyway, while the fresh open group still spans the
-          range. With `discard=False` the rows are still buffered, so the next
-          cut writes them a second time. Measured: 490 rows read where 440 are
+          range. A seal never deletes its rows (that is `evict("buffer")`'s),
+          so they are still buffered and the next cut writes them a second
+          time. Measured: 490 rows read where 440 are
           distinct, from two overlapping local files, with no error anywhere.
 
           Recovery is redundant here rather than protective. Every row that
@@ -2824,28 +2812,21 @@ class Buffer:
 
         self._seed_group()
 
-    def release_below(self, end: int) -> int:
-        """Drop buffer rows below `end`, which the published table now holds.
-        Returns how many.
+    def evict_rows(self, start: int, end: int) -> int:
+        """Drop buffer rows in `[start, end)`. Returns how many.
 
-        The other half of `finish_seal(discard=False)`: those rows stayed
-        because the published table did not have them yet, and this is what
-        notices that it does.
+        `evict("buffer")`'s delete. The caller decides `end` from what the next
+        durable copy holds; this only deletes. One statement under the write
+        lock, so a wide range stalls appends for its duration — bounding the
+        range is how a caller chunks it.
 
-        Bounded by the PUBLISHED table's frontier, never by the seal's. That is
-        the whole point — the seal moves rows to a file nothing replicates, and
-        only the published table makes them safe off-box.
-
-        Idempotent, and it has to be. Driven from the published table's own span
-        at the start of a pass rather than from the tail of a push, because a
-        push has three early returns before its watermark: a crash between the
-        register and this call would otherwise leave the rows held, and the next
-        pass — finding nothing left to push — would return before reaching it.
-        On a log that has gone quiet, for ever.
+        Idempotent: rows already gone are simply not there to delete.
         """
         with self._lock, self._con:
             cursor = self._con.execute(
-                'DELETE FROM buffer WHERE "litelink_offset" < ?', (end,)
+                'DELETE FROM buffer WHERE "litelink_offset" >= ?'
+                ' AND "litelink_offset" < ?',
+                (start, end),
             )
 
         return cursor.rowcount
@@ -2855,7 +2836,7 @@ class Buffer:
 
         Reclaims when the free list is at least `min_free_ratio` of the file.
         The default reclaims whenever there is anything worth reclaiming, which
-        is what an explicit `reclaim_buffer()` asks for; `maintain` passes the
+        is what an explicit `reclaim("buffer")` asks for; `advance` passes the
         log's `vacuum_free_ratio` instead.
 
         SQLite puts pages freed by a DELETE on a free list and never shrinks the
@@ -2878,15 +2859,15 @@ class Buffer:
         stalls appends for that long — 0.3 s at 35 MB. Running it wherever rows
         happen to leave would put a background cost on the write path and take
         the decision away from the deployment that knows its append rate. It is
-        a maintenance operation: `WriteHandle.reclaim_buffer` calls it, and
-        `maintain` does too when `vacuum_free_ratio` is set.
+        a maintenance operation: `WriteHandle.reclaim("buffer")` calls it, and
+        `advance` does too when `vacuum_free_ratio` is set.
 
         **Offsets are untouched, which is the property that matters (I9).**
         `litelink_offset` is an explicit `INTEGER PRIMARY KEY`, so it is column
         data rather than an implicit rowid SQLite may renumber: values keep
         their gaps and are never rewritten. `sqlite_sequence` survives too,
         including across a VACUUM of a FULLY DRAINED buffer — the ordinary state
-        after `release_below` on a log the published table has caught up with,
+        after `evict("buffer")` on a log the published table has caught up with,
         and the case that would matter: were that counter lost, AUTOINCREMENT
         would restart at 1 and reissue offsets the published table already
         holds. Verified both directly.

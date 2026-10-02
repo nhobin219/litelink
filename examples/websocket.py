@@ -7,12 +7,12 @@ publishes BTC/USD trades over an unauthenticated websocket; this subscribes,
 appends each one, and seals when there is enough to seal. That is the entire
 loop — everything else in this file is argument parsing and a closing query.
 
-`seal_due` is an indexed read of one row when there is nothing to do, so
+`seal` is an indexed read of one row when there is nothing to do, so
 calling it per message costs almost nothing, and when a group is queued it
 writes that one file and returns.
 
 **It blocks the event loop, and it is the SEAL that does it** — not the append.
-Measured: an append runs at a 405 us median, a `seal_due` that actually writes
+Measured: an append runs at a 405 us median, a `seal` that actually writes
 a file at 43 ms. So a trade arriving mid-seal waits for it. At this feed's rate
 that is invisible; the fix at real rates is to run the seal in another process,
 which is what `adsb/maintainer.py` is and why it exists.
@@ -98,13 +98,13 @@ async def main() -> None:
                     continue
 
                 log.append(row(frame["data"]))
-                log.seal_due()
+                log.seal()
 
-        # `seal()`, not `seal_due()`: the loop above drains groups the appender
+        # `seal()`, not `seal()`: the loop above drains groups the appender
         # already CUT, and the open group is not one of them. An orderly
         # shutdown closes it, which is the one moment that is the right thing
         # to do.
-        while log.seal() is not None:
+        while log.seal(flush=True) is not None:
             pass
 
         print(f"  {log.end_offset() - 1:,} trades, {log.staging_files()} file(s)")

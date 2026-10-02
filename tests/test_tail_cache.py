@@ -88,7 +88,7 @@ def test_the_cache_answers_exactly_what_an_uncached_read_would(
                 lowest = buffer.lowest_offset()
                 if lowest is not None:
                     cut = lowest + rng.randint(0, 15)
-                    buffer.release_below(cut)
+                    buffer.evict_rows(0, cut)
                     released = max(released, cut)
             elif roll < 0.5:
                 # A hole no buffered row will ever fill, as `ingest` leaves.
@@ -159,7 +159,7 @@ def test_reads_racing_seals_see_every_row_exactly_once(tmp_path: Path) -> None:
 
     with open_log(tmp_path, quiet()) as writer:
         writer.extend(rows(10))
-        writer.seal()
+        writer.seal(flush=True)
 
         def read() -> None:
             with litelink.open(tmp_path, "s", read_only=True) as reader:
@@ -181,7 +181,7 @@ def test_reads_racing_seals_see_every_row_exactly_once(tmp_path: Path) -> None:
                 acknowledged = writer.end_offset() - 1
                 batch += 1
                 if batch % 5 == 0:
-                    writer.seal()
+                    writer.seal(flush=True)
         finally:
             done.set()
             thread.join()
@@ -200,7 +200,7 @@ def test_a_log_written_before_the_cache_changed_reads_the_same(
     log: WriteHandle
     with open_log(tmp_path, quiet()) as log:
         log.extend(rows(30))
-        log.seal()
+        log.seal(flush=True)
         log._buffer.reserve(5)  # noqa: SLF001
         log.extend(rows(12, start=30))
         expected = offsets(log.scan(columns=[OFFSET]).read_all())

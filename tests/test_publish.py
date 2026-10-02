@@ -114,7 +114,7 @@ def test_publish_pushes_sealed_files_and_records_the_watermark(
     later reads to decide what may be evicted."""
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         sealed = log._table.data_files()
         assert sealed, "the fixture must produce sealed files to push"
 
@@ -141,10 +141,10 @@ def test_a_read_spans_published_staging_and_buffer(
     """
     with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         before = log.staging_files()
         log.publish()
-        log.maintain()
+        log.advance()
 
         assert log.staging_files() < before, "eviction must have removed local files"
         assert log.staging_extent() is None, (
@@ -180,9 +180,9 @@ def test_a_hot_read_never_touches_the_published_table(
         tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
     ) as log:
         log.extend(rows(ROWS))
-        log.seal()
-        log.publish(push_unsettled=True)
-        log.maintain()
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.advance()
         extent = log.staging_extent()
         assert extent is not None
         assert 1 < extent[0], "the fixture must evict part of the log"
@@ -220,9 +220,9 @@ def test_only_settled_files_reach_the_published_table(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
-        log.extend(rows(4))
         log.seal()
+        log.extend(rows(4))
+        log.seal(flush=True)
 
         files = log._table.data_files()
         held = log._maintenance.memory()
@@ -249,9 +249,9 @@ def test_hydrate_brings_evicted_files_back_to_local_disk(
     """
     with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
-        log.maintain()
+        log.advance()
 
         assert log.staging_extent() is None, "the fixture must evict something"
         assert log.scan().read_all().num_rows == ROWS, (
@@ -281,9 +281,9 @@ def test_hydrate_is_idempotent(tmp_path: Path, bucket: str, s3: S3Options) -> No
     """
     with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
-        log.maintain()
+        log.advance()
 
         log.hydrate(since=timedelta(hours=1))
         once = log.staging_files()
@@ -299,9 +299,9 @@ def test_hydrate_ignores_files_older_than_the_window(
     """A zero window restores nothing, which is what makes the window real."""
     with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
-        log.maintain()
+        log.advance()
         evicted = log.staging_files()
 
         log.hydrate(since=timedelta(0))
@@ -329,14 +329,14 @@ def test_rewrite_published_merges_files_left_undersized(
         staging_retention=timedelta(0),
     ) as log:
         log.extend(scrambled(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         # Evicted, so the read at the end is served BY the published table. Without
         # this the staging table still holds every row, the published leg of the
         # union is bounded above by the local extent and contributes nothing,
         # and the assertions below pass without reading a rewritten file at
         # all — which is exactly what they did before this line.
-        log.maintain()
+        log.advance()
         assert log.staging_extent() is None, "the read must need S3"
 
         remote = log._published.require()
@@ -398,7 +398,7 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
         published_snapshot_retention=timedelta(hours=1),
     ) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         superseded = {f.path for f in log._published.require().data_files()}
 
@@ -427,7 +427,7 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
                 published_snapshot_retention=timedelta(0),
             )
         )
-        log.expire("published")
+        log.reclaim("published")
 
         for path in superseded & queued:
             assert not fs.exists(path.removeprefix("s3://")), (
@@ -451,9 +451,9 @@ def test_an_interrupted_hydrate_can_be_finished(
     """
     with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
-        log.maintain()
+        log.advance()
         assert log.staging_extent() is None, "the fixture must evict the staging tier"
 
         published = log._published.require()
@@ -505,7 +505,7 @@ def test_repointing_a_published_table_reaches_the_new_one(
     with published_log(tmp_path, bucket, s3) as log:
         log.set_published(first)
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         assert log.published_through() > 0
         in_first = len(fs.find(first.removeprefix("s3://")))
@@ -550,9 +550,9 @@ def test_detaching_and_reattaching_keeps_the_published_table(
     ) as log:
         where = log.published
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
-        log.maintain()
+        log.advance()
         assert log.staging_extent() is None, "rows must be published-only"
         watermark = log.published_through()
 
@@ -590,7 +590,7 @@ def test_a_sibling_prefix_is_not_mistaken_for_this_one(
     with published_log(tmp_path, bucket, s3) as log:
         log.set_published(sibling)
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         assert len(fs.find(sibling.removeprefix("s3://"))) > 0
 
@@ -620,7 +620,7 @@ def test_a_transient_failure_does_not_replace_the_published_table(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         where = log.published
         assert where is not None
@@ -665,7 +665,7 @@ def test_an_unreadable_catalog_schema_falls_back_rather_than_rebuilds(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         where = log.published
         assert where is not None
@@ -700,7 +700,7 @@ def test_a_read_never_repairs_the_published_catalog(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         first = log.published
         assert first is not None
@@ -728,7 +728,7 @@ def test_a_read_before_the_first_publish_simply_has_no_published_leg(
     to yet reads without that leg, and creates nothing by reading."""
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(200))
-        log.seal_due()
+        log.seal()
 
         merged = log.sql("SELECT * FROM log").read_all()
 
@@ -752,7 +752,7 @@ def test_a_repoint_leaves_reads_working(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
 
         log.set_published(f"s3://{bucket}/moved")
@@ -778,7 +778,7 @@ def test_repointing_cannot_interleave_with_a_publish(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(200))
-        log.seal_due()
+        log.seal()
 
         # Short, so the bounded wait does not make this test wait it out.
         log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
@@ -810,7 +810,7 @@ def test_a_read_against_a_never_published_published_writes_nothing(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(200))
-        log.seal_due()
+        log.seal()
         assert not log._layout.published_db.exists()
 
         merged = log.sql("SELECT * FROM log").read_all()
@@ -835,7 +835,7 @@ def test_a_failed_repoint_puts_the_old_catalog_entry_back(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         original = _recorded_location(log._layout)
         assert original is not None
@@ -867,7 +867,7 @@ def test_drain_never_deletes_from_a_published_table_the_log_has_left(
     with published_log(tmp_path, bucket, s3) as log:
         log.set_published(old)
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         objects = fs.find(old.removeprefix("s3://"))
         assert objects
@@ -903,7 +903,7 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
     with published_log(tmp_path, bucket, s3) as log:
         log.set_published(f"s3://{bucket}/slashed")
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
 
         fs = filesystem(s3)
@@ -960,7 +960,7 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         local = log._table.data_files()
         settled = log._maintenance.published_prefix(
@@ -1004,7 +1004,7 @@ def test_the_backfill_sees_copies_another_process_pushed(
     """
     with published_log(tmp_path, bucket, s3) as writer:
         writer.extend(rows(ROWS))
-        writer.seal_due()
+        writer.seal()
         writer.publish()
 
         with litelink.open(tmp_path, "s", s3=s3) as other:
@@ -1012,7 +1012,7 @@ def test_the_backfill_sees_copies_another_process_pushed(
             assert other.published_files() > 0
 
             writer.extend(rows(ROWS))
-            writer.seal_due()
+            writer.seal()
             writer.publish()
             grown = writer._maintenance.published_prefix(
                 writer._table.data_files(), writer._published.uri, include_intents=False
@@ -1049,7 +1049,7 @@ def test_repointing_to_the_same_published_table_spelled_differently_keeps_the_wa
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         settled = log.published_through()
         assert settled > 0
@@ -1079,7 +1079,7 @@ def test_a_repoint_is_all_or_nothing(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         settled = log.published_through()
         assert settled > 0
@@ -1156,13 +1156,13 @@ def test_a_repoint_during_a_push_forfeits_the_watermark(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         settled = log.published_through()
         assert settled > 0
 
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
 
         # The re-point lands while this push is still in S3.
         published = log._published.require()
@@ -1214,10 +1214,10 @@ def test_eviction_learns_about_a_published_table_attached_by_another_process(
     )
     with writer:
         writer.extend(rows(ROWS))
-        writer.seal_due()
+        writer.seal()
         # Published to the local default, so the published table the maintainer
         # opened against holds every sealed file.
-        writer.publish(push_unsettled=True)
+        writer.publish(flush=True)
 
         # The maintainer opened while the log published locally.
         with litelink.open(tmp_path, "s", s3=s3) as maintainer:
@@ -1244,7 +1244,7 @@ def test_a_commit_retry_will_not_follow_the_catalog_to_another_published_table(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
 
         published = log._published.require()
@@ -1271,7 +1271,7 @@ def test_restating_the_published_table_from_a_stale_process_keeps_the_watermark(
     """
     with published_log(tmp_path, bucket, s3) as writer:
         writer.extend(rows(ROWS))
-        writer.seal_due()
+        writer.seal()
         writer.publish()
         settled = writer.published_through()
         assert settled > 0
@@ -1300,13 +1300,13 @@ def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         settled = log.published_through()
         assert settled > 0
 
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
 
         # A full in-process re-point, landing while the push is in S3: it moves
         # the durable location AND this shared object's memory of it.
@@ -1346,7 +1346,7 @@ def test_the_published_table_refuses_a_range_that_starts_inside_its_extent(
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
         published = log._published.require()
         published.reload()
@@ -1406,8 +1406,8 @@ def test_the_log_keeps_working_after_the_published_table_is_re_cut(
         for _ in range(4):
             log.extend(rows(3000))
             total += 3000
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         assert log.published_files() > 2, "expected several undersized published files"
@@ -1442,8 +1442,8 @@ def test_the_log_keeps_working_after_the_published_table_is_re_cut(
         # And the log has to keep going past a re-cut published table.
         log.extend(rows(3000))
         total += 3000
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
 
         table = log.scan().read_all()
@@ -1480,7 +1480,7 @@ def test_a_stale_handle_cannot_repair_the_published_table_it_was_pointed_away_fr
     """
     with published_log(tmp_path, bucket, s3) as writer:
         writer.extend(rows(ROWS))
-        writer.seal_due()
+        writer.seal()
         writer.publish()
 
         with litelink.open(tmp_path, "s", s3=s3) as stale:
@@ -1489,7 +1489,7 @@ def test_a_stale_handle_cannot_repair_the_published_table_it_was_pointed_away_fr
 
             writer.set_published(f"s3://{bucket}/second")
             writer.extend(rows(ROWS))
-            writer.seal_due()
+            writer.seal()
             writer.publish()
             readable = writer.scan().read_all().num_rows
 
@@ -1538,8 +1538,8 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
     with log:
         for _ in range(6):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         before = log.published_files()
@@ -1597,8 +1597,8 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
     with log:
         for _ in range(4):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         published = log._maintenance.published_prefix(
@@ -1610,15 +1610,15 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
         log.set_published(None)
         log.set_config(replace(config, target_compact_size=1 << 20))
         log.extend(rows(400))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
 
         assert all(
             f.start >= published or f.end <= published for f in log._table.data_files()
         ), "merged across a range the published table holds while detached"
 
         log.set_published(where)
-        log.maintain()
+        log.advance()
         log.publish()
 
         assert log.scan().read_all().num_rows == 2000
@@ -1659,8 +1659,8 @@ def test_expiring_the_published_table_will_not_repair_it_without_a_claim(
     with log:
         for _ in range(4):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         # A rewrite is the one thing that queues a REMOTE deletion, which is
@@ -1686,7 +1686,7 @@ def test_expiring_the_published_table_will_not_repair_it_without_a_claim(
 
         log._published.table = watching  # ty: ignore[invalid-assignment]
         try:
-            log.expire()
+            log.reclaim()
 
         finally:
             log._published.table = original  # ty: ignore[invalid-assignment]
@@ -1722,8 +1722,8 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
         s3=s3,
     ) as log:
         log.extend(rows(400))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
 
         published = log._published.require()  # noqa: SLF001
@@ -1767,8 +1767,8 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
     ) as log:
         for _ in range(4):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         published = log.published_through()
@@ -1833,8 +1833,8 @@ def test_pointing_back_at_a_published_table_restores_everything_it_held(
         for _ in range(4):
             log.extend(rows(400))
             written += 400
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         assert log.scan().read_all().num_rows == written
@@ -1897,8 +1897,8 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
     with log:
         for _ in range(4):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         log.set_config(replace(config, target_compact_size=1 << 20))
@@ -1906,8 +1906,8 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
 
         for _ in range(4):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         assert log.published_files() > 0, (
@@ -1969,7 +1969,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
     with log:
         for _ in range(3):
             log.extend(rows(400))
-            log.seal_due()
+            log.seal()
             log.compact()
 
         _crash_before_recording(log)
@@ -2034,7 +2034,7 @@ def test_eviction_never_acts_on_an_intended_copy(
         # early whatever it believes about coverage.
         for _ in range(3):
             log.extend(rows(100))
-            log.seal()
+            log.seal(flush=True)
 
         before = len(log._table.data_files())
 
@@ -2118,7 +2118,7 @@ def test_a_healed_row_carries_the_measured_bytes(
     with log:
         for _ in range(3):
             log.extend(rows(400))
-            log.seal_due()
+            log.seal()
             log.compact()
 
         _crash_before_recording(log)
@@ -2184,8 +2184,8 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
     with log:
         for _ in range(4):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         before = log.published_files()
@@ -2257,8 +2257,8 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
     with log:
         for _ in range(4):
             log.extend(rows(400))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         assert log.published_files() > 1
@@ -2311,7 +2311,7 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         s3=s3,
     ) as log:
         log.extend(rows(1200))
-        log.seal_due()
+        log.seal()
 
         sealed = log.staging_extent()
 
@@ -2328,7 +2328,7 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         # the buffer leg is bounded by the staging table's committed extent.
         assert log.scan().read_all().num_rows == 1200
 
-        log.maintain()
+        log.advance()
         log.publish()
         published = log.published_through()
 
@@ -2343,15 +2343,19 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         assert log.scan().read_all().num_rows == 1200
 
 
-def test_without_replication_a_seal_still_drops_its_rows(
+def test_without_replication_eviction_does_not_wait_for_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A published table alone is not the trigger.
 
     Without a sidecar the buffer and the Parquet share a disk and die together,
-    so holding buys nothing and costs SQLite growth on every seal. The gate is
-    `wal_replication`, and this is the half that proves a published table by itself
-    does not flip it.
+    so holding buys nothing and costs SQLite growth. The gate is
+    `wal_replication`, and this is the half that proves a published table by
+    itself does not flip it: `evict("buffer")` drops what a seal committed to
+    staging, with nothing published yet (#122).
+
+    Falsify by having `evict_buffer` use the published table's coverage
+    whenever one is remote: nothing is published, so nothing is dropped.
     """
     config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
     with litelink.new(
@@ -2363,7 +2367,8 @@ def test_without_replication_a_seal_still_drops_its_rows(
         s3=s3,
     ) as log:
         log.extend(rows(1200))
-        log.seal_due()
+        log.seal()
+        log.evict("buffer")
 
         sealed = log.staging_extent()
 
@@ -2412,7 +2417,7 @@ def test_a_held_seal_does_not_widen_the_next_file(
     ) as log:
         for _ in range(3):
             log.extend(rows(600))
-            log.seal_due()
+            log.seal()
 
         files = sorted(log._table.data_files(), key=lambda f: f.start)  # noqa: SLF001
 
@@ -2451,8 +2456,8 @@ def test_the_published_table_declares_the_same_sort_order_as_the_log(
         s3=s3,
     ) as log:
         log.extend(scrambled(600))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
 
         published = log._published.require()  # noqa: SLF001
@@ -2483,8 +2488,8 @@ def test_attaching_a_published_table_that_is_ahead_of_the_log_is_refused(
         tmp_path / "first", "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as owner:
         owner.extend(rows(1200))
-        owner.seal_due()
-        owner.maintain()
+        owner.seal()
+        owner.advance()
         owner.publish()
 
         assert owner.published_through() > 0
@@ -2583,12 +2588,12 @@ def test_a_log_is_recovered_onto_another_machine(
         s3=s3,
     ) as log:
         log.extend(rows(1200))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         # More on top, sealed but never published: the band that used to be lost.
         log.extend(rows(400))
-        log.seal_due()
+        log.seal()
         published = log.published_through()
         replicated = log.end_offset() - 1
         served = log.scan().read_all().num_rows
@@ -2645,11 +2650,11 @@ def test_a_log_is_recovered_onto_another_machine(
         assert resumed > written, f"reissued offset {resumed}, primary served {written}"
         assert report.skipped[1] - report.skipped[0] == RESTORE_RESERVE
 
-        # And it goes on working. `maintain` is where a stale local `extent`
+        # And it goes on working. `advance` is where a stale local `extent`
         # row would surface: compaction reads those rows to decide what to
         # merge, and they name Parquet that is on the machine that died.
-        revived.seal_due()
-        revived.maintain()
+        revived.seal()
+        revived.advance()
         revived.publish()
 
         assert revived.scan().read_all().num_rows == served + 1
@@ -2696,8 +2701,8 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
         root, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         early = log.published_files()
 
@@ -2709,8 +2714,8 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
     with litelink.open(root, "s", s3=s3) as log:
         for _ in range(3):
             log.extend(rows(600))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
             log.publish()
 
         current = log.published_files()
@@ -2786,8 +2791,8 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
         primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(800))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         # A seal claimed and never finished, exactly as a crash leaves one.
         log.extend(rows(400))
@@ -2819,12 +2824,12 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
     LogTable.create(Layout(second, "s"), table_schema(SCHEMA), ())
     with litelink.open(second, "s", s3=s3) as revived:
         revived._published.table(repair=True)  # noqa: SLF001
-        # `seal()`, not `seal_due()`. The recovered group is OPEN — `_seed_group`
-        # builds it, and the appender never cut it — so `seal_due` drains
+        # `seal()`, not `seal()`. The recovered group is OPEN — `_seed_group`
+        # builds it, and the appender never cut it — so `seal` drains
         # nothing and the overlap never materialises. Closing it is what the
         # next real seal on that box would do.
-        revived.seal()
-        revived.maintain()
+        revived.seal(flush=True)
+        revived.advance()
 
         offsets = revived.scan().read_all().column(OFFSET)
 
@@ -2843,7 +2848,8 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
     `_recover_seal` has two exits. The one that finds the file already
     committed retired the group with the default `discard=True`, so it deleted
     rows the published table had not taken — the only off-box copy — while the sibling
-    exit eighteen lines below passed the flag correctly.
+    exit eighteen lines below passed the flag correctly. A seal no longer
+    deletes rows on any exit (#122); this keeps both honest.
     """
     where = f"s3://{bucket}/recovered"
     config = replace(
@@ -2911,8 +2917,8 @@ def test_attaching_another_logs_published_table_is_refused_at_both_entry_points(
         tmp_path / "owner", "s", schema=SCHEMA, config=config, published=foreign, s3=s3
     ) as owner:
         owner.extend(rows(1200))
-        owner.seal_due()
-        owner.maintain()
+        owner.seal()
+        owner.advance()
         owner.publish()
 
         assert owner.published_through() > 0, (
@@ -2942,7 +2948,7 @@ def test_attaching_another_logs_published_table_is_refused_at_both_entry_points(
         tmp_path / "other", "s", schema=SCHEMA, config=local_only, s3=s3
     ) as other:
         other.extend(rows(2000))
-        other.seal_due()
+        other.seal()
 
         with pytest.raises(ValueError, match="no record of pushing"):
             other.set_published(foreign)
@@ -2983,8 +2989,8 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
         primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(800))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
 
         # THE SNAPSHOT, taken here — before the publish below. This is the lag.
@@ -2999,8 +3005,8 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
         # The primary carries on: more rows, sealed and PUSHED. The published table is
         # now ahead of everything the snapshot knows about.
         log.extend(rows(800))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         ahead = log.published_through()
 
@@ -3030,8 +3036,8 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
 
         for _ in range(3):
             revived.extend(rows(200))
-            revived.seal_due()
-            revived.maintain()
+            revived.seal()
+            revived.advance()
             revived.publish()
 
         assert revived.published_through() > ahead, (
@@ -3084,9 +3090,9 @@ def test_a_restore_fence_clears_the_published_table_and_not_just_the_replica(
         primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(300))
-        log.seal()
+        log.seal(flush=True)
         log.await_seal()
-        log.maintain()
+        log.advance()
 
         # THE SNAPSHOT. The replica stalls here, at a low sequence.
         second = tmp_path / "second"
@@ -3168,8 +3174,8 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
         primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         log.extend(rows(300))
         served = log.end_offset() - 1
@@ -3241,8 +3247,8 @@ def test_a_failed_restore_never_leaves_an_openable_root(
         primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
 
     def die(*args: object, **kwargs: object) -> object:
@@ -3321,8 +3327,8 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
         tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(1200))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         readable = log.scan().read_all().num_rows
         replication = log.write_replication_config()
@@ -3383,17 +3389,17 @@ def test_moving_back_to_the_local_default_keeps_every_row(
         tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
     ) as log:
         log.extend(rows(600))
-        log.seal_due()
+        log.seal()
         readable = log.scan().read_all().num_rows
 
         log.set_published(None)
         assert log.published == Layout(tmp_path, "s").default_published
 
-        log.maintain()
+        log.advance()
         assert log.scan().read_all().num_rows == readable
 
-        log.publish(push_unsettled=True)
-        log.maintain()
+        log.publish(flush=True)
+        log.advance()
         assert log.staging_rows() == 0, "published, so eviction may proceed"
         assert log.scan().read_all().num_rows == readable
 
@@ -3419,14 +3425,14 @@ def test_every_empty_published_table_spelling_means_the_local_default(
         s3=s3,
     ) as log:
         log.extend(rows(600))
-        log.seal_due()
+        log.seal()
         readable = log.scan().read_all().num_rows
 
         for spelling in ("", "/", "///"):
             log.set_published(spelling)
             assert log.published == Layout(tmp_path, "s").default_published
 
-        log.maintain()
+        log.advance()
 
         assert log.scan().read_all().num_rows == readable
 
@@ -3467,8 +3473,8 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
     second = tmp_path / "second"
     with published_log(tmp_path / "first", bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
 
         # Stand the second box up from a copy of the buffer, the way the
@@ -3565,7 +3571,7 @@ def test_buffered_rows_sees_another_process_seal(
             assert reader.buffered_rows() == 20
             assert reader.staging_rows() == 0
 
-            writer.seal_due()
+            writer.seal()
 
             # `buffered_rows` FIRST, before anything else reloads. That order
             # is the whole test: `staging_rows()` resolves the catalog, so
@@ -3648,9 +3654,9 @@ def test_a_handle_that_read_an_empty_published_table_still_sees_it_fill(
             # Now the log fills, is published, and is evicted dry — the rows
             # exist only in the published table.
             writer.extend(rows(ROWS))
-            writer.seal_due()
+            writer.seal()
             writer.publish()
-            writer.maintain()
+            writer.advance()
             assert writer.staging_extent() is None, "the fixture must evict dry"
 
             # The SAME handle, which read the published table while it was empty.
@@ -3683,9 +3689,9 @@ def test_an_evicted_log_still_serves_every_row(
     """
     with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
-        log.maintain()
+        log.advance()
 
         assert log.staging_extent() is None, "the fixture must evict the tier dry"
         assert log.published_through() > 0
@@ -3728,9 +3734,9 @@ def test_an_evicted_log_serves_everything_across_a_re_point(
     with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
         where = log.published
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
-        log.maintain()
+        log.advance()
 
         assert log.staging_extent() is None, "the fixture must evict the tier dry"
         assert log.scan().read_all().num_rows == ROWS
@@ -3789,7 +3795,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
     assert issubclass(litelink.LocalReadHandle, LogHandle)
 
     # The write surface is not merely refused, it is absent.
-    for absent in ("append", "extend", "seal", "publish", "maintain", "set_config"):
+    for absent in ("append", "extend", "seal", "publish", "advance", "set_config"):
         assert not hasattr(LogHandle, absent), f"LogHandle exposes {absent}"
 
     assert {n for n in vars(LogHandle) if not n.startswith("_")} == {
@@ -3922,8 +3928,8 @@ def test_restore_refuses_a_buffer_bound_to_another_published_table(
         primary, "s", schema=SCHEMA, config=config, published=held, s3=s3
     ) as log:
         log.extend(rows(800))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         seeded = log.published_through()
 
@@ -3974,8 +3980,8 @@ def test_restore_accepts_the_same_published_table_written_with_a_trailing_slash(
         primary, "s", schema=SCHEMA, config=config, published=held, s3=s3
     ) as log:
         log.extend(rows(800))
-        log.seal_due()
-        log.maintain()
+        log.seal()
+        log.advance()
         log.publish()
         seeded = log.published_through()
 
@@ -4051,11 +4057,11 @@ def test_an_otel_log_reads_back_exactly_from_the_published_table(
         s3=s3,
     ) as log:
         log.extend(rows)
-        log.seal()
-        log.maintain()
-        log.publish(push_unsettled=True)
+        log.seal(flush=True)
+        log.advance()
+        log.publish(flush=True)
         assert log.published_through() == 40
-        log.maintain()  # evicts the local copy, so the read below is the published leg
+        log.advance()  # evicts the local copy, so the read below is the published leg
 
     expected = pa.Table.from_pylist(rows, schema=OTEL).to_pylist()
     with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
@@ -4102,13 +4108,13 @@ def test_the_statistics_tiers_partition_the_log(
         wal_replication=True,
     ) as log:
         log.extend(rows(ROWS))
-        log.seal()
-        log.publish(push_unsettled=True)
-        log.maintain()
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.advance()
         log.extend(
             {"event_ts": ROWS + i, "key": "h", "payload": "y"} for i in range(held)
         )
-        log.seal()
+        log.seal(flush=True)
         assert log._buffer.span() is not None, "the seal must keep its rows"  # noqa: SLF001
         log.extend(
             {"event_ts": ROWS + held + i, "key": "t", "payload": "y"}
@@ -4156,7 +4162,7 @@ def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
     """
     with published_log(tmp_path, bucket, s3, wal_replication=True) as log:
         log.extend(rows(500))
-        log.seal()
+        log.seal(flush=True)
 
         assert log._buffer.count_from(1) == 500, "the fixture must keep sealed rows"
         assert log.buffered_rows() == 0
@@ -4171,19 +4177,19 @@ def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
 def test_maintain_expires_the_published_table_and_drains_what_that_frees(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Every `maintain` publishes and then expires published snapshots past
+    """Every `advance` publishes and then expires published snapshots past
     `published_snapshot_retention`, and the manifest lists and manifests only
     they referenced are deleted once due (#113). A table that was only ever
     published used to keep every one of them.
 
-    Falsify by dropping `expire_published` from `maintain`: four snapshots
+    Falsify by dropping `expire_published` from `advance`: four snapshots
     survive, and so do their manifest lists.
     """
     with published_log(tmp_path, bucket, s3) as log:
         for _ in range(4):
             log.extend(rows(ROWS))
-            log.seal_due()
-            log.maintain()
+            log.seal()
+            log.advance()
 
         published = log._published.require()
         published.reload()
@@ -4212,7 +4218,7 @@ def test_the_sweep_deletes_stranded_metadata_from_object_storage(
     fs = filesystem(s3)
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
-        log.seal_due()
+        log.seal()
         log.publish()
 
         published = log._published.require()

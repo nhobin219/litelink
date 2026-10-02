@@ -203,8 +203,8 @@ class LogConfig:
     # that the seal has no timer: a stream that goes quiet holds its last
     # partial file's worth of rows indefinitely.
     #
-    # A declaration rather than a supervisor. It is read — `_discard_on_seal`
-    # consults it on every seal, and validation refuses it without a remote
+    # A declaration rather than a supervisor. It is read — `evict("buffer")`
+    # consults it on every eviction, and validation refuses it without a remote
     # published table to replicate to — but litelink never starts the sidecar.
     # That is a separate process reading the WAL, which is exactly why
     # replication does not put the network in the write path, and litestream is
@@ -221,7 +221,7 @@ class LogConfig:
     # an exclusive lock and rebuilds the file, so it stalls appends for as long
     # as the LIVE data takes to copy — 0.3 s at 35 MB, measured. Only the
     # deployment knows whether its arrival rate can absorb that, so litelink
-    # will not decide it: `WriteHandle.reclaim_buffer()` is the manual door, and
+    # will not decide it: `reclaim("buffer")` is the manual door, and
     # this setting is for the deployments that would rather it happened on the
     # ordinary pass.
     #

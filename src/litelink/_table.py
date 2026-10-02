@@ -449,7 +449,7 @@ class LogTable:
         # wrong axis: the cost is decoding one entry per data FILE, each
         # carrying per-column statistics, and merging cannot reduce their
         # number. Measured 14.4 ms at 216 files against 0.0 ms for the manifest
-        # list, and a `maintain` pass asks three times over.
+        # list, and an `advance` pass asks three times over.
         self._files_at: str | None = None
         self._files: list[DataFile] = []
         # Every column's rollup, for tier selection (#90), against the same

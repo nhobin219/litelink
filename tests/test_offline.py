@@ -149,10 +149,10 @@ def test_the_whole_loop_runs_with_no_network(tmp_path: Path) -> None:
         with litelink.new({str(tmp_path / "offline")!r}, "s", schema=schema,
                      sort_by=("event_ts",), config=config) as log:
             log.extend(rows)
-            log.seal()
+            log.seal(flush=True)
             log.extend(rows)
-            log.seal()
-            log.maintain()
+            log.seal(flush=True)
+            log.advance()
             total = log.scan().read_all().num_rows
             bounded = log.scan(where="event_ts < 10").read_all().num_rows
             print("ROWS", total, "BOUNDED", bounded, "END", log.end_offset())
