@@ -288,8 +288,9 @@ end_offset=…)`) can skip it.
 file, per tier (`"staging"`, `"published"` below it, `"buffer"`) or for the whole log.
 
 **Reads from an S3 published table are cached**, in memory for the connection and on disk
-across restarts, by default. Each log's disk cache lives in `~/.cache/litelink/<log name>`
-(under `$XDG_CACHE_HOME` when set), is shared by every process reading that log, and evicts once
+across restarts, by default. Each log's disk cache lives under `~/.cache/litelink/` (or
+`$XDG_CACHE_HOME`) at the log's own path, so `/data/trades` caches in
+`~/.cache/litelink/data/trades`. It is shared by every process reading that log, and evicts once
 its disk is 80% full, counting everything on that disk. Iceberg never reuses a file name, so a
 cached block is never stale. Tune it per handle or connection:
 

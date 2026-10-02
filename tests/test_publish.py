@@ -4171,10 +4171,10 @@ def test_a_logs_default_disk_cache_is_named_after_it(
     tmp_path: Path, bucket: str, s3: S3Options, isolated_read_cache: Path
 ) -> None:
     """With no `disk_cache_path`, a log's reader caches under
-    `$XDG_CACHE_HOME/litelink/<log name>`: one directory per log, findable and
+    `$XDG_CACHE_HOME/litelink/<log path>`: one directory per log, findable and
     clearable on its own, and shared by every process reading it (#118).
 
-    Falsify by dropping `name` from the reader's `ReadCache`: the blocks land
+    Falsify by dropping `log` from the reader's `ReadCache`: the blocks land
     in the connection default, `.../litelink/duckdb`.
     """
     root = tmp_path / "log"
@@ -4187,7 +4187,8 @@ def test_a_logs_default_disk_cache_is_named_after_it(
     with litelink.open(root, "s", read_only=True, s3=s3) as reader:
         assert reader.scan().read_all().num_rows == ROWS
 
-    mine = isolated_read_cache / "litelink" / "s"
+    directory = (root / "s").resolve()
+    mine = isolated_read_cache / "litelink" / directory.relative_to(directory.anchor)
     assert any(files for _, _, files in os.walk(mine)), (
         "nothing cached under the log's name"
     )

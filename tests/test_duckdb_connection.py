@@ -300,3 +300,28 @@ def test_a_local_connection_installs_no_cache() -> None:
     connection = litelink.duckdb_connection()
 
     assert "cache_httpfs" not in loaded(connection)
+
+
+def test_the_default_cache_is_keyed_by_the_logs_path(
+    tmp_path: Path, isolated_read_cache: Path
+) -> None:
+    """Two logs of one name in different roots get two caches; a relative or
+    symlinked root reaches the same one as its target (#118).
+
+    Falsify by keying on the log's name alone: the two `trades` collide.
+    """
+    from litelink._read import default_cache_path
+
+    first = tmp_path / "a" / "trades"
+    second = tmp_path / "b" / "trades"
+    assert default_cache_path(first) != default_cache_path(second)
+
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "a")
+    assert default_cache_path(link / "trades") == default_cache_path(first)
+
+    resolved = first.resolve()
+    assert default_cache_path(first) == (
+        isolated_read_cache / "litelink" / resolved.relative_to(resolved.anchor)
+    )
+    assert default_cache_path() == isolated_read_cache / "litelink" / "duckdb"
