@@ -513,15 +513,43 @@ class Reader:
         self, found: tuple[Term, ...], boundary: int | None = None
     ) -> bool:
         """Whether the buffer's leg could hold a row matching `found`, by offset
-        alone.
+        alone. Decides only WHETHER to read the buffer; where its leg is cut
+        is `_union`'s, from exact resolved values.
 
         The buffer has no column statistics — computing them would cost the
         read this avoids — but `litelink_offset` is the log's sequence, so the
-        leg's range is known, open-ended above since rows keep arriving. Its
-        floor is `boundary`, the staging table's end, whenever there is one:
-        the leg reads nothing below it, whatever the buffer still holds — and
-        it holds sealed rows until `evict("buffer")` runs (#122). Only with no
-        staging table is the floor the buffer's own lowest offset.
+        leg's range is known: from a floor up, open-ended, since rows keep
+        arriving. A query entirely below the floor cannot match it.
+
+        **The floor is `max(lowest buffered offset, boundary)`**, where
+        `boundary` is the staging table's end (None when staging is empty).
+        Neither alone is always the tighter, which is why both are read:
+
+        - **Sealed rows not yet evicted** — the ordinary state between passes,
+          since a seal no longer deletes its rows (#122). The lowest offset is
+          a sealed row BELOW the boundary that the leg will never return, so
+          the boundary is the floor. Pruning on the lowest offset alone was a
+          regression: the buffer stopped being ruled out for any scan below
+          the tail.
+        - **Just after `evict("buffer")`** — the lowest offset is the first
+          unsealed row, normally EQUAL to the boundary. Either serves.
+        - **A gap above staging** — offsets reserved and never filled, as a
+          failed `ingest` leaves (accepted, see `ingest`). The first buffered
+          row sits ABOVE the boundary, so the lowest offset is the floor, and
+          a scan falling inside the gap skips the buffer. This is why the
+          boundary alone is not enough.
+        - **No staging table** — no boundary, so the floor is the lowest
+          buffered offset. It may be a row the published table also holds
+          (a crash between `publish` and `evict("buffer")`, or a restored
+          log), which only costs a read: `_union` cuts the leg at the
+          published table's exact span, so nothing is returned twice.
+
+        **Not the tier manifest's `published` row**, though it looks like the
+        cutoff wanted in that last case. That row may OVERSTATE what the
+        published table holds — eviction widens it before its commit, and
+        overstating is its safe direction for skipping the published table.
+        For skipping the buffer it is the unsafe direction: a query under an
+        overstated bound would skip buffer rows the published table lacks.
         """
         # Closed by `retire()`: an empty range at the log's end, which no
         # query needs, with offset terms or without.
@@ -533,9 +561,11 @@ class Reader:
         if not any(column == OFFSET for column, _, _ in found):
             return True
 
-        floor = boundary if boundary is not None else self._buffer.lowest_offset()
-        if floor is None:
+        lowest = self._buffer.lowest_offset()
+        if lowest is None:
             return True
+
+        floor = lowest if boundary is None else max(lowest, boundary)
 
         unit = entry(BUFFER, (floor, None), self._schema, UNKNOWN)
 

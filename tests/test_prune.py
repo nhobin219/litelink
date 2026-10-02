@@ -820,3 +820,41 @@ def test_a_read_without_the_published_table_stops_at_the_staging_floor(
 
         counted = log.sql("SELECT count(*) AS n FROM log", published=False)
         assert counted.read_all()["n"][0].as_py() == len(scanned)
+
+
+def test_a_gap_above_staging_lets_a_scan_inside_it_skip_the_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offsets reserved and never filled — what a failed `ingest` leaves — put
+    the first buffered row ABOVE the staging boundary. The buffer's prune
+    floor is `max(lowest, boundary)`, so a scan inside the gap skips the
+    buffer; the boundary alone would read it (#122).
+
+    Falsify by using only the staging boundary as the floor: the scan inside
+    the gap reads the buffer.
+    """
+    from litelink._buffer import Buffer
+
+    schema = pa.schema([pa.field("x", pa.int64())])
+    with litelink.new(tmp_path, "s", schema=schema) as log:
+        log.extend({"x": i} for i in range(100))
+        log.seal(flush=True)
+        log.evict("buffer")
+        log._buffer.reserve(50)  # noqa: SLF001 — offsets 101-150, never filled
+        log.extend({"x": i} for i in range(20))  # offsets 151-170
+
+        read: list[int | None] = []
+        original = Buffer.rows_from
+
+        def counted(buffer: Buffer, boundary: int | None) -> pa.Table:
+            read.append(boundary)
+            return original(buffer, boundary)
+
+        monkeypatch.setattr(Buffer, "rows_from", counted)
+
+        inside = log.scan(start_offset=110, end_offset=140).read_all()
+        assert inside.num_rows == 0
+        assert read == [], "a scan inside the gap read the buffer"
+
+        above = log.scan(start_offset=151).read_all()
+        assert above.column(OFFSET).to_pylist() == list(range(151, 171))
