@@ -4098,7 +4098,7 @@ class WriteHandle(LocalReadHandle):
         """
         self._maintenance.evict()
 
-    def expire(self, table: Table | None = None) -> None:
+    def expire(self, table: Literal["staging", "published"] | None = None) -> None:
         """Expire snapshots past the table's retention, then delete what has
         come due (§6, §8).
 
@@ -4115,7 +4115,7 @@ class WriteHandle(LocalReadHandle):
         if _covers(table, "published"):
             self._maintenance.expire_published()
 
-    def sweep(self, table: Table | None = None) -> None:
+    def sweep(self, table: Literal["staging", "published"] | None = None) -> None:
         """One pass of the stranded-metadata sweep (§6). `table` as for
         `expire`: `"staging"`, `"published"`, or None for both.
 
@@ -4629,10 +4629,10 @@ def validate(
         raise ValueError(msg)
 
 
-Table = Literal["staging", "published"]
-
-
-def _covers(table: Table | None, which: Table) -> bool:
+def _covers(
+    table: Literal["staging", "published"] | None,
+    which: Literal["staging", "published"],
+) -> bool:
     """Whether a routine's `table` argument includes `which`; None is both.
 
     Refuses anything else, so a misspelt table is an error rather than a call
