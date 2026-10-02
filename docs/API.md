@@ -530,7 +530,7 @@ whole time, but never reaching Parquet.
 ```python
 log.advance(*, flush=False) -> None
 log.seal(*, flush=False) -> int | None
-log.compact(table="staging") -> None             # "published": ad hoc, whole log
+log.compact() -> None                            # staging; the published table is never rewritten
 log.publish(*, flush=False) -> None
 log.evict(table=None, *, start_offset=None, end_offset=None) -> None  # "buffer" | "staging"
 log.reclaim(table=None, *, min_free_ratio=0.0) -> None  # "buffer" | "staging" | "published"

@@ -137,7 +137,7 @@ litelink.preflight(...)                                            # what python
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
     log.ingest(table_or_reader)                     # Arrow straight to Parquet, then published
     log.advance(*, flush=False)                     # the whole pipeline below, in order
-    log.seal(*, flush=False) · compact(table="staging") · publish(*, flush=False)
+    log.seal(*, flush=False) · compact() · publish(*, flush=False)
     log.evict(table=None) · reclaim(table=None) · sweep(table=None) # its steps: clean up
     log.retire()                                    # end the log: all published, none local
     log.set_config(...)                             # the policy; schema, sort_by, published are fixed
