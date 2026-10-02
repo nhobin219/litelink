@@ -3647,17 +3647,20 @@ class WriteHandle(LocalReadHandle):
         claim as it works, so it excludes another maintainer only where their
         work overlaps.
 
-        **`"published"`** merges undersized files already in the published
-        table. An operation, not a policy: `advance` never runs it, and normal
-        operation does not need it, because `publish` pushes only files
+        **`"published"`: you should never need to call this in normal
+        operation**, and `advance` never does. `publish` pushes only files
         compaction has finished with, so the published table is well-sized by
-        construction. It exists for the three things that break that on
-        purpose — an explicit `seal(flush=True)` stranding a small file, a
-        change to `target_compact_size`, which applies to the future while the
-        published table is immutable history, and a bulk load's undersized
-        push. Rows and offsets are unchanged; only how they are cut into files
-        changes. It downloads, merges and re-uploads, so it claims the whole
-        log for as long as that takes.
+        construction. It is a repair for the three things that break that on
+        purpose: an explicit `seal(flush=True)` or `publish(flush=True)`
+        stranding a small file, a change to `target_compact_size`, which
+        applies to the future while the published table is immutable history,
+        and a bulk load's undersized tail. Run it once after one of those, if
+        the small files matter to your readers — not on a schedule.
+
+        It merges undersized files already in the published table; rows and
+        offsets are unchanged, only how they are cut into files. It downloads,
+        merges and re-uploads, so it claims the whole log for as long as that
+        takes.
 
         The default is `"staging"`, not both, unlike the other routines that
         take a table: compacting the published table is network work to run
