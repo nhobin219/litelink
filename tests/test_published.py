@@ -18,6 +18,7 @@ import pytest
 
 import litelink
 from litelink import OFFSET, LogConfig, RetiredError, WriteHandle
+from litelink._claim import Claim, new_owner
 from litelink._layout import Layout
 from litelink._read import Reader
 from litelink._table import VERSION_HINT
@@ -739,3 +740,113 @@ def test_a_local_log_never_loads_the_read_cache(
         assert "cache_httpfs" not in extensions
         assert "httpfs" not in extensions
         assert not (isolated_read_cache / "litelink").exists()
+
+
+def _claim(log: WriteHandle, start: int, end: int) -> Claim:
+    """A claim held by another owner, as a concurrent seal or compaction holds
+    one."""
+    other = Claim(
+        log._buffer._con,  # noqa: SLF001
+        log._buffer._lock,  # noqa: SLF001
+        "other",
+        start,
+        end,
+        new_owner(),
+    )
+    assert other.acquire()
+
+    return other
+
+
+def test_publish_claims_only_the_range_it_pushes(tmp_path: Path) -> None:
+    """Once the published table has its tier row, a publish claims
+    `[floor, end of what it pushes)` and nothing else (#118): a claim above
+    that — a seal of new rows, a compaction of the trailing run — does not
+    refuse it, and one inside it does.
+
+    Falsify by having `_publish_lease` return the whole-log lease: the claim
+    above the push refuses it.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)  # the first: writes the tier row
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+
+        floor = log.published_through() + 1
+        above = _claim(log, 10**9, 10**9 + 1)
+        try:
+            log.publish(flush=True)
+        finally:
+            above.release()
+
+        assert log.published_through() == 2 * ROWS
+
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        inside = _claim(log, 2 * ROWS + 1, 2 * ROWS + 2)
+        try:
+            with pytest.raises(RuntimeError, match="another owner"):
+                log.publish(flush=True)
+        finally:
+            inside.release()
+
+        assert floor > 1
+        assert log.scan().read_all().num_rows == 3 * ROWS
+
+
+def test_a_publish_that_must_write_the_tier_row_claims_the_whole_log(
+    tmp_path: Path,
+) -> None:
+    """With no tier row, the push computes it exactly from the published
+    table's manifests, and that narrowing write must not race eviction
+    widening it — so the publish takes the whole log (#118). A re-point
+    leaves exactly this: the table there, its row dropped.
+
+    Falsify by giving a publish without a tier row a range lease: a claim far
+    above its files no longer refuses it.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log._tiers.drop()  # noqa: SLF001 — as a re-point leaves it
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+
+        far = _claim(log, 10**9, 10**9 + 1)
+        try:
+            with pytest.raises(RuntimeError, match="another owner"):
+                log.publish(flush=True)
+        finally:
+            far.release()
+
+        log.publish(flush=True)
+        assert log._tiers.has()  # noqa: SLF001
+        assert log.published_through() == 2 * ROWS
+
+
+def test_two_publishes_exclude_each_other_with_nothing_to_push(
+    tmp_path: Path,
+) -> None:
+    """Both start at the published floor, so their ranges overlap even when
+    neither has anything to upload — and that matters: a push forgets intents
+    it does not find landed, and another publisher's are files it is
+    uploading (#118).
+
+    Falsify by claiming an empty range when nothing is settled: the second
+    publish proceeds beside the first.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+
+        lease, _ = log._publish_lease(flush=False)  # noqa: SLF001
+        assert lease.acquire()
+        try:
+            with pytest.raises(RuntimeError, match="another owner"):
+                log.publish()
+        finally:
+            lease.release()

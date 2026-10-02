@@ -582,6 +582,19 @@ network.** Each takes only the exclusion it needs: a claim on the offsets it tou
 argument, None meaning every table it acts on, rather than one function per table; a misspelt
 table, or one the routine does not act on, raises `ValueError`.
 
+**What each routine excludes**, so an orchestrator can see what may run side by side (SPEC §4a).
+A claim excludes only an overlapping claim, whatever its kind:
+
+| Routine | Claims | So it waits for |
+| --- | --- | --- |
+| `seal()` | the range it seals, above staging's end | nothing but another seal of that range |
+| `compact()` | each run it merges | a publish of those files, another compaction of the run |
+| `publish()` | `[published floor, end of what it pushes)`; the whole log when it must write the tier row | compaction of those files, another publish, the whole-log operations |
+| `evict()` | the prefix it removes | anything overlapping that prefix |
+| `reclaim()` | nothing for the expiry or the delete | nothing |
+| `sweep()` | nothing | nothing |
+| `rewrite_published`, `set_published`, `set_config`, `set_sort_by`, `retire` | the whole log | everything above |
+
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
 takes no claim and never raises.

@@ -1472,16 +1472,16 @@ def test_an_outer_renew_does_not_switch_off_the_run_claim(tmp_path: Path) -> Non
         assert renewed, "the run claim was never renewed while a merge ran"
 
 
-def test_drain_will_not_unlink_while_another_owner_holds_the_log(
+def test_drain_needs_no_claim_and_still_keeps_what_is_referenced(
     tmp_path: Path,
 ) -> None:
-    """The unlink is not metadata, so it declares like everything else (§4a).
+    """`drain` takes no claim (#118): a queued name can never become
+    referenced again, so the veto plus the grace period are the whole of its
+    safety. It runs while another owner holds the entire log — and a due entry
+    that a live snapshot still references is kept, not unlinked.
 
-    Expiry is safe claimless — a metadata commit that CAS orders, idempotent.
-    The deletion that follows it is not. The case the claim was written for —
-    `hydrate` re-registering a queued name between the veto and the unlink —
-    went with `hydrate` (#118); this pins the claim until the second half of
-    #118 decides whether anything else needs it.
+    Falsify by dropping the reference veto in `drain`: the live file is
+    unlinked and the log can no longer read its rows.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
@@ -1491,93 +1491,33 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.compact()
-
-        queued = log._buffer.due_deletions(2**62)
-
-        assert queued, "expected superseded files awaiting deletion"
+        live = log._table.data_files()[0]
+        # Queued with a stamp long past, while the current snapshot names it:
+        # what a compaction's recovery leaves when the commit had in fact
+        # landed.
+        log._buffer.enqueue_deletions([log._maintenance._key(live.path)], 0)
+        superseded = [
+            p
+            for p in log._buffer.due_deletions(2**62)
+            if p != log._maintenance._key(live.path)
+        ]
+        assert superseded, "expected superseded files awaiting deletion"
 
         other = Claim(
             log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
         )
-
         assert other.acquire()
-
         try:
-            log.reclaim()
-
-            # Expiry queues MORE as it goes, so what matters is that the
-            # entries already due are still due: nothing was unlinked.
-            assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
-                "unlinked while another owner held the log"
-            )
+            # Expires the snapshot that still named them, then drains.
+            log.reclaim("staging")
         finally:
             other.release()
 
-        log.reclaim()
-
-        assert not set(queued) & set(log._buffer.due_deletions(2**62)), (
-            "never drained once the log was free"
-        )
-
-
-def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
-    """The unlink is this pass's commit, so the claim is asked again at it.
-
-    Everything slow in a drain sits between the veto being read and the
-    deletions — opening the published table, walking its manifests, one remote round
-    trip per queued object. Past the TTL another owner may lawfully take the
-    whole log; a drain holding a dead claim must stop rather than unlink
-    against a veto read under it.
-    """
-    config = LogConfig(
-        target_seal_size=1 << 30,
-        compact_min_files=2,
-        staging_snapshot_retention=timedelta(0),
-    )
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        log.compact()
-        queued = log._buffer.due_deletions(2**62)
-
-        assert queued, "expected superseded files awaiting deletion"
-
-        # The claim is taken and then lost, the way a slow remote leg loses it.
-        original = Claim.acquire
-        stolen: list[Claim] = []
-
-        def losing(self: Claim) -> bool:
-            if not original(self):
-                return False
-
-            if self.kind != "drain":
-                return True
-
-            with self.lock:
-                self.connection.execute(
-                    "UPDATE claim SET expires_at = 1 WHERE id = ?", (self.row_id,)
-                )
-
-            rival = Claim(
-                self.connection, self.lock, "maintain", 0, EVERYTHING, new_owner()
-            )
-            assert original(rival)
-            stolen.append(rival)
-
-            return True
-
-        Claim.acquire = losing
-        try:
-            with pytest.raises(RuntimeError, match="lost the"):
-                log.reclaim()
-
-        finally:
-            Claim.acquire = original
-            for rival in stolen:
-                rival.release()
-
-        assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
-            "deleted while another owner held the log"
-        )
+        due = set(log._buffer.due_deletions(2**62))
+        assert not set(superseded) & due, "drain waited on another owner's claim"
+        assert Path(live.path).exists(), "a referenced file was unlinked"
+        assert log._maintenance._key(live.path) in due, "and it stays queued"
+        assert len(read_all(log)) == 12
 
 
 def test_eviction_reads_the_published_table_under_its_own_claim(tmp_path: Path) -> None:

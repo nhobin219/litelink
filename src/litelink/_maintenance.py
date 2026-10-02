@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
-from litelink._claim import EVERYTHING, new_owner
+from litelink._claim import new_owner
 from litelink._fs import write_parquet
 from litelink._published import Published
 from litelink._statistics import rollup
@@ -1412,20 +1412,18 @@ class Maintenance:
         self.drain_published()
 
     def drain_published(self) -> None:
-        """Delete the published table's queued objects whose grace has passed,
-        under the same whole-log claim `drain` takes, for the same reason."""
+        """Delete the published table's queued objects whose grace has passed.
+
+        No claim, for the reason `drain` gives. A re-point mid-drain cannot
+        widen what this deletes: the table is the one opened here, every
+        object is checked against ITS references, and one outside the
+        log's current prefix is left queued (`_drain_published`).
+        """
         published = self._published.table()
         if published is None:
             return
 
-        claim = self._buffer.claim("drain", 0, EVERYTHING, new_owner())
-        if not claim.acquire():
-            return
-
-        try:
-            self._drain_published(published, claim.renew)
-        finally:
-            claim.release()
+        self._drain_published(published, None)
 
     def sweep_staging(self) -> None:
         """One pass of the staging table's stranded-metadata sweep (`_sweep`).
@@ -1467,64 +1465,52 @@ class Maintenance:
         if not due:
             return
 
-        # Claimed, because this UNLINKS. §4a calls expiry safe to run
-        # claimless on the grounds that it is a metadata commit ordered by CAS,
-        # and that is true of the expiry; it is not true of the deletion that
-        # follows it. The case this claim was written for — `hydrate`
-        # re-registering a file under the very name the queue still holds,
-        # between the veto and the unlink — went with `hydrate` (#118). Whether
-        # anything else can re-register a queued name, and so whether the
-        # claim can go, is the second half of #118; until then it stays.
+        # NO claim (#118). What a claim would guard is a queued name becoming
+        # referenced again between the veto below and the unlink, and nothing
+        # can do that. Every path that adds a file to a table adds one with a
+        # fresh per-attempt token — a seal, a compaction, an ingest, a
+        # published rewrite (`Layout.*_path`). Seal recovery commits the
+        # claimed name only if it never landed, and otherwise queues it and
+        # writes a fresh one; compaction recovery registers nothing. `publish`
+        # registers copies of staging files above the published span, and
+        # `register` declines a range already covered, so a range a rewrite
+        # superseded is never pushed again. `hydrate`, which re-registered a
+        # queued name on purpose, is gone.
         #
-        # The whole log, since the queue names files from anywhere in it. A
-        # refusal costs nothing: the entries stay due and the next pass takes
-        # them.
-        sweep = self._buffer.claim("drain", 0, EVERYTHING, new_owner())
-        if not sweep.acquire():
-            return
+        # So an entry that is due and unreferenced stays unreferenced. Two
+        # drains overlapping only unlink the same file twice, which
+        # `missing_ok` makes a no-op, and forget the same row twice.
+        #
+        # Reloaded first. This veto is the last thing standing between the
+        # deletion queue and an unrecoverable mistake, and asked of a handle
+        # that predates another process's commit it reports a live file as
+        # unreferenced. Every other cost in this pass dwarfs a catalog
+        # resolve.
+        self._table.reload()
+        referenced = self._table.referenced_paths()
 
-        try:
-            # Reloaded first. This veto is the last thing standing between the
-            # deletion queue and an unrecoverable mistake, and asked of a handle
-            # that predates another process's commit it reports a live file as
-            # unreferenced. Every other cost in this pass dwarfs a catalog
-            # resolve.
-            self._table.reload()
-            referenced = self._table.referenced_paths()
+        for rel_path in due:
+            path = self._layout.absolute(rel_path)
+            if str(path) in referenced:
+                # Still in a live snapshot: the grace period has passed but
+                # something references it — a compaction's recovery queues
+                # outputs whose commit may in fact have landed. Deleting a
+                # referenced file is unrecoverable; it stays queued.
+                continue
 
-            for rel_path in due:
-                path = self._layout.absolute(rel_path)
-                if str(path) in referenced:
-                    # A compaction can re-register a path the queue still holds.
-                    # Deleting a referenced file is unrecoverable, so the check
-                    # is worth its cost even though the grace period should
-                    # preclude it.
-                    continue
-
-                # Still ours, asked before EVERY deletion rather than once at
-                # the top. The unlink is this pass's commit, and §4a's rule
-                # applies to it like any other: holding a claim is asked again
-                # at the commit, and a claim past its TTL may lawfully have been
-                # taken by another owner meanwhile.
-                #
-                # Entries left behind cost nothing: they stay due.
-                checkpoint(sweep.renew)
-                # Unlink first, forget second. A crash between them leaves a row
-                # whose unlink is already a no-op; the reverse leaks the file with
-                # nothing left pointing at it.
-                path.unlink(missing_ok=True)
-                self._buffer.forget_deletion(rel_path)
-
-        finally:
-            sweep.release()
+            # Unlink first, forget second. A crash between them leaves a row
+            # whose unlink is already a no-op; the reverse leaks the file with
+            # nothing left pointing at it.
+            path.unlink(missing_ok=True)
+            self._buffer.forget_deletion(rel_path)
 
     def _drain_published(
         self, published: LogTable, renew: Callable[[], bool] | None
     ) -> None:
         """Delete the published table's queued objects whose grace has passed.
 
-        Under the whole-log claim `drain_published` takes, which is what keeps
-        a registration from landing between the veto and the delete.
+        `renew` is the caller's claim, checked before each delete, when there
+        is one; `drain_published` holds none (see `drain`).
         """
         cutoff = datetime.now(UTC) - self.config.published_snapshot_retention
         due = [

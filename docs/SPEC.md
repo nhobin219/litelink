@@ -350,8 +350,8 @@ has them, and `validate` refuses it without a remote (`s3://`) published
 table to ship to and refuses `wal_retention` without it. What it still does not do is assert
 that a sidecar is running, which the library cannot know. So it states an intent the deployment has to honour, and
 stating it falsely costs the growth without buying the durability that growth was traded
-for: seals hold their rows, nothing ships them, and only `publish` reaching the range releases
-them.
+for: the buffer holds its rows, nothing ships them, and `evict("buffer")` releases them only
+once `publish` has reached the range.
 
 **The sidecar needs a monotonic clock that does not run backwards.** litestream reports a
 measured interval through a Prometheus counter, which panics on a negative value, so one
@@ -594,8 +594,10 @@ integers. The exclusion is interval arithmetic, not mutual exclusion.
 | compact ∥ evict | eviction stays below every in-flight merge's `start` |
 | compact ∥ compact | each claims a distinct run and skips runs already claimed |
 | compact ∥ publish | a merge must not span into what publish is publishing, and vice versa |
-| publish ∥ publish | `register` declines a range the published table already covers |
+| publish ∥ publish | both claim from the published floor, so they exclude each other; `register` declines a covered range besides |
+| publish ∥ seal, evict | publish claims only `[floor, end of what it pushes)` (#118): seals land above it, eviction below the floor |
 | evict ∥ expire | both are metadata commits; CAS orders them and both are idempotent |
+| drain ∥ anything | no claim (#118): a queued name can never become referenced again, so the veto and the grace period suffice |
 
 `compact ∥ publish` is the one that is a correctness matter rather than wasted work.
 Compaction skips files at or below the published watermark, so a merged file cannot span into
@@ -700,16 +702,23 @@ hole rather than a safety condition: it exempted exactly the range that starts B
 extent and runs past it, engulfing the whole thing — every published offset in two files,
 which is the worst version of this rather than an excused one.
 
-**And `drain` claims, because the unlink is not metadata.** Expiry is safe claimless — a
-metadata commit CAS orders, idempotent — and the deletion that follows it inherited that
-reasoning without earning it. The window it was written for was `hydrate` re-registering a
-file under the very name the queue still holds, between the veto being read and the file being
-unlinked; `hydrate` is gone (#118), and whether anything else can re-register a queued name —
-and so whether the claim can go — is the second half of #118. Until then it stays, and it
-renews before EVERY deletion, not once at the top: the unlink is this pass's commit,
-everything slow in a drain sits between the veto being read and the deletions — opening the
-published table, walking its manifests, one remote round trip per queued object — and a claim
-held for the first of those is not a claim held for the last.
+**`drain` takes no claim, because nothing can make a queued file live again** (#118). What a
+claim on the unlink would guard is a queued name becoming referenced between the veto and the
+delete. `hydrate` did exactly that, deliberately, and is gone. Everything else that adds a file
+to a table adds one with a fresh per-attempt token (a seal, a compaction, an ingest, a published
+rewrite). Seal recovery commits a claimed name only if it never landed and otherwise writes a
+fresh one, and compaction recovery registers nothing. `publish` registers copies of staging
+files above the published span, and `register` declines a covered range, so a range a rewrite
+superseded is never pushed again. An entry that is due and unreferenced therefore stays
+unreferenced, and two drains overlapping only unlink one file twice.
+
+**`publish` claims only the range it pushes** (#118): `[floor, end)`, from the published
+table's frontier to the end of what it uploads, so a seal or eviction in another process is not
+refused for the length of an upload. It still excludes compaction over those files (including
+the trailing run `flush` takes), another publish (both claim from the same floor), and the
+whole-log operations that re-point or re-cut the published table. Two cases take the whole log
+instead: a publish that must write the tier row, since that exact rollup must not race
+eviction widening it, and a published table only a repairing open can reach.
 
 **And everything a pass reads to decide a deletion is read under its claim, not before it.**
 `publish` learned this for itself and eviction did not, though it acts on the same facts: it
@@ -1714,8 +1723,9 @@ The consequence worth planning for is that local disk holds roughly
    the thing eviction deletes on.
 
    What has accumulated as a result: the entry is validated at open; only a lease holder
-   may repair it; `set_published` takes the maintenance lease; `publish` re-reads the location
-   under that lease and re-checks it before writing a watermark; a failed repair restores
+   may repair it; `set_published` takes the whole-log lease, which overlaps every publish's
+   range claim; `publish` re-reads the location under its claim and re-checks it before
+   writing a watermark; a failed repair restores
    the entry it displaced; `drain` refuses to delete outside the configured prefix. Each
    is correct and each was found the hard way.
 

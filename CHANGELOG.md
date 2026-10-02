@@ -91,6 +91,13 @@ minor version carries breaking changes.
   `expire()` it was already ignored, and on `compact()` it could only abort the
   pass. Drop the argument.
 
+- **`drain` takes no claim, and `publish()` claims only the range it pushes**
+  (#118). Nothing can make a queued file live again once `hydrate` is gone,
+  so deleting due files needs no exclusion; and a publish no longer refuses a
+  seal or eviction in another process for the length of an upload. A publish
+  that must write the tier row still takes the whole log. API.md lists what
+  each routine excludes.
+
 ### Added
 
 - **`duckdb_connection` can cache what it reads from S3** (#118), replacing

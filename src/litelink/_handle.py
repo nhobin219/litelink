@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import json
 import random
 import threading
@@ -3531,7 +3532,7 @@ class WriteHandle(LocalReadHandle):
         #
         # One keyed read per publish pass, against a change that is rare and
         # durable: `Published` reads the location from `meta` on every access.
-        lease = self._lease(MAINTAIN_ROLE)
+        lease, bound = self._publish_lease(flush=flush)
         if not lease.acquire():
             msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
@@ -3552,11 +3553,86 @@ class WriteHandle(LocalReadHandle):
             # both sides of the comparison change together. The fence passes,
             # and the watermark this push earned is recorded against a published
             # table that never received it.
-            self._push(lease, self._published.uri, flush=flush)
+            self._push(lease, self._published.uri, flush=flush, bound=bound)
         finally:
             lease.release()
 
-    def _push(self, lease: Claim, pinned: str | None, *, flush: bool = False) -> None:
+    def _publish_lease(self, *, flush: bool) -> tuple[Claim, int | None]:
+        """The claim a publish takes, and the offset its push must stay below
+        (None for the whole log) (#118).
+
+        **Only the range it pushes**, `[floor, end)`: from the published
+        table's frontier to the end of what this push would upload. Nothing
+        else needs to wait for it. A seal lands above the staging table's end,
+        eviction below the published floor, and compaction refuses what the
+        published table holds — and a compaction over the trailing run, which
+        `flush` pushes too, overlaps this range and so is excluded by it.
+        `set_published` and `rewrite_published` claim the whole log, so they
+        still exclude any publish, which keeps the re-point fence `publish`
+        pins.
+
+        **Two publishes still exclude each other.** Both start at the same
+        floor, so their ranges overlap even when there is nothing to push —
+        which matters, because `_push` forgets intents it does not find
+        landed, and another publisher's intents are files it is uploading.
+
+        **The whole log, when the push might write the tier row.** With no
+        published row yet, `_push` computes it exactly from the published
+        table's manifests, and that one narrowing write must not race
+        eviction widening it (`_tiers`) — so a first publish, or the first
+        after a re-point, claims everything. So does a published table that
+        can only be opened by repairing it, which is a whole-log claim
+        holder's to do.
+
+        Provisional, and read without a claim: `_push` re-reads everything
+        under it and clamps what it uploads to `bound`.
+        """
+        whole = self._lease(MAINTAIN_ROLE)
+        if not self._tiers.has():
+            return whole, None
+
+        published = self._published.table()
+        if published is None:
+            return whole, None
+
+        self._table.reload()
+        published.reload()
+        covered = published.span()
+        floor = 0 if covered is None else covered[1]
+        pending = [f for f in self._table.data_files() if f.end > floor]
+        settled = self._settled(pending, flush=flush)
+        end = pending[settled - 1].end if settled else floor + 1
+
+        return self._lease(MAINTAIN_ROLE, floor, max(end, floor + 1)), end
+
+    def _settled(self, pending: list[DataFile], *, flush: bool) -> int:
+        """How many of `pending` — staging files above the published floor, in
+        offset order — a push takes: everything compaction is finished with
+        (`stable_prefix`), past whatever is already intended or held, or all of
+        them with `flush`."""
+        if flush:
+            return len(pending)
+
+        config = self.config
+        frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
+        head = [f for f in pending if f.start >= frozen]
+
+        return (len(pending) - len(head)) + stable_prefix(
+            head,
+            config.compact_size,
+            config.compact_min_files,
+            self._maintenance.memory(),
+            config.compact_rows,
+        )
+
+    def _push(
+        self,
+        lease: Claim,
+        pinned: str | None,
+        *,
+        flush: bool = False,
+        bound: int | None = None,
+    ) -> None:
         """Upload and register everything above the published table's span.
 
         **`flush` pushes the trailing run too**, which `publish`
@@ -3597,7 +3673,9 @@ class WriteHandle(LocalReadHandle):
         # so agreement means both reading the policy the log records rather
         # than the one each happened to open with.
 
-        published = self._published.require()
+        # Opened with `repair` only under the whole-log claim, the one that
+        # entitles it (`_publish_lease`).
+        published = self._published.require(repair=bound is None)
         self._table.reload()
         # The PUBLISHED table reloaded too, and for a stronger reason than the
         # staging table. A pyiceberg handle is a frozen snapshot view, and
@@ -3616,6 +3694,12 @@ class WriteHandle(LocalReadHandle):
         # copies of staging rows, so it never changes this row itself —
         # eviction does.
         if not self._tiers.has():
+            if bound is not None:
+                # Dropped since the range was chosen — a `set_published`
+                # landed between the two — and computing it exactly needs the
+                # whole log. Nothing pushed; the next publish claims it.
+                return
+
             self._record_published_row(published)
 
         # The published span's end: everything below it is in the bucket.
@@ -3737,34 +3821,38 @@ class WriteHandle(LocalReadHandle):
         # two share `runs` so they cannot disagree about what is in play, and
         # a second input one of them could not see is what deadlocked them once
         # already.
-        frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
-        head = [f for f in pending if f.start >= frozen]
-        settled = (len(pending) - len(head)) + stable_prefix(
-            head,
-            config.compact_size,
-            config.compact_min_files,
-            memory,
-            config.compact_rows,
-        )
-        if flush:
-            # EVERYTHING unpublished, and that is forced rather than chosen.
-            # `pending[:settled]` is a PREFIX because the watermark recorded
-            # below has to stay contiguous — eviction trusts it for I4 — so
-            # there is no way to push a load's tail while leaving an undersized
-            # SEAL beneath it unpushed. Attempted and measured: extending only
-            # through bulk-loaded files never advances past a seal sitting at
-            # index 0, and `published_through()` stays 0 with the load
-            # unpublished. Hence the blunt name.
-            #
-            # So this ships those files. Acceptable because of WHEN a load
-            # happens: `ingest` claims the whole log and is a backfill-time
-            # operation, so live capture is typically stopped and the trailing
-            # run is the load's own. And the alternative is worse by a wide
-            # margin — a load's rows never enter the buffer, so not pushing them
-            # leaves them on one disk. Compaction will not merge what the
-            # published table holds, so any small objects persist until
-            # `rewrite_published` re-cuts them.
-            settled = len(pending)
+        #
+        # `_settled` is the rule, shared with `_publish_lease` so the range a
+        # publish claims and the files it pushes are decided the same way.
+        #
+        # With `flush`, EVERYTHING unpublished, and that is forced rather than chosen.
+        # `pending[:settled]` is a PREFIX because the watermark recorded
+        # below has to stay contiguous — eviction trusts it for I4 — so
+        # there is no way to push a load's tail while leaving an undersized
+        # SEAL beneath it unpushed. Attempted and measured: extending only
+        # through bulk-loaded files never advances past a seal sitting at
+        # index 0, and `published_through()` stays 0 with the load
+        # unpublished. Hence the blunt name.
+        #
+        # So this ships those files. Acceptable because of WHEN a load
+        # happens: `ingest` claims the whole log and is a backfill-time
+        # operation, so live capture is typically stopped and the trailing
+        # run is the load's own. And the alternative is worse by a wide
+        # margin — a load's rows never enter the buffer, so not pushing them
+        # leaves them on one disk. Compaction will not merge what the
+        # published table holds, so any small objects persist until
+        # `rewrite_published` re-cuts them.
+        settled = self._settled(pending, flush=flush)
+        if bound is not None:
+            # Inside the range claimed, and nothing past it: a seal or another
+            # publish may have moved things since `_publish_lease` read them.
+            # A prefix still, so the watermark stays contiguous.
+            settled = sum(
+                1
+                for _ in itertools.takewhile(
+                    lambda f: f.end <= bound, pending[:settled]
+                )
+            )
 
         uploaded: list[tuple[DataFile, str]] = []
         for data_file in pending[:settled]:
