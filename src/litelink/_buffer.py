@@ -2142,17 +2142,12 @@ class Buffer:
     def sort_by(self) -> tuple[str, ...]:
         """The declared clustering, read from the log rather than remembered.
 
-        The rule `config` follows, for the reason `config` follows it (§4a).
-        This used to live in four places — `meta`, `WriteHandle`, `Maintenance`
-        and `Published` — kept in step by `set_sort_by` writing each. That is a
-        fan-out, and a fan-out is only correct in the process that ran it: a
-        maintainer already open elsewhere went on sorting by the key IT opened
-        with while both tables declared the new one, and compaction, the pass
-        that would have re-clustered them, read the same stale field.
+        The rule `config` follows, for the reason `config` follows it (§4a):
+        one copy of a fact, in the log, so no process can hold a stale one.
+        Fixed when the log is created; a different order is a new log.
 
-        The PARSE is cached on the raw value, as `config`'s is. Keying it on
-        the durable value is what keeps the cache from becoming the fifth home:
-        when the row changes the key changes.
+        The PARSE is cached on the raw value, as `config`'s is, so the cache
+        can never disagree with the row.
 
         A MISSING row is corruption, not "no order". `new` always writes it,
         and defaulting to unsorted here would silently de-cluster every file

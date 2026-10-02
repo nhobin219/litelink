@@ -610,33 +610,6 @@ def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
         )
 
 
-def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> None:
-    """A compaction's source is the file it replaces. A seal's is the buffer.
-
-    That difference is why a seal may overwrite its path on retry and a
-    compaction may not. With a deterministic `{lo}-{hi}` name, re-compacting a
-    range that had already been compacted wrote to the path it was reading:
-    `set_sort_by(rewrite=True)` after any compaction truncated the live,
-    table-referenced file, and a crash mid-write destroyed the only copy of
-    those rows. Two owners racing the role hit the same collision.
-    """
-    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        log.advance()
-
-        before = [f.path for f in log._table.data_files()]
-
-        assert len(before) == 1, "expected one compacted file to rewrite"
-
-        log.set_sort_by(("key", "event_ts"), rewrite=True)
-        after = [f.path for f in log._table.data_files()]
-
-        assert len(after) == 1
-        assert after[0] != before[0], "the rewrite reused the live file's path"
-        assert len(read_all(log)) == 12
-
-
 def sized(*sizes: int) -> tuple[list[DataFile], dict[str, int]]:
     """Files holding the given uncompressed sizes, adjacent and in order.
 
@@ -1388,8 +1361,8 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
 def test_an_outer_renew_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
     """`renew or claim.renew` read naturally and was wrong.
 
-    A rewrite run under the whole-log lease — `compact("published")`,
-    `rewrite_sorted` — passes that lease's `renew` down. Taking it in place of
+    A rewrite run under the whole-log lease — `compact("published")` —
+    passes that lease's `renew` down. Taking it in place of
     the run claim's stopped the run claim from being renewed at all, and the
     pre-commit check then consulted the outer claim instead. A merge over the
     TTL lost its exclusion with no stall required.

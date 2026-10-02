@@ -25,7 +25,6 @@ and a target for the WAL replica.
 
 from __future__ import annotations
 
-import contextlib
 import threading
 from typing import TYPE_CHECKING
 
@@ -34,8 +33,6 @@ from litelink._s3 import S3Options
 from litelink._table import LogTable, PublishedAbsent
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from litelink._buffer import Buffer
     from litelink._layout import Layout
 
@@ -92,45 +89,6 @@ class Published:
         # The reader resolves the published table on a query thread while a
         # maintainer publishes on another.
         self._lock = threading.RLock()
-
-    def redeclare_sort_order(self, sort_by: Sequence[str]) -> None:
-        """Push a clustering onto an already-open handle.
-
-        TAKES the order rather than reading it, and that is what lets
-        `set_sort_by` call this BEFORE it writes `meta` — the ordering the
-        staging half already depends on. Reading it here would force the call
-        after the row, and `open_published` declares an order only on the table
-        it CREATES, so a crash in that gap would leave an existing published
-        table declaring the old key for ever while every file pushed into it
-        was clustered by the new one. Nothing re-declares a published table
-        that already exists.
-
-        An argument is not the second home this class shed. The field was: it
-        stayed at whatever the process opened with, so a published table created
-        after a re-sort was born declaring the old key. `table` reads `meta`
-        when it opens a handle, so creation is correct by construction and this
-        covers the table that already exists.
-
-        OPENS one rather than settling for a handle this process happens to
-        hold. An earlier version read `self._handle`, and `set_sort_by` never
-        opens the published table itself — `validate` reads only the URI — so a
-        re-sort from a process that had not touched the published table left its
-        declaration stale for ever, successfully and silently. Review caught the
-        gap and the docstring that admitted it.
-
-        `repair=False` never creates: a published table that does not exist
-        yet is left alone, and the one created later is created from `meta`,
-        which by then holds the new order.
-
-        Best effort against the published half. The published table may be
-        unreachable, and a re-sort is a local operation that has already
-        rewritten every staging file by the time this runs; failing it here
-        would report a failure that did not happen.
-        """
-        with contextlib.suppress(Exception):
-            handle = self.table()
-            if handle is not None:
-                handle.set_sort_order(sort_by)
 
     def location(self) -> str:
         """Where the published table is, according to the log.

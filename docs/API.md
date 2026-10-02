@@ -104,7 +104,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
 | **`+ WriteHandle`** — published table | `publish` · `compact("published")` · `retire` |
-| **`+ WriteHandle`** — configure | `set_config` · `set_sort_by` |
+| **`+ WriteHandle`** — configure | `set_config` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
 
 `await_seal` is deliberately a `WriteHandle` method: it *helps* drain the queue each round
@@ -150,9 +150,9 @@ later backfill can fill (§13). There is deliberately no way to re-seed a log af
 guard that would refuse it reads the offsets currently BUFFERED, which a seal empties, so it
 cannot tell an unused offset from an issued one.
 
-`sort_by` is set here and only here; it is a read-shape decision rather than a knob (§7), and
-changing it later rewrites the staging table's files — see `set_sort_by` for what that does not
-reach. `schema` is your columns — the library prepends
+`sort_by` is set here and only here, and fixed for the log's life, like the schema and the
+published table: it is a read-shape decision rather than a knob (§7), and a different order is
+a new log started where this one ends. `schema` is your columns — the library prepends
 `litelink_offset` itself, and refuses a schema that declares it (I11).
 
 **`open` recovers before it returns**, finishing whatever a crash interrupted. It raises
@@ -594,7 +594,7 @@ A claim excludes only an overlapping claim, whatever its kind:
 | `reclaim()` | nothing for the expiry or the delete | nothing |
 | `sweep()` | nothing | nothing |
 | `set_config` | nothing: one `meta` row, read wherever a decision is made | nothing |
-| `compact("published")`, `set_sort_by`, `retire` | the whole log | everything above |
+| `compact("published")`, `retire` | the whole log | everything above |
 
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
@@ -767,8 +767,7 @@ log.config -> LogConfig
 log.set_config(config) -> None
 log.published -> str                            # s3://… or file://…, fixed at new()
 log.schema -> pa.Schema                       # your columns, as declared at new()
-log.sort_by -> tuple[str, ...]
-log.set_sort_by(sort_by, *, rewrite) -> None
+log.sort_by -> tuple[str, ...]                # fixed at new()
 ```
 
 **Everything `new` took, the log gives back**, which is what lets `open` take none of it.
@@ -776,10 +775,8 @@ log.set_sort_by(sort_by, *, rewrite) -> None
 `sort_by` is the one §7 tells you to bound every scan on a leading column of, which is advice
 no caller can follow without being able to ask.
 
-`sort_by` reads `meta` on every access, like `config` and `published`. That is not a detail of
-the getter: the seal, compaction and the published table's own declaration all read the same one
-place, so `set_sort_by` in one process cannot leave a maintainer in another clustering files
-by the key it happened to open with.
+`sort_by` reads `meta` on every access, like `config` and `published`: the seal, compaction and
+the tables' own declarations all read the same one place.
 
 **There is exactly one copy of the policy, and it is a row in SQLite.** Every decision reads
 it from there rather than from memory, so `set_config` in one process is seen by the writer's
@@ -789,25 +786,10 @@ next append and the maintainer's next pass, and nothing can hold a stale one.
 at the next decision that reads it, and a log whose policy changed mid-stream reads exactly
 like one that never did.
 
-**The published table is fixed when the log is created**, like the schema. A log does
-not move between published tables: to publish somewhere else, `retire()` it and start a new log
-where it ended, `new(root, "trades-v2", published=…, start_offset=old.end_offset())`. Offsets
+**The schema, sort order and published table are fixed when the log is created.** To change
+any of them, `retire()` the log and start a new one where it ended,
+`new(root, "trades-v2", schema=…, sort_by=…, published=…, start_offset=old.end_offset())`. Offsets
 stay dense across the two, and any engine reads both as one sequence.
-
-`set_sort_by` re-clusters what the staging table owns, so `rewrite` must be passed explicitly
-and `rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under
-the maintenance claim, because a rewrite *is* a compaction.
-
-**It does not re-cluster the published prefix.** A local rewrite there would commit a file
-straddling the published table's extent, and nothing re-cuts a local straddler — so a
-re-sort changes the declarations and rewrites only what `publish` has not yet taken. Published
-data keeps the clustering it was written with, which is §6's "sealed once and never
-rewritten" applied to history. `compact("published")` is not the other half: it re-ingests from
-the first badly-*sized* file onwards, so a well-sized published table is never a candidate.
-
-Passing the order the log already has, with `rewrite=True`, is not a no-op — it is how a
-re-sort that died after the `meta` write is finished, since that crash leaves the
-declarations correct and the files not.
 
 ### LogConfig
 
@@ -962,8 +944,7 @@ readable; one it left mid-change is refused with the release that can finish it 
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
 `append`, `ingest`, `seal`, `await_seal`, `advance`, `compact`, `publish`, `evict`,
-`reclaim`, `sweep`, `compact("published")`, `retire`, `set_config` and
-`set_sort_by` are absent from `LogHandle`.
+`reclaim`, `sweep`, `retire` and `set_config` are absent from `LogHandle`.
 Everything observational and both read paths are there.
 
 This is the difference from the older `Log.open(read_only=True)`, which returned ONE class

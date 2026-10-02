@@ -827,11 +827,9 @@ class LogTable:
     def set_sort_order(self, sort_by: Sequence[str]) -> None:
         """Declare the sort order. Does NOT reorder existing data.
 
-        An EMPTY order is a real value meaning unsorted, not a no-op. It used
-        to return early here, so `set_sort_by((), rewrite=True)` re-clustered
-        every file and left the table still declaring the old key — a table
-        lying about its own clustering, with nothing able to correct it now
-        that `meta` rather than this declaration is what `open` reads.
+        An EMPTY order is a real value meaning unsorted, not a no-op: returning
+        early on it would leave the table declaring a key its files do not
+        follow.
         """
         self._commit(lambda: self._apply_sort_order(sort_by))
 

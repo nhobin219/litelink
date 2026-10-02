@@ -666,7 +666,7 @@ the same as "expired": an expired claim nobody has taken may still be renewed, a
 a claim is the taker deleting its row.
 
 **An outer claim's renewal is combined with the run's, never substituted for it.** A rewrite
-under the whole-log lease (`compact("published")`, `rewrite_sorted`) passes that lease's `renew`
+under the whole-log lease (`compact("published")`) passes that lease's `renew`
 down; `renew or claim.renew` silently stopped renewing the run claim at all and answered the
 pre-commit check with the outer one. Callers no longer pass a callback of their own: each pass
 renews its own claim, which is why the public routines dropped `heartbeat`.
@@ -1691,9 +1691,9 @@ wal_retention          how far back a restore may go      (None = litestream's o
 ```
 
 `sort_by` is NOT in here. Everything above governs future work only, so `set_config` needs
-no rewrite; the sort order is a read-shape decision that re-clusters every file the staging
-table owns, so it is set at `litelink.new` and changed by `set_sort_by`. It lives in `meta` beside the
-schema, not in `LogConfig`.
+no rewrite; the sort order is a read-shape decision fixed when the log is created, like the
+schema, and a different order is a new log. It lives in `meta` beside the schema, not in
+`LogConfig`.
 
 `advance()` runs the whole pipeline in lifecycle order: seal, compact, publish, reclaim the
 buffer, evict, expire, sweep staging, expire the published table, sweep it. Eviction takes only
@@ -1712,7 +1712,7 @@ The consequence worth planning for is that local disk holds roughly
 ## 13. Open questions
 
 0. ~~**The published table's identity.**~~ **Closed: the location is fixed when a log is
-   created**, like its schema. A log never re-points, so nothing has to
+   created**, like its schema and sort order. A log never re-points, so nothing has to
    reconcile one table's catalog entry, watermark and coverage records against another's.
    `published.db` is still a local catalog keyed by table id naming a remote table, so "is
    this entry mine?" is still a prefix comparison, and three checks stay for logs an earlier

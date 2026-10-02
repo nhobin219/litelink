@@ -210,8 +210,8 @@ def _both(
 ) -> Callable[[], bool]:
     """Renew our own claim AND the caller's.
 
-    For a rewrite run under an outer claim — `compact("published")` and
-    `rewrite_sorted` hold the whole-log lease and pass its `renew` down — so
+    For a rewrite run under an outer claim — `compact("published")` holds
+    the whole-log lease and passes its `renew` down — so
     both stay live while a merge runs. `renew or claim.renew` read naturally
     and was wrong: a caller passing one silently stopped the run claim from
     being renewed at all, and the pre-commit check then consulted the outer
@@ -328,11 +328,8 @@ class Maintenance:
     def sort_by(self) -> tuple[str, ...]:
         """The declared clustering, read from the log on every access.
 
-        No copy is kept here, for the reason `config` keeps none: this pass
-        rewrites files, and a rewrite that clusters by a key the table no
-        longer declares is a table lying about itself. `set_sort_by` used to
-        push the new value in here; a maintainer in another process never got
-        that call.
+        No copy is kept here, for the reason `config` keeps none: there is one
+        copy of a fact, in the log.
         """
         return self._buffer.sort_by()
 
@@ -650,32 +647,6 @@ class Maintenance:
         # files, and moving their sizes onto an output that never became real
         # would leave every one of them unmeasured.
         self._buffer.record_merge(self._key(target), (self._key(f.path) for f in run))
-
-    def rewrite_sorted(
-        self,
-        renew: Callable[[], bool] | None = None,
-        owner: str | None = None,
-    ) -> None:
-        """Re-cluster every data file under the current sort order (§7).
-
-        File boundaries are preserved rather than merged: a rewrite is already
-        the expensive operation, and folding compaction into it would change
-        the file layout at the same time as the clustering, leaving no way to
-        attribute a later regression to either.
-
-        Each file goes through the same claim-write-replace path a compaction
-        uses, so a crash mid-rewrite leaves one named file to remove and a
-        table still holding the original.
-        """
-        # Between files, for the same reason `run` checkpoints between phases:
-        # this rewrites the WHOLE table, which outlasts a 30 s lease long
-        # before it outlasts a user's patience. Per file rather than per pass,
-        # because a pass here has no phases to sit between.
-        for data_file in self._table.data_files():
-            self._rewrite_run(self._table, [data_file], owner=owner)
-            checkpoint(renew)
-
-    # -- eviction -----------------------------------------------------------
 
     def _retention_boundary(self) -> int:
         """The `end` below which the retention policies would drop, before I4.

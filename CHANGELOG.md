@@ -22,6 +22,14 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: `set_sort_by()` is removed; a log's sort order is fixed when
+  the log is created** (#118), like its schema and published table. To use
+  another order, `retire()` the log and start a new one where it ended:
+  `new(root, name, sort_by=…, start_offset=old.end_offset())`. Nothing
+  re-clusters existing files any more: staging turns over within its
+  retention and the published table keeps the order it was written with, so
+  a re-sort only ever sharpened pruning for a while.
+
 - **Breaking: `rewrite_published()` is now `compact("published")`** (#118).
   It merges undersized files in the published table: compaction, not a
   rewrite of data. `compact(table="staging")` keeps its default, since

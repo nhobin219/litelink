@@ -22,7 +22,6 @@ import itertools
 import json
 import logging
 import random
-import threading
 import time
 import uuid
 from collections.abc import Iterator, Mapping
@@ -1194,18 +1193,13 @@ class WriteHandle(LocalReadHandle):
         self._tiers = PublishedTier(buffer)
         table.after_commit = self._store_staging_statistics
         self._maintenance = maintenance
-        # Sequences the only thing left that needs it: this handle mutating
-        # several objects at once, in `set_sort_by`, where a SQLite row and a
-        # Python object have to change together.
-        #
-        # Nothing on the append, seal or read paths takes it. Each collaborator
-        # owns its own safety — the buffer serialises its connection,
-        # `LogTable` guards its handle and caches, `Reader` guards its DuckDB
-        # connection — and the leases decide who may seal or maintain across
-        # processes, which no in-memory lock could. A lock on top of those is a
-        # second answer to a settled question, and it was not free: one held
-        # across a whole maintenance pass made a read wait 21.5 s.
-        self._lock = threading.RLock()
+        # No handle-wide lock. Each collaborator owns its own safety — the
+        # buffer serialises its connection, `LogTable` guards its handle and
+        # caches, `Reader` guards its DuckDB connection — and the leases decide
+        # who may seal or maintain across processes, which no in-memory lock
+        # could. A lock on top of those would be a second answer to a settled
+        # question, and not a free one: held across a maintenance pass, it
+        # made a read wait 21.5 s.
 
         # Who may seal, and who may maintain. Durable rather than in-memory,
         # because the answer has to survive the process asking (§13.6): a
@@ -1276,7 +1270,8 @@ class WriteHandle(LocalReadHandle):
         **`sort_by` defaults to offset order, and most logs should leave it
         there.** §7 measures it as a read-shape decision rather than a tuning
         knob: it declares which predicates prune, only a LEADING column prunes,
-        and changing it later rewrites every file (see `set_sort_by`).
+        and it is fixed when the log is created, like the schema: a different
+        order is a new log, started where this one ends.
 
         The default is not a fallback — it is the order the rows are already
         in, so it costs strictly less than any sort key. No sort runs at seal
@@ -2055,110 +2050,6 @@ class WriteHandle(LocalReadHandle):
         reissuing ones the dead machine had already served.
         """
         return self._restored_from
-
-    def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
-        """Change the sort order, re-clustering every file the staging table
-        owns.
-
-        §7 calls `sort_by` a read-shape decision rather than a tuning knob:
-        it declares which predicates prune, and the clustering that makes them
-        prune is baked into each file when it is written. So a new order that
-        is only declared would apply to future seals and silently leave every
-        existing file clustered the old way — the same predicate fast on recent
-        data and slow on older data, with nothing to indicate why.
-
-        `rewrite` must be passed explicitly. It is the honest name for the
-        cost: every file this rewrites is read, re-sorted and replaced.
-
-        **The published prefix is not re-clustered, and cannot be.**
-        `_rewrite_run` skips any run holding an offset the published table
-        holds, because a staging rewrite there would commit a file straddling
-        the published table's span and nothing re-cuts a staging straddler. So
-        on a published log this changes three declarations and rewrites only
-        what publish has not yet taken — and `compact("published")` is not the
-        other half either: it re-ingests from the
-        first badly-SIZED file onwards, so a well-sized published prefix is
-        never a candidate and keeps its original clustering for ever.
-
-        That is §6's "sealed once and never rewritten" applied to history, not
-        an oversight — but this docstring used to say "every existing file",
-        which on a published log was a claim the code did not honour and did
-        not report. A re-sort is a decision for a log's staging window; the
-        published table keeps the clustering it was written with.
-        """
-        with self._lock:
-            requested = tuple(sort_by)
-            validate(self._schema, requested, self.config, self._published.uri)
-            if requested == self._buffer.sort_by() and not rewrite:
-                # Restating the order the log already declares, without asking
-                # for the data. Nothing to declare, nothing accepted, so this
-                # is the no-op it looks like.
-                #
-                # It used to return here whatever `rewrite` said, and that left
-                # the one crash gap nothing healed: a crash after `meta` and
-                # before the rewrite finished leaves the declarations NEW and
-                # the files OLD, and the natural retry found the orders equal
-                # and returned without doing anything. Reproduced by review.
-                # `rewrite=True` on an unchanged order is now the way to finish
-                # it — the whole table re-clustered, which is what that flag
-                # already means and what an interrupted rewrite needs.
-                return
-
-            if not rewrite:
-                msg = (
-                    "changing sort_by re-clusters every file the staging table "
-                    "owns, and leaves the published prefix as it is; "
-                    "pass rewrite=True to accept that cost"
-                )
-                raise ValueError(msg)
-
-            # Under the maintain lease, because a rewrite IS a compaction —
-            # same claim record, same deterministic output path, same commit.
-            # Without it this reached that path beside a running `advance()`
-            # in another process: two writers to one `compaction_path`, and a
-            # single-row `compacting` intent each would clear from under the
-            # other, leaving a half-written file nothing could name.
-            #
-            # Taken with the bounded WAIT the other administrative operations
-            # use, not a single attempt. A single attempt loses to any pass
-            # already running, which made the documented way to finish an
-            # interrupted re-sort — the `rewrite=True` retry above — fail
-            # spuriously beside a maintainer that never stops. `set_config`
-            # measured one startup in six lost to exactly this.
-            lease = self._claim_settings()
-
-            try:
-                # `meta` LAST of the durable writes, because it is what
-                # every decision reads: a crash before it leaves the log
-                # deciding by the OLD key, which is the order every existing
-                # file is already in, so the operation is simply not done.
-                #
-                # What it does NOT leave is the declarations untouched, and
-                # this comment used to say otherwise — "the log goes on using
-                # the OLD key that the tables still declare", which a review
-                # reproduced as false. After the declaration writes and before
-                # `meta`, the table declares NEW while `meta` still says OLD.
-                # That mismatch is declaration-only, and the natural retry
-                # heals it: the check above compares against `meta`, which is
-                # unchanged, so a repeated call proceeds and completes all of
-                # them.
-                #
-                # Writing `meta` FIRST is what does not heal. `meta` would say
-                # NEW while every file stayed OLD, and the retry would find the
-                # orders equal and return — which is the gap the `rewrite=True`
-                # branch above now fills.
-                self._table.set_sort_order(requested)
-                # The published table's declaration too, and BEFORE `meta` like
-                # the staging one: `open_published` declares an order only on a
-                # table it creates, so a published table that already exists is
-                # re-declared here or never. Missing it entirely left a published
-                # table created after a re-sort born declaring the old key, with
-                # every file pushed into it clustered by the new one.
-                self._published.redeclare_sort_order(requested)
-                self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
-                self._maintenance.rewrite_sorted(renew=lease.renew, owner=lease.owner)
-            finally:
-                lease.release()
 
     def _claim_settings(self) -> Claim:
         """Take the whole-log claim the configuration operations share.

@@ -14,7 +14,6 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
@@ -272,52 +271,6 @@ def test_sort_by_is_declared_on_the_table(tmp_path: Path) -> None:
     """§4: declared as table metadata AND applied at write time."""
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("key", "event_ts")) as log:
         assert log._table.sort_by() == ("key", "event_ts")
-
-
-def test_changing_sort_by_requires_an_explicit_rewrite(tmp_path: Path) -> None:
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="rewrite=True"):
-            log.set_sort_by(("key",), rewrite=False)
-
-        assert log.sort_by == ("event_ts",), "refused change must not apply"
-
-
-def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
-    """The reason it cannot be a declaration alone (§7).
-
-    Clustering is baked into each file when written, so a new order that only
-    changed the metadata would leave every existing file sorted the old way —
-    the same predicate fast on new data and slow on old, with nothing to say
-    why.
-    """
-    import pyarrow.parquet as pq
-
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.extend(
-            [
-                {"event_ts": 3, "key": "a"},
-                {"event_ts": 1, "key": "c"},
-                {"event_ts": 2, "key": "b"},
-            ]
-        )
-        log.seal(flush=True)
-
-        written = next(tmp_path.rglob("*/data/*.parquet"))
-        assert pq.read_table(written)["event_ts"].to_pylist() == [1, 2, 3]
-
-        log.set_sort_by(("key",), rewrite=True)
-
-        assert log.sort_by == ("key",)
-        assert log._table.sort_by() == ("key",)
-        merged = next(tmp_path.rglob("*compacted*/*.parquet"))
-        assert pq.read_table(merged)["key"].to_pylist() == ["a", "b", "c"]
-        # Reads are unaffected: order is by offset, and every row survives.
-        rows = log.scan().read_all()
-        assert rows["litelink_offset"].to_pylist() == [1, 2, 3]
-        assert rows.num_rows == 3
-
-    with litelink.open(tmp_path, "s") as reopened:
-        assert reopened.sort_by == ("key",), "the new order must survive a reopen"
 
 
 def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
@@ -920,68 +873,6 @@ def test_a_log_with_no_stored_sort_order_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="no stored sort order"):
         litelink.open(tmp_path, "s")
-
-
-def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
-    """An empty order is a value, not a no-op.
-
-    `set_sort_order` used to return early on it, so `set_sort_by((),
-    rewrite=True)` re-clustered every file and left the table declaring the old
-    key. Harmless while `open` read that declaration and reverted; permanent
-    once `meta` is the source of truth, because nothing would reconcile them.
-    """
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.extend([{"event_ts": i, "key": f"k{i}"} for i in range(20)])
-        log.set_sort_by((), rewrite=True)
-
-        assert log._table.sort_by() == ()  # noqa: SLF001
-        assert log._buffer.get_meta("sort_by") == "[]"  # noqa: SLF001
-
-    with litelink.open(tmp_path, "s") as reopened:
-        assert reopened.sort_by == ()  # noqa: SLF001
-
-
-def test_a_rewrite_finishes_a_re_sort_that_died_after_the_meta_write(
-    tmp_path: Path,
-) -> None:
-    """The one crash gap in `set_sort_by` that nothing used to heal.
-
-    `set_sort_by` writes `meta` LAST, so a crash before it leaves the log
-    deciding by the old key and a retry completes the operation. A crash AFTER
-    it does not: the declarations say the new key, every existing file is still
-    in the old one, and the natural retry used to find the orders equal and
-    return without doing anything. Silent, permanent, and a §7 lie — a
-    predicate on the declared leading column pruning nothing, on exactly the
-    files the rewrite never reached.
-
-    Reproduced by a review pass, so this asserts the ROWS rather than the
-    declarations: both of those already said the right thing in the broken
-    state, which is what made it silent.
-    """
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        # `key` descending as `event_ts` ascends, so the two clusterings are
-        # distinguishable and neither is the insertion order by accident.
-        log.extend([{"event_ts": i, "key": f"k{20 - i:02d}"} for i in range(20)])
-        while log.seal(flush=True) is not None:
-            pass
-
-        # The state a crash after the `meta` write leaves: both declarations
-        # carry the new key, the file carries the old clustering.
-        log._table.set_sort_order(("key",))  # noqa: SLF001
-        log._buffer.set_meta("sort_by", json.dumps(["key"]))  # noqa: SLF001
-
-        written = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
-        keys = written.column("key").to_pylist()
-        assert keys != sorted(keys), "the file was already re-clustered"
-        assert log.sort_by == ("key",), "the declaration did not survive"
-
-        # The retry. Same order the log already declares, which is precisely
-        # the call that used to do nothing.
-        log.set_sort_by(("key",), rewrite=True)
-
-        rewritten = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
-        assert rewritten.column("key").to_pylist() == sorted(keys)
-        assert rewritten.num_rows == 20, "the rewrite dropped or duplicated rows"
 
 
 def test_seeding_the_sequence_forward_is_allowed_backward_is_not(

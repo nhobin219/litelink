@@ -274,9 +274,9 @@ class Layout:
 
         Uniqueness is the point. A deterministic `{start}-{end}` meant a
         compaction whose inputs were themselves a previous compaction of the
-        same range wrote to the path it was reading — `set_sort_by(rewrite=True)`
-        after any compaction truncated the live, table-referenced file, and a
-        crash mid-write destroyed the only copy of those rows. It also meant
+        same range would write to the path it was reading — truncating the
+        live, table-referenced file, so a crash mid-write destroys the only
+        copy of those rows. It would also mean
         two owners racing the role wrote one file. A seal can overwrite in place
         because its source is the buffer, which is still there; a compaction's
         source is the file it is replacing.
