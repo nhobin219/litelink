@@ -710,3 +710,32 @@ def test_evict_bounds_narrow_what_is_dropped(tmp_path: Path) -> None:
 
         with pytest.raises(ValueError, match="below start_offset"):
             log.evict("buffer", start_offset=10, end_offset=5)
+
+
+def test_a_local_log_never_loads_the_read_cache(
+    tmp_path: Path, isolated_read_cache: Path
+) -> None:
+    """The cache is for S3 reads; a local published table is already on disk
+    (#118). A read that reaches it loads no `cache_httpfs`, changes no DuckDB
+    setting, and creates no cache directory.
+
+    Falsify by installing the cache before the reader's `remote()` check: the
+    extension loads and the default directory appears.
+    """
+    with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        assert log.staging_files() == 0, "the read must reach the published table"
+
+        assert log.scan().read_all().num_rows == ROWS
+
+        connection = log._reader._connect()  # noqa: SLF001
+        extensions = {
+            name
+            for (name,) in connection.execute(
+                "SELECT extension_name FROM duckdb_extensions() WHERE loaded"
+            ).fetchall()
+        }
+        assert "cache_httpfs" not in extensions
+        assert "httpfs" not in extensions
+        assert not (isolated_read_cache / "litelink").exists()
