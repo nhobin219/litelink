@@ -662,10 +662,11 @@ before its commit and refuses to carry on if it no longer holds the range. Note 
 the same as "expired": an expired claim nobody has taken may still be renewed, and what ends
 a claim is the taker deleting its row.
 
-**A caller's heartbeat is combined with the claim's, never substituted for it.** Passing one
-was the correct usage in the role-lease era, so it is a habit that survives; `heartbeat or
-claim.renew` then silently stopped renewing the claim at all and answered the pre-commit
-check with a stranger's callback.
+**An outer claim's renewal is combined with the run's, never substituted for it.** A rewrite
+under the whole-log lease (`rewrite_published`, `rewrite_sorted`) passes that lease's `renew`
+down; `renew or claim.renew` silently stopped renewing the run claim at all and answered the
+pre-commit check with the outer one. Callers no longer pass a callback of their own: each pass
+renews its own claim, which is why the public routines dropped `heartbeat`.
 
 **And the published table refuses a range that starts inside its extent.** Everything upstream is
 arranged so a merge never straddles it, and each gap found in that arrangement has been a
@@ -1021,8 +1022,8 @@ Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
    has finished with (`stable_prefix`), or every one with push_unsettled.
 2. published.add_files([...published paths...])  -- register, ONE commit; no data movement
 3. Record each file's published copy in `extent`, and the watermark in `meta`.
-4. Housekeeping on the published table: expire its snapshots older than
-   published_snapshot_retention, delete what that frees once due, and sweep stranded
+4. (expire("published"), its own routine) Expire the published table's snapshots older than
+   published_snapshot_retention, delete what that frees once due; then sweep stranded
    metadata (§6).
 ```
 
@@ -1034,16 +1035,14 @@ never need the same overwrite applied twice. Re-cutting what is already publishe
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).
 
-**Step 4 is publishing work because it needs the published table.** `maintain()` keeps a
-partitioned machine's local storage in order without the network (§11), so it never opens the
-published table; `publish` already has, under the lease it holds. Every publish leaves a
-snapshot behind, so it is also exactly when there is something to expire. Until #113 the
+**Step 4 is its own routine, `expire("published")`, not part of `publish`.** `maintain()` runs it
+right after `publish` (§12), and an orchestrator can run it on its own schedule. Until #113 the
 published table was expired only after `rewrite_published`, on the reasoning that `publish`
 never supersedes a file. True of data files and not of Iceberg's own: a table that was only
 ever published kept every snapshot, manifest list and manifest it had ever had.
 
-**The staging table's expiry and eviction are not publishing work.** They are local storage
-work, owned by `maintain()` (§12), because a log may go a long time between publishes.
+**The staging table's expiry and eviction are not publishing work either.** They are their own
+routines, run by `maintain()` after `publish` (§12).
 Eviction reads what step 3 records to enforce I4: **a file is never evicted locally before step 2 has registered
 it** — the one ordering in publishing that is correctness, not optimisation.
 
@@ -1125,8 +1124,8 @@ can report a file that no longer exists or miss one that does.
 **One sweep exists anyway, as a backstop for files no commit recorded.** An Iceberg commit
 writes its manifests, manifest list and `metadata.json`, then swaps the catalog pointer. One
 that loses the swap, or crashes before it, leaves those files under names nothing recorded;
-pyiceberg, unlike Java Iceberg, does not delete a losing attempt's files. So `maintain` (for
-the staging table) and `publish` (for the published one) list `metadata/` at their first pass
+pyiceberg, unlike Java Iceberg, does not delete a losing attempt's files. So `sweep()` — run by
+`maintain()` after each table's last change — lists `metadata/` at their first pass
 in a process and every four hours after, and delete what is unreferenced, not a
 `metadata.json` the table still names, not queued, and older than the table's retention (an
 hour at least, so a commit in flight keeps its files). The listing comes first and the live
@@ -1691,8 +1690,9 @@ no rewrite; the sort order is a read-shape decision that re-clusters every file 
 table owns, so it is set at `litelink.new` and changed by `set_sort_by`. It lives in `meta` beside the
 schema, not in `LogConfig`.
 
-`maintain()` runs compaction, eviction **and** expiry together, in that order, and does not
-publish: eviction takes only what `publish` has already put in the published table. Each is
+`maintain()` runs the whole pipeline in lifecycle order: seal, compact, publish, reclaim the
+buffer, evict, expire, sweep staging, expire the published table, sweep it. Eviction takes only
+what `publish` has put in the published table, so it runs after it, in the same pass. Each is
 a no-op or a regression without the others: compaction alone increases
 storage, since superseded files stay referenced until their snapshots expire; eviction alone
 frees no disk, since it removes a file from the current snapshot while the previous one still
@@ -2006,8 +2006,8 @@ The consequence worth planning for is that local disk holds roughly
    recovery replays only what it owns — which is the hazard above, resolved.
 
    Nothing configures where the sealer runs, because nothing in the library runs one.
-   `seal_due()` drains the queue; `maintain()` compacts, evicts and expires and then
-   calls it. Both are plain methods on their caller's schedule, and
+   `seal_due()` drains the queue; `maintain()` calls it first, then runs the rest of the
+   pipeline. Both are plain methods on their caller's schedule, and
    if another owner holds the lease the call is refused and returns rather than
    duplicating the work.
 

@@ -27,7 +27,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -84,7 +84,7 @@ from litelink._tiers import encode as encode_tier
 from litelink._types import NON_FINITE, column_type, validate_schema
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Iterable, Sequence
     from os import PathLike
     from typing import Self
 
@@ -2482,9 +2482,7 @@ class WriteHandle(LocalReadHandle):
                 # every file pushed into it clustered by the new one.
                 self._published.redeclare_sort_order(requested)
                 self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
-                self._maintenance.rewrite_sorted(
-                    heartbeat=lease.renew, owner=lease.owner
-                )
+                self._maintenance.rewrite_sorted(renew=lease.renew, owner=lease.owner)
             finally:
                 lease.release()
 
@@ -3519,15 +3517,13 @@ class WriteHandle(LocalReadHandle):
         compacts before pushing to keep the count to what a run genuinely cannot
         fill.
 
-        **Then the published table's housekeeping**: expire its snapshots older
-        than `published_snapshot_retention`, delete the objects that frees once
-        their grace has passed, and sweep stranded metadata (#113). Published-
-        facing, so here and not in `maintain`, which must keep a partitioned
-        machine's local storage in order without the network (§11).
+        **Publishing only**, a building block. Expiring the published table and
+        sweeping it are routines of their own (`expire_published`, `sweep`),
+        so an orchestrator can schedule them apart from this (#118);
+        `maintain` runs all of them.
 
         DEVIATES from §5, which also lists local eviction (step 5). That is
-        local storage work and belongs to `maintain`, which runs whether or not
-        a publish pass has. Publish's remaining obligation to eviction is the
+        local storage work and belongs to `evict`. Publish's remaining obligation to eviction is the
         registration watermark it records in `meta`, which is what lets
         `maintain` enforce I4.
         """
@@ -3564,19 +3560,8 @@ class WriteHandle(LocalReadHandle):
             # and the watermark this push earned is recorded against a published
             # table that never received it.
             self._push(lease, self._published.uri, push_unsettled=push_unsettled)
-            # The published table's own housekeeping, after the push and under
-            # the same lease: expire its snapshots and delete what has come due
-            # (#113). Here rather than in `maintain`, which must keep working
-            # with no network (§11).
-            self._maintenance.tidy_published(lease)
         finally:
             lease.release()
-
-        # The sweep AFTER the release. It needs no claim, and a pass through a
-        # backlog on object storage is ~25 s of deletes; under the lease, every
-        # other process's `maintain` and `publish` would be refused for all of
-        # it. Never raises.
-        self._maintenance.sweep_published()
 
     def _push(
         self, lease: Claim, pinned: str | None, *, push_unsettled: bool = False
@@ -3996,60 +3981,71 @@ class WriteHandle(LocalReadHandle):
             lease.release()
 
     def maintain(self) -> None:
-        """Reclaim local storage: compact, evict, expire (§6, §8, §12).
+        """Every maintenance routine, in the order rows move: from the buffer to
+        the published table, each table swept after the last step that can
+        change it. The one call most deployments want (§5, §6, §8, §12).
 
-        The one call most deployments want, and it takes the lease once for
-        all three. `compact`, `evict` and `expire` are callable on their own
-        for the case this cannot express — schedules that differ because the
-        costs do, now that conversion reads and rewrites files while the other
-        two are metadata commits.
+        1. `seal_due` — buffer to staging;
+        2. `compact` — merges a run once it has `compact_min_files` files;
+        3. `publish` — staging to published, the files compaction is done with;
+        4. `reclaim_buffer`, when `vacuum_free_ratio` is set — after the seal
+           and the publish, the two steps that free buffer rows;
+        5. `evict` — staging drops what the published table now holds, in the
+           same pass;
+        6. `expire("staging")` — staging snapshots, then the staging drain;
+        7. `sweep("staging")`;
+        8. `expire("published")` — published snapshots, then the published
+           drain;
+        9. `sweep("published")`.
 
-        **Eviction is bounded by I4 on every log**: a file that publish has not
-        yet registered in the published table is never evicted, however old. So
-        on a partitioned-off machine, this compacts and expires but leaves the
-        window growing — §11's "local eviction stalls" — and on a log whose
-        published table is a local directory, `staging_retention` takes effect
-        as `publish` pushes to it. Eviction never deletes data (#98).
+        Each is callable on its own, and that is the point of listing them: an
+        orchestrator with schedules that differ because the costs do, or that
+        wants the published side in another process, calls the routines and
+        not this (#118). Each declares its own exclusion — a claim on the
+        offsets it touches, or none — so running them apart is safe.
 
-        Whether a stalled or partial pass should be reported rather than silent
-        is open — §11 treats stalled eviction as an operational condition, and
-        returning None says nothing about it.
+        **Every log publishes** (#98): to S3, or by default to a directory
+        beside it. **A publish that fails raises, after local maintenance**: on
+        a machine cut off from a remote published table, steps 4-7 still run —
+        eviction has nothing new to take, which is §11's "local eviction
+        stalls", but expiry and the staging sweep keep reclaiming — then the
+        published steps are skipped and the publish's error is raised. That
+        includes another owner holding the lease: maintenance is meant to run
+        in one process, so a second one is a deployment error worth hearing
+        about, not contention to wait out.
+
+        **Eviction is bounded by I4**: a file the published table does not
+        hold yet is never evicted, however old. Eviction never deletes data.
         """
-
-        # The lease is the exclusion, and it is the only one this needs. There
-        # is no lock around the pass any more: a compaction reads every file it
-        # merges and writes a new one, and holding a lock that reads also take
-        # made one read wait 21.5 s. `LogTable` guards its handle and caches
-        # for the moment each is touched, and `_commit` retries a branch that
-        # moved underneath it, which is what cross-process safety rests on
-        # anyway — a lock could never have provided it.
-        #
-        # Taken after the refusals above, so a rejected call does not leave
-        # a lease behind for its TTL and lock out the process that could
-        # have done the work.
-        # Each pass claims what it works on; see `_pass`.
-        self._maintenance.run(heartbeat=None)
-
-        # Sealing IS maintenance, so a caller running only this in a loop has
-        # to get it; `seal_due` is exposed separately only because it is cheap
-        # enough to run far more often than the rest of this.
-        #
-        # AFTER the pass, not before, and the comment here used to say the
-        # opposite of the line it sat on. The pass works on files that are
-        # already sealed, so a group cut during this call becomes a candidate
-        # on the next one — a cycle of latency, against a pass that would
-        # otherwise compact a file it had just written.
+        # Sealing first, so what this pass seals is compacted and published in
+        # this pass rather than the next. Compaction only merges a run that is
+        # ready and `publish` only takes what compaction is finished with, so
+        # a file sealed a moment ago is never touched before its time.
         self.seal_due()
+        self.compact()
 
-        # LAST, and only when asked. The pass above is what frees pages —
-        # eviction and the release of rows the published table holds both
-        # delete — so reclaiming before it would measure a free list that is
-        # about to grow. Off unless
-        # `vacuum_free_ratio` is set, because this is the one part of a
-        # maintenance pass that blocks appends; see `reclaim_buffer`.
+        # Held, not raised, so the local steps still run on a machine that
+        # cannot reach a remote published table (§11).
+        failure: Exception | None = None
+        try:
+            self.publish()
+        except Exception as exc:  # noqa: BLE001 — re-raised below
+            failure = exc
+
+        # Off unless `vacuum_free_ratio` is set, because this is the one part of
+        # a maintenance pass that blocks appends; see `reclaim_buffer`.
         ratio = self.config.vacuum_free_ratio
         if ratio is not None:
             self.reclaim_buffer(ratio)
+
+        self.evict()
+        self.expire("staging")
+        self.sweep("staging")
+        if failure is not None:
+            raise failure
+
+        self.expire("published")
+        self.sweep("published")
 
     def reclaim_buffer(self, min_free_ratio: float = 0.0) -> int:
         """Return `buffer.db`'s dead space to the OS. Bytes reclaimed, or 0.
@@ -4079,51 +4075,62 @@ class WriteHandle(LocalReadHandle):
         """
         return self._buffer.reclaim_free_pages(min_free_ratio)
 
-    def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
+    def compact(self) -> None:
         """Convert sealed files into `target_compact_size` ones (§6).
 
-        The heavy half of `maintain`, and the reason the three passes are
-        callable separately: it reads and rewrites whole files, while eviction
-        and expiry are metadata commits that finish in milliseconds. A
-        deployment that wants them on different schedules — convert hourly,
-        expire every minute — can have that, and one that does not should call
-        `maintain` and get all three.
-        """
-        self._pass(self._maintenance.compact, heartbeat)
+        The heavy step of `maintain`, and the reason its steps are callable
+        separately: it reads and rewrites whole files, while eviction and
+        expiry are metadata commits that finish in milliseconds. A deployment
+        that wants them on different schedules — convert hourly, expire every
+        minute — can have that, and one that does not should call `maintain`.
 
-    def evict(self, heartbeat: Callable[[], bool] | None = None) -> None:
+        Claims each run it merges (§4a) and renews that claim as it works, so
+        it excludes another maintainer only where their work overlaps.
+        """
+        self._maintenance.compact()
+
+    def evict(self) -> None:
         """Drop files past `staging_retention` from the staging table (§8).
 
         Never past what the published table holds (I4), so a publish that is
-        behind delays this rather than losing data.
+        behind delays this rather than losing data. Claims the prefix it
+        removes.
         """
-        self._pass(lambda _: self._maintenance.evict(), heartbeat)
+        self._maintenance.evict()
 
-    def expire(self, heartbeat: Callable[[], bool] | None = None) -> None:
-        """Expire staging snapshots past `staging_snapshot_retention`, delete
-        what has come due, and sweep stranded metadata (§6, §8). The published
-        table's are `publish`'s (#113)."""
-        self._pass(lambda _: self._maintenance.expire(), heartbeat)
-        # Outside the pass's lease, for the reason `publish` gives.
-        self._maintenance.sweep_staging()
+    def expire(self, table: Table | None = None) -> None:
+        """Expire snapshots past the table's retention, then delete what has
+        come due (§6, §8).
 
-    def _pass(
-        self,
-        run: Callable[[Callable[[], bool] | None], None],
-        heartbeat: Callable[[], bool] | None,
-    ) -> None:
-        """One maintenance pass under the maintenance lease.
-
-        The same exclusion `maintain` takes, so running the passes separately
-        is not a way around it: a second owner is refused whichever entry point
-        it came through.
+        `table` is `"staging"` (against `staging_snapshot_retention`),
+        `"published"` (against `published_snapshot_retention`), or None for
+        both, staging first. The expiry takes no claim — it is a metadata
+        commit the catalog's compare-and-swap orders — and the delete that
+        follows takes the claim `drain` does. A published table `publish` has
+        not created yet is skipped.
         """
-        # No claim here. Each pass claims the range it actually works on —
-        # compaction a run, eviction the prefix it removes — so two maintainers
-        # exclude each other only where their work overlaps, which is what §4a
-        # buys over one lease per role. An entry-point claim would put that
-        # back and cover every offset in the log while doing so.
-        run(heartbeat)
+        if _covers(table, "staging"):
+            self._maintenance.expire()
+
+        if _covers(table, "published"):
+            self._maintenance.expire_published()
+
+    def sweep(self, table: Table | None = None) -> None:
+        """One pass of the stranded-metadata sweep (§6). `table` as for
+        `expire`: `"staging"`, `"published"`, or None for both.
+
+        What a commit that lost its pointer swap, or crashed before it, left
+        behind. Lists each table's `metadata/` at the first call in a process
+        and every four hours after, and deletes at most 500 files a call.
+        Takes no claim — a dead metadata file's name is never reused — so it
+        can run anywhere beside anything, a daemon thread included. Never
+        raises; a failure is logged and retried on the next call.
+        """
+        if _covers(table, "staging"):
+            self._maintenance.sweep_staging()
+
+        if _covers(table, "published"):
+            self._maintenance.sweep_published()
 
     def rewrite_published(self) -> None:
         """Merge undersized files already in the published table (§6, ad-hoc).
@@ -4620,3 +4627,19 @@ def validate(
             f"compression must be one of {sorted(_CODECS)}, not {config.compression!r}"
         )
         raise ValueError(msg)
+
+
+Table = Literal["staging", "published"]
+
+
+def _covers(table: Table | None, which: Table) -> bool:
+    """Whether a routine's `table` argument includes `which`; None is both.
+
+    Refuses anything else, so a misspelt table is an error rather than a call
+    that silently did nothing.
+    """
+    if table not in (None, "staging", "published"):
+        msg = f'table must be "staging", "published" or None, not {table!r}'
+        raise ValueError(msg)
+
+    return table is None or table == which

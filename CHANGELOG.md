@@ -17,27 +17,58 @@ minor version carries breaking changes.
   config written by an older version fills both from its `snapshot_retention`.
   A scan of the staging table running longer than 15 minutes now needs the
   staging setting raised.
-- **`publish()` now expires the published table** (#113). Each publish expires
-  published snapshots older than `published_snapshot_retention` and deletes the
-  objects that frees once due. Previously the published table was expired only
-  after `rewrite_published`, so one that was only ever published kept every
-  snapshot, manifest list and manifest. `maintain()` no longer touches the
-  published table, so it never needs the network; a `rewrite_published`'s
-  superseded objects are now deleted by a later `publish()`.
+- **Breaking: `maintain()` now runs the whole pipeline, publish included**
+  (#117, #119). It runs in the order rows move:
+  1. `seal_due()`;
+  2. `compact()`;
+  3. **`publish()`**;
+  4. `reclaim_buffer()`, when configured;
+  5. `evict()`;
+  6. `expire("staging")`;
+  7. `sweep("staging")`;
+  8. **`expire("published")`**;
+  9. `sweep("published")`.
+
+  #100 made every log publish, and `maintain()` should have published from
+  then on. A loop calling `maintain()` then `publish()` still works, but the
+  second call now finds nothing to do and can be dropped. **`maintain()` now
+  raises** if the publish fails, including when another owner holds the
+  lease: it is meant for one process. Local maintenance (steps 4–7) still runs
+  first, so a machine cut off from a remote published table keeps reclaiming
+  local storage.
+- **The published table is now expired** (#113). `expire("published")`, step 8
+  above, expires published snapshots older than `published_snapshot_retention`
+  and deletes the objects that frees once due. Previously the published table
+  was expired only after `rewrite_published`, so one that was only ever
+  published kept every snapshot, manifest list and manifest.
+
+- **Breaking: one routine per operation, the table an argument** (#117).
+  `expire(table=None)` and `sweep(table=None)` take `"staging"`,
+  `"published"`, or None for both; a misspelt table raises `ValueError`.
+  **`expire()` with no argument now expires both tables**; it used to expire
+  staging only. Pass `"staging"` for the old behaviour.
+- **Breaking: `heartbeat` is removed** from `compact()`, `evict()` and
+  `expire()`. Each pass takes and renews its own claim on the range it works
+  on (§4a), so a caller's callback had nothing left to do: on `evict()` and
+  `expire()` it was already ignored, and on `compact()` it could only abort the
+  pass. Drop the argument.
 
 ### Added
 
+- **`sweep(table=None)`**, a routine of its own (#117). It takes no claim, so
+  an orchestrator can run it on its own schedule, in another process, or in a
+  daemon thread.
 - **A sweep for stranded Iceberg metadata** (#113). A commit that loses its
   pointer swap, or crashes before it, leaves its manifests, manifest list and
-  `metadata.json` behind, and pyiceberg does not delete them. `maintain()` (for
-  the staging table) and `publish()` (for the published one) list `metadata/`
-  at their first pass in a process and every four hours after, and delete
-  files that nothing references and that are older than an hour and the
-  table's retention, at most 500 a pass. It runs after the pass has released
-  its lease, so a slow backlog pass never holds up another process. This also clears the manifests
-  orphaned before #112. A sweep failure is logged, never raised. `retire()`
-  also sweeps both tables completely, with 32 deletes in flight, before it
-  marks the log retired, since a retired log takes no more passes.
+  `metadata.json` behind, and pyiceberg does not delete them. `maintain()`
+  sweeps each table after its last change. A sweep lists `metadata/` at its
+  first pass in a process and every four hours after, and deletes files that
+  nothing references and that are older than both an hour and the table's
+  retention, at most 500 a pass. It takes no claim, so a slow pass through a
+  backlog never holds up another process, and a failure is logged, never
+  raised. This also clears the manifests orphaned before #112. `retire()`
+  sweeps both tables completely, with 32 deletes in flight, before it marks
+  the log retired, since a retired log takes no more passes.
 
 ### Fixed
 

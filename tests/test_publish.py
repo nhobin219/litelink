@@ -427,9 +427,7 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
                 published_snapshot_retention=timedelta(0),
             )
         )
-        # `publish`, not `maintain`: the published table's queue is drained by
-        # the pass that already talks to it (#113).
-        log.publish()
+        log.expire("published")
 
         for path in superseded & queued:
             assert not fs.exists(path.removeprefix("s3://")), (
@@ -1972,7 +1970,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         for _ in range(3):
             log.extend(rows(400))
             log.seal_due()
-            log.maintain()
+            log.compact()
 
         _crash_before_recording(log)
 
@@ -1996,7 +1994,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
         # The ingredient that turns the crash into a permanent stall.
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.maintain()
+        log.compact()
 
         assert all(
             f.start >= extent[1] or f.end <= extent[1] for f in log._table.data_files()
@@ -2121,7 +2119,7 @@ def test_a_healed_row_carries_the_measured_bytes(
         for _ in range(3):
             log.extend(rows(400))
             log.seal_due()
-            log.maintain()
+            log.compact()
 
         _crash_before_recording(log)
 
@@ -2214,7 +2212,7 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
         Maintenance._discard_scratch = after_teardown
         try:
             with pytest.raises(RuntimeError, match="lost the claim"):
-                log._maintenance.rewrite_published(heartbeat=lambda: state["calls"] < 2)
+                log._maintenance.rewrite_published(renew=lambda: state["calls"] < 2)
 
         finally:
             Maintenance._discard_scratch = discard
@@ -4170,22 +4168,22 @@ def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
         assert (whole[OFFSET].min, whole[OFFSET].max) == (1, 500)
 
 
-def test_publish_expires_the_published_table_and_drains_what_that_frees(
+def test_maintain_expires_the_published_table_and_drains_what_that_frees(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Every publish expires published snapshots past
+    """Every `maintain` publishes and then expires published snapshots past
     `published_snapshot_retention`, and the manifest lists and manifests only
     they referenced are deleted once due (#113). A table that was only ever
     published used to keep every one of them.
 
-    Falsify by dropping the `tidy_published` call from `publish`: four
-    snapshots survive, and so do their manifest lists.
+    Falsify by dropping `expire_published` from `maintain`: four snapshots
+    survive, and so do their manifest lists.
     """
     with published_log(tmp_path, bucket, s3) as log:
         for _ in range(4):
             log.extend(rows(ROWS))
             log.seal_due()
-            log.publish()
+            log.maintain()
 
         published = log._published.require()
         published.reload()
@@ -4198,7 +4196,7 @@ def test_publish_expires_the_published_table_and_drains_what_that_frees(
         assert log.scan().read_all().num_rows == 4 * ROWS
 
 
-def test_publish_sweeps_stranded_metadata_from_object_storage(
+def test_the_sweep_deletes_stranded_metadata_from_object_storage(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The sweep on S3: a listing names objects as the published table names
@@ -4223,9 +4221,7 @@ def test_publish_sweeps_stranded_metadata_from_object_storage(
         fs.pipe(stranded.removeprefix("s3://"), b"stranded")
         live = published.referenced_paths() | published.live_metadata()
 
-        log.extend(rows(ROWS))
-        log.seal_due()
-        log.publish()
+        log.sweep()
 
         assert not fs.exists(stranded.removeprefix("s3://"))
         published.reload()
@@ -4233,4 +4229,4 @@ def test_publish_sweeps_stranded_metadata_from_object_storage(
             assert fs.exists(path.removeprefix("s3://")), path
 
         assert live, "the test must hold live objects to keep"
-        assert log.scan().read_all().num_rows == 2 * ROWS
+        assert log.scan().read_all().num_rows == ROWS

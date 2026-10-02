@@ -206,7 +206,9 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
         assert before == 3
 
         # Nothing published yet: retention says evict everything, I4 says none.
-        log.maintain()
+        # `evict`, the routine under test: `maintain` would also publish, to a
+        # bucket this test never stands up.
+        log.evict()
 
         assert log.staging_files() == before, "evicted with an empty published table"
 
@@ -215,7 +217,7 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
         log._buffer.record_file(
             f"s3://bucket/prefix/data/{first.start}.parquet", first.start, first.end, 1
         )
-        log.maintain()
+        log.evict()
 
         assert log.staging_files() == before - 1, "did not evict what was published"
     finally:
@@ -497,15 +499,17 @@ def test_iceberg_metadata_does_not_grow_without_bound(tmp_path: Path) -> None:
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 8)
-        avro_before = len(list(tmp_path.rglob("*.avro")))
+        # The staging table's, since `maintain` now publishes too.
+        staging = metadata_dir(log)
+        avro_before = len(list(staging.glob("*.avro")))
         assert avro_before >= 8, "one manifest list per commit, at least"
 
         log.maintain()
         log.maintain()  # the second pass retires what the first only queued
 
-        metadata = list(tmp_path.rglob("*.metadata.json"))
+        metadata = list(staging.glob("*.metadata.json"))
         assert len(metadata) <= 11, f"{len(metadata)} metadata files for 8 commits"
-        assert len(list(tmp_path.rglob("*.avro"))) < avro_before, (
+        assert len(list(staging.glob("*.avro"))) < avro_before, (
             "expired snapshots' manifests were never reclaimed"
         )
         assert len(read_all(log)) == 32, "the data is still readable"
@@ -1434,18 +1438,22 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
         assert log.staging_files() == before, "committed without holding the claim"
 
 
-def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
-    """`heartbeat or claim.renew` read naturally and was wrong.
+def test_an_outer_renew_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
+    """`renew or claim.renew` read naturally and was wrong.
 
-    Any caller passing a heartbeat — which is what the role-lease era asked
-    for, so it is a habit carried forward — stopped the run claim from being
-    renewed at all, and the pre-commit check then consulted a stranger's
-    callback instead of the claim. A merge over the TTL lost its exclusion with
-    no stall required.
+    A rewrite run under the whole-log lease — `rewrite_published`,
+    `rewrite_sorted` — passes that lease's `renew` down. Taking it in place of
+    the run claim's stopped the run claim from being renewed at all, and the
+    pre-commit check then consulted the outer claim instead. A merge over the
+    TTL lost its exclusion with no stall required.
+
+    Falsify by making `_both` return `theirs` when it is given: no run claim
+    is renewed.
     """
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
+        run = sorted(log._table.data_files(), key=lambda f: f.start)
         renewed: list[int] = []
         original = Claim.renew
 
@@ -1456,7 +1464,7 @@ def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) ->
 
         Claim.renew = counting
         try:
-            log.compact(heartbeat=lambda: True)
+            log._maintenance._rewrite_run(log._table, run, lambda: True)
 
         finally:
             Claim.renew = original
@@ -2247,24 +2255,3 @@ def test_an_expiry_with_nothing_to_expire_commits_nothing(tmp_path: Path) -> Non
         log._maintenance.expire()
 
         assert log._table.metadata_location == before
-
-
-def test_maintain_never_opens_the_published_table(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`maintain` keeps local storage in order with no network (§11), so the
-    published table's expiry is `publish`'s (#113).
-
-    Falsify by calling `tidy_published` from `expire`: the published table is
-    opened and this raises.
-    """
-    config = LogConfig(compact_min_files=2, staging_snapshot_retention=timedelta(0))
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 4)
-        log.publish()
-
-        def unreachable(*, repair: bool = False) -> None:
-            raise AssertionError("maintain opened the published table")
-
-        monkeypatch.setattr(log._published, "table", unreachable)
-        log.maintain()

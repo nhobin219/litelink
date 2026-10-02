@@ -172,8 +172,8 @@ def test_rewrite_published_works_on_a_local_published_table(tmp_path: Path) -> N
         assert all(key.startswith("file:///") for key in superseded)
 
         time.sleep(1.1)
-        # `publish`, which drains the published table's queue (#113).
-        log.publish()
+        # `expire_published`, which drains the published table's queue (#113).
+        log.expire("published")
         assert offsets(log) == expected
         assert not any(
             Path(key.removeprefix("file://")).exists() for key in superseded
@@ -254,7 +254,7 @@ def test_set_published_none_points_back_at_the_local_default(tmp_path: Path) -> 
         log.set_published(None)
 
         assert log._buffer.get_meta("published") == log.published  # noqa: SLF001
-        log.maintain()
+        log.evict()
         assert log.staging_rows() == 500, (
             "the default published table holds none of it yet"
         )
@@ -474,12 +474,10 @@ def test_publish_sweeps_a_local_published_table(
         stranded = directory / f"{uuid.uuid4()}-m0.avro"
         stranded.write_bytes(b"stranded")
 
-        log.extend(rows(ROWS))
-        log.seal_due()
-        log.publish()
+        log.sweep()
 
         assert not stranded.exists()
-        assert log.scan().read_all().num_rows == 2 * ROWS
+        assert log.scan().read_all().num_rows == ROWS
 
 
 def test_retire_deletes_stranded_metadata_in_both_tables(tmp_path: Path) -> None:
@@ -515,15 +513,15 @@ def test_retire_deletes_stranded_metadata_in_both_tables(tmp_path: Path) -> None
         assert retired.scan().read_all().num_rows == ROWS
 
 
-def test_the_published_sweep_runs_after_publish_releases_its_lease(
+def test_the_published_sweep_runs_with_publishs_lease_released(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The sweep needs no claim, and a backlog pass on object storage is tens
     of seconds of deletes; under `publish`'s lease every other process's
     `maintain` and `publish` would be refused for all of it.
 
-    Falsify by running `sweep_published` inside the `try` that holds the
-    lease: the lease cannot be taken during the sweep.
+    Falsify by running `sweep_published` inside `publish`'s `try`, which
+    holds the lease: the lease cannot be taken during the sweep.
     """
     with local_log(tmp_path) as log:
         log.extend(rows(ROWS))
@@ -539,6 +537,100 @@ def test_the_published_sweep_runs_after_publish_releases_its_lease(
             real(*args, **kwargs)  # ty: ignore[invalid-argument-type]
 
         monkeypatch.setattr(maintenance, "_sweep", sweep)
-        log.publish()
+        log.maintain()
 
-        assert free == [True]
+        assert free == [True, True], "both sweeps, with the lease free"
+
+
+def test_maintain_seals_publishes_and_evicts_in_one_pass(tmp_path: Path) -> None:
+    """The pipeline runs in lifecycle order: what a pass seals is published, and
+    what it publishes is evicted, in the same pass (#117, #119).
+
+    Falsify by moving `publish` after `evict` in `maintain`: the staging table
+    still holds the files after one pass.
+    """
+    with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
+        log.extend(rows(ROWS))
+
+        log.maintain()
+
+        # The trailing run and the unsealed tail stay local until they settle;
+        # everything that was published has already left staging.
+        through = log.published_through()
+        assert through > 0
+        assert all(
+            f.start > through
+            for f in log._table.data_files()  # noqa: SLF001
+        ), "a published file survived the pass that published it"
+        assert log.scan().read_all().num_rows == ROWS
+
+
+def test_a_failed_publish_raises_after_local_maintenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a machine cut off from its published table, local storage is still
+    reclaimed, and the failure is not swallowed.
+
+    Falsify by letting the publish's error escape at once: `expire` never
+    runs and the call log ends at `publish`.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        ran: list[str] = []
+        for name in ("evict", "expire", "sweep"):
+            real = getattr(log, name)
+
+            def record(*args: object, real=real, name=name) -> None:
+                ran.append(" ".join([name, *map(str, args)]))
+                real(*args)
+
+            monkeypatch.setattr(log, name, record)
+
+        def unreachable(**_: object) -> None:
+            ran.append("publish")
+            raise OSError("published table unreachable")
+
+        monkeypatch.setattr(log, "publish", unreachable)
+
+        with pytest.raises(OSError, match="unreachable"):
+            log.maintain()
+
+        assert ran == ["publish", "evict", "expire staging", "sweep staging"], (
+            "local steps run, the published ones do not"
+        )
+
+
+def test_expire_and_sweep_take_the_table_they_act_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One routine per operation, the table an argument: `"staging"`,
+    `"published"`, or None for both. A misspelt table is refused, not a call
+    that silently did nothing.
+
+    Falsify by treating an unknown table as None: the misspelling sweeps both.
+    """
+    with local_log(tmp_path) as log:
+        maintenance = log._maintenance  # noqa: SLF001
+        called: list[str] = []
+        for name in ("expire", "expire_published", "sweep_staging", "sweep_published"):
+            monkeypatch.setattr(
+                maintenance, name, lambda name=name: called.append(name)
+            )
+
+        log.expire("staging")
+        log.sweep("published")
+        assert called == ["expire", "sweep_published"]
+
+        called.clear()
+        log.expire()
+        log.sweep()
+        assert called == [
+            "expire",
+            "expire_published",
+            "sweep_staging",
+            "sweep_published",
+        ]
+
+        for routine in (log.expire, log.sweep):
+            with pytest.raises(ValueError, match="table must be"):
+                routine("stagin")  # ty: ignore[invalid-argument-type]

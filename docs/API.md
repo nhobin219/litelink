@@ -497,30 +497,49 @@ whole time, but never reaching Parquet.
 
 ```python
 log.maintain() -> None
-log.compact(heartbeat=None) -> None
-log.evict(heartbeat=None) -> None
-log.expire(heartbeat=None) -> None
+log.seal_due() -> int | None
+log.compact() -> None
+log.publish(*, push_unsettled=False) -> None
+log.reclaim_buffer(min_free_ratio=0.0) -> int
+log.evict() -> None
+log.expire(table=None) -> None        # "staging" | "published" | None for both
+log.sweep(table=None) -> None         # the same
 ```
 
-`maintain()` is the one call most deployments want: it takes the maintenance claim once, runs
-compaction, eviction and expiry in that order, then calls `seal_due()` at the end. Eviction
-drops only what the published table already holds (I4), so on every log — a local-only one included —
-`staging_retention` takes effect as `publish` publishes.
+`maintain()` is the one call most deployments want: the whole pipeline, in the order rows move
+from the buffer to the published table, each table swept after the last step that can change it.
 
-The three are exposed separately because their costs differ by an order of magnitude:
-**`compact` reads and rewrites whole files while `evict` and `expire` are metadata commits
-that finish in milliseconds**, so a deployment wanting them on different schedules can have
-that. `heartbeat` is a `Callable[[], bool]` the pass consults to decide whether to keep going,
-which is how a long compaction yields to something more important.
+1. `seal_due()`: buffer → staging.
+2. `compact()`: merges a run once it has `compact_min_files` files that fit the target.
+3. `publish()`: staging → published, only what compaction is finished with.
+4. `reclaim_buffer()`, when `vacuum_free_ratio` is set.
+5. `evict()`: staging drops what the published table now holds, in the same pass (I4).
+6. `expire("staging")`: staging snapshots past `staging_snapshot_retention`, then the
+   staging drain.
+7. `sweep("staging")`.
+8. `expire("published")`: published snapshots past `published_snapshot_retention`, then the
+   published drain.
+9. `sweep("published")`.
 
-Each is a no-op or a regression without the others: compaction alone increases storage,
-eviction alone frees no disk, and expiry is what actually deletes bytes.
+**It is meant for a script or a single process, and raises on a second owner.** If another
+owner holds the publish lease, or the publish fails for any other reason, steps 4–7 still run
+(local storage keeps being reclaimed on a machine cut off from a remote published table), then
+the published steps are skipped and the error is raised. Every log publishes (#98), to a local
+directory by default, so the pipeline needs the network only when the published table is
+remote.
 
-All of it is the **staging** table's, and none of it needs the network. Expiry keeps the
-staging table's snapshots for `staging_snapshot_retention`, and its first pass in a process
-(then every four hours) also sweeps `metadata/` for files a lost or crashed commit left behind
-(SPEC §6). The published table's expiry, draining and sweep are `publish()`'s, against
-`published_snapshot_retention`.
+**Each step is also a routine of its own**, for an orchestrator whose schedules differ because
+the costs do, or that wants the published side in another process or `sweep()` in a daemon
+thread. **`compact` reads and rewrites whole files, while `evict` and `expire` are metadata
+commits that finish in milliseconds, and `publish` is the only step that waits on the
+network.** Each takes only the exclusion it needs: a claim on the offsets it touches, or none
+(`expire`'s commit and `sweep`). A routine that works on both tables takes the table as an
+argument, `"staging"`, `"published"` or None for both, rather than one function per table; a
+misspelt table raises `ValueError`.
+
+The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
+and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
+takes no claim and never raises.
 
 ## Published table
 

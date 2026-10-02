@@ -38,9 +38,9 @@ has lost a race to do something that was done.
 **The library owns neither the thread nor the interval.** Each role here is a
 plain method on its own schedule. `seal_due` runs often because it is an
 indexed read of one row when there is nothing to do; the rest run rarely
-because they read table metadata. `maintain()` still exists and runs compact,
-evict and expire in one call — `--role all` is that, and is the right shape
-when the costs do not justify four processes.
+because they read table metadata. `maintain()` still exists and runs the whole
+pipeline, publish included, in one call — `--role all` is that, and is the
+right shape when the costs do not justify four processes.
 
 The claims are what make any of this safe. Each pass claims the offset RANGE it
 is about to work on, so passes on disjoint ranges run at once and only real
@@ -140,15 +140,14 @@ def publish_pass(log: WriteHandle) -> str | None:
 
 
 def all_passes(log: WriteHandle, root: Path) -> str | None:
-    """`maintain()` plus a push: every local pass, in the order
-    it encodes — eviction queues deletions that expiry then drains, so running
-    them the other way round only makes files wait a cycle."""
+    """`maintain()`: the whole pipeline, publish included, in the order rows
+    move — eviction queues deletions that expiry then drains, so running them
+    the other way round only makes files wait a cycle."""
     log.maintain()
     report = (
         f"local {log.staging_rows():,} rows in {log.staging_files()} files  "
         f"buffer {log.buffered_rows():,} rows  disk {_disk(root) / 1e6:.1f} MB"
     )
-    log.publish()
     report += f"  published through {log.published_through():,}"
 
     return report

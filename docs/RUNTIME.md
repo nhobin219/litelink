@@ -51,12 +51,10 @@ compaction ever delays sealing enough to matter. It costs latency, not file size
 cut was recorded when the rows arrived.
 
 **Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue;
-`maintain()` compacts, evicts and expires — and calls `seal_due()` itself at the end, so a
-caller running only `maintain()` in a loop is still correct. At the end rather than the
-start because the pass ahead of it works on files that are already sealed: a group cut
-during this call becomes a compaction candidate on the next one, which costs a cycle of
-latency and nothing else. They are two methods rather than one only because their costs differ by an order
-of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
+`maintain()` runs the whole pipeline, starting with `seal_due()`, so a caller running only
+`maintain()` in a loop is still correct, and what a pass seals is compacted and published in
+the same pass. They are two methods rather than one only because their costs differ by an
+order of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
 often, while `maintain()` reads table metadata and wants to be run rarely.
 
 The library owns no thread and no interval. It used to: `extend()` quietly started a
@@ -576,8 +574,8 @@ and the metadata this library depends on is deleted through its own expiry queue
 **The passes are callable one at a time**, and worth doing when their costs diverge.
 Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
 finish in milliseconds; `publish` is the only one that can block on a network. `maintain()`
-runs the three local ones and is what most deployments want; `compact()`, `evict()` and
-`expire()` exist for the schedules it cannot express.
+runs all of them, publish included, and is what most deployments want; the routines exist for
+the schedules it cannot express.
 
 None of those four takes a claim of its own. Each PASS claims the range it is about to work
 on — a merge claims its run, eviction the prefix it removes — so running them separately is

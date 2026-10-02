@@ -12,8 +12,9 @@ pyiceberg's is metadata-only. Draining is what actually unlinks, and it waits
 `staging_snapshot_retention` so a running scan does not lose files underneath it
 (I6).
 
-The published table's expiry, drain and sweep live here too, but `publish` runs
-them (`tidy_published`): `maintain` never needs the network.
+The published table has the same routines — `expire_published`,
+`drain_published`, `sweep_published` — each callable on its own, so an
+orchestrator can run them on their own schedule or process (#118).
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
-from litelink._claim import EVERYTHING, Claim, new_owner
+from litelink._claim import EVERYTHING, new_owner
 from litelink._fs import write_parquet
 from litelink._published import Published
 from litelink._statistics import rollup
@@ -78,7 +79,7 @@ if TYPE_CHECKING:
     from litelink._table import DataFile, LogTable
 
 
-def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
+def checkpoint(renew: Callable[[], bool] | None) -> None:
     """Renew the caller's claim, or refuse to carry on without it.
 
     Losing the range mid-pass is not something to push through: another owner
@@ -87,7 +88,7 @@ def checkpoint(heartbeat: Callable[[], bool] | None) -> None:
     expiring — an uncontested holder renews fine — so a failed renew means
     somebody else owns these offsets now.
     """
-    if heartbeat is not None and not heartbeat():
+    if renew is not None and not renew():
         msg = "lost the claim on this range mid-pass"
         raise RuntimeError(msg)
 
@@ -207,16 +208,17 @@ def stable_prefix(
 def _both(
     ours: Callable[[], bool], theirs: Callable[[], bool] | None
 ) -> Callable[[], bool]:
-    """Renew our own claim AND report the caller's heartbeat.
+    """Renew our own claim AND the caller's.
 
-    `heartbeat or claim.renew` read naturally and was wrong: any caller passing
-    a heartbeat — which is what the role-lease era asked for, so it is a habit
-    people carry forward — silently stopped the run claim from being renewed at
-    all, and the pre-commit check then consulted a stranger's callback instead
-    of the claim. A merge over the TTL would lose its exclusion with no stall
-    required, and commit rows eviction had removed in the meantime.
+    For a rewrite run under an outer claim — `rewrite_published` and
+    `rewrite_sorted` hold the whole-log lease and pass its `renew` down — so
+    both stay live while a merge runs. `renew or claim.renew` read naturally
+    and was wrong: a caller passing one silently stopped the run claim from
+    being renewed at all, and the pre-commit check then consulted the outer
+    claim instead of the run's. A merge over the TTL would lose its exclusion
+    with no stall required, and commit rows eviction had removed meanwhile.
 
-    Ours is renewed first and unconditionally, so a falsy caller heartbeat
+    Ours is renewed first and unconditionally, so a failed outer renewal
     cannot short-circuit it.
     """
 
@@ -334,29 +336,6 @@ class Maintenance:
         """
         return self._buffer.sort_by()
 
-    def run(self, heartbeat: Callable[[], bool] | None = None) -> None:
-        """The local passes, with a checkpoint between them.
-
-        `heartbeat` renews the caller's claim and reports whether it still
-        holds it. A pass is long — a compaction of 540 files measured 20 s
-        against a 30 s lease — so without one, a second maintainer can take the
-        role mid-pass and start compacting the same runs. Both would write the
-        same deterministic output path, which is a torn file rather than a
-        conflict Iceberg could resolve.
-
-        Between phases rather than inside them: it bounds the exposure to a
-        single phase without threading a callback through every loop, and a
-        phase that runs long enough to matter is a reason to raise the TTL, not
-        to check more often.
-        """
-        self.compact(heartbeat)
-        checkpoint(heartbeat)
-        self.evict()
-        checkpoint(heartbeat)
-        self.expire()
-        checkpoint(heartbeat)
-        self.sweep_staging()
-
     # -- compaction ---------------------------------------------------------
 
     PUBLISHED_THROUGH_KEY = "published_through"
@@ -421,7 +400,7 @@ class Maintenance:
 
         return reached
 
-    def compact(self, heartbeat: Callable[[], bool] | None = None) -> None:
+    def compact(self) -> None:
         """Merge runs of undersized adjacent files (§6).
 
         Real work on the happy path. Not repair — the cut is exact and there is
@@ -484,7 +463,7 @@ class Maintenance:
             self.memory(),
             config.compact_rows,
         ):
-            self._merge(run, heartbeat)
+            self._merge(run, None)
 
     def memory(self) -> dict[str, int]:
         """What each data file holds uncompressed, keyed by the path a
@@ -500,16 +479,16 @@ class Maintenance:
             for key, size in self._buffer.file_bytes().items()
         }
 
-    def _merge(self, run: list[DataFile], heartbeat: Callable[[], bool] | None) -> None:
+    def _merge(self, run: list[DataFile], renew: Callable[[], bool] | None) -> None:
         """Compact a run, if there is enough of it to be worth a rewrite."""
         if len(run) >= self.config.compact_min_files:
-            self._rewrite_run(self._table, run, heartbeat)
+            self._rewrite_run(self._table, run, renew)
 
     def _rewrite_run(
         self,
         table: LogTable,
         run: list[DataFile],
-        heartbeat: Callable[[], bool] | None = None,
+        renew: Callable[[], bool] | None = None,
         *,
         upload: bool = False,
         owner: str | None = None,
@@ -600,7 +579,7 @@ class Maintenance:
                 run,
                 rel_path,
                 target,
-                _both(claim.renew, heartbeat),
+                _both(claim.renew, renew),
                 upload=upload,
             )
         finally:
@@ -616,7 +595,7 @@ class Maintenance:
         run: list[DataFile],
         rel_path: str,
         target: str,
-        heartbeat: Callable[[], bool] | None = None,
+        renew: Callable[[], bool] | None = None,
         *,
         upload: bool = False,
     ) -> None:
@@ -647,7 +626,7 @@ class Maintenance:
         # another owner recover — removing the output this claimed — and the
         # commit would then land anyway, leaving the table pointing at a file
         # that no longer exists while the sources it superseded drain away.
-        checkpoint(heartbeat)
+        checkpoint(renew)
 
         # Queued BEFORE the commit that supersedes them, not after. A crash in
         # between used to lose the only record of these paths — recovery clears
@@ -674,7 +653,7 @@ class Maintenance:
 
     def rewrite_sorted(
         self,
-        heartbeat: Callable[[], bool] | None = None,
+        renew: Callable[[], bool] | None = None,
         owner: str | None = None,
     ) -> None:
         """Re-cluster every data file under the current sort order (§7).
@@ -694,7 +673,7 @@ class Maintenance:
         # because a pass here has no phases to sit between.
         for data_file in self._table.data_files():
             self._rewrite_run(self._table, [data_file], owner=owner)
-            checkpoint(heartbeat)
+            checkpoint(renew)
 
     # -- eviction -----------------------------------------------------------
 
@@ -932,7 +911,7 @@ class Maintenance:
 
     def rewrite_published(
         self,
-        heartbeat: Callable[[], bool] | None = None,
+        renew: Callable[[], bool] | None = None,
         owner: str | None = None,
     ) -> None:
         """Re-cut undersized published files to `target_compact_size` (§6,
@@ -995,7 +974,7 @@ class Maintenance:
         # refuses to delete anything the table still references, so an entry
         # made for a commit that never lands simply never comes due.
         self._enqueue(data_file.path for data_file in stale)
-        self._recut(published, stale, heartbeat, owner)
+        self._recut(published, stale, renew, owner)
 
     def _badly_sized(self, published: LogTable) -> list[DataFile]:
         """The published files from the first one under `target_compact_size` on.
@@ -1065,7 +1044,7 @@ class Maintenance:
         self,
         published: LogTable,
         stale: list[DataFile],
-        heartbeat: Callable[[], bool] | None = None,
+        renew: Callable[[], bool] | None = None,
         owner: str | None = None,
     ) -> None:
         """Append `stale` back through a buffer and seal it out again."""
@@ -1125,7 +1104,7 @@ class Maintenance:
             scratch.seed_offsets(start)
             expected = 0
             for data_file in stale:
-                checkpoint(heartbeat)
+                checkpoint(renew)
                 rows = published.scan_range(data_file.start, data_file.end)
                 # Sorted by offset and then stripped of it. The counter is what
                 # reassigns them, so the rows have to arrive in the order their
@@ -1136,13 +1115,13 @@ class Maintenance:
                 rows = rows.sort_by([(OFFSET, "ascending")])
                 expected += rows.num_rows
                 scratch.append(rows.drop_columns([OFFSET]).to_pylist())
-                written += self._seal_scratch(scratch, published, heartbeat)
+                written += self._seal_scratch(scratch, published, renew)
 
             # The tail, which by definition did not reach the target. Cutting
             # it short is what `seal()` does, and one undersized file at the
             # end is where one is allowed to be.
             scratch.close_open_group()
-            written += self._seal_scratch(scratch, published, heartbeat)
+            written += self._seal_scratch(scratch, published, renew)
         finally:
             scratch.close()
             self._discard_scratch()
@@ -1184,7 +1163,7 @@ class Maintenance:
         # Renewing here makes that unreachable rather than unlikely: recovery's
         # acquire deleted this claim's row, so the renew finds nothing and the
         # rewrite aborts while the originals are still live.
-        checkpoint(heartbeat)
+        checkpoint(renew)
         published.replace_range(
             start, end, [published.uri(p) for p, _, _, _ in written]
         )
@@ -1217,7 +1196,7 @@ class Maintenance:
         self,
         scratch: Buffer,
         published: LogTable,
-        heartbeat: Callable[[], bool] | None = None,
+        renew: Callable[[], bool] | None = None,
     ) -> list[tuple[str, int, int, int]]:
         """Write out every extent the scratch buffer has cut, and return their
         names. The seal's own loop: take the queued range, claim the path
@@ -1263,7 +1242,7 @@ class Maintenance:
             self._buffer.intend_file(published.uri(rel_path), start, end, held)
             published.put(dest, rel_path)
             dest.unlink(missing_ok=True)
-            checkpoint(heartbeat)
+            checkpoint(renew)
 
             scratch.finish_seal(end, rel_path)
             # Carried in memory, not read back from the intent: a rival publish
@@ -1348,40 +1327,33 @@ class Maintenance:
         )
         self.drain()
 
-    def tidy_published(self, claim: Claim) -> None:
-        """The published table's half of expiry, drain and sweep (§5, #113).
+    def expire_published(self) -> None:
+        """Expire the published table's snapshots past
+        `published_snapshot_retention`, then delete what has come due (§6, #113).
 
-        Called by `publish` at the end of a pass, under the lease it already
-        holds, rather than by `maintain`. The sweep is not part of it: `publish`
-        runs `sweep_published` after releasing the lease. Two reasons, both about what
-        `maintain` must not do:
+        The published half of `expire`, and a routine of its own rather than a
+        step inside `publish`, so an orchestrator can run it on its own
+        schedule or in its own process (#118). `maintain` runs it after
+        `publish`.
 
-        - **No network.** `maintain` keeps a partitioned machine's local
-          storage in order (§11). Expiring an S3 published table every pass
-          would make each one fail where the network is down, and `publish`
-          already needs the network.
-        - **No published table conjured.** Opening it with `repair` creates
-          one where none exists. `publish` creates it anyway; `maintain`
-          has no business to.
+        **No claim for the expiry.** It is a metadata commit the catalog's
+        compare-and-swap orders, like staging's. What used to need one was
+        opening the published table with `repair`, which can drop a catalog
+        entry and create a table in its place; this opens without it, so a
+        table not created yet — or not where the log now points — is skipped,
+        and `publish` is what creates and repairs it. The drain that follows
+        takes its own claim, as `drain` does.
 
-        Every publish leaves a snapshot behind, so this is also exactly when
-        there is something to expire. It used to run only once
-        `rewrite_published` had queued a remote deletion, on the reasoning
-        that `publish` never supersedes a file. True of data files and not of
-        Iceberg's own: a table that was only ever published kept every
-        snapshot, manifest list and manifest it had ever had (#113). A pass
-        with nothing old enough commits nothing.
-
-        The claim is what entitles the repairing open. Expiry alone could go
-        claimless, as a metadata commit CAS orders; a repairing open DROPS a
-        catalog entry naming another prefix and creates a table in its place,
-        and two at once collide.
+        It used to run only once `rewrite_published` had queued a remote
+        deletion, on the reasoning that `publish` never supersedes a file. True
+        of data files and not of Iceberg's own: a table that was only ever
+        published kept every snapshot, manifest list and manifest (#113). A
+        pass with nothing old enough commits nothing.
         """
-        published = self._published.table(repair=True)
+        published = self._published.table()
         if published is None:
             return
 
-        checkpoint(claim.renew)
         cutoff = datetime.now(UTC) - self.config.published_snapshot_retention
         retiring = list(
             published.expiring_paths(published.snapshots_older_than(cutoff))
@@ -1389,26 +1361,36 @@ class Maintenance:
         self._enqueue(retiring)
         published.expire_snapshots_older_than(cutoff)
         self._buffer.restamp_deletions(retiring, int(datetime.now(UTC).timestamp()))
+        self.drain_published()
 
-        checkpoint(claim.renew)
-        self._drain_published(published, claim.renew)
+    def drain_published(self) -> None:
+        """Delete the published table's queued objects whose grace has passed,
+        under the same whole-log claim `drain` takes, for the same reason."""
+        published = self._published.table()
+        if published is None:
+            return
+
+        claim = self._buffer.claim("drain", 0, EVERYTHING, new_owner())
+        if not claim.acquire():
+            return
+
+        try:
+            self._drain_published(published, claim.renew)
+        finally:
+            claim.release()
 
     def sweep_staging(self) -> None:
         """One pass of the staging table's stranded-metadata sweep (`_sweep`).
 
         Called with no claim held, by design: it needs none, and a backlog
-        pass is slow on the published side's object storage. Holding a lease
+        pass on object storage is tens of seconds of deletes. Holding a lease
         through it would refuse every other process's maintenance meanwhile.
         """
         self._sweep("staging", self._table, self.config.staging_snapshot_retention)
 
     def sweep_published(self) -> None:
-        """One pass of the published table's sweep, after `publish` has
-        released its lease (`sweep_staging` says why).
-
-        Opens without `repair`: only a claim holder may repair, and `publish`
-        has just opened and repaired it under one, so this finds it cached.
-        """
+        """One pass of the published table's sweep (`sweep_staging` says why
+        it holds nothing). Opens without `repair`, which is `publish`'s."""
         published = self._published.table()
         if published is not None:
             self._sweep(
@@ -1423,8 +1405,8 @@ class Maintenance:
         disk — seals through `sealing`, compactions through `compacting` — so
         there is no category of file that could only be found by looking.
 
-        Staging entries only. The published table's are drained by `publish`,
-        through `tidy_published`, against its own retention.
+        Staging entries only. The published table's are `drain_published`'s,
+        against its own retention.
         """
         # Read against the CURRENT retention, so lowering it takes effect on
         # files already queued.
@@ -1498,8 +1480,8 @@ class Maintenance:
     ) -> None:
         """Delete the published table's queued objects whose grace has passed.
 
-        Under `publish`'s lease, which is the claim this needs: nothing else
-        can register into the published table while it is held.
+        Under the whole-log claim `drain_published` takes, which is what keeps
+        a registration from landing between the veto and the delete.
         """
         cutoff = datetime.now(UTC) - self.config.published_snapshot_retention
         due = [

@@ -166,12 +166,15 @@ def test_recovery_leaves_another_owners_seal_alone(tmp_path: Path) -> None:
 def test_maintain_does_nothing_while_another_owner_holds_the_range(
     tmp_path: Path,
 ) -> None:
-    """It skips rather than raising, which is the §4a change.
+    """The local routines skip a range another owner holds, and `publish` —
+    which claims the whole log — raises, after them.
 
-    Under one lease per role, a second maintainer was refused outright. Now the
-    passes claim the ranges they work on, so another owner working somewhere is
-    ordinary: this one does what it can and leaves the rest, which is still
-    there next pass.
+    The passes claim the ranges they work on (§4a), so compaction leaves
+    claimed work for the next pass. A refused publish is not that: maintenance
+    is meant to run in one process, so a second owner is a deployment error,
+    and `maintain` says so rather than quietly publishing nothing.
+
+    Falsify by swallowing the refused publish in `maintain`: no raise.
     """
     with open_log(
         tmp_path, LogConfig(target_seal_size=4096, compact_min_files=2)
@@ -190,7 +193,8 @@ def test_maintain_does_nothing_while_another_owner_holds_the_range(
 
         assert other.acquire()
 
-        log.maintain()
+        with pytest.raises(RuntimeError, match="another owner"):
+            log.maintain()
 
         assert len(log._table.data_files()) == before, (
             "worked on a range another owner had claimed"
