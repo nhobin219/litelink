@@ -312,7 +312,7 @@ def test_a_local_connection_caches_in_memory_and_honours_the_flag() -> None:
     assert settings(off)["enable_external_file_cache"] == "false"
 
 
-def test_a_disk_cache_without_remote_is_refused() -> None:
+def test_a_disk_cache_without_s3_options_is_refused() -> None:
     """The disk cache wraps httpfs, which a local connection never loads, so
     asking for one there is refused rather than silently ignored.
 
