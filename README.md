@@ -287,24 +287,15 @@ end_offset=…)`) can skip it.
 `column_statistics(tier=…)` gives every column's bounds and counts without opening a data
 file, per tier (`"staging"`, `"published"` below it, `"buffer"`) or for the whole log.
 
-**Reads from an S3 published table are cached**, in memory for the connection and on disk
-across restarts, by default. Each log's disk cache lives under `~/.cache/litelink/` (or
-`$XDG_CACHE_HOME`) at the log's own path, so `/data/trades` caches in
-`~/.cache/litelink/data/trades`. It is shared by every process reading that log, and evicts once
-its disk is 80% full, counting everything on that disk. Iceberg never reuses a file name, so a
-cached block is never stale. Tune it per handle or connection:
+**Reading from another machine can cache what it reads.** `duckdb_connection(remote=True)`
+keeps DuckDB's memory cache on, and with `disk_cache=True` also caches on disk across restarts,
+under `~/.cache/litelink/<cache_key>` (or `$XDG_CACHE_HOME`), shared by every process using the
+key. It is off by default and never used by a log's own handles: on the host that writes a log,
+a disk cache would put back on disk exactly what eviction removed.
 
 ```python
-litelink.open("data", "trades", read_only=True,
-              memory_cache=True, disk_cache=True,
-              disk_cache_path="/var/cache/trades", disk_cache_volume_limit=0.8)
+con = litelink.duckdb_connection(remote=True, disk_cache=True, cache_key="trades-reader")
 ```
-
-**`retire()` ends a log for good.** It pushes every row to the published table, empties the
-staging table and the buffer, and records the retirement by giving the buffer an end and
-marking the published table. After that the log opens for reading only, and `append`,
-`ingest`, a writer `open` and `restore` all refuse, naming the offset the next log should
-start at.
 
 ## Reading from another machine
 

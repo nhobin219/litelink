@@ -4114,68 +4114,16 @@ def test_the_sweep_deletes_stranded_metadata_from_object_storage(
         assert log.scan().read_all().num_rows == ROWS
 
 
-def test_a_reader_caches_published_reads_on_disk_and_shares_them(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """What replaced `hydrate` (#118): a read of the S3 published table caches
-    its blocks on disk, and another handle pointed at the same directory —
-    another process, in production — serves them from there rather than S3.
-
-    Falsify by not calling `install_read_cache` from the reader: the cache
-    directory stays empty.
-    """
-    cache = tmp_path / "cache"
-    root = tmp_path / "log"
-    with published_log(
-        root,
-        bucket,
-        s3,
-        staging_retention=timedelta(0),
-        staging_rows=0,
-    ) as log:
-        log.extend(rows(ROWS))
-        log.advance(flush=True)
-        assert log.staging_files() == 0, "every read must come from published"
-
-    def cached(directory: Path) -> int:
-        return sum(len(files) for _, _, files in os.walk(directory))
-
-    def read(directory: Path) -> None:
-        with litelink.open(
-            root,
-            "s",
-            read_only=True,
-            s3=s3,
-            disk_cache_path=directory,
-            memory_cache=False,
-        ) as reader:
-            assert reader.scan().read_all().num_rows == ROWS
-
-    # A reader with an empty directory fills it: reads go through the cache.
-    read(cache)
-    filled = cached(cache)
-    assert filled > 0, "a published read cached nothing"
-
-    # Another reader on the SAME directory adds nothing: every block it needed
-    # was already there, so none was fetched from S3 again.
-    read(cache)
-    assert cached(cache) == filled, "the second reader fetched blocks again"
-
-    # The control: on its own directory, the same read does fill one.
-    elsewhere = tmp_path / "elsewhere"
-    read(elsewhere)
-    assert cached(elsewhere) == filled
-
-
-def test_a_logs_default_disk_cache_is_named_after_it(
+def test_a_disk_cached_connection_shares_published_reads_by_key(
     tmp_path: Path, bucket: str, s3: S3Options, isolated_read_cache: Path
 ) -> None:
-    """With no `disk_cache_path`, a log's reader caches under
-    `$XDG_CACHE_HOME/litelink/<log path>`: one directory per log, findable and
-    clearable on its own, and shared by every process reading it (#118).
+    """What replaced `hydrate` (#118), as a reader on another machine uses it:
+    a `duckdb_connection(disk_cache=True, cache_key=…)` caches the published
+    table's blocks on disk, and a later connection with the same key — another
+    process, in production — reuses them rather than fetching from S3.
 
-    Falsify by dropping `cache_key` from the reader's `ReadCache`: the blocks land
-    in the connection default, `.../litelink/duckdb`.
+    Falsify by not calling `install_read_cache` from `duckdb_connection`: no
+    directory is filled.
     """
     root = tmp_path / "log"
     with published_log(
@@ -4183,13 +4131,35 @@ def test_a_logs_default_disk_cache_is_named_after_it(
     ) as log:
         log.extend(rows(ROWS))
         log.advance(flush=True)
+        metadata = log._published.require().metadata_location  # noqa: SLF001
 
-    with litelink.open(root, "s", read_only=True, s3=s3) as reader:
-        assert reader.scan().read_all().num_rows == ROWS
+    def cached(key: str) -> int:
+        return sum(
+            len(files)
+            for _, _, files in os.walk(isolated_read_cache / "litelink" / key)
+        )
 
-    directory = (root / "s").resolve()
-    mine = isolated_read_cache / "litelink" / directory.relative_to(directory.anchor)
-    assert any(files for _, _, files in os.walk(mine)), (
-        "nothing cached under the log's name"
-    )
-    assert not (isolated_read_cache / "litelink" / "duckdb").exists()
+    def read(key: str) -> None:
+        connection = litelink.duckdb_connection(
+            s3, remote=True, disk_cache=True, memory_cache=False, cache_key=key
+        )
+        try:
+            (count,) = connection.execute(
+                f"SELECT count(*) FROM iceberg_scan('{metadata}')"
+            ).fetchone() or (0,)
+            assert count == ROWS
+        finally:
+            connection.close()
+
+    # An empty key's directory fills: the reads went through the cache.
+    read("stream-1")
+    filled = cached("stream-1")
+    assert filled > 0, "a published read cached nothing"
+
+    # The same key again adds nothing: every block was already there.
+    read("stream-1")
+    assert cached("stream-1") == filled, "the second reader fetched blocks again"
+
+    # The control: another key fills its own.
+    read("stream-2")
+    assert cached("stream-2") == filled

@@ -423,14 +423,10 @@ litelink.duckdb_connection(
     *,
     remote: bool = False,
     memory_cache: bool = True,
-    disk_cache: bool = True,
-    disk_cache_path: str | PathLike | None = None,   # $XDG_CACHE_HOME/litelink/duckdb
+    disk_cache: bool = False,
+    cache_key: str | PathLike | None = None,   # under ~/.cache/litelink; None: "default"
     disk_cache_volume_limit: float = 0.8,
 ) -> duckdb.DuckDBPyConnection
-
-con = litelink.duckdb_connection(remote=True)     # credentials from the environment
-con.sql("SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/trades',"
-        " version_name_format = '%s%s.metadata.json')")
 ```
 
 It loads `avro` and `iceberg`; `remote=True` also loads `httpfs` and creates the S3 secret,
@@ -440,32 +436,33 @@ missing extension raises `ExtensionMissing`, naming how to provision it rather t
 three ways to supply them. Each call builds a new connection, about half a second of
 `LOAD iceberg`, so hold on to one.
 
-**Reads from S3 are cached, in memory and on disk, by default** (#118). This is what replaced
+**A reader on another machine can cache what it reads from S3** (#118). This is what replaced
 `hydrate`: a cache holds what is actually read, needs no write to either table, and survives
 restarts.
 
-| Parameter | Layer | Lifetime |
-| --- | --- | --- |
-| `memory_cache` | DuckDB's external file cache | the connection's |
-| `disk_cache` | the `cache_httpfs` extension, on disk, in `disk_cache_path` | across restarts and processes |
+| Parameter | Default | Layer | Lifetime |
+| --- | --- | --- | --- |
+| `memory_cache` | on | DuckDB's external file cache | the connection's |
+| `disk_cache` | **off** | the `cache_httpfs` extension, on disk | across restarts and processes |
 
-- **One disk cache per log, shared by every process reading it.** A log's reader defaults to
-  `$XDG_CACHE_HOME/litelink/<log path>` (or `~/.cache/litelink/<log path>`): the log's absolute
-  directory mirrored underneath, so `/home/me/data/trades` caches in
-  `~/.cache/litelink/home/me/data/trades`. Keyed by path because a name is unique only within its
-  root. Moving a log starts a cold cache. A bare `duckdb_connection` uses `duckdb` in place of
-  the path. Sharing is safe because Iceberg never reuses a file name: a cached block is never stale.
+- **Off by default, and never used by a log's own handles.** On the host that writes a log, a
+  disk cache of its published table would put back on local disk exactly what eviction
+  removed. It is for a reader elsewhere: streamcast's `Stream.snapshot`, say, which spans
+  several logs and caches by stream.
+- **`cache_key` names the directory**, under `$XDG_CACHE_HOME/litelink` (or
+  `~/.cache/litelink`): `cache_key="stream-uuid"` is `~/.cache/litelink/stream-uuid`. An
+  absolute path is used as given; None is `~/.cache/litelink/default`. The key is the caller's,
+  because only the caller knows what deserves its own cache. Every process using the same key
+  shares it, which is safe because Iceberg never reuses a file name.
+- **The cache belongs to the database the call builds**, shared by its cursors. A caller pooling
+  connections pools per key.
 - **`disk_cache_volume_limit` bounds it by how full its VOLUME may get**, not by its own size:
-  the cache evicts once the volume is 80% full, counting everything on that volume. If other
-  data fills the disk, the cache shrinks, possibly to nothing, so the log's own writes come
-  first. `cache_httpfs` has no byte cap of its own, and left alone keeps only 5% free.
+  it evicts once the volume is 80% full, counting everything on it. `cache_httpfs` has no byte
+  cap of its own, and left alone keeps only 5% free.
 - **`memory_cache=False` turns off every RAM layer**, `cache_httpfs`'s own read-through cache
   included.
-- **Only an S3 published table is cached.** A local one is already on disk.
 - **`cache_httpfs` is bundled in the platform wheels.** Elsewhere, `just duckdb-extensions
-  --remote` installs it, and without it a disk-cached connection raises `ExtensionMissing`.
-
-`litelink.new`, `open` and `restore` take the same four parameters, for the log's own reader.
+  --remote` installs it, and without it `disk_cache=True` raises `ExtensionMissing`.
 
 ```python
 litelink.install_s3_secret(connection, s3: S3Options | None = None) -> None
@@ -617,10 +614,9 @@ lands (a follow-up). `wal_replication`, `replication_config()` and `restore` nee
 one: the WAL replica exists to get rows off the machine, and a local published table is on
 this disk already.
 
-**Reading history often is the reader's cache's job, not staging's.** `hydrate`, which copied
-published files back into the staging table, is gone (#118). A reader caches what it reads from
-the published table, on disk by default; see `duckdb_connection`. Raising `staging_retention`
-applies to data captured afterwards.
+**`hydrate`, which copied published files back into the staging table, is gone** (#118). A
+reader on another machine caches what it reads instead; see `duckdb_connection`. Raising
+`staging_retention` applies to data captured afterwards.
 
 `rewrite_published` merges undersized files already in the published table. An operation, not a policy —
 nothing calls it on a schedule, and normal operation does not need it, because publish pushes

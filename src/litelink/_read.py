@@ -284,52 +284,49 @@ def install_s3_secret(
 _COMMUNITY = frozenset({"cache_httpfs"})
 
 
-def default_cache_path(cache_key: Path | None = None) -> Path:
-    """Where the reader's disk cache lives unless told otherwise (#118):
-    `$XDG_CACHE_HOME/litelink/<log path>`, or `~/.cache/litelink/<log path>`
-    — the log's absolute directory mirrored underneath, so
-    `/home/me/data/trades` caches in `~/.cache/litelink/home/me/data/trades`.
+def cache_directory(cache_key: str | PathLike[str] | None = None) -> Path:
+    """Where a connection's disk cache lives (#118).
 
-    **One directory per log**, shared by every process reading it — which is
-    the only sharing that ever paid, since different logs never read the same
-    files. Keyed by PATH, not name, because a name is unique only within its
-    root: two `trades` logs in different roots get two caches. Resolved, so a
-    relative root and a symlink reach the same one. Moving a log starts it a
-    cold cache and leaves the old directory behind — never a stale one,
-    since Iceberg never reuses a file name.
+    Under `$XDG_CACHE_HOME/litelink`, or `~/.cache/litelink`:
 
-    `cache_key` is the log's directory; a connection not tied to a log
-    (`duckdb_connection`) passes None and uses `duckdb` in place of the path. Per user, not inside the log, and never
-    `cache_httpfs`'s own default under `/tmp`, which many systems clear at
-    boot.
+    - **a relative `cache_key`** names a directory there —
+      `cache_key="stream-uuid"` is `~/.cache/litelink/stream-uuid`. The key is
+      the caller's, because what deserves its own cache is something only the
+      caller knows: a streamcast stream is a composition of logs, and is
+      cached by its id.
+    - **an absolute one** is used as given, for a cache on its own volume.
+    - **None** is `~/.cache/litelink/default` — a SIBLING of the keyed
+      directories, never their parent, so no cache's eviction can reach into
+      another's.
+
+    Sharing a directory between processes is safe: Iceberg never reuses a
+    file name, so a cached block is never stale. Never `cache_httpfs`'s own
+    default under `/tmp`, which many systems clear at boot.
     """
-    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "litelink"
     if cache_key is None:
-        return base / "litelink" / "duckdb"
+        return root / "default"
 
-    resolved = Path(cache_key).resolve()
+    key = Path(cache_key)
+    if key.is_absolute():
+        return key
 
-    return base / "litelink" / resolved.relative_to(resolved.anchor)
+    if ".." in key.parts:
+        msg = f"cache_key {str(cache_key)!r} would reach outside {root}"
+        raise ValueError(msg)
+
+    return root / key
 
 
 @dataclass(frozen=True, slots=True)
 class ReadCache:
-    """How a reader caches what it reads from an S3 published table (#118).
-
-    Replaces `hydrate`, which copied a time window of published files into
-    staging whether anyone read them or not. A cache holds what is actually
-    read, needs no write to either table, and persists across restarts.
-    """
+    """How a connection caches what it reads from S3 (#118). See
+    `duckdb_connection`."""
 
     memory_cache: bool = True
-    disk_cache: bool = True
-    disk_cache_path: str | PathLike[str] | None = None
+    disk_cache: bool = False
+    cache_key: str | PathLike[str] | None = None
     disk_cache_volume_limit: float = 0.8
-    # What the default cache directory is derived from: the directory of the
-    # log this reader serves, or None for a connection not tied to one.
-    # Resolved when the cache is installed, so the environment is read at the
-    # point of use.
-    cache_key: Path | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.disk_cache_volume_limit <= 1:
@@ -375,7 +372,7 @@ def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) 
     """
     if cache.disk_cache:
         load_extension(connection, "cache_httpfs", remote=True)
-        directory = Path(cache.disk_cache_path or default_cache_path(cache.cache_key))
+        directory = cache_directory(cache.cache_key)
         directory.mkdir(parents=True, exist_ok=True)
         floor = int(
             shutil.disk_usage(directory).total * (1 - cache.disk_cache_volume_limit)
@@ -402,8 +399,8 @@ def duckdb_connection(
     *,
     remote: bool = False,
     memory_cache: bool = True,
-    disk_cache: bool = True,
-    disk_cache_path: str | PathLike[str] | None = None,
+    disk_cache: bool = False,
+    cache_key: str | PathLike[str] | None = None,
     disk_cache_volume_limit: float = 0.8,
 ) -> duckdb.DuckDBPyConnection:
     """A DuckDB connection provisioned to read a published table (#108).
@@ -428,15 +425,24 @@ def duckdb_connection(
     nobody installs are a connection with no secret, which reads S3 as
     anonymous and fails as a 403 at the first query rather than here.
 
-    **Reads from S3 are cached** (#118), with `remote=True`, in two layers:
-    `memory_cache` for this connection's lifetime, and `disk_cache` in
-    `disk_cache_path` (default `$XDG_CACHE_HOME/litelink/duckdb`, else
-    `~/.cache/litelink/duckdb`; a log's own reader uses the log's path in
-    place of `duckdb`), shared by every process and surviving restarts. The disk cache evicts once its VOLUME is
-    `disk_cache_volume_limit` full — counting everything on that volume, not
-    just the cache. See `install_read_cache`. `disk_cache` needs the
-    `cache_httpfs` extension, bundled in the platform wheels; without it this
-    raises `ExtensionMissing`.
+    **Reads from S3 can be cached** (#118), with `remote=True`, in two layers:
+
+    - `memory_cache` (on): DuckDB's external file cache, for this
+      connection's lifetime.
+    - `disk_cache` (OFF): the bundled `cache_httpfs` extension on disk, in
+      `cache_directory(cache_key)`, surviving restarts and shared by every
+      process using the same key. It evicts once its VOLUME is
+      `disk_cache_volume_limit` full — counting everything on that volume,
+      not just the cache.
+
+    **For a reader on another machine**, which is what it is for: a log's own
+    host reads its published table rarely, and a disk cache there would put
+    back on local disk exactly what eviction removed. So litelink's own
+    handles never cache to disk; a caller reading published tables from
+    elsewhere — streamcast's `Stream.snapshot`, which spans several logs and
+    caches by stream — asks for it here, with a key it chooses. The cache
+    belongs to the DATABASE this builds, shared by all its cursors, so a
+    caller pooling connections pools per key. See `install_read_cache`.
 
     A new connection per call, which the caller owns. Building one costs about
     half a second, nearly all of it `LOAD iceberg` (#102), so hold on to it.
@@ -449,7 +455,7 @@ def duckdb_connection(
     cache = ReadCache(
         memory_cache=memory_cache,
         disk_cache=disk_cache,
-        disk_cache_path=disk_cache_path,
+        cache_key=cache_key,
         disk_cache_volume_limit=disk_cache_volume_limit,
     )
 
@@ -483,12 +489,8 @@ class Reader:
         buffer: Buffer,
         connect: Callable[[], duckdb.DuckDBPyConnection],
         published: Published,
-        cache: ReadCache | None = None,
     ) -> None:
         self._layout = layout
-        # Applied with httpfs, on the first query that reads an S3 published
-        # table — never for a local one, which has nothing to cache (#118).
-        self._cache = cache or ReadCache()
         self._table = table
         self._buffer = buffer
         self._connect_to = connect
@@ -559,7 +561,6 @@ class Reader:
             # log whose queries never need the remote published table never
             # pays for it — §7's rule that a hot read is offline.
             load_extension(self._connect(), "httpfs", remote=True)
-            install_read_cache(self._connect(), self._cache)
             self._remote_ready = True
 
         create_secret(cursor, self._published.s3.resolved())

@@ -23,10 +23,9 @@ minor version carries breaking changes.
 ### Changed
 
 - **Breaking: `hydrate()` is removed** (#118). It copied a time window of
-  published files back into staging whether anyone read them or not; the
-  reader's disk cache (above) keeps what is actually read, across restarts,
-  without writing to either table. A replayed retired log reads through it
-  too. Rows needed readable with no network at all need `staging_retention`
+  published files back into staging whether anyone read them or not; a
+  reader on another machine caches what it actually reads instead (above),
+  across restarts, without writing to either table. Rows needed readable with no network at all need `staging_retention`
   raised before they are evicted.
 
 - **Breaking: `evict(table)` and `reclaim(table)`, one set of verbs for every
@@ -94,17 +93,15 @@ minor version carries breaking changes.
 
 ### Added
 
-- **Reads from an S3 published table are cached** (#118), replacing `hydrate`.
-  `duckdb_connection`, `new`, `open` and `restore` take `memory_cache=True`
-  (DuckDB's external file cache, for the connection's lifetime),
-  `disk_cache=True` (the `cache_httpfs` extension on disk, surviving
-  restarts), `disk_cache_path=None` (default `$XDG_CACHE_HOME/litelink/<log
-  path>`, one per log, shared by every process reading it) and
-  `disk_cache_volume_limit=0.8` (the cache evicts once its VOLUME is that full,
-  counting everything on it). `cache_httpfs` is bundled in the platform wheels
-  and installed by `just duckdb-extensions --remote`; without it a
-  disk-cached connection raises `ExtensionMissing`.
-
+- **`duckdb_connection` can cache what it reads from S3** (#118), replacing
+  `hydrate` for a reader on another machine: `memory_cache=True` (DuckDB's
+  external file cache, for the connection's lifetime), `disk_cache=False` (the
+  bundled `cache_httpfs` extension on disk, surviving restarts), `cache_key`
+  (the directory under `$XDG_CACHE_HOME/litelink`, e.g. a stream id; absolute
+  paths used as given; None is `default`) and `disk_cache_volume_limit=0.8`
+  (evicts once the cache's VOLUME is that full, counting everything on it). A
+  log's own handles never cache to disk. `cache_httpfs` is bundled in the
+  platform wheels and installed by `just duckdb-extensions --remote`.
 - **`sweep(table=None)`**, a routine of its own (#117). It takes no claim, so
   an orchestrator can run it on its own schedule, in another process, or in a
   daemon thread.

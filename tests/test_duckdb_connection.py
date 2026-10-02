@@ -237,53 +237,62 @@ OPTIONS = litelink.S3Options(
 )
 
 
-def test_a_remote_connection_caches_in_memory_and_on_disk_by_default(
+def test_a_remote_connection_caches_in_memory_only_by_default() -> None:
+    """Memory on, disk off (#118). A disk cache is for a reader on another
+    machine, which asks for it; on a log's own host it would put back on disk
+    what eviction removed.
+
+    Falsify by defaulting `disk_cache` to True: `cache_httpfs` loads.
+    """
+    connection = litelink.duckdb_connection(OPTIONS, remote=True)
+
+    assert "cache_httpfs" not in loaded(connection)
+    assert settings(connection)["enable_external_file_cache"] == "true"
+
+
+def test_a_disk_cache_is_layered_under_memory_in_the_keyed_directory(
     isolated_read_cache: Path,
 ) -> None:
-    """Both layers on, the disk cache at the per-user default, bounded by its
-    volume (#118).
+    """With `disk_cache=True`: `cache_httpfs` on disk in the key's directory,
+    DuckDB's memory cache switched back ON after the extension switches it
+    off, and the volume floor set from the limit rather than the extension's
+    5% (#118).
 
-    `cache_httpfs` switches DuckDB's own memory cache OFF when it loads, so a
-    connection that merely loaded it would serve every repeat read from disk.
     Falsify by dropping the `enable_external_file_cache` line from
     `install_read_cache`: it reads false.
     """
     import shutil
 
-    connection = litelink.duckdb_connection(OPTIONS, remote=True)
+    connection = litelink.duckdb_connection(
+        OPTIONS, remote=True, disk_cache=True, cache_key="stream-1"
+    )
 
     found = settings(connection)
-    expected = isolated_read_cache / "litelink" / "duckdb"
+    expected = isolated_read_cache / "litelink" / "stream-1"
     assert "cache_httpfs" in loaded(connection)
     assert found["cache_httpfs_type"] == "on_disk"
     assert found["cache_httpfs_cache_directory"] == str(expected)
     assert expected.is_dir()
     assert found["enable_external_file_cache"] == "true"
     assert found["cache_httpfs_disk_cache_reader_enable_memory_cache"] == "true"
-    # 0.8 full means 20% of the volume kept free, not the extension's 5%.
     floor = int(found["cache_httpfs_min_disk_bytes_for_cache"])
     assert floor == int(shutil.disk_usage(expected).total * (1 - 0.8))
 
 
 def test_each_cache_layer_turns_off_on_its_own(tmp_path: Path) -> None:
     """`memory_cache=False` turns off every RAM layer, `cache_httpfs`'s own
-    read-through cache included; `disk_cache=False` never loads the extension;
-    `disk_cache_path` is used as given.
+    read-through cache included.
 
     Falsify by leaving `cache_httpfs`'s reader cache on when `memory_cache` is
     False: ~128 MB per process of RAM caching the flag claimed to turn off.
     """
     no_memory = litelink.duckdb_connection(
-        OPTIONS, remote=True, memory_cache=False, disk_cache_path=tmp_path
+        OPTIONS, remote=True, memory_cache=False, disk_cache=True, cache_key=tmp_path
     )
     found = settings(no_memory)
     assert found["enable_external_file_cache"] == "false"
     assert found["cache_httpfs_disk_cache_reader_enable_memory_cache"] == "false"
     assert found["cache_httpfs_cache_directory"] == str(tmp_path)
-
-    no_disk = litelink.duckdb_connection(OPTIONS, remote=True, disk_cache=False)
-    assert "cache_httpfs" not in loaded(no_disk)
-    assert settings(no_disk)["enable_external_file_cache"] == "true"
 
 
 @pytest.mark.parametrize("limit", [0.0, -0.1, 1.5])
@@ -291,37 +300,35 @@ def test_a_volume_limit_outside_zero_to_one_is_refused(limit: float) -> None:
     """How full the cache's volume may get is a share; 0 would evict
     everything at once and above 1 can never be reached."""
     with pytest.raises(ValueError, match="disk_cache_volume_limit"):
-        litelink.duckdb_connection(OPTIONS, remote=True, disk_cache_volume_limit=limit)
+        litelink.duckdb_connection(
+            OPTIONS, remote=True, disk_cache=True, disk_cache_volume_limit=limit
+        )
 
 
 def test_a_local_connection_installs_no_cache() -> None:
     """Only an S3 published table goes through httpfs, so a local read path
-    loads no cache extension at all."""
-    connection = litelink.duckdb_connection()
+    loads no cache extension at all, whatever is asked."""
+    connection = litelink.duckdb_connection(disk_cache=True)
 
     assert "cache_httpfs" not in loaded(connection)
 
 
-def test_the_default_cache_is_keyed_by_the_logs_path(
+def test_the_cache_key_names_the_directory(
     tmp_path: Path, isolated_read_cache: Path
 ) -> None:
-    """Two logs of one name in different roots get two caches; a relative or
-    symlinked root reaches the same one as its target (#118).
+    """A relative key is a directory under the root, an absolute one is used
+    as given, and none is `default` — a sibling of the keyed directories,
+    never their parent, so no cache's eviction reaches another's (#118). A
+    key that climbs out of the root is refused.
 
-    Falsify by keying on the log's name alone: the two `trades` collide.
+    Falsify by mapping None to the root itself: `default` is missing and every
+    keyed directory sits inside the unkeyed cache.
     """
-    from litelink._read import default_cache_path
+    from litelink._read import cache_directory
 
-    first = tmp_path / "a" / "trades"
-    second = tmp_path / "b" / "trades"
-    assert default_cache_path(first) != default_cache_path(second)
-
-    link = tmp_path / "link"
-    link.symlink_to(tmp_path / "a")
-    assert default_cache_path(link / "trades") == default_cache_path(first)
-
-    resolved = first.resolve()
-    assert default_cache_path(first) == (
-        isolated_read_cache / "litelink" / resolved.relative_to(resolved.anchor)
-    )
-    assert default_cache_path() == isolated_read_cache / "litelink" / "duckdb"
+    root = isolated_read_cache / "litelink"
+    assert cache_directory("stream-uuid") == root / "stream-uuid"
+    assert cache_directory(tmp_path / "volume") == tmp_path / "volume"
+    assert cache_directory() == root / "default"
+    with pytest.raises(ValueError, match="outside"):
+        cache_directory("../elsewhere")

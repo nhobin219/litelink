@@ -53,7 +53,7 @@ from litelink._maintenance import (
     stable_prefix,
 )
 from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import ReadCache, Reader, duckdb_connection
+from litelink._read import Reader, duckdb_connection
 from litelink._replication import flush, litestream_config, restore_buffer
 from litelink._s3 import S3Options
 from litelink._statistics import (
@@ -1248,10 +1248,6 @@ class WriteHandle(LocalReadHandle):
         published: str | None = None,
         s3: S3Options | None = None,
         start_offset: int = 1,
-        memory_cache: bool = True,
-        disk_cache: bool = True,
-        disk_cache_path: PathLike[str] | str | None = None,
-        disk_cache_volume_limit: float = 0.8,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
 
@@ -1433,13 +1429,6 @@ class WriteHandle(LocalReadHandle):
                 buffer,
                 duckdb_connection,
                 published=remote,
-                cache=ReadCache(
-                    memory_cache,
-                    disk_cache,
-                    disk_cache_path,
-                    disk_cache_volume_limit,
-                    cache_key=layout.directory,
-                ),
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
             config=settings,
@@ -1462,10 +1451,6 @@ class WriteHandle(LocalReadHandle):
         name: str,
         *,
         s3: S3Options | None = None,
-        memory_cache: bool = True,
-        disk_cache: bool = True,
-        disk_cache_path: PathLike[str] | str | None = None,
-        disk_cache_volume_limit: float = 0.8,
     ) -> Self:
         """Open an existing log, and recover it.
 
@@ -1553,13 +1538,6 @@ class WriteHandle(LocalReadHandle):
                 buffer,
                 duckdb_connection,
                 published=remote,
-                cache=ReadCache(
-                    memory_cache,
-                    disk_cache,
-                    disk_cache_path,
-                    disk_cache_volume_limit,
-                    cache_key=layout.directory,
-                ),
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
@@ -1600,10 +1578,6 @@ class WriteHandle(LocalReadHandle):
         published: str,
         s3: S3Options | None = None,
         binary: str | None = None,
-        memory_cache: bool = True,
-        disk_cache: bool = True,
-        disk_cache_path: PathLike[str] | str | None = None,
-        disk_cache_volume_limit: float = 0.8,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 
@@ -1999,15 +1973,7 @@ class WriteHandle(LocalReadHandle):
 
             raise
 
-        log = cls.open(
-            layout.root,
-            name,
-            s3=options,
-            memory_cache=memory_cache,
-            disk_cache=disk_cache,
-            disk_cache_path=disk_cache_path,
-            disk_cache_volume_limit=disk_cache_volume_limit,
-        )
+        log = cls.open(layout.root, name, s3=options)
 
         # The published table's row taken afresh. The staging table was rebuilt
         # empty and every published file now sits below it, so nothing a
@@ -4220,8 +4186,9 @@ class WriteHandle(LocalReadHandle):
         log can start at the one after. Reads still work: `open(...,
         read_only=True)` reads the published table, and so does any Iceberg
         engine.
-        A retired log someone replays often reads it through the reader's
-        disk cache, which keeps what is read across restarts (#118).
+        A retired log replayed often from another machine can be read through
+        a `duckdb_connection` with `disk_cache=True`, which keeps what is read
+        across restarts (#118).
 
         Steps, each safe to re-run — a crash leaves the log `retiring`, and
         calling this again finishes it:
