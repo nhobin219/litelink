@@ -517,15 +517,11 @@ class Reader:
 
         The buffer has no column statistics — computing them would cost the
         read this avoids — but `litelink_offset` is the log's sequence, so the
-        leg's range is known: from the higher of its lowest offset and
-        `boundary` (the staging table's end, below which the leg reads
-        nothing) up, open-ended, since rows keep arriving. A query entirely
-        below that cannot match it.
-
-        The boundary matters because a seal no longer deletes its rows (#122):
-        until `evict("buffer")` runs, the buffer's lowest offset is a sealed
-        row the leg will never return, and pruning on it alone stopped ruling
-        the buffer out for any scan below the tail.
+        leg's range is known, open-ended above since rows keep arriving. Its
+        floor is `boundary`, the staging table's end, whenever there is one:
+        the leg reads nothing below it, whatever the buffer still holds — and
+        it holds sealed rows until `evict("buffer")` runs (#122). Only with no
+        staging table is the floor the buffer's own lowest offset.
         """
         # Closed by `retire()`: an empty range at the log's end, which no
         # query needs, with offset terms or without.
@@ -537,14 +533,11 @@ class Reader:
         if not any(column == OFFSET for column, _, _ in found):
             return True
 
-        lowest = self._buffer.lowest_offset()
-        if lowest is None:
+        floor = boundary if boundary is not None else self._buffer.lowest_offset()
+        if floor is None:
             return True
 
-        if boundary is not None:
-            lowest = max(lowest, boundary)
-
-        unit = entry(BUFFER, (lowest, None), self._schema, UNKNOWN)
+        unit = entry(BUFFER, (floor, None), self._schema, UNKNOWN)
 
         return bool(prune(build([unit], key=KEY), [BUFFER], found, key=KEY))
 
