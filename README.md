@@ -135,9 +135,10 @@ litelink.preflight(...)                                            # what python
 # A WriteHandle also writes:
     log.append(row) -> int                          # durable on return
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
-    log.ingest(table_or_reader)                     # Arrow straight to Parquet
-    log.seal() · log.advance()                 # seal; the whole pipeline, publish included
-    log.publish(*, flush=False)            # push to the published table
+    log.ingest(table_or_reader)                     # Arrow straight to Parquet, then published
+    log.advance(*, flush=False)                     # the whole pipeline below, in order
+    log.seal(*, flush=False) · compact() · publish(*, flush=False) · evict()
+    log.expire(table=None) · sweep(table=None) · reclaim_buffer()   # its steps, one at a time
     log.retire()                                    # end the log: all published, none local
     log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
 ```
@@ -154,6 +155,70 @@ The deliberate choices:
   inside the staging window never touches the network, however much has been evicted.
 
 Full reference in [`docs/API.md`](docs/API.md).
+
+## The pipeline
+
+Rows move through three tables, and `advance()` moves them. It runs every step in the order
+rows travel, then cleans up behind them, each table after the last step that can change it:
+
+```
+  log.append(row) · log.extend(rows)        durable on return: SQLite, synchronous=FULL
+                │
+                ▼
+  ┌───────────────────────────┐
+  │ buffer         buffer.db  │   rows wait until a file's worth has arrived
+  └───────────────────────────┘
+                │  1. seal       writes what the size trigger cut       flush: everything
+                ▼
+  ┌───────────────────────────┐ ◄──┐
+  │ staging    local Iceberg  │    │  2. compact   merges runs of small files
+  └───────────────────────────┘ ───┘
+                │  3. publish    what compaction is finished with       flush: everything
+                ▼
+  ┌───────────────────────────┐
+  │ published        Iceberg  │   a directory beside the log by default, or s3://
+  └───────────────────────────┘
+
+  then, behind the rows:
+     4. reclaim_buffer        buffer.db's dead space          only with vacuum_free_ratio
+     5. evict                 staging drops what published holds, never before (I4)
+     6. expire("staging")     old snapshots, then deletes what they alone used
+     7. sweep("staging")      files a lost or crashed commit left behind
+     8. expire("published")   the same, on the published table
+     9. sweep("published")
+```
+
+- **`flush=True` means the same everywhere**: push everything through this stage now,
+  regardless of thresholds. `advance(flush=True)` passes it to `seal` and `publish`, so one
+  pass leaves nothing buffered and nothing unpublished. Use it at shutdown, not in a loop: it
+  leaves undersized files behind.
+- **Nothing runs unless you call it.** The library owns no thread. Call `seal()` often (it is
+  one indexed read when there is nothing to do) and `advance()` rarely.
+- **Each step is a routine of its own** for an orchestrator that wants them on different
+  schedules or in different processes. `advance()` is the one-process version, and raises if
+  another process holds the lease.
+- **A publish that fails stops only the published steps.** Steps 4–7 still run, so a machine
+  cut off from S3 keeps reclaiming local storage; then the error is raised.
+
+`ingest()` loads data that is already durable, a Parquet corpus say, so it skips the buffer:
+
+```
+  log.ingest(arrow_table_or_reader)         the source is already durable: no buffer, no per-row fsync
+                │  reserve offsets, sort, write files at target_compact_size, register in batches
+                ▼
+  ┌───────────────────────────┐
+  │ staging                   │   the whole log is claimed for the load
+  └───────────────────────────┘
+                │  compact()            merges only small files already in staging
+                │  publish(flush=True)  the load's only second copy, last short file included
+                ▼
+  ┌───────────────────────────┐
+  │ published                 │   skip with ingest(..., publish=False)
+  └───────────────────────────┘
+```
+
+It runs only what a load needs to be safe. Eviction, expiry and the sweeps are left to the
+next `advance()`, which a log that only ever ingests still needs, or its snapshots accumulate.
 
 ## Writing
 
