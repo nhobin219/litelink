@@ -320,7 +320,7 @@ def test_the_whole_log_takes_each_file_once() -> None:
 def test_a_straddling_published_file_keeps_its_bounds_and_loses_the_counts() -> None:
     """Rows on both sides of the local boundary cannot be counted once.
 
-    Only `rewrite_published` re-cutting the published table makes one. Its bounds are
+    Only `compact("published")` re-cutting the published table makes one. Its bounds are
     over rows the log holds, so they stand; every count is None, never doubled.
     """
     local = [_span(10, 19, 100, 200)]

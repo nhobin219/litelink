@@ -22,6 +22,12 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: `rewrite_published()` is now `compact("published")`** (#118).
+  It merges undersized files in the published table: compaction, not a
+  rewrite of data. `compact(table="staging")` keeps its default, since
+  compacting the published table is network work to run on purpose and a
+  loop calling `compact()` must never start doing it.
+
 - **Breaking: `set_published()` is removed; a log's published table is fixed
   when the log is created** (#118), like its schema. To publish somewhere
   else, `retire()` the log and start a new one where it ended:
@@ -88,7 +94,7 @@ minor version carries breaking changes.
 - **The published table is now expired** (#113). `reclaim("published")`
   expires published snapshots older than `published_snapshot_retention`
   and deletes the objects that frees once due. Previously the published table
-  was expired only after `rewrite_published`, so one that was only ever
+  was expired only after `rewrite_published()`, so one that was only ever
   published kept every snapshot, manifest list and manifest.
 - **Breaking: one routine per operation, the table an argument** (#117,
   #122). `evict`, `reclaim` and `sweep` take the table they act on, None

@@ -1198,7 +1198,7 @@ def test_rewriting_the_published_table_does_not_strand_staging_eviction(
 ) -> None:
     """The two tiers cut the same rows independently, and I4 must not care.
 
-    `rewrite_published` re-cuts the published table to different boundaries — that is its
+    `compact("published")` re-cuts the published table to different boundaries — that is its
     whole job. Asking whether a local file's range EQUALS a published one then
     failed for every local file, permanently: eviction clamped to zero and
     stopped, and compaction stopped treating published files as the published table's
@@ -1388,7 +1388,7 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
 def test_an_outer_renew_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
     """`renew or claim.renew` read naturally and was wrong.
 
-    A rewrite run under the whole-log lease — `rewrite_published`,
+    A rewrite run under the whole-log lease — `compact("published")`,
     `rewrite_sorted` — passes that lease's `renew` down. Taking it in place of
     the run claim's stopped the run claim from being renewed at all, and the
     pre-commit check then consulted the outer claim instead. A merge over the

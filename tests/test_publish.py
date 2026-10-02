@@ -279,7 +279,7 @@ def test_rewrite_published_merges_files_left_undersized(
                 target_compact_size=1024 * 1024,
             )
         )
-        log.rewrite_published()
+        log.compact("published")
 
         remote.reload()
         after = remote.data_files()
@@ -338,7 +338,7 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
                 target_compact_size=1024 * 1024,
             )
         )
-        log.rewrite_published()
+        log.compact("published")
 
         queued = set(log._buffer.queued_deletions())
         assert superseded & queued, "the sources must be queued, not deleted"
@@ -815,7 +815,7 @@ def test_the_published_table_refuses_a_range_that_starts_inside_its_extent(
 def test_the_log_keeps_working_after_the_published_table_is_re_cut(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """`rewrite_published` while local files still overlap what it re-cuts.
+    """`compact("published")` while local files still overlap what it re-cuts.
 
     The two tiers then hold the same rows at boundaries neither shares, which
     is the state every later decision has to survive: I4 asking whether the
@@ -859,7 +859,7 @@ def test_the_log_keeps_working_after_the_published_table_is_re_cut(
         # The documented reason it exists: a raised target leaves history sized
         # for the old one.
         log.set_config(replace(config, target_compact_size=256 * 1024))
-        log.rewrite_published()
+        log.compact("published")
 
         assert log.scan().read_all().num_rows == total
 
@@ -915,7 +915,7 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
     made a rewrite cut its outputs at the seal's row limit while the published table
     holds files sized to the compact one — many times more files than it
     started with, each still undersized by bytes, so the next
-    `rewrite_published` flags the same tail again and it never converges. The
+    `compact("published")` flags the same tail again and it never converges. The
     operation exists to merge undersized published files; that inverted it.
     """
     config = replace(
@@ -951,7 +951,7 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
         # A raised target makes the history undersized, which is the reason
         # this operation exists.
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.rewrite_published()
+        log.compact("published")
 
         after = log.published_files()
 
@@ -1003,7 +1003,7 @@ def test_expiring_the_published_table_will_not_repair_it_without_a_claim(
         # A rewrite is the one thing that queues a REMOTE deletion, which is
         # the signal `_expire_published` acts on.
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.rewrite_published()
+        log.compact("published")
 
         assert any("://" in p for p in log._buffer.queued_deletions()), (
             "expected a remote entry to make expiry reach the published table"
@@ -1306,7 +1306,7 @@ def test_a_healed_row_carries_the_measured_bytes(
 
     What that costs is not cosmetic: a rewrite's deliberately undersized tail
     recorded as full is never flagged by `_badly_sized` again, so
-    `rewrite_published` stops converging it, and nothing re-measures a published
+    `compact("published")` stops converging it, and nothing re-measures a published
     file.
     """
     config = replace(
@@ -1423,7 +1423,7 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
         Maintenance._discard_scratch = after_teardown
         try:
             with pytest.raises(RuntimeError, match="lost the claim"):
-                log._maintenance.rewrite_published(renew=lambda: state["calls"] < 2)
+                log._maintenance.compact_published(renew=lambda: state["calls"] < 2)
 
         finally:
             Maintenance._discard_scratch = discard
@@ -1437,7 +1437,7 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
 ) -> None:
     """The published half of the grace fix, where the loss was demonstrated.
 
-    `rewrite_published` queues the files it is replacing when it STARTS, and they
+    `compact("published")` queues the files it is replacing when it STARTS, and they
     stop being referenced only when `replace_range` commits. Left at the
     queueing, a rewrite slower than its snapshot retention — and re-cutting a
     published table is the slowest thing here — spends the whole grace before it
@@ -1482,7 +1482,7 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
         assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
 
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.rewrite_published()
+        log.compact("published")
 
         overdue = [p for p in log._buffer.due_deletions(stale + 1) if p in superseded]
 

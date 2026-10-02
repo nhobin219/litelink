@@ -305,7 +305,7 @@ class LogConfig:
     # Changing it is safe at any time and rewrites nothing. Parquet records the
     # codec per column chunk, so a table holding both reads correctly —
     # verified across `scan` and `sql` — and existing files are never touched.
-    # `rewrite_published` is what re-cuts history into the new one, when the
+    # `compact("published")` is what re-cuts history into the new one, when the
     # size is worth the transfer.
     compression: str = "zstd"
 

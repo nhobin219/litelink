@@ -58,7 +58,7 @@ not a service, so this costs no daemon.
                          archive.db on a log from before 0.6)
     litestream.yml       the sidecar's config, if replicating    (§3a)
     data/                sealed Parquet                           (§4)
-        compacted/       merged by compaction, and rewrite_published's
+        compacted/       merged by compaction, and compact("published")'s
                          re-cuts                                 (§6)
         ingested/        written by bulk ingest, never buffered   (§13.4)
     metadata/            Iceberg metadata JSON and Avro
@@ -666,7 +666,7 @@ the same as "expired": an expired claim nobody has taken may still be renewed, a
 a claim is the taker deleting its row.
 
 **An outer claim's renewal is combined with the run's, never substituted for it.** A rewrite
-under the whole-log lease (`rewrite_published`, `rewrite_sorted`) passes that lease's `renew`
+under the whole-log lease (`compact("published")`, `rewrite_sorted`) passes that lease's `renew`
 down; `renew or claim.renew` silently stopped renewing the run claim at all and answered the
 pre-commit check with the outer one. Callers no longer pass a callback of their own: each pass
 renews its own claim, which is why the public routines dropped `heartbeat`.
@@ -680,7 +680,7 @@ and those offsets sit in two files at once, in the immutable tier, with nothing 
 repair it. Refusing costs a stall; admitting costs silence.
 
 **That stall has no remedy today, and this paragraph used to imply one.** Nothing re-cuts a
-LOCAL straddler — `rewrite_published` works the other side — so the log stops advancing its
+LOCAL straddler — `compact("published")` works the other side — so the log stops advancing its
 watermark, eviction pins below the straddling file, and the shipped publish role dies on the
 `ValueError` because it catches `RuntimeError` and `CommitFailedException` only. The refusal
 is still the right trade against silent permanent duplication in the immutable tier, but
@@ -779,7 +779,7 @@ and registered, taking the live entry with it.
 **Compaction asks whether ANY published table holds a file, not the configured one.** Detaching does
 not make the copies stop existing. Merging across a range some published table holds makes a LOCAL
 file whose boundaries line up with nothing there, and nothing re-cuts a local straddler —
-`rewrite_published` works the other side — so re-attaching stalls the log for good: eviction
+`compact("published")` works the other side — so re-attaching stalls the log for good: eviction
 pins below it and every push is refused. Four legitimate operations reach it, with no warning
 at any step: detach, raise the target, maintain, re-attach. Skipping those files costs
 nothing, because only compacted files are ever pushed, so one with a published copy is already
@@ -798,7 +798,7 @@ eviction pins on it, and nothing raises. A file no merge can touch is settled by
 Note what that correction cost the earlier justification: "a file with a published copy is
 already at the target" is false the moment the target is RAISED after the copy was made —
 which is the scenario the exclusion exists for. Such a file stays at the size it was
-published at, and `rewrite_published` is the tool for that.
+published at, and `compact("published")` is the tool for that.
 
 **Opening the published table with `repair` needs the durable location, not a remembered one.** That
 open may drop a catalog entry naming another prefix and create a fresh table at this one;
@@ -944,7 +944,7 @@ longer authorises a deletion, which was the whole of the problem.
 
 **Coverage, not equality.** The two tiers cut the same rows into files independently, so
 asking whether a local range EQUALS a published one was wrong the moment they could differ.
-`rewrite_published` re-cuts the published table to different boundaries by design — that is its entire
+`compact("published")` re-cuts the published table to different boundaries by design — that is its entire
 job — and under an equality test every local file then matched nothing, for ever: eviction
 clamped to zero and stopped, and compaction stopped treating published files as the published table's
 business and merged across its extent, which `register` admits as a partial overlap and the
@@ -1037,14 +1037,14 @@ Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
 **Compactions are never replicated.** A file is pushed only once compaction is done with it,
 and compaction refuses to merge anything the published table holds (§4a), so the two tables
 never need the same overwrite applied twice. Re-cutting what is already published is
-`rewrite_published`'s job, run on purpose.
+`compact("published")`'s job, run on purpose.
 
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).
 
 **Step 4 is its own routine, `reclaim("published")`, not part of `publish`.** `advance()` runs it
 right after `publish` (§12), and an orchestrator can run it on its own schedule. Until #113 the
-published table was expired only after `rewrite_published`, on the reasoning that `publish`
+published table was expired only after `compact("published")`, on the reasoning that `publish`
 never supersedes a file. True of data files and not of Iceberg's own: a table that was only
 ever published kept every snapshot, manifest list and manifest it had ever had.
 
@@ -1451,7 +1451,7 @@ the engine.
 **The published row changes when the local floor moves, not when the published table does.** Eviction
 widens it by the rows it moves, from their local manifest statistics, before its commit — so a
 read resolving the new, higher floor finds the row already covering what went below it. `publish`
-adds only copies of rows the staging table still holds and `rewrite_published` re-cuts rows the
+adds only copies of rows the staging table still holds and `compact("published")` re-cuts rows the
 published table has, so neither touches it. The one write that narrows is an exact rollup from the published table's manifests, run only
 under the whole-log maintenance claim, which eviction cannot hold beside: at the first `publish`,
 on a re-point (which drops the row first), at `restore`, and at `open` for a log written before

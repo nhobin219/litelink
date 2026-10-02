@@ -30,7 +30,7 @@ one that claims less loses rows. So eviction WIDENS the row before the commit
 that moves rows below the staging table, and the one write that narrows — an
 exact rollup from the published table's manifests — runs only under the
 whole-log maintenance claim, where eviction cannot run beside it. `publish` and
-`rewrite_published` never change it: one adds copies of rows the staging table
+`compact("published")` never change it: one adds copies of rows the staging table
 still holds, the other re-cuts rows the published table already has.
 
 **A missing row means "no statistics", and nothing turns it into a row but an

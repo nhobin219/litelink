@@ -1514,7 +1514,7 @@ class LogTable:
         Refusing costs a stall, and the stall is worse than this used to say.
         The straddling file never lands, the watermark stops, eviction pins
         below it, and **nothing re-cuts a staging straddler**:
-        `rewrite_published` works the other side, and no tool does this one. The
+        `compact("published")` works the other side, and no tool does this one. The
         refusal is still right — a loud permanent stall beats a silent permanent
         duplication — but calling it recoverable was wrong, and the operator's
         only route today is to lower the compaction target so the straddler is

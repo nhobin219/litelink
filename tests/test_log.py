@@ -368,7 +368,6 @@ def test_a_reader_has_no_mutation_to_refuse(tmp_path: Path) -> None:
             "evict",
             "reclaim",
             "sweep",
-            "rewrite_published",
             "retire",
             "set_config",
             "set_sort_by",

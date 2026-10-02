@@ -756,7 +756,7 @@ class LogHandle:
         missing information is None rather than a narrower bound — see
         `ColumnStatistics` for exactly when, including why a float's bounds say
         nothing about NaN and why strings carry none. A published file that
-        straddles the staging range (only `rewrite_published` cuts one) makes
+        straddles the staging range (only `compact("published")` cuts one) makes
         every count None in `"published"` and in the whole log: its bounds hold,
         but its rows cannot be counted once without opening it.
         """
@@ -2075,7 +2075,7 @@ class WriteHandle(LocalReadHandle):
         holds, because a staging rewrite there would commit a file straddling
         the published table's span and nothing re-cuts a staging straddler. So
         on a published log this changes three declarations and rewrites only
-        what publish has not yet taken — and `rewrite_published` is not the
+        what publish has not yet taken — and `compact("published")` is not the
         other half either: it re-ingests from the
         first badly-SIZED file onwards, so a well-sized published prefix is
         never a candidate and keeps its original clustering for ever.
@@ -2396,7 +2396,7 @@ class WriteHandle(LocalReadHandle):
         integer gaps, and every pass was measured correct on a gapped log. The
         one price worth stating rather than discovering: compaction will merge
         across the gap, and a merged file spanning one can never be re-cut by
-        `rewrite_published`.
+        `compact("published")`.
 
         Takes a `pa.Table` or a `pa.RecordBatchReader` and nothing else.
         Parquet-to-Arrow is the caller's — `pq.ParquetFile(...).iter_batches()`
@@ -3178,7 +3178,7 @@ class WriteHandle(LocalReadHandle):
         in the published table — up to `compact_min_files - 1` seals forming a
         run `_merge` will not rewrite, plus the load's own tail — and compaction
         will not merge them afterwards, because it refuses to touch anything the
-        published table holds. `rewrite_published` re-cuts them. `ingest`
+        published table holds. `compact("published")` re-cuts them. `ingest`
         compacts before pushing to keep the count to what a run genuinely cannot
         fill.
 
@@ -3212,7 +3212,7 @@ class WriteHandle(LocalReadHandle):
         eviction below the published floor, and compaction refuses what the
         published table holds — and a compaction over the trailing run, which
         `flush` pushes too, overlaps this range and so is excluded by it.
-        `rewrite_published` and the other whole-log operations still exclude
+        `compact("published")` and the other whole-log operations still exclude
         any publish.
 
         **Two publishes still exclude each other.** Both start at the same
@@ -3300,7 +3300,7 @@ class WriteHandle(LocalReadHandle):
         Safe in the direction it moves. Compaction refuses to merge anything a
         published table already holds, so a file pushed early is simply never
         merged — the cost is a small object the published table keeps until
-        `rewrite_published` re-cuts it, not a duplicate range. The deadlock the
+        `compact("published")` re-cuts it, not a duplicate range. The deadlock the
         shared `runs` exclusion guards against is the opposite direction:
         holding back a file compaction will never touch.
 
@@ -3314,7 +3314,7 @@ class WriteHandle(LocalReadHandle):
         The published table may still gain a small file: one stranded between
         larger neighbours can never be merged, so holding it back would block
         the watermark forever rather than improve anything. That is a cosmetic
-        cost with a deliberate cause, and `rewrite_published` is the tool for
+        cost with a deliberate cause, and `compact("published")` is the tool for
         it.
         """
         # Read under the claim, the same as everything else that decides what
@@ -3507,7 +3507,7 @@ class WriteHandle(LocalReadHandle):
         # margin — a load's rows never enter the buffer, so not pushing them
         # leaves them on one disk. Compaction will not merge what the
         # published table holds, so any small objects persist until
-        # `rewrite_published` re-cuts them.
+        # `compact("published")` re-cuts them.
         settled = self._settled(pending, flush=flush)
         if bound is not None:
             # Inside the range claimed, and nothing past it: a seal or another
@@ -3675,7 +3675,7 @@ class WriteHandle(LocalReadHandle):
         passes `flush` to `seal` and `publish`, so every buffered row is sealed
         and every staging file published in this pass — at shutdown, say, to
         get everything off this machine. The cost is undersized files, in
-        staging and in the published table; `rewrite_published` re-cuts the
+        staging and in the published table; `compact("published")` re-cuts the
         published ones.
 
         Data moves first, then cleanup follows behind it:
@@ -3746,19 +3746,50 @@ class WriteHandle(LocalReadHandle):
         self.reclaim("published")
         self.sweep("published")
 
-    def compact(self) -> None:
-        """Convert sealed files into `target_compact_size` ones (§6).
+    def compact(self, table: Literal["staging", "published"] = "staging") -> None:
+        """Merge undersized files into `target_compact_size` ones (§6).
 
-        The heavy step of `advance`, and the reason its steps are callable
-        separately: it reads and rewrites whole files, while eviction and
-        expiry are metadata commits that finish in milliseconds. A deployment
-        that wants them on different schedules — convert hourly, expire every
-        minute — can have that, and one that does not should call `advance`.
+        **`"staging"`** (the default) is the heavy step of `advance`: it reads
+        and rewrites whole files, while eviction and expiry are metadata
+        commits that finish in milliseconds, which is why the steps are
+        callable separately. It claims each run it merges (§4a) and renews that
+        claim as it works, so it excludes another maintainer only where their
+        work overlaps.
 
-        Claims each run it merges (§4a) and renews that claim as it works, so
-        it excludes another maintainer only where their work overlaps.
+        **`"published"`** merges undersized files already in the published
+        table. An operation, not a policy: `advance` never runs it, and normal
+        operation does not need it, because `publish` pushes only files
+        compaction has finished with, so the published table is well-sized by
+        construction. It exists for the three things that break that on
+        purpose — an explicit `seal(flush=True)` stranding a small file, a
+        change to `target_compact_size`, which applies to the future while the
+        published table is immutable history, and a bulk load's undersized
+        push. Rows and offsets are unchanged; only how they are cut into files
+        changes. It downloads, merges and re-uploads, so it claims the whole
+        log for as long as that takes.
+
+        The default is `"staging"`, not both, unlike the other routines that
+        take a table: compacting the published table is network work to run
+        occasionally, on purpose, and a loop calling `compact()` must never
+        start doing it.
         """
-        self._maintenance.compact()
+        if table == "staging":
+            self._maintenance.compact()
+            return
+
+        if table != "published":
+            msg = f'table must be "staging" or "published", not {table!r}'
+            raise ValueError(msg)
+
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds a claim over this range"
+            raise RuntimeError(msg)
+
+        try:
+            self._maintenance.compact_published(lease.renew, lease.owner)
+        finally:
+            lease.release()
 
     def evict(
         self,
@@ -3880,33 +3911,6 @@ class WriteHandle(LocalReadHandle):
 
         if _covers(table, "published", allowed):
             self._maintenance.sweep_published()
-
-    def rewrite_published(self) -> None:
-        """Merge undersized files already in the published table (§6, ad-hoc).
-
-        An operation, not a policy. Nothing calls it on a schedule and normal
-        operation does not need it: `publish` pushes only files compaction has
-        finished with, so the published table is well-sized by construction —
-        except for what a bulk load pushed with `flush` to avoid
-        stranding rows that have no second copy. It exists for the three things
-        that break that on purpose — an explicit `seal()` stranding a small
-        file, a change to `target_compact_size`, which applies to the future
-        while the published table is immutable history, and that load's
-        undersized push.
-
-        Run it when nothing else is maintaining the log: it takes the same
-        lease as `advance` and `publish`, and it rewrites the same files they
-        would.
-        """
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds a claim over this range"
-            raise RuntimeError(msg)
-
-        try:
-            self._maintenance.rewrite_published(lease.renew, lease.owner)
-        finally:
-            lease.release()
 
     def retire(self) -> None:
         """End this log for good: every row to the published table, nothing

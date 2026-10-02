@@ -210,7 +210,7 @@ def _both(
 ) -> Callable[[], bool]:
     """Renew our own claim AND the caller's.
 
-    For a rewrite run under an outer claim — `rewrite_published` and
+    For a rewrite run under an outer claim — `compact("published")` and
     `rewrite_sorted` hold the whole-log lease and pass its `renew` down — so
     both stay live while a merge runs. `renew or claim.renew` read naturally
     and was wrong: a caller passing one silently stopped the run claim from
@@ -369,7 +369,7 @@ class Maintenance:
 
         **Coverage, not equality.** The two tiers cut the same rows into files
         independently, and asking whether a staging range EQUALS a published one
-        was wrong the moment they could differ. `rewrite_published` re-cuts the
+        was wrong the moment they could differ. `compact("published")` re-cuts the
         published table to different boundaries by design — that is its entire
         job — and every staging file then matched nothing, for ever: eviction
         clamped to zero and stopped, and compaction stopped seeing published
@@ -448,7 +448,7 @@ class Maintenance:
         # file with a published copy is already at the target" — is false the
         # moment the target is RAISED after the copy was made, which is the
         # scenario this exists for. What it costs is that such a file stays at
-        # the size it was published at; `rewrite_published` is the tool for
+        # the size it was published at; `compact("published")` is the tool for
         # that. What it buys is that no merge can ever straddle a range a
         # published table holds. `_push` applies the same exclusion, or the two
         # deadlock.
@@ -551,7 +551,7 @@ class Maintenance:
         # publish pass that ran since — under a policy whose grouping settles a
         # partial prefix of this run — can have pushed part of it. Merging what
         # is left commits a STAGING file straddling the published table's span,
-        # and nothing re-cuts a staging straddler: `rewrite_published` works the
+        # and nothing re-cuts a staging straddler: `compact("published")` works the
         # other side.
         #
         # The published ranges read DURABLY here, not from this object's
@@ -953,7 +953,7 @@ class Maintenance:
         finally:
             removal.release()
 
-    def rewrite_published(
+    def compact_published(
         self,
         renew: Callable[[], bool] | None = None,
         owner: str | None = None,
@@ -997,7 +997,7 @@ class Maintenance:
         """
         # `repair=True`: this holds the maintenance lease, which is what makes
         # replacing an entry that names another prefix safe. Opening with
-        # `repair=False` here meant `advance` and `rewrite_published` failed
+        # `repair=False` here meant `advance` and `compact("published")` failed
         # after a re-point with an error telling the operator that a
         # maintenance pass would fix it — which they are.
         published = self._published.table(repair=True)
@@ -1037,7 +1037,7 @@ class Maintenance:
         buffer seeded at the range's start, so it RENUMBERS them densely — over
         a gap that hands every row above it an offset belonging to different
         data. `_recut` asserts against that, so before this exclusion a single
-        gapped file made every later `rewrite_published` raise: after a failover
+        gapped file made every later `compact("published")` raise: after a failover
         reserves 2**20 offsets (§3a) the first sealed file spans the hole, and
         being the published table's first file it was in every candidate run for
         the life of the log. One un-rewritable file is the honest cost of the
@@ -1051,14 +1051,14 @@ class Maintenance:
         # and returned `files[index:]` from the first undersized one — which
         # still CONTAINS any gapped file after it. That is the normal shape: the
         # published table's tail file before a failover is undersized, and the
-        # reserve's gapped file lands after it. Measured, `rewrite_published`
+        # reserve's gapped file lands after it. Measured, `compact("published")`
         # went on raising for the life of every restored log.
         #
         # A gap bounds a segment at both ends: a file with one inside it, and a
         # file that does not continue the previous file's range.
         #
         # A segment yielding a SINGLE file is skipped rather than returned.
-        # `rewrite_published` declines a run of one — merging one file is a
+        # `compact("published")` declines a run of one — merging one file is a
         # no-op rewrite — so returning it stopped the walk and left every later
         # segment unreachable. That made the tool a permanent no-op on exactly
         # the shape it was fixed for: an undersized published table tail, then the
@@ -1126,7 +1126,7 @@ class Maintenance:
         # cut its outputs at the seal's row limit while the published table
         # holds files sized to the compact one — eight times more files than it
         # started with, each still undersized by bytes, so the next
-        # `rewrite_published` flags the same tail again and the operation never
+        # `compact("published")` flags the same tail again and the operation never
         # converges. It is meant to merge undersized published files; that
         # inverted it.
         config = self.config
@@ -1387,7 +1387,7 @@ class Maintenance:
         and `publish` is what creates and repairs it. The drain that follows
         takes its own claim, as `drain` does.
 
-        It used to run only once `rewrite_published` had queued a remote
+        It used to run only once `compact("published")` had queued a remote
         deletion, on the reasoning that `publish` never supersedes a file. True
         of data files and not of Iceberg's own: a table that was only ever
         published kept every snapshot, manifest list and manifest (#113). A

@@ -2718,7 +2718,7 @@ class Buffer:
           box's UNSEALED floor, above the band, so the band would fall into no
           leg of a read and be lost at the first seal after recovery.
         - **`pending_delete` rows naming local files** go; REMOTE ones stay,
-          and that half is required. `rewrite_published` is the only thing that
+          and that half is required. `compact("published")` is the only thing that
           queues a remote entry, and this design refuses directory listing, so
           dropping them leaks published objects nothing can ever find again.
         - **`claim` rows** go. They carry the dead box's owners and a future

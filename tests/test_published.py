@@ -160,9 +160,9 @@ def test_rewrite_published_works_on_a_local_published_table(tmp_path: Path) -> N
     """
     with published(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
         expected = offsets(log)
-        # A raised target is one of the things `rewrite_published` exists for.
+        # A raised target is one of the things `compact("published")` exists for.
         log.set_config(replace(log.config, target_compact_size=4 * 64 * 1024))
-        log.rewrite_published()
+        log.compact("published")
 
         superseded = [
             key
@@ -849,3 +849,29 @@ def test_a_mismatched_catalog_sends_publish_to_the_whole_log(
 
         assert bound is None
         assert (lease.start, lease.end) == (0, EVERYTHING)
+
+
+def test_compact_takes_the_table_and_defaults_to_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`compact("published")` merges undersized published files; the default
+    is staging only, so a loop calling `compact()` never starts re-cutting
+    the published table. A misspelt table is refused.
+
+    Falsify by defaulting `table` to the published table: the bare call goes
+    to `compact_published`.
+    """
+    with local_log(tmp_path) as log:
+        maintenance = log._maintenance  # noqa: SLF001
+        called: list[str] = []
+        monkeypatch.setattr(maintenance, "compact", lambda: called.append("staging"))
+        monkeypatch.setattr(
+            maintenance, "compact_published", lambda *_: called.append("published")
+        )
+
+        log.compact()
+        log.compact("published")
+        assert called == ["staging", "published"]
+
+        with pytest.raises(ValueError, match="table must be"):
+            log.compact("stagin")  # ty: ignore[invalid-argument-type]

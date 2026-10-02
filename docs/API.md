@@ -103,7 +103,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
-| **`+ WriteHandle`** — published table | `publish` · `rewrite_published` · `retire` |
+| **`+ WriteHandle`** — published table | `publish` · `compact("published")` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
 
@@ -320,7 +320,7 @@ next `ingest`.
 **A load that fails costs its reservation.** The offsets of the file being written are gone,
 leaving a gap. Files stay non-overlapping and adjacent in offset order, which is what §6
 needs; the one price is that compaction will merge across a gap and such a file can never be
-re-cut by `rewrite_published`.
+re-cut by `compact("published")`.
 
 ## Reading
 
@@ -377,7 +377,7 @@ predicate rather than the handle, so the same unbounded query reads the publishe
 has moved its rows there. A bounded hot query stays local however much has been evicted.
 
 The published table's row changes when eviction moves rows below the staging table: eviction widens it
-before its commit. `publish` and `rewrite_published` leave it alone. It is recomputed from the
+before its commit. `publish` and `compact("published")` leave it alone. It is recomputed from the
 published table's manifests at the first `publish`, on a re-point, at `restore`, and at `open` for a log
 written before it existed. With no row, the published table is read.
 
@@ -530,7 +530,7 @@ whole time, but never reaching Parquet.
 ```python
 log.advance(*, flush=False) -> None
 log.seal(*, flush=False) -> int | None
-log.compact() -> None
+log.compact(table="staging") -> None             # "published": ad hoc, whole log
 log.publish(*, flush=False) -> None
 log.evict(table=None, *, start_offset=None, end_offset=None) -> None  # "buffer" | "staging"
 log.reclaim(table=None, *, min_free_ratio=0.0) -> None  # "buffer" | "staging" | "published"
@@ -594,7 +594,7 @@ A claim excludes only an overlapping claim, whatever its kind:
 | `reclaim()` | nothing for the expiry or the delete | nothing |
 | `sweep()` | nothing | nothing |
 | `set_config` | nothing: one `meta` row, read wherever a decision is made | nothing |
-| `rewrite_published`, `set_sort_by`, `retire` | the whole log | everything above |
+| `compact("published")`, `set_sort_by`, `retire` | the whole log | everything above |
 
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
@@ -604,7 +604,7 @@ takes no claim and never raises.
 
 ```python
 log.publish(*, flush: bool = False) -> None
-log.rewrite_published() -> None
+log.compact("published") -> None
 ```
 
 `publish` uploads the staging files compaction is finished with, registers them into the
@@ -614,7 +614,7 @@ published table holds. `flush=True` also pushes the trailing run that
 `stable_prefix` holds back for compaction — everything unpublished, not a subset, because the
 push walks a prefix and the watermark it records must stay contiguous. Use it to close a bulk
 load's tail on a log that has gone quiet; the cost is undersized objects the published table keeps
-until `rewrite_published` re-cuts them.
+until `compact("published")` re-cuts them.
 
 `publish` is lazy, restartable and arbitrarily far behind, and **no read
 depends on it**. All three raise `RuntimeError` when another owner holds the claim.
@@ -632,7 +632,7 @@ this disk already.
 reader on another machine caches what it reads instead; see `duckdb_connection`. Raising
 `staging_retention` applies to data captured afterwards.
 
-`rewrite_published` merges undersized files already in the published table. An operation, not a policy —
+`compact("published")` merges undersized files already in the published table. An operation, not a policy —
 nothing calls it on a schedule, and normal operation does not need it, because publish pushes
 only files compaction has finished with. It exists for the two things that break that on
 purpose: an explicit `seal()` stranding a small file, and a change to `target_compact_size`.
@@ -703,7 +703,7 @@ manifests, so no data file is opened and nothing extra is written or published.
 The tiers overlap in storage by design — the published table keeps a copy of the staging window, and a
 `wal_replication` seal keeps its rows in the buffer — so each row is counted from one place, as
 a read takes it. The one layout whose rows can't be separated is a published file straddling
-the local boundary, which only `rewrite_published` produces; its bounds still hold, and every
+the local boundary, which only `compact("published")` produces; its bounds still hold, and every
 count in `"published"` and `None` comes back `None` rather than doubled.
 
 **`"published"` is 0.5's `"archive"`, narrowed.** That was the whole archive, overlapping the
@@ -802,7 +802,7 @@ the maintenance claim, because a rewrite *is* a compaction.
 straddling the published table's extent, and nothing re-cuts a local straddler — so a
 re-sort changes the declarations and rewrites only what `publish` has not yet taken. Published
 data keeps the clustering it was written with, which is §6's "sealed once and never
-rewritten" applied to history. `rewrite_published` is not the other half: it re-ingests from
+rewritten" applied to history. `compact("published")` is not the other half: it re-ingests from
 the first badly-*sized* file onwards, so a well-sized published table is never a candidate.
 
 Passing the order the log already has, with `rewrite=True`, is not a no-op — it is how a
@@ -869,7 +869,7 @@ that is network-bound.
 
 **Changing it rewrites nothing and is safe on a live log.** Parquet records the codec per
 column chunk, so a table holding both reads correctly through `scan` and `sql`, and existing
-files are never touched. `rewrite_published` is what re-cuts history into the new codec, when
+files are never touched. `compact("published")` is what re-cuts history into the new codec, when
 the size is worth the transfer.
 
 ## Replication
@@ -962,7 +962,7 @@ readable; one it left mid-change is refused with the release that can finish it 
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
 `append`, `ingest`, `seal`, `await_seal`, `advance`, `compact`, `publish`, `evict`,
-`reclaim`, `sweep`, `rewrite_published`, `retire`, `set_config` and
+`reclaim`, `sweep`, `compact("published")`, `retire`, `set_config` and
 `set_sort_by` are absent from `LogHandle`.
 Everything observational and both read paths are there.
 
@@ -976,7 +976,7 @@ with overloads, and so does this, so the misuse is caught before it runs.
 intended topology; multiple machines write separate logs and readers union.
 
 **The claim decides who does the work, not the caller.** `advance`, its routines, `publish`,
-`rewrite_published`, `retire` and the three setters all coordinate through rows in
+`compact("published")`, `retire` and the three setters all coordinate through rows in
 SQLite, so a second caller is refused with `RuntimeError` rather than duplicating the work — and that holds
 between threads and between processes on identical terms.
 

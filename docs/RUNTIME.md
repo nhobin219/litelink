@@ -372,7 +372,7 @@ immutable and its neighbours are too big to merge with — so waiting achieves n
 Holding it blocked the published table permanently: everything after it is newer, so the watermark
 never advanced, and I4 pinned local disk with it.
 
-So the published table can gain one small file per explicit seal. `rewrite_published` is the tool
+So the published table can gain one small file per explicit seal. `compact("published")` is the tool
 for that, ad-hoc, and the same one that recompacts after a `target_compact_size` change.
 
 **What would change this.** Compaction rewriting everything downstream of an undersized
@@ -608,7 +608,7 @@ An UNCORRELATED key costs twice, and neither cost shows up in a benchmark of the
   offset order, so reading from an offset needs a sort after reading rather than a scan.
   For a log this is the primary access pattern, which makes it the expensive half.
 
-Both are properties of the first seal, not of any later rewrite. `rewrite_published` and
+Both are properties of the first seal, not of any later rewrite. `compact("published")` and
 `compact` re-sort what they rewrite, exactly as a seal does — they neither introduce this
 nor repair it.
 

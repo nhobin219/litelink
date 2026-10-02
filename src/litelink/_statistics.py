@@ -237,7 +237,7 @@ def below_staging(
 
     What eviction moved out of the staging table, and so what a read's
     published leg covers. A file that straddles the range — only
-    `rewrite_published` can cut one — is included whole: its bounds overstate,
+    `compact("published")` can cut one — is included whole: its bounds overstate,
     but its rows cannot be split from the staging copies without opening it.
     """
     beyond = []
@@ -301,7 +301,7 @@ def whole_log(
       themselves, exactly.
 
     One case cannot be split: a published file straddling the staging range,
-    which only `rewrite_published` re-cutting the published table can produce.
+    which only `compact("published")` re-cutting the published table can produce.
     Its rows are partly in staging too, so its bounds still hold — a bound over
     rows the log holds twice is a bound over rows it holds — but no count can
     be taken without double counting, and every count, `record_count`
