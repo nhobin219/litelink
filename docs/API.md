@@ -435,13 +435,15 @@ missing extension raises `ExtensionMissing`, naming how to provision it rather t
 three ways to supply them. Each call builds a new connection, about half a second of
 `LOAD iceberg`, so hold on to one.
 
-**A reader on another machine can cache what it reads from S3** (#118). A cache holds what is
-actually read, needs no write to either table, and survives restarts.
+**Reads are cached in memory, and a reader on another machine can also cache on disk** (#118).
+The memory cache is on for every connection, local reads included. The disk cache holds what is
+actually read from S3, needs no write to either table, and survives restarts; it needs
+`remote=True`, and asking for it without that raises `ValueError` rather than doing nothing.
 
 | Parameter | Default | Layer | Lifetime |
 | --- | --- | --- | --- |
-| `memory_cache` | on | DuckDB's external file cache | the connection's |
-| `disk_cache` | **off** | the `cache_httpfs` extension, on disk | across restarts and processes |
+| `memory_cache` | on, every connection | DuckDB's external file cache | the connection's |
+| `disk_cache` | **off**, and `remote=True` only | the `cache_httpfs` extension, on disk | across restarts and processes |
 
 - **Off by default, and never used by a log's own handles.** On the host that writes a log, a
   disk cache of its published table would put back on local disk exactly what eviction

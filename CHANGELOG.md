@@ -164,6 +164,11 @@ minor version carries breaking changes.
 
 ### Fixed
 
+- **`duckdb_connection` no longer ignores its cache flags without
+  `remote=True`.** `memory_cache=False` now turns the memory cache off on a
+  local connection too, and `disk_cache=True` without `remote=True` raises
+  `ValueError`: the disk cache wraps httpfs, which only a remote connection
+  loads.
 - **An expiry with nothing to expire no longer commits.** pyiceberg would
   write a new `metadata.json` and swap the catalog pointer on every pass.
 - **Expiry now deletes the manifests a commit merges away** (#111). With

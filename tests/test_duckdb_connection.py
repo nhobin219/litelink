@@ -305,12 +305,31 @@ def test_a_volume_limit_outside_zero_to_one_is_refused(limit: float) -> None:
         )
 
 
-def test_a_local_connection_installs_no_cache() -> None:
-    """Only an S3 published table goes through httpfs, so a local read path
-    loads no cache extension at all, whatever is asked."""
-    connection = litelink.duckdb_connection(disk_cache=True)
+def test_a_local_connection_caches_in_memory_and_honours_the_flag() -> None:
+    """Only an S3 published table goes through httpfs, so a local connection
+    loads no disk cache; the memory cache is on, and `memory_cache=False`
+    turns it off.
+
+    Falsify by applying `memory_cache` only to a remote connection: the second
+    connection reads true.
+    """
+    connection = litelink.duckdb_connection()
 
     assert "cache_httpfs" not in loaded(connection)
+    assert settings(connection)["enable_external_file_cache"] == "true"
+
+    off = litelink.duckdb_connection(memory_cache=False)
+    assert settings(off)["enable_external_file_cache"] == "false"
+
+
+def test_a_disk_cache_without_remote_is_refused() -> None:
+    """The disk cache wraps httpfs, which a local connection never loads, so
+    asking for one there is refused rather than silently ignored.
+
+    Falsify by dropping the check: the call returns a connection with no cache.
+    """
+    with pytest.raises(ValueError, match="remote=True"):
+        litelink.duckdb_connection(disk_cache=True)
 
 
 def test_the_cache_key_names_the_directory(

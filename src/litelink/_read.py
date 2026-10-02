@@ -338,7 +338,7 @@ class ReadCache:
 
 
 def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) -> None:
-    """Configure `connection` to cache S3 reads as `cache` says (#118).
+    """Configure `connection`'s read caches as `cache` says (#118).
 
     Two layers, because `cache_httpfs` runs ONE mode at a time:
 
@@ -367,8 +367,9 @@ def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) 
     shared. Its block size is left alone, since changing it invalidates every
     cached file.
 
-    Settings are GLOBAL so every cursor of `connection` gets them. Only an S3
-    published table goes through httpfs, so for a local one this is inert.
+    Settings are GLOBAL so every cursor of `connection` gets them. The memory
+    cache applies to every connection, local reads included; the disk cache
+    only to a remote one, since only S3 reads go through httpfs.
     """
     if cache.disk_cache:
         load_extension(connection, "cache_httpfs", remote=True)
@@ -425,11 +426,12 @@ def duckdb_connection(
     nobody installs are a connection with no secret, which reads S3 as
     anonymous and fails as a 403 at the first query rather than here.
 
-    **Reads from S3 can be cached** (#118), with `remote=True`, in two layers:
+    **Reads are cached** (#118), in two layers:
 
     - `memory_cache` (on): DuckDB's external file cache, for this
-      connection's lifetime.
-    - `disk_cache` (OFF): the bundled `cache_httpfs` extension on disk, in
+      connection's lifetime. Every connection, local reads included.
+    - `disk_cache` (OFF, and `remote=True` only): the bundled `cache_httpfs`
+      extension on disk, in
       `cache_directory(cache_key)`, surviving restarts and shared by every
       process using the same key. It evicts once its VOLUME is
       `disk_cache_volume_limit` full — counting everything on that volume,
@@ -450,6 +452,12 @@ def duckdb_connection(
     """
     if s3 is not None and not remote:
         msg = "s3 options are for a remote connection; pass remote=True as well"
+        raise ValueError(msg)
+
+    # Refused rather than ignored, like `s3`: the disk cache wraps httpfs, so
+    # a connection that never reads S3 would ask for one and get none.
+    if disk_cache and not remote:
+        msg = "disk_cache caches S3 reads; pass remote=True as well"
         raise ValueError(msg)
 
     cache = ReadCache(
@@ -473,7 +481,8 @@ def duckdb_connection(
     # slow path.
     if remote:
         install_s3_secret(connection, s3)
-        install_read_cache(connection, cache)
+
+    install_read_cache(connection, cache)
 
     return connection
 
