@@ -103,8 +103,8 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
-| **`+ WriteHandle`** — published table | `publish` · `rewrite_published` · `retire` |
-| **`+ WriteHandle`** — configure | `set_config` · `set_published` · `set_sort_by` |
+| **`+ WriteHandle`** — published table | `publish` · `retire` |
+| **`+ WriteHandle`** — configure | `set_config` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
 
 `await_seal` is deliberately a `WriteHandle` method: it *helps* drain the queue each round
@@ -150,9 +150,9 @@ later backfill can fill (§13). There is deliberately no way to re-seed a log af
 guard that would refuse it reads the offsets currently BUFFERED, which a seal empties, so it
 cannot tell an unused offset from an issued one.
 
-`sort_by` is set here and only here; it is a read-shape decision rather than a knob (§7), and
-changing it later rewrites the staging table's files — see `set_sort_by` for what that does not
-reach. `schema` is your columns — the library prepends
+`sort_by` is set here and only here, and fixed for the log's life, like the schema and the
+published table: it is a read-shape decision rather than a knob (§7), and a different order is
+a new log started where this one ends. `schema` is your columns — the library prepends
 `litelink_offset` itself, and refuses a schema that declares it (I11).
 
 **`open` recovers before it returns**, finishing whatever a crash interrupted. It raises
@@ -319,8 +319,8 @@ next `ingest`.
 
 **A load that fails costs its reservation.** The offsets of the file being written are gone,
 leaving a gap. Files stay non-overlapping and adjacent in offset order, which is what §6
-needs; the one price is that compaction will merge across a gap and such a file can never be
-re-cut by `rewrite_published`.
+needs; the one price is that compaction will merge across a gap, and the published table
+keeps that file as written.
 
 ## Reading
 
@@ -377,7 +377,7 @@ predicate rather than the handle, so the same unbounded query reads the publishe
 has moved its rows there. A bounded hot query stays local however much has been evicted.
 
 The published table's row changes when eviction moves rows below the staging table: eviction widens it
-before its commit. `publish` and `rewrite_published` leave it alone. It is recomputed from the
+before its commit. `publish` leaves it alone. It is recomputed from the
 published table's manifests at the first `publish`, on a re-point, at `restore`, and at `open` for a log
 written before it existed. With no row, the published table is read.
 
@@ -530,7 +530,7 @@ whole time, but never reaching Parquet.
 ```python
 log.advance(*, flush=False) -> None
 log.seal(*, flush=False) -> int | None
-log.compact() -> None
+log.compact() -> None                            # staging; the published table is never rewritten
 log.publish(*, flush=False) -> None
 log.evict(table=None, *, start_offset=None, end_offset=None) -> None  # "buffer" | "staging"
 log.reclaim(table=None, *, min_free_ratio=0.0) -> None  # "buffer" | "staging" | "published"
@@ -582,6 +582,20 @@ network.** Each takes only the exclusion it needs: a claim on the offsets it tou
 argument, None meaning every table it acts on, rather than one function per table; a misspelt
 table, or one the routine does not act on, raises `ValueError`.
 
+**What each routine excludes**, so an orchestrator can see what may run side by side (SPEC §4a).
+A claim excludes only an overlapping claim, whatever its kind:
+
+| Routine | Claims | So it waits for |
+| --- | --- | --- |
+| `seal()` | the range it seals, above staging's end | nothing but another seal of that range |
+| `compact()` | each run it merges | a publish of those files, another compaction of the run |
+| `publish()` | `[published floor, end of what it pushes)`; the whole log when it must write the tier row | compaction of those files, another publish, the whole-log operations |
+| `evict()` | the prefix it removes | anything overlapping that prefix |
+| `reclaim()` | nothing for the expiry or the delete | nothing |
+| `sweep()` | nothing | nothing |
+| `set_config` | nothing: one `meta` row, read wherever a decision is made | nothing |
+| `retire`, `ingest` | the whole log | everything above |
+
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
 takes no claim and never raises.
@@ -590,7 +604,6 @@ takes no claim and never raises.
 
 ```python
 log.publish(*, flush: bool = False) -> None
-log.rewrite_published() -> None
 ```
 
 `publish` uploads the staging files compaction is finished with, registers them into the
@@ -599,8 +612,7 @@ replicated: a file is pushed once it is settled, and compaction will not merge w
 published table holds. `flush=True` also pushes the trailing run that
 `stable_prefix` holds back for compaction — everything unpublished, not a subset, because the
 push walks a prefix and the watermark it records must stay contiguous. Use it to close a bulk
-load's tail on a log that has gone quiet; the cost is undersized objects the published table keeps
-until `rewrite_published` re-cuts them.
+load's tail on a log that has gone quiet; the cost is undersized objects the published table keeps.
 
 `publish` is lazy, restartable and arbitrarily far behind, and **no read
 depends on it**. All three raise `RuntimeError` when another owner holds the claim.
@@ -618,10 +630,12 @@ this disk already.
 reader on another machine caches what it reads instead; see `duckdb_connection`. Raising
 `staging_retention` applies to data captured afterwards.
 
-`rewrite_published` merges undersized files already in the published table. An operation, not a policy —
-nothing calls it on a schedule, and normal operation does not need it, because publish pushes
-only files compaction has finished with. It exists for the two things that break that on
-purpose: an explicit `seal()` stranding a small file, and a change to `target_compact_size`.
+**The published table is never rewritten.** It is the log's immutable record, and well-sized by
+construction, since `publish` pushes only files compaction has finished with. The few things
+that leave a smaller file there — a flushed seal or publish, a bulk load's tail, a raised
+`target_compact_size` — leave it as written. To re-cut a log's history at another size, backfill
+it into a new log created with the target you want and `start_offset` at the old log's first
+offset, then `ingest` the old log's rows in offset order, which lands them at the same offsets.
 
 ## Observing
 
@@ -689,7 +703,7 @@ manifests, so no data file is opened and nothing extra is written or published.
 The tiers overlap in storage by design — the published table keeps a copy of the staging window, and a
 `wal_replication` seal keeps its rows in the buffer — so each row is counted from one place, as
 a read takes it. The one layout whose rows can't be separated is a published file straddling
-the local boundary, which only `rewrite_published` produces; its bounds still hold, and every
+the local boundary, which only a re-cut by an earlier version produces; its bounds still hold, and every
 count in `"published"` and `None` comes back `None` rather than doubled.
 
 **`"published"` is 0.5's `"archive"`, narrowed.** That was the whole archive, overlapping the
@@ -751,11 +765,9 @@ says to regenerate the config (see RUNTIME.md).
 ```python
 log.config -> LogConfig
 log.set_config(config) -> None
-log.published -> str                            # s3://… or file://…
-log.set_published(published) -> None              # None: the local default
+log.published -> str                            # s3://… or file://…, fixed at new()
 log.schema -> pa.Schema                       # your columns, as declared at new()
-log.sort_by -> tuple[str, ...]
-log.set_sort_by(sort_by, *, rewrite) -> None
+log.sort_by -> tuple[str, ...]                # fixed at new()
 ```
 
 **Everything `new` took, the log gives back**, which is what lets `open` take none of it.
@@ -763,42 +775,21 @@ log.set_sort_by(sort_by, *, rewrite) -> None
 `sort_by` is the one §7 tells you to bound every scan on a leading column of, which is advice
 no caller can follow without being able to ask.
 
-`sort_by` reads `meta` on every access, like `config` and `published`. That is not a detail of
-the getter: the seal, compaction and the published table's own declaration all read the same one
-place, so `set_sort_by` in one process cannot leave a maintainer in another clustering files
-by the key it happened to open with.
+`sort_by` reads `meta` on every access, like `config` and `published`: the seal, compaction and
+the tables' own declarations all read the same one place.
 
 **There is exactly one copy of the policy, and it is a row in SQLite.** Every decision reads
 it from there rather than from memory, so `set_config` in one process is seen by the writer's
 next append and the maintainer's next pass, and nothing can hold a stale one.
 
-`set_config` and `set_published` take the whole-log claim, so they cannot interleave with a
-publish, a merge or an eviction. Both wait for maintenance rather than failing on the first try,
-because the shipped writer calls `set_published` on every restart while a maintainer runs
-elsewhere.
+`set_config` takes no claim. Every setting governs future work only, so a change takes effect
+at the next decision that reads it, and a log whose policy changed mid-stream reads exactly
+like one that never did.
 
-**There is no detached state.** `set_published(None)` points the log back at its local default,
-and I4 holds across every move: nothing leaves the staging table until the published table it now
-points at holds it. **A move opens its new table before recording it** — creating it, or
-adopting one through its `version-hint.text` — so a move that cannot reach it raises with
-nothing changed. Re-stating the current location does nothing at all — no claim, no write,
-no network — so a writer that declares its published table on every restart never waits on
-maintenance or an outage for it.
-
-`set_sort_by` re-clusters what the staging table owns, so `rewrite` must be passed explicitly
-and `rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under
-the maintenance claim, because a rewrite *is* a compaction.
-
-**It does not re-cluster the published prefix.** A local rewrite there would commit a file
-straddling the published table's extent, and nothing re-cuts a local straddler — so a
-re-sort changes the declarations and rewrites only what `publish` has not yet taken. Published
-data keeps the clustering it was written with, which is §6's "sealed once and never
-rewritten" applied to history. `rewrite_published` is not the other half: it re-ingests from
-the first badly-*sized* file onwards, so a well-sized published table is never a candidate.
-
-Passing the order the log already has, with `rewrite=True`, is not a no-op — it is how a
-re-sort that died after the `meta` write is finished, since that crash leaves the
-declarations correct and the files not.
+**The schema, sort order and published table are fixed when the log is created.** To change
+any of them, `retire()` the log and start a new one where it ended,
+`new(root, "trades-v2", schema=…, sort_by=…, published=…, start_offset=old.end_offset())`. Offsets
+stay dense across the two, and any engine reads both as one sequence.
 
 ### LogConfig
 
@@ -841,7 +832,7 @@ can absorb that. A writer with no WAL replica can leave it None for ever and los
 but disk. 0.5 is the value to reach for: the win scales with what is reclaimed and the cost
 with what is kept, so the trade only improves above it.
 
-**`compression` governs every data file** — a seal, a compaction, a published rewrite, a bulk
+**`compression` governs every data file** — a seal, a compaction, a bulk
 ingest. It is a setting rather than a constant because the right answer is a property of the
 payload: a text or JSON column is what zstd crushes, and §15.5 requires `none` for blob
 columns, where a codec spends CPU proving that already-compressed bytes are incompressible.
@@ -860,8 +851,7 @@ that is network-bound.
 
 **Changing it rewrites nothing and is safe on a live log.** Parquet records the codec per
 column chunk, so a table holding both reads correctly through `scan` and `sql`, and existing
-files are never touched. `rewrite_published` is what re-cuts history into the new codec, when
-the size is worth the transfer.
+files are never touched: a new codec applies to what is written from then on.
 
 ## Replication
 
@@ -953,8 +943,7 @@ readable; one it left mid-change is refused with the release that can finish it 
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
 `append`, `ingest`, `seal`, `await_seal`, `advance`, `compact`, `publish`, `evict`,
-`reclaim`, `sweep`, `rewrite_published`, `retire`, `set_config`, `set_published` and
-`set_sort_by` are absent from `LogHandle`.
+`reclaim`, `sweep`, `retire` and `set_config` are absent from `LogHandle`.
 Everything observational and both read paths are there.
 
 This is the difference from the older `Log.open(read_only=True)`, which returned ONE class
@@ -967,7 +956,7 @@ with overloads, and so does this, so the misuse is caught before it runs.
 intended topology; multiple machines write separate logs and readers union.
 
 **The claim decides who does the work, not the caller.** `advance`, its routines, `publish`,
-`rewrite_published`, `retire` and the three setters all coordinate through rows in
+`retire` and `ingest` all coordinate through rows in
 SQLite, so a second caller is refused with `RuntimeError` rather than duplicating the work — and that holds
 between threads and between processes on identical terms.
 

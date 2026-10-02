@@ -610,33 +610,6 @@ def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
         )
 
 
-def test_a_rewrite_never_writes_over_the_file_it_is_reading(tmp_path: Path) -> None:
-    """A compaction's source is the file it replaces. A seal's is the buffer.
-
-    That difference is why a seal may overwrite its path on retry and a
-    compaction may not. With a deterministic `{lo}-{hi}` name, re-compacting a
-    range that had already been compacted wrote to the path it was reading:
-    `set_sort_by(rewrite=True)` after any compaction truncated the live,
-    table-referenced file, and a crash mid-write destroyed the only copy of
-    those rows. Two owners racing the role hit the same collision.
-    """
-    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        log.advance()
-
-        before = [f.path for f in log._table.data_files()]
-
-        assert len(before) == 1, "expected one compacted file to rewrite"
-
-        log.set_sort_by(("key", "event_ts"), rewrite=True)
-        after = [f.path for f in log._table.data_files()]
-
-        assert len(after) == 1
-        assert after[0] != before[0], "the rewrite reused the live file's path"
-        assert len(read_all(log)) == 12
-
-
 def sized(*sizes: int) -> tuple[list[DataFile], dict[str, int]]:
     """Files holding the given uncompressed sizes, adjacent and in order.
 
@@ -1193,99 +1166,6 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
         log.close()
 
 
-def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None:
-    """A re-point changes where the NEXT file goes, and nothing else (§4a).
-
-    The frontier this replaces had to be reset, because it named ranges of the
-    published table being left — and that reset was the only backwards boundary move in
-    the log, which is what made every reader that had cached the old position
-    wrong at once. Per segment there is nothing to reset: files already pushed
-    keep naming the bucket that holds them.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        published=f"file://{tmp_path}/prefix",
-    )
-    with log:
-        seal_files(log, 2)
-        first = min(log._table.data_files(), key=lambda f: f.start)
-        log._buffer.record_file(
-            f"file://{tmp_path}/prefix/data/{first.start}.parquet",
-            first.start,
-            first.end,
-            1,
-        )
-        local = log._table.data_files()
-
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == first.end
-        )
-
-        log.set_published(f"file://{tmp_path}/elsewhere")
-
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == 0
-        ), "the new published table holds nothing, and says so without any reset"
-
-        log.set_published(f"file://{tmp_path}/prefix")
-
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == first.end
-        ), "pointing back finds the copies still recorded where they are"
-
-
-def test_rewriting_the_published_table_does_not_strand_staging_eviction(
-    tmp_path: Path,
-) -> None:
-    """The two tiers cut the same rows independently, and I4 must not care.
-
-    `rewrite_published` re-cuts the published table to different boundaries — that is its
-    whole job. Asking whether a local file's range EQUALS a published one then
-    failed for every local file, permanently: eviction clamped to zero and
-    stopped, and compaction stopped treating published files as the published table's
-    business and merged across its extent. Neither heals, because nothing ever
-    re-cuts the published table back.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        published="s3://bucket/prefix",
-    )
-    with log:
-        seal_files(log, 3, per_file=4)
-        files = sorted(log._table.data_files(), key=lambda f: f.start)
-
-        assert len(files) == 3
-
-        # The published table holds every row of all three, cut its own way: two files
-        # whose boundaries line up with none of the local ones.
-        start, end = files[0].start, files[-1].end
-        middle = files[1].start + 1
-        log._buffer.record_file("s3://bucket/prefix/data/a.parquet", start, middle, 1)
-        log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, end, 1)
-
-        assert (
-            log._maintenance.published_prefix(
-                files, log._published.uri, include_intents=False
-            )
-            == end
-        ), "the published table holds every row; how it cut them is not I4's business"
-
-
 def test_a_gap_in_the_published_table_stops_the_walk(tmp_path: Path) -> None:
     """Coverage must join adjacent files without inventing rows between them."""
     log = litelink.new(
@@ -1342,7 +1222,7 @@ def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
 
         assert remaining < rows_before, "the setup must actually evict"
 
-        log._maintenance._rewrite_run(log._table, run, None)
+        log._maintenance._rewrite_run(log._table, run)
 
         assert len(read_all(log)) == remaining, (
             "the merge put back rows eviction had removed"
@@ -1438,50 +1318,16 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
         assert log.staging_files() == before, "committed without holding the claim"
 
 
-def test_an_outer_renew_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
-    """`renew or claim.renew` read naturally and was wrong.
-
-    A rewrite run under the whole-log lease — `rewrite_published`,
-    `rewrite_sorted` — passes that lease's `renew` down. Taking it in place of
-    the run claim's stopped the run claim from being renewed at all, and the
-    pre-commit check then consulted the outer claim instead. A merge over the
-    TTL lost its exclusion with no stall required.
-
-    Falsify by making `_both` return `theirs` when it is given: no run claim
-    is renewed.
-    """
-    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        run = sorted(log._table.data_files(), key=lambda f: f.start)
-        renewed: list[int] = []
-        original = Claim.renew
-
-        def counting(self: Claim) -> bool:
-            renewed.append(self.row_id or 0)
-
-            return original(self)
-
-        Claim.renew = counting
-        try:
-            log._maintenance._rewrite_run(log._table, run, lambda: True)
-
-        finally:
-            Claim.renew = original
-
-        assert renewed, "the run claim was never renewed while a merge ran"
-
-
-def test_drain_will_not_unlink_while_another_owner_holds_the_log(
+def test_drain_needs_no_claim_and_still_keeps_what_is_referenced(
     tmp_path: Path,
 ) -> None:
-    """The unlink is not metadata, so it declares like everything else (§4a).
+    """`drain` takes no claim (#118): a queued name can never become
+    referenced again, so the veto plus the grace period are the whole of its
+    safety. It runs while another owner holds the entire log — and a due entry
+    that a live snapshot still references is kept, not unlinked.
 
-    Expiry is safe claimless — a metadata commit that CAS orders, idempotent.
-    The deletion that follows it is not. The case the claim was written for —
-    `hydrate` re-registering a queued name between the veto and the unlink —
-    went with `hydrate` (#118); this pins the claim until the second half of
-    #118 decides whether anything else needs it.
+    Falsify by dropping the reference veto in `drain`: the live file is
+    unlinked and the log can no longer read its rows.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
@@ -1491,138 +1337,33 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.compact()
-
-        queued = log._buffer.due_deletions(2**62)
-
-        assert queued, "expected superseded files awaiting deletion"
+        live = log._table.data_files()[0]
+        # Queued with a stamp long past, while the current snapshot names it:
+        # what a compaction's recovery leaves when the commit had in fact
+        # landed.
+        log._buffer.enqueue_deletions([log._maintenance._key(live.path)], 0)
+        superseded = [
+            p
+            for p in log._buffer.due_deletions(2**62)
+            if p != log._maintenance._key(live.path)
+        ]
+        assert superseded, "expected superseded files awaiting deletion"
 
         other = Claim(
             log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
         )
-
         assert other.acquire()
-
         try:
-            log.reclaim()
-
-            # Expiry queues MORE as it goes, so what matters is that the
-            # entries already due are still due: nothing was unlinked.
-            assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
-                "unlinked while another owner held the log"
-            )
+            # Expires the snapshot that still named them, then drains.
+            log.reclaim("staging")
         finally:
             other.release()
 
-        log.reclaim()
-
-        assert not set(queued) & set(log._buffer.due_deletions(2**62)), (
-            "never drained once the log was free"
-        )
-
-
-def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
-    """The unlink is this pass's commit, so the claim is asked again at it.
-
-    Everything slow in a drain sits between the veto being read and the
-    deletions — opening the published table, walking its manifests, one remote round
-    trip per queued object. Past the TTL another owner may lawfully take the
-    whole log; a drain holding a dead claim must stop rather than unlink
-    against a veto read under it.
-    """
-    config = LogConfig(
-        target_seal_size=1 << 30,
-        compact_min_files=2,
-        staging_snapshot_retention=timedelta(0),
-    )
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        log.compact()
-        queued = log._buffer.due_deletions(2**62)
-
-        assert queued, "expected superseded files awaiting deletion"
-
-        # The claim is taken and then lost, the way a slow remote leg loses it.
-        original = Claim.acquire
-        stolen: list[Claim] = []
-
-        def losing(self: Claim) -> bool:
-            if not original(self):
-                return False
-
-            if self.kind != "drain":
-                return True
-
-            with self.lock:
-                self.connection.execute(
-                    "UPDATE claim SET expires_at = 1 WHERE id = ?", (self.row_id,)
-                )
-
-            rival = Claim(
-                self.connection, self.lock, "maintain", 0, EVERYTHING, new_owner()
-            )
-            assert original(rival)
-            stolen.append(rival)
-
-            return True
-
-        Claim.acquire = losing
-        try:
-            with pytest.raises(RuntimeError, match="lost the"):
-                log.reclaim()
-
-        finally:
-            Claim.acquire = original
-            for rival in stolen:
-                rival.release()
-
-        assert set(queued) <= set(log._buffer.due_deletions(2**62)), (
-            "deleted while another owner held the log"
-        )
-
-
-def test_eviction_reads_the_published_table_under_its_own_claim(tmp_path: Path) -> None:
-    """Everything that decides a deletion is read under the claim, or it is a
-    statement about the past.
-
-    `publish` learned this for itself — under the claim, not before it — and
-    eviction acts on the same fact. The window is not narrow: `set_published` is
-    documented as something the shipped writer calls on every restart, and it
-    takes the whole log, which is free precisely while eviction holds nothing.
-    Attaching a published table between the read and the acquire left eviction
-    deleting the only copy of every aged row the new published table was configured to
-    receive — and publish can never push them afterwards, because they have left
-    the table.
-    """
-    config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        # Published to the local default, so the published table eviction reads first
-        # holds every file and would let it drop all but the newest.
-        log.publish(flush=True)
-        before = log.staging_files()
-
-        assert before == 3
-
-        # The log is re-pointed between eviction's read and its claim, at a
-        # published table holding nothing.
-        original = Claim.acquire
-
-        def attaching(self: Claim) -> bool:
-            if self.kind == "evict":
-                log._buffer.set_meta("published", "s3://bucket/prefix")
-
-            return original(self)
-
-        Claim.acquire = attaching
-        try:
-            log.evict()
-
-        finally:
-            Claim.acquire = original
-
-        assert log.staging_files() == before, (
-            "evicted on the strength of a published table the log had just left"
-        )
+        due = set(log._buffer.due_deletions(2**62))
+        assert not set(superseded) & due, "drain waited on another owner's claim"
+        assert Path(live.path).exists(), "a referenced file was unlinked"
+        assert log._maintenance._key(live.path) in due, "and it stays queued"
+        assert len(read_all(log)) == 12
 
 
 def test_eviction_reads_the_policy_the_log_records(tmp_path: Path) -> None:

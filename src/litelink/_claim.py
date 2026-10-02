@@ -52,8 +52,8 @@ if TYPE_CHECKING:
 DEFAULT_TTL_MS = 30_000
 
 # Above every offset the log will ever assign. What an operation claims when it
-# is not an operation on an interval at all — a re-point, a config change, a
-# published rewrite, a drain — so that it excludes every pass rather than
+# is not an operation on an interval at all — retiring the log, a bulk load —
+# so that it excludes every pass rather than
 # commuting with one it has nothing in common with.
 EVERYTHING = 1 << 62
 

@@ -29,9 +29,8 @@ published table holds below the staging table costs a read that finds nothing;
 one that claims less loses rows. So eviction WIDENS the row before the commit
 that moves rows below the staging table, and the one write that narrows — an
 exact rollup from the published table's manifests — runs only under the
-whole-log maintenance claim, where eviction cannot run beside it. `publish` and
-`rewrite_published` never change it: one adds copies of rows the staging table
-still holds, the other re-cuts rows the published table already has.
+whole-log maintenance claim, where eviction cannot run beside it. `publish` never
+changes it: it adds copies of rows the staging table still holds.
 
 **A missing row means "no statistics", and nothing turns it into a row but an
 exact rollup.** Widening a row that is not there would describe only the rows

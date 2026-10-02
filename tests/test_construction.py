@@ -9,21 +9,17 @@ having them as parameters is for.
 from __future__ import annotations
 
 import json
-import threading
-import time
 from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
 import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._buffer import SORT_KEY, Buffer
-from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._handle import table_schema, validate
 from litelink._layout import Layout, validate_published
 from litelink._maintenance import Maintenance
@@ -76,7 +72,7 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     config = LogConfig()
     # Local-only, and still a real object: the reader, the maintainer and the
     # WriteHandle are handed the same one. It stores no location — it reads the log's,
-    # so `set_published` reaches all three by writing one row.
+    # which is fixed when the log is created.
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
     published = Published(layout, buffer, S3Options())
     log = WriteHandle(
@@ -271,68 +267,10 @@ def test_set_config_validates(tmp_path: Path) -> None:
         assert log.config == LogConfig(), "a rejected config must not be applied"
 
 
-def test_set_published_persists(tmp_path: Path) -> None:
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.set_published(f"file://{tmp_path}/x")
-
-    with litelink.open(tmp_path, "s") as reopened:
-        assert reopened._published.uri == f"file://{tmp_path}/x"
-        reopened.set_published(None)
-
-    with litelink.open(tmp_path, "s") as detached:
-        assert detached._published.uri == Layout(tmp_path, "s").default_published
-
-
 def test_sort_by_is_declared_on_the_table(tmp_path: Path) -> None:
     """§4: declared as table metadata AND applied at write time."""
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("key", "event_ts")) as log:
         assert log._table.sort_by() == ("key", "event_ts")
-
-
-def test_changing_sort_by_requires_an_explicit_rewrite(tmp_path: Path) -> None:
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        with pytest.raises(ValueError, match="rewrite=True"):
-            log.set_sort_by(("key",), rewrite=False)
-
-        assert log.sort_by == ("event_ts",), "refused change must not apply"
-
-
-def test_changing_sort_by_re_clusters_existing_files(tmp_path: Path) -> None:
-    """The reason it cannot be a declaration alone (§7).
-
-    Clustering is baked into each file when written, so a new order that only
-    changed the metadata would leave every existing file sorted the old way —
-    the same predicate fast on new data and slow on old, with nothing to say
-    why.
-    """
-    import pyarrow.parquet as pq
-
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.extend(
-            [
-                {"event_ts": 3, "key": "a"},
-                {"event_ts": 1, "key": "c"},
-                {"event_ts": 2, "key": "b"},
-            ]
-        )
-        log.seal(flush=True)
-
-        written = next(tmp_path.rglob("*/data/*.parquet"))
-        assert pq.read_table(written)["event_ts"].to_pylist() == [1, 2, 3]
-
-        log.set_sort_by(("key",), rewrite=True)
-
-        assert log.sort_by == ("key",)
-        assert log._table.sort_by() == ("key",)
-        merged = next(tmp_path.rglob("*compacted*/*.parquet"))
-        assert pq.read_table(merged)["key"].to_pylist() == ["a", "b", "c"]
-        # Reads are unaffected: order is by offset, and every row survives.
-        rows = log.scan().read_all()
-        assert rows["litelink_offset"].to_pylist() == [1, 2, 3]
-        assert rows.num_rows == 3
-
-    with litelink.open(tmp_path, "s") as reopened:
-        assert reopened.sort_by == ("key",), "the new order must survive a reopen"
 
 
 def test_the_reserved_column_name_avoids_duckdbs_parser(tmp_path: Path) -> None:
@@ -413,23 +351,6 @@ def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
         buffer.close()
 
 
-def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
-    """For a buffer whose rows still exist somewhere else.
-
-    The published rewrite re-cuts through a scratch buffer whose every row came
-    from the published table and is still in it until the rewrite's final commit, so a
-    crash there costs a re-run rather than data. 0 is OFF. WAL stays either
-    way: the read-only handle is a second connection to the same file, which is
-    what WAL is for here — not durability.
-    """
-    buffer = Buffer.open(tmp_path / "scratch.db", SCHEMA, durable=False)
-    try:
-        assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 0
-        assert buffer._con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    finally:
-        buffer.close()
-
-
 def test_a_config_written_without_a_setting_still_opens() -> None:
     """Adding a setting must not make existing logs unopenable.
 
@@ -494,7 +415,6 @@ def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:
         layout.catalog_db,
         layout.published_db,
     }
-    assert layout.rewrite_db not in layout.databases
     assert all(path.suffix == ".db" for path in layout.databases)
 
 
@@ -828,69 +748,6 @@ def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> N
         assert log.scan().read_all().num_rows == 8, "evicted under a generous floor"
 
 
-def test_two_processes_cannot_assemble_the_pair_validate_refuses(
-    tmp_path: Path,
-) -> None:
-    """`validate` refuses a PAIR, so both halves must be read durably.
-
-    Each setter checked its own new half against this process's memory of the
-    other, so two handles could assemble the refused combination between them:
-    one attaches an evict-on-upload policy while a published table is configured, the
-    other detaches the published table against a policy it read before that. The next
-    maintenance pass then executes it and deletes the only copy of everything.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        published="s3://bucket/prefix",
-    )
-    with log, litelink.open(tmp_path, "s") as other:
-        # `other` opened while a remote published table was configured and a normal
-        # policy was in force; it still remembers both.
-        log.set_config(LogConfig(wal_replication=True))
-
-        with pytest.raises(ValueError, match="remote published table"):
-            other.set_published(None)
-
-
-def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) -> None:
-    """Reading the other half durably is not enough; the check must be atomic.
-
-    `validate` refuses a PAIR, and each setter reads the other half from
-    `meta`. Read and write as two transactions with nothing between them and
-    the check is only a statement about the past: each call passes against a
-    state the other is about to change, and between them they assemble the very
-    pair neither would accept. The next maintenance pass then executes it and
-    deletes the only copy of everything sealed.
-
-    Both setters take the same claim now, so the interleaving cannot happen —
-    modelled here by holding that claim while the second call runs.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        published="s3://bucket/prefix",
-    )
-    with log:
-        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
-        held = log._lease("maintain")
-
-        assert held.acquire()
-
-        try:
-            # Bounded: it waits for maintenance rather than refusing outright,
-            # and reports rather than hanging when the wait runs out.
-            with pytest.raises(RuntimeError, match="has held a claim"):
-                log.set_config(LogConfig(staging_rows=0))
-
-        finally:
-            held.release()
-
-
 @pytest.mark.parametrize(
     "name", ["staging_snapshot_retention", "published_snapshot_retention"]
 )
@@ -921,98 +778,8 @@ def test_negative_snapshot_retention_is_refused(tmp_path: Path, name: str) -> No
     ).close()
 
 
-def test_a_configuration_change_waits_for_maintenance(tmp_path: Path) -> None:
-    """It waits rather than refusing on the first try.
-
-    The two setters share a claim because `validate` refuses a pair, but they
-    also collide with ordinary maintenance — and the shipped writer calls both
-    on every restart while a maintainer runs continuously. Measured before this
-    wait existed: one startup in six failed, which turns a routine restart into
-    a coin toss.
-    """
-    log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
-    with log:
-        log._settings_wait = 5.0  # ty: ignore[unresolved-attribute]
-        held = log._lease("maintain")
-
-        assert held.acquire()
-
-        released = threading.Event()
-
-        def let_go() -> None:
-            time.sleep(0.3)
-            held.release()
-            released.set()
-
-        thread = threading.Thread(target=let_go)
-        thread.start()
-        try:
-            log.set_config(LogConfig(staging_rows=500))
-
-            assert released.is_set(), "returned before the holder let go"
-            assert log.config.staging_rows == 500
-        finally:
-            thread.join(timeout=5)
-
-
-def test_a_setter_that_lost_its_claim_does_not_write(tmp_path: Path) -> None:
-    """The claim makes the read and the write one decision only while it is held.
-
-    Both setters read the other half, validate the pair, then write. A stall
-    past the TTL between the read and the write is the threat the TTL exists
-    for: the other setter takes the lapsed claim lawfully, validates against
-    the half this one has not written yet, writes its own — and between them
-    they record the pair `validate` just refused, which the next maintenance
-    pass carries out. Every data commit already asks the claim again at the
-    write; the setters stopped one line short.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        published="s3://bucket/prefix",
-    )
-    with log:
-        before = log.config.staging_rows
-        original = log._buffer.get_meta
-        rivals: list[Claim] = []
-
-        def losing(key: str) -> str | None:
-            # Between the read of the other half and the write: the claim
-            # lapses and another owner takes it.
-            if key == "published" and not rivals:
-                with log._buffer._lock:
-                    log._buffer._con.execute("UPDATE claim SET expires_at = 1")
-
-                rival = Claim(
-                    log._buffer._con,
-                    log._buffer._lock,
-                    "maintain",
-                    0,
-                    EVERYTHING,
-                    new_owner(),
-                )
-                assert rival.acquire()
-                rivals.append(rival)
-
-            return original(key)
-
-        log._buffer.get_meta = losing  # ty: ignore[invalid-assignment]
-        try:
-            with pytest.raises(RuntimeError, match="lost the claim"):
-                log.set_config(LogConfig(staging_rows=7))
-
-        finally:
-            log._buffer.get_meta = original  # ty: ignore[invalid-assignment]
-            for rival in rivals:
-                rival.release()
-
-        assert log.config.staging_rows == before, "wrote without holding the claim"
-
-
 def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -> None:
-    """Neither the policy nor the published location is copied into a process.
+    """The policy is not copied into a process.
 
     This is the property that replaces twelve `refresh` calls. Each of them
     existed to drag a process-local copy back into agreement with the log, and
@@ -1028,15 +795,11 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
     )
     with first, litelink.open(tmp_path, "s") as second:
         assert second.config.staging_rows is None
-        default = second._published.uri
 
         first.set_config(LogConfig(staging_rows=4242))
-        first.set_published(f"file://{tmp_path}/prefix")
 
         # `second` was never told, and never asked.
         assert second.config.staging_rows == 4242
-        assert default != second._published.uri
-        assert second._published.uri == f"file://{tmp_path}/prefix"
         assert second._maintenance.config.staging_rows == 4242
         assert second._buffer.config().staging_rows == 4242
 
@@ -1092,68 +855,6 @@ def test_a_log_with_no_stored_sort_order_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="no stored sort order"):
         litelink.open(tmp_path, "s")
-
-
-def test_clearing_the_sort_order_clears_both_records(tmp_path: Path) -> None:
-    """An empty order is a value, not a no-op.
-
-    `set_sort_order` used to return early on it, so `set_sort_by((),
-    rewrite=True)` re-clustered every file and left the table declaring the old
-    key. Harmless while `open` read that declaration and reverted; permanent
-    once `meta` is the source of truth, because nothing would reconcile them.
-    """
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        log.extend([{"event_ts": i, "key": f"k{i}"} for i in range(20)])
-        log.set_sort_by((), rewrite=True)
-
-        assert log._table.sort_by() == ()  # noqa: SLF001
-        assert log._buffer.get_meta("sort_by") == "[]"  # noqa: SLF001
-
-    with litelink.open(tmp_path, "s") as reopened:
-        assert reopened.sort_by == ()  # noqa: SLF001
-
-
-def test_a_rewrite_finishes_a_re_sort_that_died_after_the_meta_write(
-    tmp_path: Path,
-) -> None:
-    """The one crash gap in `set_sort_by` that nothing used to heal.
-
-    `set_sort_by` writes `meta` LAST, so a crash before it leaves the log
-    deciding by the old key and a retry completes the operation. A crash AFTER
-    it does not: the declarations say the new key, every existing file is still
-    in the old one, and the natural retry used to find the orders equal and
-    return without doing anything. Silent, permanent, and a §7 lie — a
-    predicate on the declared leading column pruning nothing, on exactly the
-    files the rewrite never reached.
-
-    Reproduced by a review pass, so this asserts the ROWS rather than the
-    declarations: both of those already said the right thing in the broken
-    state, which is what made it silent.
-    """
-    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
-        # `key` descending as `event_ts` ascends, so the two clusterings are
-        # distinguishable and neither is the insertion order by accident.
-        log.extend([{"event_ts": i, "key": f"k{20 - i:02d}"} for i in range(20)])
-        while log.seal(flush=True) is not None:
-            pass
-
-        # The state a crash after the `meta` write leaves: both declarations
-        # carry the new key, the file carries the old clustering.
-        log._table.set_sort_order(("key",))  # noqa: SLF001
-        log._buffer.set_meta("sort_by", json.dumps(["key"]))  # noqa: SLF001
-
-        written = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
-        keys = written.column("key").to_pylist()
-        assert keys != sorted(keys), "the file was already re-clustered"
-        assert log.sort_by == ("key",), "the declaration did not survive"
-
-        # The retry. Same order the log already declares, which is precisely
-        # the call that used to do nothing.
-        log.set_sort_by(("key",), rewrite=True)
-
-        rewritten = pq.read_table(log._table.data_files()[0].path)  # noqa: SLF001
-        assert rewritten.column("key").to_pylist() == sorted(keys)
-        assert rewritten.num_rows == 20, "the rewrite dropped or duplicated rows"
 
 
 def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
@@ -1309,28 +1010,6 @@ def test_every_entry_point_taking_a_published_table_checks_its_shape(
     # from the argument alone, so it must land before any directory does.
     assert not (tmp_path / "new").exists()
     assert not (tmp_path / "restore").exists()
-
-
-def test_repointing_a_log_at_a_malformed_published_table_is_refused(
-    tmp_path: Path,
-) -> None:
-    """`set_published` goes through `validate` too, and must.
-
-    A log that is already running is the worse place to accept one: the
-    location is written to `meta` and every later publish reads it back, so a
-    malformed prefix becomes durable state that fails at the next maintenance
-    pass rather than at the call that set it.
-
-    Falsify by deleting the `validate_published` call in `validate`: the repoint
-    succeeds and the string is stored.
-    """
-    with litelink.new(tmp_path, "s", schema=SCHEMA) as log:
-        with pytest.raises(ValueError, match="missing a slash"):
-            log.set_published("s3:/bucket/prefix")
-
-        assert log.published == Layout(tmp_path, "s").default_published, (
-            "a refused repoint was stored anyway"
-        )
 
 
 def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
@@ -1576,3 +1255,22 @@ def test_the_config_is_written_under_the_staging_names_and_reads_the_old_ones() 
     recovered = LogConfig.from_json(old)
     assert recovered.staging_retention == timedelta(hours=2)
     assert recovered.staging_rows == 500
+
+
+def test_set_config_takes_no_claim(tmp_path: Path) -> None:
+    """The policy is one `meta` row that every decision re-reads, and the
+    published location it is validated against is fixed at creation — so a
+    configuration change neither waits for maintenance nor excludes it.
+
+    Falsify by having `set_config` take the whole-log claim: it is refused
+    while another owner holds the log.
+    """
+    with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)) as log:
+        held = log._lease("maintain")
+        assert held.acquire()
+        try:
+            log.set_config(LogConfig(staging_rows=7))
+        finally:
+            held.release()
+
+        assert log.config.staging_rows == 7

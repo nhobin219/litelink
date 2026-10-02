@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import json
+import logging
 import random
-import threading
 import time
 import uuid
 from collections.abc import Iterator, Mapping
@@ -72,7 +73,6 @@ from litelink._table import (
     RETIRED_PROPERTY,
     LogTable,
     forget_published_entry,
-    published_columns,
     published_retired,
     published_span,
 )
@@ -112,6 +112,8 @@ _AWAIT_POLL = 0.05
 # gives up. Long enough to cover an ordinary merge, short enough that a wedged
 # log is reported rather than hung.
 _SETTINGS_WAIT_S = 10.0
+
+_log = logging.getLogger(__name__)
 
 SEAL_ROLE = "seal"
 MAINTAIN_ROLE = "maintain"
@@ -383,23 +385,6 @@ def _span(start: int, end: int) -> tuple[int, int] | None:
 def _now() -> str:
     """A timestamp a person will read."""
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def _repointed_mid_push() -> RuntimeError:
-    """The log was pointed at another published table while a publish pass
-    was pushing.
-
-    A push can outlive its lease — a register alone measured 4.1 s against S3,
-    and retries compound it — so the re-point that races it took the lease
-    lawfully. Nothing here is corrupt; the watermark this push earned simply
-    describes a published table the log has left, and recording it would tell
-    eviction (I4) that the new published table holds rows it has never been
-    sent.
-    """
-    return RuntimeError(
-        "the published table was re-pointed while this publish was pushing; its watermark "
-        "belongs to the previous published table and is not recorded"
-    )
 
 
 def _scan_query(
@@ -770,7 +755,8 @@ class LogHandle:
         missing information is None rather than a narrower bound — see
         `ColumnStatistics` for exactly when, including why a float's bounds say
         nothing about NaN and why strings carry none. A published file that
-        straddles the staging range (only `rewrite_published` cuts one) makes
+        straddles the staging range (only a re-cut by an earlier version makes
+        one) makes
         every count None in `"published"` and in the whole log: its bounds hold,
         but its rows cannot be counted once without opening it.
         """
@@ -994,8 +980,7 @@ class LogHandle:
         for the rest of its life.
 
         That state is ordinary — `publish` creates the table on a maintenance
-        tick before anything is sealed, and `set_published` creates one at a new
-        prefix — and one early call was enough to pin it: a `scan`, an
+        tick before anything is sealed — and one early call was enough to pin it: a `scan`, an
         `end_offset`, even a bare metadata poll. The handle then served the
         buffer alone with no error while `coverage()`, which does resolve,
         reported the same log gap-free. Measured: 0 of 20 rows, indefinitely, on
@@ -1209,19 +1194,13 @@ class WriteHandle(LocalReadHandle):
         self._tiers = PublishedTier(buffer)
         table.after_commit = self._store_staging_statistics
         self._maintenance = maintenance
-        # Sequences the only thing left that needs it: this handle mutating
-        # several objects at once, in `set_config`, `set_published` and
-        # `set_sort_by`, where a SQLite row and a Python object have to change
-        # together.
-        #
-        # Nothing on the append, seal or read paths takes it. Each collaborator
-        # owns its own safety — the buffer serialises its connection,
-        # `LogTable` guards its handle and caches, `Reader` guards its DuckDB
-        # connection — and the leases decide who may seal or maintain across
-        # processes, which no in-memory lock could. A lock on top of those is a
-        # second answer to a settled question, and it was not free: one held
-        # across a whole maintenance pass made a read wait 21.5 s.
-        self._lock = threading.RLock()
+        # No handle-wide lock. Each collaborator owns its own safety — the
+        # buffer serialises its connection, `LogTable` guards its handle and
+        # caches, `Reader` guards its DuckDB connection — and the leases decide
+        # who may seal or maintain across processes, which no in-memory lock
+        # could. A lock on top of those would be a second answer to a settled
+        # question, and not a free one: held across a maintenance pass, it
+        # made a read wait 21.5 s.
 
         # Who may seal, and who may maintain. Durable rather than in-memory,
         # because the answer has to survive the process asking (§13.6): a
@@ -1292,7 +1271,8 @@ class WriteHandle(LocalReadHandle):
         **`sort_by` defaults to offset order, and most logs should leave it
         there.** §7 measures it as a read-shape decision rather than a tuning
         knob: it declares which predicates prune, only a LEADING column prunes,
-        and changing it later rewrites every file (see `set_sort_by`).
+        and it is fixed when the log is created, like the schema: a different
+        order is a new log, started where this one ends.
 
         The default is not a fallback — it is the order the rows are already
         in, so it costs strictly less than any sort key. No sort runs at seal
@@ -1320,8 +1300,8 @@ class WriteHandle(LocalReadHandle):
         # downstream has to distinguish "unset" from "explicitly unsorted".
         order = tuple(sort_by or ())
         settings = config or LogConfig()
-        # Same normalisation as `set_published`: an empty string and None both
-        # mean the local default, which `validate` sees as None.
+        # An empty string and None both mean the local default, which
+        # `validate` sees as None.
         published = (published or "").rstrip("/") or None
         validate(schema, order, settings, published)
         # The type as well as the range, because this one is written to `meta`
@@ -1346,8 +1326,8 @@ class WriteHandle(LocalReadHandle):
         # second box, pointed at the old prefix. Silently, that log pushes
         # nothing — its offsets are below the published table's — eviction
         # pins, and the published table's contents read back as its own.
-        # `set_published` refuses the same thing; both entry points need it,
-        # because either can be the one that points the log.
+        # A log is pointed at its published table here and nowhere else, so
+        # this is the only place that needs the check.
         if published is not None:
             try:
                 covered = published_span(layout, published, s3 or S3Options())
@@ -1778,7 +1758,7 @@ class WriteHandle(LocalReadHandle):
                 if recorded
                 else (
                     f"restore cannot attach {published!r} to it — a log's published table is "
-                    f"set when it is created, or later with set_published"
+                    f"set when it is created and cannot be changed"
                 )
             )
             msg = (
@@ -2047,43 +2027,21 @@ class WriteHandle(LocalReadHandle):
         keep, what to compact — so this needs no rewrite. `sort_by` and the
         schema are not in here precisely because they do.
         """
-        with self._lock:
-            # The same claim `set_published` takes, and for the same reason.
-            # `validate` refuses a PAIR — `wal_replication` with no remote
-            # published table to replicate to — so the two halves have to be
-            # decided together. Reading the other half durably is not enough on
-            # its own: read and write as two transactions and the check is only
-            # a statement about the past, so the two setters could each pass
-            # against a state the other was about to change and assemble the
-            # refused pair between them. The pair this first guarded was an
-            # evict-on-upload policy with no archive to evict into, and the next
-            # maintenance pass executed it faithfully, deleting the only copy of
-            # everything sealed. Verified by execution before this claim
-            # existed.
-            lease = self._claim_settings()
-
-            try:
-                validate(
-                    self._schema,
-                    self._buffer.sort_by(),
-                    config,
-                    self._buffer.get_meta(_PUBLISHED_KEY) or None,
-                )
-                # Asked again at the write. The claim makes the read and the
-                # write one decision only while it is held, and a stall past
-                # the TTL between them is the threat the TTL exists for: the
-                # other setter takes the lapsed claim lawfully, validates
-                # against the half this one has not written yet, writes its
-                # own — and between them they record the pair `validate` just
-                # refused. Every data commit already asks this; the setters
-                # stopped one line short.
-                checkpoint(lease.renew)
-                # The only write. There is nothing to fan out: `Maintenance`,
-                # the seal target and `config` all read this row rather than
-                # keeping copies of it.
-                self._buffer.set_meta(_CONFIG_KEY, config.to_json())
-            finally:
-                lease.release()
+        # No claim. `validate` refuses a PAIR — `wal_replication` with no
+        # remote published table — and the other half, the published location,
+        # is fixed when the log is created, so the check reads a value nothing
+        # can change and this is a single row write. Every routine re-reads the
+        # policy at the point it decides, so a change takes effect at the next
+        # decision, not mid-way through one.
+        validate(
+            self._schema,
+            self._buffer.sort_by(),
+            config,
+            self._buffer.get_meta(_PUBLISHED_KEY) or None,
+        )
+        # The only write. There is nothing to fan out: `Maintenance`, the seal
+        # target and `config` all read this row rather than keeping copies.
+        self._buffer.set_meta(_CONFIG_KEY, config.to_json())
 
     def recovery(self) -> _Recovery | None:
         """What `restore` recovered, or None on a log opened normally.
@@ -2094,406 +2052,12 @@ class WriteHandle(LocalReadHandle):
         """
         return self._restored_from
 
-    def set_published(self, published: str | None) -> None:
-        """Point the log at another published table, or back at its local
-        default with None (§5). There is no detached state (#98).
-
-        Takes the whole-log claim, so it cannot interleave with a publish pass,
-        a merge, an eviction or the other setter — `validate` refuses a PAIR, so
-        the policy and the location have to be decided together. The shipped
-        writer calls this on every restart while a maintainer runs in another
-        process, so it waits for maintenance rather than failing on the first
-        try; see `_claim_settings`.
-
-        **Re-pointing does not move anything, but it is reversible.** Rows
-        already evicted into the old published table stay there, and the read
-        path resolves only the published table the log currently names — so
-        while pointed elsewhere they are not readable through this log, and a
-        full `scan()` returns fewer rows than were written, silently.
-
-        Pointing BACK undoes that. Each published table writes
-        `version-hint.text` beside its metadata at every commit, so a prefix
-        whose catalog entry this log dropped is registered from what the bucket
-        itself says rather than created empty over the top of it. Only a
-        repairing caller adopts, which `set_published` is; a read still leaves
-        the published leg out until one has run.
-
-        **A published table AHEAD of this log is refused.** One whose span
-        reaches the next offset to be assigned is another log's history, and
-        attaching it wedges this one silently — nothing is ever pushed,
-        eviction pins, and local disk grows without bound. `litelink.restore`
-        is the operation for resuming that log here. Pointing back at a
-        published table this log has moved past is unaffected, and supported.
-
-        **One writer per published table is otherwise assumed, not checked.**
-        The hint records where the metadata was at the last commit THIS log
-        made. Another writer touching that published table while this log
-        pointed elsewhere would leave the hint behind its true state, and
-        adopting it would strand the commits made in between. That is §13's
-        published-identity seam; the contract is one writer per log, and
-        nothing here enforces it.
-
-        What re-pointing no longer does is disturb what the log already knows.
-        There is no watermark to carry across: each pushed file records the
-        bucket its copy went to (§4a), so ranges the old published table holds
-        go on naming it, eviction keeps asking about the published table that
-        is configured now, and compaction keeps refusing to merge across any of
-        them.
-        """
-        # NORMALISED here, not in `_repoint`, so every guard below and the
-        # write see the same location. `set_published("")` once detached past
-        # guards that saw it as non-None — 7,828 acknowledged rows lost. None
-        # and "" now both mean the local default (#98): there is no detached
-        # state, so nothing for a guard to miss.
-        published = (published or "").rstrip("/") or self._layout.default_published
-
-        # Re-stating where the log already points does nothing: no claim, no
-        # write, no network. A writer that declares its published table on
-        # every restart must not wait for maintenance, or fail during an
-        # outage, to be told what it already knew.
-        if published == self._published.location():
-            return
-
-        with self._lock:
-            lease = self._claim_settings()
-
-            # Every write inside, so a failure — a full disk, a busy database —
-            # releases the claim instead of stranding it for its whole TTL.
-            try:
-                # Read, checked and written UNDER the claim. `validate` refuses
-                # a PAIR, and reading the other half durably is not enough on
-                # its own: read and write as two transactions with nothing
-                # between them, and the check is only a statement about the
-                # past — `set_config` could land its half in the gap, so
-                # between them the two calls assemble the very pair neither
-                # would accept, and the next maintenance pass executes it.
-                #
-                # `set_config` takes this same claim, which is what makes the
-                # two serialise. It is the rule §4a already states for data,
-                # applied to the configuration that governs it.
-                validate(self._schema, self._buffer.sort_by(), self.config, published)
-                self._refuse_published_ahead(published)
-                self._refuse_published_behind(published)
-                # Asked again under the claim: another process may have made
-                # the same move meanwhile, and then there is nothing to do.
-                if published == self._published.location():
-                    return
-
-                # A MOVE opens — or creates, or adopts through its
-                # `version-hint.text` — the table at the new location before
-                # anything is written, and fails the call if it cannot. Best
-                # effort, it reported success while the catalog still named
-                # the old table, and every other process refused the published
-                # table until a maintenance pass repaired it.
-                self._published.adopt(published)
-
-                # The other half of the same rule; see `set_config`.
-                checkpoint(lease.renew)
-                self._repoint(published)
-            finally:
-                lease.release()
-
-    def _refuse_published_behind(self, published: str | None) -> None:
-        """Refuse a published table missing a column this log has.
-
-        Logs are immutable now (§9), but a log that used `add_column` under an
-        older release can still meet a published table it pointed away from
-        before that change: pointing back does no schema work —
-        `open_published` only DECLARES a schema when it creates a table, and
-        nothing in `src/` re-declares an existing one — so that published table
-        stays narrow, and every later push fails permanently:
-
-            ValueError: PyArrow table contains more columns: region.
-
-        `publish` then never advances, eviction's I4 clamp pins on the unpushed
-        files, and local disk grows without bound.
-
-        Refused rather than repaired. Widening an existing published table is
-        `union_by_name` against a table this log did not create, which belongs
-        with `rewrite_published` and wants its own design; doing it quietly from
-        a setter would mean `set_published` mutating a shared published table as
-        a side effect. Tracked as an issue.
-        """
-        if published is None:
-            return
-
-        # Read from the bucket, not through `self._published`: that object
-        # takes its URI from `meta`, which still names the OLD published table.
-        try:
-            columns = published_columns(self._layout, published, self._published.s3)
-        except Exception:
-            # A bad minute in object storage is not a schema disagreement.
-            # `_refuse_published_ahead` treats it the same way: cannot tell, so
-            # pass rather than refuse a published table that may be fine.
-            return
-
-        if columns is None:
-            return
-
-        declared = set(self._buffer.shape().schema.names)
-        missing = sorted(declared - set(columns))
-        if missing:
-            msg = (
-                f"published table at {published} is missing {missing}, which this log has "
-                "added since. Attaching it would make every later publish fail "
-                "permanently and pin eviction, so the log would grow without "
-                "bound. Widen the published table first"
-            )
-            raise ValueError(msg)
-
-    def _refuse_published_ahead(self, published: str | None) -> None:
-        """Refuse a published table whose span reaches past this log's next
-        offset.
-
-        That published table belongs to a different log's history, and
-        attaching it wedges this one SILENTLY. Traced: `publish` computes
-        `floor` from the published table's span, every staging file sits below
-        it, so `pending` is empty and nothing is ever pushed. The watermark is
-        still written, eviction's I4 clamp finds no `extent` rows and pins at
-        zero, and local disk grows without bound while `publish()` returns
-        success having uploaded nothing. No error surfaces at any step.
-
-        It is reachable by the obvious failover attempt — `litelink.new` on a
-        second box, then `set_published` at the old prefix — which is exactly
-        what `litelink.restore` exists to do properly.
-
-        **Its last offset `>= next_offset`, not "overlaps".** Pointing back at a
-        published table that holds offsets this log has moved PAST is supported
-        and tested; the published table's ranges simply sit below the staging
-        ones. Only a published table reaching at or above the next offset to be
-        assigned is describing a stream this log is not.
-
-        **Read through `version-hint.text`, never `open_published`.** At this
-        point `meta` still names the OLD published table, so `Published.table()`
-        opens that one. Going to `open_published` for the new prefix fails both
-        ways: with `repair=False` the catalog row names the old published table
-        and the boundary check raises on every ordinary re-point; with
-        `repair=True` it drops that row as a side effect of what is meant to be
-        a read.
-
-        Absent, unreachable, or unreadable all PASS. `_repoint` deliberately
-        tolerates a published table that does not exist yet — "configuring one
-        is a statement of intent, not a claim that the bucket exists" — and this
-        is called on every writer restart, so it must not fail closed on a bad
-        minute in object storage.
-        """
-        if published is None:
-            return
-
-        try:
-            covered = published_span(self._layout, published, self._published.s3)
-        except Exception:
-            return
-
-        if covered is None:
-            return
-
-        nxt = self._buffer.next_offset()
-        # Ahead when its last offset, `covered[1] - 1`, is at or past `nxt`.
-        if covered[1] > nxt:
-            msg = (
-                f"the published table at {published!r} holds offsets up to {covered[1] - 1}, at or "
-                f"above this log's next offset ({nxt}) — it is another log's "
-                f"history. Attaching it would push nothing and pin eviction, "
-                f"silently. To resume that log here, use litelink.restore"
-            )
-            raise ValueError(msg)
-
-        # And it must be a published table this log has SEEN. A populated
-        # prefix that this log holds no `extent` row for is somebody else's,
-        # whatever its offsets look like — and offsets are all a comparison has
-        # to go on, since two logs of the same name both start at 1.
-        #
-        # Attaching one cannot be contained downstream, which two attempts
-        # tried: the watermark is raised to the published table's span by
-        # `confirmed` on every pass, and this log's own `extent` rows are
-        # written for the published table's ENTIRE manifest by `_push`'s
-        # backfill within one publish pass. Measured — a bound derived from
-        # either moved with the contamination. The backfill is right to trust
-        # the manifest; what it needs is for the published table to be ours,
-        # and §13's identity token is what would prove it. Until then the check
-        # belongs at the moment the log is pointed, before anything has
-        # laundered anything.
-        #
-        # Pointing back passes: ranges pushed to a published table go on naming
-        # it after the log points elsewhere (§4a), so returning to one finds its
-        # own records intact. A fresh prefix passes too — `covered` is None
-        # above.
-        if not self._buffer.published_records(published, 0):
-            raise _foreign_published(published)
-
-    def _repoint(self, published: str | None) -> None:
-        """Record the new location, with the maintenance lease held."""
-        # Already normalised by `set_published`, which is the only caller and
-        # does it before its guards rather than after. Repeated here so this
-        # method is correct on its own terms: every path builder strips
-        # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same published
-        # table everywhere except here — where the difference would read as a
-        # move and reset the watermarks of a published table that genuinely
-        # holds data.
-        normalised = (published or "").rstrip("/") or self._layout.default_published
-        # ONE transaction, because the three facts are only true together.
-        #
-        # Where the published table is, and the two watermarks describing what
-        # the PREVIOUS one held: the confirmed one eviction acts on, and the
-        # frontier compaction reads to decide which files are already the
-        # published table's business. As separate writes a crash lands between
-        # them, and BOTH orders have cost a defect — watermark last leaves the
-        # new published table carrying the old one's promise, which eviction
-        # believes; watermark first leaves the old published table with a
-        # frontier of zero, and compaction does not wait for a publish the way
-        # eviction does, so it merges across a boundary the published table
-        # already holds. There is no ordering that is safe, so there is no
-        # ordering.
-        # Whether this is a move is decided against the DURABLE location, in
-        # the transaction that acts on the decision. This object's memory of
-        # where the published table is goes stale the moment another process
-        # re-points it, and nothing but a publish pass refreshes it — so a
-        # maintainer re-asserting the published table it already has would read
-        # its own staleness as a move and zero the watermarks of a bucket that
-        # holds the data.
-        # The published table's tier row describes the published table being
-        # left, so a move forgets it BEFORE the log points anywhere new:
-        # forgotten first, a read can only include the published table, never
-        # trust the old one's row for the new one. A restatement keeps it — the
-        # shipped writer calls this on every restart. Compared against the
-        # durable location, which nothing else can move while this holds the
-        # claim.
-        if self._published.location() != normalised:
-            self._tiers.drop()
-
-        self._buffer.set_meta_moved(
-            _PUBLISHED_KEY,
-            normalised,
-            {Maintenance.PUBLISHED_THROUGH_KEY: "0"},
-        )
-
-        # Reaches the maintainer and the reader because all three hold this
-        # object. `evict` asks it whether I4 is owed anything, and a setting
-        # that stopped at `WriteHandle` would leave the maintainer deleting the
-        # only copy of rows a published table was just configured to receive.
-
-        # The new published table's tier row, while the claim is held, so reads
-        # stop fetching it for every query — from the table `set_published`
-        # already adopted, so nothing is repaired here. Best effort: the first
-        # publish pass records it otherwise.
-        with contextlib.suppress(Exception):
-            adopted = self._published.table()
-            if adopted is not None and not self._tiers.has():
-                self._record_published_row(adopted)
-
-    def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
-        """Change the sort order, re-clustering every file the staging table
-        owns.
-
-        §7 calls `sort_by` a read-shape decision rather than a tuning knob:
-        it declares which predicates prune, and the clustering that makes them
-        prune is baked into each file when it is written. So a new order that
-        is only declared would apply to future seals and silently leave every
-        existing file clustered the old way — the same predicate fast on recent
-        data and slow on older data, with nothing to indicate why.
-
-        `rewrite` must be passed explicitly. It is the honest name for the
-        cost: every file this rewrites is read, re-sorted and replaced.
-
-        **The published prefix is not re-clustered, and cannot be.**
-        `_rewrite_run` skips any run holding an offset the published table
-        holds, because a staging rewrite there would commit a file straddling
-        the published table's span and nothing re-cuts a staging straddler. So
-        on a published log this changes three declarations and rewrites only
-        what publish has not yet taken — and `rewrite_published` is not the
-        other half either: it re-ingests from the
-        first badly-SIZED file onwards, so a well-sized published prefix is
-        never a candidate and keeps its original clustering for ever.
-
-        That is §6's "sealed once and never rewritten" applied to history, not
-        an oversight — but this docstring used to say "every existing file",
-        which on a published log was a claim the code did not honour and did
-        not report. A re-sort is a decision for a log's staging window; the
-        published table keeps the clustering it was written with.
-        """
-        with self._lock:
-            requested = tuple(sort_by)
-            validate(self._schema, requested, self.config, self._published.uri)
-            if requested == self._buffer.sort_by() and not rewrite:
-                # Restating the order the log already declares, without asking
-                # for the data. Nothing to declare, nothing accepted, so this
-                # is the no-op it looks like.
-                #
-                # It used to return here whatever `rewrite` said, and that left
-                # the one crash gap nothing healed: a crash after `meta` and
-                # before the rewrite finished leaves the declarations NEW and
-                # the files OLD, and the natural retry found the orders equal
-                # and returned without doing anything. Reproduced by review.
-                # `rewrite=True` on an unchanged order is now the way to finish
-                # it — the whole table re-clustered, which is what that flag
-                # already means and what an interrupted rewrite needs.
-                return
-
-            if not rewrite:
-                msg = (
-                    "changing sort_by re-clusters every file the staging table "
-                    "owns, and leaves the published prefix as it is; "
-                    "pass rewrite=True to accept that cost"
-                )
-                raise ValueError(msg)
-
-            # Under the maintain lease, because a rewrite IS a compaction —
-            # same claim record, same deterministic output path, same commit.
-            # Without it this reached that path beside a running `advance()`
-            # in another process: two writers to one `compaction_path`, and a
-            # single-row `compacting` intent each would clear from under the
-            # other, leaving a half-written file nothing could name.
-            #
-            # Taken with the bounded WAIT the other administrative operations
-            # use, not a single attempt. A single attempt loses to any pass
-            # already running, which made the documented way to finish an
-            # interrupted re-sort — the `rewrite=True` retry above — fail
-            # spuriously beside a maintainer that never stops. `set_config`
-            # measured one startup in six lost to exactly this.
-            lease = self._claim_settings()
-
-            try:
-                # `meta` LAST of the durable writes, because it is what
-                # every decision reads: a crash before it leaves the log
-                # deciding by the OLD key, which is the order every existing
-                # file is already in, so the operation is simply not done.
-                #
-                # What it does NOT leave is the declarations untouched, and
-                # this comment used to say otherwise — "the log goes on using
-                # the OLD key that the tables still declare", which a review
-                # reproduced as false. After the declaration writes and before
-                # `meta`, the table declares NEW while `meta` still says OLD.
-                # That mismatch is declaration-only, and the natural retry
-                # heals it: the check above compares against `meta`, which is
-                # unchanged, so a repeated call proceeds and completes all of
-                # them.
-                #
-                # Writing `meta` FIRST is what does not heal. `meta` would say
-                # NEW while every file stayed OLD, and the retry would find the
-                # orders equal and return — which is the gap the `rewrite=True`
-                # branch above now fills.
-                self._table.set_sort_order(requested)
-                # The published table's declaration too, and BEFORE `meta` like
-                # the staging one: `open_published` declares an order only on a
-                # table it creates, so a published table that already exists is
-                # re-declared here or never. Missing it entirely left a published
-                # table created after a re-sort born declaring the old key, with
-                # every file pushed into it clustered by the new one.
-                self._published.redeclare_sort_order(requested)
-                self._buffer.set_meta(_SORT_KEY, json.dumps(list(requested)))
-                self._maintenance.rewrite_sorted(renew=lease.renew, owner=lease.owner)
-            finally:
-                lease.release()
-
     def _claim_settings(self) -> Claim:
         """Take the whole-log claim the configuration operations share.
 
-        Retried, not refused on the first try. `set_config` and `set_published`
-        exclude each other because `validate` refuses a PAIR and the two halves
-        have to be decided together — but they also collide with ordinary
-        maintenance, and the shipped writer calls both on every restart while a
-        maintainer runs continuously. Measured before this wait existed: one
+        Retried, not refused on the first try. These operations collide with
+        ordinary maintenance, which a maintainer runs continuously in another
+        process. Measured before this wait existed: one
         startup in six failed, which turns a routine restart into a coin toss.
 
         Bounded, so a genuinely long merge still surfaces rather than hanging.
@@ -2723,8 +2287,7 @@ class WriteHandle(LocalReadHandle):
         needs files non-overlapping and adjacent in offset order, not free of
         integer gaps, and every pass was measured correct on a gapped log. The
         one price worth stating rather than discovering: compaction will merge
-        across the gap, and a merged file spanning one can never be re-cut by
-        `rewrite_published`.
+        across the gap, and the published table keeps that file as written.
 
         Takes a `pa.Table` or a `pa.RecordBatchReader` and nothing else.
         Parquet-to-Arrow is the caller's — `pq.ParquetFile(...).iter_batches()`
@@ -3417,8 +2980,9 @@ class WriteHandle(LocalReadHandle):
         committed — so the table is already correct and the next `advance()`
         will pick the same run up again. All that is owed is the half-written
         output, and `compacting` names it, so removing it costs one unlink
-        rather than a directory scan — or, for a published rewrite, one DELETE
-        rather than a paginated LIST over object storage.
+        rather than a directory scan — or, for a published object an earlier
+        version's rewrite claimed, one DELETE rather than a paginated LIST over
+        object storage.
         """
         pending = self._buffer.pending_compaction()
         if pending is None:
@@ -3429,8 +2993,8 @@ class WriteHandle(LocalReadHandle):
         # and the decision that matters is `drain`'s, which reloads at the
         # moment it removes.
 
-        # EVERY claim, not the first. A published rewrite writes one file per
-        # re-cut segment and claims each before it exists (I2), so taking one
+        # EVERY claim, not the first. An interrupted operation can hold several,
+        # each claimed before its file existed (I2), so taking one
         # row and then clearing the table left the rest as objects in a bucket
         # that nothing references and only a paginated LIST could find — the
         # one thing this design refuses to need.
@@ -3453,13 +3017,10 @@ class WriteHandle(LocalReadHandle):
         claimed = self._buffer.pending_outputs()
         self._maintenance.enqueue_recovered(key for _, _, key in claimed)
 
-        # The scratch database an interrupted rewrite left behind. It is
-        # rebuilt from the published table next time, so nothing in it is owed.
-        self._layout.rewrite_db.unlink(missing_ok=True)
-        # Only the rows just read. A rewrite whose lease lapsed mid-upload can
-        # be claiming its next segment while this runs, and clearing the table
-        # wholesale takes that claim with it — leaving an object in the bucket
-        # named by nothing, which is the state claims exist to prevent.
+        # Only the rows just read. Another operation can be claiming its next
+        # output while this runs, and clearing the table wholesale takes that
+        # claim with it — leaving a file named by nothing, which is the state
+        # claims exist to prevent.
         for _, _, key in claimed:
             self._buffer.clear_compaction(key)
 
@@ -3506,8 +3067,8 @@ class WriteHandle(LocalReadHandle):
         in the published table — up to `compact_min_files - 1` seals forming a
         run `_merge` will not rewrite, plus the load's own tail — and compaction
         will not merge them afterwards, because it refuses to touch anything the
-        published table holds. `rewrite_published` re-cuts them. `ingest`
-        compacts before pushing to keep the count to what a run genuinely cannot
+        published table holds; they stay as written. `ingest` compacts before
+        pushing to keep the count to what a run genuinely cannot
         fill.
 
         **Publishing only**, a building block. Expiring the published table and
@@ -3520,43 +3081,97 @@ class WriteHandle(LocalReadHandle):
         registration watermark it records in `meta`, which is what lets
         `advance` enforce I4.
         """
-        # Re-read where the published table IS before pushing to it.
-        # `set_published` is a durable change made by whichever process runs
-        # it, and every other process cached the old value when it opened — so
-        # a maintainer started before a re-point would go on pushing to the
-        # retired published table and, worse, reconcile the watermark from ITS
-        # span. Eviction trusts that watermark and deletes staging files the new
-        # published table has never been sent: the rows survive only in the
-        # bucket the re-point was retiring.
-        #
-        # One keyed read per publish pass, against a change that is rare and
-        # durable: `Published` reads the location from `meta` on every access.
-        lease = self._lease(MAINTAIN_ROLE)
+        lease, bound = self._publish_lease(flush=flush)
         if not lease.acquire():
             msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
-            # UNDER the lease, not before it. Read first, the location can be
-            # re-pointed between the read and the acquire — `set_published`
-            # takes the same lease, so it is free until this line — and the push
-            # then runs against the old published table while the log durably
-            # points at the new one. `_push` would reconcile the old published
-            # table's span into the watermark with no network call at all, and
-            # eviction believes a watermark whatever earned it.
-            # PINNED here, and every fence downstream compares against this
-            # string rather than re-reading the object. `Published` is shared by
-            # the log, the reader and the maintainer precisely so a re-point
-            # reaches all three — which means a `set_published` on another
-            # thread moves the value a fence was going to compare AGAINST, and
-            # both sides of the comparison change together. The fence passes,
-            # and the watermark this push earned is recorded against a published
-            # table that never received it.
-            self._push(lease, self._published.uri, flush=flush)
+            self._push(lease, self._published.uri, flush=flush, bound=bound)
         finally:
             lease.release()
 
-    def _push(self, lease: Claim, pinned: str | None, *, flush: bool = False) -> None:
+    def _publish_lease(self, *, flush: bool) -> tuple[Claim, int | None]:
+        """The claim a publish takes, and the offset its push must stay below
+        (None for the whole log) (#118).
+
+        **Only the range it pushes**, `[floor, end)`: from the published
+        table's frontier to the end of what this push would upload. Nothing
+        else needs to wait for it. A seal lands above the staging table's end,
+        eviction below the published floor, and compaction refuses what the
+        published table holds — and a compaction over the trailing run, which
+        `flush` pushes too, overlaps this range and so is excluded by it.
+        The whole-log operations still exclude any publish.
+
+        **Two publishes still exclude each other.** Both start at the same
+        floor, so their ranges overlap even when there is nothing to push —
+        which matters, because `_push` forgets intents it does not find
+        landed, and another publisher's intents are files it is uploading.
+
+        **The whole log, when the push might write the tier row.** With no
+        published row yet, `_push` computes it exactly from the published
+        table's manifests, and that one narrowing write must not race
+        eviction widening it (`_tiers`) — so a first publish, or the first
+        after a re-point, claims everything. So does a published table that
+        can only be opened by repairing it, which is a whole-log claim
+        holder's to do.
+
+        Provisional, and read without a claim: `_push` re-reads everything
+        under it and clamps what it uploads to `bound`.
+        """
+        whole = self._lease(MAINTAIN_ROLE)
+        if not self._tiers.has():
+            return whole, None
+
+        try:
+            published = self._published.table()
+        except ValueError:
+            # The catalog names another prefix than the log — a re-point by an
+            # earlier version, left half done — and only a repairing open,
+            # under the whole log, may fix it. `_push` does.
+            return whole, None
+
+        if published is None:
+            return whole, None
+
+        self._table.reload()
+        published.reload()
+        covered = published.span()
+        floor = 0 if covered is None else covered[1]
+        pending = [f for f in self._table.data_files() if f.end > floor]
+        settled = self._settled(pending, flush=flush)
+        end = pending[settled - 1].end if settled else floor + 1
+
+        return self._lease(MAINTAIN_ROLE, floor, max(end, floor + 1)), end
+
+    def _settled(self, pending: list[DataFile], *, flush: bool) -> int:
+        """How many of `pending` — staging files above the published floor, in
+        offset order — a push takes: everything compaction is finished with
+        (`stable_prefix`), past whatever is already intended or held, or all of
+        them with `flush`."""
+        if flush:
+            return len(pending)
+
+        config = self.config
+        frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
+        head = [f for f in pending if f.start >= frozen]
+
+        return (len(pending) - len(head)) + stable_prefix(
+            head,
+            config.compact_size,
+            config.compact_min_files,
+            self._maintenance.memory(),
+            config.compact_rows,
+        )
+
+    def _push(
+        self,
+        lease: Claim,
+        pinned: str | None,
+        *,
+        flush: bool = False,
+        bound: int | None = None,
+    ) -> None:
         """Upload and register everything above the published table's span.
 
         **`flush` pushes the trailing run too**, which `publish`
@@ -3572,8 +3187,8 @@ class WriteHandle(LocalReadHandle):
 
         Safe in the direction it moves. Compaction refuses to merge anything a
         published table already holds, so a file pushed early is simply never
-        merged — the cost is a small object the published table keeps until
-        `rewrite_published` re-cuts it, not a duplicate range. The deadlock the
+        merged — the cost is a small object the published table keeps, not a
+        duplicate range. The deadlock the
         shared `runs` exclusion guards against is the opposite direction:
         holding back a file compaction will never touch.
 
@@ -3587,8 +3202,7 @@ class WriteHandle(LocalReadHandle):
         The published table may still gain a small file: one stranded between
         larger neighbours can never be merged, so holding it back would block
         the watermark forever rather than improve anything. That is a cosmetic
-        cost with a deliberate cause, and `rewrite_published` is the tool for
-        it.
+        cost with a deliberate cause.
         """
         # Read under the claim, the same as everything else that decides what
         # this pass does. The grouping `stable_prefix` computes has to match
@@ -3597,7 +3211,9 @@ class WriteHandle(LocalReadHandle):
         # so agreement means both reading the policy the log records rather
         # than the one each happened to open with.
 
-        published = self._published.require()
+        # Opened with `repair` only under the whole-log claim, the one that
+        # entitles it (`_publish_lease`).
+        published = self._published.require(repair=bound is None)
         self._table.reload()
         # The PUBLISHED table reloaded too, and for a stronger reason than the
         # staging table. A pyiceberg handle is a frozen snapshot view, and
@@ -3616,6 +3232,29 @@ class WriteHandle(LocalReadHandle):
         # copies of staging rows, so it never changes this row itself —
         # eviction does.
         if not self._tiers.has():
+            if bound is not None:
+                # The row vanished between `_publish_lease` choosing a range
+                # and this claim being taken. Writing it is an exact rollup
+                # that must not race eviction's `widen` (`_tiers`), so it needs
+                # the whole log — and this push holds only a range. So it
+                # pushes NOTHING, and the next publish, finding no row, claims
+                # the whole log and writes it.
+                #
+                # Only something dropping the row concurrently reaches here, and
+                # nothing does while a log is live: `restore` drops it, but on a
+                # fresh machine before any publish. So this is a guard rather
+                # than a path — and a publish that silently did nothing is
+                # exactly what an operator wants to hear about, since every row
+                # it would have pushed stays local one pass longer.
+                _log.warning(
+                    "litelink: publish of %s pushed nothing: the published "
+                    "table's tier row was dropped while the push was claiming "
+                    "its range; the next publish claims the whole log and "
+                    "pushes",
+                    self._layout.directory,
+                )
+                return
+
             self._record_published_row(published)
 
         # The published span's end: everything below it is in the bucket.
@@ -3635,9 +3274,7 @@ class WriteHandle(LocalReadHandle):
         # first only reports where the published table was.
         # Stored as the last offset held, so one below the span's end.
         confirmed = max(self._maintenance.published_through(), floor - 1)
-        self._buffer.set_meta_if(
-            _PUBLISHED_KEY, pinned, {Maintenance.PUBLISHED_THROUGH_KEY: str(confirmed)}
-        )
+        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: confirmed})
 
         memory = self._maintenance.memory()
 
@@ -3737,34 +3374,37 @@ class WriteHandle(LocalReadHandle):
         # two share `runs` so they cannot disagree about what is in play, and
         # a second input one of them could not see is what deadlocked them once
         # already.
-        frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
-        head = [f for f in pending if f.start >= frozen]
-        settled = (len(pending) - len(head)) + stable_prefix(
-            head,
-            config.compact_size,
-            config.compact_min_files,
-            memory,
-            config.compact_rows,
-        )
-        if flush:
-            # EVERYTHING unpublished, and that is forced rather than chosen.
-            # `pending[:settled]` is a PREFIX because the watermark recorded
-            # below has to stay contiguous — eviction trusts it for I4 — so
-            # there is no way to push a load's tail while leaving an undersized
-            # SEAL beneath it unpushed. Attempted and measured: extending only
-            # through bulk-loaded files never advances past a seal sitting at
-            # index 0, and `published_through()` stays 0 with the load
-            # unpublished. Hence the blunt name.
-            #
-            # So this ships those files. Acceptable because of WHEN a load
-            # happens: `ingest` claims the whole log and is a backfill-time
-            # operation, so live capture is typically stopped and the trailing
-            # run is the load's own. And the alternative is worse by a wide
-            # margin — a load's rows never enter the buffer, so not pushing them
-            # leaves them on one disk. Compaction will not merge what the
-            # published table holds, so any small objects persist until
-            # `rewrite_published` re-cuts them.
-            settled = len(pending)
+        #
+        # `_settled` is the rule, shared with `_publish_lease` so the range a
+        # publish claims and the files it pushes are decided the same way.
+        #
+        # With `flush`, EVERYTHING unpublished, and that is forced rather than chosen.
+        # `pending[:settled]` is a PREFIX because the watermark recorded
+        # below has to stay contiguous — eviction trusts it for I4 — so
+        # there is no way to push a load's tail while leaving an undersized
+        # SEAL beneath it unpushed. Attempted and measured: extending only
+        # through bulk-loaded files never advances past a seal sitting at
+        # index 0, and `published_through()` stays 0 with the load
+        # unpublished. Hence the blunt name.
+        #
+        # So this ships those files. Acceptable because of WHEN a load
+        # happens: `ingest` claims the whole log and is a backfill-time
+        # operation, so live capture is typically stopped and the trailing
+        # run is the load's own. And the alternative is worse by a wide
+        # margin — a load's rows never enter the buffer, so not pushing them
+        # leaves them on one disk. Compaction will not merge what the
+        # published table holds, so any small objects stay as they are.
+        settled = self._settled(pending, flush=flush)
+        if bound is not None:
+            # Inside the range claimed, and nothing past it: a seal or another
+            # publish may have moved things since `_publish_lease` read them.
+            # A prefix still, so the watermark stays contiguous.
+            settled = sum(
+                1
+                for _ in itertools.takewhile(
+                    lambda f: f.end <= bound, pending[:settled]
+                )
+            )
 
         uploaded: list[tuple[DataFile, str]] = []
         for data_file in pending[:settled]:
@@ -3802,13 +3442,6 @@ class WriteHandle(LocalReadHandle):
         # waited, and the buffer grew for the whole of it.
         checkpoint(lease.renew)
         last = uploaded[-1][0]
-        if (self._buffer.get_meta(_PUBLISHED_KEY) or None) != pinned:
-            # The upload already spent longer than a lease TTL against S3 more
-            # than once, which is how the log gets re-pointed underneath a push
-            # — and registering into the published table it was pointed AWAY
-            # from writes the log's rows somewhere nothing will look for them
-            # again.
-            raise _repointed_mid_push()
 
         if not published.register(
             [published.uri(rel_path) for _, rel_path in uploaded],
@@ -3843,25 +3476,10 @@ class WriteHandle(LocalReadHandle):
             )
 
         # After the register, never before: the watermark is a promise that the
-        # published table HAS the range, and I4 lets `advance` delete the
-        # staging copy on the strength of it.
-        #
-        # And only if it is still a promise about the SAME published table.
-        # This push can outlive its lease — a register alone measured 4.1 s and
-        # retries compound it — and a re-point that takes the lease meanwhile
-        # leaves this about to record a watermark earned by a bucket the log has
-        # left.
-        #
-        # Re-read rather than trusted, and in the same transaction as the
-        # write: nothing lowers a watermark afterwards, so recording one earned
-        # by a bucket the log has left is not a mistake anything corrects.
-        if not self._buffer.set_meta_if(
-            # The stored watermark is the last offset held.
-            _PUBLISHED_KEY,
-            pinned,
-            {Maintenance.PUBLISHED_THROUGH_KEY: str(last.end - 1)},
-        ):
-            raise _repointed_mid_push()
+        # published table HAS the range. Stored as the last offset held, and
+        # never lowered: another publish on a disjoint range (#118) can have
+        # recorded a higher one while this push was registering.
+        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: last.end - 1})
 
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.
@@ -3943,8 +3561,7 @@ class WriteHandle(LocalReadHandle):
         passes `flush` to `seal` and `publish`, so every buffered row is sealed
         and every staging file published in this pass — at shutdown, say, to
         get everything off this machine. The cost is undersized files, in
-        staging and in the published table; `rewrite_published` re-cuts the
-        published ones.
+        staging and in the published table, where they stay.
 
         Data moves first, then cleanup follows behind it:
 
@@ -4015,16 +3632,20 @@ class WriteHandle(LocalReadHandle):
         self.sweep("published")
 
     def compact(self) -> None:
-        """Convert sealed files into `target_compact_size` ones (§6).
+        """Merge undersized staging files into `target_compact_size` ones (§6).
 
-        The heavy step of `advance`, and the reason its steps are callable
-        separately: it reads and rewrites whole files, while eviction and
-        expiry are metadata commits that finish in milliseconds. A deployment
-        that wants them on different schedules — convert hourly, expire every
-        minute — can have that, and one that does not should call `advance`.
+        The heavy step of `advance`: it reads and rewrites whole files, while
+        eviction and expiry are metadata commits that finish in milliseconds,
+        which is why the steps are callable separately. It claims each run it
+        merges (§4a) and renews that claim as it works, so it excludes another
+        maintainer only where their work overlaps.
 
-        Claims each run it merges (§4a) and renews that claim as it works, so
-        it excludes another maintainer only where their work overlaps.
+        Staging only. The published table is never rewritten: it is the log's
+        immutable record, and `publish` pushes only files compaction has
+        finished with, so it is well-sized by construction. The exceptions —
+        a flushed seal or publish, a bulk load's tail, a raised
+        `target_compact_size` — leave a few smaller files, which stay as they
+        were written.
         """
         self._maintenance.compact()
 
@@ -4148,33 +3769,6 @@ class WriteHandle(LocalReadHandle):
 
         if _covers(table, "published", allowed):
             self._maintenance.sweep_published()
-
-    def rewrite_published(self) -> None:
-        """Merge undersized files already in the published table (§6, ad-hoc).
-
-        An operation, not a policy. Nothing calls it on a schedule and normal
-        operation does not need it: `publish` pushes only files compaction has
-        finished with, so the published table is well-sized by construction —
-        except for what a bulk load pushed with `flush` to avoid
-        stranding rows that have no second copy. It exists for the three things
-        that break that on purpose — an explicit `seal()` stranding a small
-        file, a change to `target_compact_size`, which applies to the future
-        while the published table is immutable history, and that load's
-        undersized push.
-
-        Run it when nothing else is maintaining the log: it takes the same
-        lease as `advance` and `publish`, and it rewrites the same files they
-        would.
-        """
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds a claim over this range"
-            raise RuntimeError(msg)
-
-        try:
-            self._maintenance.rewrite_published(lease.renew, lease.owner)
-        finally:
-            lease.release()
 
     def retire(self) -> None:
         """End this log for good: every row to the published table, nothing

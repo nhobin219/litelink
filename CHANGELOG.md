@@ -22,6 +22,34 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: `set_sort_by()` is removed; a log's sort order is fixed when
+  the log is created** (#118), like its schema and published table. To use
+  another order, `retire()` the log and start a new one where it ended:
+  `new(root, name, sort_by=…, start_offset=old.end_offset())`. Nothing
+  re-clusters existing files any more: staging turns over within its
+  retention and the published table keeps the order it was written with, so
+  a re-sort only ever sharpened pruning for a while.
+
+- **Breaking: `rewrite_published()` is removed, and `compact()` takes no
+  table** (#118). The published table is the log's immutable record and
+  nothing rewrites it. It is well-sized by construction, since `publish`
+  pushes only files compaction has finished with; the few smaller files —
+  a flushed seal or publish, a bulk load's tail, files published before a
+  raised `target_compact_size` — stay as written. `compact()` compacts
+  staging, as before. To re-cut a log at another size, backfill it into a
+  new log created with that target: `ingest` its rows in offset order.
+
+- **Breaking: `set_published()` is removed; a log's published table is fixed
+  when the log is created** (#118), like its schema. To publish somewhere
+  else, `retire()` the log and start a new one where it ended:
+  `new(root, name, published=…, start_offset=old.end_offset())`. Every guard
+  re-pointing needed went with it: the re-point checks in `publish`, the
+  whole-log claim the setters took, and adopting a table back from its
+  `version-hint.text`. **`set_config()` takes no claim** any more. Logs
+  written before keep the catalog repair and `drain_published`'s prefix check,
+  in case they carry a half-done re-point; `drain_published` also refuses a
+  table whose catalog entry names another prefix than the log does.
+
 - **Breaking: `hydrate()` is removed** (#118). It copied a time window of
   published files back into staging whether anyone read them or not; a
   reader on another machine caches what it actually reads instead (above),
@@ -77,7 +105,7 @@ minor version carries breaking changes.
 - **The published table is now expired** (#113). `reclaim("published")`
   expires published snapshots older than `published_snapshot_retention`
   and deletes the objects that frees once due. Previously the published table
-  was expired only after `rewrite_published`, so one that was only ever
+  was expired only after `rewrite_published()`, so one that was only ever
   published kept every snapshot, manifest list and manifest.
 - **Breaking: one routine per operation, the table an argument** (#117,
   #122). `evict`, `reclaim` and `sweep` take the table they act on, None
@@ -90,6 +118,13 @@ minor version carries breaking changes.
   on (§4a), so a caller's callback had nothing left to do: on `evict()` and
   `expire()` it was already ignored, and on `compact()` it could only abort the
   pass. Drop the argument.
+
+- **`drain` takes no claim, and `publish()` claims only the range it pushes**
+  (#118). Nothing can make a queued file live again once `hydrate` is gone,
+  so deleting due files needs no exclusion; and a publish no longer refuses a
+  seal or eviction in another process for the length of an upload. A publish
+  that must write the tier row still takes the whole log. API.md lists what
+  each routine excludes.
 
 ### Added
 

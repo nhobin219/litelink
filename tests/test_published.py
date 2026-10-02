@@ -8,8 +8,6 @@ compact, publish, evict — so none of this needs S3 or the network.
 from __future__ import annotations
 
 import sqlite3
-import time
-from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -18,6 +16,7 @@ import pytest
 
 import litelink
 from litelink import OFFSET, LogConfig, RetiredError, WriteHandle
+from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._layout import Layout
 from litelink._read import Reader
 from litelink._table import VERSION_HINT
@@ -147,39 +146,6 @@ def test_retiring_a_local_only_log_keeps_every_row(tmp_path: Path) -> None:
         assert offsets(reader) == list(range(1, total + 1))
 
 
-def test_rewrite_published_works_on_a_local_published_table(tmp_path: Path) -> None:
-    """It used to refuse a local-only log.
-
-    A re-cut keeps every row, and the files it supersedes are queued as
-    published objects — by URI — so they are released through the published
-    table's own expiry rather than unlinked as if they were local files.
-
-    Falsify by naming the published table's files as plain paths in `LogTable._name`:
-    the superseded files are queued as local ones.
-    """
-    with published(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
-        expected = offsets(log)
-        # A raised target is one of the things `rewrite_published` exists for.
-        log.set_config(replace(log.config, target_compact_size=4 * 64 * 1024))
-        log.rewrite_published()
-
-        superseded = [
-            key
-            for key in log._buffer.queued_deletions()  # noqa: SLF001
-            if "/published/" in key
-        ]
-        assert superseded, "the re-cut must supersede published files"
-        assert all(key.startswith("file:///") for key in superseded)
-
-        time.sleep(1.1)
-        # `expire_published`, which drains the published table's queue (#113).
-        log.reclaim("published")
-        assert offsets(log) == expected
-        assert not any(
-            Path(key.removeprefix("file://")).exists() for key in superseded
-        ), "released once the published table expired the snapshots naming them"
-
-
 def test_replication_and_restore_need_a_remote_published_table(
     tmp_path: Path,
 ) -> None:
@@ -238,32 +204,6 @@ def test_a_log_from_before_published_tables_gets_the_default(tmp_path: Path) -> 
         assert log.published_through() == 500
 
 
-def test_set_published_none_points_back_at_the_local_default(tmp_path: Path) -> None:
-    """There is no detached state: None re-points to the local default, and
-    I4 still holds across the move — nothing the new published table lacks is evicted.
-
-    Falsify by mapping None to "" in `set_published`: `log.published` reads the
-    default, but the stored row is empty and the next publish's fence refuses it.
-    """
-    with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
-        log.extend(rows(500))
-        log.seal(flush=True)
-        log.set_published(f"file://{tmp_path / 'away'}")
-        log.publish(flush=True)
-        log.set_published(None)
-
-        assert log._buffer.get_meta("published") == log.published  # noqa: SLF001
-        log.evict()
-        assert log.staging_rows() == 500, (
-            "the default published table holds none of it yet"
-        )
-
-        log.publish(flush=True)
-        log.advance()
-        assert log.staging_rows() == 0
-        assert offsets(log) == list(range(1, 501))
-
-
 def test_the_reader_never_loads_httpfs_for_a_local_published_table(
     tmp_path: Path,
 ) -> None:
@@ -271,59 +211,6 @@ def test_the_reader_never_loads_httpfs_for_a_local_published_table(
         log.scan().read_all()
         assert not log._reader._remote_ready  # noqa: SLF001
         assert isinstance(log._reader, Reader)  # noqa: SLF001
-
-
-def test_a_move_the_new_published_table_cannot_take_is_refused_and_not_recorded(
-    tmp_path: Path,
-) -> None:
-    """A move opens the new table before it records anything, so one that
-    cannot reach it fails the call and leaves the log where it was.
-
-    Falsify by making the move's `adopt` best effort in `set_published`: the
-    call succeeds and the log records a published table nothing can open.
-    """
-    blocker = tmp_path / "blocker"
-    blocker.write_text("a file, so nothing can be created beneath it")
-
-    with local_log(tmp_path) as log:
-        log.extend(rows(100))
-        log.seal(flush=True)
-        before = log.published
-
-        with pytest.raises(OSError):  # noqa: PT011
-            log.set_published(f"file://{blocker}/published table")
-
-        assert log.published == before, "a move that failed was recorded"
-        log.publish(flush=True)
-        assert log.published_through() == 100
-
-
-def test_restating_the_published_table_takes_no_claim_and_opens_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A writer that declares its published table on every restart is told it already
-    has it — without waiting on maintenance or reaching the published table.
-
-    Falsify by removing the early return in `set_published`: the refused claim
-    raises.
-    """
-    from litelink._handle import WriteHandle as Handle
-    from litelink._table import LogTable
-
-    def refuse(*_: object, **__: object) -> None:
-        msg = "a restatement must not claim or open anything"
-        raise AssertionError(msg)
-
-    with local_log(tmp_path) as log:
-        where = log.published
-        monkeypatch.setattr(Handle, "_claim_settings", refuse)
-        monkeypatch.setattr(LogTable, "open_published", refuse)
-
-        log.set_published(where)
-        log.set_published(None)
-        log.set_published(where + "/")
-
-        assert log.published == where
 
 
 def stored_names(root: Path) -> dict[str, set[str]]:
@@ -739,3 +626,191 @@ def test_a_local_log_never_loads_the_read_cache(
         assert "cache_httpfs" not in extensions
         assert "httpfs" not in extensions
         assert not (isolated_read_cache / "litelink").exists()
+
+
+def _claim(log: WriteHandle, start: int, end: int) -> Claim:
+    """A claim held by another owner, as a concurrent seal or compaction holds
+    one."""
+    other = Claim(
+        log._buffer._con,  # noqa: SLF001
+        log._buffer._lock,  # noqa: SLF001
+        "other",
+        start,
+        end,
+        new_owner(),
+    )
+    assert other.acquire()
+
+    return other
+
+
+def test_publish_claims_only_the_range_it_pushes(tmp_path: Path) -> None:
+    """Once the published table has its tier row, a publish claims
+    `[floor, end of what it pushes)` and nothing else (#118): a claim above
+    that — a seal of new rows, a compaction of the trailing run — does not
+    refuse it, and one inside it does.
+
+    Falsify by having `_publish_lease` return the whole-log lease: the claim
+    above the push refuses it.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)  # the first: writes the tier row
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+
+        floor = log.published_through() + 1
+        above = _claim(log, 10**9, 10**9 + 1)
+        try:
+            log.publish(flush=True)
+        finally:
+            above.release()
+
+        assert log.published_through() == 2 * ROWS
+
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        inside = _claim(log, 2 * ROWS + 1, 2 * ROWS + 2)
+        try:
+            with pytest.raises(RuntimeError, match="another owner"):
+                log.publish(flush=True)
+        finally:
+            inside.release()
+
+        assert floor > 1
+        assert log.scan().read_all().num_rows == 3 * ROWS
+
+
+def test_a_publish_that_must_write_the_tier_row_claims_the_whole_log(
+    tmp_path: Path,
+) -> None:
+    """With no tier row, the push computes it exactly from the published
+    table's manifests, and that narrowing write must not race eviction
+    widening it — so the publish takes the whole log (#118). A re-point
+    leaves exactly this: the table there, its row dropped.
+
+    Falsify by giving a publish without a tier row a range lease: a claim far
+    above its files no longer refuses it.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log._tiers.drop()  # noqa: SLF001 — as a re-point leaves it
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+
+        far = _claim(log, 10**9, 10**9 + 1)
+        try:
+            with pytest.raises(RuntimeError, match="another owner"):
+                log.publish(flush=True)
+        finally:
+            far.release()
+
+        log.publish(flush=True)
+        assert log._tiers.has()  # noqa: SLF001
+        assert log.published_through() == 2 * ROWS
+
+
+def test_two_publishes_exclude_each_other_with_nothing_to_push(
+    tmp_path: Path,
+) -> None:
+    """Both start at the published floor, so their ranges overlap even when
+    neither has anything to upload — and that matters: a push forgets intents
+    it does not find landed, and another publisher's are files it is
+    uploading (#118).
+
+    Falsify by claiming an empty range when nothing is settled: the second
+    publish proceeds beside the first.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+
+        lease, _ = log._publish_lease(flush=False)  # noqa: SLF001
+        assert lease.acquire()
+        try:
+            with pytest.raises(RuntimeError, match="another owner"):
+                log.publish()
+        finally:
+            lease.release()
+
+
+def test_a_push_whose_tier_row_vanished_warns_and_pushes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Case 3 (#118): the tier row dropped between `_publish_lease` choosing a
+    range and the claim being taken. Writing the row needs the whole log, so
+    the push does nothing — and says so, since every row it would have pushed
+    stays local a pass longer. The next publish claims the whole log and
+    pushes.
+
+    Falsify by returning silently: the warning is missing.
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+
+        chosen = log._publish_lease  # noqa: SLF001
+
+        def dropping(*, flush: bool) -> tuple[Claim, int | None]:
+            lease, bound = chosen(flush=flush)
+            log._tiers.drop()  # noqa: SLF001 — the concurrent drop
+            return lease, bound
+
+        monkeypatch.setattr(log, "_publish_lease", dropping)
+        log.publish(flush=True)
+
+        assert "pushed nothing" in caplog.text
+        assert log.published_through() == ROWS
+
+        monkeypatch.undo()
+        log.publish(flush=True)
+        assert log.published_through() == 2 * ROWS
+
+
+def test_the_published_watermark_never_moves_down(tmp_path: Path) -> None:
+    """Two publishes on disjoint ranges can finish out of order (#118). The
+    slower one's write must not lower what the faster recorded — so the raise
+    is atomic, in one transaction.
+
+    Falsify by writing the value as given in `raise_meta`: the watermark falls
+    back to the slower publish's end.
+    """
+    with local_log(tmp_path) as log:
+        buffer = log._buffer  # noqa: SLF001
+        buffer.raise_meta({"published_through": 12000})
+        buffer.raise_meta({"published_through": 8000})
+        assert buffer.get_meta("published_through") == "12000"
+
+
+def test_a_mismatched_catalog_sends_publish_to_the_whole_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog naming another prefix — a re-point from before 0.7 left half
+    done — can only be repaired by a whole-log claim holder. A range-claimed
+    publish would raise on every pass instead of repairing it, as publish did
+    before (#118).
+
+    Falsify by letting the `ValueError` out of `_publish_lease`: publish
+    raises "a maintenance pass repairs this".
+    """
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+
+        def mismatched(*, repair: bool = False) -> None:
+            msg = "the published catalog names another prefix"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(log._published, "table", mismatched)  # noqa: SLF001
+        lease, bound = log._publish_lease(flush=False)  # noqa: SLF001
+
+        assert bound is None
+        assert (lease.start, lease.end) == (0, EVERYTHING)

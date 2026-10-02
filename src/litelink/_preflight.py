@@ -192,7 +192,7 @@ def _extension(name: str, *, required: bool) -> Check:
 def _published(prefix: str, name: str, s3: S3Options | None) -> Check:
     """Can this machine READ that published table with the credentials it has?
 
-    Through `published_span`, which is the same call `new` and `set_published` make,
+    Through `published_span`, which is the same call `new` makes,
     so this checks what they will actually do rather than something adjacent.
     It reads the version hint from the bucket alone — no `published.db`, no
     catalog — and it separates the two answers an operator needs told apart:

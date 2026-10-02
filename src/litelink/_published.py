@@ -12,11 +12,10 @@ works, and which no reader test can set up without building a Log first.
 
 One injected object instead. `new`/`open` construct it and pass it to all
 three, so each is given its published table at construction like every other
-collaborator, and `set_published` has one place to write instead of a fan-out
-to keep in step. That the fan-out is gone is not only tidiness: the cached
-handle lives here too, so re-pointing the published table drops it, where
-before the Log changed the URI and went on serving reads from the table it had
-already opened.
+collaborator, and the location has one place to live instead of a fan-out to
+keep in step. The cached handle lives here too, keyed by the location it was
+opened for, so nothing can go on serving reads from a table the log does not
+name.
 
 Every log has a published table (#98): a remote one on S3, or a local directory
 — by default under the log's own. `remote()` is the one question about which,
@@ -26,7 +25,6 @@ and a target for the WAL replica.
 
 from __future__ import annotations
 
-import contextlib
 import threading
 from typing import TYPE_CHECKING
 
@@ -35,8 +33,6 @@ from litelink._s3 import S3Options
 from litelink._table import LogTable, PublishedAbsent
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from litelink._buffer import Buffer
     from litelink._layout import Layout
 
@@ -91,55 +87,15 @@ class Published:
         self._handle_uri: str | None = None
         # Guards the handle and its key together, because they are one fact.
         # The reader resolves the published table on a query thread while a
-        # maintainer publishes on another and `set_published` re-points it from
-        # a third.
+        # maintainer publishes on another.
         self._lock = threading.RLock()
-
-    def redeclare_sort_order(self, sort_by: Sequence[str]) -> None:
-        """Push a clustering onto an already-open handle.
-
-        TAKES the order rather than reading it, and that is what lets
-        `set_sort_by` call this BEFORE it writes `meta` — the ordering the
-        staging half already depends on. Reading it here would force the call
-        after the row, and `open_published` declares an order only on the table
-        it CREATES, so a crash in that gap would leave an existing published
-        table declaring the old key for ever while every file pushed into it
-        was clustered by the new one. Nothing re-declares a published table
-        that already exists.
-
-        An argument is not the second home this class shed. The field was: it
-        stayed at whatever the process opened with, so a published table created
-        after a re-sort was born declaring the old key. `table` reads `meta`
-        when it opens a handle, so creation is correct by construction and this
-        covers the table that already exists.
-
-        OPENS one rather than settling for a handle this process happens to
-        hold. An earlier version read `self._handle`, and `set_sort_by` never
-        opens the published table itself — `validate` reads only the URI — so a
-        re-sort from a process that had not touched the published table left its
-        declaration stale for ever, successfully and silently. Review caught the
-        gap and the docstring that admitted it.
-
-        `repair=False` never creates: a published table that does not exist
-        yet is left alone, and the one created later is created from `meta`,
-        which by then holds the new order.
-
-        Best effort against the published half. The published table may be
-        unreachable, and a re-sort is a local operation that has already
-        rewritten every staging file by the time this runs; failing it here
-        would report a failure that did not happen.
-        """
-        with contextlib.suppress(Exception):
-            handle = self.table()
-            if handle is not None:
-                handle.set_sort_order(sort_by)
 
     def location(self) -> str:
         """Where the published table is, according to the log.
 
-        Every log has one (#98). An empty or missing row — what `set_published
-        (None)` writes, and what a log created without one holds — means the
-        local default under the log's directory.
+        Every log has one, fixed when it is created. An empty or
+        missing row — what a log created without one holds — means the local
+        default under the log's directory.
         """
         return self._buffer.get_meta(PUBLISHED_KEY) or self._layout.default_published
 
@@ -189,28 +145,6 @@ class Published:
                     return None
 
                 self._handle_uri = uri
-
-            return self._handle
-
-    def adopt(self, uri: str) -> LogTable:
-        """Open the table at `uri` with repair on — creating it, or adopting
-        it through its `version-hint.text` — and point the catalog at it.
-
-        For `set_published`, BEFORE the log records `uri`: a move that cannot
-        reach its new table fails with nothing written, rather than leaving
-        the catalog naming the old one. The handle is cached against `uri`, so
-        once the location is recorded every caller gets it.
-        """
-        with self._lock:
-            self._handle = LogTable.open_published(
-                self._layout,
-                uri,
-                self._s3,
-                self._buffer.shape().table,
-                self._buffer.sort_by(),
-                repair=True,
-            )
-            self._handle_uri = uri
 
             return self._handle
 

@@ -257,9 +257,9 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     all there is. The sibling `load_table` branch refuses exactly this, in
     those words.
 
-    So a read that fails RAISES. Callers that would rather carry on — the
-    `set_published` guard, which must not fail closed on a bad minute in object
-    storage — catch it themselves and say so.
+    So a read that fails RAISES. Callers that would rather carry on — a guard
+    that must not fail closed on a bad minute in object storage — catch it
+    themselves and say so.
     """
     directory = f"{layout.published_table_location(prefix)}/metadata"
     source = io.new_input(f"{directory}/{VERSION_HINT}")
@@ -827,11 +827,9 @@ class LogTable:
     def set_sort_order(self, sort_by: Sequence[str]) -> None:
         """Declare the sort order. Does NOT reorder existing data.
 
-        An EMPTY order is a real value meaning unsorted, not a no-op. It used
-        to return early here, so `set_sort_by((), rewrite=True)` re-clustered
-        every file and left the table still declaring the old key — a table
-        lying about its own clustering, with nothing able to correct it now
-        that `meta` rather than this declaration is what `open` reads.
+        An EMPTY order is a real value meaning unsorted, not a no-op: returning
+        early on it would leave the table declaring a key its files do not
+        follow.
         """
         self._commit(lambda: self._apply_sort_order(sort_by))
 
@@ -1306,14 +1304,11 @@ class LogTable:
                 time.sleep(random.uniform(0, _COMMIT_BACKOFF_MS * (2**attempt)) / 1000)
                 self.reload()
                 # Refreshed, so check it is still the same table. The catalog
-                # row is keyed by table id, not by identity, and a
-                # `set_published` racing a slow register replaces what that row
-                # names — so the reload silently re-binds this operation to the
-                # NEW published table and the retry commits paths that live in
-                # the old bucket. The new published table's manifests would then
-                # reference objects the re-point retired, and the next publish's
-                # reconcile would launder that span into the watermark eviction
-                # acts on.
+                # row is keyed by table id, not by identity, so if it names
+                # another table than the one this handle opened — a half-done
+                # re-point by an earlier version — the reload silently re-binds
+                # this operation to it, and the retry commits paths that live in
+                # the other bucket.
                 self._verify_identity()
             else:
                 self.reload()
@@ -1516,8 +1511,7 @@ class LogTable:
 
         Refusing costs a stall, and the stall is worse than this used to say.
         The straddling file never lands, the watermark stops, eviction pins
-        below it, and **nothing re-cuts a staging straddler**:
-        `rewrite_published` works the other side, and no tool does this one. The
+        below it, and **nothing re-cuts a staging straddler**. The
         refusal is still right — a loud permanent stall beats a silent permanent
         duplication — but calling it recoverable was wrong, and the operator's
         only route today is to lower the compaction target so the straddler is
@@ -1565,10 +1559,9 @@ class LogTable:
         itself — putting a path on disk this process only learns about
         afterwards, which is what the deletion queue exists to avoid.
 
-        Several paths because a published rewrite re-cuts a range into however
-        many correctly sized files it takes, and the swap has to be one
-        snapshot: committing them one at a time would mean each commit deleting
-        a sub-range of a file the next commit still needs.
+        Several paths are accepted in one snapshot, so a range replaced by more
+        than one file never has a commit deleting a sub-range of a file the
+        next commit still needs.
         """
 
         def swap() -> None:

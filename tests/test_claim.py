@@ -360,41 +360,6 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
         assert taker.acquire(), "the replay path kept the seal lease"
 
 
-def test_a_sort_rewrite_takes_the_maintenance_lease(tmp_path: Path) -> None:
-    """A rewrite IS a compaction, so it needs compaction's exclusion.
-
-    Same claim record, same deterministic output path, same commit. Reaching
-    that path lease-free let it run beside a `advance()` in another process:
-    two writers to one `compaction_path`, and a single-row `compacting` intent
-    each would clear from under the other — leaving a half-written file that
-    nothing could name, which is the one thing §12's queue exists to prevent.
-    """
-    with open_log(tmp_path, config=LogConfig(target_seal_size=1 << 30)) as log:
-        log.extend(rows(20))
-        log.seal(flush=True)
-
-        held = Claim(
-            log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
-        )
-
-        assert held.acquire(), "could not simulate another maintainer"
-
-        # Bounded WAIT, not a single attempt: a rewrite is administrative and
-        # the maintainer it collides with never stops, so refusing outright
-        # made the documented way to finish an interrupted re-sort lose a race
-        # it should have waited out. It still reports rather than hanging.
-        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]  # noqa: SLF001
-        with pytest.raises(RuntimeError, match="has held a claim"):
-            log.set_sort_by(("key", "event_ts"), rewrite=True)
-
-        assert log.sort_by == ("event_ts",), "the sort order changed anyway"
-
-        held.release()
-        log.set_sort_by(("key", "event_ts"), rewrite=True)
-
-        assert log.sort_by == ("key", "event_ts")
-
-
 def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
     tmp_path: Path,
 ) -> None:

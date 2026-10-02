@@ -492,11 +492,9 @@ class Buffer:
         # a factor of about 37, and it is recorded here so nobody restores the
         # shortcut on the strength of it.
         self._sealer = sealer
-        # What `shape()` falls back to when `meta` has no schema row yet. Two
-        # callers need that and both would otherwise fail at construction:
+        # What `shape()` falls back to when `meta` has no schema row yet:
         # `_create` runs inside `Buffer.open` BEFORE `litelink.new` writes the
-        # row, and the scratch buffer a published rewrite cuts through is handed
-        # a schema directly and only ever has `CONFIG_KEY` written into it.
+        # row, and would otherwise fail at construction.
         #
         # A fallback, not the value. Everything reads `shape()`, so a schema
         # change reaches every holder without anyone remembering to refresh —
@@ -600,7 +598,6 @@ class Buffer:
         schema: pa.Schema,
         *,
         readonly: bool = False,
-        durable: bool = True,
     ) -> Buffer:
         """Connect, configure, and create the tables. Then hand them to `cls`.
 
@@ -613,13 +610,6 @@ class Buffer:
         the handle cannot write even by mistake, and creates nothing. WAL allows
         any number of these alongside the single writer (§1).
 
-        `durable=False` is for a buffer whose contents are derived from
-        something that still exists — the scratch buffer a published rewrite
-        re-cuts through, whose every row came from the published table and is
-        still there until the rewrite's final commit. A crash costs a re-run
-        rather than data, so the fsync per commit is paying for a guarantee
-        nothing depends on. Never for a log's own buffer: there, the fsync IS
-        the product (§3).
         """
         if readonly:
             con = cls._connect_readonly(path)
@@ -647,7 +637,7 @@ class Buffer:
         # §3's durability claim rests on this line. WAL alone fsyncs at
         # checkpoint, not at commit, which would put committed rows back in the
         # OS page cache — the exact loss this library exists to prevent.
-        writer.execute(f"PRAGMA synchronous={'FULL' if durable else 'OFF'}")
+        writer.execute("PRAGMA synchronous=FULL")
 
         buffer = cls(
             writer,
@@ -1187,22 +1177,17 @@ class Buffer:
 
     @property
     def schema(self) -> pa.Schema:
-        """The declared Arrow schema, for building a second buffer like this
-        one — a published rewrite re-ingests through a scratch buffer and must
-        cast the rows exactly as this one would."""
+        """The declared Arrow schema: the columns as the caller wrote them."""
         return self.shape().schema
 
     def seed_offsets(self, first: int) -> None:
         """Make the next appended row take offset `first`.
 
-        Only for the scratch buffer a published rewrite re-ingests through. Rows
-        being re-cut keep the offsets they already have — they are the same
-        rows, and §4's contiguous non-overlapping ranges are stated in them —
-        so the sequence has to resume where the range starts rather than at 1.
-
-        Seeded rather than supplied per row, so the rewrite goes through the
-        ordinary append path and I11 still holds: nothing hands an offset to
-        `extend`, the counter simply starts elsewhere.
+        For a log that starts above 1 (`new(start_offset=…)`) and for the
+        reserve `restore` fences above the offsets a dead machine may have
+        issued. Seeded rather than supplied per row, so appends go through the
+        ordinary path and I11 still holds: nothing hands an offset to `extend`,
+        the counter simply starts elsewhere.
         """
         # `sqlite_sequence` is SQLite's own, and documented as writable — but
         # it carries no unique constraint, so this is an UPDATE with an INSERT
@@ -1344,22 +1329,6 @@ class Buffer:
             ).fetchone()
 
         return row is None or row[0] is not None
-
-    def group_bytes(self, end: int) -> int:
-        """What the extent ending at `end` holds, before a file claims it.
-
-        Read out so it can be recorded against the published table's copy: the
-        scratch buffer measured these rows exactly as the appender would have,
-        and that count is the whole reason the rewrite goes through a buffer at
-        all.
-        """
-        with self._lock:
-            row = self._con.execute(
-                "SELECT bytes FROM extent WHERE end_offset = ? AND rel_path IS NULL",
-                (end,),
-            ).fetchone()
-
-        return 0 if row is None else int(row[0])
 
     def rows_between(self, start: int, end: int) -> pa.Table:
         """Buffered rows in `[start, end)`, as Arrow. The seal's input.
@@ -1910,8 +1879,7 @@ class Buffer:
         That keeps the number in the same currency as the seal that first
         measured it, however many rewrites later — which is the whole reason it
         is carried rather than derived from whatever the merged file compresses
-        to. It is also what lets the published rewrite build its extents with
-        the same arithmetic a staging compaction uses.
+        to.
         """
         paths = list(sources)
         if not paths:
@@ -2052,37 +2020,22 @@ class Buffer:
             _write_meta(self._con, {key: value, **(dict(reset) if moved else {})})
             return moved
 
-    def set_meta_if(
-        self, key: str, expected: str | None, pairs: Mapping[str, str]
-    ) -> bool:
-        """Write `pairs`, but only while `meta[key]` still reads `expected`.
+    def raise_meta(self, values: Mapping[str, int]) -> None:
+        """Write integer watermarks that only ever go up: a value already
+        stored above the one given is kept.
 
-        Compare-and-set, in ONE write transaction, for the guards that decide
-        whether a fact still belongs to the log it was computed for. Read and
-        write as separate statements, the check is only ever a statement about
-        the past: `publish` re-reads which published table it is pushing to
-        before recording a watermark, and a `set_published` landing between the
-        read and the write leaves the log pointed at the NEW published table
-        holding the OLD one's watermark — which eviction believes (I4) and
-        nothing ever lowers.
-
-        The lease does not close that window, because the window opens when the
-        lease has already lapsed: a push that spent longer than the TTL in S3
-        is exactly the case the guard exists for, and the re-point that races
-        it took the lease lawfully. SPEC §4a states the rule — the read of a
-        conflicting claim and the write that depends on it happen in one SQLite
-        transaction, or they are not a guard.
-
-        Returns whether the write happened, so callers can decline rather than
-        record something they no longer have the right to record.
+        In ONE transaction, because two publishes on disjoint ranges can
+        finish out of order (#118), and a read-then-write max would let the
+        slower one lower what the faster recorded.
         """
         with self._transaction():
-            current = _meta_value(self._con, key) or None
-            if current != (expected or None):
-                return False
-
-            _write_meta(self._con, pairs)
-            return True
+            _write_meta(
+                self._con,
+                {
+                    name: str(max(value, int(_meta_value(self._con, name) or 0)))
+                    for name, value in values.items()
+                },
+            )
 
     def shape(self) -> Shape:
         """The declared schema and its derivations, read from the log.
@@ -2157,17 +2110,12 @@ class Buffer:
     def sort_by(self) -> tuple[str, ...]:
         """The declared clustering, read from the log rather than remembered.
 
-        The rule `config` follows, for the reason `config` follows it (§4a).
-        This used to live in four places — `meta`, `WriteHandle`, `Maintenance`
-        and `Published` — kept in step by `set_sort_by` writing each. That is a
-        fan-out, and a fan-out is only correct in the process that ran it: a
-        maintainer already open elsewhere went on sorting by the key IT opened
-        with while both tables declared the new one, and compaction, the pass
-        that would have re-clustered them, read the same stale field.
+        The rule `config` follows, for the reason `config` follows it (§4a):
+        one copy of a fact, in the log, so no process can hold a stale one.
+        Fixed when the log is created; a different order is a new log.
 
-        The PARSE is cached on the raw value, as `config`'s is. Keying it on
-        the durable value is what keeps the cache from becoming the fifth home:
-        when the row changes the key changes.
+        The PARSE is cached on the raw value, as `config`'s is, so the cache
+        can never disagree with the row.
 
         A MISSING row is corruption, not "no order". `new` always writes it,
         and defaulting to unsorted here would silently de-cluster every file
@@ -2585,10 +2533,9 @@ class Buffer:
         """Record one more output path, without clearing the others.
 
         A compaction writes one file and `claim_compaction` says so by
-        replacing whatever was there. A published rewrite writes several before
-        a single commit swaps them all in, and every one of them needs its name
-        recorded before it exists (I2) — so they accumulate, and recovery
-        removes each that the commit never claimed.
+        replacing whatever was there. Recovery still reads every row, because a
+        log written by an earlier version can hold several from one interrupted
+        operation, each named before it existed (I2).
         """
         with self._lock:
             self._con.execute(
@@ -2606,8 +2553,7 @@ class Buffer:
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
     def pending_outputs(self) -> list[tuple[int, int, str]]:
-        """Every claimed output, for recovery. One row for a compaction,
-        several for an interrupted published rewrite."""
+        """Every claimed output, for recovery."""
         with self._lock:
             rows = self._con.execute(
                 "SELECT start_offset, end_offset, rel_path FROM compacting"
@@ -2733,8 +2679,8 @@ class Buffer:
           box's UNSEALED floor, above the band, so the band would fall into no
           leg of a read and be lost at the first seal after recovery.
         - **`pending_delete` rows naming local files** go; REMOTE ones stay,
-          and that half is required. `rewrite_published` is the only thing that
-          queues a remote entry, and this design refuses directory listing, so
+          and that half is required. Expiring the published table queues
+          remote entries, and this design refuses directory listing, so
           dropping them leaks published objects nothing can ever find again.
         - **`claim` rows** go. They carry the dead box's owners and a future
           expiry, so keeping them makes this one wait out a TTL for processes

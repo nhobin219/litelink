@@ -165,18 +165,6 @@ class Layout:
         return self.directory / "litestream.yml"
 
     @property
-    def rewrite_db(self) -> Path:
-        """Scratch buffer for a published rewrite.
-
-        Its own file, not the log's: the rewrite re-ingests published rows
-        through an ordinary `Buffer` to re-cut them, and that buffer must not
-        be the log's own — appends are still landing there, and its offsets are
-        the live ones. Inside the stream directory like everything else, so a
-        crash leaves the strays where the stream's own cleanup can see them.
-        """
-        return self.directory / "rewrite.db"
-
-    @property
     def published_db(self) -> Path:
         """The published catalog, kept beside the staging one (§2).
 
@@ -217,10 +205,6 @@ class Layout:
         `version-hint.text`; it is replicated for the SAME-machine case, where
         it saves a round trip, and a failover deliberately does not restore it
         because a stale copy wins over the bucket's own pointer.
-
-        The rewrite scratch is excluded. It is derived from the published table
-        and deleted at the end of the operation that makes it, so replicating
-        it would ship a temporary file to object storage to no purpose.
 
         Listed here rather than assembled by a caller, because which files
         matter is exactly what this class knows and nothing else should have to
@@ -274,9 +258,9 @@ class Layout:
 
         Uniqueness is the point. A deterministic `{start}-{end}` meant a
         compaction whose inputs were themselves a previous compaction of the
-        same range wrote to the path it was reading — `set_sort_by(rewrite=True)`
-        after any compaction truncated the live, table-referenced file, and a
-        crash mid-write destroyed the only copy of those rows. It also meant
+        same range would write to the path it was reading — truncating the
+        live, table-referenced file, so a crash mid-write destroys the only
+        copy of those rows. It would also mean
         two owners racing the role wrote one file. A seal can overwrite in place
         because its source is the buffer, which is still there; a compaction's
         source is the file it is replacing.

@@ -354,7 +354,7 @@ left the table, because that one is about readers still holding it (I6).
 "When it left the table" is the COMMIT, not the queueing, and the two are not the same
 moment. Files are queued before the commit that supersedes them, since a crash in between
 would lose the only record of their paths, so every supersession corrects the stamp
-afterwards — a merge, a published rewrite, an eviction and both expiries. Left at the
+afterwards — a merge, an eviction and both expiries. Left at the
 queueing, an operation slower than its table's snapshot retention spends the whole grace before it
 commits and the files fall due the instant they stop being referenced: measured at a five
 second retention, a reader 0.4 s old lost every file its snapshot named and failed
@@ -372,8 +372,9 @@ immutable and its neighbours are too big to merge with — so waiting achieves n
 Holding it blocked the published table permanently: everything after it is newer, so the watermark
 never advanced, and I4 pinned local disk with it.
 
-So the published table can gain one small file per explicit seal. `rewrite_published` is the tool
-for that, ad-hoc, and the same one that recompacts after a `target_compact_size` change.
+So the published table can gain one small file per explicit seal, and a raised
+`target_compact_size` leaves what is already published at the size it was pushed at. Both stay
+as written: the published table is the log's immutable record, and nothing rewrites it.
 
 **What would change this.** Compaction rewriting everything downstream of an undersized
 file would keep the published table perfect — merging `[0.1][8][8]` and splitting at the cap moves
@@ -382,8 +383,8 @@ online because the rewrite window is everything unpublished, so the work is larg
 when publish is furthest behind, and it charges a full rewrite for a rare deliberate act.
 
 That reasoning depends on `seal()` being exceptional. **If it turns out to be common in
-real use, small files will accumulate in the published table faster than anyone runs the offline
-tool, and this belongs online after all.** It is a threshold change rather than a redesign:
+real use, small files will accumulate in the published table, and this belongs online after
+all.** It is a threshold change rather than a redesign:
 the mechanism is the same, only the trigger moves.
 
 ## The concurrency contract
@@ -412,7 +413,7 @@ calls:
 
 **Not** concurrency-safe — call them when nothing else is using the log:
 
-- `set_config`, `set_published`, `set_sort_by`
+- `set_config`
 - `close`
 
 The first three mutate a SQLite row and a Python object together, and they are the only
@@ -510,8 +511,7 @@ lives, and a row keeps its identity through every stage: open while the appender
 closed when the cut is frozen, named when the seal commits the file, and re-pointed at the
 published copy's URI when `publish` pushes a second copy. `bytes` — what the appender counted
 those rows as in memory — is written once, at the cut, and carried by everything downstream: compaction
-adds up the runs it merges, `publish` copies the number to the published table's name for the file,
-and the published rewrite sizes its merges from the same column. Nothing re-derives it,
+adds up the runs it merges, and `publish` copies the number to the published table's name for the file. Nothing re-derives it,
 because nothing can: a Parquet footer records what the rows compressed from, not what they
 cost to hold, and Iceberg has no per-file field to keep it in — v2's data-file metadata is
 a fixed set with nothing user-extensible, and `add_files` cannot attach one.
@@ -608,9 +608,8 @@ An UNCORRELATED key costs twice, and neither cost shows up in a benchmark of the
   offset order, so reading from an offset needs a sort after reading rather than a scan.
   For a log this is the primary access pattern, which makes it the expensive half.
 
-Both are properties of the first seal, not of any later rewrite. `rewrite_published` and
-`compact` re-sort what they rewrite, exactly as a seal does — they neither introduce this
-nor repair it.
+Both are properties of the first seal, not of any later rewrite. `compact` re-sorts what it
+rewrites, exactly as a seal does — it neither introduces this nor repairs it.
 
 ## Losing the machine
 

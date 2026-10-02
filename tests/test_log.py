@@ -274,7 +274,8 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
         log.extend(rows(400))
 
         held: list[float] = []
-        real_lock = log._lock
+        buffer = log._buffer
+        real_lock = buffer._lock
 
         class Timed:
             def __enter__(self) -> None:
@@ -285,13 +286,14 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
                 real_lock.release()
                 held.append((time.perf_counter() - self._at) * 1000)
 
-        log._lock = cast("threading.RLock", Timed())
+        buffer._lock = cast("threading.RLock", Timed())
         started = time.perf_counter()
         log.seal(flush=True)
         total = (time.perf_counter() - started) * 1000
-        log._lock = real_lock
+        buffer._lock = real_lock
 
     locked = sum(held)
+    assert held, "the seal never took the buffer lock, so this measured nothing"
 
     assert total > 5.0, "seal was too fast to say anything about"
     assert locked < total / 2, (
@@ -368,11 +370,8 @@ def test_a_reader_has_no_mutation_to_refuse(tmp_path: Path) -> None:
             "evict",
             "reclaim",
             "sweep",
-            "rewrite_published",
             "retire",
             "set_config",
-            "set_sort_by",
-            "set_published",
             "recover",
         ):
             assert not hasattr(reader, absent), f"a reader exposes {absent}"

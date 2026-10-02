@@ -58,8 +58,7 @@ not a service, so this costs no daemon.
                          archive.db on a log from before 0.6)
     litestream.yml       the sidecar's config, if replicating    (§3a)
     data/                sealed Parquet                           (§4)
-        compacted/       merged by compaction, and rewrite_published's
-                         re-cuts                                 (§6)
+        compacted/       merged by compaction                     (§6)
         ingested/        written by bulk ingest, never buffered   (§13.4)
     metadata/            Iceberg metadata JSON and Avro
     published/           the published prefix, when not on S3    (§5)
@@ -350,8 +349,8 @@ has them, and `validate` refuses it without a remote (`s3://`) published
 table to ship to and refuses `wal_retention` without it. What it still does not do is assert
 that a sidecar is running, which the library cannot know. So it states an intent the deployment has to honour, and
 stating it falsely costs the growth without buying the durability that growth was traded
-for: seals hold their rows, nothing ships them, and only `publish` reaching the range releases
-them.
+for: the buffer holds its rows, nothing ships them, and `evict("buffer")` releases them only
+once `publish` has reached the range.
 
 **The sidecar needs a monotonic clock that does not run backwards.** litestream reports a
 measured interval through a Prometheus counter, which panics on a negative value, so one
@@ -594,8 +593,10 @@ integers. The exclusion is interval arithmetic, not mutual exclusion.
 | compact ∥ evict | eviction stays below every in-flight merge's `start` |
 | compact ∥ compact | each claims a distinct run and skips runs already claimed |
 | compact ∥ publish | a merge must not span into what publish is publishing, and vice versa |
-| publish ∥ publish | `register` declines a range the published table already covers |
+| publish ∥ publish | both claim from the published floor, so they exclude each other; `register` declines a covered range besides |
+| publish ∥ seal, evict | publish claims only `[floor, end of what it pushes)` (#118): seals land above it, eviction below the floor |
 | evict ∥ expire | both are metadata commits; CAS orders them and both are idempotent |
+| drain ∥ anything | no claim (#118): a queued name can never become referenced again, so the veto and the grace period suffice |
 
 `compact ∥ publish` is the one that is a correctness matter rather than wasted work.
 Compaction skips files at or below the published watermark, so a merged file cannot span into
@@ -663,11 +664,9 @@ before its commit and refuses to carry on if it no longer holds the range. Note 
 the same as "expired": an expired claim nobody has taken may still be renewed, and what ends
 a claim is the taker deleting its row.
 
-**An outer claim's renewal is combined with the run's, never substituted for it.** A rewrite
-under the whole-log lease (`rewrite_published`, `rewrite_sorted`) passes that lease's `renew`
-down; `renew or claim.renew` silently stopped renewing the run claim at all and answered the
-pre-commit check with the outer one. Callers no longer pass a callback of their own: each pass
-renews its own claim, which is why the public routines dropped `heartbeat`.
+**Each pass renews its own claim, and only its own.** No caller passes a renewal callback down,
+which is why the public routines take no `heartbeat`: a pass's pre-commit check must answer for
+the range it is about to commit, not for some outer claim.
 
 **And the published table refuses a range that starts inside its extent.** Everything upstream is
 arranged so a merge never straddles it, and each gap found in that arrangement has been a
@@ -678,7 +677,7 @@ and those offsets sit in two files at once, in the immutable tier, with nothing 
 repair it. Refusing costs a stall; admitting costs silence.
 
 **That stall has no remedy today, and this paragraph used to imply one.** Nothing re-cuts a
-LOCAL straddler — `rewrite_published` works the other side — so the log stops advancing its
+LOCAL straddler, so the log stops advancing its
 watermark, eviction pins below the straddling file, and the shipped publish role dies on the
 `ValueError` because it catches `RuntimeError` and `CommitFailedException` only. The refusal
 is still the right trade against silent permanent duplication in the immutable tier, but
@@ -700,24 +699,37 @@ hole rather than a safety condition: it exempted exactly the range that starts B
 extent and runs past it, engulfing the whole thing — every published offset in two files,
 which is the worst version of this rather than an excused one.
 
-**And `drain` claims, because the unlink is not metadata.** Expiry is safe claimless — a
-metadata commit CAS orders, idempotent — and the deletion that follows it inherited that
-reasoning without earning it. The window it was written for was `hydrate` re-registering a
-file under the very name the queue still holds, between the veto being read and the file being
-unlinked; `hydrate` is gone (#118), and whether anything else can re-register a queued name —
-and so whether the claim can go — is the second half of #118. Until then it stays, and it
-renews before EVERY deletion, not once at the top: the unlink is this pass's commit,
-everything slow in a drain sits between the veto being read and the deletions — opening the
-published table, walking its manifests, one remote round trip per queued object — and a claim
-held for the first of those is not a claim held for the last.
+**`drain` takes no claim, because nothing can make a queued file live again** (#118). What a
+claim on the unlink would guard is a queued name becoming referenced between the veto and the
+delete. `hydrate` did exactly that, deliberately, and is gone. Everything else that adds a file
+to a table adds one with a fresh per-attempt token (a seal, a compaction, an ingest, a published
+rewrite). Seal recovery commits a claimed name only if it never landed and otherwise writes a
+fresh one, and compaction recovery registers nothing. `publish` registers copies of staging
+files above the published span, and `register` declines a covered range, so a range a rewrite
+superseded is never pushed again. An entry that is due and unreferenced therefore stays
+unreferenced, and two drains overlapping only unlink one file twice.
+
+**`publish` claims only the range it pushes** (#118): `[floor, end)`, from the published
+table's frontier to the end of what it uploads, so a seal or eviction in another process is not
+refused for the length of an upload. It still excludes compaction over those files (including
+the trailing run `flush` takes), another publish (both claim from the same floor), and a
+whole-log operation. Two cases take the whole log
+instead: a publish that must write the tier row, since that exact rollup must not race
+eviction widening it, and a published table only a repairing open can reach.
+
+The range is chosen before it is claimed, so the tier row can vanish in between. A push holding
+only a range then cannot write the row, so it pushes nothing, **logs a warning**, and leaves the
+next publish to claim the whole log. Only something dropping the row concurrently reaches this,
+so it is a guard rather than a path, but a publish that silently did nothing would leave rows
+local a pass longer with no sign of why. Two publishes on disjoint ranges can also finish out
+of order, so the watermark write is a rising one: it never lowers what another recorded.
 
 **And everything a pass reads to decide a deletion is read under its claim, not before it.**
 `publish` learned this for itself and eviction did not, though it acts on the same facts: it
-read the published location, and the policy, before claiming anything. `set_published` is
-documented as something the shipped writer calls on every restart and it takes the whole
-log, which is free precisely while eviction holds nothing — so attaching a published table between
-the read and the acquire left eviction deleting the only copy of every aged row that published table
-was configured to receive, unrecoverably, since publish cannot push what has left the table.
+read what the published table holds, and the policy, before claiming anything — and another
+process can change either between that read and the claim. A deletion decided on the earlier
+read acts on facts the claim does not back, and a file that has left the staging table can
+never be pushed afterwards.
 Eviction therefore claims on the UNCLAMPED retention boundary, which only ever falls, and
 recomputes everything under the claim. `set_config` gets the same treatment for the same
 reason: it writes durable state that no running process would otherwise hear about, and
@@ -749,13 +761,9 @@ Reading both halves durably is still not enough, and this is the part that took 
 to see: read and write as two transactions with nothing between them, and the check is only
 a statement about the past. Each setter could pass against a state the other was about to
 change, so between them the two calls assembled the very pair neither would accept — and the
-next maintenance pass carried it out. **`set_config` and `set_published` therefore take the
-same claim**, which is §4a's own rule about data, applied to the configuration that governs
-it: the check and the act share a transaction, or they are not a guard. `litelink.new` records
-the pair in one `meta` transaction for the same reason, and both setters ask for the claim
-again at the write — the read and the write are one decision only while it is held, and a
-stall past the TTL between them lets the other setter take the lapsed claim lawfully and
-record the other half.
+next maintenance pass carried it out. **The published location is fixed when the log is
+created**, so one half of the pair cannot change: `set_config` checks against a value nothing
+can move, and takes no claim. `litelink.new` records the pair in one `meta` transaction.
 
 **And a repairing open is a CLAIM HOLDER's privilege.** That is the other half of the same
 rule, and it went unenforced at one call site: expiry is exempt from claims because it is a
@@ -767,8 +775,8 @@ and registered, taking the live entry with it.
 
 **Compaction asks whether ANY published table holds a file, not the configured one.** Detaching does
 not make the copies stop existing. Merging across a range some published table holds makes a LOCAL
-file whose boundaries line up with nothing there, and nothing re-cuts a local straddler —
-`rewrite_published` works the other side — so re-attaching stalls the log for good: eviction
+file whose boundaries line up with nothing there, and nothing re-cuts a local straddler,
+so re-attaching stalls the log for good: eviction
 pins below it and every push is refused. Four legitimate operations reach it, with no warning
 at any step: detach, raise the target, maintain, re-attach. Skipping those files costs
 nothing, because only compacted files are ever pushed, so one with a published copy is already
@@ -787,7 +795,7 @@ eviction pins on it, and nothing raises. A file no merge can touch is settled by
 Note what that correction cost the earlier justification: "a file with a published copy is
 already at the target" is false the moment the target is RAISED after the copy was made —
 which is the scenario the exclusion exists for. Such a file stays at the size it was
-published at, and `rewrite_published` is the tool for that.
+published at: the published table is never rewritten.
 
 **Opening the published table with `repair` needs the durable location, not a remembered one.** That
 open may drop a catalog entry naming another prefix and create a fresh table at this one;
@@ -932,12 +940,12 @@ manifest, which it reads anyway.
 longer authorises a deletion, which was the whole of the problem.
 
 **Coverage, not equality.** The two tiers cut the same rows into files independently, so
-asking whether a local range EQUALS a published one was wrong the moment they could differ.
-`rewrite_published` re-cuts the published table to different boundaries by design — that is its entire
-job — and under an equality test every local file then matched nothing, for ever: eviction
-clamped to zero and stopped, and compaction stopped treating published files as the published table's
-business and merged across its extent, which `register` admits as a partial overlap and the
-published table keeps as duplicate rows. Neither heals, because nothing re-cuts the published table back.
+asking whether a local range EQUALS a published one is wrong whenever they differ — a
+published table written by an earlier version's re-cut, for one. Under an equality test every
+local file then matches nothing, for ever: eviction clamps to zero and stops, and compaction
+stops treating published files as the published table's business and merges across its extent,
+which `register` admits as a partial overlap and the published table keeps as duplicate rows.
+Neither heals, because nothing rewrites the published table.
 The question I4 actually asks is whether the published table holds the ROWS, so adjacent published
 files join and a gap ends the answer.
 
@@ -1025,17 +1033,15 @@ Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
 
 **Compactions are never replicated.** A file is pushed only once compaction is done with it,
 and compaction refuses to merge anything the published table holds (§4a), so the two tables
-never need the same overwrite applied twice. Re-cutting what is already published is
-`rewrite_published`'s job, run on purpose.
+never need the same overwrite applied twice. Nothing rewrites what is already published.
 
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).
 
 **Step 4 is its own routine, `reclaim("published")`, not part of `publish`.** `advance()` runs it
-right after `publish` (§12), and an orchestrator can run it on its own schedule. Until #113 the
-published table was expired only after `rewrite_published`, on the reasoning that `publish`
-never supersedes a file. True of data files and not of Iceberg's own: a table that was only
-ever published kept every snapshot, manifest list and manifest it had ever had.
+right after `publish` (§12), and an orchestrator can run it on its own schedule. `publish`
+never supersedes a data file, but every commit leaves Iceberg's own behind: a table that is
+only ever published still gains a snapshot, manifest list and manifest per push.
 
 **The staging table's expiry and eviction are not publishing work either.** They are their own
 routines, run by `advance()` after `publish` (§12).
@@ -1440,8 +1446,7 @@ the engine.
 **The published row changes when the local floor moves, not when the published table does.** Eviction
 widens it by the rows it moves, from their local manifest statistics, before its commit — so a
 read resolving the new, higher floor finds the row already covering what went below it. `publish`
-adds only copies of rows the staging table still holds and `rewrite_published` re-cuts rows the
-published table has, so neither touches it. The one write that narrows is an exact rollup from the published table's manifests, run only
+adds only copies of rows the staging table still holds, so it never touches it. The one write that narrows is an exact rollup from the published table's manifests, run only
 under the whole-log maintenance claim, which eviction cannot hold beside: at the first `publish`,
 on a re-point (which drops the row first), at `restore`, and at `open` for a log written before
 the row existed. With no row, the published table is read.
@@ -1518,9 +1523,8 @@ once, and a maintainer the operator never invoked deleted 4,025 acknowledged off
 shape.
 
 Now every log has a published table: on S3 when one is given, otherwise a local directory under the
-log's own. Eviction drops only what it holds, `set_published(None)` re-points to the local
-default rather than detaching, and `staging_retention = 0` means "evict on publish" on every
-log. The cost moves to the published table: a local one keeps everything until truncation by offset
+log's own, fixed when the log is created. Eviction drops only what it holds, and
+`staging_retention = 0` means "evict on publish" on every log. The cost moves to the published table: a local one keeps everything until truncation by offset
 or age lands, which is a follow-up.
 
 Raising it applies to data captured afterwards. Reading older data often is the reader's
@@ -1681,9 +1685,9 @@ wal_retention          how far back a restore may go      (None = litestream's o
 ```
 
 `sort_by` is NOT in here. Everything above governs future work only, so `set_config` needs
-no rewrite; the sort order is a read-shape decision that re-clusters every file the staging
-table owns, so it is set at `litelink.new` and changed by `set_sort_by`. It lives in `meta` beside the
-schema, not in `LogConfig`.
+no rewrite; the sort order is a read-shape decision fixed when the log is created, like the
+schema, and a different order is a new log. It lives in `meta` beside the schema, not in
+`LogConfig`.
 
 `advance()` runs the whole pipeline in lifecycle order: seal, compact, publish, reclaim the
 buffer, evict, expire, sweep staging, expire the published table, sweep it. Eviction takes only
@@ -1701,77 +1705,15 @@ The consequence worth planning for is that local disk holds roughly
 
 ## 13. Open questions
 
-0. **The published table's identity is local, and re-pointing has to reconcile it.** Seven
-   consecutive review rounds found defects in one seam, each fix adding a guard on top
-   of the last. That is a design signal, and it is recorded here rather than patched
-   again.
-
-   The shape of the problem: `published.db` is a LOCAL catalog keyed by table id, naming a
-   REMOTE table. Nothing in the entry says which prefix it belongs to, so "is this entry
-   mine?" is answered by comparing its metadata location against the configured prefix —
-   a string comparison standing in for an identity. Meanwhile `set_published` changes
-   durable state that every other process cached at open, and the watermark it resets is
-   the thing eviction deletes on.
-
-   What has accumulated as a result: the entry is validated at open; only a lease holder
-   may repair it; `set_published` takes the maintenance lease; `publish` re-reads the location
-   under that lease and re-checks it before writing a watermark; a failed repair restores
-   the entry it displaced; `drain` refuses to delete outside the configured prefix. Each
-   is correct and each was found the hard way.
-
-   What would replace them: give the published table an IDENTITY the entry carries — a token
-   written into the published table's own table properties at creation and recorded beside the
-   URI locally, so "is this mine?" is an equality check on a value rather than an
-   inference from a path. Prefix comparison then stops being load-bearing and a re-point
-   becomes one durable fact to change rather than three that can disagree.
-
-   Re-attaching to a published table that already holds data no longer waits on that: the
-   published table publishes `version-hint.text` at every commit and `open_published` registers
-   from it. What the token would add is a CHECK. The hint says where this log left the
-   metadata, and adopting it trusts that nothing else wrote the published table in between —
-   true under the one-writer-per-log contract, and unverifiable without an identity.
-
-   **The deferral has a measured cost, and this paragraph used to understate it.** It
-   claimed the guards above were sufficient for the operations the library supports —
-   attach, detach, re-point to a fresh prefix. A later round disproved that. It found
-   four more defects in this seam, and unlike their predecessors two of them needed no
-   race, no crash and no lease lapse: attaching a published table to a log a maintainer already
-   had open let that maintainer go on deleting the only copy of every row past
-   `staging_retention`, because `evict` asked its own memory whether I4 was owed; and
-   re-asserting a published table from a process whose memory had gone stale read as a move and
-   zeroed the watermarks of a bucket that held the data. The findings got *less*
-   contrived, which is the opposite of what a converging seam does.
-
-   The reason is now legible. The published table's identity lives in four places — the `meta`
-   row, each process's `Published` object, the `published.db` catalog row, and each captured
-   pyiceberg handle — and every guard listed above synchronises one read-write pair. Each
-   round finds the next pair nobody has synchronised yet. The four latest fixes (pin the
-   URI per push, compare-and-set the re-point against the durable value, refresh `evict`
-   from the buffer, refuse a commit whose table left its warehouse) are the same shape
-   again, and they are not evidence the next round will be clean.
-
-   The identity token above is what ends it, because it gives every guard one immutable
-   value to compare and no second in-memory life. Until it exists, the honest statement
-   of the contract is narrower than the API suggests: **re-pointing a live log is
-   defended interleaving by interleaving, not by construction.** The regime the current
-   mechanism is actually sound in is a re-point with every other process stopped.
-
-0. ~~**Per-operation claims, replacing the maintenance lease.**~~ **Closed: built.**
-   The `claim(id, owner, expires_at, kind, start_offset, end_offset, rel_path)` table exists, every
-   range-owning pass claims before it works with the conflict check and the insert in one
-   `BEGIN IMMEDIATE`, and recovery reclaims expired claims rather than a role's. See §4a
-   and `_claim.py`.
-
-   `sealing` and `compacting` were NOT subsumed, which the original sketch expected. They
-   are intent records — the path written down before the file exists (I2) — and a claim
-   answers a different question, so collapsing them would have made one row mean two
-   things.
-
-   The correctness item it was also going to fix is fixed by a different mechanism: a merge
-   can no longer include files publish has published, because compaction and `publish` both read
-   the per-segment published records rather than a watermark, and `published_prefix` excludes
-   anything a published table holds.
-
+0. ~~**The published table's identity.**~~ **Closed: the location is fixed when a log is
+   created**, like its schema and sort order. A log never re-points, so nothing has to
+   reconcile one table's catalog entry, watermark and coverage records against another's.
+   `published.db` is still a local catalog keyed by table id naming a remote table, so "is
+   this entry mine?" is still a prefix comparison, and three checks stay for logs an earlier
+   version re-pointed: the entry is validated at open, only a whole-log claim holder may
+   repair it, and `drain_published` deletes nothing outside the log's prefix or from a table
+   whose catalog entry names another. An identity token written into the published table's
+   properties at creation would make that comparison an equality check; nothing needs it now.
 1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
    data naturally clustered by ingest time, so `litelink_offset` and `ingest_ts` statistics are tight
    and manifests prune without a partition spec. Partitioning by event date would be
@@ -1848,7 +1790,7 @@ The consequence worth planning for is that local disk holds roughly
    length of a rewrite.
 
    That table already exists: `compacting` holds exactly `(start_offset, end_offset, rel_path)`, takes several
-   rows because a published rewrite claims one object at a time, and its recovery already
+   rows at once, and its recovery already
    does the right thing for an abandoned ingest — queue every claimed path, and let `drain`
    refuse the ones the table turned out to reference. A second table of the same shape would
    be a second mechanism for one fact. What ingest must NOT reuse is `claim_seal`: on reopen
