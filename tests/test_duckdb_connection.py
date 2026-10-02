@@ -52,11 +52,11 @@ def test_it_is_public_and_loads_the_iceberg_read_path() -> None:
     assert secrets(connection) == {}
 
 
-def test_remote_loads_httpfs_and_the_secret_from_the_options() -> None:
-    """`remote=True` with explicit options: the secret carries them, in
+def test_s3_options_load_httpfs_and_the_secret_from_them() -> None:
+    """Explicit `s3_options`: the secret carries them, in
     DuckDB's spelling (host:port, with the scheme as `USE_SSL`).
 
-    Falsify by building the secret from `S3Options()` instead of `s3`: the
+    Falsify by building the secret from `S3Options()` instead of `s3_options`: the
     endpoint is the environment's, not the one passed.
     """
     options = litelink.S3Options(
@@ -65,7 +65,7 @@ def test_remote_loads_httpfs_and_the_secret_from_the_options() -> None:
         secret_key="secret",
         region="eu-west-2",
     )
-    connection = litelink.duckdb_connection(options, remote=True)
+    connection = litelink.duckdb_connection(s3_options=options)
 
     assert "httpfs" in loaded(connection)
     found = secrets(connection)
@@ -109,20 +109,20 @@ def aws_environment(
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 
-def test_remote_without_options_reads_the_environment(
+def test_empty_s3_options_read_the_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """With no `s3`, the endpoint and region come from the environment and the
+    """With `S3Options()`, the endpoint and region come from the environment and the
     keys from the credential chain — here a profile in a credentials file — as
     the log's own read path does. The chain secret refreshes itself.
 
-    Falsify by requiring `s3` when `remote=True`, or by dropping `REFRESH auto`
+    Falsify by requiring explicit keys in `s3_options`, or by dropping `REFRESH auto`
     from `secret_sql`: this raises, or the refresh assertion fails.
     """
     aws_environment(monkeypatch, tmp_path, credentials=True)
     monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9123")
     monkeypatch.setenv("AWS_REGION", "ap-south-1")
-    connection = litelink.duckdb_connection(remote=True)
+    connection = litelink.duckdb_connection(s3_options=litelink.S3Options())
 
     found = secrets(connection)["litelink_s3"]
     assert "provider=credential_chain" in found
@@ -143,7 +143,7 @@ def test_no_credentials_anywhere_names_the_fix(
     aws_environment(monkeypatch, tmp_path, credentials=False)
 
     with pytest.raises(RuntimeError, match="no S3 credentials were found") as caught:
-        litelink.duckdb_connection(remote=True)
+        litelink.duckdb_connection(s3_options=litelink.S3Options())
 
     assert "AWS_ACCESS_KEY_ID" in str(caught.value)
     assert isinstance(caught.value.__cause__, duckdb.Error)
@@ -174,16 +174,6 @@ def test_a_secret_installed_on_a_connection_reaches_its_cursors() -> None:
 
     assert "127.0.0.1:9002" in secrets(cursor)["litelink_s3"]
     assert "httpfs" in loaded(connection)
-
-
-def test_options_without_remote_are_refused() -> None:
-    """Credentials nobody installs read as anonymous, and that fails as a 403
-    at the first query rather than at the call that dropped them.
-
-    Falsify by ignoring `s3` when `remote` is False: no error, and no secret.
-    """
-    with pytest.raises(ValueError, match="remote=True"):
-        litelink.duckdb_connection(litelink.S3Options(region="us-east-1"))
 
 
 def test_an_unprovisioned_machine_gets_the_message_that_fixes_it(
@@ -244,7 +234,7 @@ def test_a_remote_connection_caches_in_memory_only_by_default() -> None:
 
     Falsify by defaulting `disk_cache` to True: `cache_httpfs` loads.
     """
-    connection = litelink.duckdb_connection(OPTIONS, remote=True)
+    connection = litelink.duckdb_connection(s3_options=OPTIONS)
 
     assert "cache_httpfs" not in loaded(connection)
     assert settings(connection)["enable_external_file_cache"] == "true"
@@ -264,7 +254,7 @@ def test_a_disk_cache_is_layered_under_memory_in_the_keyed_directory(
     import shutil
 
     connection = litelink.duckdb_connection(
-        OPTIONS, remote=True, disk_cache=True, cache_key="stream-1"
+        s3_options=OPTIONS, disk_cache=True, cache_key="stream-1"
     )
 
     found = settings(connection)
@@ -287,7 +277,7 @@ def test_each_cache_layer_turns_off_on_its_own(tmp_path: Path) -> None:
     False: ~128 MB per process of RAM caching the flag claimed to turn off.
     """
     no_memory = litelink.duckdb_connection(
-        OPTIONS, remote=True, memory_cache=False, disk_cache=True, cache_key=tmp_path
+        s3_options=OPTIONS, memory_cache=False, disk_cache=True, cache_key=tmp_path
     )
     found = settings(no_memory)
     assert found["enable_external_file_cache"] == "false"
@@ -301,16 +291,35 @@ def test_a_volume_limit_outside_zero_to_one_is_refused(limit: float) -> None:
     everything at once and above 1 can never be reached."""
     with pytest.raises(ValueError, match="disk_cache_volume_limit"):
         litelink.duckdb_connection(
-            OPTIONS, remote=True, disk_cache=True, disk_cache_volume_limit=limit
+            s3_options=OPTIONS, disk_cache=True, disk_cache_volume_limit=limit
         )
 
 
-def test_a_local_connection_installs_no_cache() -> None:
-    """Only an S3 published table goes through httpfs, so a local read path
-    loads no cache extension at all, whatever is asked."""
-    connection = litelink.duckdb_connection(disk_cache=True)
+def test_a_local_connection_caches_in_memory_and_honours_the_flag() -> None:
+    """Only an S3 published table goes through httpfs, so a local connection
+    loads no disk cache; the memory cache is on, and `memory_cache=False`
+    turns it off.
+
+    Falsify by applying `memory_cache` only to a remote connection: the second
+    connection reads true.
+    """
+    connection = litelink.duckdb_connection()
 
     assert "cache_httpfs" not in loaded(connection)
+    assert settings(connection)["enable_external_file_cache"] == "true"
+
+    off = litelink.duckdb_connection(memory_cache=False)
+    assert settings(off)["enable_external_file_cache"] == "false"
+
+
+def test_a_disk_cache_without_s3_options_is_refused() -> None:
+    """The disk cache wraps httpfs, which a local connection never loads, so
+    asking for one there is refused rather than silently ignored.
+
+    Falsify by dropping the check: the call returns a connection with no cache.
+    """
+    with pytest.raises(ValueError, match="s3_options"):
+        litelink.duckdb_connection(disk_cache=True)
 
 
 def test_the_cache_key_names_the_directory(

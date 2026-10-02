@@ -102,7 +102,7 @@ def published_log(
         sort_by=("event_ts",),
         config=config,
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     )
 
 
@@ -344,10 +344,10 @@ def test_a_read_never_repairs_the_published_catalog(
     # half done leaves — so nothing has had the chance to repair the entry
     # before the read sees it.
     second = f"s3://{bucket}/elsewhere"
-    with litelink.open(tmp_path, "s", s3=s3) as writer:
+    with litelink.open(tmp_path, "s", s3_options=s3) as writer:
         writer._buffer.set_meta("published", second)
 
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+    with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reader:
         with pytest.raises(ValueError, match="not under"):
             reader._published.table()
 
@@ -447,7 +447,7 @@ def test_drain_never_deletes_outside_the_logs_own_published_table(
         schema=SCHEMA,
         sort_by=("event_ts",),
         published=f"s3://{bucket}/retired",
-        s3=s3,
+        s3_options=s3,
     )
     with elsewhere:
         elsewhere.extend(rows(ROWS))
@@ -591,7 +591,7 @@ def test_the_backfill_sees_copies_another_process_pushed(
         writer.seal()
         writer.publish()
 
-        with litelink.open(tmp_path, "s", s3=s3) as other:
+        with litelink.open(tmp_path, "s", s3_options=s3) as other:
             # `other` caches its published handle here, at today's extent.
             assert other.published_files() > 0
 
@@ -706,7 +706,7 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
         schema=SCHEMA,
         config=replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2),
         published=where,
-        s3=s3,
+        s3_options=s3,
     ) as log:
         log.extend(rows(400))
         log.seal()
@@ -750,7 +750,7 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
         staging_rows=200,
     )
     with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         for _ in range(4):
             log.extend(rows(400))
@@ -763,7 +763,7 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
     assert published > 0, "nothing reached the published table to read back"
 
     # The documented way another machine provisions DuckDB for this (#108).
-    connection = litelink.duckdb_connection(s3, remote=True)
+    connection = litelink.duckdb_connection(s3_options=s3)
     # `{prefix}/{name}`, which is the table location itself now. It used to be
     # `{prefix}/litelink/{name}` — pyiceberg's `<warehouse>/<namespace>/<table>`
     # default — while the data files sat at `{prefix}/{name}/data`, so an engine
@@ -826,7 +826,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         sort_by=("event_ts",),
         config=config,
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     )
     with log:
         for _ in range(3):
@@ -888,7 +888,7 @@ def test_eviction_never_acts_on_an_intended_copy(
         sort_by=("event_ts",),
         config=config,
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     )
     with log:
         # Several files, so the row floor lands on an edge below the head —
@@ -973,7 +973,7 @@ def test_a_healed_row_carries_the_measured_bytes(
         sort_by=("event_ts",),
         config=config,
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     )
     with log:
         for _ in range(3):
@@ -1035,7 +1035,7 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         schema=SCHEMA,
         config=config,
         published=f"s3://{bucket}/held",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         log.extend(rows(1200))
         log.seal()
@@ -1091,7 +1091,7 @@ def test_without_replication_eviction_does_not_wait_for_the_published_table(
         schema=SCHEMA,
         config=config,
         published=f"s3://{bucket}/unheld",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         log.extend(rows(1200))
         log.seal()
@@ -1140,7 +1140,7 @@ def test_a_held_seal_does_not_widen_the_next_file(
         schema=SCHEMA,
         config=config,
         published=f"s3://{bucket}/widen",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         for _ in range(3):
             log.extend(rows(600))
@@ -1180,7 +1180,7 @@ def test_the_published_table_declares_the_same_sort_order_as_the_log(
         sort_by=("event_ts",),
         config=config,
         published=f"s3://{bucket}/sorted",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         log.extend(scrambled(600))
         log.seal()
@@ -1227,7 +1227,7 @@ def test_a_log_is_recovered_onto_another_machine(
         sort_by=("event_ts",),
         config=config,
         published=where,
-        s3=s3,
+        s3_options=s3,
     ) as log:
         log.extend(rows(1200))
         log.seal()
@@ -1263,7 +1263,7 @@ def test_a_log_is_recovered_onto_another_machine(
     # is hole B, and it is what makes the offset reserve necessary rather than
     # decorative — without these the replica's frontier equals the primary's
     # and no reuse is possible to detect.
-    with litelink.open(primary, "s", s3=s3) as log:
+    with litelink.open(primary, "s", s3_options=s3) as log:
         log.extend(rows(50))
         written = log.end_offset() - 1
 
@@ -1273,7 +1273,7 @@ def test_a_log_is_recovered_onto_another_machine(
     second = tmp_path / "second"
 
     with litelink.restore(
-        second, "s", published=where, s3=s3, binary=str(binary)
+        second, "s", published=where, s3_options=s3, binary=str(binary)
     ) as revived:
         report = revived.recovery()
 
@@ -1340,7 +1340,7 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
     root = tmp_path / "log"
     layout = Layout(root, "s")
     with litelink.new(
-        root, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        root, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(600))
         log.seal()
@@ -1353,7 +1353,7 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
     stale = tmp_path / "stale-archive.db"
     shutil.copyfile(layout.published_db, stale)
 
-    with litelink.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3_options=s3) as log:
         for _ in range(3):
             log.extend(rows(600))
             log.seal()
@@ -1368,7 +1368,7 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
 
     # The hazard: the old catalog wins over the bucket's own pointer.
     shutil.copyfile(stale, layout.published_db)
-    with litelink.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3_options=s3) as log:
         assert log.published_files() == early, (
             "expected the stale catalog to be believed; the case has changed"
         )
@@ -1376,7 +1376,7 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
     # And the fix, which is what `restore` does before it opens anything.
     assert forget_published_entry(layout), "there was no entry to drop"
 
-    with litelink.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3_options=s3) as log:
         # A reader may not adopt — that is a write to `published.db` — so it
         # still sees nothing until a repairing caller runs.
         assert log.published_files() == 0
@@ -1430,7 +1430,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(800))
         log.seal()
@@ -1464,7 +1464,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
         buffer.close()
 
     LogTable.create(Layout(second, "s"), table_schema(SCHEMA), ())
-    with litelink.open(second, "s", s3=s3) as revived:
+    with litelink.open(second, "s", s3_options=s3) as revived:
         revived._published.table(repair=True)  # noqa: SLF001
         # `seal()`, not `seal()`. The recovered group is OPEN — `_seed_group`
         # builds it, and the appender never cut it — so `seal` drains
@@ -1501,7 +1501,7 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         wal_replication=True,
     )
     with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(600))
         group = log._buffer.pending_group()  # noqa: SLF001
@@ -1555,7 +1555,12 @@ def test_creating_a_log_on_another_logs_published_table_is_refused(
     )
     # Someone else's log, which fills that prefix.
     with litelink.new(
-        tmp_path / "owner", "s", schema=SCHEMA, config=config, published=foreign, s3=s3
+        tmp_path / "owner",
+        "s",
+        schema=SCHEMA,
+        config=config,
+        published=foreign,
+        s3_options=s3,
     ) as owner:
         owner.extend(rows(1200))
         owner.seal()
@@ -1574,7 +1579,7 @@ def test_creating_a_log_on_another_logs_published_table_is_refused(
             schema=SCHEMA,
             config=config,
             published=foreign,
-            s3=s3,
+            s3_options=s3,
         )
 
     assert not (tmp_path / "mine" / "s" / "buffer.db").exists(), (
@@ -1610,7 +1615,7 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(800))
         log.seal()
@@ -1641,7 +1646,7 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
     )
 
     # Restored from that snapshot, then worked the way a revived box is.
-    with litelink.restore(second, "s", published=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3_options=s3) as revived:
         # Checked BEFORE any work: the first seal recycles the open group, so
         # a stale one is invisible a moment later. Releasing the published rows
         # empties this buffer — every row in the snapshot is below the frontier
@@ -1711,7 +1716,7 @@ def test_a_restore_fence_clears_the_published_table_and_not_just_the_replica(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(300))
         log.seal(flush=True)
@@ -1748,7 +1753,7 @@ def test_a_restore_fence_clears_the_published_table_and_not_just_the_replica(
         "so the case is not set up"
     )
 
-    with litelink.restore(second, "s", published=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3_options=s3) as revived:
         report = revived.recovery()
 
         assert report is not None, "a restored log must carry its report"
@@ -1795,7 +1800,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(600))
         log.seal()
@@ -1821,7 +1826,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     monkeypatch.setattr(Buffer, "strip_local_state", die)
 
     with pytest.raises(RuntimeError, match="interrupted"):
-        litelink.restore(second, "s", published=where, s3=s3)
+        litelink.restore(second, "s", published=where, s3_options=s3)
 
     monkeypatch.undo()
 
@@ -1829,10 +1834,10 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     # table created FIRST this root would open, report `recovery() is None`,
     # and hand out offsets the primary already served.
     with pytest.raises(FileNotFoundError):
-        litelink.open(second, "s", s3=s3)
+        litelink.open(second, "s", s3_options=s3)
 
     # And the half state is resumable rather than a dead end.
-    with litelink.restore(second, "s", published=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3_options=s3) as revived:
         resumed = revived.append({"event_ts": 1, "key": "k", "payload": "p"})
 
         assert resumed > served, (
@@ -1868,7 +1873,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
     )
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(600))
         log.seal()
@@ -1904,7 +1909,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
             patched.setattr(target, method, die)
 
             with pytest.raises(RuntimeError, match="bad minute"):
-                litelink.restore(root, "s", published=where, s3=s3)
+                litelink.restore(root, "s", published=where, s3_options=s3)
 
         # The root is not a log. Whatever failed, nothing here can be opened
         # and handed offsets, because the table that would make it openable is
@@ -1913,10 +1918,10 @@ def test_a_failed_restore_never_leaves_an_openable_root(
             f"{method} failed and still left an openable root"
         )
         with pytest.raises(FileNotFoundError):
-            litelink.open(root, "s", s3=s3)
+            litelink.open(root, "s", s3_options=s3)
 
         # And it is resumable rather than a dead end.
-        with litelink.restore(root, "s", published=where, s3=s3) as revived:
+        with litelink.restore(root, "s", published=where, s3_options=s3) as revived:
             assert revived.scan().read_all().num_rows > 0
 
 
@@ -1948,7 +1953,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
         wal_replication=True,
     )
     with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
+        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
     ) as log:
         log.extend(rows(1200))
         log.seal()
@@ -1979,12 +1984,14 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     Layout(tmp_path, "s").buffer_db.unlink()
 
     with pytest.raises(Exception, match="already exists"):
-        litelink.restore(tmp_path, "s", published=where, s3=s3, binary=str(binary))
+        litelink.restore(
+            tmp_path, "s", published=where, s3_options=s3, binary=str(binary)
+        )
 
     # The row survives, so the local files are still referenced and the log
     # still reads. Before this, `WriteHandle.open` answered "use new() to create one".
     assert LogTable.exists_for(Layout(tmp_path, "s"))
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reopened:
+    with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reopened:
         assert reopened.scan().read_all().num_rows == readable
 
 
@@ -2053,7 +2060,7 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
         source.close()
         copy.close()
 
-    with litelink.restore(second, "s", published=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3_options=s3) as revived:
         assert revived.staging_extent() is None, (
             "a restore rebuilds the staging table empty — that is the state where "
             "the two questions diverge"
@@ -2073,7 +2080,7 @@ def test_a_writer_reports_where_its_next_append_lands_not_what_it_can_serve(
         # Restored from a replica, so the staging table is empty and the rows
         # are in the published table — a view that reads it is the only one that can
         # answer "what can I serve".
-        with litelink.open(second, "s", read_only=True, s3=s3) as view:
+        with litelink.open(second, "s", read_only=True, s3_options=s3) as view:
             served = view.scan().read_all().column(OFFSET).to_pylist()
             assert view.end_offset() == max(served) + 1
             assert view.end_offset() < revived.end_offset(), (
@@ -2127,11 +2134,11 @@ def test_buffered_rows_sees_another_process_seal(
         sort_by=("event_ts",),
         config=config,
         published=where,
-        s3=s3,
+        s3_options=s3,
     ) as writer:
         writer.extend(rows(20))
 
-        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+        with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reader:
             # Warm the reader's view BEFORE the seal, so its cached pointer is
             # the stale one.
             assert reader.buffered_rows() == 20
@@ -2207,13 +2214,13 @@ def test_a_handle_that_read_an_empty_published_table_still_sees_it_fill(
         sort_by=("event_ts",),
         config=config,
         published=where,
-        s3=s3,
+        s3_options=s3,
     ) as writer:
         # A maintenance tick BEFORE anything is sealed: this creates the
         # published table, empty. That is the state that used to poison a handle.
         writer.publish()
 
-        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+        with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reader:
             assert reader.scan().read_all().num_rows == 0
             assert reader.end_offset() >= 1
 
@@ -2268,7 +2275,7 @@ def test_an_evicted_log_still_serves_every_row(
         )
 
         # A reader on the same root agrees, opened the same way.
-        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
+        with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as view:
             assert view.scan().read_all().num_rows == ROWS
 
 
@@ -2395,7 +2402,7 @@ def test_restore_refuses_a_buffer_bound_to_another_published_table(
     # The published table the caller means, with rows actually in it.
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, published=held, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=held, s3_options=s3
     ) as log:
         log.extend(rows(800))
         log.seal()
@@ -2410,7 +2417,7 @@ def test_restore_refuses_a_buffer_bound_to_another_published_table(
     # A different log, bound to a different published table, whose buffer is the donor.
     donor = tmp_path / "donor"
     litelink.new(
-        donor, "s", schema=SCHEMA, config=config, published=other, s3=s3
+        donor, "s", schema=SCHEMA, config=config, published=other, s3_options=s3
     ).close()
 
     revived = tmp_path / "revived"
@@ -2418,7 +2425,7 @@ def test_restore_refuses_a_buffer_bound_to_another_published_table(
     _clone_buffer(Layout(donor, "s").buffer_db, Layout(revived, "s").buffer_db)
 
     with pytest.raises(ValueError, match="records published=") as caught:
-        litelink.restore(revived, "s", published=held, s3=s3)
+        litelink.restore(revived, "s", published=held, s3_options=s3)
 
     # Both prefixes named: which one it found, and which one was asked for.
     assert other in str(caught.value)
@@ -2447,7 +2454,7 @@ def test_restore_accepts_the_same_published_table_written_with_a_trailing_slash(
 
     primary = tmp_path / "primary"
     with litelink.new(
-        primary, "s", schema=SCHEMA, config=config, published=held, s3=s3
+        primary, "s", schema=SCHEMA, config=config, published=held, s3_options=s3
     ) as log:
         log.extend(rows(800))
         log.seal()
@@ -2464,7 +2471,9 @@ def test_restore_accepts_the_same_published_table_written_with_a_trailing_slash(
     _clone_buffer(Layout(primary, "s").buffer_db, Layout(revived, "s").buffer_db)
 
     # The SAME published table, one trailing slash different. This must attach.
-    with litelink.restore(revived, "s", published=held + "/", s3=s3) as revived_log:
+    with litelink.restore(
+        revived, "s", published=held + "/", s3_options=s3
+    ) as revived_log:
         assert revived_log.published_through() == seeded
         assert revived_log.scan().read_all().num_rows > 0
 
@@ -2489,7 +2498,9 @@ def test_restore_refuses_a_buffer_from_a_local_only_log(
     _clone_buffer(Layout(donor, "s").buffer_db, Layout(revived, "s").buffer_db)
 
     with pytest.raises(ValueError, match="records published='file://") as caught:
-        litelink.restore(revived, "s", published=f"s3://{bucket}/nowhere", s3=s3)
+        litelink.restore(
+            revived, "s", published=f"s3://{bucket}/nowhere", s3_options=s3
+        )
 
     assert f"s3://{bucket}/nowhere" in str(caught.value)
     # The commit point was never reached, so a corrected call can still run.
@@ -2524,7 +2535,7 @@ def test_an_otel_log_reads_back_exactly_from_the_published_table(
         sort_by=("ts",),
         config=config,
         published=where,
-        s3=s3,
+        s3_options=s3,
     ) as log:
         log.extend(rows)
         log.seal(flush=True)
@@ -2534,7 +2545,7 @@ def test_an_otel_log_reads_back_exactly_from_the_published_table(
         log.advance()  # evicts the local copy, so the read below is the published leg
 
     expected = pa.Table.from_pylist(rows, schema=OTEL).to_pylist()
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
+    with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as view:
         assert view.staging_rows() == 0, "the local copy must be evicted"
         assert view.schema == OTEL
         assert view.scan().read_all().drop([OFFSET]).to_pylist() == expected
@@ -2735,7 +2746,7 @@ def test_a_disk_cached_connection_shares_published_reads_by_key(
 
     def read(key: str) -> None:
         connection = litelink.duckdb_connection(
-            s3, remote=True, disk_cache=True, memory_cache=False, cache_key=key
+            s3_options=s3, disk_cache=True, memory_cache=False, cache_key=key
         )
         try:
             (count,) = connection.execute(

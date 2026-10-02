@@ -191,7 +191,7 @@ def main() -> None:
         # Credentials from the environment, never from the log — see
         # `capture.py`. Harmless for a local published table: nothing resolves
         # them unless a push to S3 actually happens.
-        log = litelink.open(args.root, NAME, s3=S3Options())
+        log = litelink.open(args.root, NAME, s3_options=S3Options())
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 

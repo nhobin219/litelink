@@ -295,7 +295,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
         sort_by=("event_ts",),
         config=config,
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         log.extend(rows(300))
         log.seal(flush=True)
@@ -537,7 +537,7 @@ def test_an_ingested_range_survives_the_whole_published_table_cycle(
             published_snapshot_retention=timedelta(seconds=0),
         ),
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         assert log.ingest(table(3000)) == (1, 3001)
         log.extend(rows(400, start=3000))
@@ -585,7 +585,7 @@ def test_a_loaded_range_reaches_the_published_table_whole(
             published_snapshot_retention=timedelta(seconds=0),
         ),
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         _, hi = log.ingest(table(3000)) or (0, 0)
 
@@ -718,7 +718,7 @@ def test_a_load_pushes_the_undersized_seals_beneath_it_too(
         sort_by=("event_ts",),
         config=config,
         published=f"s3://{bucket}/prefix",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         # Far below the compact target, so it lands in the trailing run.
         log.extend(rows(200))

@@ -259,14 +259,14 @@ def create_secret(target: duckdb.DuckDBPyConnection, options: S3Options) -> None
 
 
 def install_s3_secret(
-    connection: duckdb.DuckDBPyConnection, s3: S3Options | None = None
+    connection: duckdb.DuckDBPyConnection, s3_options: S3Options | None = None
 ) -> None:
     """Load `httpfs` and create or replace the S3 secret on `connection`.
 
-    What `duckdb_connection(remote=True)` does after loading the read path, for
+    What `duckdb_connection(s3_options=...)` does after loading the read path, for
     a connection litelink did not build — one shared database handing out
     cursors, say — and for credentials that have changed since. Credentials come
-    from `s3`, or with none given from the environment and then the AWS
+    from `s3_options`, or with none given from the environment and then the AWS
     credential chain. A chain secret refreshes itself (`REFRESH auto`), so an
     expiring STS token is not a reason to call this; rotated explicit keys are.
 
@@ -276,7 +276,7 @@ def install_s3_secret(
     found.
     """
     load_extension(connection, "httpfs", remote=True)
-    create_secret(connection, (s3 or S3Options()).resolved())
+    create_secret(connection, (s3_options or S3Options()).resolved())
 
 
 # Extensions published from DuckDB's COMMUNITY repository rather than the core
@@ -338,7 +338,7 @@ class ReadCache:
 
 
 def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) -> None:
-    """Configure `connection` to cache S3 reads as `cache` says (#118).
+    """Configure `connection`'s read caches as `cache` says (#118).
 
     Two layers, because `cache_httpfs` runs ONE mode at a time:
 
@@ -367,8 +367,9 @@ def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) 
     shared. Its block size is left alone, since changing it invalidates every
     cached file.
 
-    Settings are GLOBAL so every cursor of `connection` gets them. Only an S3
-    published table goes through httpfs, so for a local one this is inert.
+    Settings are GLOBAL so every cursor of `connection` gets them. The memory
+    cache applies to every connection, local reads included; the disk cache
+    only to a remote one, since only S3 reads go through httpfs.
     """
     if cache.disk_cache:
         load_extension(connection, "cache_httpfs", remote=True)
@@ -395,9 +396,8 @@ def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) 
 
 
 def duckdb_connection(
-    s3: S3Options | None = None,
     *,
-    remote: bool = False,
+    s3_options: S3Options | None = None,
     memory_cache: bool = True,
     disk_cache: bool = False,
     cache_key: str | PathLike[str] | None = None,
@@ -411,29 +411,27 @@ def duckdb_connection(
     network read. A missing one raises `ExtensionMissing`, saying how to
     provision it.
 
-    `remote=True` also runs `install_s3_secret`: `httpfs`, and the S3 secret
-    from `s3` or, with none given, from the environment and then the AWS
-    credential chain. A machine with no credentials at all raises
-    `RuntimeError` naming the fix. That is what reading a published table on S3
-    from another machine needs:
+    **`s3_options` is what makes a connection read S3.** Given, it also runs
+    `install_s3_secret`: `httpfs`, and the S3 secret from those options, where
+    an empty `S3Options()` takes everything from the environment and then the
+    AWS credential chain. A machine with no credentials at all raises
+    `RuntimeError` naming the fix, here rather than as a 403 at the first
+    query. Without it nothing S3 is loaded, so a local reader pays nothing for
+    it. Reading a published table on S3 from another machine:
 
-        con = litelink.duckdb_connection(remote=True)
+        con = litelink.duckdb_connection(s3_options=litelink.S3Options())
         con.sql("SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/trades',"
                 " version_name_format = '%s%s.metadata.json')")
 
-    `s3` without `remote=True` is refused rather than ignored: credentials
-    nobody installs are a connection with no secret, which reads S3 as
-    anonymous and fails as a 403 at the first query rather than here.
-
-    **Reads from S3 can be cached** (#118), with `remote=True`, in two layers:
+    **Reads are cached** (#118), in two layers:
 
     - `memory_cache` (on): DuckDB's external file cache, for this
-      connection's lifetime.
-    - `disk_cache` (OFF): the bundled `cache_httpfs` extension on disk, in
-      `cache_directory(cache_key)`, surviving restarts and shared by every
-      process using the same key. It evicts once its VOLUME is
-      `disk_cache_volume_limit` full — counting everything on that volume,
-      not just the cache.
+      connection's lifetime. Every connection, local reads included.
+    - `disk_cache` (OFF, and only with `s3_options`): the bundled
+      `cache_httpfs` extension on disk, in `cache_directory(cache_key)`,
+      surviving restarts and shared by every process using the same key. It
+      evicts once its VOLUME is `disk_cache_volume_limit` full — counting
+      everything on that volume, not just the cache.
 
     **For a reader on another machine**, which is what it is for: a log's own
     host reads its published table rarely, and a disk cache there would put
@@ -445,11 +443,13 @@ def duckdb_connection(
     caller pooling connections pools per key. See `install_read_cache`.
 
     A new connection per call, which the caller owns. Building one costs about
-    half a second, nearly all of it `LOAD iceberg` (#102), so hold on to it.
-    It is also the factory every log's reader is built with.
+    a quarter of a second, nearly all of it `LOAD iceberg` (#102), so hold on
+    to it. It is also the factory every log's reader is built with.
     """
-    if s3 is not None and not remote:
-        msg = "s3 options are for a remote connection; pass remote=True as well"
+    # Refused rather than ignored: the disk cache wraps httpfs, which only an
+    # S3 connection loads, so a local one would ask for a cache and get none.
+    if disk_cache and s3_options is None:
+        msg = "disk_cache caches S3 reads; pass s3_options as well"
         raise ValueError(msg)
 
     cache = ReadCache(
@@ -471,9 +471,10 @@ def duckdb_connection(
     # No ATTACH of the buffer database. `Buffer.rows_from` records what that
     # cost: two SQLite libraries in one process is silent corruption, not a
     # slow path.
-    if remote:
-        install_s3_secret(connection, s3)
-        install_read_cache(connection, cache)
+    if s3_options is not None:
+        install_s3_secret(connection, s3_options)
+
+    install_read_cache(connection, cache)
 
     return connection
 

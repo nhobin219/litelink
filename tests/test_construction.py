@@ -434,7 +434,7 @@ def test_replication_config_names_every_database_and_the_wal_prefix(
         schema=SCHEMA,
         config=LogConfig(wal_replication=True),
         published="s3://bucket/prefix",
-        s3=s3,
+        s3_options=s3,
     ) as log:
         rendered = log.replication_config()
 
@@ -482,7 +482,7 @@ def test_the_config_uses_litestreams_current_single_replica_key(
         schema=SCHEMA,
         config=LogConfig(wal_replication=True),
         published="s3://bucket/prefix",
-        s3=S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1"),
+        s3_options=S3Options(endpoint="http://127.0.0.1:9000", region="us-east-1"),
     ) as log:
         rendered = log.replication_config()
 

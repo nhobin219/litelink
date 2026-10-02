@@ -49,7 +49,7 @@ def open(  # noqa: A001
     name: str,
     *,
     read_only: Literal[False] = False,
-    s3: S3Options | None = None,
+    s3_options: S3Options | None = None,
 ) -> WriteHandle: ...
 
 
@@ -59,7 +59,7 @@ def open(  # noqa: A001
     name: str,
     *,
     read_only: Literal[True],
-    s3: S3Options | None = None,
+    s3_options: S3Options | None = None,
 ) -> LocalReadHandle: ...
 
 
@@ -68,7 +68,7 @@ def open(  # noqa: A001
     name: str,
     *,
     read_only: bool = False,
-    s3: S3Options | None = None,
+    s3_options: S3Options | None = None,
 ) -> LogHandle:
     """Open an existing log, for writing or for reading beside its writer.
 
@@ -111,7 +111,7 @@ def open(  # noqa: A001
             raise buffer.retired_error()
 
         config = _validated_shape(layout, buffer, name)
-        remote = Published(layout, buffer, s3)
+        remote = Published(layout, buffer, s3_options)
         reader = Reader(layout, table, buffer, duckdb_connection, published=remote)
         if read_only:
             return LocalReadHandle(
@@ -213,7 +213,7 @@ def new(
     sort_by: Sequence[str] | None = None,
     config: LogConfig | None = None,
     published: str | None = None,
-    s3: S3Options | None = None,
+    s3_options: S3Options | None = None,
     start_offset: int = 1,
 ) -> WriteHandle:
     """Create a log. See `litelink.new` for the shape it fixes and why."""
@@ -224,7 +224,7 @@ def new(
         sort_by=sort_by,
         config=config,
         published=published,
-        s3=s3,
+        s3_options=s3_options,
         start_offset=start_offset,
     )
 
@@ -234,7 +234,7 @@ def restore(
     name: str,
     *,
     published: str,
-    s3: S3Options | None = None,
+    s3_options: S3Options | None = None,
     binary: str | None = None,
 ) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
@@ -243,7 +243,7 @@ def restore(
         root,
         name,
         published=published,
-        s3=s3,
+        s3_options=s3_options,
         binary=binary,
     )
 

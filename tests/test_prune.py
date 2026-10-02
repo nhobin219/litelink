@@ -522,11 +522,11 @@ def test_a_log_without_a_published_row_reads_the_published_table_until_backfille
         forged.execute("DELETE FROM tier_statistics")
 
     remote = Remote(monkeypatch, refuse=False)
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+    with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reader:
         assert reader.scan(start_offset=low).read_all().num_rows == ROWS - low + 1
         assert remote.calls == 1, "no published row must read the published table"
 
-    with litelink.open(tmp_path, "s", s3=s3) as writer:
+    with litelink.open(tmp_path, "s", s3_options=s3) as writer:
         assert writer._tiers.has()  # noqa: SLF001
         assert writer.scan(start_offset=low).read_all().num_rows == ROWS - low + 1
         assert remote.calls == 1, "backfilled, the hot read is local again"
@@ -565,7 +565,7 @@ def test_a_restore_computes_the_published_row_from_the_published_table(
         log.publish(flush=True)
         published = log.published_through()
 
-    with litelink.restore(second, "s", published=where, s3=s3) as revived:
+    with litelink.restore(second, "s", published=where, s3_options=s3) as revived:
         found = published_row(revived)
         assert found is not None
         assert found.offsets[1] == published + 1

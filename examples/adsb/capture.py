@@ -139,7 +139,7 @@ def main() -> None:
     # prints the exports for a local endpoint.
     s3 = S3Options()
     try:
-        log = litelink.open(args.root, NAME, s3=s3)
+        log = litelink.open(args.root, NAME, s3_options=s3)
         # A log's published table is fixed when it is created (litelink#118),
         # so a restart asking for a different one is a mistake to report, not
         # an instruction: moving a log is `retire()` and a new one. Only when
@@ -163,7 +163,7 @@ def main() -> None:
             sort_by=SORT_BY,
             config=config,
             published=args.published,
-            s3=s3,
+            s3_options=s3,
         )
 
     print(f"capturing {NAME} into {args.root} at ~{args.rate:,.0f} reports/s")
