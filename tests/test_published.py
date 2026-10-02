@@ -8,8 +8,6 @@ compact, publish, evict — so none of this needs S3 or the network.
 from __future__ import annotations
 
 import sqlite3
-import time
-from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -146,39 +144,6 @@ def test_retiring_a_local_only_log_keeps_every_row(tmp_path: Path) -> None:
 
     with litelink.open(tmp_path, "s", read_only=True) as reader:
         assert offsets(reader) == list(range(1, total + 1))
-
-
-def test_rewrite_published_works_on_a_local_published_table(tmp_path: Path) -> None:
-    """It used to refuse a local-only log.
-
-    A re-cut keeps every row, and the files it supersedes are queued as
-    published objects — by URI — so they are released through the published
-    table's own expiry rather than unlinked as if they were local files.
-
-    Falsify by naming the published table's files as plain paths in `LogTable._name`:
-    the superseded files are queued as local ones.
-    """
-    with published(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
-        expected = offsets(log)
-        # A raised target is one of the things `compact("published")` exists for.
-        log.set_config(replace(log.config, target_compact_size=4 * 64 * 1024))
-        log.compact("published")
-
-        superseded = [
-            key
-            for key in log._buffer.queued_deletions()  # noqa: SLF001
-            if "/published/" in key
-        ]
-        assert superseded, "the re-cut must supersede published files"
-        assert all(key.startswith("file:///") for key in superseded)
-
-        time.sleep(1.1)
-        # `expire_published`, which drains the published table's queue (#113).
-        log.reclaim("published")
-        assert offsets(log) == expected
-        assert not any(
-            Path(key.removeprefix("file://")).exists() for key in superseded
-        ), "released once the published table expired the snapshots naming them"
 
 
 def test_replication_and_restore_need_a_remote_published_table(
@@ -849,29 +814,3 @@ def test_a_mismatched_catalog_sends_publish_to_the_whole_log(
 
         assert bound is None
         assert (lease.start, lease.end) == (0, EVERYTHING)
-
-
-def test_compact_takes_the_table_and_defaults_to_staging(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`compact("published")` merges undersized published files; the default
-    is staging only, so a loop calling `compact()` never starts re-cutting
-    the published table. A misspelt table is refused.
-
-    Falsify by defaulting `table` to the published table: the bare call goes
-    to `compact_published`.
-    """
-    with local_log(tmp_path) as log:
-        maintenance = log._maintenance  # noqa: SLF001
-        called: list[str] = []
-        monkeypatch.setattr(maintenance, "compact", lambda: called.append("staging"))
-        monkeypatch.setattr(
-            maintenance, "compact_published", lambda *_: called.append("published")
-        )
-
-        log.compact()
-        log.compact("published")
-        assert called == ["staging", "published"]
-
-        with pytest.raises(ValueError, match="table must be"):
-            log.compact("stagin")  # ty: ignore[invalid-argument-type]

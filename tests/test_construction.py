@@ -351,23 +351,6 @@ def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
         buffer.close()
 
 
-def test_a_derived_buffer_can_skip_the_fsync(tmp_path: Path) -> None:
-    """For a buffer whose rows still exist somewhere else.
-
-    The published rewrite re-cuts through a scratch buffer whose every row came
-    from the published table and is still in it until the rewrite's final commit, so a
-    crash there costs a re-run rather than data. 0 is OFF. WAL stays either
-    way: the read-only handle is a second connection to the same file, which is
-    what WAL is for here — not durability.
-    """
-    buffer = Buffer.open(tmp_path / "scratch.db", SCHEMA, durable=False)
-    try:
-        assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 0
-        assert buffer._con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    finally:
-        buffer.close()
-
-
 def test_a_config_written_without_a_setting_still_opens() -> None:
     """Adding a setting must not make existing logs unopenable.
 
@@ -432,7 +415,6 @@ def test_every_database_a_restore_needs_is_listed(tmp_path: Path) -> None:
         layout.catalog_db,
         layout.published_db,
     }
-    assert layout.rewrite_db not in layout.databases
     assert all(path.suffix == ".db" for path in layout.databases)
 
 

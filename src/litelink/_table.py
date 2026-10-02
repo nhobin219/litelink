@@ -1511,8 +1511,7 @@ class LogTable:
 
         Refusing costs a stall, and the stall is worse than this used to say.
         The straddling file never lands, the watermark stops, eviction pins
-        below it, and **nothing re-cuts a staging straddler**:
-        `compact("published")` works the other side, and no tool does this one. The
+        below it, and **nothing re-cuts a staging straddler**. The
         refusal is still right — a loud permanent stall beats a silent permanent
         duplication — but calling it recoverable was wrong, and the operator's
         only route today is to lower the compaction target so the straddler is
@@ -1560,10 +1559,9 @@ class LogTable:
         itself — putting a path on disk this process only learns about
         afterwards, which is what the deletion queue exists to avoid.
 
-        Several paths because a published rewrite re-cuts a range into however
-        many correctly sized files it takes, and the swap has to be one
-        snapshot: committing them one at a time would mean each commit deleting
-        a sub-range of a file the next commit still needs.
+        Several paths are accepted in one snapshot, so a range replaced by more
+        than one file never has a commit deleting a sub-range of a file the
+        next commit still needs.
         """
 
         def swap() -> None:

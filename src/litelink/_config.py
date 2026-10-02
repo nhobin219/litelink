@@ -283,7 +283,7 @@ class LogConfig:
     compact_min_files: int = 4
 
     # The Parquet codec every data file is written with — a seal, a compaction,
-    # a published rewrite, a bulk ingest.
+    # a bulk ingest.
     #
     # **A setting rather than a constant, because the right answer is a
     # property of the payload.** §15.5 requires NONE for blob columns: sensor
@@ -304,9 +304,8 @@ class LogConfig:
     #
     # Changing it is safe at any time and rewrites nothing. Parquet records the
     # codec per column chunk, so a table holding both reads correctly —
-    # verified across `scan` and `sql` — and existing files are never touched.
-    # `compact("published")` is what re-cuts history into the new one, when the
-    # size is worth the transfer.
+    # verified across `scan` and `sql` — and existing files are never touched:
+    # a new codec applies to what is written from then on.
     compression: str = "zstd"
 
     def to_json(self) -> str:

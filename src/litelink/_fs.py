@@ -37,9 +37,8 @@ def write_parquet(table: pa.Table, path: Path, compression: str) -> None:
     """Write a data file and make it durable, in the one place that does it.
 
     Every data file this library creates goes through here — a seal, a
-    compaction, a published rewrite, a bulk ingest — because the pair of calls
-    is the same pair every time and the codec is a setting that must not have
-    four homes. It had none: all four sites called `pq.write_table` with no
+    compaction, a bulk ingest — because the pair of calls is the same pair
+    every time and the codec is a setting that must not have several homes. It had none: all four sites called `pq.write_table` with no
     `compression`, taking pyarrow's Snappy default, and on a JSON payload
     column that measured 97 bytes/row against 51 for zstd. A fifth write site
     added later cannot silently take a different answer, because there is no

@@ -30,11 +30,14 @@ minor version carries breaking changes.
   retention and the published table keeps the order it was written with, so
   a re-sort only ever sharpened pruning for a while.
 
-- **Breaking: `rewrite_published()` is now `compact("published")`** (#118).
-  It merges undersized files in the published table: compaction, not a
-  rewrite of data. `compact(table="staging")` keeps its default, since
-  compacting the published table is network work to run on purpose and a
-  loop calling `compact()` must never start doing it.
+- **Breaking: `rewrite_published()` is removed, and `compact()` takes no
+  table** (#118). The published table is the log's immutable record and
+  nothing rewrites it. It is well-sized by construction, since `publish`
+  pushes only files compaction has finished with; the few smaller files —
+  a flushed seal or publish, a bulk load's tail, files published before a
+  raised `target_compact_size` — stay as written. `compact()` compacts
+  staging, as before. To re-cut a log at another size, backfill it into a
+  new log created with that target: `ingest` its rows in offset order.
 
 - **Breaking: `set_published()` is removed; a log's published table is fixed
   when the log is created** (#118), like its schema. To publish somewhere

@@ -755,7 +755,8 @@ class LogHandle:
         missing information is None rather than a narrower bound — see
         `ColumnStatistics` for exactly when, including why a float's bounds say
         nothing about NaN and why strings carry none. A published file that
-        straddles the staging range (only `compact("published")` cuts one) makes
+        straddles the staging range (only a re-cut by an earlier version makes
+        one) makes
         every count None in `"published"` and in the whole log: its bounds hold,
         but its rows cannot be counted once without opening it.
         """
@@ -2286,8 +2287,7 @@ class WriteHandle(LocalReadHandle):
         needs files non-overlapping and adjacent in offset order, not free of
         integer gaps, and every pass was measured correct on a gapped log. The
         one price worth stating rather than discovering: compaction will merge
-        across the gap, and a merged file spanning one can never be re-cut by
-        `compact("published")`.
+        across the gap, and the published table keeps that file as written.
 
         Takes a `pa.Table` or a `pa.RecordBatchReader` and nothing else.
         Parquet-to-Arrow is the caller's — `pq.ParquetFile(...).iter_batches()`
@@ -2980,8 +2980,9 @@ class WriteHandle(LocalReadHandle):
         committed — so the table is already correct and the next `advance()`
         will pick the same run up again. All that is owed is the half-written
         output, and `compacting` names it, so removing it costs one unlink
-        rather than a directory scan — or, for a published rewrite, one DELETE
-        rather than a paginated LIST over object storage.
+        rather than a directory scan — or, for a published object an earlier
+        version's rewrite claimed, one DELETE rather than a paginated LIST over
+        object storage.
         """
         pending = self._buffer.pending_compaction()
         if pending is None:
@@ -2992,8 +2993,8 @@ class WriteHandle(LocalReadHandle):
         # and the decision that matters is `drain`'s, which reloads at the
         # moment it removes.
 
-        # EVERY claim, not the first. A published rewrite writes one file per
-        # re-cut segment and claims each before it exists (I2), so taking one
+        # EVERY claim, not the first. An interrupted operation can hold several,
+        # each claimed before its file existed (I2), so taking one
         # row and then clearing the table left the rest as objects in a bucket
         # that nothing references and only a paginated LIST could find — the
         # one thing this design refuses to need.
@@ -3016,13 +3017,10 @@ class WriteHandle(LocalReadHandle):
         claimed = self._buffer.pending_outputs()
         self._maintenance.enqueue_recovered(key for _, _, key in claimed)
 
-        # The scratch database an interrupted rewrite left behind. It is
-        # rebuilt from the published table next time, so nothing in it is owed.
-        self._layout.rewrite_db.unlink(missing_ok=True)
-        # Only the rows just read. A rewrite whose lease lapsed mid-upload can
-        # be claiming its next segment while this runs, and clearing the table
-        # wholesale takes that claim with it — leaving an object in the bucket
-        # named by nothing, which is the state claims exist to prevent.
+        # Only the rows just read. Another operation can be claiming its next
+        # output while this runs, and clearing the table wholesale takes that
+        # claim with it — leaving a file named by nothing, which is the state
+        # claims exist to prevent.
         for _, _, key in claimed:
             self._buffer.clear_compaction(key)
 
@@ -3069,8 +3067,8 @@ class WriteHandle(LocalReadHandle):
         in the published table — up to `compact_min_files - 1` seals forming a
         run `_merge` will not rewrite, plus the load's own tail — and compaction
         will not merge them afterwards, because it refuses to touch anything the
-        published table holds. `compact("published")` re-cuts them. `ingest`
-        compacts before pushing to keep the count to what a run genuinely cannot
+        published table holds; they stay as written. `ingest` compacts before
+        pushing to keep the count to what a run genuinely cannot
         fill.
 
         **Publishing only**, a building block. Expiring the published table and
@@ -3103,8 +3101,7 @@ class WriteHandle(LocalReadHandle):
         eviction below the published floor, and compaction refuses what the
         published table holds — and a compaction over the trailing run, which
         `flush` pushes too, overlaps this range and so is excluded by it.
-        `compact("published")` and the other whole-log operations still exclude
-        any publish.
+        The whole-log operations still exclude any publish.
 
         **Two publishes still exclude each other.** Both start at the same
         floor, so their ranges overlap even when there is nothing to push —
@@ -3190,8 +3187,8 @@ class WriteHandle(LocalReadHandle):
 
         Safe in the direction it moves. Compaction refuses to merge anything a
         published table already holds, so a file pushed early is simply never
-        merged — the cost is a small object the published table keeps until
-        `compact("published")` re-cuts it, not a duplicate range. The deadlock the
+        merged — the cost is a small object the published table keeps, not a
+        duplicate range. The deadlock the
         shared `runs` exclusion guards against is the opposite direction:
         holding back a file compaction will never touch.
 
@@ -3205,8 +3202,7 @@ class WriteHandle(LocalReadHandle):
         The published table may still gain a small file: one stranded between
         larger neighbours can never be merged, so holding it back would block
         the watermark forever rather than improve anything. That is a cosmetic
-        cost with a deliberate cause, and `compact("published")` is the tool for
-        it.
+        cost with a deliberate cause.
         """
         # Read under the claim, the same as everything else that decides what
         # this pass does. The grouping `stable_prefix` computes has to match
@@ -3397,8 +3393,7 @@ class WriteHandle(LocalReadHandle):
         # run is the load's own. And the alternative is worse by a wide
         # margin — a load's rows never enter the buffer, so not pushing them
         # leaves them on one disk. Compaction will not merge what the
-        # published table holds, so any small objects persist until
-        # `compact("published")` re-cuts them.
+        # published table holds, so any small objects stay as they are.
         settled = self._settled(pending, flush=flush)
         if bound is not None:
             # Inside the range claimed, and nothing past it: a seal or another
@@ -3566,8 +3561,7 @@ class WriteHandle(LocalReadHandle):
         passes `flush` to `seal` and `publish`, so every buffered row is sealed
         and every staging file published in this pass — at shutdown, say, to
         get everything off this machine. The cost is undersized files, in
-        staging and in the published table; `compact("published")` re-cuts the
-        published ones.
+        staging and in the published table, where they stay.
 
         Data moves first, then cleanup follows behind it:
 
@@ -3637,53 +3631,23 @@ class WriteHandle(LocalReadHandle):
         self.reclaim("published")
         self.sweep("published")
 
-    def compact(self, table: Literal["staging", "published"] = "staging") -> None:
-        """Merge undersized files into `target_compact_size` ones (§6).
+    def compact(self) -> None:
+        """Merge undersized staging files into `target_compact_size` ones (§6).
 
-        **`"staging"`** (the default) is the heavy step of `advance`: it reads
-        and rewrites whole files, while eviction and expiry are metadata
-        commits that finish in milliseconds, which is why the steps are
-        callable separately. It claims each run it merges (§4a) and renews that
-        claim as it works, so it excludes another maintainer only where their
-        work overlaps.
+        The heavy step of `advance`: it reads and rewrites whole files, while
+        eviction and expiry are metadata commits that finish in milliseconds,
+        which is why the steps are callable separately. It claims each run it
+        merges (§4a) and renews that claim as it works, so it excludes another
+        maintainer only where their work overlaps.
 
-        **`"published"`: you should never need to call this in normal
-        operation**, and `advance` never does. `publish` pushes only files
-        compaction has finished with, so the published table is well-sized by
-        construction. It is a repair for the three things that break that on
-        purpose: an explicit `seal(flush=True)` or `publish(flush=True)`
-        stranding a small file, a change to `target_compact_size`, which
-        applies to the future while the published table is immutable history,
-        and a bulk load's undersized tail. Run it once after one of those, if
-        the small files matter to your readers — not on a schedule.
-
-        It merges undersized files already in the published table; rows and
-        offsets are unchanged, only how they are cut into files. It downloads,
-        merges and re-uploads, so it claims the whole log for as long as that
-        takes.
-
-        The default is `"staging"`, not both, unlike the other routines that
-        take a table: compacting the published table is network work to run
-        occasionally, on purpose, and a loop calling `compact()` must never
-        start doing it.
+        Staging only. The published table is never rewritten: it is the log's
+        immutable record, and `publish` pushes only files compaction has
+        finished with, so it is well-sized by construction. The exceptions —
+        a flushed seal or publish, a bulk load's tail, a raised
+        `target_compact_size` — leave a few smaller files, which stay as they
+        were written.
         """
-        if table == "staging":
-            self._maintenance.compact()
-            return
-
-        if table != "published":
-            msg = f'table must be "staging" or "published", not {table!r}'
-            raise ValueError(msg)
-
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds a claim over this range"
-            raise RuntimeError(msg)
-
-        try:
-            self._maintenance.compact_published(lease.renew, lease.owner)
-        finally:
-            lease.release()
+        self._maintenance.compact()
 
     def evict(
         self,

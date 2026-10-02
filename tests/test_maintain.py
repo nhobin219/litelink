@@ -1166,46 +1166,6 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
         log.close()
 
 
-def test_rewriting_the_published_table_does_not_strand_staging_eviction(
-    tmp_path: Path,
-) -> None:
-    """The two tiers cut the same rows independently, and I4 must not care.
-
-    `compact("published")` re-cuts the published table to different boundaries — that is its
-    whole job. Asking whether a local file's range EQUALS a published one then
-    failed for every local file, permanently: eviction clamped to zero and
-    stopped, and compaction stopped treating published files as the published table's
-    business and merged across its extent. Neither heals, because nothing ever
-    re-cuts the published table back.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        published="s3://bucket/prefix",
-    )
-    with log:
-        seal_files(log, 3, per_file=4)
-        files = sorted(log._table.data_files(), key=lambda f: f.start)
-
-        assert len(files) == 3
-
-        # The published table holds every row of all three, cut its own way: two files
-        # whose boundaries line up with none of the local ones.
-        start, end = files[0].start, files[-1].end
-        middle = files[1].start + 1
-        log._buffer.record_file("s3://bucket/prefix/data/a.parquet", start, middle, 1)
-        log._buffer.record_file("s3://bucket/prefix/data/b.parquet", middle, end, 1)
-
-        assert (
-            log._maintenance.published_prefix(
-                files, log._published.uri, include_intents=False
-            )
-            == end
-        ), "the published table holds every row; how it cut them is not I4's business"
-
-
 def test_a_gap_in_the_published_table_stops_the_walk(tmp_path: Path) -> None:
     """Coverage must join adjacent files without inventing rows between them."""
     log = litelink.new(
@@ -1262,7 +1222,7 @@ def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
 
         assert remaining < rows_before, "the setup must actually evict"
 
-        log._maintenance._rewrite_run(log._table, run, None)
+        log._maintenance._rewrite_run(log._table, run)
 
         assert len(read_all(log)) == remaining, (
             "the merge put back rows eviction had removed"
@@ -1356,40 +1316,6 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
                 taker.release()
 
         assert log.staging_files() == before, "committed without holding the claim"
-
-
-def test_an_outer_renew_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
-    """`renew or claim.renew` read naturally and was wrong.
-
-    A rewrite run under the whole-log lease — `compact("published")` —
-    passes that lease's `renew` down. Taking it in place of
-    the run claim's stopped the run claim from being renewed at all, and the
-    pre-commit check then consulted the outer claim instead. A merge over the
-    TTL lost its exclusion with no stall required.
-
-    Falsify by making `_both` return `theirs` when it is given: no run claim
-    is renewed.
-    """
-    config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        run = sorted(log._table.data_files(), key=lambda f: f.start)
-        renewed: list[int] = []
-        original = Claim.renew
-
-        def counting(self: Claim) -> bool:
-            renewed.append(self.row_id or 0)
-
-            return original(self)
-
-        Claim.renew = counting
-        try:
-            log._maintenance._rewrite_run(log._table, run, lambda: True)
-
-        finally:
-            Claim.renew = original
-
-        assert renewed, "the run claim was never renewed while a merge ran"
 
 
 def test_drain_needs_no_claim_and_still_keeps_what_is_referenced(
