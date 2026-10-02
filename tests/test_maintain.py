@@ -1679,9 +1679,7 @@ def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:
 def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
     """Eviction is a supersession commit, and re-dates what it drops to it.
 
-    A path already queued with an old stamp — once reachable with no failure
-    at all through `hydrate` re-registering a queued name, removed in #118 —
-    would otherwise keep that stamp through the `INSERT OR IGNORE`, leave the
+    A path already queued with an old stamp would otherwise keep that stamp through the `INSERT OR IGNORE`, leave the
     table already overdue, and be drained out from under a reader streaming
     it. The stamp is what the reader's grace rests on, so it is asserted
     directly.

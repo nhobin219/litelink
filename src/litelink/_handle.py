@@ -458,12 +458,11 @@ class LogHandle:
     reaches back reads history — because the whole log is the right answer to
     it.
 
-    That reverses 0.4.0, deliberately. 0.4.0 fixed the tiers at assembly with
-    `include_archive`, so a `scan` would not start touching the network
-    because eviction happened to run; the price was that the caller named a
-    tier, and a handle without the archive answered short for any query that
-    reached below the local window. Now latency follows the predicate rather
-    than the handle: the same query reads the published table once eviction
+    Tiers are not fixed at assembly. That would keep a `scan` off the network
+    however far eviction ran, at the price of the caller naming a tier and a
+    handle without the published table answering short for any query that
+    reached below the local window. Latency follows the predicate rather than
+    the handle: the same query reads the published table once eviction
     has moved the rows it asks for there.
     """
 

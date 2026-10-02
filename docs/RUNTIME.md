@@ -18,7 +18,7 @@ should be cut and returns.
 | role | what it does | process |
 |---|---|---|
 | **writer** | `append` / `extend` — the hot path | yours |
-| **maintainer** | seal, compact, evict, expire, unlink | its own |
+| **maintainer** | seal, compact, publish, evict, reclaim, sweep | its own, or one per step group |
 
 **Sealing is maintenance**, not a third role. It is the first thing the maintainer does
 with what the writer leaves behind: turn the buffer into Parquet. Compaction, eviction
@@ -34,21 +34,24 @@ writer starves the appending thread through the GIL even while holding no lock. 
 measured 45.2 ms behind an in-process seal. A separate process does not share the GIL.
 That is the whole reason the claims exist.
 
-**Why it is one process and not two.** Sealing and compaction are the same kind of work:
-off the hot path, committing to the same Iceberg table, neither latency-critical the way
-an append is. Sharing a GIL between them costs nothing that matters, while splitting them
-costs something real — within a process the seal and the passes share one `LogTable`, which
-guards its handle, and nothing does across processes, so two maintainer processes race on
-Iceberg's delete-after-commit metadata cleanup and each warns about files the other
-already removed.
+**One process or five.** `advance()` in a loop is the whole role in one process, and is right
+until one step starts delaying another. Past that, split it the way API.md's "Process split"
+recommends: a step gets its own process when it is heavy on CPU or the network — `seal`,
+`compact` and `publish` each alone, local cleanup (`evict`, `reclaim` buffer and staging,
+`sweep("staging")`) in one, and the published table's `reclaim` and `sweep` in another.
+Sealing and compaction are both CPU-bound pure Python, so sharing an interpreter makes a seal
+wait on a merge and the buffer grow meanwhile; `publish` and the published cleanup wait on the
+network, which must not hold up anything local.
 
-The one role does hold **two kinds of claim**, over the seal's queued range and over the
-range a pass is working on, because they guard different recovery records: `sealing`
-belongs to whoever claimed the first and `compacting` to whoever claimed the second, and a
-process replaying one must not replay the other. That
-also means splitting the role across two processes later needs no code change, if a long
-compaction ever delays sealing enough to matter. It costs latency, not file size — the
-cut was recorded when the rows arrived.
+The price of each extra process committing to the Iceberg table is noise: processes race on
+pyiceberg's delete-after-commit metadata cleanup, and the loser warns about a file the winner
+already removed. Nothing litelink depends on goes through that cleanup — its own files are
+deleted through its expiry queue — so the warning costs nothing but a log line.
+
+Splitting needs no code change. Seal and compaction take different claims because they guard
+different recovery records — `sealing` belongs to whoever claimed the seal's range and
+`compacting` to whoever claimed a run — and a process replaying one must not replay the other.
+A delayed seal costs latency, not file size: the cut was recorded when the rows arrived.
 
 **Both are plain methods, and the caller owns the loop.** `seal()` drains the queue;
 `advance()` runs the whole pipeline, starting with `seal()`, so a caller running only
@@ -57,12 +60,9 @@ the same pass. They are two methods rather than one only because their costs dif
 order of magnitude: `seal()` is an indexed read of one row when idle, so it can be run
 often, while `advance()` reads table metadata and wants to be run rarely.
 
-The library owns no thread and no interval. It used to: `extend()` quietly started a
-sealing thread and a `seal_mode` setting chose between "background", "inline" and "none".
-None of that survived the queue — once the cut is recorded by the append, sealing is just
-draining, which is what `advance()` already was. A library that spawns threads on your
-behalf is also a library whose tests interfere with themselves, which is how two of the
-bugs above were found.
+The library owns no thread and no interval. The append records the cut, so sealing is only
+draining, and the caller decides when. A library that spawns threads on your behalf is also a
+library whose tests interfere with themselves.
 
 Whichever process calls them, **the `claim` table decides** who does the work — by offset
 RANGE, not by role (§4a). Two passes on disjoint ranges run at once; one that finds its

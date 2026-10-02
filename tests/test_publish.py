@@ -2711,7 +2711,7 @@ def test_the_sweep_deletes_stranded_metadata_from_object_storage(
 def test_a_disk_cached_connection_shares_published_reads_by_key(
     tmp_path: Path, bucket: str, s3: S3Options, isolated_read_cache: Path
 ) -> None:
-    """What replaced `hydrate` (#118), as a reader on another machine uses it:
+    """A reader on another machine caching the published table (#118):
     a `duckdb_connection(disk_cache=True, cache_key=…)` caches the published
     table's blocks on disk, and a later connection with the same key — another
     process, in production — reuses them rather than fetching from S3.

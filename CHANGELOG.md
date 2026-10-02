@@ -19,6 +19,16 @@ minor version carries breaking changes.
 > **⚠️ `seal()` and `publish()` no longer delete buffer rows.** `evict("buffer")`
 > does, and `advance()` runs it. A loop that calls `seal()` but never
 > `evict("buffer")` or `advance()` now grows `buffer.db` without bound.
+>
+> **Running the steps in separate processes? Adopt the recommended split.**
+> API.md's "Process split" names five maintainer processes beside the writer:
+> `seal`, `compact`, `publish`, local cleanup (`evict()`, `reclaim("buffer")`,
+> `reclaim("staging")`, `sweep("staging")`) and published cleanup
+> (`reclaim("published")`, `sweep("published")`). A split from 0.6 that
+> leaves out `evict("buffer")` grows `buffer.db` without bound, one without
+> `sweep` keeps the metadata a crashed commit stranded, and one that runs
+> published cleanup beside local cleanup lets a slow bucket delay freeing
+> local disk. `examples/adsb/maintainer.py` runs each role.
 
 ### Changed
 

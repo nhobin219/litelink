@@ -701,12 +701,11 @@ which is the worst version of this rather than an excused one.
 
 **`drain` takes no claim, because nothing can make a queued file live again** (#118). What a
 claim on the unlink would guard is a queued name becoming referenced between the veto and the
-delete. `hydrate` did exactly that, deliberately, and is gone. Everything else that adds a file
-to a table adds one with a fresh per-attempt token (a seal, a compaction, an ingest, a published
-rewrite). Seal recovery commits a claimed name only if it never landed and otherwise writes a
+delete. Nothing re-registers a queued name: everything that adds a file to a table adds one
+with a fresh per-attempt token (a seal, a compaction, an ingest). Seal recovery commits a claimed name only if it never landed and otherwise writes a
 fresh one, and compaction recovery registers nothing. `publish` registers copies of staging
-files above the published span, and `register` declines a covered range, so a range a rewrite
-superseded is never pushed again. An entry that is due and unreferenced therefore stays
+files above the published span, and `register` declines a covered range, so a range already
+published is never pushed again. An entry that is due and unreferenced therefore stays
 unreferenced, and two drains overlapping only unlink one file twice.
 
 **`publish` claims only the range it pushes** (#118): `[floor, end)`, from the published
@@ -1448,13 +1447,12 @@ widens it by the rows it moves, from their local manifest statistics, before its
 read resolving the new, higher floor finds the row already covering what went below it. `publish`
 adds only copies of rows the staging table still holds, so it never touches it. The one write that narrows is an exact rollup from the published table's manifests, run only
 under the whole-log maintenance claim, which eviction cannot hold beside: at the first `publish`,
-on a re-point (which drops the row first), at `restore`, and at `open` for a log written before
+at `restore`, and at `open` for a log written before
 the row existed. With no row, the published table is read.
 
-This reverses 0.4.0, which fixed a handle's tiers at assembly (`include_archive`,
-`with_archive()`) so that a read would not start touching the network because eviction ran.
-That rule bought predictability at the price of the caller naming a tier and a handle
-without the published table answering short. Now a query's latency follows its predicates: a bounded
+A handle does not fix its tiers at assembly. That would keep a read off the network however
+far eviction ran, at the price of the caller naming a tier and a handle without the published
+table answering short. A query's latency follows its predicates instead: a bounded
 hot query stays local, and an unbounded one reads history because the whole log is the right
 answer to it.
 

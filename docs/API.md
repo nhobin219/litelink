@@ -160,7 +160,7 @@ a new log started where this one ends. `schema` is your columns — the library 
 or sort order is missing — a log that exists but is corrupt.
 
 **`open(..., read_only=True)` opens a second view alongside a live writer.** Any number of processes may hold
-one. They take no lease, mutate nothing, and coordinate with nobody. Reading in the *same*
+one. They take no claim, mutate nothing, and coordinate with nobody. Reading in the *same*
 process as the writer is the case to avoid — see RUNTIME.md on two SQLite libraries in one
 process.
 
@@ -371,8 +371,7 @@ columns have bounds; strings, bytes and nested columns do not. Any other part of
 constrains nothing, and any other shape reads the published table — correct, and only slower. `scan`
 builds that shape, with `start_offset`/`end_offset` as offset comparisons.
 
-**This reverses 0.4.0**, which fixed the tiers at assembly with `include_archive` and
-`with_archive()`. Both are gone. The trade is stated plainly: latency now follows the
+**A handle does not fix its tiers at assembly.** The trade is stated plainly: latency now follows the
 predicate rather than the handle, so the same unbounded query reads the published table once eviction
 has moved its rows there. A bounded hot query stays local however much has been evicted.
 
@@ -436,9 +435,8 @@ missing extension raises `ExtensionMissing`, naming how to provision it rather t
 three ways to supply them. Each call builds a new connection, about half a second of
 `LOAD iceberg`, so hold on to one.
 
-**A reader on another machine can cache what it reads from S3** (#118). This is what replaced
-`hydrate`: a cache holds what is actually read, needs no write to either table, and survives
-restarts.
+**A reader on another machine can cache what it reads from S3** (#118). A cache holds what is
+actually read, needs no write to either table, and survives restarts.
 
 | Parameter | Default | Layer | Lifetime |
 | --- | --- | --- | --- |
@@ -567,7 +565,7 @@ has passed since then — the grace that lets a scan already reading it finish (
 `reclaim` deletes it; a retention of zero deletes it in the same call.
 
 **It is meant for a script or a single process, and raises on a second owner.** If another
-owner holds the publish lease, or the publish fails for any other reason, steps 4–8 still run
+owner holds a claim publish needs, or the publish fails for any other reason, steps 4–8 still run
 (local storage keeps being reclaimed on a machine cut off from a remote published table), then
 the published steps are skipped and the error is raised. Every log publishes (#98), to a local
 directory by default, so the pipeline needs the network only when the published table is
@@ -600,6 +598,34 @@ The sweep lists a table's `metadata/` at its first pass in a process, then every
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
 takes no claim and never raises.
 
+### Process split
+
+`advance()` in one process is the simple shape. When a log is busy enough that one step
+delays another, this is the split litelink recommends: **a step gets its own process when it
+is heavy on CPU or the network**, and the writer appends in a process of its own.
+
+| Process | Runs | Why it stands alone |
+| --- | --- | --- |
+| seal | `seal()` | pure-Python CPU work, and all that bounds the buffer |
+| compact | `compact()` | the heaviest CPU work; beside `seal` it would delay it through the interpreter |
+| publish | `publish()` | the network; one push to a slow bucket can take a minute |
+| clean | `evict()`, `reclaim("buffer")`, `reclaim("staging")`, `sweep("staging")` | local disk, freed promptly |
+| clean published | `reclaim("published")`, `sweep("published")` | deletes and listing on the published table |
+
+**Local cleanup is one process, in that order.** Eviction and expiry are metadata commits that
+finish in milliseconds, and eviction queues the files `reclaim` then deletes. Splitting them
+gains nothing and adds a process committing to the Iceberg table. The published table's
+cleanup is apart because on object storage it is network calls, and a slow listing of a bucket
+must not delay freeing local disk.
+
+Each process loops on its own cadence: `seal` every fraction of a second, since it is an indexed
+read of one row when there is nothing to do; the others every few seconds to a minute. The
+claims make any arrangement safe (the table above); a pass that finds its range claimed raises
+`RuntimeError`, one that loses an Iceberg commit race more times than it retries raises
+pyiceberg's `CommitFailedException`, and either way nothing landed and the next pass finds
+what is left. `examples/adsb/maintainer.py` runs each
+role, and `just demo-maintain` starts all five.
+
 ## Published table
 
 ```python
@@ -626,9 +652,9 @@ lands (a follow-up). `wal_replication`, `replication_config()` and `restore` nee
 one: the WAL replica exists to get rows off the machine, and a local published table is on
 this disk already.
 
-**`hydrate`, which copied published files back into the staging table, is gone** (#118). A
-reader on another machine caches what it reads instead; see `duckdb_connection`. Raising
-`staging_retention` applies to data captured afterwards.
+**Nothing copies published files back into the staging table.** A reader on another machine
+caches what it reads instead; see `duckdb_connection`. Raising `staging_retention` applies to
+data captured afterwards.
 
 **The published table is never rewritten.** It is the log's immutable record, and well-sized by
 construction, since `publish` pushes only files compaction has finished with. The few things

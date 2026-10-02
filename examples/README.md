@@ -44,20 +44,34 @@ just demo-maintain     # terminal 2: one process per storage role
 just demo-tail         # terminal 3: watch where the rows are
 ```
 
-`demo-maintain` starts four processes — `seal`, `compact`, `reclaim`, `publish` —
-and one command stops them all. They are separate processes rather than one,
-because a seal is CPU-bound pure Python and so is compaction, only more of it:
-run together, sealing waits on compaction through the interpreter and the buffer
-grows for as long as it waits. That is the same argument that makes the writer
-its own process, one level down. Each prints only when it does something, so
-silence is the healthy state.
+`demo-maintain` starts five processes — `seal`, `compact`, `publish`, `clean` and
+`clean-published` — and one command stops them all. That is the split litelink
+recommends for a deployment ([`docs/API.md`](../docs/API.md#process-split)): a
+step gets its own process when it is heavy on CPU or the network.
 
-`maintainer.py --role all` is the single-process shape, and is right when the
-costs do not justify four. It is also quieter: four processes committing to one
-Iceberg table race on pyiceberg's post-commit metadata cleanup and log a
-`Failed to delete metadata file` now and then. Measured to be noise — 817,760
-rows read back contiguous across a run that logged it — but a single process
-produces none.
+| Role | Runs |
+| --- | --- |
+| `seal` | `seal()` |
+| `compact` | `compact()` |
+| `publish` | `publish()` |
+| `clean` | `evict()`, `reclaim("buffer")`, `reclaim("staging")`, `sweep("staging")` |
+| `clean-published` | `reclaim("published")`, `sweep("published")` |
+
+A seal is CPU-bound pure Python and so is compaction, only more of it: run
+together, sealing waits on compaction through the interpreter and the buffer
+grows for as long as it waits. `publish` and the published table's cleanup wait
+on the network, and must not hold up anything local. Local cleanup is metadata
+commits that finish in milliseconds, in an order — eviction queues what
+`reclaim` deletes — so it stays one process. Each prints only when it does
+something, so silence is the healthy state.
+
+`maintainer.py --role all` is `advance()`, the single-process shape, and is
+right when the costs do not justify five. It is also quieter: processes
+committing to one Iceberg table race on pyiceberg's post-commit metadata
+cleanup and log a `Failed to delete metadata file` now and then. Measured to be
+noise — 817,760 rows read back contiguous across a run that logged it — and
+data files are never affected, since those go through litelink's own expiry
+queue.
 
 The feed is synthetic on purpose. A demo you can turn up to a hundred thousand
 rows a second is the one that shows what the tiers are for; a real feed arrives
@@ -111,10 +125,10 @@ uv run python examples/adsb/replicate.py --root litelink-data
 .bin/litestream replicate -config litelink-data/positions/litestream.yml
 ```
 
-Two roles, because there are two kinds of work: **the hot path, and everything else.**
-The writer appends; the maintainer does the rest. Sealing is maintenance, not a third
-role — it is the first thing done with what the writer leaves behind. (A reader is not a
-role: any number may open the log with `litelink.open(..., read_only=True)`, holding and mutating nothing.)
+The writer appends; the maintainer processes do the rest. Sealing is
+maintenance, not part of the hot path — it is the first thing done with what the
+writer leaves behind. (A reader is not a role: any number may open the log with
+`litelink.open(..., read_only=True)`, holding and mutating nothing.)
 
 `demo-capture` seals nothing at all, and that is the point of running it alone first:
 `demo-tail` shows every row in the buffer and none in the staging table. They are durable and
@@ -122,75 +136,46 @@ readable the whole time — `scan()` unions the buffer with the table — so not
 by starting the maintainer late. Start it and the rows move into Parquet at exactly the
 cuts recorded while it was not running.
 
-Nothing coordinates that but the `claim` table. The writer holds no lease and never
-tries; the maintainer takes both when it starts, and if it dies they lapse and the next
-one takes over.
+Nothing coordinates the processes but the `claim` table. The writer holds no claim and
+never tries; each maintainer pass claims the offset range it works on, and if a process
+dies its claims lapse and the next one takes over. Every hand-off is a row in SQLite
+rather than an object in Python, and WAL serialises the processes. Reading is safe for
+the same reason — but DuckDB must never open the buffer database itself, which
+[`docs/RUNTIME.md`](../docs/RUNTIME.md) explains.
 
-`adsb/maintainer.py` is one loop calling plain methods at their own cadences — `seal()`
-often, `advance()` and `publish()` less so. The library owns neither the thread nor the
-interval, so there is no `seal_mode` to set and nothing starts behind your back.
+The library owns neither the thread nor the interval, so there is no `seal_mode` to set
+and nothing starts behind your back.
+
+**Why a process and not the writer's thread.** A seal is CPU-bound pure Python — most of
+its commit is pyiceberg copying table metadata — so a sealing thread starves the
+appending one through the GIL even while holding no lock: appends measured 45.2 ms behind
+an in-process seal. A process does not share the GIL.
+
+The stream is a synthetic ADS-B position feed, generated in-process, parsed into columns
+rather than stored as raw frames — which is the point of declaring a schema, since every
+field then prunes from Iceberg statistics. `adsb/capture.py` appends and nothing else.
+Every append is durable when `extend()` returns, with no buffer to flush, and the only
+other thing it does is record where the next file should be cut — see
+[`docs/RUNTIME.md`](../docs/RUNTIME.md).
+
+`adsb/tail.py` opens the same log with `litelink.open(..., read_only=True)` while the
+writer runs, and prints where the rows are. The column worth watching is the split: rows
+move from the buffer into the Iceberg table at each seal, and the total never
+double-counts across that boundary because both legs derive from one committed extent
+(§7, I3). It counts in DuckDB rather than materialising rows, which is what §7 means
+about a query over `litelink_offset` never touching the columns it did not ask for.
+
+The demo keeps its data on purpose — `adsb/tail.py` reads it after the writer stops, and
+it is there to poke at — so nothing removes it automatically, and `staging_retention` is
+left unset so the window grows without bound. Roughly 25 MB per 30 seconds at the default
+rate. A real deployment sets a retention and lets `clean` hold the size.
 
 ```
 just demo-clean        # delete the captured data when you are done
 ```
 
 That removes both demo roots — `litelink-data` here and `litelink-ws` from the websocket
-capture — plus whatever this log pushed to the published table, so one command covers every demo
-in this directory.
+capture — plus whatever this log pushed to the published table, so one command covers
+every demo in this directory.
 
 Benchmarks live in [`benchmarks/`](../benchmarks/).
-
-The four maintainer processes all commit to the Iceberg table, and they race on
-pyiceberg's `write.metadata.delete-after-commit` cleanup: the loser logs `Failed to delete
-metadata file …` about a file the winner already removed. Noise rather than damage — 817,760
-rows read back contiguous across a run that logged it — and `maintainer.py --role all`
-produces none. Data files are never affected either way; those go through `pending_delete`,
-transactionally.
-
-The demo keeps its data on purpose — `adsb/tail.py` reads it after the writer stops, and it is
-there to poke at — so nothing removes it automatically, and `staging_retention` is left unset
-so the window grows without bound. Roughly 25 MB per 30 seconds at the default rate. A real
-deployment sets a retention and lets `advance()` hold the size; the benchmarks, which have
-nothing to inspect afterwards, run in a temp directory and clean up on exit.
-
-The stream is a synthetic ADS-B position feed, generated in-process, parsed into columns rather than
-stored as raw frames — which is the point of declaring a schema, since every field then
-prunes from Iceberg statistics.
-
-`adsb/capture.py` appends and nothing else. Every append is durable when `extend()` returns,
-with no buffer to flush, and the only other thing it does is record where the next file
-should be cut — see [`docs/RUNTIME.md`](../docs/RUNTIME.md).
-
-`adsb/maintainer.py` does everything else, in one process.
-
-**Why a process and not the writer's thread.** A seal is CPU-bound pure Python — most of
-its commit is pyiceberg copying table metadata — so a sealing thread starves the
-appending one through the GIL even while holding no lock: appends measured 45.2 ms behind
-an in-process seal. A process does not share the GIL. This is what the leases are for.
-
-**Why sealing is not its own process.** They are the same kind of work —
-off the hot path, writing to the same Iceberg table, neither latency-critical the way an
-append is. Sharing a GIL between them costs nothing that matters, and separating them
-costs something real: `_table_lock` serialises a seal's commit against a maintenance pass
-*within* a process, and nothing does across processes. Run as two, they raced on
-Iceberg's delete-after-commit metadata cleanup and each logged warnings about files the
-other had already removed.
-
-They keep separate leases, so splitting them later needs no code change — point a second
-process at the same log and the `maintain` role moves. Worth doing only if compaction
-starts delaying seals enough to matter, and a delayed seal costs latency rather than file
-size: the cut was recorded when the rows arrived.
-
-Running both against one log is safe because every hand-off is a row in SQLite rather
-than an object in Python, and WAL serialises the processes. Reading is safe for the same
-reason — but note that DuckDB must never open the buffer database itself, which
-[`docs/RUNTIME.md`](../docs/RUNTIME.md) explains at some cost.
-
-`adsb/tail.py` opens the same log with `litelink.open(..., read_only=True)` while the writer runs, and prints where the rows
-are. The column worth watching is the split: rows move from the buffer into the Iceberg
-table at each seal, and the total never double-counts across that boundary because both
-legs derive from one committed extent (§7, I3). It counts in DuckDB rather than
-materialising rows, which is what §7 means about a query over `litelink_offset` never
-touching the columns it did not ask for.
-
-None of them needs object storage, a service, or a network.

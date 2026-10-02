@@ -855,10 +855,7 @@ class Maintenance:
             self._table.evict_below(boundary)
             # Re-dated to the commit, like every other supersession: the paths
             # were queued before it, and the grace is about readers holding
-            # them, which starts when the commit lands. (The case that first
-            # needed it with no failure at all was `hydrate` re-registering a
-            # queued path, whose re-enqueue kept the first eviction's stamp —
-            # removed in #118; the commit-time rule stands without it.)
+            # them, which starts when the commit lands.
             self._buffer.restamp_deletions(
                 (self._key(p) for p in dropped), int(datetime.now(UTC).timestamp())
             )
