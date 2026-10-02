@@ -99,7 +99,7 @@ def test_it_reports_a_published_table_it_cannot_read(
     where = f"s3://{bucket}/prefix"
     wrong = replace(s3, access_key="wrong-key", secret_key="wrong-secret")
 
-    report = preflight(published=where, s3=wrong, replication=False)
+    report = preflight(published=where, s3_options=wrong, replication=False)
     check = next(c for c in report.checks if c.name.startswith("published table"))
 
     assert not check.ok
@@ -119,7 +119,7 @@ def test_it_passes_a_published_table_that_is_merely_empty(
     the bucket answers with a refusal, which is the distinction this reports.
     """
     report = preflight(
-        published=f"s3://{bucket}/never-written", s3=s3, replication=False
+        published=f"s3://{bucket}/never-written", s3_options=s3, replication=False
     )
     check = next(c for c in report.checks if c.name.startswith("published table"))
 

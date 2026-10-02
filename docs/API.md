@@ -48,10 +48,10 @@ raised; a `read_only` flag did the same to thirteen methods.
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
-             s3=None, start_offset=1)                    -> WriteHandle
-litelink.open(root, name, *, s3=None)                    -> WriteHandle
-litelink.open(root, name, *, read_only=True, s3=None)    -> LocalReadHandle
-litelink.restore(root, name, *, published, s3=None, binary=None) -> WriteHandle
+             s3_options=None, start_offset=1)              -> WriteHandle
+litelink.open(root, name, *, s3_options=None)              -> WriteHandle
+litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
+litelink.restore(root, name, *, published, s3_options=None, binary=None) -> WriteHandle
 ```
 
 **`open` is overloaded on the `read_only` literal**, so the type you get is static:
@@ -131,11 +131,11 @@ the range contains.
 ## Lifecycle
 
 ```python
-litelink.new(root, name, *, schema, sort_by=None, config=None, published=None, s3=None,
+litelink.new(root, name, *, schema, sort_by=None, config=None, published=None, s3_options=None,
              start_offset=1) -> WriteHandle
-litelink.open(root, name, *, s3=None) -> WriteHandle
-litelink.open(root, name, *, read_only=True, s3=None) -> LocalReadHandle
-litelink.restore(root, name, *, published, s3=None, binary=None) -> WriteHandle
+litelink.open(root, name, *, s3_options=None) -> WriteHandle
+litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
+litelink.restore(root, name, *, published, s3_options=None, binary=None) -> WriteHandle
 ```
 
 **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
@@ -418,9 +418,8 @@ extensions litelink's platform wheels bundle, so the first read is not a network
 
 ```python
 litelink.duckdb_connection(
-    s3: S3Options | None = None,
     *,
-    remote: bool = False,
+    s3_options: S3Options | None = None,      # given: this connection reads S3
     memory_cache: bool = True,
     disk_cache: bool = False,
     cache_key: str | PathLike | None = None,   # under ~/.cache/litelink; None: "default"
@@ -428,22 +427,31 @@ litelink.duckdb_connection(
 ) -> duckdb.DuckDBPyConnection
 ```
 
-It loads `avro` and `iceberg`; `remote=True` also loads `httpfs` and creates the S3 secret,
-from `s3` or, with none given, from the environment and then the AWS credential chain. A
-missing extension raises `ExtensionMissing`, naming how to provision it rather than DuckDB's
+It loads `avro` and `iceberg`. **`s3_options` is what makes a connection read S3**: given, it
+also loads `httpfs` and creates the S3 secret from those options, and an empty `S3Options()`
+takes everything from the environment and then the AWS credential chain. Without it nothing S3
+is loaded, so a local reader pays nothing for it.
+
+```python
+litelink.duckdb_connection()                                   # local reads only
+litelink.duckdb_connection(s3_options=litelink.S3Options())    # S3, credentials from env / AWS chain
+litelink.duckdb_connection(s3_options=litelink.S3Options(region="eu-west-2"))  # explicit options
+```
+
+A missing extension raises `ExtensionMissing`, naming how to provision it rather than DuckDB's
 `INSTALL` advice, and a machine with no credentials at all raises `RuntimeError` naming the
-three ways to supply them. Each call builds a new connection, about half a second of
-`LOAD iceberg`, so hold on to one.
+three ways to supply them, at the call rather than as a 403 at the first query. Each call
+builds a new connection, about a quarter of a second of `LOAD iceberg`, so hold on to one.
 
 **Reads are cached in memory, and a reader on another machine can also cache on disk** (#118).
 The memory cache is on for every connection, local reads included. The disk cache holds what is
 actually read from S3, needs no write to either table, and survives restarts; it needs
-`remote=True`, and asking for it without that raises `ValueError` rather than doing nothing.
+`s3_options`, and asking for it without them raises `ValueError` rather than doing nothing.
 
 | Parameter | Default | Layer | Lifetime |
 | --- | --- | --- | --- |
 | `memory_cache` | on, every connection | DuckDB's external file cache | the connection's |
-| `disk_cache` | **off**, and `remote=True` only | the `cache_httpfs` extension, on disk | across restarts and processes |
+| `disk_cache` | **off**, and only with `s3_options` | the `cache_httpfs` extension, on disk | across restarts and processes |
 
 - **Off by default, and never used by a log's own handles.** On the host that writes a log, a
   disk cache of its published table would put back on local disk exactly what eviction
@@ -465,7 +473,7 @@ actually read from S3, needs no write to either table, and survives restarts; it
   --remote` installs it, and without it `disk_cache=True` raises `ExtensionMissing`.
 
 ```python
-litelink.install_s3_secret(connection, s3: S3Options | None = None) -> None
+litelink.install_s3_secret(connection, s3_options: S3Options | None = None) -> None
 ```
 
 The S3 half on its own, for a connection litelink did not build — one database handing out
@@ -887,7 +895,7 @@ files are never touched: a new codec applies to what is written from then on.
 log.databases -> tuple[Path, ...]
 log.replication_config() -> str
 log.write_replication_config() -> Path
-WriteHandle.replication_config_for(root, name, published, s3=None, retention=None) -> str
+WriteHandle.replication_config_for(root, name, published, s3_options=None, retention=None) -> str
 ```
 
 litelink does not run the sidecar — it says what the config has to name. `databases` is the

@@ -1224,7 +1224,7 @@ class WriteHandle(LocalReadHandle):
         sort_by: Sequence[str] | None = None,
         config: LogConfig | None = None,
         published: str | None = None,
-        s3: S3Options | None = None,
+        s3_options: S3Options | None = None,
         start_offset: int = 1,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
@@ -1329,7 +1329,7 @@ class WriteHandle(LocalReadHandle):
         # this is the only place that needs the check.
         if published is not None:
             try:
-                covered = published_span(layout, published, s3 or S3Options())
+                covered = published_span(layout, published, s3_options or S3Options())
             except Exception:
                 # Unreachable or unreadable is "cannot tell", which passes:
                 # configuring a published table is a statement of intent, not a
@@ -1396,7 +1396,7 @@ class WriteHandle(LocalReadHandle):
         # Built here and handed to all three, so each is given its published
         # table at construction rather than having one pushed into it
         # afterwards.
-        remote = Published(layout, buffer, s3)
+        remote = Published(layout, buffer, s3_options)
 
         log = cls(
             layout=layout,
@@ -1429,7 +1429,7 @@ class WriteHandle(LocalReadHandle):
         root: PathLike[str] | str,
         name: str,
         *,
-        s3: S3Options | None = None,
+        s3_options: S3Options | None = None,
     ) -> Self:
         """Open an existing log, and recover it.
 
@@ -1506,7 +1506,7 @@ class WriteHandle(LocalReadHandle):
             msg = f"log at {layout.root}/{name} has no stored sort order; it is corrupt"
             raise ValueError(msg) from exc
 
-        remote = Published(layout, buffer, s3)
+        remote = Published(layout, buffer, s3_options)
         log = cls(
             layout=layout,
             table=table,
@@ -1533,7 +1533,7 @@ class WriteHandle(LocalReadHandle):
         root: PathLike[str] | str,
         name: str,
         published: str,
-        s3: S3Options | None = None,
+        s3_options: S3Options | None = None,
         retention: timedelta | None = None,
     ) -> str:
         """A litestream config for a log that may not exist here yet (§3a).
@@ -1546,7 +1546,9 @@ class WriteHandle(LocalReadHandle):
         """
         layout = Layout(Path(root), name)
 
-        return litestream_config(layout, published, s3 or S3Options(), retention)
+        return litestream_config(
+            layout, published, s3_options or S3Options(), retention
+        )
 
     @classmethod
     def restore(
@@ -1555,7 +1557,7 @@ class WriteHandle(LocalReadHandle):
         name: str,
         *,
         published: str,
-        s3: S3Options | None = None,
+        s3_options: S3Options | None = None,
         binary: str | None = None,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
@@ -1680,7 +1682,7 @@ class WriteHandle(LocalReadHandle):
                 )
                 raise FileExistsError(msg)
 
-        options = s3 or S3Options()
+        options = s3_options or S3Options()
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
 
@@ -1952,7 +1954,7 @@ class WriteHandle(LocalReadHandle):
 
             raise
 
-        log = cls.open(layout.root, name, s3=options)
+        log = cls.open(layout.root, name, s3_options=options)
 
         # The published table's row taken afresh. The staging table was rebuilt
         # empty and every published file now sits below it, so nothing a

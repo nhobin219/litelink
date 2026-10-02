@@ -135,10 +135,10 @@ That costs ~124 MB. Run `python -m litelink` to check a machine before you rely 
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
-             s3=None, start_offset=1)                            -> WriteHandle
-litelink.open(root, name, *, s3=None)                              -> WriteHandle
+             s3_options=None, start_offset=1)                      -> WriteHandle
+litelink.open(root, name, *, s3_options=None)                      -> WriteHandle
 litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
-litelink.restore(root, name, *, published, s3=None, ...)             -> WriteHandle
+litelink.restore(root, name, *, published, s3_options=None, ...)   -> WriteHandle
 litelink.validate_row(schema, row)                                 # raises as append would
 litelink.preflight(...)                                            # what python -m litelink runs
 
@@ -227,14 +227,18 @@ end_offset=…)`) can skip it.
 `column_statistics(tier=…)` gives every column's bounds and counts without opening a data
 file, per tier (`"staging"`, `"published"` below it, `"buffer"`) or for the whole log.
 
-**Reading from another machine can cache what it reads.** `duckdb_connection(remote=True)`
-keeps DuckDB's memory cache on, and with `disk_cache=True` also caches on disk across restarts,
-under `~/.cache/litelink/<cache_key>` (or `$XDG_CACHE_HOME`), shared by every process using the
-key. It is off by default and never used by a log's own handles: on the host that writes a log,
-a disk cache would put back on disk exactly what eviction removed.
+**Reads are cached in memory, and a reader on another machine can also cache on disk.** Every
+`duckdb_connection` keeps DuckDB's memory cache on, local reads included (`memory_cache=False`
+turns it off). One built with `s3_options` reads S3, and with `disk_cache=True` also caches what
+it reads on disk across restarts, under `~/.cache/litelink/<cache_key>` (or `$XDG_CACHE_HOME`),
+shared by every process using the key. The disk cache is off by default and never used by a
+log's own handles: on the host that writes a log, it would put back on disk exactly what
+eviction removed.
 
 ```python
-con = litelink.duckdb_connection(remote=True, disk_cache=True, cache_key="trades-reader")
+con = litelink.duckdb_connection(
+    s3_options=litelink.S3Options(), disk_cache=True, cache_key="trades-reader"
+)
 ```
 
 ## Reading from another machine

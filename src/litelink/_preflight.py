@@ -331,7 +331,7 @@ def preflight(
     *,
     published: str | None = None,
     name: str = "s",
-    s3: S3Options | None = None,
+    s3_options: S3Options | None = None,
     replication: bool = True,
 ) -> Report:
     """Check everything this machine needs that the package cannot carry.
@@ -352,7 +352,7 @@ def preflight(
         # The reader's disk cache (#118), on by default for an S3 published
         # table: a machine missing it fails its first remote read.
         checks.append(_extension("cache_httpfs", required=False))
-        checks.append(_published(published, name, s3))
+        checks.append(_published(published, name, s3_options))
 
     if replication:
         checks.append(_litestream())

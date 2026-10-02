@@ -142,7 +142,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log = litelink.open(args.root, NAME, read_only=True, s3=S3Options())
+    log = litelink.open(args.root, NAME, read_only=True, s3_options=S3Options())
     print(f"tailing {args.root}/{NAME} (readonly). Ctrl-C to stop.")
     print(f"published table: {log.published}")
     print("staging falls as published rises; stream counts every row either way")

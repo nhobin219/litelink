@@ -88,7 +88,7 @@ def test_a_retired_log_is_all_published_and_nothing_in_staging(
         recorded = json.loads(published.properties[RETIRED_PROPERTY])
         assert recorded["through"] == total
 
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+    with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reader:
         offsets = reader.scan(columns=[OFFSET]).read_all().column(0).to_pylist()
         assert sorted(offsets) == list(range(1, total + 1))
         held = reader.column_statistics(tier="published")
@@ -111,7 +111,7 @@ def test_a_retired_log_takes_no_rows_from_any_handle(
     earlier handle's append lands after retirement.
     """
     with written(tmp_path, bucket, s3) as log:
-        earlier = litelink.open(tmp_path, "s", s3=s3)
+        earlier = litelink.open(tmp_path, "s", s3_options=s3)
         log.retire()
 
         for handle in (log, earlier):
@@ -145,9 +145,9 @@ def test_a_retired_log_opens_for_reading_only(
         log.retire()
 
     with pytest.raises(RetiredError, match=f"start_offset={through + 1}"):
-        litelink.open(tmp_path, "s", s3=s3)
+        litelink.open(tmp_path, "s", s3_options=s3)
 
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+    with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reader:
         assert reader.scan().read_all().num_rows == through
 
 
@@ -169,7 +169,7 @@ def test_restore_refuses_on_the_published_table_alone(
 
     assert Buffer.peek_retired(Layout(second, "s").buffer_db) is None
     with pytest.raises(RetiredError, match="retired"):
-        litelink.restore(second, "s", published=where, s3=s3)
+        litelink.restore(second, "s", published=where, s3_options=s3)
 
 
 def test_restore_refuses_on_the_replica_marker_alone(
@@ -189,7 +189,7 @@ def test_restore_refuses_on_the_replica_marker_alone(
 
     monkeypatch.setattr("litelink._handle.published_retired", lambda *_: None)
     with pytest.raises(RetiredError, match="retired"):
-        litelink.restore(second, "s", published=where, s3=s3)
+        litelink.restore(second, "s", published=where, s3_options=s3)
 
 
 def test_retire_resumes_after_a_crash(
@@ -218,7 +218,7 @@ def test_retire_resumes_after_a_crash(
             log.append({"event_ts": 1, "key": "k", "payload": "p"})
 
     monkeypatch.setattr(WriteHandle, "publish", original)
-    with litelink.open(tmp_path, "s", s3=s3) as again:
+    with litelink.open(tmp_path, "s", s3_options=s3) as again:
         again.retire()
         assert again._buffer.retired()["state"] == "retired"  # ty: ignore[not-subscriptable]  # noqa: SLF001
 
@@ -338,7 +338,7 @@ def test_a_retired_log_never_reads_its_buffer(
         return original(buffer, boundary)
 
     monkeypatch.setattr(Buffer, "rows_from", counted)
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
+    with litelink.open(tmp_path, "s", read_only=True, s3_options=s3) as reader:
         assert reader.scan().read_all().num_rows == through
         assert reader.scan(where="event_ts < 10").read_all().num_rows == 10
         assert reader.scan(start_offset=through - 3).read_all().num_rows == 4

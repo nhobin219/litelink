@@ -101,7 +101,7 @@ WRITER = """
         published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(ROOT, "s", schema=SCHEMA, sort_by=("event_ts",),
-                  config=config, published=PUBLISHED, s3=S3)
+                  config=config, published=PUBLISHED, s3_options=S3)
     print("ready", flush=True)
     for start in range(0, ROWS, BATCH):
         log.extend([
@@ -116,7 +116,7 @@ WRITER = """
 # Seals, compacts, evicts and pushes — nothing else. It never appends, and it
 # holds the seal and maintain leases the writer therefore never takes.
 MAINTAINER = """
-    log = litelink.open(ROOT, "s", s3=S3)
+    log = litelink.open(ROOT, "s", s3_options=S3)
     passes = 0
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
@@ -146,7 +146,7 @@ MAINTAINER = """
 # each exactly once. A seal, a compaction, an eviction or a publish landing
 # mid-query would show up here as a gap or a repeat.
 READER = """
-    log = litelink.open(ROOT, "s", read_only=True, s3=S3)
+    log = litelink.open(ROOT, "s", read_only=True, s3_options=S3)
     samples, high = 0, 0
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -218,7 +218,7 @@ def test_the_published_table_actually_took_part(
     finish(writer, "writer")
     finish(maintainer, "maintainer")
 
-    with litelink.open(root, "s", s3=s3) as log:
+    with litelink.open(root, "s", s3_options=s3) as log:
         watermark = int(log._buffer.get_meta("published_through") or 0)
         assert watermark > 0, "nothing was ever published"
 

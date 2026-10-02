@@ -32,6 +32,17 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: `s3=` is now `s3_options=`** on `new`, `open`, `restore`,
+  `replication_config_for`, `preflight`, `install_s3_secret` and
+  `duckdb_connection`.
+- **Breaking: `duckdb_connection(remote=True)` is gone; `s3_options` is what
+  makes a connection read S3.** `duckdb_connection()` reads locally and loads
+  nothing S3. `duckdb_connection(s3_options=S3Options())` loads `httpfs` and
+  creates the secret from the environment and the AWS credential chain, as
+  `remote=True` did; pass explicit options to override. `s3_options` is
+  keyword-only. `disk_cache=True` without `s3_options` raises `ValueError`
+  rather than doing nothing, since the disk cache wraps httpfs.
+
 - **Breaking: `set_sort_by()` is removed; a log's sort order is fixed when
   the log is created** (#118), like its schema and published table. To use
   another order, `retire()` the log and start a new one where it ended:
@@ -164,11 +175,9 @@ minor version carries breaking changes.
 
 ### Fixed
 
-- **`duckdb_connection` no longer ignores its cache flags without
-  `remote=True`.** `memory_cache=False` now turns the memory cache off on a
-  local connection too, and `disk_cache=True` without `remote=True` raises
-  `ValueError`: the disk cache wraps httpfs, which only a remote connection
-  loads.
+- **`duckdb_connection(memory_cache=False)` turns the memory cache off on a
+  local connection too.** It was applied only to a remote one, and DuckDB's
+  own default is on for every connection.
 - **An expiry with nothing to expire no longer commits.** pyiceberg would
   write a new `metadata.json` and swap the catalog pointer on every pass.
 - **Expiry now deletes the manifests a commit merges away** (#111). With

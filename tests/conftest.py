@@ -136,8 +136,8 @@ def isolated_read_cache(
 ) -> Path:
     """The reader's default disk cache, kept out of the real `~/.cache` (#118).
 
-    `duckdb_connection(remote=True)` caches S3 reads on disk by default, under
-    `$XDG_CACHE_HOME/litelink/duckdb`. Without this every remote test would
+    `duckdb_connection(s3_options=..., disk_cache=True)` caches S3 reads on
+    disk, under `$XDG_CACHE_HOME/litelink`. Without this every remote test would
     write into the home directory of whoever runs the suite, and share blocks
     between tests that should not see each other's reads.
     """

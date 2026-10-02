@@ -130,7 +130,7 @@ def test_a_log_a_released_version_wrote_reads_back_and_backfills(
     low = report["extent"][0]
     assert 1 < low <= ROWS, "the release must have evicted part of the log"
 
-    with litelink.open(tmp_path, "s", s3=s3) as log:
+    with litelink.open(tmp_path, "s", s3_options=s3) as log:
         coverage = log.coverage()
         assert coverage.published == (1, low)
         offsets = log.scan(columns=[OFFSET]).read_all().column(0).to_pylist()
