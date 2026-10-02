@@ -709,9 +709,9 @@ class Buffer:
         # remembering it here is what makes reclamation a keyed read of this
         # table rather than a directory walk looking for things nobody claimed.
         #
-        # `superseded_at`, not a precomputed deadline: the grace period is
-        # `snapshot_retention`, and freezing it at enqueue time would mean a
-        # lowered setting never applied to anything already queued.
+        # `superseded_at`, not a precomputed deadline: the grace period is the
+        # owning table's snapshot retention, and freezing it at enqueue time
+        # would mean a lowered setting never applied to anything already queued.
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS pending_delete (
               rel_path TEXT PRIMARY KEY, superseded_at INTEGER NOT NULL
@@ -1788,7 +1788,7 @@ class Buffer:
         silently stopped reclaiming anything.
 
         The two settings are sized by unrelated things: §6 wants
-        `snapshot_retention` above the longest scan, §8 wants
+        `staging_snapshot_retention` above the longest scan, §8 wants
         `staging_retention` above the longest hot lookback. Any deployment where
         the second is longer than the first — which is the ordinary one — has
         every file losing its Iceberg age before it is old enough to evict.
@@ -2672,8 +2672,8 @@ class Buffer:
         reader cannot be holding a file the commit has not yet superseded — so
         the clock has to start at the commit, not at the queueing.
 
-        Stamped at the queueing, a rewrite slower than `snapshot_retention`
-        burns the whole grace before it commits: the moment the originals stop
+        Stamped at the queueing, a rewrite slower than its table's snapshot
+        retention burns the whole grace before it commits: the moment the originals stop
         being referenced they are already due, and drain takes them out from
         under any scan resolved a moment earlier. Measured at a 5 s retention:
         a reader 0.4 s old lost all fourteen files its snapshot named, and its

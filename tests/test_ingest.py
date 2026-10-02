@@ -284,7 +284,8 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     config = LogConfig(
         target_seal_size=4096,
         target_compact_size=8192,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
         wal_replication=True,
     )
     with litelink.new(
@@ -532,7 +533,8 @@ def test_an_ingested_range_survives_the_whole_published_table_cycle(
             target_compact_size=8192,
             compact_min_files=2,
             staging_retention=timedelta(seconds=0),
-            snapshot_retention=timedelta(seconds=0),
+            staging_snapshot_retention=timedelta(seconds=0),
+            published_snapshot_retention=timedelta(seconds=0),
         ),
         published=f"s3://{bucket}/prefix",
         s3=s3,
@@ -579,7 +581,8 @@ def test_a_loaded_range_reaches_the_published_table_whole(
             target_seal_size=4096,
             target_compact_size=8192,
             compact_min_files=2,
-            snapshot_retention=timedelta(seconds=0),
+            staging_snapshot_retention=timedelta(seconds=0),
+            published_snapshot_retention=timedelta(seconds=0),
         ),
         published=f"s3://{bucket}/prefix",
         s3=s3,
@@ -704,7 +707,8 @@ def test_a_load_pushes_the_undersized_seals_beneath_it_too(
         target_seal_size=4096,
         target_compact_size=1024 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
         wal_replication=True,
     )
     with litelink.new(

@@ -51,12 +51,10 @@ compaction ever delays sealing enough to matter. It costs latency, not file size
 cut was recorded when the rows arrived.
 
 **Both are plain methods, and the caller owns the loop.** `seal_due()` drains the queue;
-`maintain()` compacts, evicts and expires — and calls `seal_due()` itself at the end, so a
-caller running only `maintain()` in a loop is still correct. At the end rather than the
-start because the pass ahead of it works on files that are already sealed: a group cut
-during this call becomes a compaction candidate on the next one, which costs a cycle of
-latency and nothing else. They are two methods rather than one only because their costs differ by an order
-of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
+`maintain()` runs the whole pipeline, starting with `seal_due()`, so a caller running only
+`maintain()` in a loop is still correct, and what a pass seals is compacted and published in
+the same pass. They are two methods rather than one only because their costs differ by an
+order of magnitude: `seal_due()` is an indexed read of one row when idle, so it can be run
 often, while `maintain()` reads table metadata and wants to be run rarely.
 
 The library owns no thread and no interval. It used to: `extend()` quietly started a
@@ -133,8 +131,8 @@ streams.
   §4 step 2   NO _lock  ← all the cost      │
     rows_between(start,end) on 2nd conn      └─ expire() → drain()
     sort → write Parquet → fsync                 snapshots past
-    commit to Iceberg ────────────────┐          snapshot_retention, then
-                                      │          unlink files whose grace
+    commit to Iceberg ────────────────┐          staging_snapshot_retention,
+                                      │          then unlink files whose grace
   §4 step 3   with _lock:             │          has passed, in the SAME
     DELETE rows < end IF discarding   │          txn that clears the queue
     NAME the extent's row             │
@@ -160,13 +158,16 @@ Two different things get called "eviction". They happen in different roles:
   briefly, so a concurrent append waits for it — but it is a delete by primary key, not
   work proportional to the seal.
 - **Parquet files** are removed from the table by the **maintainer** under
-  `staging_retention`, and *unlinked* only later by `drain()`, once `snapshot_retention`
-  has passed.
+  `staging_retention`, and *unlinked* only later by `drain()`, once
+  `staging_snapshot_retention` has passed. The published table's are expired and drained by
+  `publish`, against `published_snapshot_retention`.
 
 A file's path is written to SQLite **before** the file is created (`sealing`,
 `compacting`) and again before it is deleted (`pending_delete`). So no file can exist on
 disk that this database cannot name, and reclaiming disk is a keyed read rather than a
-directory walk. That matters most where a walk is a paginated, billable LIST.
+directory walk. That matters most where a walk is a paginated, billable LIST. The one listing
+is the stranded-metadata sweep (SPEC §6), a backstop for the files a commit that lost its
+pointer swap, or crashed before it, leaves behind.
 
 ---
 
@@ -355,7 +356,7 @@ left the table, because that one is about readers still holding it (I6).
 moment. Files are queued before the commit that supersedes them, since a crash in between
 would lose the only record of their paths, so every supersession corrects the stamp
 afterwards — a merge, a published rewrite, an eviction and both expiries. Left at the
-queueing, an operation slower than `snapshot_retention` spends the whole grace before it
+queueing, an operation slower than its table's snapshot retention spends the whole grace before it
 commits and the files fall due the instant they stop being referenced: measured at a five
 second retention, a reader 0.4 s old lost every file its snapshot named and failed
 mid-scan.
@@ -573,8 +574,8 @@ and the metadata this library depends on is deleted through its own expiry queue
 **The passes are callable one at a time**, and worth doing when their costs diverge.
 Conversion reads and rewrites whole files; eviction and expiry are metadata commits that
 finish in milliseconds; `publish` is the only one that can block on a network. `maintain()`
-runs the three local ones and is what most deployments want; `compact()`, `evict()` and
-`expire()` exist for the schedules it cannot express.
+runs all of them, publish included, and is what most deployments want; the routines exist for
+the schedules it cannot express.
 
 None of those four takes a claim of its own. Each PASS claims the range it is about to work
 on — a merge claims its run, eviction the prefix it removes — so running them separately is

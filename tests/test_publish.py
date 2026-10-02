@@ -15,6 +15,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -89,7 +90,8 @@ def published_log(
         # seals' worth of rows to observe anything.
         "target_compact_size": 64 * 1024,
         "compact_min_files": 2,
-        "snapshot_retention": timedelta(seconds=0),
+        "staging_snapshot_retention": timedelta(seconds=0),
+        "published_snapshot_retention": timedelta(seconds=0),
     }
     settings.update(overrides)
     config = LogConfig(**settings)  # ty: ignore[invalid-argument-type]
@@ -392,7 +394,8 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
         s3,
         target_seal_size=8 * 1024,
         target_compact_size=8 * 1024,
-        snapshot_retention=timedelta(hours=1),
+        staging_snapshot_retention=timedelta(hours=1),
+        published_snapshot_retention=timedelta(hours=1),
     ) as log:
         log.extend(rows(ROWS))
         log.seal_due()
@@ -417,8 +420,14 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
                 "a queued file must still exist until its grace period passes"
             )
 
-        log.set_config(replace(log.config, snapshot_retention=timedelta(0)))
-        log.maintain()
+        log.set_config(
+            replace(
+                log.config,
+                staging_snapshot_retention=timedelta(0),
+                published_snapshot_retention=timedelta(0),
+            )
+        )
+        log.expire("published")
 
         for path in superseded & queued:
             assert not fs.exists(path.removeprefix("s3://")), (
@@ -855,7 +864,7 @@ def test_drain_never_deletes_from_a_published_table_the_log_has_left(
     """
     old = f"s3://{bucket}/retired"
     fs = filesystem(s3)
-    with published_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.set_published(old)
         log.extend(rows(ROWS))
         log.seal_due()
@@ -869,7 +878,9 @@ def test_drain_never_deletes_from_a_published_table_the_log_has_left(
         log._buffer.enqueue_deletions([stranded], 0)
         log.set_published(f"s3://{bucket}/current")
 
-        log._maintenance.drain()
+        current = log._published.table(repair=True)
+        assert current is not None
+        log._maintenance._drain_published(current, None)
 
         assert fs.exists(objects[0]), (
             "drain must not delete from the published table the log has left"
@@ -889,7 +900,7 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
     another published table's — and the guard that exists to protect a retired bucket
     instead stops the queue draining at all, for ever.
     """
-    with published_log(tmp_path, bucket, s3, snapshot_retention=timedelta(0)) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.set_published(f"s3://{bucket}/slashed")
         log.extend(rows(ROWS))
         log.seal_due()
@@ -925,7 +936,7 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         log._buffer.set_meta(PUBLISHED_KEY, f"s3://{bucket}/slashed/")
         assert log._published.uri == f"s3://{bucket}/slashed/"
 
-        log._maintenance.drain()
+        log._maintenance._drain_published(remote, None)
 
         assert doomed not in log._buffer.queued_deletions(), (
             "the log's own published object must be drainable"
@@ -1195,7 +1206,8 @@ def test_eviction_learns_about_a_published_table_attached_by_another_process(
         target_compact_size=32 * 1024,
         compact_min_files=2,
         staging_rows=1,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     writer = litelink.new(
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config, s3=s3
@@ -1377,7 +1389,8 @@ def test_the_log_keeps_working_after_the_published_table_is_re_cut(
         target_compact_size=32 * 1024,
         compact_min_files=2,
         staging_rows=2000,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -1510,7 +1523,8 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
         target_compact_size=16 * 1024,
         target_compact_rows=80,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -1567,7 +1581,8 @@ def test_compaction_while_detached_does_not_wedge_a_reattach(
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     where = f"s3://{bucket}/prefix"
     log = litelink.new(
@@ -1629,7 +1644,8 @@ def test_expiring_the_published_table_will_not_repair_it_without_a_claim(
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -1799,7 +1815,8 @@ def test_pointing_back_at_a_published_table_restores_everything_it_held(
         target_compact_size=16 * 1024,
         compact_min_files=2,
         staging_rows=200,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     first = f"s3://{bucket}/first"
     log = litelink.new(
@@ -1865,7 +1882,8 @@ def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -1936,7 +1954,8 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -1951,7 +1970,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
         for _ in range(3):
             log.extend(rows(400))
             log.seal_due()
-            log.maintain()
+            log.compact()
 
         _crash_before_recording(log)
 
@@ -1975,7 +1994,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
         # The ingredient that turns the crash into a permanent stall.
         log.set_config(replace(config, target_compact_size=1 << 20))
-        log.maintain()
+        log.compact()
 
         assert all(
             f.start >= extent[1] or f.end <= extent[1] for f in log._table.data_files()
@@ -2084,7 +2103,8 @@ def test_a_healed_row_carries_the_measured_bytes(
         target_seal_size=8 * 1024,
         target_compact_size=64 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -2099,7 +2119,7 @@ def test_a_healed_row_carries_the_measured_bytes(
         for _ in range(3):
             log.extend(rows(400))
             log.seal_due()
-            log.maintain()
+            log.compact()
 
         _crash_before_recording(log)
 
@@ -2149,7 +2169,8 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -2191,7 +2212,7 @@ def test_a_rewrite_that_lost_its_claim_does_not_commit(
         Maintenance._discard_scratch = after_teardown
         try:
             with pytest.raises(RuntimeError, match="lost the claim"):
-                log._maintenance.rewrite_published(heartbeat=lambda: state["calls"] < 2)
+                log._maintenance.rewrite_published(renew=lambda: state["calls"] < 2)
 
         finally:
             Maintenance._discard_scratch = discard
@@ -2207,7 +2228,7 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
 
     `rewrite_published` queues the files it is replacing when it STARTS, and they
     stop being referenced only when `replace_range` commits. Left at the
-    queueing, a rewrite slower than `snapshot_retention` — and re-cutting a
+    queueing, a rewrite slower than its snapshot retention — and re-cutting a
     published table is the slowest thing here — spends the whole grace before it
     commits, so drain takes the originals out from under any reader that
     resolved the pre-rewrite snapshot.
@@ -2221,7 +2242,8 @@ def test_a_rewrite_restamps_the_files_it_supersedes(
         target_seal_size=8 * 1024,
         target_compact_size=16 * 1024,
         compact_min_files=2,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(
         tmp_path,
@@ -3523,7 +3545,8 @@ def test_buffered_rows_sees_another_process_seal(
         LogConfig(),
         target_seal_size=1,
         wal_replication=True,
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     with litelink.new(
         tmp_path,
@@ -3602,7 +3625,8 @@ def test_a_handle_that_read_an_empty_published_table_still_sees_it_fill(
         target_compact_size=64 * 1024,
         compact_min_files=2,
         staging_retention=timedelta(0),
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     with litelink.new(
         tmp_path,
@@ -4142,3 +4166,67 @@ def test_a_seal_that_keeps_its_rows_does_not_count_them_twice(
         assert whole.record_count == 500
         assert whole["event_ts"].null_count == 0
         assert (whole[OFFSET].min, whole[OFFSET].max) == (1, 500)
+
+
+def test_maintain_expires_the_published_table_and_drains_what_that_frees(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """Every `maintain` publishes and then expires published snapshots past
+    `published_snapshot_retention`, and the manifest lists and manifests only
+    they referenced are deleted once due (#113). A table that was only ever
+    published used to keep every one of them.
+
+    Falsify by dropping `expire_published` from `maintain`: four snapshots
+    survive, and so do their manifest lists.
+    """
+    with published_log(tmp_path, bucket, s3) as log:
+        for _ in range(4):
+            log.extend(rows(ROWS))
+            log.seal_due()
+            log.maintain()
+
+        published = log._published.require()
+        published.reload()
+        assert len(list(published._table.snapshots())) == 1
+
+        listed = {path for path, _ in published.metadata_files()}
+        lists = {p for p in listed if p.rpartition("/")[2].startswith("snap-")}
+        assert len(lists) == 1, "an expired snapshot's manifest list must be deleted"
+        assert lists <= published.anchors(), "and the one left is the current one"
+        assert log.scan().read_all().num_rows == 4 * ROWS
+
+
+def test_the_sweep_deletes_stranded_metadata_from_object_storage(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep on S3: a listing names objects as the published table names
+    them, so a stranded manifest is deleted and nothing live is.
+
+    Falsify by building the listed names without the `s3://` scheme: the
+    anchor check refuses the listing and the stranded object survives.
+    """
+    import litelink._maintenance as maintenance
+
+    monkeypatch.setattr(maintenance, "SWEEP_MIN_AGE", timedelta(0))
+    monkeypatch.setattr(maintenance, "SWEEP_INTERVAL", timedelta(0))
+    fs = filesystem(s3)
+    with published_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.publish()
+
+        published = log._published.require()
+        directory = published.metadata_location.rpartition("/")[0]
+        stranded = f"{directory}/{uuid.uuid4()}-m0.avro"
+        fs.pipe(stranded.removeprefix("s3://"), b"stranded")
+        live = published.referenced_paths() | published.live_metadata()
+
+        log.sweep()
+
+        assert not fs.exists(stranded.removeprefix("s3://"))
+        published.reload()
+        for path in published.referenced_paths():
+            assert fs.exists(path.removeprefix("s3://")), path
+
+        assert live, "the test must hold live objects to keep"
+        assert log.scan().read_all().num_rows == ROWS

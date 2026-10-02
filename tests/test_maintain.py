@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import random
 import threading
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +14,7 @@ import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
 import litelink
+import litelink._maintenance as maintenance
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import COMPACT_MULTIPLE
 from litelink._handle import LogConfig, WriteHandle, validate
@@ -164,7 +167,7 @@ def test_no_eviction_without_staging_retention(tmp_path: Path) -> None:
 
 def test_expiry_drops_old_snapshots(tmp_path: Path) -> None:
     config = LogConfig(
-        compact_min_files=99, snapshot_retention=timedelta(microseconds=1)
+        compact_min_files=99, staging_snapshot_retention=timedelta(microseconds=1)
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
@@ -203,7 +206,9 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
         assert before == 3
 
         # Nothing published yet: retention says evict everything, I4 says none.
-        log.maintain()
+        # `evict`, the routine under test: `maintain` would also publish, to a
+        # bucket this test never stands up.
+        log.evict()
 
         assert log.staging_files() == before, "evicted with an empty published table"
 
@@ -212,7 +217,7 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
         log._buffer.record_file(
             f"s3://bucket/prefix/data/{first.start}.parquet", first.start, first.end, 1
         )
-        log.maintain()
+        log.evict()
 
         assert log.staging_files() == before - 1, "did not evict what was published"
     finally:
@@ -234,7 +239,7 @@ def test_reads_stay_correct_across_a_compaction(tmp_path: Path) -> None:
 
 
 def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
-    """§12: local disk holds staging_retention + snapshot_retention of data.
+    """§12: local disk holds staging_retention + staging_snapshot_retention of data.
 
     Eviction removes a file from the current snapshot; the bytes stay on disk,
     referenced by the previous snapshot, until expiry deletes them. Conflating
@@ -244,7 +249,7 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
     config = LogConfig(
         compact_min_files=99,
         staging_retention=timedelta(microseconds=1),
-        snapshot_retention=timedelta(days=365),  # nothing may expire
+        staging_snapshot_retention=timedelta(days=365),  # nothing may expire
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
@@ -262,7 +267,9 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
 
     with open_log(
         tmp_path,
-        LogConfig(compact_min_files=99, snapshot_retention=timedelta(microseconds=1)),
+        LogConfig(
+            compact_min_files=99, staging_snapshot_retention=timedelta(microseconds=1)
+        ),
     ) as log:
         log.maintain()
 
@@ -280,7 +287,7 @@ def test_sweep_spares_an_in_flight_seal(tmp_path: Path) -> None:
     with a seal deletes the file the very next step is about to register.
     """
     config = LogConfig(
-        compact_min_files=99, snapshot_retention=timedelta(microseconds=1)
+        compact_min_files=99, staging_snapshot_retention=timedelta(microseconds=1)
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(3))
@@ -309,7 +316,7 @@ def test_recovery_queues_a_crashed_compaction_by_name(tmp_path: Path) -> None:
     unlink time, so the last word belongs to a check made when the file is
     actually removed — the same route an abandoned seal has always taken.
     """
-    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
+    config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
         rel_path = log._layout.compaction_path(1, 4, "deadbeef")
@@ -339,7 +346,7 @@ def test_recovery_never_removes_a_file_the_table_adopted(tmp_path: Path) -> None
     whole range: the sources it superseded were queued before the commit and
     drain away behind it.
     """
-    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
+    config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
         live = log._table.data_files()[0]
@@ -393,7 +400,7 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
         target_seal_size=1 << 30,
         compact_min_files=2,
         staging_retention=timedelta(days=365),
-        snapshot_retention=timedelta(days=365),
+        staging_snapshot_retention=timedelta(days=365),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
@@ -424,7 +431,7 @@ def test_manifests_a_commit_merged_away_are_reclaimed(tmp_path: Path) -> None:
     Falsify by having `expire` enqueue `metadata_paths` instead of
     `expiring_paths`: one orphan per seal stays on disk.
     """
-    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
+    config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
     with open_log(tmp_path, config) as log:
         seal_files(log, 8)
         log._maintenance.expire()
@@ -450,7 +457,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
     impatient = LogConfig(
         target_seal_size=1 << 30,
         compact_min_files=2,
-        snapshot_retention=timedelta(microseconds=1),
+        staging_snapshot_retention=timedelta(microseconds=1),
     )
     with open_log(tmp_path, impatient) as log:
         log.maintain()
@@ -463,7 +470,7 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
 def test_a_referenced_file_is_never_deleted_by_the_drain(tmp_path: Path) -> None:
     """Belt and braces: the queue is a hint, a live reference is a veto."""
     config = LogConfig(
-        compact_min_files=99, snapshot_retention=timedelta(microseconds=1)
+        compact_min_files=99, staging_snapshot_retention=timedelta(microseconds=1)
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
@@ -488,19 +495,21 @@ def test_iceberg_metadata_does_not_grow_without_bound(tmp_path: Path) -> None:
     day that nothing would ever remove.
     """
     config = LogConfig(
-        compact_min_files=99, snapshot_retention=timedelta(microseconds=1)
+        compact_min_files=99, staging_snapshot_retention=timedelta(microseconds=1)
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 8)
-        avro_before = len(list(tmp_path.rglob("*.avro")))
+        # The staging table's, since `maintain` now publishes too.
+        staging = metadata_dir(log)
+        avro_before = len(list(staging.glob("*.avro")))
         assert avro_before >= 8, "one manifest list per commit, at least"
 
         log.maintain()
         log.maintain()  # the second pass retires what the first only queued
 
-        metadata = list(tmp_path.rglob("*.metadata.json"))
+        metadata = list(staging.glob("*.metadata.json"))
         assert len(metadata) <= 11, f"{len(metadata)} metadata files for 8 commits"
-        assert len(list(tmp_path.rglob("*.avro"))) < avro_before, (
+        assert len(list(staging.glob("*.avro"))) < avro_before, (
             "expired snapshots' manifests were never reclaimed"
         )
         assert len(read_all(log)) == 32, "the data is still readable"
@@ -733,13 +742,13 @@ def test_sizing_does_not_depend_on_how_well_the_data_compressed() -> None:
 
 
 def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> None:
-    """`staging_retention` must not depend on `snapshot_retention`.
+    """`staging_retention` must not depend on `staging_snapshot_retention`.
 
     A file's age came from the snapshot that added it, and expiry deletes that
     snapshot — after which the file was in no age map at all, `evict` could not
     classify it as stale, and it stayed on local disk for ever.
 
-    The two settings are sized by unrelated things: §6 says `snapshot_retention`
+    The two settings are sized by unrelated things: §6 says `staging_snapshot_retention`
     must exceed the longest SCAN, §8 says `staging_retention` must exceed the
     longest hot LOOKBACK. So the ordinary configuration has expiry running in
     minutes and retention in days — and every file lost its age long before it
@@ -749,7 +758,7 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         target_seal_size=1 << 30,
         compact_min_files=2,
         staging_retention=timedelta(microseconds=1),
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
@@ -794,7 +803,7 @@ def test_staging_rows_keeps_recent_data_a_time_window_would_drop(
         compact_min_files=2,
         staging_retention=timedelta(microseconds=1),
         staging_rows=8,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)  # 4 rows each, all older than the window
@@ -821,7 +830,7 @@ def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> N
         staging_retention=timedelta(hours=1),
         # Retains almost nothing on its own.
         staging_rows=1,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
@@ -840,7 +849,7 @@ def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
         compact_min_files=2,
         staging_retention=None,
         staging_rows=4,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 4)
@@ -865,7 +874,7 @@ def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> No
         target_seal_size=4096,
         target_compact_size=4 * 4096,
         compact_min_files=2,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(1200))
@@ -904,7 +913,7 @@ def test_only_compacted_files_are_eligible_for_the_published_table(
         target_seal_size=4096,
         target_compact_size=8 * 4096,
         compact_min_files=2,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(200))
@@ -939,7 +948,9 @@ def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
 
     assert config.compact_size == 4096 * COMPACT_MULTIPLE
 
-    with open_log(tmp_path, replace(config, snapshot_retention=timedelta(0))) as log:
+    with open_log(
+        tmp_path, replace(config, staging_snapshot_retention=timedelta(0))
+    ) as log:
         log.extend(rows(1200))
         log.seal_due()
         before = len(log._table.data_files())
@@ -987,7 +998,7 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         target_compact_size=8 * 4096,
         compact_min_files=2,
         staging_retention=timedelta(microseconds=1),
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(1200))
@@ -1105,7 +1116,7 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
         # Deliberately not a multiple of the 4 rows each sealed file holds, so
         # the raw boundary falls inside one.
         staging_rows=6,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 5)
@@ -1143,7 +1154,7 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
         target_seal_size=4096,
         target_compact_size=8 * 4096,
         compact_min_files=2,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     log = litelink.new(
         tmp_path,
@@ -1427,18 +1438,22 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
         assert log.staging_files() == before, "committed without holding the claim"
 
 
-def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
-    """`heartbeat or claim.renew` read naturally and was wrong.
+def test_an_outer_renew_does_not_switch_off_the_run_claim(tmp_path: Path) -> None:
+    """`renew or claim.renew` read naturally and was wrong.
 
-    Any caller passing a heartbeat — which is what the role-lease era asked
-    for, so it is a habit carried forward — stopped the run claim from being
-    renewed at all, and the pre-commit check then consulted a stranger's
-    callback instead of the claim. A merge over the TTL lost its exclusion with
-    no stall required.
+    A rewrite run under the whole-log lease — `rewrite_published`,
+    `rewrite_sorted` — passes that lease's `renew` down. Taking it in place of
+    the run claim's stopped the run claim from being renewed at all, and the
+    pre-commit check then consulted the outer claim instead. A merge over the
+    TTL lost its exclusion with no stall required.
+
+    Falsify by making `_both` return `theirs` when it is given: no run claim
+    is renewed.
     """
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
+        run = sorted(log._table.data_files(), key=lambda f: f.start)
         renewed: list[int] = []
         original = Claim.renew
 
@@ -1449,7 +1464,7 @@ def test_a_caller_heartbeat_does_not_switch_off_the_run_claim(tmp_path: Path) ->
 
         Claim.renew = counting
         try:
-            log.compact(heartbeat=lambda: True)
+            log._maintenance._rewrite_run(log._table, run, lambda: True)
 
         finally:
             Claim.renew = original
@@ -1473,7 +1488,7 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
     config = LogConfig(
         target_seal_size=1 << 30,
         compact_min_files=2,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
@@ -1520,7 +1535,7 @@ def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
     config = LogConfig(
         target_seal_size=1 << 30,
         compact_min_files=2,
-        snapshot_retention=timedelta(0),
+        staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
@@ -1892,7 +1907,7 @@ def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:
     would lose the only record of their paths. But the grace period is about
     readers still holding them (I6), so it has to be measured from when they
     actually left the table — stamped at the queueing, a merge slower than
-    `snapshot_retention` burns the whole grace before it commits, and the
+    `staging_snapshot_retention` burns the whole grace before it commits, and the
     originals are due the instant they stop being referenced.
 
     Worse for an attempt that aborts and is retried later: it commits against
@@ -2045,3 +2060,198 @@ def test_staging_rows_counts_rows_rather_than_differencing_offsets(
         assert log.staging_rows() == before, (
             "the reserved hole was read as a million rows and evicted the window"
         )
+
+
+# -- the stranded-metadata sweep (#113) -------------------------------------
+
+
+def metadata_dir(log: WriteHandle) -> Path:
+    return Path(log._table.metadata_location.removeprefix("file://")).parent
+
+
+def strand(log: WriteHandle, name: str, *, age: timedelta) -> Path:
+    """A file in the staging table's `metadata/` that no commit recorded, as a
+    commit that lost its compare-and-swap or crashed before it leaves one."""
+    path = metadata_dir(log) / name
+    path.write_bytes(b"stranded")
+    written = (datetime.now(UTC) - age).timestamp()
+    os.utime(path, (written, written))
+
+    return path
+
+
+@pytest.fixture
+def sweep_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No age floor and no listing interval, so a test sees each pass act."""
+    monkeypatch.setattr(maintenance, "SWEEP_MIN_AGE", timedelta(0))
+    monkeypatch.setattr(maintenance, "SWEEP_INTERVAL", timedelta(0))
+
+
+def test_the_sweep_deletes_stranded_metadata_and_nothing_live(
+    tmp_path: Path, sweep_now: None
+) -> None:
+    """A stranded manifest, manifest list and `metadata.json` go; every file a
+    live snapshot or the table's metadata log names stays, and the log reads.
+
+    Falsify by dropping `live_metadata()` from the live set: the previous
+    `metadata.json` versions the table keeps are deleted, and the assertion on
+    them fails.
+    """
+    config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 3)
+        before = set(metadata_dir(log).iterdir())
+        stranded = {
+            strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(hours=2)),
+            strand(log, f"snap-1-1-{uuid.uuid4()}.avro", age=timedelta(hours=2)),
+            strand(log, f"00099-{uuid.uuid4()}.metadata.json", age=timedelta(hours=2)),
+        }
+
+        log.maintain()
+
+        assert not any(p.exists() for p in stranded)
+        live = {Path(p) for p in log._table.referenced_paths()} | {
+            Path(p) for p in log._table.live_metadata()
+        }
+        assert before & live <= set(metadata_dir(log).iterdir()), (
+            "a file the table still names was deleted"
+        )
+        assert len(before & live) > 3, "the test must hold live files to keep"
+        assert len(read_all(log)) == 12
+
+
+def test_the_sweep_leaves_young_files_for_a_commit_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commit writes its files before the swap that makes them live, so a
+    young unreferenced file may be one about to be committed. The age floor
+    holds even at a zero retention.
+
+    Falsify by setting `SWEEP_MIN_AGE` to zero: the young file is deleted.
+    """
+    monkeypatch.setattr(maintenance, "SWEEP_INTERVAL", timedelta(0))
+    config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 1)
+        young = strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(minutes=5))
+        old = strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(hours=2))
+
+        log.maintain()
+
+        assert young.exists()
+        assert not old.exists()
+
+
+def test_the_sweep_works_a_backlog_down_in_batches(
+    tmp_path: Path, sweep_now: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backlog is listed once and deleted `SWEEP_BATCH` a pass, so no pass
+    stalls on it; a file stranded meanwhile waits for the next listing.
+
+    Falsify by deleting the whole list in one pass: the first pass leaves
+    nothing, and the count after it fails.
+    """
+    monkeypatch.setattr(maintenance, "SWEEP_BATCH", 2)
+    config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 1)
+        backlog = [
+            strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(hours=2))
+            for _ in range(5)
+        ]
+
+        log.maintain()
+        assert sum(p.exists() for p in backlog) == 3
+
+        monkeypatch.setattr(maintenance, "SWEEP_INTERVAL", timedelta(hours=4))
+        late = strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(hours=2))
+        log.maintain()
+        log.maintain()
+
+        assert not any(p.exists() for p in backlog)
+        assert late.exists(), "listed again only once the interval passes"
+
+
+def test_the_sweep_refuses_a_listing_that_names_files_differently(
+    tmp_path: Path, sweep_now: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the listing does not contain the current metadata as the table names
+    it, every comparison is meaningless and the sweep would delete the table.
+    It deletes nothing instead.
+
+    Falsify by removing the anchor check: the listing below names the live
+    files as `file://` URIs, so none match `live` and every one is deleted.
+    """
+    # A day's retention, so expiry and drain delete nothing and every file
+    # that goes would have been the sweep's doing.
+    config = LogConfig(
+        compact_min_files=99, staging_snapshot_retention=timedelta(days=1)
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 2)
+        table = log._table
+        real = table.metadata_files
+        monkeypatch.setattr(
+            table, "metadata_files", lambda: [(f"file://{p}", t) for p, t in real()]
+        )
+        before = set(metadata_dir(log).iterdir())
+        old = datetime.now(UTC) - timedelta(days=2)
+        for path in before:
+            os.utime(path, (old.timestamp(), old.timestamp()))
+
+        log.maintain()
+
+        assert before <= set(metadata_dir(log).iterdir())
+        assert len(read_all(log)) == 8
+
+
+def test_a_failing_sweep_never_fails_the_pass(
+    tmp_path: Path,
+    sweep_now: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Housekeeping: a failure is logged and the next pass lists again.
+
+    Falsify by letting the exception out of `_sweep`: `maintain` raises.
+    """
+    config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 1)
+        stranded = strand(log, f"{uuid.uuid4()}-m0.avro", age=timedelta(hours=2))
+        table = log._table
+        real = table.remove
+
+        def refuse(path: str) -> None:
+            raise PermissionError(path)
+
+        monkeypatch.setattr(table, "remove", refuse)
+        log.maintain()
+
+        assert stranded.exists()
+        assert "retried on the next pass" in caplog.text
+
+        monkeypatch.setattr(table, "remove", real)
+        log.maintain()
+
+        assert not stranded.exists()
+
+
+def test_an_expiry_with_nothing_to_expire_commits_nothing(tmp_path: Path) -> None:
+    """pyiceberg commits an empty removal — a new `metadata.json` and a catalog
+    swap — when nothing is old enough. On the published table, every `publish`
+    would pay a remote commit to learn nothing changed.
+
+    Falsify by dropping the guard in `expire_snapshots_older_than`: the
+    metadata location moves.
+    """
+    config = LogConfig(
+        compact_min_files=99, staging_snapshot_retention=timedelta(days=1)
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 2)
+        before = log._table.metadata_location
+
+        log._maintenance.expire()
+
+        assert log._table.metadata_location == before

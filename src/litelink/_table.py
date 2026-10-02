@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pyarrow.fs import FileSelector, FileType
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.conversions import from_bytes
 from pyiceberg.exceptions import (
@@ -24,7 +25,7 @@ from pyiceberg.exceptions import (
     NoSuchTableError,
 )
 from pyiceberg.io import load_file_io
-from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.io.pyarrow import PyArrowFileIO, schema_to_pyarrow
 from pyiceberg.table import StaticTable
 from pyiceberg.transforms import IdentityTransform
 
@@ -1169,6 +1170,63 @@ class LogTable:
 
         return paths
 
+    def metadata_files(self) -> list[tuple[str, datetime]]:
+        """Every manifest, manifest list and `metadata.json` in this table's
+        `metadata/` directory, with when each was written.
+
+        A LISTING, which nothing else in this library does: every file a commit
+        writes is meant to be found from SQLite or from a snapshot. This is
+        for the files that rule misses — what a commit writes before it loses
+        the compare-and-swap or crashes, which pyiceberg leaves behind, and the
+        manifests merged away before #112 (#113). Named the way
+        `referenced_paths` names them, so the two compare.
+
+        Through the table's own FileIO, so an object store is listed with the
+        credentials every other read uses. Empty for a FileIO other than
+        pyarrow's, which this library does not configure.
+        """
+        io = self._table.io
+        if not isinstance(io, PyArrowFileIO):
+            return []
+
+        location = f"{self._table.location().rstrip('/')}/metadata"
+        scheme, netloc, path = PyArrowFileIO.parse_location(location, io.properties)
+        fs = io.fs_by_scheme(scheme, netloc)
+        listed = fs.get_file_info(FileSelector(path, allow_not_found=True))
+        # Every listed name as a URI, which `_name` then turns into this table's
+        # form: a plain path for the staging table, the URI for the published
+        # one — `file://` included, for a published table on local disk.
+        prefix = f"{scheme}://"
+
+        return [
+            (self._name(f"{prefix}{info.path}"), info.mtime)
+            for info in listed
+            if info.type == FileType.File
+            and info.mtime is not None
+            and (info.path.endswith(".avro") or info.path.endswith(".metadata.json"))
+        ]
+
+    def live_metadata(self) -> set[str]:
+        """The `metadata.json` files this table still names: the current one and
+        the previous versions its log keeps (`previous-versions-max`)."""
+        return {self._name(self._table.metadata_location)} | {
+            self._name(entry.metadata_file)
+            for entry in self._table.metadata.metadata_log
+        }
+
+    def anchors(self) -> set[str]:
+        """Files certainly live and certainly on disk: the current
+        `metadata.json` and the current snapshot's manifest list.
+
+        What the sweep checks its listing against before trusting it.
+        """
+        current = self._table.current_snapshot()
+        names = {self._name(self._table.metadata_location)}
+        if current is not None:
+            names.add(self._name(current.manifest_list))
+
+        return names
+
     def snapshots_older_than(self, cutoff: datetime) -> list[Snapshot]:
         """Snapshots eligible for expiry, excluding the current one."""
         current = self._table.current_snapshot()
@@ -1558,12 +1616,19 @@ class LogTable:
         self._commit(lambda: self._table.delete(delete_filter=offset_below(end)))
 
     def expire_snapshots_older_than(self, cutoff: datetime) -> None:
-        """Expire snapshot METADATA. Does not delete any file — see §6."""
-        self._commit(
-            lambda: (
+        """Expire snapshot METADATA. Does not delete any file — see §6.
+
+        Nothing to expire commits nothing. pyiceberg would otherwise commit an
+        empty removal, a fresh `metadata.json` and a catalog swap, on every
+        maintenance pass; on a published table that is a remote commit to
+        learn nothing changed (#113).
+        """
+
+        def expire() -> None:
+            if self.snapshots_older_than(cutoff):
                 self._table.maintenance.expire_snapshots().older_than(cutoff).commit()
-            )
-        )
+
+        self._commit(expire)
 
     def scan_range(self, start: int, end: int) -> pa.Table:
         return self._table.scan(row_filter=offset_in(start, end)).to_arrow()

@@ -136,7 +136,7 @@ litelink.preflight(...)                                            # what python
     log.append(row) -> int                          # durable on return
     log.extend(rows) -> list[int]                   # ONE transaction, one fsync
     log.ingest(table_or_reader)                     # Arrow straight to Parquet
-    log.seal_due() · log.maintain()                 # seal; compact, evict, expire
+    log.seal_due() · log.maintain()                 # seal; the whole pipeline, publish included
     log.publish(*, push_unsettled=False)            # push to the published table
     log.retire()                                    # end the log: all published, none local
     log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
@@ -173,7 +173,7 @@ log = litelink.new("data", "trades", schema=schema, sort_by=("event_ts",))
 log.append({"trade_id": 624438572, "event_ts": 1787772776240000,
             "price": 78501.62, "amount": 0.0076})     # durable on return
 log.extend(group_of_rows)                             # the throughput lever
-log.maintain()                                        # compact, evict, expire
+log.maintain()                                        # seal, compact, publish, evict, expire, sweep
 ```
 
 `extend()` commits the whole group in one transaction, so it is one fsync for the batch
