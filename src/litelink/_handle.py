@@ -4169,7 +4169,10 @@ class WriteHandle(LocalReadHandle):
         4. evict the whole staging table, and check nothing is left local;
         5. record the retirement on the published table (`litelink.retired`),
            so `restore` refuses whatever a replica says;
-        6. narrow the buffer's range to `[end, end)`, empty, and flush the WAL
+        6. delete every stranded metadata file in both tables — what a commit
+           that lost its pointer swap or crashed left behind (#113). A retired
+           log takes no more passes, so the sweep gets no later chance;
+        7. narrow the buffer's range to `[end, end)`, empty, and flush the WAL
            replica again. That empty range is what reads as `retired` rather
            than `retiring`, and what lets every read skip the buffer.
 
@@ -4222,6 +4225,13 @@ class WriteHandle(LocalReadHandle):
             )
         finally:
             claim.release()
+
+        # Every stranded metadata file in both tables, all at once (#113). A
+        # retired log takes no more passes, so this is the sweep's last chance
+        # — and the manifests merged away before #112 are a backlog of
+        # thousands. Before the last step, so a failure leaves the log
+        # retiring and calling this again finishes it.
+        self._maintenance.sweep_everything()
 
         # Last: the buffer's range narrowed to `[end, end)` with a record count
         # of 0 — which is what makes the log read as retired rather than

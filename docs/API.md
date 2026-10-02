@@ -654,7 +654,9 @@ log.retire() -> None
 
 Ends the log for good: every row goes to the published table, the staging table and buffer are emptied,
 and the retirement is recorded twice: the buffer gets an end (its `end_offset`, until now
-open), and the published table gets a `litelink.retired` property.
+open), and the published table gets a `litelink.retired` property. Before it finishes, it
+deletes every stranded metadata file in both tables (SPEC §6), since a retired log takes no more
+maintenance passes; that runs 32 deletes at once, so a backlog of thousands takes seconds.
 Afterwards:
 
 | Operation | On a retired log |

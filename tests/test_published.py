@@ -480,3 +480,36 @@ def test_publish_sweeps_a_local_published_table(
 
         assert not stranded.exists()
         assert log.scan().read_all().num_rows == 2 * ROWS
+
+
+def test_retire_deletes_stranded_metadata_in_both_tables(tmp_path: Path) -> None:
+    """A retired log takes no more passes, so `retire` sweeps both tables
+    completely before it finishes (#113).
+
+    Falsify by dropping `sweep_everything` from `retire`: both stranded
+    manifests survive.
+    """
+    import os
+    import uuid
+    from datetime import UTC, datetime
+
+    old = (datetime.now(UTC) - timedelta(hours=2)).timestamp()
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.publish()
+
+        stranded = []
+        for table in (log._table, log._published.require()):  # noqa: SLF001
+            directory = Path(table.metadata_location.removeprefix("file://")).parent
+            path = directory / f"{uuid.uuid4()}-m0.avro"
+            path.write_bytes(b"stranded")
+            os.utime(path, (old, old))
+            stranded.append(path)
+
+        log.retire()
+
+        assert not any(path.exists() for path in stranded)
+
+    with litelink.open(tmp_path, "s", read_only=True) as retired:
+        assert retired.scan().read_all().num_rows == ROWS

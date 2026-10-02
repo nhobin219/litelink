@@ -1134,7 +1134,8 @@ set is read after it, so a commit landing between them counts as live; and the s
 outright unless the listing names the current metadata exactly as the table does. It needs no
 claim, because a metadata file's name carries a fresh UUID and nothing ever references a dead
 one again. On a healthy table it finds nothing; it deletes at most 500 files a pass, and
-never raises into the pass that runs it.
+never raises into the pass that runs it. `retire()` runs it once more over both tables, all
+at once and in parallel, before the log is marked retired: a retired log takes no more passes.
 
 The alternative is to make orphans impossible rather than discoverable. Every data file the
 library creates has its path written to SQLite *before* it is written to disk:

@@ -22,6 +22,7 @@ import contextlib
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -48,6 +49,8 @@ SWEEP_BATCH = 500
 # and a retention of zero — which tests and demos set — must not let the sweep
 # take a commit's manifests out from under it.
 SWEEP_MIN_AGE = timedelta(hours=1)
+# Concurrent deletes when `retire` sweeps everything at once.
+SWEEP_THREADS = 32
 
 
 @dataclass
@@ -1605,6 +1608,45 @@ class Maintenance:
             # not listed again, and anything not is.
             state.pending = []
             state.next_listing = 0.0
+
+    def sweep_everything(self) -> dict[str, int]:
+        """Delete every stranded metadata file in both tables now, not
+        `SWEEP_BATCH` a pass. Deleted counts, by table.
+
+        For `retire`: a retired log takes no more passes, so whatever the sweep
+        has not reached by then it never will. The same rules as `_sweep`, and
+        no claim, for the same reason. Raises rather than logs, so a failure
+        leaves the log retiring and the next `retire()` tries again.
+
+        **Deleted in parallel.** One S3 delete is a round trip, ~50 ms, so the
+        backlog #111 found — thousands of manifests per log — would hold
+        `retire` for minutes one at a time. `SWEEP_THREADS` at once brings 5,500
+        to seconds, through the FileIO every other access uses, without a
+        batch-delete client and the dependency it would bring.
+        """
+        config = self.config
+        tables: list[tuple[str, LogTable, timedelta]] = [
+            ("staging", self._table, config.staging_snapshot_retention)
+        ]
+        published = self._published.table()
+        if published is not None:
+            tables.append(("published", published, config.published_snapshot_retention))
+
+        deleted: dict[str, int] = {}
+        for name, table, retention in tables:
+            doomed = self._stranded(table, max(retention, SWEEP_MIN_AGE))
+
+            def remove(path: str, table: LogTable = table) -> None:
+                with contextlib.suppress(FileNotFoundError):
+                    table.remove(path)
+
+            with ThreadPoolExecutor(max_workers=SWEEP_THREADS) as pool:
+                # `list` so the first failure raises here, not silently.
+                list(pool.map(remove, doomed))
+
+            deleted[name] = len(doomed)
+
+        return deleted
 
     def _stranded(self, table: LogTable, min_age: timedelta) -> list[str]:
         """The metadata files in `table`'s directory nothing will ever read.
