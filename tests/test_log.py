@@ -372,7 +372,6 @@ def test_a_reader_has_no_mutation_to_refuse(tmp_path: Path) -> None:
             "retire",
             "set_config",
             "set_sort_by",
-            "set_published",
             "recover",
         ):
             assert not hasattr(reader, absent), f"a reader exposes {absent}"

@@ -533,42 +533,6 @@ def test_a_log_without_a_published_row_reads_the_published_table_until_backfille
 
 
 @pytest.mark.s3
-def test_repointing_forgets_the_published_row(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A row describes one published table; a move must not carry it to another.
-
-    Pointed at a fresh prefix, the row is recomputed there: nothing below the
-    staging table. Pointed back, the original's again. A move to one that
-    cannot be reached is refused, and leaves the row as it was.
-
-    Falsify by removing the `drop()` in `_repoint`: the fresh prefix keeps the
-    old published table's row.
-    """
-    with evicted(tmp_path, bucket, s3) as log:
-        original = log.published
-        assert original is not None
-
-        before = published_row(log)
-        assert before is not None and before.statistics.record_count
-
-        log.set_published(f"s3://{bucket}/elsewhere")
-        fresh = published_row(log)
-        assert fresh is not None and fresh.statistics.record_count == 0
-
-        log.set_published(original)
-        again = published_row(log)
-        assert again is not None and again.offsets == before.offsets
-        assert log.scan().read_all().num_rows == ROWS
-
-        with pytest.raises(OSError):  # noqa: PT011
-            log.set_published(f"s3://{bucket}-nonexistent/prefix")
-
-        assert log.published == original
-        assert published_row(log) == again
-
-
-@pytest.mark.s3
 def test_a_restore_computes_the_published_row_from_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:

@@ -104,7 +104,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
 | **`+ WriteHandle`** — published table | `publish` · `rewrite_published` · `retire` |
-| **`+ WriteHandle`** — configure | `set_config` · `set_published` · `set_sort_by` |
+| **`+ WriteHandle`** — configure | `set_config` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
 
 `await_seal` is deliberately a `WriteHandle` method: it *helps* drain the queue each round
@@ -593,7 +593,8 @@ A claim excludes only an overlapping claim, whatever its kind:
 | `evict()` | the prefix it removes | anything overlapping that prefix |
 | `reclaim()` | nothing for the expiry or the delete | nothing |
 | `sweep()` | nothing | nothing |
-| `rewrite_published`, `set_published`, `set_config`, `set_sort_by`, `retire` | the whole log | everything above |
+| `set_config` | nothing: one `meta` row, read wherever a decision is made | nothing |
+| `rewrite_published`, `set_sort_by`, `retire` | the whole log | everything above |
 
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
@@ -764,8 +765,7 @@ says to regenerate the config (see RUNTIME.md).
 ```python
 log.config -> LogConfig
 log.set_config(config) -> None
-log.published -> str                            # s3://… or file://…
-log.set_published(published) -> None              # None: the local default
+log.published -> str                            # s3://… or file://…, fixed at new()
 log.schema -> pa.Schema                       # your columns, as declared at new()
 log.sort_by -> tuple[str, ...]
 log.set_sort_by(sort_by, *, rewrite) -> None
@@ -785,18 +785,14 @@ by the key it happened to open with.
 it from there rather than from memory, so `set_config` in one process is seen by the writer's
 next append and the maintainer's next pass, and nothing can hold a stale one.
 
-`set_config` and `set_published` take the whole-log claim, so they cannot interleave with a
-publish, a merge or an eviction. Both wait for maintenance rather than failing on the first try,
-because the shipped writer calls `set_published` on every restart while a maintainer runs
-elsewhere.
+`set_config` takes no claim. Every setting governs future work only, so a change takes effect
+at the next decision that reads it, and a log whose policy changed mid-stream reads exactly
+like one that never did.
 
-**There is no detached state.** `set_published(None)` points the log back at its local default,
-and I4 holds across every move: nothing leaves the staging table until the published table it now
-points at holds it. **A move opens its new table before recording it** — creating it, or
-adopting one through its `version-hint.text` — so a move that cannot reach it raises with
-nothing changed. Re-stating the current location does nothing at all — no claim, no write,
-no network — so a writer that declares its published table on every restart never waits on
-maintenance or an outage for it.
+**The published table is fixed when the log is created**, like the schema. A log does
+not move between published tables: to publish somewhere else, `retire()` it and start a new log
+where it ended, `new(root, "trades-v2", published=…, start_offset=old.end_offset())`. Offsets
+stay dense across the two, and any engine reads both as one sequence.
 
 `set_sort_by` re-clusters what the staging table owns, so `rewrite` must be passed explicitly
 and `rewrite=False` raises `ValueError` naming the cost you have not accepted. It runs under
@@ -966,7 +962,7 @@ readable; one it left mid-change is refused with the release that can finish it 
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
 `append`, `ingest`, `seal`, `await_seal`, `advance`, `compact`, `publish`, `evict`,
-`reclaim`, `sweep`, `rewrite_published`, `retire`, `set_config`, `set_published` and
+`reclaim`, `sweep`, `rewrite_published`, `retire`, `set_config` and
 `set_sort_by` are absent from `LogHandle`.
 Everything observational and both read paths are there.
 

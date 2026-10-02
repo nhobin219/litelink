@@ -12,11 +12,10 @@ works, and which no reader test can set up without building a Log first.
 
 One injected object instead. `new`/`open` construct it and pass it to all
 three, so each is given its published table at construction like every other
-collaborator, and `set_published` has one place to write instead of a fan-out
-to keep in step. That the fan-out is gone is not only tidiness: the cached
-handle lives here too, so re-pointing the published table drops it, where
-before the Log changed the URI and went on serving reads from the table it had
-already opened.
+collaborator, and the location has one place to live instead of a fan-out to
+keep in step. The cached handle lives here too, keyed by the location it was
+opened for, so nothing can go on serving reads from a table the log does not
+name.
 
 Every log has a published table (#98): a remote one on S3, or a local directory
 — by default under the log's own. `remote()` is the one question about which,
@@ -91,8 +90,7 @@ class Published:
         self._handle_uri: str | None = None
         # Guards the handle and its key together, because they are one fact.
         # The reader resolves the published table on a query thread while a
-        # maintainer publishes on another and `set_published` re-points it from
-        # a third.
+        # maintainer publishes on another.
         self._lock = threading.RLock()
 
     def redeclare_sort_order(self, sort_by: Sequence[str]) -> None:
@@ -137,9 +135,9 @@ class Published:
     def location(self) -> str:
         """Where the published table is, according to the log.
 
-        Every log has one (#98). An empty or missing row — what `set_published
-        (None)` writes, and what a log created without one holds — means the
-        local default under the log's directory.
+        Every log has one, fixed when it is created. An empty or
+        missing row — what a log created without one holds — means the local
+        default under the log's directory.
         """
         return self._buffer.get_meta(PUBLISHED_KEY) or self._layout.default_published
 
@@ -189,28 +187,6 @@ class Published:
                     return None
 
                 self._handle_uri = uri
-
-            return self._handle
-
-    def adopt(self, uri: str) -> LogTable:
-        """Open the table at `uri` with repair on — creating it, or adopting
-        it through its `version-hint.text` — and point the catalog at it.
-
-        For `set_published`, BEFORE the log records `uri`: a move that cannot
-        reach its new table fails with nothing written, rather than leaving
-        the catalog naming the old one. The handle is cached against `uri`, so
-        once the location is recorded every caller gets it.
-        """
-        with self._lock:
-            self._handle = LogTable.open_published(
-                self._layout,
-                uri,
-                self._s3,
-                self._buffer.shape().table,
-                self._buffer.sort_by(),
-                repair=True,
-            )
-            self._handle_uri = uri
 
             return self._handle
 

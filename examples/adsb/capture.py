@@ -140,25 +140,19 @@ def main() -> None:
     s3 = S3Options()
     try:
         log = litelink.open(args.root, NAME, s3=s3)
-        # The PUBLISHED table first, then the policy. `validate` refuses a pair, and
-        # each call is checked against the durable other half — so setting the
-        # policy first refuses `--staging-retention 0` and `--replicate` on a log
-        # that has no published table YET, while the same command line attaches one on
-        # the next line. The final pair is valid; only the order made it
-        # unreachable, and the error told the user they had asked for something
-        # they had not.
-        #
-        # Only when one was actually asked for. Unconditionally, a plain
-        # `just demo-capture` on a log created by `just demo-published` passes
-        # None and DETACHES the published table — which succeeds without credentials,
-        # resets the watermark, and strands every row already evicted from
-        # local disk. `demo-clean` then sees no published table, skips the S3 removal,
-        # and deletes the local state, leaving paid storage nothing can name.
-        if args.published is not None:
-            _settle(
-                lambda: log.set_published(args.published),
-                "attaching the published table",
+        # A log's published table is fixed when it is created (litelink#118),
+        # so a restart asking for a different one is a mistake to report, not
+        # an instruction: moving a log is `retire()` and a new one. Only when
+        # one was asked for — a plain `just demo-capture` on a log created by
+        # `just demo-published` keeps the table it has.
+        if args.published is not None and (args.published.rstrip("/") != log.published):
+            log.close()
+            msg = (
+                f"{args.root}/{NAME} publishes to {log.published}, not "
+                f"{args.published}; a log's published table is fixed when it is "
+                f"created"
             )
+            raise SystemExit(msg)
 
         _settle(lambda: log.set_config(config), "applying the config")
     except FileNotFoundError:

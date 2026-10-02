@@ -74,7 +74,6 @@ from litelink._table import (
     RETIRED_PROPERTY,
     LogTable,
     forget_published_entry,
-    published_columns,
     published_retired,
     published_span,
 )
@@ -387,23 +386,6 @@ def _span(start: int, end: int) -> tuple[int, int] | None:
 def _now() -> str:
     """A timestamp a person will read."""
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def _repointed_mid_push() -> RuntimeError:
-    """The log was pointed at another published table while a publish pass
-    was pushing.
-
-    A push can outlive its lease — a register alone measured 4.1 s against S3,
-    and retries compound it — so the re-point that races it took the lease
-    lawfully. Nothing here is corrupt; the watermark this push earned simply
-    describes a published table the log has left, and recording it would tell
-    eviction (I4) that the new published table holds rows it has never been
-    sent.
-    """
-    return RuntimeError(
-        "the published table was re-pointed while this publish was pushing; its watermark "
-        "belongs to the previous published table and is not recorded"
-    )
 
 
 def _scan_query(
@@ -998,8 +980,7 @@ class LogHandle:
         for the rest of its life.
 
         That state is ordinary — `publish` creates the table on a maintenance
-        tick before anything is sealed, and `set_published` creates one at a new
-        prefix — and one early call was enough to pin it: a `scan`, an
+        tick before anything is sealed — and one early call was enough to pin it: a `scan`, an
         `end_offset`, even a bare metadata poll. The handle then served the
         buffer alone with no error while `coverage()`, which does resolve,
         reported the same log gap-free. Measured: 0 of 20 rows, indefinitely, on
@@ -1214,9 +1195,8 @@ class WriteHandle(LocalReadHandle):
         table.after_commit = self._store_staging_statistics
         self._maintenance = maintenance
         # Sequences the only thing left that needs it: this handle mutating
-        # several objects at once, in `set_config`, `set_published` and
-        # `set_sort_by`, where a SQLite row and a Python object have to change
-        # together.
+        # several objects at once, in `set_sort_by`, where a SQLite row and a
+        # Python object have to change together.
         #
         # Nothing on the append, seal or read paths takes it. Each collaborator
         # owns its own safety — the buffer serialises its connection,
@@ -1324,8 +1304,8 @@ class WriteHandle(LocalReadHandle):
         # downstream has to distinguish "unset" from "explicitly unsorted".
         order = tuple(sort_by or ())
         settings = config or LogConfig()
-        # Same normalisation as `set_published`: an empty string and None both
-        # mean the local default, which `validate` sees as None.
+        # An empty string and None both mean the local default, which
+        # `validate` sees as None.
         published = (published or "").rstrip("/") or None
         validate(schema, order, settings, published)
         # The type as well as the range, because this one is written to `meta`
@@ -1350,8 +1330,8 @@ class WriteHandle(LocalReadHandle):
         # second box, pointed at the old prefix. Silently, that log pushes
         # nothing — its offsets are below the published table's — eviction
         # pins, and the published table's contents read back as its own.
-        # `set_published` refuses the same thing; both entry points need it,
-        # because either can be the one that points the log.
+        # A log is pointed at its published table here and nowhere else, so
+        # this is the only place that needs the check.
         if published is not None:
             try:
                 covered = published_span(layout, published, s3 or S3Options())
@@ -1782,7 +1762,7 @@ class WriteHandle(LocalReadHandle):
                 if recorded
                 else (
                     f"restore cannot attach {published!r} to it — a log's published table is "
-                    f"set when it is created, or later with set_published"
+                    f"set when it is created and cannot be changed"
                 )
             )
             msg = (
@@ -2051,43 +2031,21 @@ class WriteHandle(LocalReadHandle):
         keep, what to compact — so this needs no rewrite. `sort_by` and the
         schema are not in here precisely because they do.
         """
-        with self._lock:
-            # The same claim `set_published` takes, and for the same reason.
-            # `validate` refuses a PAIR — `wal_replication` with no remote
-            # published table to replicate to — so the two halves have to be
-            # decided together. Reading the other half durably is not enough on
-            # its own: read and write as two transactions and the check is only
-            # a statement about the past, so the two setters could each pass
-            # against a state the other was about to change and assemble the
-            # refused pair between them. The pair this first guarded was an
-            # evict-on-upload policy with no archive to evict into, and the next
-            # maintenance pass executed it faithfully, deleting the only copy of
-            # everything sealed. Verified by execution before this claim
-            # existed.
-            lease = self._claim_settings()
-
-            try:
-                validate(
-                    self._schema,
-                    self._buffer.sort_by(),
-                    config,
-                    self._buffer.get_meta(_PUBLISHED_KEY) or None,
-                )
-                # Asked again at the write. The claim makes the read and the
-                # write one decision only while it is held, and a stall past
-                # the TTL between them is the threat the TTL exists for: the
-                # other setter takes the lapsed claim lawfully, validates
-                # against the half this one has not written yet, writes its
-                # own — and between them they record the pair `validate` just
-                # refused. Every data commit already asks this; the setters
-                # stopped one line short.
-                checkpoint(lease.renew)
-                # The only write. There is nothing to fan out: `Maintenance`,
-                # the seal target and `config` all read this row rather than
-                # keeping copies of it.
-                self._buffer.set_meta(_CONFIG_KEY, config.to_json())
-            finally:
-                lease.release()
+        # No claim. `validate` refuses a PAIR — `wal_replication` with no
+        # remote published table — and the other half, the published location,
+        # is fixed when the log is created, so the check reads a value nothing
+        # can change and this is a single row write. Every routine re-reads the
+        # policy at the point it decides, so a change takes effect at the next
+        # decision, not mid-way through one.
+        validate(
+            self._schema,
+            self._buffer.sort_by(),
+            config,
+            self._buffer.get_meta(_PUBLISHED_KEY) or None,
+        )
+        # The only write. There is nothing to fan out: `Maintenance`, the seal
+        # target and `config` all read this row rather than keeping copies.
+        self._buffer.set_meta(_CONFIG_KEY, config.to_json())
 
     def recovery(self) -> _Recovery | None:
         """What `restore` recovered, or None on a log opened normally.
@@ -2097,294 +2055,6 @@ class WriteHandle(LocalReadHandle):
         reissuing ones the dead machine had already served.
         """
         return self._restored_from
-
-    def set_published(self, published: str | None) -> None:
-        """Point the log at another published table, or back at its local
-        default with None (§5). There is no detached state (#98).
-
-        Takes the whole-log claim, so it cannot interleave with a publish pass,
-        a merge, an eviction or the other setter — `validate` refuses a PAIR, so
-        the policy and the location have to be decided together. The shipped
-        writer calls this on every restart while a maintainer runs in another
-        process, so it waits for maintenance rather than failing on the first
-        try; see `_claim_settings`.
-
-        **Re-pointing does not move anything, but it is reversible.** Rows
-        already evicted into the old published table stay there, and the read
-        path resolves only the published table the log currently names — so
-        while pointed elsewhere they are not readable through this log, and a
-        full `scan()` returns fewer rows than were written, silently.
-
-        Pointing BACK undoes that. Each published table writes
-        `version-hint.text` beside its metadata at every commit, so a prefix
-        whose catalog entry this log dropped is registered from what the bucket
-        itself says rather than created empty over the top of it. Only a
-        repairing caller adopts, which `set_published` is; a read still leaves
-        the published leg out until one has run.
-
-        **A published table AHEAD of this log is refused.** One whose span
-        reaches the next offset to be assigned is another log's history, and
-        attaching it wedges this one silently — nothing is ever pushed,
-        eviction pins, and local disk grows without bound. `litelink.restore`
-        is the operation for resuming that log here. Pointing back at a
-        published table this log has moved past is unaffected, and supported.
-
-        **One writer per published table is otherwise assumed, not checked.**
-        The hint records where the metadata was at the last commit THIS log
-        made. Another writer touching that published table while this log
-        pointed elsewhere would leave the hint behind its true state, and
-        adopting it would strand the commits made in between. That is §13's
-        published-identity seam; the contract is one writer per log, and
-        nothing here enforces it.
-
-        What re-pointing no longer does is disturb what the log already knows.
-        There is no watermark to carry across: each pushed file records the
-        bucket its copy went to (§4a), so ranges the old published table holds
-        go on naming it, eviction keeps asking about the published table that
-        is configured now, and compaction keeps refusing to merge across any of
-        them.
-        """
-        # NORMALISED here, not in `_repoint`, so every guard below and the
-        # write see the same location. `set_published("")` once detached past
-        # guards that saw it as non-None — 7,828 acknowledged rows lost. None
-        # and "" now both mean the local default (#98): there is no detached
-        # state, so nothing for a guard to miss.
-        published = (published or "").rstrip("/") or self._layout.default_published
-
-        # Re-stating where the log already points does nothing: no claim, no
-        # write, no network. A writer that declares its published table on
-        # every restart must not wait for maintenance, or fail during an
-        # outage, to be told what it already knew.
-        if published == self._published.location():
-            return
-
-        with self._lock:
-            lease = self._claim_settings()
-
-            # Every write inside, so a failure — a full disk, a busy database —
-            # releases the claim instead of stranding it for its whole TTL.
-            try:
-                # Read, checked and written UNDER the claim. `validate` refuses
-                # a PAIR, and reading the other half durably is not enough on
-                # its own: read and write as two transactions with nothing
-                # between them, and the check is only a statement about the
-                # past — `set_config` could land its half in the gap, so
-                # between them the two calls assemble the very pair neither
-                # would accept, and the next maintenance pass executes it.
-                #
-                # `set_config` takes this same claim, which is what makes the
-                # two serialise. It is the rule §4a already states for data,
-                # applied to the configuration that governs it.
-                validate(self._schema, self._buffer.sort_by(), self.config, published)
-                self._refuse_published_ahead(published)
-                self._refuse_published_behind(published)
-                # Asked again under the claim: another process may have made
-                # the same move meanwhile, and then there is nothing to do.
-                if published == self._published.location():
-                    return
-
-                # A MOVE opens — or creates, or adopts through its
-                # `version-hint.text` — the table at the new location before
-                # anything is written, and fails the call if it cannot. Best
-                # effort, it reported success while the catalog still named
-                # the old table, and every other process refused the published
-                # table until a maintenance pass repaired it.
-                self._published.adopt(published)
-
-                # The other half of the same rule; see `set_config`.
-                checkpoint(lease.renew)
-                self._repoint(published)
-            finally:
-                lease.release()
-
-    def _refuse_published_behind(self, published: str | None) -> None:
-        """Refuse a published table missing a column this log has.
-
-        Logs are immutable now (§9), but a log that used `add_column` under an
-        older release can still meet a published table it pointed away from
-        before that change: pointing back does no schema work —
-        `open_published` only DECLARES a schema when it creates a table, and
-        nothing in `src/` re-declares an existing one — so that published table
-        stays narrow, and every later push fails permanently:
-
-            ValueError: PyArrow table contains more columns: region.
-
-        `publish` then never advances, eviction's I4 clamp pins on the unpushed
-        files, and local disk grows without bound.
-
-        Refused rather than repaired. Widening an existing published table is
-        `union_by_name` against a table this log did not create, which belongs
-        with `rewrite_published` and wants its own design; doing it quietly from
-        a setter would mean `set_published` mutating a shared published table as
-        a side effect. Tracked as an issue.
-        """
-        if published is None:
-            return
-
-        # Read from the bucket, not through `self._published`: that object
-        # takes its URI from `meta`, which still names the OLD published table.
-        try:
-            columns = published_columns(self._layout, published, self._published.s3)
-        except Exception:
-            # A bad minute in object storage is not a schema disagreement.
-            # `_refuse_published_ahead` treats it the same way: cannot tell, so
-            # pass rather than refuse a published table that may be fine.
-            return
-
-        if columns is None:
-            return
-
-        declared = set(self._buffer.shape().schema.names)
-        missing = sorted(declared - set(columns))
-        if missing:
-            msg = (
-                f"published table at {published} is missing {missing}, which this log has "
-                "added since. Attaching it would make every later publish fail "
-                "permanently and pin eviction, so the log would grow without "
-                "bound. Widen the published table first"
-            )
-            raise ValueError(msg)
-
-    def _refuse_published_ahead(self, published: str | None) -> None:
-        """Refuse a published table whose span reaches past this log's next
-        offset.
-
-        That published table belongs to a different log's history, and
-        attaching it wedges this one SILENTLY. Traced: `publish` computes
-        `floor` from the published table's span, every staging file sits below
-        it, so `pending` is empty and nothing is ever pushed. The watermark is
-        still written, eviction's I4 clamp finds no `extent` rows and pins at
-        zero, and local disk grows without bound while `publish()` returns
-        success having uploaded nothing. No error surfaces at any step.
-
-        It is reachable by the obvious failover attempt — `litelink.new` on a
-        second box, then `set_published` at the old prefix — which is exactly
-        what `litelink.restore` exists to do properly.
-
-        **Its last offset `>= next_offset`, not "overlaps".** Pointing back at a
-        published table that holds offsets this log has moved PAST is supported
-        and tested; the published table's ranges simply sit below the staging
-        ones. Only a published table reaching at or above the next offset to be
-        assigned is describing a stream this log is not.
-
-        **Read through `version-hint.text`, never `open_published`.** At this
-        point `meta` still names the OLD published table, so `Published.table()`
-        opens that one. Going to `open_published` for the new prefix fails both
-        ways: with `repair=False` the catalog row names the old published table
-        and the boundary check raises on every ordinary re-point; with
-        `repair=True` it drops that row as a side effect of what is meant to be
-        a read.
-
-        Absent, unreachable, or unreadable all PASS. `_repoint` deliberately
-        tolerates a published table that does not exist yet — "configuring one
-        is a statement of intent, not a claim that the bucket exists" — and this
-        is called on every writer restart, so it must not fail closed on a bad
-        minute in object storage.
-        """
-        if published is None:
-            return
-
-        try:
-            covered = published_span(self._layout, published, self._published.s3)
-        except Exception:
-            return
-
-        if covered is None:
-            return
-
-        nxt = self._buffer.next_offset()
-        # Ahead when its last offset, `covered[1] - 1`, is at or past `nxt`.
-        if covered[1] > nxt:
-            msg = (
-                f"the published table at {published!r} holds offsets up to {covered[1] - 1}, at or "
-                f"above this log's next offset ({nxt}) — it is another log's "
-                f"history. Attaching it would push nothing and pin eviction, "
-                f"silently. To resume that log here, use litelink.restore"
-            )
-            raise ValueError(msg)
-
-        # And it must be a published table this log has SEEN. A populated
-        # prefix that this log holds no `extent` row for is somebody else's,
-        # whatever its offsets look like — and offsets are all a comparison has
-        # to go on, since two logs of the same name both start at 1.
-        #
-        # Attaching one cannot be contained downstream, which two attempts
-        # tried: the watermark is raised to the published table's span by
-        # `confirmed` on every pass, and this log's own `extent` rows are
-        # written for the published table's ENTIRE manifest by `_push`'s
-        # backfill within one publish pass. Measured — a bound derived from
-        # either moved with the contamination. The backfill is right to trust
-        # the manifest; what it needs is for the published table to be ours,
-        # and §13's identity token is what would prove it. Until then the check
-        # belongs at the moment the log is pointed, before anything has
-        # laundered anything.
-        #
-        # Pointing back passes: ranges pushed to a published table go on naming
-        # it after the log points elsewhere (§4a), so returning to one finds its
-        # own records intact. A fresh prefix passes too — `covered` is None
-        # above.
-        if not self._buffer.published_records(published, 0):
-            raise _foreign_published(published)
-
-    def _repoint(self, published: str | None) -> None:
-        """Record the new location, with the maintenance lease held."""
-        # Already normalised by `set_published`, which is the only caller and
-        # does it before its guards rather than after. Repeated here so this
-        # method is correct on its own terms: every path builder strips
-        # trailing slashes, so `s3://b/p` and `s3://b/p/` are the same published
-        # table everywhere except here — where the difference would read as a
-        # move and reset the watermarks of a published table that genuinely
-        # holds data.
-        normalised = (published or "").rstrip("/") or self._layout.default_published
-        # ONE transaction, because the three facts are only true together.
-        #
-        # Where the published table is, and the two watermarks describing what
-        # the PREVIOUS one held: the confirmed one eviction acts on, and the
-        # frontier compaction reads to decide which files are already the
-        # published table's business. As separate writes a crash lands between
-        # them, and BOTH orders have cost a defect — watermark last leaves the
-        # new published table carrying the old one's promise, which eviction
-        # believes; watermark first leaves the old published table with a
-        # frontier of zero, and compaction does not wait for a publish the way
-        # eviction does, so it merges across a boundary the published table
-        # already holds. There is no ordering that is safe, so there is no
-        # ordering.
-        # Whether this is a move is decided against the DURABLE location, in
-        # the transaction that acts on the decision. This object's memory of
-        # where the published table is goes stale the moment another process
-        # re-points it, and nothing but a publish pass refreshes it — so a
-        # maintainer re-asserting the published table it already has would read
-        # its own staleness as a move and zero the watermarks of a bucket that
-        # holds the data.
-        # The published table's tier row describes the published table being
-        # left, so a move forgets it BEFORE the log points anywhere new:
-        # forgotten first, a read can only include the published table, never
-        # trust the old one's row for the new one. A restatement keeps it — the
-        # shipped writer calls this on every restart. Compared against the
-        # durable location, which nothing else can move while this holds the
-        # claim.
-        if self._published.location() != normalised:
-            self._tiers.drop()
-
-        self._buffer.set_meta_moved(
-            _PUBLISHED_KEY,
-            normalised,
-            {Maintenance.PUBLISHED_THROUGH_KEY: "0"},
-        )
-
-        # Reaches the maintainer and the reader because all three hold this
-        # object. `evict` asks it whether I4 is owed anything, and a setting
-        # that stopped at `WriteHandle` would leave the maintainer deleting the
-        # only copy of rows a published table was just configured to receive.
-
-        # The new published table's tier row, while the claim is held, so reads
-        # stop fetching it for every query — from the table `set_published`
-        # already adopted, so nothing is repaired here. Best effort: the first
-        # publish pass records it otherwise.
-        with contextlib.suppress(Exception):
-            adopted = self._published.table()
-            if adopted is not None and not self._tiers.has():
-                self._record_published_row(adopted)
 
     def set_sort_by(self, sort_by: Sequence[str], *, rewrite: bool) -> None:
         """Change the sort order, re-clustering every file the staging table
@@ -2493,11 +2163,9 @@ class WriteHandle(LocalReadHandle):
     def _claim_settings(self) -> Claim:
         """Take the whole-log claim the configuration operations share.
 
-        Retried, not refused on the first try. `set_config` and `set_published`
-        exclude each other because `validate` refuses a PAIR and the two halves
-        have to be decided together — but they also collide with ordinary
-        maintenance, and the shipped writer calls both on every restart while a
-        maintainer runs continuously. Measured before this wait existed: one
+        Retried, not refused on the first try. These operations collide with
+        ordinary maintenance, which a maintainer runs continuously in another
+        process. Measured before this wait existed: one
         startup in six failed, which turns a routine restart into a coin toss.
 
         Bounded, so a genuinely long merge still surfaces rather than hanging.
@@ -3524,38 +3192,12 @@ class WriteHandle(LocalReadHandle):
         registration watermark it records in `meta`, which is what lets
         `advance` enforce I4.
         """
-        # Re-read where the published table IS before pushing to it.
-        # `set_published` is a durable change made by whichever process runs
-        # it, and every other process cached the old value when it opened — so
-        # a maintainer started before a re-point would go on pushing to the
-        # retired published table and, worse, reconcile the watermark from ITS
-        # span. Eviction trusts that watermark and deletes staging files the new
-        # published table has never been sent: the rows survive only in the
-        # bucket the re-point was retiring.
-        #
-        # One keyed read per publish pass, against a change that is rare and
-        # durable: `Published` reads the location from `meta` on every access.
         lease, bound = self._publish_lease(flush=flush)
         if not lease.acquire():
             msg = "another owner holds a claim over this range"
             raise RuntimeError(msg)
 
         try:
-            # UNDER the lease, not before it. Read first, the location can be
-            # re-pointed between the read and the acquire — `set_published`
-            # takes the same lease, so it is free until this line — and the push
-            # then runs against the old published table while the log durably
-            # points at the new one. `_push` would reconcile the old published
-            # table's span into the watermark with no network call at all, and
-            # eviction believes a watermark whatever earned it.
-            # PINNED here, and every fence downstream compares against this
-            # string rather than re-reading the object. `Published` is shared by
-            # the log, the reader and the maintainer precisely so a re-point
-            # reaches all three — which means a `set_published` on another
-            # thread moves the value a fence was going to compare AGAINST, and
-            # both sides of the comparison change together. The fence passes,
-            # and the watermark this push earned is recorded against a published
-            # table that never received it.
             self._push(lease, self._published.uri, flush=flush, bound=bound)
         finally:
             lease.release()
@@ -3570,9 +3212,8 @@ class WriteHandle(LocalReadHandle):
         eviction below the published floor, and compaction refuses what the
         published table holds — and a compaction over the trailing run, which
         `flush` pushes too, overlaps this range and so is excluded by it.
-        `set_published` and `rewrite_published` claim the whole log, so they
-        still exclude any publish, which keeps the re-point fence `publish`
-        pins.
+        `rewrite_published` and the other whole-log operations still exclude
+        any publish.
 
         **Two publishes still exclude each other.** Both start at the same
         floor, so their ranges overlap even when there is nothing to push —
@@ -3597,9 +3238,9 @@ class WriteHandle(LocalReadHandle):
         try:
             published = self._published.table()
         except ValueError:
-            # The catalog names another prefix — a re-point from before 0.7
-            # left it half done — and only a repairing open, under the whole
-            # log, may fix it. `_push` does, as every publish did before.
+            # The catalog names another prefix than the log — a re-point by an
+            # earlier version, left half done — and only a repairing open,
+            # under the whole log, may fix it. `_push` does.
             return whole, None
 
         if published is None:
@@ -3712,13 +3353,12 @@ class WriteHandle(LocalReadHandle):
                 # pushes NOTHING, and the next publish, finding no row, claims
                 # the whole log and writes it.
                 #
-                # Only something dropping the row concurrently reaches here: a
-                # re-point did, before the published location became fixed at
-                # creation (#118); `restore` drops it too, but before any
-                # publish on that machine. So this is a guard rather than a
-                # path — and a publish that silently did nothing is exactly
-                # what an operator wants to hear about, since every row it
-                # would have pushed stays local one pass longer.
+                # Only something dropping the row concurrently reaches here, and
+                # nothing does while a log is live: `restore` drops it, but on a
+                # fresh machine before any publish. So this is a guard rather
+                # than a path — and a publish that silently did nothing is
+                # exactly what an operator wants to hear about, since every row
+                # it would have pushed stays local one pass longer.
                 _log.warning(
                     "litelink: publish of %s pushed nothing: the published "
                     "table's tier row was dropped while the push was claiming "
@@ -3747,12 +3387,7 @@ class WriteHandle(LocalReadHandle):
         # first only reports where the published table was.
         # Stored as the last offset held, so one below the span's end.
         confirmed = max(self._maintenance.published_through(), floor - 1)
-        self._buffer.set_meta_if(
-            _PUBLISHED_KEY,
-            pinned,
-            {Maintenance.PUBLISHED_THROUGH_KEY: str(confirmed)},
-            rising=True,
-        )
+        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: confirmed})
 
         memory = self._maintenance.memory()
 
@@ -3921,13 +3556,6 @@ class WriteHandle(LocalReadHandle):
         # waited, and the buffer grew for the whole of it.
         checkpoint(lease.renew)
         last = uploaded[-1][0]
-        if (self._buffer.get_meta(_PUBLISHED_KEY) or None) != pinned:
-            # The upload already spent longer than a lease TTL against S3 more
-            # than once, which is how the log gets re-pointed underneath a push
-            # — and registering into the published table it was pointed AWAY
-            # from writes the log's rows somewhere nothing will look for them
-            # again.
-            raise _repointed_mid_push()
 
         if not published.register(
             [published.uri(rel_path) for _, rel_path in uploaded],
@@ -3962,28 +3590,10 @@ class WriteHandle(LocalReadHandle):
             )
 
         # After the register, never before: the watermark is a promise that the
-        # published table HAS the range, and I4 lets `advance` delete the
-        # staging copy on the strength of it.
-        #
-        # And only if it is still a promise about the SAME published table.
-        # This push can outlive its lease — a register alone measured 4.1 s and
-        # retries compound it — and a re-point that takes the lease meanwhile
-        # leaves this about to record a watermark earned by a bucket the log has
-        # left.
-        #
-        # Re-read rather than trusted, and in the same transaction as the
-        # write: nothing lowers a watermark afterwards, so recording one earned
-        # by a bucket the log has left is not a mistake anything corrects.
-        if not self._buffer.set_meta_if(
-            # The stored watermark is the last offset held.
-            _PUBLISHED_KEY,
-            pinned,
-            {Maintenance.PUBLISHED_THROUGH_KEY: str(last.end - 1)},
-            # Never lowered: another publish on a disjoint range (#118) can
-            # have recorded a higher one while this push was registering.
-            rising=True,
-        ):
-            raise _repointed_mid_push()
+        # published table HAS the range. Stored as the last offset held, and
+        # never lowered: another publish on a disjoint range (#118) can have
+        # recorded a higher one while this push was registering.
+        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: last.end - 1})
 
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.

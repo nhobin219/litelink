@@ -22,6 +22,17 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: `set_published()` is removed; a log's published table is fixed
+  when the log is created** (#118), like its schema. To publish somewhere
+  else, `retire()` the log and start a new one where it ended:
+  `new(root, name, published=…, start_offset=old.end_offset())`. Every guard
+  re-pointing needed went with it: the re-point checks in `publish`, the
+  whole-log claim the setters took, and adopting a table back from its
+  `version-hint.text`. **`set_config()` takes no claim** any more. Logs
+  written before keep the catalog repair and `drain_published`'s prefix check,
+  in case they carry a half-done re-point; `drain_published` also refuses a
+  table whose catalog entry names another prefix than the log does.
+
 - **Breaking: `hydrate()` is removed** (#118). It copied a time window of
   published files back into staging whether anyone read them or not; a
   reader on another machine caches what it actually reads instead (above),

@@ -140,7 +140,7 @@ litelink.preflight(...)                                            # what python
     log.seal(*, flush=False) · compact() · publish(*, flush=False)   # its steps: move data
     log.evict(table=None) · reclaim(table=None) · sweep(table=None) # its steps: clean up
     log.retire()                                    # end the log: all published, none local
-    log.set_config(...) · set_published(...) · set_sort_by(..., rewrite=True)
+    log.set_config(...) · set_sort_by(..., rewrite=True)
 ```
 
 The deliberate choices:
@@ -385,8 +385,9 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
 ## What it is not
 
 - **Not a mutable store.** Rows are only appended, never updated or deleted in place, and a
-  log's schema is fixed when it is created. To change the schema, `retire()` the log and start
-  a new one where it ended: `new(root, "trades-v2", schema=…, start_offset=old.end_offset())`.
+  log's schema and published table are fixed when it is created. To change either, `retire()`
+  the log and start a new one where it ended:
+  `new(root, "trades-v2", schema=…, published=…, start_offset=old.end_offset())`.
   Offsets stay dense across the two, and any engine reads both as one sequence.
 
 - **Not an unbounded staging table.** A seal's cost tracks what the table's metadata holds, so

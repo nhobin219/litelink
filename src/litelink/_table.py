@@ -257,9 +257,9 @@ def _published_location(io: FileIO, layout: Layout, prefix: str) -> str | None:
     all there is. The sibling `load_table` branch refuses exactly this, in
     those words.
 
-    So a read that fails RAISES. Callers that would rather carry on — the
-    `set_published` guard, which must not fail closed on a bad minute in object
-    storage — catch it themselves and say so.
+    So a read that fails RAISES. Callers that would rather carry on — a guard
+    that must not fail closed on a bad minute in object storage — catch it
+    themselves and say so.
     """
     directory = f"{layout.published_table_location(prefix)}/metadata"
     source = io.new_input(f"{directory}/{VERSION_HINT}")
@@ -1306,14 +1306,11 @@ class LogTable:
                 time.sleep(random.uniform(0, _COMMIT_BACKOFF_MS * (2**attempt)) / 1000)
                 self.reload()
                 # Refreshed, so check it is still the same table. The catalog
-                # row is keyed by table id, not by identity, and a
-                # `set_published` racing a slow register replaces what that row
-                # names — so the reload silently re-binds this operation to the
-                # NEW published table and the retry commits paths that live in
-                # the old bucket. The new published table's manifests would then
-                # reference objects the re-point retired, and the next publish's
-                # reconcile would launder that span into the watermark eviction
-                # acts on.
+                # row is keyed by table id, not by identity, so if it names
+                # another table than the one this handle opened — a half-done
+                # re-point by an earlier version — the reload silently re-binds
+                # this operation to it, and the retry commits paths that live in
+                # the other bucket.
                 self._verify_identity()
             else:
                 self.reload()

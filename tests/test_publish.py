@@ -364,121 +364,6 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
             )
 
 
-def test_repointing_a_published_table_reaches_the_new_one(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Re-pointing must actually re-point, and must not carry a watermark.
-
-    The published table's catalog is a LOCAL SQLite file keyed by table id, so an entry
-    made for the old prefix is found again unless it is dropped — and the
-    handle then reads, and `publish` writes, into the bucket the log claims to
-    have left. Worse, `_push` reconciles the watermark up from that old
-    published table's extent, undoing the reset that exists to stop eviction deleting
-    the only copy of rows the new published table has never been sent.
-    """
-    first, second = f"s3://{bucket}/one", f"s3://{bucket}/two"
-    fs = filesystem(s3)
-    with published_log(tmp_path, bucket, s3) as log:
-        log.set_published(first)
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        assert log.published_through() > 0
-        in_first = len(fs.find(first.removeprefix("s3://")))
-        assert in_first > 0
-
-        log.set_published(second)
-
-        assert log.published_through() == 0, (
-            "a bucket that has been sent nothing has earned no watermark"
-        )
-
-        log.publish()
-
-        assert (
-            second.removeprefix("s3://") in log._published.require().metadata_location
-        )
-        assert len(fs.find(second.removeprefix("s3://"))) > 0, (
-            "publish must reach the NEW published table"
-        )
-        assert len(fs.find(first.removeprefix("s3://"))) == in_first, (
-            "detaching a published table is not deleting it"
-        )
-
-
-def test_detaching_and_reattaching_keeps_the_published_table(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Coming back to the same published table must find what is in it.
-
-    Dropping the catalog entry the moment a log is re-pointed looked like the
-    fix for reaching the wrong published table, and broke this instead: pointing back
-    at a published table that still held data built a fresh empty table over it, and
-    rows already evicted locally were reachable from nowhere. The entry is
-    checked against the prefix when the published table is opened, so leaving and
-    returning to the same one changes nothing.
-    """
-    # A microsecond rather than zero, because zero means "evict on upload" and
-    # `validate` refuses that pair at construction. Either way the floor is
-    # cleared below before detaching, which is now the enforced order.
-    with published_log(
-        tmp_path, bucket, s3, staging_retention=timedelta(microseconds=1)
-    ) as log:
-        where = log.published
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        log.advance()
-        assert log.staging_extent() is None, "rows must be published-only"
-        watermark = log.published_through()
-
-        # The floor comes off BEFORE the detach, which is the documented order
-        # and now the enforced one: detaching retires I4's clamp, so a log with
-        # a retention floor could evict files the published table never took. Retention
-        # has already done its work above; this is about coming back to the
-        # same published table.
-        log.set_config(replace(log.config, staging_retention=None, staging_rows=None))
-        log.set_published(None)
-        log.set_published(where)
-        log.publish()
-
-        assert log.published_through() == watermark, (
-            "the same published table still holds the same range"
-        )
-        merged = log.sql("SELECT * FROM log").read_all()
-        assert sorted(merged.column(OFFSET).to_pylist()) == list(range(1, ROWS + 1)), (
-            "every row must still be readable after a detach and reattach"
-        )
-
-
-def test_a_sibling_prefix_is_not_mistaken_for_this_one(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """`s3://b/one` is a string prefix of `s3://b/one-more`.
-
-    The published table's catalog entry is checked against the prefix asked for, and a
-    bare `startswith` accepts a sibling's entry as this log's — so a log
-    re-pointed from `one-more` to `one` would keep reading and writing into
-    `one-more`, which is a neighbour it was explicitly pointed away from.
-    """
-    sibling, target = f"s3://{bucket}/one-more", f"s3://{bucket}/one"
-    fs = filesystem(s3)
-    with published_log(tmp_path, bucket, s3) as log:
-        log.set_published(sibling)
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        assert len(fs.find(sibling.removeprefix("s3://"))) > 0
-
-        log.set_published(target)
-        log.publish()
-
-        where = log._published.require().metadata_location
-        assert where.startswith(f"{target}/"), (
-            f"a sibling prefix was mistaken for this one: {where}"
-        )
-
-
 def test_a_transient_failure_does_not_replace_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
@@ -582,8 +467,9 @@ def test_a_read_never_repairs_the_published_catalog(
         assert first is not None
 
     # The entry now names `first`, while the log is pointed at `second`.
-    # Written straight to `meta` rather than through `set_published`, so nothing
-    # has had the chance to repair the entry before the read sees it.
+    # Written straight to `meta` — the state a pre-0.7 re-point that crashed
+    # half done leaves — so nothing has had the chance to repair the entry
+    # before the read sees it.
     second = f"s3://{bucket}/elsewhere"
     with litelink.open(tmp_path, "s", s3=s3) as writer:
         writer._buffer.set_meta("published", second)
@@ -612,66 +498,6 @@ def test_a_read_before_the_first_publish_simply_has_no_published_leg(
         assert _recorded_location(log._layout) is None, (
             "reading must not create the published table"
         )
-
-
-def test_a_repoint_leaves_reads_working(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Re-pointing is routine, so it must not break reading until a maintainer
-    happens to run.
-
-    The catalog entry still names the previous published table until something replaces
-    it, and only a lease holder may — so `set_published` does it, under the
-    lease, rather than leaving every cross-tier read raising in the meantime.
-    The check at open stays as the repair for what this misses: another owner
-    holding the lease, or a crash between the two durable writes.
-    """
-    with published_log(tmp_path, bucket, s3) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-
-        log.set_published(f"s3://{bucket}/moved")
-
-    with litelink.open(tmp_path, "s", read_only=True, s3=s3) as reader:
-        merged = reader.sql("SELECT * FROM log").read_all()
-
-        assert merged.num_rows == ROWS, "a re-pointed log must still be readable"
-
-
-def test_repointing_cannot_interleave_with_a_publish(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A publish that has already pushed finishes by writing the watermark.
-
-    Land a re-point between those two moments and the log points at the new,
-    empty published table while carrying a watermark earned by the old one — eviction
-    believes it and deletes the only local copy of rows the new published table has
-    never been sent. Nothing lowers a watermark, so no later publish undoes it.
-
-    Re-reading the location at the top of `publish` narrows that window; only the
-    lease closes it. Held here by a stand-in for the maintainer.
-    """
-    with published_log(tmp_path, bucket, s3) as log:
-        log.extend(rows(200))
-        log.seal()
-
-        # Short, so the bounded wait does not make this test wait it out.
-        log._settings_wait = 0.2  # ty: ignore[unresolved-attribute]
-        held = log._lease("maintain")
-        assert held.acquire()
-        try:
-            with pytest.raises(RuntimeError, match="has held a claim"):
-                log.set_published(f"s3://{bucket}/elsewhere")
-        finally:
-            held.release()
-
-        # And the refusal changed nothing: the published table is still the old one.
-        assert log.published is not None
-        assert log.published.endswith("/prefix")
-
-        log.set_published(f"s3://{bucket}/elsewhere")
-        assert log.published.endswith("/elsewhere")
 
 
 def test_a_read_against_a_never_published_published_writes_nothing(
@@ -728,38 +554,48 @@ def test_a_failed_repoint_puts_the_old_catalog_entry_back(
     )
 
 
-def test_drain_never_deletes_from_a_published_table_the_log_has_left(
+def test_drain_never_deletes_outside_the_logs_own_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A queued remote path names the published table it was superseded in.
+    """A queued remote path outside the log's prefix is left alone.
 
-    The reference veto asks the published table the log is pointed at NOW, so after a
-    re-point those entries would be checked against a new published table that
-    references nothing, and deleted from the old bucket — where they may still
-    be live, and may be the only copy of rows already evicted locally.
+    The published location is fixed at creation now (#118), but a log written
+    before could re-point, and its queue can still name objects of the table
+    it left — checked against this log's table, they look unreferenced, while
+    they may be live, and the only copy of rows evicted elsewhere.
+
+    Falsify by dropping the prefix guard in `_drain_published`: the other
+    table's live object is deleted.
     """
-    old = f"s3://{bucket}/retired"
     fs = filesystem(s3)
-    with published_log(tmp_path, bucket, s3) as log:
-        log.set_published(old)
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        objects = fs.find(old.removeprefix("s3://"))
-        assert objects
+    elsewhere = litelink.new(
+        tmp_path / "elsewhere",
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        published=f"s3://{bucket}/retired",
+        s3=s3,
+    )
+    with elsewhere:
+        elsewhere.extend(rows(ROWS))
+        elsewhere.seal(flush=True)
+        elsewhere.publish(flush=True)
 
-        # Queue one of the old published table's live objects, as an interrupted
-        # rewrite would have, then leave for a different published table.
+    objects = fs.find(f"{bucket}/retired")
+    assert objects
+
+    with published_log(tmp_path / "log", bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+
+        # Another table's live object, queued as a pre-0.7 re-point leaves it.
         stranded = f"s3://{objects[0]}"
         log._buffer.enqueue_deletions([stranded], 0)
-        log.set_published(f"s3://{bucket}/current")
-
-        current = log._published.table(repair=True)
-        assert current is not None
-        log._maintenance._drain_published(current, None)
+        log._maintenance.drain_published()
 
         assert fs.exists(objects[0]), (
-            "drain must not delete from the published table the log has left"
+            "drain must not delete outside the log's own published table"
         )
         assert stranded in log._buffer.queued_deletions(), (
             "and it stays queued for whoever owns that published table"
@@ -777,13 +613,12 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
     instead stops the queue draining at all, for ever.
     """
     with published_log(tmp_path, bucket, s3) as log:
-        log.set_published(f"s3://{bucket}/slashed")
         log.extend(rows(ROWS))
         log.seal()
         log.publish()
 
         fs = filesystem(s3)
-        objects = fs.find(f"{bucket}/slashed")
+        objects = fs.find(f"{bucket}/prefix")
         assert objects
 
         # An object the published table does NOT reference, chosen deliberately. This
@@ -801,7 +636,7 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         log._buffer.enqueue_deletions([doomed], 0)
 
         # The slash goes into `meta` DIRECTLY, because every public way in
-        # normalises it away: `set_published`, `new` and `open` all `rstrip("/")`
+        # normalises it away: `new` and `open` both `rstrip("/")`
         # before storing. Written through any of them this test cannot fail —
         # verified by deleting the guard's own `rstrip` and watching it still
         # pass — so it proved nothing about the guard it names.
@@ -809,8 +644,8 @@ def test_a_trailing_slash_does_not_wedge_the_remote_queue(
         # A durable value with a trailing slash is still reachable: it is what
         # a log written by a version that normalised somewhere else carries,
         # and `drain` reads `meta`, not the argument someone once passed.
-        log._buffer.set_meta(PUBLISHED_KEY, f"s3://{bucket}/slashed/")
-        assert log._published.uri == f"s3://{bucket}/slashed/"
+        log._buffer.set_meta(PUBLISHED_KEY, f"s3://{bucket}/prefix/")
+        assert log._published.uri == f"s3://{bucket}/prefix/"
 
         log._maintenance._drain_published(remote, None)
 
@@ -912,202 +747,6 @@ def test_the_backfill_sees_copies_another_process_pushed(
             ), "recovered against a stale manifest"
 
 
-def test_repointing_to_the_same_published_table_spelled_differently_keeps_the_watermark(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A trailing slash is not a move.
-
-    Every path builder strips one, so `s3://b/p` and `s3://b/p/` name the same
-    objects everywhere except the comparison that decides whether the published table
-    changed. Read verbatim, re-stating the current published table with a slash on the
-    end reads as a move and resets both watermarks — against a bucket that
-    genuinely holds the data, which is I4's whole premise for eviction.
-    """
-    with published_log(tmp_path, bucket, s3) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        settled = log.published_through()
-        assert settled > 0
-
-        log.set_published(f"s3://{bucket}/prefix/")
-
-        assert log.published_through() == settled, (
-            "the same published table, spelled with a trailing slash, is the same published table"
-        )
-        assert log.scan().read_all().num_rows == ROWS
-
-
-def test_a_repoint_is_all_or_nothing(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Where the published table is and what it holds are only true together.
-
-    The two watermarks describe the PREVIOUS published table, so a crash between them
-    and the location leaves a log whose parts disagree — and both orderings
-    have cost a defect. Watermark last leaves the new published table carrying the old
-    one's promise, which eviction believes. Watermark first leaves the OLD
-    published table with a frontier of zero, and compaction, unlike eviction, does not
-    wait for a publish before merging across a boundary the published table already holds.
-
-    So the failure is injected rather than reasoned about: any single write may
-    fail, and what survives must still be coherent.
-    """
-    with published_log(tmp_path, bucket, s3) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        settled = log.published_through()
-        assert settled > 0
-
-        calls = 0
-        original = log._buffer.set_meta
-
-        def flaky(key: str, value: str) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise RuntimeError("crash between the writes")
-
-            original(key, value)
-
-        log._buffer.set_meta = flaky  # ty: ignore[invalid-assignment]
-        try:
-            log.set_published(f"s3://{bucket}/elsewhere")
-        except RuntimeError:
-            pass
-
-        finally:
-            log._buffer.set_meta = original  # ty: ignore[invalid-assignment]
-
-        recorded = log._buffer.get_meta("published") or None
-        if recorded == f"s3://{bucket}/prefix":
-            assert log.published_through() == settled, (
-                "still the old published table, so its watermark must still be true"
-            )
-
-        else:
-            assert log.published_through() == 0, (
-                "a new published table must not inherit the old one's promise"
-            )
-
-
-def test_set_meta_if_writes_only_while_the_guard_still_holds(tmp_path: Path) -> None:
-    """The guard and the write it protects are one transaction, or no guard.
-
-    `publish` re-reads which published table it is pushing to before recording a
-    watermark. Read and written separately, that check only reports where the
-    published table was — a `set_published` landing between leaves the log pointed at the
-    NEW published table holding the OLD one's extent, which eviction believes (I4) and
-    nothing ever lowers.
-
-    What this pins is the contract, not the atomicity: the window the
-    transaction closes is between two adjacent statements, and a test that
-    tried to land inside it would be a race that usually loses. Atomicity here
-    is by construction — one `BEGIN IMMEDIATE`, per SPEC §4a.
-    """
-    log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
-    with log:
-        log._buffer.set_meta("published", "s3://a/p")
-
-        assert not log._buffer.set_meta_if("published", "s3://b/p", {"w": "9"}), (
-            "a guard that no longer holds must decline"
-        )
-        assert log._buffer.get_meta("w") is None
-
-        assert log._buffer.set_meta_if("published", "s3://a/p", {"w": "9"})
-        assert log._buffer.get_meta("w") == "9"
-
-
-def test_a_repoint_during_a_push_forfeits_the_watermark(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A watermark earned by one published table is never recorded against another.
-
-    The push outlives its lease — a register alone measured 4.1 s against S3,
-    and retries compound it — so the `set_published` that races it holds the
-    lease lawfully. What must not happen is the log ending up pointed at the
-    new published table while `published_through` describes the old one: eviction acts
-    on that number (I4) and deletes local files the new published table was never sent.
-    """
-    with published_log(tmp_path, bucket, s3) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        settled = log.published_through()
-        assert settled > 0
-
-        log.extend(rows(ROWS))
-        log.seal()
-
-        # The re-point lands while this push is still in S3.
-        published = log._published.require()
-        original = published.register
-
-        def racing(*args: object, **kwargs: object) -> bool:
-            outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
-            log._buffer.set_meta("published", f"s3://{bucket}/elsewhere")
-            return outcome
-
-        published.register = racing  # ty: ignore[invalid-assignment]
-        try:
-            with pytest.raises(RuntimeError, match="re-pointed"):
-                log.publish()
-
-        finally:
-            published.register = original  # ty: ignore[invalid-assignment]
-
-        assert log._maintenance.published_through() == settled, (
-            "a published table the log has never pushed to must not inherit a watermark"
-        )
-
-
-def test_eviction_learns_about_a_published_table_attached_by_another_process(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """I4 is owed by the log, not by a process's memory of it.
-
-    Attaching a published table to a log a maintainer already has open is supported
-    (§13.0). `publish` is the only thing that refreshes this process's `Published`,
-    and a maintainer that believes the log is local-only never publishes — so it
-    would go on deleting the only copy of every row that ages past
-    `staging_retention`, for as long as it ran, while the durable configuration
-    promised the published table held them.
-
-    The detach direction heals on its own, because a push to a published table that is
-    gone fails. This direction has nothing that fails.
-    """
-    config = LogConfig(
-        target_seal_size=32 * 1024,
-        target_compact_size=32 * 1024,
-        compact_min_files=2,
-        staging_rows=1,
-        staging_snapshot_retention=timedelta(seconds=0),
-        published_snapshot_retention=timedelta(seconds=0),
-    )
-    writer = litelink.new(
-        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config, s3=s3
-    )
-    with writer:
-        writer.extend(rows(ROWS))
-        writer.seal()
-        # Published to the local default, so the published table the maintainer
-        # opened against holds every sealed file.
-        writer.publish(flush=True)
-
-        # The maintainer opened while the log published locally.
-        with litelink.open(tmp_path, "s", s3=s3) as maintainer:
-            assert not maintainer._published.remote()
-
-            writer.set_published(f"s3://{bucket}/prefix")
-
-            maintainer.evict()
-
-            assert maintainer.scan().read_all().num_rows == ROWS, (
-                "nothing may be deleted for a published table that holds nothing"
-            )
-
-
 def test_a_commit_retry_will_not_follow_the_catalog_to_another_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
@@ -1131,80 +770,6 @@ def test_a_commit_retry_will_not_follow_the_catalog_to_another_published_table(
             published._verify_identity()
 
         assert moved
-
-
-def test_restating_the_published_table_from_a_stale_process_keeps_the_watermark(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """ "Is this a move?" is a question about the log, not about this process.
-
-    Nothing refreshes a process's memory of where the published table is except a publish,
-    so in the two-process deployment `set_published` is documented for, a caller
-    can hold a stale one. Asked of that memory, both answers are wrong — here,
-    re-asserting the published table the log already has reads as a move and zeroes the
-    watermarks of a bucket that genuinely holds the data, which drops the
-    compaction frontier to 0 over a live published table.
-    """
-    with published_log(tmp_path, bucket, s3) as writer:
-        writer.extend(rows(ROWS))
-        writer.seal()
-        writer.publish()
-        settled = writer.published_through()
-        assert settled > 0
-
-        with litelink.open(tmp_path, "s", s3=s3) as other:
-            # There is no per-process memory to go stale any more, so the
-            # case this once modelled cannot arise: re-asserting the published table
-            # the log already has reads the same durable value either way.
-            other.set_published(f"s3://{bucket}/prefix")
-
-            assert other.published_through() == settled, (
-                "re-asserting the published table the log already has is not a move"
-            )
-
-
-def test_a_fence_cannot_be_satisfied_by_the_repoint_it_guards_against(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Both sides of the comparison must not move together.
-
-    `Published` is shared by the log, the reader and the maintainer exactly so a
-    re-point reaches all three — which means a `set_published` on another thread
-    updates the value a fence is about to compare against as well as the one it
-    compares. Read live, the fence passes, and the watermark this push earned
-    is recorded against a published table that never received it.
-    """
-    with published_log(tmp_path, bucket, s3) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        settled = log.published_through()
-        assert settled > 0
-
-        log.extend(rows(ROWS))
-        log.seal()
-
-        # A full in-process re-point, landing while the push is in S3: it moves
-        # the durable location AND this shared object's memory of it.
-        published = log._published.require()
-        original = published.register
-
-        def racing(*args: object, **kwargs: object) -> bool:
-            outcome = original(*args, **kwargs)  # ty: ignore[invalid-argument-type]
-            log._buffer.set_meta("published", f"s3://{bucket}/elsewhere")
-            return outcome
-
-        published.register = racing  # ty: ignore[invalid-assignment]
-        try:
-            with pytest.raises(RuntimeError, match="re-pointed"):
-                log.publish()
-
-        finally:
-            published.register = original  # ty: ignore[invalid-assignment]
-
-        assert log._maintenance.published_through() == settled, (
-            "a published table the log has never pushed to must not inherit a watermark"
-        )
 
 
 def test_the_published_table_refuses_a_range_that_starts_inside_its_extent(
@@ -1341,45 +906,6 @@ def test_the_log_keeps_working_after_the_published_table_is_re_cut(
         )
 
 
-def test_a_stale_handle_cannot_repair_the_published_table_it_was_pointed_away_from(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Opening with `repair` is the most dangerous thing a handle does.
-
-    It lets `open_published` drop a catalog entry naming another prefix and
-    create a fresh table at this one. The maintenance claim is what entitles a
-    caller to that; the durable location is what tells it WHICH published table to
-    repair, and every repairing caller except `publish` inherited the privilege
-    without the premise. A handle that remembers the published table the log has left
-    then destroys the live published table's catalog entry, and the next pass "repairs"
-    again by creating an empty table over its data.
-    """
-    with published_log(tmp_path, bucket, s3) as writer:
-        writer.extend(rows(ROWS))
-        writer.seal()
-        writer.publish()
-
-        with litelink.open(tmp_path, "s", s3=s3) as stale:
-            # `stale` remembers the first published table and never opens its handle.
-            assert stale._published.uri == f"s3://{bucket}/prefix"
-
-            writer.set_published(f"s3://{bucket}/second")
-            writer.extend(rows(ROWS))
-            writer.seal()
-            writer.publish()
-            readable = writer.scan().read_all().num_rows
-
-            # The documented ad-hoc operation, run from the stale handle.
-            stale.rewrite_published()
-
-            assert writer.scan().read_all().num_rows == readable, (
-                "a stale handle repaired the wrong published table and lost history"
-            )
-            assert stale._published.uri == f"s3://{bucket}/second", (
-                "the repairing open must adopt the location the log records"
-            )
-
-
 def test_a_rewrite_re_cuts_to_the_compact_row_target(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
@@ -1433,71 +959,6 @@ def test_a_rewrite_re_cuts_to_the_compact_row_target(
             f"the rewrite fragmented the published table: {before} files became {after}"
         )
         assert log.scan().read_all().num_rows == 2400
-
-
-def test_compaction_while_detached_does_not_wedge_a_reattach(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Four legitimate operations, no warning at any step, and a dead log.
-
-    Detach, raise the compaction target so history is undersized again,
-    maintain, re-attach. While detached, compaction had no published table to ask
-    about, so it merged across ranges the published table still holds — and nothing
-    re-cuts a LOCAL straddler: `rewrite_published` works the other side. On
-    re-attach, eviction pins below the straddler for ever and every push is
-    refused by `_refuse_straddle`, which the shipped maintainer does not catch.
-
-    Detaching does not make the published table's copies stop existing, so compaction
-    asks whether ANY published table holds a file, not whether the configured one
-    does. It costs nothing: only compacted files are ever pushed, so a file
-    with a published copy is already at the target.
-    """
-    config = replace(
-        LogConfig(),
-        target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
-        compact_min_files=2,
-        staging_snapshot_retention=timedelta(seconds=0),
-        published_snapshot_retention=timedelta(seconds=0),
-    )
-    where = f"s3://{bucket}/prefix"
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        config=config,
-        published=where,
-        s3=s3,
-    )
-    with log:
-        for _ in range(4):
-            log.extend(rows(400))
-            log.seal()
-            log.advance()
-            log.publish()
-
-        published = log._maintenance.published_prefix(
-            log._table.data_files(), log._published.uri, include_intents=False
-        )
-
-        assert published > 0, "expected the published table to hold a prefix"
-
-        log.set_published(None)
-        log.set_config(replace(config, target_compact_size=1 << 20))
-        log.extend(rows(400))
-        log.seal()
-        log.advance()
-
-        assert all(
-            f.start >= published or f.end <= published for f in log._table.data_files()
-        ), "merged across a range the published table holds while detached"
-
-        log.set_published(where)
-        log.advance()
-        log.publish()
-
-        assert log.scan().read_all().num_rows == 2000
 
 
 def test_expiring_the_published_table_will_not_repair_it_without_a_claim(
@@ -1578,9 +1039,8 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
 ) -> None:
     """The hint has to name the metadata the table is actually at.
 
-    Asserted against the pointer directly, which is why this sits beside the
-    re-attach test rather than inside it: a round trip through `set_published`
-    recovers a hint that is one version stale often enough to pass, because the
+    Asserted against the pointer directly: a round trip through the hint
+    recovers one that is one version stale often enough to pass, because the
     missing snapshot's rows may still be in the staging tier.
 
     It does NOT pin publish-after-reload. That was the intent, and falsifying
@@ -1666,131 +1126,6 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
 
     assert rows_read is not None
     assert rows_read[0] == published
-
-
-def test_pointing_back_at_a_published_table_restores_everything_it_held(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A re-point costs reach, not data — and pointing back gets it back.
-
-    Both halves matter and they are different claims. While pointed elsewhere,
-    rows evicted into the old published table are out of reach: the read path resolves
-    exactly one published table, so a full `scan()` returns fewer rows
-    than were written, silently. That has not changed.
-
-    What has is the way back. This test asserted the opposite until the published table
-    began publishing `version-hint.text` beside its metadata — before that, the
-    local catalog row was the only thing naming the published table's current metadata,
-    and re-pointing drops it, so returning built an EMPTY table over objects
-    still sitting in the bucket. Now the bucket says where its own metadata is,
-    and `open_published` registers from that instead of creating.
-    """
-    config = replace(
-        LogConfig(),
-        target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
-        compact_min_files=2,
-        staging_rows=200,
-        staging_snapshot_retention=timedelta(seconds=0),
-        published_snapshot_retention=timedelta(seconds=0),
-    )
-    first = f"s3://{bucket}/first"
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        config=config,
-        published=first,
-        s3=s3,
-    )
-    with log:
-        written = 0
-        for _ in range(4):
-            log.extend(rows(400))
-            written += 400
-            log.seal()
-            log.advance()
-            log.publish()
-
-        assert log.scan().read_all().num_rows == written
-
-        log.set_published(f"s3://{bucket}/second")
-        moved = log.scan().read_all().num_rows
-
-        assert moved < written, "expected the evicted history to be out of reach"
-
-        # ALL of them, not merely more than `moved`. Adopting the published table has
-        # to hand back the extent it actually holds; a partial recovery would
-        # mean registering a metadata JSON older than the last commit, which is
-        # the failure mode a remembered-at-open pointer would have had and this
-        # one must not.
-        log.set_published(first)
-
-        assert log.scan().read_all().num_rows == written
-
-        # And it is genuinely the old table, not a new one that happens to
-        # read: an empty table created over the objects would show no files at
-        # all while the union still answered from the staging tier.
-        assert log.published_files() > 0
-
-
-def test_a_fresh_prefix_after_a_target_raise_does_not_stall(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Compaction and `publish` must exclude the same files, or they deadlock.
-
-    `stable_prefix` holds a file back when compaction might still merge it, and
-    compaction refuses to merge anything some published table already holds. Give
-    compaction that second input without giving it to `publish` and the two stop
-    agreeing: after a re-point to a FRESH prefix the floor is 0, so files the
-    old published table covers are back in `pending`, group into a mergeable run under
-    the raised target, and are held back for ever against a merge that will
-    never happen. Nothing is ever pushed, the watermark never moves, eviction
-    pins on it, and no error surfaces anywhere.
-
-    The re-attach test next to this one hides it, because re-attaching the SAME
-    published table leaves its own extent as the floor, which keeps those files out of
-    `pending` entirely.
-    """
-    config = replace(
-        LogConfig(),
-        target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
-        compact_min_files=2,
-        staging_snapshot_retention=timedelta(seconds=0),
-        published_snapshot_retention=timedelta(seconds=0),
-    )
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        config=config,
-        published=f"s3://{bucket}/first",
-        s3=s3,
-    )
-    with log:
-        for _ in range(4):
-            log.extend(rows(400))
-            log.seal()
-            log.advance()
-            log.publish()
-
-        log.set_config(replace(config, target_compact_size=1 << 20))
-        log.set_published(f"s3://{bucket}/second")
-
-        for _ in range(4):
-            log.extend(rows(400))
-            log.seal()
-            log.advance()
-            log.publish()
-
-        assert log.published_files() > 0, (
-            "nothing was ever pushed to the new published table: publish and compaction "
-            "disagree about which files are still in play"
-        )
-        assert log.published_through() > 0, "the watermark never moved"
 
 
 def _crash_before_recording(log: WriteHandle) -> None:
@@ -2346,91 +1681,6 @@ def test_the_published_table_declares_the_same_sort_order_as_the_log(
         assert log.published_through() > 0
 
 
-def test_attaching_a_published_table_that_is_ahead_of_the_log_is_refused(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """The obvious failover attempt, which wedges the log silently.
-
-    `WriteHandle.new` on a second box then `set_published` at the old prefix: `publish`
-    computes its floor from the published table's extent, every local file sits below
-    it, so nothing is ever pushed. The watermark is still written, eviction's
-    I4 clamp finds no `extent` rows and pins at zero, and local disk grows
-    without bound while `publish()` returns success having uploaded nothing.
-    """
-    where = f"s3://{bucket}/ahead"
-    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
-    # A populated published table: this is the log that legitimately owns it.
-    with litelink.new(
-        tmp_path / "first", "s", schema=SCHEMA, config=config, published=where, s3=s3
-    ) as owner:
-        owner.extend(rows(1200))
-        owner.seal()
-        owner.advance()
-        owner.publish()
-
-        assert owner.published_through() > 0
-
-    # A fresh log elsewhere, appending from offset 1, pointed at that published table.
-    with litelink.new(
-        tmp_path / "second", "s", schema=SCHEMA, config=config, s3=s3
-    ) as fresh:
-        fresh.extend(rows(10))
-
-        with pytest.raises(ValueError, match="another log's history"):
-            fresh.set_published(where)
-
-        assert fresh.published == Layout(tmp_path / "second", "s").default_published, (
-            "the log was re-pointed despite the refusal"
-        )
-
-
-def test_a_prefix_that_holds_nothing_yet_is_still_attachable(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """The guard must not fail closed.
-
-    `_repoint` deliberately tolerates a published table that does not exist yet —
-    configuring one is a statement of intent, not a claim that the bucket is
-    there — and `set_published` runs on every writer restart. A check that
-    raised on an unreadable prefix would turn a routine restart into a coin
-    toss against object storage.
-    """
-    with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
-        log.extend(rows(10))
-        log.set_published(f"s3://{bucket}/never-written-to")
-
-        assert log.published == f"s3://{bucket}/never-written-to"
-
-
-def test_a_hint_naming_unreadable_metadata_refuses_the_move(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A move adopts the table at its new location before recording it, and a
-    hint naming metadata that cannot be read is a broken published table: refused, with
-    the log left where it was and the hint not written over.
-
-    It used to be accepted as a statement of intent, leaving the first `publish`
-    to fail. A move that reports success has to have a table to point at.
-
-    Falsify by making the adopt in `set_published` best effort: the move is
-    recorded.
-    """
-    prefix = f"s3://{bucket}/corrupt"
-    fs = filesystem(s3)
-    hint = f"{bucket}/corrupt/s/metadata/{VERSION_HINT}"
-    fs.pipe(hint, b"00042-does-not-exist")
-
-    with litelink.new(tmp_path, "s", schema=SCHEMA, s3=s3) as log:
-        log.extend(rows(10))
-        before = log.published
-
-        with pytest.raises(FileNotFoundError):
-            log.set_published(prefix)
-
-        assert log.published == before
-        assert fs.cat(hint) == b"00042-does-not-exist", "the hint was written over"
-
-
 def test_a_log_is_recovered_onto_another_machine(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
@@ -2759,7 +2009,7 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
         )
 
 
-def test_attaching_another_logs_published_table_is_refused_at_both_entry_points(
+def test_creating_a_log_on_another_logs_published_table_is_refused(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
     """A populated published table this log never pushed to belongs to another log.
@@ -2777,9 +2027,8 @@ def test_attaching_another_logs_published_table_is_refused_at_both_entry_points(
     foreign published table's ranges ARE this log's records. Measured: a bound derived
     from either moved with the contamination.
 
-    Both entry points, because either can be the one that points the log —
-    `litelink.new(published=...)` is exactly what an operator reaches for when failing
-    over by hand.
+    `litelink.new(published=...)` is the only way to point a log now (#118), and it
+    is exactly what an operator reaches for when failing over by hand.
     """
     foreign = f"s3://{bucket}/foreign"
     config = replace(
@@ -2815,23 +2064,6 @@ def test_attaching_another_logs_published_table_is_refused_at_both_entry_points(
     assert not (tmp_path / "mine" / "s" / "buffer.db").exists(), (
         "the refusal left a half-built log behind"
     )
-
-    # And pointing an existing one at it. Created local-only, so without
-    # `wal_replication` — `validate` refuses that pair, and the published table is
-    # what this is about to try to attach.
-    local_only = replace(config, wal_replication=False)
-    with litelink.new(
-        tmp_path / "other", "s", schema=SCHEMA, config=local_only, s3=s3
-    ) as other:
-        other.extend(rows(2000))
-        other.seal()
-
-        with pytest.raises(ValueError, match="no record of pushing"):
-            other.set_published(foreign)
-
-        assert other.published == Layout(tmp_path / "other", "s").default_published, (
-            "the log was pointed despite the refusal"
-        )
 
 
 def test_a_restore_from_a_replica_the_published_table_has_outrun(
@@ -3240,77 +2472,19 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
         assert reopened.scan().read_all().num_rows == readable
 
 
-def test_moving_back_to_the_local_default_keeps_every_row(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """`set_published(None)` re-points to the local default (#98), and I4 holds
-    across the move: the local published table holds nothing yet, so nothing may leave
-    the staging table until a `publish` publishes it there.
-
-    It used to detach, which retired the clamp: measured before the refusal
-    that guarded it, 4,025 acknowledged offsets unreadable after one pass.
-    There is no detached state now, so there is no clamp to retire.
-
-    Falsify by skipping the published table clamp in `Maintenance.evict`: the files
-    below the floor are deleted unpublished.
-    """
-    where = f"s3://{bucket}/back-home"
-    config = replace(
-        LogConfig(),
-        target_seal_size=8 * 1024,
-        compact_min_files=2,
-        staging_rows=0,
-    )
-    with litelink.new(
-        tmp_path, "s", schema=SCHEMA, config=config, published=where, s3=s3
-    ) as log:
-        log.extend(rows(600))
-        log.seal()
-        readable = log.scan().read_all().num_rows
-
-        log.set_published(None)
-        assert log.published == Layout(tmp_path, "s").default_published
-
-        log.advance()
-        assert log.scan().read_all().num_rows == readable
-
-        log.publish(flush=True)
-        log.advance()
-        assert log.staging_rows() == 0, "published, so eviction may proceed"
-        assert log.scan().read_all().num_rows == readable
-
-
 def test_every_empty_published_table_spelling_means_the_local_default(
-    tmp_path: Path, bucket: str, s3: S3Options
+    tmp_path: Path,
 ) -> None:
-    """`set_published("")` must land where `None` does, guards and all.
+    """`published=""` must land where `None` does.
 
     Normalising `"" -> None` once happened after the guards, so an empty
-    string slipped past them to a detach — 7,828 acknowledged rows lost. The
-    plausible route is not a literal but `os.environ.get("PUBLISHED", "")`.
+    string slipped past them — 7,828 acknowledged rows lost. The plausible
+    route is not a literal but `os.environ.get("PUBLISHED", "")`.
     """
-    config = replace(
-        LogConfig(), target_seal_size=8 * 1024, compact_min_files=2, staging_rows=100
-    )
-    with litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        config=config,
-        published=f"s3://{bucket}/empty-string",
-        s3=s3,
-    ) as log:
-        log.extend(rows(600))
-        log.seal()
-        readable = log.scan().read_all().num_rows
-
-        for spelling in ("", "/", "///"):
-            log.set_published(spelling)
-            assert log.published == Layout(tmp_path, "s").default_published
-
-        log.advance()
-
-        assert log.scan().read_all().num_rows == readable
+    for number, spelling in enumerate(("", "/", "///")):
+        root = tmp_path / str(number)
+        with litelink.new(root, "s", schema=SCHEMA, published=spelling) as log:
+            assert log.published == Layout(root, "s").default_published
 
 
 def test_creating_a_log_with_an_empty_published_table_publishes_locally(
@@ -3483,8 +2657,8 @@ def test_a_handle_that_read_an_empty_published_table_still_sees_it_fill(
     published table is not load-bearing, for the rest of that handle's life.
 
     The empty-but-existing published table is ordinary, not a corner: `publish` creates
-    the table on a maintenance tick before anything is sealed, and
-    `set_published` creates one at a new prefix. One early call is enough to pin
+    the table on a maintenance tick before anything is sealed. One early call
+    is enough to pin
     it — a `scan`, an `end_offset`, even a bare metadata poll of the kind
     `examples/adsb/tail.py` makes on its first tick.
 
@@ -3582,60 +2756,6 @@ def test_an_evicted_log_still_serves_every_row(
             assert view.scan().read_all().num_rows == ROWS
 
 
-@pytest.mark.slow
-def test_an_evicted_log_serves_everything_across_a_re_point(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """Detach and re-attach must not make an evicted log read short.
-
-    `_repoint` zeroes `published_through` when the location moves, deliberately:
-    a maintainer re-asserting a stale location must not claim the new bucket
-    already holds rows. A detach-and-reattach is two moves, so a log returning
-    to the published table it just left carries watermark 0 while the bucket still
-    holds every row — and `set_published`'s own docstring promises "Pointing BACK
-    undoes that".
-
-    **So the watermark cannot stand in for "the published table holds rows".** Deriving
-    it that way sent an evicted-dry log back to serving its buffer alone:
-    measured, 550 of 4,000 rows with no error, `litelink.open(, read_only=True)` agreeing,
-    and `coverage()` reporting `gap=None` over the missing 3,450. The window
-    closes only at the next `publish()`, which is why the existing detach test
-    passes — it reads after one.
-
-    The published table is asked directly now.
-
-    Falsify by keying `_published_required` on `published_through() > 0`: this
-    fails while every other reader test still passes.
-    """
-    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
-        where = log.published
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        log.advance()
-
-        assert log.staging_extent() is None, "the fixture must evict the tier dry"
-        assert log.scan().read_all().num_rows == ROWS
-
-        # The floor comes off first, which detaching requires: an evict-on-upload
-        # policy presupposes a published table to upload to.
-        log.set_config(replace(log.config, staging_retention=None, staging_rows=None))
-        log.set_published(None)
-        log.set_published(where)
-        assert log.published_through() == 0, (
-            "the fixture must reproduce the zeroed watermark a re-point leaves"
-        )
-
-        served = log.scan().read_all().column(OFFSET).to_pylist()
-        assert sorted(served) == list(range(1, ROWS + 1)), (
-            f"served {len(served)} of {ROWS} after a re-point, before any publish"
-        )
-
-        # And a separate reader process agrees, opened the same way.
-        with litelink.open(tmp_path, "s", read_only=True, s3=s3) as view:
-            assert view.scan().read_all().num_rows == ROWS
-
-
 def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
     """Every handle is on the primary, and the surface is pinned to API.md.
 
@@ -3716,48 +2836,6 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         "published",
         "reader",
     }
-
-
-def test_a_log_whose_stored_published_table_is_malformed_can_still_be_repaired(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """The escape hatch the new shape check must not close.
-
-    `validate` refuses a malformed prefix, and `set_config` and `set_sort_by`
-    pass the STORED one — so a log written before that rule existed would meet
-    it on a call that has nothing to do with the published table. That is acceptable
-    only while the repair is reachable, which is why `open` deliberately does
-    not validate: it takes no published table argument, and refusing to open the log
-    would remove the `set_published` that fixes it.
-
-    Falsify by calling `validate_published` from `open` as well: the log cannot
-    be opened, and there is no supported way to correct the prefix.
-    """
-    where = f"s3://{bucket}/repairable"
-    with litelink.new(tmp_path, "s", schema=SCHEMA, published=where, s3=s3) as log:
-        log.extend(rows(1))
-
-    # The state the rule is retroactive about, forged directly: a stored prefix
-    # that `new` would refuse today.
-    with sqlite3.connect(tmp_path / "s" / "buffer.db") as con:
-        con.execute(
-            "UPDATE meta SET v = ? WHERE k = ?", ("s3:/bucket/bad", PUBLISHED_KEY)
-        )
-
-    with litelink.open(tmp_path, "s", s3=s3) as log:
-        assert log.published == "s3:/bucket/bad", (
-            "open refused a malformed stored prefix"
-        )
-
-        with pytest.raises(ValueError, match="missing a slash"):
-            log.set_config(LogConfig())
-
-        log.set_published(where)
-        assert log.published == where
-
-        # And the setter that was blocked works again, which is what makes the
-        # repair a repair rather than a way to keep going around the rule.
-        log.set_config(LogConfig())
 
 
 def _clone_buffer(source: Path, target: Path) -> None:

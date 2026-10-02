@@ -496,8 +496,7 @@ class Reader:
         self._connect_to = connect
         # The shared published object, not a table handle: it opens the table
         # on first use, so a reader whose queries the published table cannot
-        # answer never touches the network (I5), and `set_published` re-points
-        # this same object rather than leaving the reader holding a stale one.
+        # answer never touches the network (I5).
         self._published = published
         self._remote_ready = False
         # Which tiers a query needs, per tier (#90). Read from disk per query;

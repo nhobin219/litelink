@@ -1193,59 +1193,6 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
         log.close()
 
 
-def test_repointing_does_not_move_any_boundary_backwards(tmp_path: Path) -> None:
-    """A re-point changes where the NEXT file goes, and nothing else (§4a).
-
-    The frontier this replaces had to be reset, because it named ranges of the
-    published table being left — and that reset was the only backwards boundary move in
-    the log, which is what made every reader that had cached the old position
-    wrong at once. Per segment there is nothing to reset: files already pushed
-    keep naming the bucket that holds them.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        published=f"file://{tmp_path}/prefix",
-    )
-    with log:
-        seal_files(log, 2)
-        first = min(log._table.data_files(), key=lambda f: f.start)
-        log._buffer.record_file(
-            f"file://{tmp_path}/prefix/data/{first.start}.parquet",
-            first.start,
-            first.end,
-            1,
-        )
-        local = log._table.data_files()
-
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == first.end
-        )
-
-        log.set_published(f"file://{tmp_path}/elsewhere")
-
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == 0
-        ), "the new published table holds nothing, and says so without any reset"
-
-        log.set_published(f"file://{tmp_path}/prefix")
-
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == first.end
-        ), "pointing back finds the copies still recorded where they are"
-
-
 def test_rewriting_the_published_table_does_not_strand_staging_eviction(
     tmp_path: Path,
 ) -> None:
@@ -1518,51 +1465,6 @@ def test_drain_needs_no_claim_and_still_keeps_what_is_referenced(
         assert Path(live.path).exists(), "a referenced file was unlinked"
         assert log._maintenance._key(live.path) in due, "and it stays queued"
         assert len(read_all(log)) == 12
-
-
-def test_eviction_reads_the_published_table_under_its_own_claim(tmp_path: Path) -> None:
-    """Everything that decides a deletion is read under the claim, or it is a
-    statement about the past.
-
-    `publish` learned this for itself — under the claim, not before it — and
-    eviction acts on the same fact. The window is not narrow: `set_published` is
-    documented as something the shipped writer calls on every restart, and it
-    takes the whole log, which is free precisely while eviction holds nothing.
-    Attaching a published table between the read and the acquire left eviction
-    deleting the only copy of every aged row the new published table was configured to
-    receive — and publish can never push them afterwards, because they have left
-    the table.
-    """
-    config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 3)
-        # Published to the local default, so the published table eviction reads first
-        # holds every file and would let it drop all but the newest.
-        log.publish(flush=True)
-        before = log.staging_files()
-
-        assert before == 3
-
-        # The log is re-pointed between eviction's read and its claim, at a
-        # published table holding nothing.
-        original = Claim.acquire
-
-        def attaching(self: Claim) -> bool:
-            if self.kind == "evict":
-                log._buffer.set_meta("published", "s3://bucket/prefix")
-
-            return original(self)
-
-        Claim.acquire = attaching
-        try:
-            log.evict()
-
-        finally:
-            Claim.acquire = original
-
-        assert log.staging_files() == before, (
-            "evicted on the strength of a published table the log had just left"
-        )
 
 
 def test_eviction_reads_the_policy_the_log_records(tmp_path: Path) -> None:

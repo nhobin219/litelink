@@ -2052,54 +2052,22 @@ class Buffer:
             _write_meta(self._con, {key: value, **(dict(reset) if moved else {})})
             return moved
 
-    def set_meta_if(
-        self,
-        key: str,
-        expected: str | None,
-        pairs: Mapping[str, str],
-        *,
-        rising: bool = False,
-    ) -> bool:
-        """Write `pairs`, but only while `meta[key]` still reads `expected`.
+    def raise_meta(self, values: Mapping[str, int]) -> None:
+        """Write integer watermarks that only ever go up: a value already
+        stored above the one given is kept.
 
-        Compare-and-set, in ONE write transaction, for the guards that decide
-        whether a fact still belongs to the log it was computed for. Read and
-        write as separate statements, the check is only ever a statement about
-        the past: `publish` re-reads which published table it is pushing to
-        before recording a watermark, and a `set_published` landing between the
-        read and the write leaves the log pointed at the NEW published table
-        holding the OLD one's watermark — which eviction believes (I4) and
-        nothing ever lowers.
-
-        The lease does not close that window, because the window opens when the
-        lease has already lapsed: a push that spent longer than the TTL in S3
-        is exactly the case the guard exists for, and the re-point that races
-        it took the lease lawfully. SPEC §4a states the rule — the read of a
-        conflicting claim and the write that depends on it happen in one SQLite
-        transaction, or they are not a guard.
-
-        Returns whether the write happened, so callers can decline rather than
-        record something they no longer have the right to record.
-
-        `rising` makes every value a watermark that only ever goes up: an
-        integer already stored above the one given is kept. In the same
-        transaction, because two publishes on disjoint ranges can finish out
-        of order (#118), and a read-then-write max would let the slower one
-        lower what the faster recorded.
+        In ONE transaction, because two publishes on disjoint ranges can
+        finish out of order (#118), and a read-then-write max would let the
+        slower one lower what the faster recorded.
         """
         with self._transaction():
-            current = _meta_value(self._con, key) or None
-            if current != (expected or None):
-                return False
-
-            if rising:
-                pairs = {
-                    name: str(max(int(value), int(_meta_value(self._con, name) or 0)))
-                    for name, value in pairs.items()
-                }
-
-            _write_meta(self._con, pairs)
-            return True
+            _write_meta(
+                self._con,
+                {
+                    name: str(max(value, int(_meta_value(self._con, name) or 0)))
+                    for name, value in values.items()
+                },
+            )
 
     def shape(self) -> Shape:
         """The declared schema and its derivations, read from the log.

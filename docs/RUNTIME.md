@@ -412,7 +412,7 @@ calls:
 
 **Not** concurrency-safe — call them when nothing else is using the log:
 
-- `set_config`, `set_published`, `set_sort_by`
+- `set_config`, `set_sort_by`
 - `close`
 
 The first three mutate a SQLite row and a Python object together, and they are the only

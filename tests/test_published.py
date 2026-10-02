@@ -20,7 +20,6 @@ import litelink
 from litelink import OFFSET, LogConfig, RetiredError, WriteHandle
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._layout import Layout
-from litelink._published import PUBLISHED_KEY
 from litelink._read import Reader
 from litelink._table import VERSION_HINT
 from tests.test_publish import ROWS, SCHEMA, rows
@@ -240,32 +239,6 @@ def test_a_log_from_before_published_tables_gets_the_default(tmp_path: Path) -> 
         assert log.published_through() == 500
 
 
-def test_set_published_none_points_back_at_the_local_default(tmp_path: Path) -> None:
-    """There is no detached state: None re-points to the local default, and
-    I4 still holds across the move — nothing the new published table lacks is evicted.
-
-    Falsify by mapping None to "" in `set_published`: `log.published` reads the
-    default, but the stored row is empty and the next publish's fence refuses it.
-    """
-    with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
-        log.extend(rows(500))
-        log.seal(flush=True)
-        log.set_published(f"file://{tmp_path / 'away'}")
-        log.publish(flush=True)
-        log.set_published(None)
-
-        assert log._buffer.get_meta("published") == log.published  # noqa: SLF001
-        log.evict()
-        assert log.staging_rows() == 500, (
-            "the default published table holds none of it yet"
-        )
-
-        log.publish(flush=True)
-        log.advance()
-        assert log.staging_rows() == 0
-        assert offsets(log) == list(range(1, 501))
-
-
 def test_the_reader_never_loads_httpfs_for_a_local_published_table(
     tmp_path: Path,
 ) -> None:
@@ -273,59 +246,6 @@ def test_the_reader_never_loads_httpfs_for_a_local_published_table(
         log.scan().read_all()
         assert not log._reader._remote_ready  # noqa: SLF001
         assert isinstance(log._reader, Reader)  # noqa: SLF001
-
-
-def test_a_move_the_new_published_table_cannot_take_is_refused_and_not_recorded(
-    tmp_path: Path,
-) -> None:
-    """A move opens the new table before it records anything, so one that
-    cannot reach it fails the call and leaves the log where it was.
-
-    Falsify by making the move's `adopt` best effort in `set_published`: the
-    call succeeds and the log records a published table nothing can open.
-    """
-    blocker = tmp_path / "blocker"
-    blocker.write_text("a file, so nothing can be created beneath it")
-
-    with local_log(tmp_path) as log:
-        log.extend(rows(100))
-        log.seal(flush=True)
-        before = log.published
-
-        with pytest.raises(OSError):  # noqa: PT011
-            log.set_published(f"file://{blocker}/published table")
-
-        assert log.published == before, "a move that failed was recorded"
-        log.publish(flush=True)
-        assert log.published_through() == 100
-
-
-def test_restating_the_published_table_takes_no_claim_and_opens_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A writer that declares its published table on every restart is told it already
-    has it — without waiting on maintenance or reaching the published table.
-
-    Falsify by removing the early return in `set_published`: the refused claim
-    raises.
-    """
-    from litelink._handle import WriteHandle as Handle
-    from litelink._table import LogTable
-
-    def refuse(*_: object, **__: object) -> None:
-        msg = "a restatement must not claim or open anything"
-        raise AssertionError(msg)
-
-    with local_log(tmp_path) as log:
-        where = log.published
-        monkeypatch.setattr(Handle, "_claim_settings", refuse)
-        monkeypatch.setattr(LogTable, "open_published", refuse)
-
-        log.set_published(where)
-        log.set_published(None)
-        log.set_published(where + "/")
-
-        assert log.published == where
 
 
 def stored_names(root: Path) -> dict[str, set[str]]:
@@ -892,18 +812,15 @@ def test_a_push_whose_tier_row_vanished_warns_and_pushes_nothing(
 def test_the_published_watermark_never_moves_down(tmp_path: Path) -> None:
     """Two publishes on disjoint ranges can finish out of order (#118). The
     slower one's write must not lower what the faster recorded — so the raise
-    is atomic, in the same transaction as its guard.
+    is atomic, in one transaction.
 
-    Falsify by dropping `rising` from `set_meta_if`: the watermark falls back
-    to the slower publish's end.
+    Falsify by writing the value as given in `raise_meta`: the watermark falls
+    back to the slower publish's end.
     """
     with local_log(tmp_path) as log:
         buffer = log._buffer  # noqa: SLF001
-        where = buffer.get_meta(PUBLISHED_KEY)
-        assert buffer.set_meta_if(PUBLISHED_KEY, where, {"published_through": "12000"})
-        assert buffer.set_meta_if(
-            PUBLISHED_KEY, where, {"published_through": "8000"}, rising=True
-        )
+        buffer.raise_meta({"published_through": 12000})
+        buffer.raise_meta({"published_through": 8000})
         assert buffer.get_meta("published_through") == "12000"
 
 

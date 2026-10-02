@@ -556,12 +556,12 @@ class Maintenance:
         #
         # The published ranges read DURABLY here, not from this object's
         # memory. A compaction pass holds no pass-level claim — only per-run
-        # ones — so a `set_published` is free between two runs of one pass, and
-        # the shipped writer calls it on every restart. Answered from pass-start
-        # memory, this guard once reported "no archive" for the rest of a pass
-        # that had since been given one, and skipped itself entirely.
-        # From then on every push is refused by `_refuse_straddle`, the
-        # watermark never advances again, and eviction pins on it.
+        # ones — so what another process recorded between two runs of one pass
+        # has to be read, not remembered. A guard answering from pass-start
+        # memory can miss coverage recorded since, and a merge that straddles
+        # what the published table holds makes every push refuse in
+        # `_refuse_straddle`: the watermark never advances again, and eviction
+        # pins on it.
         if table is self._table:
             published = self.published_prefix(current, None, include_intents=True)
             if any(f.start < published for f in run):
@@ -858,16 +858,11 @@ class Maintenance:
         # everything read before it is a statement about the past.
         #
         # `publish` learned this for itself — "UNDER the lease, not before it" —
-        # and eviction acts on the same facts without having learned it. The
-        # window is not narrow: `set_published` is documented as something the
-        # shipped writer calls on every restart, and it takes the whole log,
-        # which is free precisely while this holds nothing. Attaching a
-        # published table between the read and the acquire left this deleting
-        # the only copy of every aged row the new published table was
-        # configured to receive, and publish can never push them afterwards
-        # because they have left the table. Re-pointing left it evicting on a
-        # clamp earned by the OLD published table, whose rows the read path no
-        # longer scans.
+        # and eviction acts on the same facts: what the published table holds,
+        # and the retention policy, both of which another process can change
+        # between a read here and the claim. Deciding from the earlier read
+        # would delete on facts the claim no longer backs, and a file that has
+        # left the staging table can never be pushed afterwards.
         self._table.reload()
         self._age_cache = None
         files = self._table.data_files()
@@ -1465,7 +1460,7 @@ class Maintenance:
         if not due:
             return
 
-        # NO claim (#118). What a claim would guard is a queued name becoming
+        # No claim. What a claim would guard is a queued name becoming
         # referenced again between the veto below and the unlink, and nothing
         # can do that. Every path that adds a file to a table adds one with a
         # fresh per-attempt token — a seal, a compaction, an ingest, a
@@ -1474,8 +1469,7 @@ class Maintenance:
         # writes a fresh one; compaction recovery registers nothing. `publish`
         # registers copies of staging files above the published span, and
         # `register` declines a range already covered, so a range a rewrite
-        # superseded is never pushed again. `hydrate`, which re-registered a
-        # queued name on purpose, is gone.
+        # superseded is never pushed again.
         #
         # So an entry that is due and unreferenced stays unreferenced. Two
         # drains overlapping only unlink the same file twice, which
@@ -1521,14 +1515,32 @@ class Maintenance:
         if not due:
             return
 
-        # Reloaded first, for the reason `drain` gives.
-        published.reload()
-        referenced = published.referenced_paths()
         # Normalised, because the configured URI may carry a trailing slash
         # while every queued path is built from it stripped. The mismatch would
         # classify this log's OWN objects as another published table's and
         # wedge the queue permanently.
         ours = f"{(self._published.uri or '').rstrip('/')}/"
+
+        # Reloaded first, for the reason `drain` gives — and then refused
+        # unless what it reloaded is the table under `ours`. The veto below
+        # asks THIS handle what is referenced, and the prefix guard asks `meta`
+        # which table is the log's; the two must be the same table, or every
+        # object of one looks unreferenced by the other — and live objects
+        # get deleted. A reload follows the catalog row, which a re-point by an
+        # earlier version, crashed half done, leaves naming another prefix than
+        # `meta` does. The queue is left as it is until a publish's repairing
+        # open puts the two back in agreement.
+        published.reload()
+        if not str(published.metadata_location).startswith(ours):
+            _log.warning(
+                "litelink: not draining the published table: its catalog names "
+                "%s, which is not under %s; a publish repairs this",
+                published.metadata_location,
+                ours,
+            )
+            return
+
+        referenced = published.referenced_paths()
 
         for uri in due:
             if uri in referenced:
@@ -1593,8 +1605,8 @@ class Maintenance:
         already done the work it exists for; the failure is logged and the
         next pass lists afresh.
         """
-        # Per table, not per role: after `set_published` a backlog listed on
-        # the old published table must not be worked through the new one.
+        # Per table, not per role: a backlog listed on one table must never be
+        # worked through another's handle.
         state = self._sweeps.setdefault(
             f"{name}:{table.metadata_location.rpartition('/')[0]}", _SweepState()
         )

@@ -729,11 +729,10 @@ of order, so the watermark write is a rising one: it never lowers what another r
 
 **And everything a pass reads to decide a deletion is read under its claim, not before it.**
 `publish` learned this for itself and eviction did not, though it acts on the same facts: it
-read the published location, and the policy, before claiming anything. `set_published` is
-documented as something the shipped writer calls on every restart and it takes the whole
-log, which is free precisely while eviction holds nothing — so attaching a published table between
-the read and the acquire left eviction deleting the only copy of every aged row that published table
-was configured to receive, unrecoverably, since publish cannot push what has left the table.
+read what the published table holds, and the policy, before claiming anything — and another
+process can change either between that read and the claim. A deletion decided on the earlier
+read acts on facts the claim does not back, and a file that has left the staging table can
+never be pushed afterwards.
 Eviction therefore claims on the UNCLAMPED retention boundary, which only ever falls, and
 recomputes everything under the claim. `set_config` gets the same treatment for the same
 reason: it writes durable state that no running process would otherwise hear about, and
@@ -765,13 +764,9 @@ Reading both halves durably is still not enough, and this is the part that took 
 to see: read and write as two transactions with nothing between them, and the check is only
 a statement about the past. Each setter could pass against a state the other was about to
 change, so between them the two calls assembled the very pair neither would accept — and the
-next maintenance pass carried it out. **`set_config` and `set_published` therefore take the
-same claim**, which is §4a's own rule about data, applied to the configuration that governs
-it: the check and the act share a transaction, or they are not a guard. `litelink.new` records
-the pair in one `meta` transaction for the same reason, and both setters ask for the claim
-again at the write — the read and the write are one decision only while it is held, and a
-stall past the TTL between them lets the other setter take the lapsed claim lawfully and
-record the other half.
+next maintenance pass carried it out. **The published location is fixed when the log is
+created**, so one half of the pair cannot change: `set_config` checks against a value nothing
+can move, and takes no claim. `litelink.new` records the pair in one `meta` transaction.
 
 **And a repairing open is a CLAIM HOLDER's privilege.** That is the other half of the same
 rule, and it went unenforced at one call site: expiry is exempt from claims because it is a
@@ -1534,9 +1529,8 @@ once, and a maintainer the operator never invoked deleted 4,025 acknowledged off
 shape.
 
 Now every log has a published table: on S3 when one is given, otherwise a local directory under the
-log's own. Eviction drops only what it holds, `set_published(None)` re-points to the local
-default rather than detaching, and `staging_retention = 0` means "evict on publish" on every
-log. The cost moves to the published table: a local one keeps everything until truncation by offset
+log's own, fixed when the log is created. Eviction drops only what it holds, and
+`staging_retention = 0` means "evict on publish" on every log. The cost moves to the published table: a local one keeps everything until truncation by offset
 or age lands, which is a follow-up.
 
 Raising it applies to data captured afterwards. Reading older data often is the reader's
@@ -1717,78 +1711,15 @@ The consequence worth planning for is that local disk holds roughly
 
 ## 13. Open questions
 
-0. **The published table's identity is local, and re-pointing has to reconcile it.** Seven
-   consecutive review rounds found defects in one seam, each fix adding a guard on top
-   of the last. That is a design signal, and it is recorded here rather than patched
-   again.
-
-   The shape of the problem: `published.db` is a LOCAL catalog keyed by table id, naming a
-   REMOTE table. Nothing in the entry says which prefix it belongs to, so "is this entry
-   mine?" is answered by comparing its metadata location against the configured prefix —
-   a string comparison standing in for an identity. Meanwhile `set_published` changes
-   durable state that every other process cached at open, and the watermark it resets is
-   the thing eviction deletes on.
-
-   What has accumulated as a result: the entry is validated at open; only a lease holder
-   may repair it; `set_published` takes the whole-log lease, which overlaps every publish's
-   range claim; `publish` re-reads the location under its claim and re-checks it before
-   writing a watermark; a failed repair restores
-   the entry it displaced; `drain` refuses to delete outside the configured prefix. Each
-   is correct and each was found the hard way.
-
-   What would replace them: give the published table an IDENTITY the entry carries — a token
-   written into the published table's own table properties at creation and recorded beside the
-   URI locally, so "is this mine?" is an equality check on a value rather than an
-   inference from a path. Prefix comparison then stops being load-bearing and a re-point
-   becomes one durable fact to change rather than three that can disagree.
-
-   Re-attaching to a published table that already holds data no longer waits on that: the
-   published table publishes `version-hint.text` at every commit and `open_published` registers
-   from it. What the token would add is a CHECK. The hint says where this log left the
-   metadata, and adopting it trusts that nothing else wrote the published table in between —
-   true under the one-writer-per-log contract, and unverifiable without an identity.
-
-   **The deferral has a measured cost, and this paragraph used to understate it.** It
-   claimed the guards above were sufficient for the operations the library supports —
-   attach, detach, re-point to a fresh prefix. A later round disproved that. It found
-   four more defects in this seam, and unlike their predecessors two of them needed no
-   race, no crash and no lease lapse: attaching a published table to a log a maintainer already
-   had open let that maintainer go on deleting the only copy of every row past
-   `staging_retention`, because `evict` asked its own memory whether I4 was owed; and
-   re-asserting a published table from a process whose memory had gone stale read as a move and
-   zeroed the watermarks of a bucket that held the data. The findings got *less*
-   contrived, which is the opposite of what a converging seam does.
-
-   The reason is now legible. The published table's identity lives in four places — the `meta`
-   row, each process's `Published` object, the `published.db` catalog row, and each captured
-   pyiceberg handle — and every guard listed above synchronises one read-write pair. Each
-   round finds the next pair nobody has synchronised yet. The four latest fixes (pin the
-   URI per push, compare-and-set the re-point against the durable value, refresh `evict`
-   from the buffer, refuse a commit whose table left its warehouse) are the same shape
-   again, and they are not evidence the next round will be clean.
-
-   The identity token above is what ends it, because it gives every guard one immutable
-   value to compare and no second in-memory life. Until it exists, the honest statement
-   of the contract is narrower than the API suggests: **re-pointing a live log is
-   defended interleaving by interleaving, not by construction.** The regime the current
-   mechanism is actually sound in is a re-point with every other process stopped.
-
-0. ~~**Per-operation claims, replacing the maintenance lease.**~~ **Closed: built.**
-   The `claim(id, owner, expires_at, kind, start_offset, end_offset, rel_path)` table exists, every
-   range-owning pass claims before it works with the conflict check and the insert in one
-   `BEGIN IMMEDIATE`, and recovery reclaims expired claims rather than a role's. See §4a
-   and `_claim.py`.
-
-   `sealing` and `compacting` were NOT subsumed, which the original sketch expected. They
-   are intent records — the path written down before the file exists (I2) — and a claim
-   answers a different question, so collapsing them would have made one row mean two
-   things.
-
-   The correctness item it was also going to fix is fixed by a different mechanism: a merge
-   can no longer include files publish has published, because compaction and `publish` both read
-   the per-segment published records rather than a watermark, and `published_prefix` excludes
-   anything a published table holds.
-
+0. ~~**The published table's identity.**~~ **Closed: the location is fixed when a log is
+   created**, like its schema. A log never re-points, so nothing has to
+   reconcile one table's catalog entry, watermark and coverage records against another's.
+   `published.db` is still a local catalog keyed by table id naming a remote table, so "is
+   this entry mine?" is still a prefix comparison, and three checks stay for logs an earlier
+   version re-pointed: the entry is validated at open, only a whole-log claim holder may
+   repair it, and `drain_published` deletes nothing outside the log's prefix or from a table
+   whose catalog entry names another. An identity token written into the published table's
+   properties at creation would make that comparison an equality check; nothing needs it now.
 1. ~~**Partitioning.**~~ **Closed: unpartitioned.** Sealing contiguous offset ranges leaves
    data naturally clustered by ingest time, so `litelink_offset` and `ingest_ts` statistics are tight
    and manifests prune without a partition spec. Partitioning by event date would be
