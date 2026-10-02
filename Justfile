@@ -168,7 +168,7 @@ demo-maintain *args:
     # one level down. `just demo-tail` is the combined view; these print only
     # when they do something.
     # Every role, always: a local-only log publishes too, to its own directory.
-    roles="seal compact reclaim publish"
+    roles="seal compact publish clean clean-published"
     pids=""
     stop() { kill $pids 2>/dev/null || true; }
     # Ctrl-C reaches the children directly — they are in this process group —
@@ -176,7 +176,7 @@ demo-maintain *args:
     # the ways that do not, a `kill` of this shell or a supervisor stopping it.
     # No `setsid` here on purpose: detaching them would put them OUT of the
     # group Ctrl-C signals, making the trap the only thing standing between a
-    # stopped demo and four orphans holding leases.
+    # stopped demo and five orphans holding leases.
     trap 'stop' EXIT
     # Ctrl-C is how this is meant to end, so it exits 0 rather than reporting a
     # failed recipe.
@@ -184,7 +184,7 @@ demo-maintain *args:
     for role in $roles; do
         # `{{args}}` BEFORE the role, so a user-supplied `--role` cannot win:
         # argparse takes the last, and `just demo-maintain --role all` would
-        # otherwise start four processes all in role `all` — four sidecars
+        # otherwise start five processes all in role `all` — five sidecars
         # against one database.
         uv run python examples/adsb/maintainer.py {{args}} --role "$role" &
         pids="$pids $!"
@@ -195,7 +195,7 @@ demo-maintain *args:
 # no producer to start, no credentials, no maintainer, no threads. Bitstamp
 # publishes BTC/USD trades over an unauthenticated websocket.
 #
-# `just demo-capture` and friends are the other end of the range — four
+# `just demo-capture` and friends are the other end of the range — five
 # processes, one per storage role, against a synthetic feed under `adsb/` that
 # can be driven as hard as you like.
 

@@ -1,58 +1,53 @@
 """One storage role, one process.
 
-    uv run python examples/adsb/maintainer.py --role seal|compact|reclaim|publish|all
+    uv run python examples/adsb/maintainer.py --role ROLE
 
 The **writer** appends and does nothing else. Everything else is storage work,
-and this runs one piece of it: sealing the buffer into Parquet, converting
-sealed files into published-shaped ones, reclaiming local disk, or pushing to the
-published table. `just demo-maintain` starts all four.
+split five ways, and this runs one of them; `just demo-maintain` starts all
+five. It is the split litelink recommends for a deployment (docs/API.md):
 
-**Why one process each.** A seal is CPU-bound pure Python — most of its commit
-is pyiceberg copying table metadata — so it starves a thread sharing its
-interpreter even while holding no lock. Appends measured 45.2 ms behind an
-in-process seal, which is why the writer is its own process. Compaction is the
-same work and more of it, so the argument repeats one level down: run
-compaction beside sealing and sealing waits on it, and the buffer grows for as
-long as it waits. A thread is not enough — it fixes blocking on the network,
-not contention for the interpreter.
+| Role | Runs | Why it is its own process |
+| --- | --- | --- |
+| `seal` | `seal()` | it is all that bounds the buffer, so nothing may delay it |
+| `compact` | `compact()` | the heaviest CPU work; beside `seal` it would delay it |
+| `publish` | `publish()` | the network; one push can take a minute |
+| `clean` | `evict()`, `reclaim` buffer and staging, `sweep("staging")` | local disk, freed promptly |
+| `clean-published` | `reclaim("published")`, `sweep("published")` | deletes and listing on the published table |
 
-**What this file used to say, and why it changed.** It argued against
-splitting, on two grounds. One is stale: `_table_lock` serialised a seal's
-commit against a maintenance pass within a process, and that lock is gone —
-both now rest on Iceberg's compare-and-swap retry, which is what makes them
-safe across processes too.
+**A step gets its own process when it is heavy on CPU or the network.** A seal
+is CPU-bound pure Python — most of its commit is pyiceberg copying table
+metadata — so it starves a thread sharing its interpreter even while holding
+no lock: appends measured 45.2 ms behind an in-process seal, which is why the
+writer is its own process. Compaction is the same work and more of it, so the
+argument repeats one level down. A thread is not enough — it fixes blocking on
+the network, not contention for the interpreter.
 
-The other still happens, and was measured again here rather than assumed away.
-Two processes committing to one table race on pyiceberg's delete-after-commit
-metadata cleanup, and the loser logs `Failed to delete metadata file` for one
-the winner has already removed. A single-process control over the same workload
-produced none, so it is the split that causes it.
+**The cleanup steps are not split further.** Eviction and expiry are metadata
+commits that finish in milliseconds, and they have an order: eviction queues
+the files that `reclaim` then deletes. What does matter is the network, so the
+published table's expiry and sweep run apart from local cleanup, and a slow
+listing of a bucket never holds up freeing local disk.
 
-It is noise rather than damage, and that was checked too: across a four-process
-run that logged the race, 817,760 appended rows read back contiguous with no
-gap and no duplicate. The commit itself is protected by the CAS retry, and the
-metadata files this library depends on are deleted through its own expiry queue
-rather than pyiceberg's cleanup — so a cleanup that finds its file already gone
-has lost a race to do something that was done.
+**Each extra process committing to the Iceberg table costs a log line.** Two
+processes race on pyiceberg's delete-after-commit metadata cleanup, and the
+loser logs `Failed to delete metadata file` for one the winner already removed.
+It is noise rather than damage: across a run that logged it, 817,760 appended
+rows read back contiguous with no gap and no duplicate. The metadata files this
+library depends on are deleted through its own expiry queue, not pyiceberg's
+cleanup.
 
-**The library owns neither the thread nor the interval.** Each role here is a
-plain method on its own schedule. `seal` runs often because it is an
-indexed read of one row when there is nothing to do; the rest run rarely
-because they read table metadata. `advance()` still exists and runs the whole
-pipeline, publish included, in one call — `--role all` is that, and is the
-right shape when the costs do not justify four processes.
+**The library owns neither the thread nor the interval.** Each role is plain
+method calls on its own schedule. `seal` runs often because it is an indexed
+read of one row when there is nothing to do; the rest run rarely because they
+read table metadata. `--role all` is `advance()`: the whole pipeline in one
+process, the right shape when the costs do not justify five.
 
 The claims are what make any of this safe. Each pass claims the offset RANGE it
 is about to work on, so passes on disjoint ranges run at once and only real
 overlap serialises — a compaction merging one run and a publish pushing another
-have nothing to say to each other. An owner is minted per attempt, so two
-processes and two threads are refused on identical terms, and the expiry on a
-claim is what tells recovery whether an interrupted operation is live work or a
-dead process's leavings. Seal and compaction keep different recovery records
-(`sealing`, `compacting`), so whoever replays one must not replay the other.
-
-A pass that finds its range claimed SKIPS it rather than failing: someone else
-is already doing that work, and what is left is still there next pass.
+have nothing to say to each other. A pass that finds its range claimed SKIPS it
+rather than failing: someone else is already doing that work, and what is left
+is still there next pass.
 """
 
 from __future__ import annotations
@@ -65,17 +60,12 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from _stream import NAME
 from pyiceberg.exceptions import CommitFailedException
 
 import litelink
 from litelink import WriteHandle
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
 from litelink._s3 import S3Options
 
 
@@ -108,18 +98,20 @@ def compact_pass(log: WriteHandle) -> str | None:
     return f"converted {before} files -> {after}  local {log.staging_rows():,} rows"
 
 
-def reclaim_pass(log: WriteHandle, root: Path) -> str | None:
-    """Evict what the next copy holds, then reclaim staging and published:
-    expire snapshots and delete what came due. Not the buffer's `VACUUM`,
-    which blocks appends and is `vacuum_free_ratio`'s to decide.
+def clean_pass(log: WriteHandle, root: Path) -> str | None:
+    """Free local disk: evict what the next copy holds, then reclaim the
+    buffer and staging and sweep staging. In this order, because eviction
+    queues the files `reclaim` deletes.
 
     Staging eviction never goes past what the published table holds (I4), and
-    `publish` is the step that moves that, in its own role here.
+    `publish` is the step that moves that, in its own role. `reclaim("buffer")`
+    is a `VACUUM` only when `vacuum_free_ratio` is set.
     """
     before = log.staging_files()
     log.evict()
+    log.reclaim("buffer")
     log.reclaim("staging")
-    log.reclaim("published")
+    log.sweep("staging")
     after = log.staging_files()
     if after == before:
         return None
@@ -128,6 +120,15 @@ def reclaim_pass(log: WriteHandle, root: Path) -> str | None:
         f"released {before - after} files  local {log.staging_rows():,} rows  "
         f"disk {_disk(root) / 1e6:.1f} MB"
     )
+
+
+def clean_published_pass(log: WriteHandle) -> None:
+    """Expire the published table's snapshots, delete what came due, and sweep
+    it. Its own process because on object storage these are network calls, and
+    the sweep lists the whole of `metadata/`. Silent: nothing here changes a
+    count worth printing."""
+    log.reclaim("published")
+    log.sweep("published")
 
 
 def publish_pass(log: WriteHandle) -> str | None:
@@ -156,13 +157,15 @@ def all_passes(log: WriteHandle, root: Path) -> str | None:
 
 
 # Cadence per role, and they differ by an order of magnitude because the costs
-# do: sealing is an indexed read when idle, conversion reads and rewrites whole
-# files, reclaiming is a metadata commit, and a push waits on a network.
+# do: sealing is an indexed read when idle, compaction reads and rewrites whole
+# files, local cleanup is metadata commits, and the rest wait on a network. A
+# sweep lists at most every four hours however often it is called.
 ROLES = {
     "seal": 0.25,
     "compact": 10.0,
-    "reclaim": 30.0,
     "publish": 10.0,
+    "clean": 10.0,
+    "clean-published": 60.0,
     "all": 10.0,
 }
 
@@ -192,7 +195,7 @@ def main() -> None:
     except FileNotFoundError as exc:
         raise SystemExit(f"{exc}\nstart `just demo-capture` first") from exc
 
-    label = f"[{args.role:>7}]"
+    label = f"[{args.role:>15}]"
     print(f"{label} pid {os.getpid()}, every {every:g}s", flush=True)
 
     # SIGTERM, not just Ctrl-C. Python does not unwind on it — the process
@@ -206,7 +209,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
 
     # The sidecar belongs to whichever process is already published-facing, so it
-    # is not started four times over.
+    # is not started five times over.
     sidecar = (
         Sidecar(log)
         if log.config.wal_replication and args.role in {"publish", "all"}
@@ -220,8 +223,9 @@ def main() -> None:
     passes = {
         "seal": lambda: seal_pass(log),
         "compact": lambda: compact_pass(log),
-        "reclaim": lambda: reclaim_pass(log, args.root),
         "publish": lambda: publish_pass(log),
+        "clean": lambda: clean_pass(log, args.root),
+        "clean-published": lambda: clean_published_pass(log),
         "all": lambda: all_passes(log, args.root),
     }
     run = passes[args.role]
@@ -245,11 +249,10 @@ def main() -> None:
                 # the work is still there next pass, so a maintainer that died
                 # here would be trading a delay for an outage.
                 #
-                # Reachable in ordinary operation now that passes claim ranges
-                # rather than a role: two maintainers working disjoint offsets
-                # is the point of that, and it means two of them committing to
-                # one Iceberg branch. It is NOT a RuntimeError, so the clause
-                # above never caught it.
+                # Reachable in ordinary operation: passes claim ranges, so two
+                # maintainers working disjoint offsets commit to one Iceberg
+                # branch at once. It is not a RuntimeError, so it needs its own
+                # clause.
                 report = f"lost the commit race, retrying next pass: {exc}"
 
             if report is not None:
@@ -401,7 +404,7 @@ class Sidecar:
             if not self.owner:
                 return
 
-            print("[   publish] took over WAL replication", flush=True)
+            print(f"[{'publish':>15}] took over WAL replication", flush=True)
 
         if self._process is not None and self._process.poll() is None:
             return
@@ -438,67 +441,6 @@ class Sidecar:
             self._process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._process.kill()
-
-
-def _maintain(log: WriteHandle, root: Path) -> None:
-    """One pass, phase by phase.
-
-    `log.advance()` does all of this in one call and is what most deployments
-    want. It is split here because the phases cost wildly different amounts and
-    a single number hides which one was slow — conversion reads and rewrites
-    whole files, eviction and expiry are metadata commits, and publish is the only
-    one that can block on a network. An 83 s publish went unnoticed inside a
-    combined figure until the buffer had grown to 170,540 rows.
-
-    `seal` reads 0 ms in a healthy log and that is the point: the loop above
-    drains the queue every quarter second, so by the time a pass runs there is
-    nothing left to seal. A number here means sealing fell behind, which is the
-    first thing to know and was previously invisible.
-    """
-    timings: dict[str, float] = {}
-    try:
-        for name, phase in (
-            ("seal", log.seal),
-            ("compact", log.compact),
-            ("reclaim", _reclaim(log)),
-        ):
-            started = time.monotonic()
-            phase()
-            timings[name] = (time.monotonic() - started) * 1000
-    except RuntimeError as exc:
-        # Another owner holds a claim over this range. Not worth dying over: it
-        # means someone else is already doing this.
-        print(f"  skipped: {exc}")
-        return
-
-    # After the local passes, not before. Eviction reads the published watermark
-    # to decide what it is allowed to drop (I4), so a push landing first is
-    # what lets the NEXT pass reclaim the disk it freed up.
-    pushed = time.monotonic()
-    log.publish()
-    published_rows = f" {log.published_through():>14,}"
-    published_files = f" {log.published_files():>14,}"
-    publish_column = f" {(time.monotonic() - pushed) * 1000:>7.0f}ms"
-
-    print(
-        f"{log.staging_rows():>13,} {log.buffered_rows():>13,}{published_rows}"
-        f" {log.staging_files():>12,}{published_files}"
-        f" {_disk(root) / 1e6:>7.1f}MB"
-        f" {timings['seal']:>6.0f}ms {timings['compact']:>8.0f}ms"
-        f" {timings['reclaim']:>8.0f}ms{publish_column}"
-    )
-
-
-def _reclaim(log: WriteHandle) -> Callable[[], None]:
-    """Eviction and expiry as one phase: both are metadata commits that finish
-    in milliseconds, and splitting them further would report noise."""
-
-    def run() -> None:
-        log.evict()
-        log.reclaim("staging")
-        log.reclaim("published")
-
-    return run
 
 
 def _disk(root: Path) -> int:

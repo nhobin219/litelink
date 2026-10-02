@@ -208,8 +208,8 @@ later `reclaim` deletes it.
 - **Nothing runs unless you call it.** The library owns no thread. Call `seal()` often (it is
   one indexed read when there is nothing to do) and `advance()` rarely.
 - **Each step is a routine of its own** for an orchestrator that wants them on different
-  schedules or in different processes. `advance()` is the one-process version, and raises if
-  another process holds the lease.
+  schedules or in different processes; API.md's "Process split" is the recommended layout.
+  `advance()` is the one-process version, and raises if another process holds a claim it needs.
 - **A publish that fails stops only the published steps.** Steps 4–8 still run, so a machine
   cut off from S3 keeps reclaiming local storage; then the error is raised.
 
