@@ -117,7 +117,7 @@ def main() -> None:
         target_seal_size=1024 * 1024,
         target_compact_size=8 * 1024 * 1024,
         compact_min_files=3,
-        snapshot_retention=timedelta(seconds=30),
+        staging_snapshot_retention=timedelta(seconds=30),
         # None without a published table, because with nowhere to push to a retention
         # is a policy for deleting the only copy — which `WriteHandle.new` refuses to
         # be told by accident.

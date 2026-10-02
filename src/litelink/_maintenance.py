@@ -9,14 +9,21 @@ storage, since superseded files stay referenced until their snapshots expire.
 Eviction alone frees no disk, since it removes a file from the current snapshot
 while the previous one still references it. Expiry deletes no files at all —
 pyiceberg's is metadata-only. Draining is what actually unlinks, and it waits
-`snapshot_retention` so a running scan does not lose files underneath it (I6).
+`staging_snapshot_retention` so a running scan does not lose files underneath it
+(I6).
+
+The published table's expiry, drain and sweep live here too, but `publish` runs
+them (`tidy_published`): `maintain` never needs the network.
 """
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import time
 import uuid
-from dataclasses import replace
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from litelink._buffer import _NO_ROW_LIMIT, OFFSET, Buffer
@@ -25,6 +32,33 @@ from litelink._fs import write_parquet
 from litelink._published import Published
 from litelink._statistics import rollup
 from litelink._tiers import PublishedTier
+
+_log = logging.getLogger(__name__)
+
+# The stranded-metadata sweep (#113, `Maintenance._sweep`). How often a table's
+# `metadata/` is listed: often enough that a lost commit race does not linger,
+# rarely enough that the LIST is noise. A process lists at its first pass, so a
+# restart is the other trigger.
+SWEEP_INTERVAL = timedelta(hours=4)
+# Deletions per pass. One S3 delete is a round trip, ~50 ms, so a backlog of
+# thousands would otherwise hold one pass for minutes.
+SWEEP_BATCH = 500
+# The floor under the age a file must reach, whatever a table's retention says.
+# A commit writes its files before it swaps the pointer that makes them live,
+# and a retention of zero — which tests and demos set — must not let the sweep
+# take a commit's manifests out from under it.
+SWEEP_MIN_AGE = timedelta(hours=1)
+
+
+@dataclass
+class _SweepState:
+    """One table's sweep, between passes. In memory only (`_sweep`)."""
+
+    pending: list[str] = field(default_factory=list)
+    # `time.monotonic()` at which to list again; 0 lists at the first pass.
+    next_listing: float = 0.0
+    deleted: int = 0
+
 
 # Where the log records its settings. Beside `PUBLISHED_KEY` in spirit: not
 # `WriteHandle`'s private business, because eviction decides deletions from it.
@@ -272,6 +306,7 @@ class Maintenance:
         # Read once per eviction pass rather than once per file. Cleared at the
         # top of `evict`, so a pass never decides from what a previous one saw.
         self._age_cache: dict[str, int] | None = None
+        self._sweeps: dict[str, _SweepState] = {}
 
     @property
     def config(self) -> LogConfig:
@@ -1151,8 +1186,8 @@ class Maintenance:
         )
         # The grace period starts HERE, not when they were queued. A reader
         # cannot hold a file the commit has not yet superseded, and a rewrite
-        # slower than `snapshot_retention` would otherwise have burnt the whole
-        # of it before this line — leaving the originals due the instant they
+        # slower than the published snapshot retention would otherwise have
+        # burnt the whole of it before this line — leaving the originals due the instant they
         # stopped being referenced.
         self._buffer.restamp_deletions(
             (self._key(f.path) for f in stale), int(datetime.now(UTC).timestamp())
@@ -1267,14 +1302,16 @@ class Maintenance:
     # -- expiry and the deletion queue --------------------------------------
 
     def expire(self) -> None:
-        """Expire snapshots past `snapshot_retention`, then reclaim (§6, §8)."""
-        cutoff = datetime.now(UTC) - self.config.snapshot_retention
+        """Expire each table's snapshots past its retention, reclaim what has
+        come due, then sweep stranded metadata (§6, §8, #113)."""
+        cutoff = datetime.now(UTC) - self.config.staging_snapshot_retention
 
         # Collect the doomed snapshots' manifest lists and manifests (and the
         # manifests their commits merged away, #111) BEFORE
         # expiring them. Afterwards their names exist nowhere: the metadata that
         # referenced them is gone, and the only remaining way to find the files
-        # would be to list the directory — the thing this design refuses to do.
+        # would be to list the directory, which `sweep` does only as a
+        # backstop for files no commit ever recorded.
         doomed = self._table.expiring_paths(self._table.snapshots_older_than(cutoff))
 
         # Queued BEFORE the expiry, like every other supersession here. After
@@ -1305,60 +1342,43 @@ class Maintenance:
         self._buffer.restamp_deletions(
             (self._key(p) for p in doomed), int(datetime.now(UTC).timestamp())
         )
-        self._expire_published(cutoff)
         self.drain()
+        self._sweep("staging", self._table, self.config.staging_snapshot_retention)
 
-    def _expire_published(self, cutoff: datetime) -> None:
-        """The same expiry on the published table, when a rewrite has left work
-        there.
+    def tidy_published(self, claim: Claim) -> None:
+        """The published table's half of expiry, drain and sweep (§5, #113).
 
-        Only then. `publish` adds files and never supersedes one, so a published
-        table that has only ever been published has nothing an old snapshot is
-        keeping alive, and expiring it every pass would spend a remote catalog
-        commit to discover that. `rewrite_published` is the one thing that
-        supersedes a published file, and it is also the only thing that puts a
-        published entry in the deletion queue — so a queue with one in it is the
-        exact signal that the published table has garbage to release.
+        Called by `publish` at the end of a pass, under the lease it already
+        holds, rather than by `maintain`. Two reasons, both about what
+        `maintain` must not do:
 
-        Without this the queue never drains: `drain` refuses to delete a file
-        any snapshot still references, and until the snapshot that named it
-        expires, one always does.
+        - **No network.** `maintain` keeps a partitioned machine's local
+          storage in order (§11). Expiring an S3 published table every pass
+          would make each one fail where the network is down, and `publish`
+          already needs the network.
+        - **No published table conjured.** Opening it with `repair` creates
+          one where none exists. `publish` creates it anyway; `maintain`
+          has no business to.
+
+        Every publish leaves a snapshot behind, so this is also exactly when
+        there is something to expire. It used to run only once
+        `rewrite_published` had queued a remote deletion, on the reasoning
+        that `publish` never supersedes a file. True of data files and not of
+        Iceberg's own: a table that was only ever published kept every
+        snapshot, manifest list and manifest it had ever had (#113). A pass
+        with nothing old enough commits nothing.
+
+        The claim is what entitles the repairing open. Expiry alone could go
+        claimless, as a metadata commit CAS orders; a repairing open DROPS a
+        catalog entry naming another prefix and creates a table in its place,
+        and two at once collide.
         """
-        if not any(is_remote(p) for p in self._buffer.queued_deletions()):
-            return
-
-        # CLAIMED, because what follows opens the published table with `repair`
-        # on. Expiry is exempt from claims on the grounds that it is a metadata
-        # commit CAS orders — true of the snapshot expiry, and not true of a
-        # repairing open, which DROPS a catalog entry naming another prefix and
-        # creates a table in its place. That privilege belongs to a claim
-        # holder: two of them at once collide on the first attempt, because
-        # pyiceberg writes the metadata object before inserting the catalog row,
-        # and the loser raises a bare `Exception` the shipped maintainer does
-        # not catch. Worse, a claimless drop can land after a claim holder has
-        # already created and registered, taking the live entry with it.
-        #
-        # Rounds nine and ten fixed WHICH published table a repairing open
-        # targets. This is the other half — who is entitled to repair one — and
-        # this call site inherited expiry's exemption without it applying.
-        sweep = self._buffer.claim("expire-published", 0, EVERYTHING, new_owner())
-        if not sweep.acquire():
-            return
-
-        try:
-            self._expire_published_claimed(cutoff, sweep)
-        finally:
-            sweep.release()
-
-    def _expire_published_claimed(self, cutoff: datetime, sweep: Claim) -> None:
-        """The published half of expiry, with the claim held. See
-        `_expire_published`."""
         published = self._published.table(repair=True)
         if published is None:
             return
 
-        checkpoint(sweep.renew)
-
+        checkpoint(claim.renew)
+        cutoff = datetime.now(UTC) - self.config.published_snapshot_retention
         retiring = list(
             published.expiring_paths(published.snapshots_older_than(cutoff))
         )
@@ -1366,20 +1386,34 @@ class Maintenance:
         published.expire_snapshots_older_than(cutoff)
         self._buffer.restamp_deletions(retiring, int(datetime.now(UTC).timestamp()))
 
+        checkpoint(claim.renew)
+        self._drain_published(published, claim.renew)
+        self._sweep(
+            "published",
+            published,
+            self.config.published_snapshot_retention,
+            claim.renew,
+        )
+
     def drain(self) -> None:
-        """Delete files whose grace period has passed.
+        """Delete staging files whose grace period has passed.
 
         A keyed read of `pending_delete`, not a directory walk. Every file this
         library creates has its path written to SQLite before it is written to
         disk — seals through `sealing`, compactions through `compacting` — so
-        there is no category of file that could only be found by looking. That
-        matters more the moment this points at object storage, where the walk is
-        a paginated LIST that costs money and can lag reality.
+        there is no category of file that could only be found by looking.
+
+        Staging entries only. The published table's are drained by `publish`,
+        through `tidy_published`, against its own retention.
         """
-        # Read against the CURRENT snapshot_retention, so lowering it takes
-        # effect on files already queued.
-        cutoff = datetime.now(UTC) - self.config.snapshot_retention
-        due = self._buffer.due_deletions(int(cutoff.timestamp()))
+        # Read against the CURRENT retention, so lowering it takes effect on
+        # files already queued.
+        cutoff = datetime.now(UTC) - self.config.staging_snapshot_retention
+        due = [
+            p
+            for p in self._buffer.due_deletions(int(cutoff.timestamp()))
+            if not is_remote(p)
+        ]
         if not due:
             return
 
@@ -1409,53 +1443,8 @@ class Maintenance:
             # resolve.
             self._table.reload()
             referenced = self._table.referenced_paths()
-            # Only if the queue holds a published object, so an ordinary drain
-            # opens nothing. `rewrite_published` is what puts them here, and it
-            # is an operation somebody ran on purpose. A published object is
-            # named by its URI — `file://` for a local published table — so
-            # "remote" here means "the published table's", wherever it is.
-            remote = (
-                self._published.table(repair=True)
-                if any(is_remote(p) for p in due)
-                else None
-            )
-            remote_referenced = set() if remote is None else remote.referenced_paths()
 
             for rel_path in due:
-                if is_remote(rel_path):
-                    if remote is None or rel_path in remote_referenced:
-                        continue
-
-                    # Only objects belonging to the published table this log is
-                    # pointed at. A queued remote path names the published table
-                    # it was superseded in, and the veto above asks the CURRENT
-                    # one — so after a re-point, entries left by a rewrite on
-                    # the old published table would be checked against a new
-                    # published table that references nothing and deleted from
-                    # the old bucket, where they may still be live and may be
-                    # the only copy of rows already evicted from staging.
-                    #
-                    # Left queued rather than forgotten: they are somebody's to
-                    # resolve, and the log that owns that published table is the
-                    # one that can say whether they are dead. A stranded queue
-                    # row is a bounded cost; deleting live data in a bucket this
-                    # log no longer understands is not.
-                    #
-                    # Normalised, because the configured URI may carry a
-                    # trailing slash while every queued path is built from it
-                    # stripped. The mismatch would classify this log's OWN
-                    # objects as another published table's and wedge the remote
-                    # queue permanently.
-                    if not rel_path.startswith(
-                        f"{(self._published.uri or '').rstrip('/')}/"
-                    ):
-                        continue
-
-                    checkpoint(sweep.renew)
-                    remote.remove(rel_path)
-                    self._buffer.forget_deletion(rel_path)
-                    continue
-
                 path = self._layout.absolute(rel_path)
                 if str(path) in referenced:
                     # A compaction can re-register a path the queue still holds.
@@ -1467,14 +1456,11 @@ class Maintenance:
                 # Still ours, asked before EVERY deletion rather than once at
                 # the top. The unlink is this pass's commit, and §4a's rule
                 # applies to it like any other: holding a claim is asked again
-                # at the commit. It matters here because everything slow in this
-                # pass sits between the veto being read and the deletions —
-                # opening the published table, walking its manifests, and one
-                # remote round trip per queued object, measured at ~650 ms each.
-                # Past the TTL, a `hydrate` may lawfully take the whole log,
-                # register a file under the very name still queued here, and
-                # release; this would then unlink it against a stale veto and
-                # leave the staging table pointing at a file that is not there.
+                # at the commit. Past the TTL, a `hydrate` may lawfully take the
+                # whole log, register a file under the very name still queued
+                # here, and release; this would then unlink it against a stale
+                # veto and leave the staging table pointing at a file that is
+                # not there.
                 #
                 # Entries left behind cost nothing: they stay due.
                 checkpoint(sweep.renew)
@@ -1486,6 +1472,187 @@ class Maintenance:
 
         finally:
             sweep.release()
+
+    def _drain_published(
+        self, published: LogTable, renew: Callable[[], bool] | None
+    ) -> None:
+        """Delete the published table's queued objects whose grace has passed.
+
+        Under `publish`'s lease, which is the claim this needs: nothing else
+        can register into the published table while it is held.
+        """
+        cutoff = datetime.now(UTC) - self.config.published_snapshot_retention
+        due = [
+            p
+            for p in self._buffer.due_deletions(int(cutoff.timestamp()))
+            if is_remote(p)
+        ]
+        if not due:
+            return
+
+        # Reloaded first, for the reason `drain` gives.
+        published.reload()
+        referenced = published.referenced_paths()
+        # Normalised, because the configured URI may carry a trailing slash
+        # while every queued path is built from it stripped. The mismatch would
+        # classify this log's OWN objects as another published table's and
+        # wedge the queue permanently.
+        ours = f"{(self._published.uri or '').rstrip('/')}/"
+
+        for uri in due:
+            if uri in referenced:
+                continue
+
+            # Only objects belonging to the published table this log is pointed
+            # at. A queued path names the published table it was superseded in,
+            # and the veto above asks the CURRENT one — so after a re-point,
+            # entries left by a rewrite on the old published table would be
+            # checked against a new published table that references nothing and
+            # deleted from the old bucket, where they may still be live and may
+            # be the only copy of rows already evicted from staging.
+            #
+            # Left queued rather than forgotten: they are somebody's to
+            # resolve, and the log that owns that published table is the one
+            # that can say whether they are dead. A stranded queue row is a
+            # bounded cost; deleting live data in a bucket this log no longer
+            # understands is not.
+            if not uri.startswith(ours):
+                continue
+
+            # Before every deletion, for the reason `drain` gives: one remote
+            # round trip each, measured at ~650 ms, adds up past a TTL.
+            checkpoint(renew)
+            with contextlib.suppress(FileNotFoundError):
+                published.remove(uri)
+
+            self._buffer.forget_deletion(uri)
+
+    # -- the stranded-metadata sweep (#113) ---------------------------------
+
+    def _sweep(
+        self,
+        name: str,
+        table: LogTable,
+        retention: timedelta,
+        renew: Callable[[], bool] | None = None,
+    ) -> None:
+        """Delete a batch of `table`'s stranded metadata, listing when due.
+
+        A commit writes its manifests, manifest list and `metadata.json` before
+        it swaps the catalog pointer. One that loses the swap, or crashes
+        before it, leaves them behind under names nothing recorded — pyiceberg,
+        unlike Java Iceberg, does not delete a losing attempt's files. So does
+        every merge before #112. This is the one place the library LISTS a
+        directory, as a backstop for those, and on a healthy table it finds
+        nothing.
+
+        Listed at the first pass after the process starts, then every
+        `SWEEP_INTERVAL`; the list is held in memory and worked down
+        `SWEEP_BATCH` files a pass, so a backlog never stalls one (S3 deletes
+        one object per round trip). Nothing is stored: a restart lists again,
+        and finds what is left.
+
+        **No claim, because a dead metadata file cannot come back to life.**
+        Every name carries a fresh UUID and is never reused, a snapshot only
+        inherits manifests from the current one, and a `metadata.json` only
+        builds on the current one. What the listing finds unreferenced and old
+        stays dead whatever runs beside this.
+
+        Never raises. It is housekeeping, and a pass that fails here has
+        already done the work it exists for; the failure is logged and the
+        next pass lists afresh.
+        """
+        # Per table, not per role: after `set_published` a backlog listed on
+        # the old published table must not be worked through the new one.
+        state = self._sweeps.setdefault(
+            f"{name}:{table.metadata_location.rpartition('/')[0]}", _SweepState()
+        )
+        try:
+            if not state.pending and time.monotonic() >= state.next_listing:
+                state.next_listing = time.monotonic() + SWEEP_INTERVAL.total_seconds()
+                state.pending = self._stranded(table, max(retention, SWEEP_MIN_AGE))
+                if state.pending:
+                    _log.info(
+                        "litelink: %d stranded metadata file(s) to delete from the %s table",
+                        len(state.pending),
+                        name,
+                    )
+
+            batch = state.pending[:SWEEP_BATCH]
+            for path in batch:
+                checkpoint(renew)
+                with contextlib.suppress(FileNotFoundError):
+                    table.remove(path)
+
+                state.pending.remove(path)
+                state.deleted += 1
+
+            if batch and not state.pending:
+                _log.info(
+                    "litelink: deleted %d stranded metadata file(s) from the %s table",
+                    state.deleted,
+                    name,
+                )
+                state.deleted = 0
+        except Exception:
+            _log.warning(
+                "litelink: sweeping stranded metadata from the %s table failed; "
+                "it is retried on the next pass",
+                name,
+                exc_info=True,
+            )
+            # Listed afresh next pass. Anything deleted before the failure is
+            # not listed again, and anything not is.
+            state.pending = []
+            state.next_listing = 0.0
+
+    def _stranded(self, table: LogTable, min_age: timedelta) -> list[str]:
+        """The metadata files in `table`'s directory nothing will ever read.
+
+        Unreferenced by every live snapshot, not a `metadata.json` the table
+        still names, not already queued (`drain` owns those, with their grace),
+        and older than `min_age`.
+
+        The order is what makes it safe. The directory is listed FIRST and
+        what is live read AFTER, so a commit landing in between counts as
+        live. The age rule covers a commit still in flight, whose files exist
+        before the swap that makes them referenced, and the manifests of a
+        snapshot expired a moment ago that a reader may still hold.
+        """
+        # Refuse on any sign the listing names files differently from the
+        # table. The current `metadata.json` and manifest list are certainly
+        # live and certainly on disk; if the listing does not contain them in
+        # the form `live` uses, every comparison below is meaningless and the
+        # sweep would delete the table out from under itself.
+        #
+        # Taken BEFORE the listing, so a commit landing during it cannot look
+        # like a mismatch: what was current a moment before the listing is
+        # still on disk when it runs (the previous `metadata.json` versions
+        # are kept, and a manifest list outlives its snapshot by a retention).
+        table.reload()
+        anchors = table.anchors()
+        listed = table.metadata_files()
+        table.reload()
+        live = table.referenced_paths() | table.live_metadata()
+
+        if not anchors <= {path for path, _ in listed}:
+            if listed:
+                _log.warning(
+                    "litelink: not sweeping %s: its listing does not name the "
+                    "table's current metadata as the table does",
+                    table.metadata_location,
+                )
+
+            return []
+
+        queued = set(self._buffer.queued_deletions())
+        cutoff = datetime.now(UTC) - min_age
+
+        return [
+            path
+            for path, written in listed
+            if written < cutoff and path not in live and self._key(path) not in queued
+        ]
 
     def _key(self, path: str) -> str:
         """How a file is named in SQLite, whichever tier it is in.

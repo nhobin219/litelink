@@ -3519,11 +3519,17 @@ class WriteHandle(LocalReadHandle):
         compacts before pushing to keep the count to what a run genuinely cannot
         fill.
 
-        DEVIATES from §5, which also lists snapshot expiry (step 4) and local
-        eviction (step 5). Both are local storage work and belong to
-        `maintain`, which runs whether or not a publish pass has. Publish's
-        remaining obligation to eviction is the registration watermark it
-        records in `meta`, which is what lets `maintain` enforce I4.
+        **Then the published table's housekeeping**: expire its snapshots older
+        than `published_snapshot_retention`, delete the objects that frees once
+        their grace has passed, and sweep stranded metadata (#113). Published-
+        facing, so here and not in `maintain`, which must keep a partitioned
+        machine's local storage in order without the network (§11).
+
+        DEVIATES from §5, which also lists local eviction (step 5). That is
+        local storage work and belongs to `maintain`, which runs whether or not
+        a publish pass has. Publish's remaining obligation to eviction is the
+        registration watermark it records in `meta`, which is what lets
+        `maintain` enforce I4.
         """
         # Re-read where the published table IS before pushing to it.
         # `set_published` is a durable change made by whichever process runs
@@ -3558,6 +3564,11 @@ class WriteHandle(LocalReadHandle):
             # and the watermark this push earned is recorded against a published
             # table that never received it.
             self._push(lease, self._published.uri, push_unsettled=push_unsettled)
+            # The published table's own housekeeping, after the push and under
+            # the same lease: expire its snapshots, delete what has come due,
+            # sweep stranded metadata (#113). Here rather than in `maintain`,
+            # which must keep working with no network (§11).
+            self._maintenance.tidy_published(lease)
         finally:
             lease.release()
 
@@ -4083,8 +4094,9 @@ class WriteHandle(LocalReadHandle):
         self._pass(lambda _: self._maintenance.evict(), heartbeat)
 
     def expire(self, heartbeat: Callable[[], bool] | None = None) -> None:
-        """Expire snapshots past `snapshot_retention`, then delete what has
-        come due (§6, §8)."""
+        """Expire staging snapshots past `staging_snapshot_retention`, delete
+        what has come due, and sweep stranded metadata (§6, §8). The published
+        table's are `publish`'s (#113)."""
         self._pass(lambda _: self._maintenance.expire(), heartbeat)
 
     def _pass(
@@ -4476,15 +4488,17 @@ def validate(
         msg = f"sort_by cannot name a struct, map or list column: {nested}"
         raise ValueError(msg)
 
-    if config.snapshot_retention < timedelta(0):
-        # The same sign slip, one field over. Expiry computes
-        # `now - snapshot_retention`, so a negative one puts the cutoff in the
-        # future: every superseded file is unlinked in the pass that supersedes
-        # it, and I6's whole promise — the grace must exceed the longest scan —
-        # is not merely shortened but inverted. Zero is allowed deliberately;
-        # it means "no grace", which tests and demos ask for on purpose.
-        msg = f"snapshot_retention must not be negative: {config.snapshot_retention}"
-        raise ValueError(msg)
+    for name in ("staging_snapshot_retention", "published_snapshot_retention"):
+        # The same sign slip, one field over. Expiry computes `now - retention`,
+        # so a negative one puts the cutoff in the future: every superseded
+        # file is unlinked in the pass that supersedes it, and I6's whole
+        # promise — the grace must exceed the longest scan — is not merely
+        # shortened but inverted. Zero is allowed deliberately; it means "no
+        # grace", which tests and demos ask for on purpose.
+        retention = getattr(config, name)
+        if retention < timedelta(0):
+            msg = f"{name} must not be negative: {retention}"
+            raise ValueError(msg)
 
     if config.staging_retention is not None and config.staging_retention < timedelta(0):
         # The same check its twin above has always had, and the reason it

@@ -133,8 +133,8 @@ streams.
   §4 step 2   NO _lock  ← all the cost      │
     rows_between(start,end) on 2nd conn      └─ expire() → drain()
     sort → write Parquet → fsync                 snapshots past
-    commit to Iceberg ────────────────┐          snapshot_retention, then
-                                      │          unlink files whose grace
+    commit to Iceberg ────────────────┐          staging_snapshot_retention,
+                                      │          then unlink files whose grace
   §4 step 3   with _lock:             │          has passed, in the SAME
     DELETE rows < end IF discarding   │          txn that clears the queue
     NAME the extent's row             │
@@ -160,13 +160,16 @@ Two different things get called "eviction". They happen in different roles:
   briefly, so a concurrent append waits for it — but it is a delete by primary key, not
   work proportional to the seal.
 - **Parquet files** are removed from the table by the **maintainer** under
-  `staging_retention`, and *unlinked* only later by `drain()`, once `snapshot_retention`
-  has passed.
+  `staging_retention`, and *unlinked* only later by `drain()`, once
+  `staging_snapshot_retention` has passed. The published table's are expired and drained by
+  `publish`, against `published_snapshot_retention`.
 
 A file's path is written to SQLite **before** the file is created (`sealing`,
 `compacting`) and again before it is deleted (`pending_delete`). So no file can exist on
 disk that this database cannot name, and reclaiming disk is a keyed read rather than a
-directory walk. That matters most where a walk is a paginated, billable LIST.
+directory walk. That matters most where a walk is a paginated, billable LIST. The one listing
+is the stranded-metadata sweep (SPEC §6), a backstop for the files a commit that lost its
+pointer swap, or crashed before it, leaves behind.
 
 ---
 
@@ -355,7 +358,7 @@ left the table, because that one is about readers still holding it (I6).
 moment. Files are queued before the commit that supersedes them, since a crash in between
 would lose the only record of their paths, so every supersession corrects the stamp
 afterwards — a merge, a published rewrite, an eviction and both expiries. Left at the
-queueing, an operation slower than `snapshot_retention` spends the whole grace before it
+queueing, an operation slower than its table's snapshot retention spends the whole grace before it
 commits and the files fall due the instant they stop being referenced: measured at a five
 second retention, a reader 0.4 s old lost every file its snapshot named and failed
 mid-scan.

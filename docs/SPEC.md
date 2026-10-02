@@ -1021,6 +1021,9 @@ Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
    has finished with (`stable_prefix`), or every one with push_unsettled.
 2. published.add_files([...published paths...])  -- register, ONE commit; no data movement
 3. Record each file's published copy in `extent`, and the watermark in `meta`.
+4. Housekeeping on the published table: expire its snapshots older than
+   published_snapshot_retention, delete what that frees once due, and sweep stranded
+   metadata (§6).
 ```
 
 **Compactions are never replicated.** A file is pushed only once compaction is done with it,
@@ -1031,9 +1034,17 @@ never need the same overwrite applied twice. Re-cutting what is already publishe
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).
 
-**Expiry and eviction are not publishing work.** They are local storage work, owned by
-`maintain()` (§12), because a log may go a long time between publishes. Eviction reads what
-step 3 records to enforce I4: **a file is never evicted locally before step 2 has registered
+**Step 4 is publishing work because it needs the published table.** `maintain()` keeps a
+partitioned machine's local storage in order without the network (§11), so it never opens the
+published table; `publish` already has, under the lease it holds. Every publish leaves a
+snapshot behind, so it is also exactly when there is something to expire. Until #113 the
+published table was expired only after `rewrite_published`, on the reasoning that `publish`
+never supersedes a file. True of data files and not of Iceberg's own: a table that was only
+ever published kept every snapshot, manifest list and manifest it had ever had.
+
+**The staging table's expiry and eviction are not publishing work.** They are local storage
+work, owned by `maintain()` (§12), because a log may go a long time between publishes.
+Eviction reads what step 3 records to enforce I4: **a file is never evicted locally before step 2 has registered
 it** — the one ordering in publishing that is correctness, not optimisation.
 
 ---
@@ -1093,7 +1104,11 @@ Step 4 is atomic — Iceberg swaps the snapshot pointer — so readers never obs
 double count. No grace window is needed for *correctness*.
 
 Snapshot expiry still needs one: expiring the pre-compaction snapshot deletes files a
-long-running scan may still hold open. Retain snapshots for at least `snapshot_retention`.
+long-running scan may still hold open. Each table retains snapshots for its own setting:
+`staging_snapshot_retention` (default 15 minutes) for this log's own scans, and
+`published_snapshot_retention` (default 1 hour) for readers on other machines, holding a
+metadata pointer this process cannot see. Both are bounded. A log's offsets are its
+point-in-time reads, so no snapshot is kept for time travel.
 
 **Expiry does not delete the files, and the library must.** Verified against pyiceberg
 0.11.1: `maintenance.expire_snapshots()` drops the snapshot metadata and nothing else — after
@@ -1106,6 +1121,20 @@ file is unreferenced and swept"* invites a sweep, and a sweep is the wrong mecha
 orphans by listing directories costs a walk proportional to everything retained, and becomes a
 paginated LIST against object storage — priced per request, and eventually consistent, so it
 can report a file that no longer exists or miss one that does.
+
+**One sweep exists anyway, as a backstop for files no commit recorded.** An Iceberg commit
+writes its manifests, manifest list and `metadata.json`, then swaps the catalog pointer. One
+that loses the swap, or crashes before it, leaves those files under names nothing recorded;
+pyiceberg, unlike Java Iceberg, does not delete a losing attempt's files. So `maintain` (for
+the staging table) and `publish` (for the published one) list `metadata/` at their first pass
+in a process and every four hours after, and delete what is unreferenced, not a
+`metadata.json` the table still names, not queued, and older than the table's retention (an
+hour at least, so a commit in flight keeps its files). The listing comes first and the live
+set is read after it, so a commit landing between them counts as live; and the sweep refuses
+outright unless the listing names the current metadata exactly as the table does. It needs no
+claim, because a metadata file's name carries a fresh UUID and nothing ever references a dead
+one again. On a healthy table it finds nothing; it deletes at most 500 files a pass, and
+never raises into the pass that runs it.
 
 The alternative is to make orphans impossible rather than discoverable. Every data file the
 library creates has its path written to SQLite *before* it is written to disk:
@@ -1123,12 +1152,13 @@ single snapshot; only the first leaves the process knowing the filename in advan
 A file is then always in exactly one of four states — referenced by a live snapshot, claimed
 by an in-flight seal, claimed by an in-flight compaction, or queued for deletion — and each is
 a keyed read. Reclaiming space is draining `pending_delete` for rows superseded longer ago
-than `snapshot_retention`, checking each against the live references, unlinking, and only then
+than their table's snapshot retention — staging rows by `maintain`, the published table's by
+`publish` — checking each against the live references, unlinking, and only then
 forgetting the row: a crash between the unlink and the forget retries a no-op, whereas the
 reverse order loses the path with the file still on disk.
 
-Store when a file was superseded, not a precomputed deadline. The grace period is
-`snapshot_retention`, and freezing it at enqueue time means a lowered setting never applies to
+Store when a file was superseded, not a precomputed deadline. The grace period is the owning
+table's snapshot retention, and freezing it at enqueue time means a lowered setting never applies to
 anything already queued.
 
 **Compaction is local, which is what makes it affordable.** An object-store-native design
@@ -1472,7 +1502,8 @@ knowledge of the staging tier.
 | knob | governs | too low means |
 |---|---|---|
 | `staging_retention` | how much history the staging table keeps | hot reads reach the published table |
-| `snapshot_retention` | how long expired snapshots survive | long scans hit deleted files |
+| `staging_snapshot_retention` | how long the staging table's expired snapshots survive | long local scans hit deleted files |
+| `published_snapshot_retention` | how long the published table's expired snapshots survive | remote readers hit deleted files |
 
 `staging_retention` must exceed the longest hot-path lookback **with margin** — equal leaves
 nothing for seal delay.
@@ -1579,7 +1610,7 @@ Each needs a test.
 | **I3** | Tier boundaries are derived from each neighbour's committed offset extent at read time, never from stored flags or an assumption of disjointness. | The published table overlaps the staging window by design. A flag would have to be updated in a different transaction from the Iceberg commit, reintroducing a double-count or drop window. |
 | **I4** | A file is never evicted from the staging table while the published table still lacks it. Every log has one (#98): on S3, or a local directory. | Eviction before registration is data loss. It used to be vacuous for a log with no published table, which made `staging_retention` a deletion policy over the only copy — and made detaching a published table a silent conversion into one (§8). |
 | **I5** | Reads served from within `staging_retention` never touch the network or require publish to have run. | The central claim. A read that quietly needs the network reintroduces every problem this shape removes. Conditional because `staging_retention = 0` is a valid archival configuration (§8) in which the staging window is empty by choice. |
-| **I6** | Snapshot expiry retains at least `snapshot_retention`, exceeding the longest scan. | Expiry deletes data files an open scan is still reading. |
+| **I6** | Snapshot expiry retains each table's snapshots for at least its snapshot retention, exceeding the longest scan of that table. | Expiry deletes data files an open scan is still reading. |
 | **I7** | *Retired with schema changes (#93).* Schema changes reached the published table before the staging table. | Logs are immutable (§9), so there is no schema change to order. |
 | **I11** | `litelink_offset` is assigned by the library and never accepted from the caller. | Monotonicity and non-reuse are the boundary mechanism; an application-supplied value cannot be enforced. |
 | **I17** | An append names only columns the log declares, supplies a value for every non-nullable one, and gives each a value of its declared type, or it is refused. | The insert is built from the SCHEMA's columns, so an unknown key is dropped before any SQL exists and neither SQLite nor pyarrow ever sees it — `append` would return an offset for a row it had truncated. The omission is the same wedge from the other side: a non-nullable column the row leaves out, or supplies as `None`, is stored as NULL, and then **every** scan raises `Casting field … with null values to non-nullable` — including scans of rows written before it — while `append` keeps handing back offsets. Writer sees a healthy log, readers see nothing. A row misspelling a declared column trips both halves at once: it names something undeclared and shadows the real column with NULL. The type clause closes the same two outcomes reached through a value rather than a name: SQLite has affinities, not types, so it stores whatever it is given and the declared schema is not consulted again until the read. A value Arrow cannot parse (`"x"` into an int64) wedges every scan; one it can parse but not preserve (`1.5` into an int64, `12345` into a string, `True` into an int64) is silently rewritten, so what is read back is not what was appended and nothing raises at all. Magnitude is checked with it: `2**40` IS an int and `1e300` IS a float, and they fail the same two ways — the int32 wedges every scan, the float32 reads back as `inf`. **Enforced by the buffer's DDL, not by Python.** Every column is declared `ANY` with a `typeof` CHECK, and that is the whole design: a STRICT column of a declared type does not refuse a wrong value, it CONVERTS one. An INTEGER column given `'77'` stores 77 and `'007'` stores 7; a REAL column given `'1e999'` stores `inf`; a TEXT column given `12345` stores `'12345'`. The conversion happens before any CHECK could see it, so a constraint on a typed column would be asked about a value that had already been changed. `ANY` stores the value exactly as given, which is what lets `typeof` tell the truth about it; STRICT is still declared, because it is what makes `ANY` mean "no conversion". `NOT NULL` carries the nullability half — absent and explicitly-None reach SQLite identically — and the range tests ride in the same CHECK. An integer is a legal value for a FLOAT column — `{"price": 5}` is too natural to refuse — but only within the range where every integer converts exactly (2**53 for float64, 2**24 for float32). Past it the value stays an integer in the buffer, since `ANY` performs no conversion, and Arrow then cannot build the column at all: one such value makes every scan and every seal raise for ever while appends keep succeeding. The bound is a range rather than a per-value test because a SQL CHECK cannot ask whether one particular integer is representable, so some that would convert exactly are refused too. Python is left with the one question SQLite cannot be asked, an unknown column: the insert names the schema's columns, so a key the log does not have is dropped before any SQL exists. One leniency is deliberate — `True` into an integer column stores 1, because the driver converts it before SQLite sees it, and it is lossless. A `fixed_size_binary(n)` column adds `length() = n` to its CHECK. **A float must be finite** (#87): the CHECK refuses ±inf, and NaN — which SQLite stores as NULL before any CHECK sees it — is refused in Python, as are non-finite values in a nested column and in `ingest`'s Arrow. NaN because readers disagree about it: Iceberg's file bounds and Parquet's row-group statistics leave it out, so whether DuckDB returns a stored NaN depends on what else shares its file. ±inf because the layer above speaks JSON, which has no infinity. **Nested columns are the one place Python enforces I17.** A `struct`, `map` or `list` value is stored as JSON text, which no CHECK can see into, and Arrow is no check either: it drops a struct key the type does not declare, silently, and accepts `None` for a non-nullable child. So `Nested` walks the declared type before the insert and refuses the same classes — wrong type, out of range, inexact integer into a float, unknown struct field, null where the field is not nullable — naming the path to the value. |
@@ -1645,7 +1676,8 @@ target_seal_size       Arrow bytes per SEAL               (size it for READ late
                                                           whatever compression achieved)
 staging_retention      staging window, by TIME            (> longest hot lookback, with margin; 0 = evict on publish)
 staging_rows           staging window, by ROWS            (floor: keep at least this many recent rows)
-snapshot_retention     snapshot expiry floor              (> longest scan)
+staging_snapshot_retention    staging snapshot expiry floor    (> longest local scan; default 15 min)
+published_snapshot_retention  published snapshot expiry floor  (> longest remote scan; default 1 hour)
 compact_min_files      minimum adjacent files to compact  (default 4; below 2 is refused —
                                                           every run would look mergeable)
 wal_replication        ship the WAL with a sidecar        (needs an s3:// published table; also decides
@@ -1663,11 +1695,11 @@ publish: eviction takes only what `publish` has already put in the published tab
 a no-op or a regression without the others: compaction alone increases
 storage, since superseded files stay referenced until their snapshots expire; eviction alone
 frees no disk, since it removes a file from the current snapshot while the previous one still
-references it; and expiry is what actually deletes bytes, held back by `snapshot_retention`
-so a running scan does not lose files underneath it (I6).
+references it; and expiry is what actually deletes bytes, held back by
+`staging_snapshot_retention` so a running scan does not lose files underneath it (I6).
 
 The consequence worth planning for is that local disk holds roughly
-`staging_retention + snapshot_retention` of data, not `staging_retention`.
+`staging_retention + staging_snapshot_retention` of data, not `staging_retention`.
 
 ---
 
@@ -2228,7 +2260,7 @@ The consequence worth planning for is that local disk holds roughly
    ```
 
    **The larger factor is snapshot accumulation, and expiry arrests it** — which `maintain()`
-   already does, bounded by `snapshot_retention`. An earlier version of this entry blamed file
+   already does, bounded by `staging_snapshot_retention`. An earlier version of this entry blamed file
    count alone, measured with `maintain()` never running so that every snapshot survived. That
    made the growth look both steeper and less fixable than it is.
 

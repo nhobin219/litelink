@@ -264,9 +264,19 @@ class LogConfig:
     #
     # None leaves litestream on its own defaults (24h/24h as of v0.5.16).
     wal_retention: timedelta | None = None
-    # §6/§8. Must exceed the longest scan: expiry deletes files an open scan is
-    # still reading (I6).
-    snapshot_retention: timedelta = timedelta(hours=1)
+    # §6/§8. How long a superseded snapshot, and the files only it referenced,
+    # survive. One per table, because their readers differ (#113).
+    #
+    # Each must exceed the longest scan of its table: expiry deletes files an
+    # open scan is still reading (I6). Nothing else rests on them. A log's
+    # offsets are its point-in-time reads, so an Iceberg snapshot is never
+    # kept for time travel, and both are bounded.
+    #
+    # The published table's is longer because its readers are other machines
+    # and other engines, holding a metadata pointer this process cannot see.
+    # The staging table's readers are this log's own scans.
+    staging_snapshot_retention: timedelta = timedelta(minutes=15)
+    published_snapshot_retention: timedelta = timedelta(hours=1)
 
     # §6. What counts as "big enough to leave alone" is `settled_size` of the
     # target, not its own setting — see `_maintenance.settled_size`.
@@ -325,7 +335,12 @@ class LogConfig:
                     if self.wal_retention is None
                     else self.wal_retention.total_seconds()
                 ),
-                "snapshot_retention": self.snapshot_retention.total_seconds(),
+                "staging_snapshot_retention": (
+                    self.staging_snapshot_retention.total_seconds()
+                ),
+                "published_snapshot_retention": (
+                    self.published_snapshot_retention.total_seconds()
+                ),
                 "compact_min_files": self.compact_min_files,
                 "compression": self.compression,
             }
@@ -354,7 +369,12 @@ class LogConfig:
             "staging_retention", raw.get("local_retention", defaults.staging_retention)
         )
         wal = raw.get("wal_retention", defaults.wal_retention)
-        snapshots = raw.get("snapshot_retention")
+        # A config written before #113 held one `snapshot_retention` for both
+        # tables. It fills both, so a value raised for long scans keeps
+        # protecting them on the published table as well.
+        legacy = raw.get("snapshot_retention")
+        staging_snapshots = raw.get("staging_snapshot_retention", legacy)
+        published_snapshots = raw.get("published_snapshot_retention", legacy)
 
         return cls(
             target_seal_size=raw.get("target_seal_size", defaults.target_seal_size),
@@ -380,10 +400,15 @@ class LogConfig:
                 if isinstance(wal, timedelta) or wal is None
                 else timedelta(seconds=wal)
             ),
-            snapshot_retention=(
-                defaults.snapshot_retention
-                if snapshots is None
-                else timedelta(seconds=snapshots)
+            staging_snapshot_retention=(
+                defaults.staging_snapshot_retention
+                if staging_snapshots is None
+                else timedelta(seconds=staging_snapshots)
+            ),
+            published_snapshot_retention=(
+                defaults.published_snapshot_retention
+                if published_snapshots is None
+                else timedelta(seconds=published_snapshots)
             ),
             compact_min_files=raw.get("compact_min_files", defaults.compact_min_files),
             compression=raw.get("compression", defaults.compression),

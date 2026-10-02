@@ -30,7 +30,8 @@ def local_log(root: Path, *, at: str | None = None, **overrides: object) -> Writ
         "target_seal_size": 64 * 1024,
         "target_compact_size": 64 * 1024,
         "compact_min_files": 2,
-        "snapshot_retention": timedelta(seconds=0),
+        "staging_snapshot_retention": timedelta(seconds=0),
+        "published_snapshot_retention": timedelta(seconds=0),
     }
     settings.update(overrides)
     config = LogConfig(**settings)  # ty: ignore[invalid-argument-type]
@@ -171,7 +172,8 @@ def test_rewrite_published_works_on_a_local_published_table(tmp_path: Path) -> N
         assert all(key.startswith("file:///") for key in superseded)
 
         time.sleep(1.1)
-        log.maintain()
+        # `publish`, which drains the published table's queue (#113).
+        log.publish()
         assert offsets(log) == expected
         assert not any(
             Path(key.removeprefix("file://")).exists() for key in superseded
@@ -445,3 +447,36 @@ def test_a_log_with_the_old_names_opens_and_moves_to_the_new_ones(
     assert names["files"] >= {"archive.db"}, "the catalog file is kept"
     assert "published.db" not in names["files"]
     assert names["catalogs"] == {"catalog.db:local", "archive.db:archive"}
+
+
+def test_publish_sweeps_a_local_published_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default published table is on local disk and named by `file://`
+    URIs, which the sweep's listing must produce too (#113).
+
+    Falsify by listing local files as plain paths: the anchor check refuses
+    every listing, and the stranded manifest survives.
+    """
+    import uuid
+
+    import litelink._maintenance as maintenance
+
+    monkeypatch.setattr(maintenance, "SWEEP_MIN_AGE", timedelta(0))
+    monkeypatch.setattr(maintenance, "SWEEP_INTERVAL", timedelta(0))
+    with local_log(tmp_path) as log:
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.publish()
+
+        table = log._published.require()  # noqa: SLF001
+        directory = Path(table.metadata_location.removeprefix("file://")).parent
+        stranded = directory / f"{uuid.uuid4()}-m0.avro"
+        stranded.write_bytes(b"stranded")
+
+        log.extend(rows(ROWS))
+        log.seal_due()
+        log.publish()
+
+        assert not stranded.exists()
+        assert log.scan().read_all().num_rows == 2 * ROWS

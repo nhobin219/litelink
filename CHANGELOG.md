@@ -9,13 +9,42 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+### Changed
+
+- **Breaking: `LogConfig.snapshot_retention` is split in two** (#113).
+  `staging_snapshot_retention` (default **15 minutes**, was 1 hour) and
+  `published_snapshot_retention` (default 1 hour). Pass the new names; a stored
+  config written by an older version fills both from its `snapshot_retention`.
+  A scan of the staging table running longer than 15 minutes now needs the
+  staging setting raised.
+- **`publish()` now expires the published table** (#113). Each publish expires
+  published snapshots older than `published_snapshot_retention` and deletes the
+  objects that frees once due. Previously the published table was expired only
+  after `rewrite_published`, so one that was only ever published kept every
+  snapshot, manifest list and manifest. `maintain()` no longer touches the
+  published table, so it never needs the network; a `rewrite_published`'s
+  superseded objects are now deleted by a later `publish()`.
+
+### Added
+
+- **A sweep for stranded Iceberg metadata** (#113). A commit that loses its
+  pointer swap, or crashes before it, leaves its manifests, manifest list and
+  `metadata.json` behind, and pyiceberg does not delete them. `maintain()` (for
+  the staging table) and `publish()` (for the published one) list `metadata/`
+  at their first pass in a process and every four hours after, and delete
+  files that nothing references and that are older than an hour and the
+  table's retention, at most 500 a pass. This also clears the manifests
+  orphaned before #112. A sweep failure is logged, never raised.
+
 ### Fixed
 
+- **An expiry with nothing to expire no longer commits.** pyiceberg would
+  write a new `metadata.json` and swap the catalog pointer on every pass.
 - **Expiry now deletes the manifests a commit merges away** (#111). With
   manifest merging on, each seal wrote an `-m0` manifest and folded it into
   the `-m1` its snapshot lists, so no snapshot ever named the `-m0` and
   nothing deleted it. Metadata grew by one file per seal. Files already
-  orphaned this way are not reclaimed.
+  orphaned this way are reclaimed by the sweep above.
 
 ## 0.6.1 — 2026-10-01
 

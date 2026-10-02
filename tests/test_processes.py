@@ -97,7 +97,8 @@ WRITER = """
         target_seal_size=TARGET,
         compact_min_files=2,
         staging_retention=timedelta(seconds=0),
-        snapshot_retention=timedelta(seconds=0),
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
     )
     log = litelink.new(ROOT, "s", schema=SCHEMA, sort_by=("event_ts",),
                   config=config, published=PUBLISHED, s3=S3)

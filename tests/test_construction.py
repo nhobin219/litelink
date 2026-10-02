@@ -445,7 +445,25 @@ def test_a_config_written_without_a_setting_still_opens() -> None:
     assert recovered.target_seal_size == 4096
     assert recovered.compact_min_files == 2
     assert recovered.staging_rows == LogConfig().staging_rows
-    assert recovered.snapshot_retention == LogConfig().snapshot_retention
+    assert recovered.staging_snapshot_retention == timedelta(minutes=15)
+    assert recovered.published_snapshot_retention == timedelta(hours=1)
+
+
+def test_a_config_from_before_the_split_retention_fills_both() -> None:
+    """A record written before #113 holds one `snapshot_retention`, which then
+    governed both tables. It fills both new settings, so a value raised for long
+    scans keeps protecting the published table too.
+
+    Falsify by reading the legacy key into staging alone: the published
+    retention comes back as the 1 hour default.
+    """
+    written = json.dumps({"snapshot_retention": 86_400.0})
+
+    recovered = LogConfig.from_json(written)
+
+    assert recovered.staging_snapshot_retention == timedelta(days=1)
+    assert recovered.published_snapshot_retention == timedelta(days=1)
+    assert LogConfig.from_json(recovered.to_json()) == recovered
 
 
 def test_a_config_written_by_a_newer_version_still_opens() -> None:
@@ -873,22 +891,25 @@ def test_the_refused_pair_cannot_be_assembled_by_interleaving(tmp_path: Path) ->
             held.release()
 
 
-def test_negative_snapshot_retention_is_refused(tmp_path: Path) -> None:
-    """The same sign slip, one field over.
+@pytest.mark.parametrize(
+    "name", ["staging_snapshot_retention", "published_snapshot_retention"]
+)
+def test_negative_snapshot_retention_is_refused(tmp_path: Path, name: str) -> None:
+    """The same sign slip, one field over, for either table.
 
-    Expiry computes `now - snapshot_retention`, so a negative one puts the
-    cutoff in the future: every superseded file is unlinked in the pass that
-    supersedes it, and I6's promise — the grace must exceed the longest scan —
-    is not shortened but inverted. Zero stays legal; it means "no grace", which
-    tests and demos ask for on purpose.
+    Expiry computes `now - retention`, so a negative one puts the cutoff in the
+    future: every superseded file is unlinked in the pass that supersedes it,
+    and I6's promise — the grace must exceed the longest scan — is not
+    shortened but inverted. Zero stays legal; it means "no grace", which tests
+    and demos ask for on purpose.
     """
-    with pytest.raises(ValueError, match="snapshot_retention must not be negative"):
+    with pytest.raises(ValueError, match=f"{name} must not be negative"):
         litelink.new(
             tmp_path,
             "s",
             schema=SCHEMA,
             sort_by=("event_ts",),
-            config=LogConfig(snapshot_retention=timedelta(hours=-1)),
+            config=replace(LogConfig(), **{name: timedelta(hours=-1)}),
         )
 
     litelink.new(
@@ -896,7 +917,7 @@ def test_negative_snapshot_retention_is_refused(tmp_path: Path) -> None:
         "zero",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        config=LogConfig(snapshot_retention=timedelta(0)),
+        config=replace(LogConfig(), **{name: timedelta(0)}),
     ).close()
 
 

@@ -516,6 +516,12 @@ which is how a long compaction yields to something more important.
 Each is a no-op or a regression without the others: compaction alone increases storage,
 eviction alone frees no disk, and expiry is what actually deletes bytes.
 
+All of it is the **staging** table's, and none of it needs the network. Expiry keeps the
+staging table's snapshots for `staging_snapshot_retention`, and its first pass in a process
+(then every four hours) also sweeps `metadata/` for files a lost or crashed commit left behind
+(SPEC §6). The published table's expiry, draining and sweep are `publish()`'s, against
+`published_snapshot_retention`.
+
 ## Published table
 
 ```python
@@ -740,7 +746,8 @@ target_compact_size   int | None      = None     uncompressed (Arrow) bytes per 
 target_compact_rows   int | None      = None     rows per compacted file (None = 8x)
 staging_retention     timedelta|None  = None     staging window by TIME (None keeps everything)
 staging_rows          int | None      = None     staging window by ROWS — a floor, not a ceiling
-snapshot_retention    timedelta       = 1 hour   how long expired snapshots survive
+staging_snapshot_retention    timedelta = 15 min   how long the staging table's expired snapshots survive
+published_snapshot_retention  timedelta = 1 hour   how long the published table's expired snapshots survive
 compact_min_files     int             = 4        minimum adjacent files to merge
 wal_replication       bool            = False    needs an s3:// published table; also makes a seal KEEP its rows
 wal_retention         timedelta|None  = None     how far back a restore may go
