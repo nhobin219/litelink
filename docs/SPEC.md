@@ -702,19 +702,14 @@ which is the worst version of this rather than an excused one.
 
 **And `drain` claims, because the unlink is not metadata.** Expiry is safe claimless — a
 metadata commit CAS orders, idempotent — and the deletion that follows it inherited that
-reasoning without earning it. Consulting the table without declaring anything leaves the
-window everything else here was built to close: `hydrate` re-registers a file under the very
-name the queue still holds, deliberately reusing the published key, and can commit that
-between the veto being read and the file being unlinked. The staging table then references a
-file that is not there, and every scan over that range raises until eviction ages the entry
-out. And it renews before EVERY deletion, not once at the top: the unlink is this pass's
-commit, everything slow in a drain sits between the veto being read and the deletions —
-opening the published table, walking its manifests, one remote round trip per queued object — and a
-claim held for the first of those is not a claim held for the last. `hydrate` renews after
-its fetch for the same reason and against the same partner: a whole file downloaded per
-iteration, and the name it is restoring is one the deletion queue still holds — drain's own
-per-deletion renewal cannot help there, because drain is then the legitimate holder and
-hydrate the lapsed one.
+reasoning without earning it. The window it was written for was `hydrate` re-registering a
+file under the very name the queue still holds, between the veto being read and the file being
+unlinked; `hydrate` is gone (#118), and whether anything else can re-register a queued name —
+and so whether the claim can go — is the second half of #118. Until then it stays, and it
+renews before EVERY deletion, not once at the top: the unlink is this pass's commit,
+everything slow in a drain sits between the veto being read and the deletions — opening the
+published table, walking its manifests, one remote round trip per queued object — and a claim
+held for the first of those is not a claim held for the last.
 
 **And everything a pass reads to decide a deletion is read under its claim, not before it.**
 `publish` learned this for itself and eviction did not, though it acts on the same facts: it
@@ -1446,8 +1441,7 @@ the engine.
 widens it by the rows it moves, from their local manifest statistics, before its commit — so a
 read resolving the new, higher floor finds the row already covering what went below it. `publish`
 adds only copies of rows the staging table still holds and `rewrite_published` re-cuts rows the
-published table has, so neither touches it; hydrate lowers the floor and leaves it overstating, which
-is safe. The one write that narrows is an exact rollup from the published table's manifests, run only
+published table has, so neither touches it. The one write that narrows is an exact rollup from the published table's manifests, run only
 under the whole-log maintenance claim, which eviction cannot hold beside: at the first `publish`,
 on a re-point (which drops the row first), at `restore`, and at `open` for a log written before
 the row existed. With no row, the published table is read.
@@ -1529,9 +1523,9 @@ default rather than detaching, and `staging_retention = 0` means "evict on publi
 log. The cost moves to the published table: a local one keeps everything until truncation by offset
 or age lands, which is a follow-up.
 
-Raising it is an operation, not a config change: `hydrate(since=…)` fetches published files
-and re-registers them into the staging table. Without it, a raised setting applies only to
-data captured afterwards.
+Raising it applies to data captured afterwards. Reading older data often is the reader's
+disk cache's job (#118), not the staging table's: it keeps what is read from the published
+table, across restarts, without writing to either table.
 
 Buffer rows are deleted by `evict("buffer")` once the next durable copy holds them — staging,
 or the published table with `wal_replication` (§3a). There is no SQLite retention knob.

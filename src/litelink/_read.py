@@ -8,7 +8,10 @@ its planning happens in Python and costs ~100 ms per scan, paid on every query.
 from __future__ import annotations
 
 import contextlib
+import os
+import shutil
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,6 +36,7 @@ from litelink.manifest import Term, build, prune
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from os import PathLike
 
     from litelink._buffer import Buffer
     from litelink._layout import Layout
@@ -200,6 +204,7 @@ def load_extension(
         connection.execute(f"LOAD {name}")
     except duckdb.IOException as exc:
         flag = " --remote" if remote else ""
+        source = " FROM community" if name in _COMMUNITY else ""
         tier = (
             "\n\nOnly an S3 published table needs this. A log publishing to a "
             "local directory never loads it, so if yours does you can ignore it."
@@ -219,7 +224,7 @@ def load_extension(
             f"Fetch it into this machine's DuckDB home, which needs network:\n"
             f"\n"
             f'    python -c "import duckdb; '
-            f"duckdb.connect().execute('INSTALL {name}')\"\n"
+            f"duckdb.connect().execute('INSTALL {name}{source}')\"\n"
             f"\n"
             f"Extensions are built per DuckDB version and platform, so one "
             f"fetched for a different duckdb will not load."
@@ -274,8 +279,129 @@ def install_s3_secret(
     create_secret(connection, (s3 or S3Options()).resolved())
 
 
+# Extensions published from DuckDB's COMMUNITY repository rather than the core
+# one, which changes the install line an error has to give.
+_COMMUNITY = frozenset({"cache_httpfs"})
+
+
+def cache_directory(cache_key: str | PathLike[str] | None = None) -> Path:
+    """Where a connection's disk cache lives (#118).
+
+    Under `$XDG_CACHE_HOME/litelink`, or `~/.cache/litelink`:
+
+    - **a relative `cache_key`** names a directory there —
+      `cache_key="stream-uuid"` is `~/.cache/litelink/stream-uuid`. The key is
+      the caller's, because what deserves its own cache is something only the
+      caller knows: a streamcast stream is a composition of logs, and is
+      cached by its id.
+    - **an absolute one** is used as given, for a cache on its own volume.
+    - **None** is `~/.cache/litelink/default` — a SIBLING of the keyed
+      directories, never their parent, so no cache's eviction can reach into
+      another's.
+
+    Sharing a directory between processes is safe: Iceberg never reuses a
+    file name, so a cached block is never stale. Never `cache_httpfs`'s own
+    default under `/tmp`, which many systems clear at boot.
+    """
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "litelink"
+    if cache_key is None:
+        return root / "default"
+
+    key = Path(cache_key)
+    if key.is_absolute():
+        return key
+
+    if ".." in key.parts:
+        msg = f"cache_key {str(cache_key)!r} would reach outside {root}"
+        raise ValueError(msg)
+
+    return root / key
+
+
+@dataclass(frozen=True, slots=True)
+class ReadCache:
+    """How a connection caches what it reads from S3 (#118). See
+    `duckdb_connection`."""
+
+    memory_cache: bool = True
+    disk_cache: bool = False
+    cache_key: str | PathLike[str] | None = None
+    disk_cache_volume_limit: float = 0.8
+
+    def __post_init__(self) -> None:
+        if not 0 < self.disk_cache_volume_limit <= 1:
+            msg = (
+                "disk_cache_volume_limit is how full the cache's volume may get, "
+                f"a share in (0, 1]; got {self.disk_cache_volume_limit}"
+            )
+            raise ValueError(msg)
+
+
+def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) -> None:
+    """Configure `connection` to cache S3 reads as `cache` says (#118).
+
+    Two layers, because `cache_httpfs` runs ONE mode at a time:
+
+    - **Disk** (`disk_cache`): the `cache_httpfs` community extension in
+      on-disk mode, wrapping httpfs. Survives restarts — measured, a new
+      process reusing the directory served every block from it and read 0
+      bytes from S3.
+    - **Memory** (`memory_cache`): DuckDB's own external file cache, in its
+      buffer manager, for the connection's lifetime. Loading `cache_httpfs`
+      switches it OFF (to avoid caching twice), so it is set back explicitly.
+      With both on, hot blocks come from RAM and warm ones from disk.
+      `memory_cache=False` also turns off `cache_httpfs`'s own read-through
+      memory cache for its disk reader (~128 MB per process), so the flag
+      means what it says.
+
+    **The disk cache is bounded by its volume, not its size.** `cache_httpfs`
+    has no byte cap; it evicts once free space on the cache's volume falls
+    below a floor, which by default is 5% — a default-on cache would fill the
+    disk the log may be writing to. `disk_cache_volume_limit` is how full that
+    volume may get, converted here to the floor. It measures EVERYTHING on the
+    volume: other data filling it past the limit shrinks the cache, possibly
+    to nothing, which is the intent — the log's own writes come first.
+
+    Eviction stays on the extension's default policy (by creation time): its
+    LRU alternative is documented for a single process, and this cache is
+    shared. Its block size is left alone, since changing it invalidates every
+    cached file.
+
+    Settings are GLOBAL so every cursor of `connection` gets them. Only an S3
+    published table goes through httpfs, so for a local one this is inert.
+    """
+    if cache.disk_cache:
+        load_extension(connection, "cache_httpfs", remote=True)
+        directory = cache_directory(cache.cache_key)
+        directory.mkdir(parents=True, exist_ok=True)
+        floor = int(
+            shutil.disk_usage(directory).total * (1 - cache.disk_cache_volume_limit)
+        )
+        connection.execute("SET GLOBAL cache_httpfs_type = 'on_disk'")
+        connection.execute(
+            "SET GLOBAL cache_httpfs_cache_directory = ?", [str(directory)]
+        )
+        connection.execute(
+            "SET GLOBAL cache_httpfs_min_disk_bytes_for_cache = ?", [floor]
+        )
+        connection.execute(
+            "SET GLOBAL cache_httpfs_disk_cache_reader_enable_memory_cache = ?",
+            [cache.memory_cache],
+        )
+
+    connection.execute(
+        "SET GLOBAL enable_external_file_cache = ?", [cache.memory_cache]
+    )
+
+
 def duckdb_connection(
-    s3: S3Options | None = None, *, remote: bool = False
+    s3: S3Options | None = None,
+    *,
+    remote: bool = False,
+    memory_cache: bool = True,
+    disk_cache: bool = False,
+    cache_key: str | PathLike[str] | None = None,
+    disk_cache_volume_limit: float = 0.8,
 ) -> duckdb.DuckDBPyConnection:
     """A DuckDB connection provisioned to read a published table (#108).
 
@@ -299,6 +425,25 @@ def duckdb_connection(
     nobody installs are a connection with no secret, which reads S3 as
     anonymous and fails as a 403 at the first query rather than here.
 
+    **Reads from S3 can be cached** (#118), with `remote=True`, in two layers:
+
+    - `memory_cache` (on): DuckDB's external file cache, for this
+      connection's lifetime.
+    - `disk_cache` (OFF): the bundled `cache_httpfs` extension on disk, in
+      `cache_directory(cache_key)`, surviving restarts and shared by every
+      process using the same key. It evicts once its VOLUME is
+      `disk_cache_volume_limit` full — counting everything on that volume,
+      not just the cache.
+
+    **For a reader on another machine**, which is what it is for: a log's own
+    host reads its published table rarely, and a disk cache there would put
+    back on local disk exactly what eviction removed. So litelink's own
+    handles never cache to disk; a caller reading published tables from
+    elsewhere — streamcast's `Stream.snapshot`, which spans several logs and
+    caches by stream — asks for it here, with a key it chooses. The cache
+    belongs to the DATABASE this builds, shared by all its cursors, so a
+    caller pooling connections pools per key. See `install_read_cache`.
+
     A new connection per call, which the caller owns. Building one costs about
     half a second, nearly all of it `LOAD iceberg` (#102), so hold on to it.
     It is also the factory every log's reader is built with.
@@ -306,6 +451,13 @@ def duckdb_connection(
     if s3 is not None and not remote:
         msg = "s3 options are for a remote connection; pass remote=True as well"
         raise ValueError(msg)
+
+    cache = ReadCache(
+        memory_cache=memory_cache,
+        disk_cache=disk_cache,
+        cache_key=cache_key,
+        disk_cache_volume_limit=disk_cache_volume_limit,
+    )
 
     connection = duckdb.connect()
     # `avro` BEFORE `iceberg`, and quietly: `iceberg`'s init auto-installs it
@@ -321,6 +473,7 @@ def duckdb_connection(
     # slow path.
     if remote:
         install_s3_secret(connection, s3)
+        install_read_cache(connection, cache)
 
     return connection
 

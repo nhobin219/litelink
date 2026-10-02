@@ -1478,12 +1478,10 @@ def test_drain_will_not_unlink_while_another_owner_holds_the_log(
     """The unlink is not metadata, so it declares like everything else (§4a).
 
     Expiry is safe claimless — a metadata commit that CAS orders, idempotent.
-    The deletion that follows it is not. Consulting the table without declaring
-    anything leaves the window every other pass here was built to close:
-    `hydrate` re-registers a file under the very name the queue still holds,
-    deliberately reusing the published key, and can commit that between the veto
-    being read and the file being unlinked. The staging table then references a
-    file that is not there.
+    The deletion that follows it is not. The case the claim was written for —
+    `hydrate` re-registering a queued name between the veto and the unlink —
+    went with `hydrate` (#118); this pins the claim until the second half of
+    #118 decides whether anything else needs it.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
@@ -1528,9 +1526,8 @@ def test_drain_stops_if_it_loses_the_log_mid_sweep(tmp_path: Path) -> None:
     Everything slow in a drain sits between the veto being read and the
     deletions — opening the published table, walking its manifests, one remote round
     trip per queued object. Past the TTL another owner may lawfully take the
-    whole log, `hydrate` a file under the very name still queued here, and
-    release; a drain holding a dead claim would then unlink it against a stale
-    veto and leave the staging table pointing at a file that is not there.
+    whole log; a drain holding a dead claim must stop rather than unlink
+    against a veto read under it.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
@@ -1939,22 +1936,14 @@ def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:
 
 
 def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
-    """Eviction is the third supersession commit, and the one reachable
-    without any failure at all.
+    """Eviction is a supersession commit, and re-dates what it drops to it.
 
-    `hydrate` re-registers a file under the very rel_path the deletion queue
-    still holds — deliberately, it reuses the published key — and drain's
-    reference veto then preserves that entry rather than draining it. When the
-    hydrated file is evicted again, `staging_retention` later, the re-enqueue is
-    an `INSERT OR IGNORE` that keeps the FIRST eviction's stamp, so the file
-    leaves the table already overdue and drain takes it out from under any
-    reader streaming it. Measured by review: unlinked 0.078 s after leaving the
-    table, against a three-second grace.
-
-    Asserted at the stamp rather than by staging the hydrate, because the
-    reader's safety rests on the stamp and staging it takes a live published table plus
-    an eviction the published table coverage permits — conditions that make the test
-    about its own setup.
+    A path already queued with an old stamp — once reachable with no failure
+    at all through `hydrate` re-registering a queued name, removed in #118 —
+    would otherwise keep that stamp through the `INSERT OR IGNORE`, leave the
+    table already overdue, and be drained out from under a reader streaming
+    it. The stamp is what the reader's grace rests on, so it is asserted
+    directly.
     """
     config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
@@ -1964,7 +1953,7 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
 
         assert len(dropped) == 3
 
-        # Queued by an eviction a day ago, as the hydrate round-trip leaves it.
+        # Already queued with a day-old stamp.
         stale = int(datetime.now(UTC).timestamp()) - 86_400
         log._buffer.enqueue_deletions(dropped, stale)
 

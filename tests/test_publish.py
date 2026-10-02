@@ -238,77 +238,6 @@ def test_only_settled_files_reach_the_published_table(
         assert log._published.require().span() == (1, files[-2].end)
 
 
-def test_hydrate_brings_evicted_files_back_to_local_disk(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """§8: raising `staging_retention` is an operation, not a config change.
-
-    Everything is evicted first, so the staging table holds only the unsealed
-    tail and every read reaches the published table. After hydrating, the rows are
-    back on local disk rather than merely reachable.
-    """
-    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        log.advance()
-
-        assert log.staging_extent() is None, "the fixture must evict something"
-        assert log.scan().read_all().num_rows == ROWS, (
-            "the rows are in the published table, and a read that needs them reads it"
-        )
-
-        log.hydrate(since=timedelta(hours=1))
-
-        assert log.staging_rows() + log.buffered_rows() == ROWS, (
-            "hydrating puts them back on local disk"
-        )
-        assert log.scan().read_all().num_rows == ROWS
-        restored = log.sql("SELECT * FROM log").read_all().column(OFFSET).to_pylist()
-        assert sorted(restored) == list(range(1, ROWS + 1)), (
-            "every offset exactly once, with no overlap against what stayed local"
-        )
-
-
-def test_hydrate_is_idempotent(tmp_path: Path, bucket: str, s3: S3Options) -> None:
-    """Run twice and nothing doubles.
-
-    Files land under the name they have in the published table, so the second pass
-    rewrites the same paths, and the range filter refuses anything the staging
-    table already holds. Without that filter the second run would register the
-    published table's copy of a range alongside the copy it just restored, and every
-    row in it would be read twice.
-    """
-    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        log.advance()
-
-        log.hydrate(since=timedelta(hours=1))
-        once = log.staging_files()
-        log.hydrate(since=timedelta(hours=1))
-
-        assert log.staging_files() == once
-        assert log.scan().read_all().num_rows == ROWS
-
-
-def test_hydrate_ignores_files_older_than_the_window(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A zero window restores nothing, which is what makes the window real."""
-    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        log.advance()
-        evicted = log.staging_files()
-
-        log.hydrate(since=timedelta(0))
-
-        assert log.staging_files() == evicted
-
-
 def test_rewrite_published_merges_files_left_undersized(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
@@ -433,59 +362,6 @@ def test_rewrite_published_defers_deleting_what_it_superseded(
             assert not fs.exists(path.removeprefix("s3://")), (
                 "the drain must remove remote files once they come due"
             )
-
-
-def test_an_interrupted_hydrate_can_be_finished(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """The hole that no later run could fill.
-
-    Restoring upward makes the first file the new lowest local range, so a
-    failure before the next one leaves the gap ABOVE what was restored. The
-    next run takes its floor from that new lower bound, finds the gap is no
-    longer below it, and skips it for ever — and `_union` bounds the published
-    leg by the local floor, so those offsets are then served by neither tier.
-
-    Restoring downward, an interruption is only a range that starts higher than
-    intended, and the next run continues from there.
-    """
-    with published_log(tmp_path, bucket, s3, staging_retention=timedelta(0)) as log:
-        log.extend(rows(ROWS))
-        log.seal()
-        log.publish()
-        log.advance()
-        assert log.staging_extent() is None, "the fixture must evict the staging tier"
-
-        published = log._published.require()
-        real_fetch = published.fetch
-        calls = 0
-
-        def fail_after_one(path: str, destination: Path) -> None:
-            nonlocal calls
-            calls += 1
-            if calls > 1:
-                msg = "network died mid-hydrate"
-                raise OSError(msg)
-
-            real_fetch(path, destination)
-
-        published.fetch = fail_after_one  # ty: ignore[invalid-assignment]
-        with pytest.raises(OSError, match="mid-hydrate"):
-            log.hydrate(since=timedelta(hours=1))
-
-        published.fetch = real_fetch  # ty: ignore[invalid-assignment]
-        partial = log.sql("SELECT * FROM log").read_all().column(OFFSET).to_pylist()
-        assert partial, "the first file must have been restored"
-        assert sorted(partial) == list(range(min(partial), max(partial) + 1)), (
-            "an interrupted hydrate must leave a contiguous local range, not a hole"
-        )
-
-        log.hydrate(since=timedelta(hours=1))
-
-        restored = log.sql("SELECT * FROM log").read_all().column(OFFSET).to_pylist()
-        assert sorted(restored) == list(range(1, ROWS + 1)), (
-            "the second run must finish what the first started"
-        )
 
 
 def test_repointing_a_published_table_reaches_the_new_one(
@@ -4236,3 +4112,54 @@ def test_the_sweep_deletes_stranded_metadata_from_object_storage(
 
         assert live, "the test must hold live objects to keep"
         assert log.scan().read_all().num_rows == ROWS
+
+
+def test_a_disk_cached_connection_shares_published_reads_by_key(
+    tmp_path: Path, bucket: str, s3: S3Options, isolated_read_cache: Path
+) -> None:
+    """What replaced `hydrate` (#118), as a reader on another machine uses it:
+    a `duckdb_connection(disk_cache=True, cache_key=…)` caches the published
+    table's blocks on disk, and a later connection with the same key — another
+    process, in production — reuses them rather than fetching from S3.
+
+    Falsify by not calling `install_read_cache` from `duckdb_connection`: no
+    directory is filled.
+    """
+    root = tmp_path / "log"
+    with published_log(
+        root, bucket, s3, staging_retention=timedelta(0), staging_rows=0
+    ) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        metadata = log._published.require().metadata_location  # noqa: SLF001
+
+    def cached(key: str) -> int:
+        return sum(
+            len(files)
+            for _, _, files in os.walk(isolated_read_cache / "litelink" / key)
+        )
+
+    def read(key: str) -> None:
+        connection = litelink.duckdb_connection(
+            s3, remote=True, disk_cache=True, memory_cache=False, cache_key=key
+        )
+        try:
+            (count,) = connection.execute(
+                f"SELECT count(*) FROM iceberg_scan('{metadata}')"
+            ).fetchone() or (0,)
+            assert count == ROWS
+        finally:
+            connection.close()
+
+    # An empty key's directory fills: the reads went through the cache.
+    read("stream-1")
+    filled = cached("stream-1")
+    assert filled > 0, "a published read cached nothing"
+
+    # The same key again adds nothing: every block was already there.
+    read("stream-1")
+    assert cached("stream-1") == filled, "the second reader fetched blocks again"
+
+    # The control: another key fills its own.
+    read("stream-2")
+    assert cached("stream-2") == filled

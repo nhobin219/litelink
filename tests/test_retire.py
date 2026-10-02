@@ -223,22 +223,6 @@ def test_retire_resumes_after_a_crash(
         assert again._buffer.retired()["state"] == "retired"  # ty: ignore[not-subscriptable]  # noqa: SLF001
 
 
-def test_hydrate_works_on_a_retired_log(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """It adds no rows and assigns no offsets, so retirement allows it."""
-    with written(tmp_path, bucket, s3) as log:
-        log.retire()
-        assert log.staging_rows() == 0
-
-        log.hydrate(since=timedelta(hours=1))
-
-        assert log.staging_rows() > 0
-
-
-# -- the WAL replica ------------------------------------------------------------
-
-
 def sidecar_binary() -> str:
     binary = litestream_binary()
     if shutil.which(binary) is None and not os.access(binary, os.X_OK):

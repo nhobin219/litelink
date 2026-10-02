@@ -47,11 +47,17 @@ PLATFORMS = {
 #     "An error occurred while trying to automatically install ... 'avro'"
 # So a bundle that carries `iceberg` without `avro` is not offline-capable, and
 # the failure appears only once everything else has been provisioned correctly.
-EXTENSIONS = ("avro", "iceberg", "httpfs")
+EXTENSIONS = ("avro", "iceberg", "httpfs", "cache_httpfs")
+
+# Extensions DuckDB publishes from its COMMUNITY repository rather than the core
+# one: a different host, signed with the community key. `cache_httpfs` is the
+# reader's on-disk block cache over httpfs (#118).
+COMMUNITY = frozenset({"cache_httpfs"})
 # HTTPS. The same host serves byte-identical content over TLS — verified,
 # matching content-length and ETag — and the plain-HTTP form was simply what
 # DuckDB's own `.info` files record.
 BASE = "https://extensions.duckdb.org"
+COMMUNITY_BASE = "https://community-extensions.duckdb.org"
 
 # The DuckDB a wheel's bundled extension serves. Declared rather than taken
 # from the build environment, for two reasons: the build runs isolated and
@@ -88,11 +94,16 @@ CHECKSUMS = {
     "osx_arm64/avro": "5531e2418d553b069bf4cc36e6ddefadffd01f179915b1007ce5d778bbbae220",
     "osx_arm64/iceberg": "b9bddab02268434dcdef49f16bbd7d78d3a35beae74cb79c4ecdbb143e106c8a",
     "osx_arm64/httpfs": "758acc0b0c4fbf09506f387ff6f52826b1038b7b6849ded39928d2f992945230",
+    "linux_amd64/cache_httpfs": "03e66e6c147dda57100c9730ba990ab9c24244189a271447ab87c23eef60d8c1",
+    "linux_arm64/cache_httpfs": "408964419cb536835ee8543cbd8207d445c1600e46200530985046334a64510d",
+    "osx_amd64/cache_httpfs": "7bb635f9a920276b8d9b0e9559cd2df9bc597139fa7773ced1b34a9ce45ad007",
+    "osx_arm64/cache_httpfs": "7acd41c5a07a913abeae004100b34ee4cf7e0c68e41e1ec4338f6e38d21a47d8",
 }
 
 
 def extension_url(duckdb_version: str, platform: str, name: str) -> str:
-    return f"{BASE}/v{duckdb_version}/{platform}/{name}.duckdb_extension.gz"
+    base = COMMUNITY_BASE if name in COMMUNITY else BASE
+    return f"{base}/v{duckdb_version}/{platform}/{name}.duckdb_extension.gz"
 
 
 def vendor(target: str, duckdb_version: str, into: Path) -> list[Path]:

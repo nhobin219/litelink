@@ -287,11 +287,15 @@ end_offset=…)`) can skip it.
 `column_statistics(tier=…)` gives every column's bounds and counts without opening a data
 file, per tier (`"staging"`, `"published"` below it, `"buffer"`) or for the whole log.
 
-**`retire()` ends a log for good.** It pushes every row to the published table, empties the
-staging table and the buffer, and records the retirement by giving the buffer an end and
-marking the published table. After that the log opens for reading only, and `append`,
-`ingest`, a writer `open` and `restore` all refuse, naming the offset the next log should
-start at.
+**Reading from another machine can cache what it reads.** `duckdb_connection(remote=True)`
+keeps DuckDB's memory cache on, and with `disk_cache=True` also caches on disk across restarts,
+under `~/.cache/litelink/<cache_key>` (or `$XDG_CACHE_HOME`), shared by every process using the
+key. It is off by default and never used by a log's own handles: on the host that writes a log,
+a disk cache would put back on disk exactly what eviction removed.
+
+```python
+con = litelink.duckdb_connection(remote=True, disk_cache=True, cache_key="trades-reader")
+```
 
 ## Reading from another machine
 

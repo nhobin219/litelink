@@ -50,9 +50,12 @@ import duckdb
 # without it, `LOAD iceberg` with autoinstall disabled fails asking for avro.
 READ_PATH = ("iceberg", "avro")
 
-# The archive tier (§5). Local-first capture never loads this, which is why it
-# is opt-in rather than part of the required set.
-REMOTE = ("httpfs",)
+# The S3 published tier (§5). Local-first capture never loads these, which is
+# why they are opt-in rather than part of the required set. `cache_httpfs` is
+# the reader's on-disk block cache over httpfs (#118), and comes from DuckDB's
+# COMMUNITY repository rather than the core one.
+REMOTE = ("httpfs", "cache_httpfs")
+COMMUNITY = frozenset({"cache_httpfs"})
 
 
 def extension_directory(con: duckdb.DuckDBPyConnection) -> str:
@@ -78,7 +81,8 @@ def install(extensions: tuple[str, ...]) -> int:
         # INSTALL is idempotent and skips the download if the file is present,
         # so re-running costs nothing. LOAD after it is the part that proves the
         # binary is usable rather than merely present on disk.
-        con.execute(f"INSTALL {name}")
+        source = " FROM community" if name in COMMUNITY else ""
+        con.execute(f"INSTALL {name}{source}")
         con.execute(f"LOAD {name}")
         print(f"  {name:16} ok")
 
