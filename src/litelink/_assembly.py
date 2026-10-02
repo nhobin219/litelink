@@ -135,7 +135,7 @@ def open(  # noqa: A001
                 disk_cache,
                 disk_cache_path,
                 disk_cache_volume_limit,
-                log=layout.directory,
+                cache_key=layout.directory,
             ),
         )
         if read_only:

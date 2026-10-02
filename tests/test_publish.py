@@ -4174,7 +4174,7 @@ def test_a_logs_default_disk_cache_is_named_after_it(
     `$XDG_CACHE_HOME/litelink/<log path>`: one directory per log, findable and
     clearable on its own, and shared by every process reading it (#118).
 
-    Falsify by dropping `log` from the reader's `ReadCache`: the blocks land
+    Falsify by dropping `cache_key` from the reader's `ReadCache`: the blocks land
     in the connection default, `.../litelink/duckdb`.
     """
     root = tmp_path / "log"

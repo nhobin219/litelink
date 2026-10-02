@@ -284,7 +284,7 @@ def install_s3_secret(
 _COMMUNITY = frozenset({"cache_httpfs"})
 
 
-def default_cache_path(log: Path | None = None) -> Path:
+def default_cache_path(cache_key: Path | None = None) -> Path:
     """Where the reader's disk cache lives unless told otherwise (#118):
     `$XDG_CACHE_HOME/litelink/<log path>`, or `~/.cache/litelink/<log path>`
     — the log's absolute directory mirrored underneath, so
@@ -298,16 +298,16 @@ def default_cache_path(log: Path | None = None) -> Path:
     cold cache and leaves the old directory behind — never a stale one,
     since Iceberg never reuses a file name.
 
-    A connection not tied to a log (`duckdb_connection`) uses `duckdb` in
-    place of the path. Per user, not inside the log, and never
+    `cache_key` is the log's directory; a connection not tied to a log
+    (`duckdb_connection`) passes None and uses `duckdb` in place of the path. Per user, not inside the log, and never
     `cache_httpfs`'s own default under `/tmp`, which many systems clear at
     boot.
     """
     base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    if log is None:
+    if cache_key is None:
         return base / "litelink" / "duckdb"
 
-    resolved = Path(log).resolve()
+    resolved = Path(cache_key).resolve()
 
     return base / "litelink" / resolved.relative_to(resolved.anchor)
 
@@ -325,10 +325,11 @@ class ReadCache:
     disk_cache: bool = True
     disk_cache_path: str | PathLike[str] | None = None
     disk_cache_volume_limit: float = 0.8
-    # The directory of the log this reader serves, which keys the default
-    # cache directory; None for a connection not tied to one. Resolved when the
-    # cache is installed, so the environment is read at the point of use.
-    log: Path | None = None
+    # What the default cache directory is derived from: the directory of the
+    # log this reader serves, or None for a connection not tied to one.
+    # Resolved when the cache is installed, so the environment is read at the
+    # point of use.
+    cache_key: Path | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.disk_cache_volume_limit <= 1:
@@ -374,7 +375,7 @@ def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) 
     """
     if cache.disk_cache:
         load_extension(connection, "cache_httpfs", remote=True)
-        directory = Path(cache.disk_cache_path or default_cache_path(cache.log))
+        directory = Path(cache.disk_cache_path or default_cache_path(cache.cache_key))
         directory.mkdir(parents=True, exist_ok=True)
         floor = int(
             shutil.disk_usage(directory).total * (1 - cache.disk_cache_volume_limit)
