@@ -1160,7 +1160,7 @@ def test_maintain_reclaims_only_when_the_ratio_is_set(
     both directions, because a default that quietly reclaimed would put that
     pause on every existing deployment at upgrade.
 
-    Falsify by calling `reclaim_buffer` unconditionally in `advance`: the
+    Falsify by calling `reclaim("buffer")` unconditionally in `advance`: the
     `None` case records a call.
     """
     calls: list[float] = []
