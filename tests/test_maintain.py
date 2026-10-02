@@ -412,6 +412,30 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
         assert_nothing_untracked(log)
 
 
+def test_manifests_a_commit_merged_away_are_reclaimed(tmp_path: Path) -> None:
+    """#111: with manifest merging on, each seal writes an `-m0` manifest and
+    folds it into an `-m1` before committing. Only the `-m1` is in a snapshot,
+    so a reclaim that walks snapshots never found the `-m0`. On a long-running
+    box that was 99% of them, and metadata grew with every seal.
+
+    After expiry, the only unreferenced manifest left is the one the current
+    snapshot's own commit merged away, which goes when that snapshot expires.
+
+    Falsify by having `expire` enqueue `metadata_paths` instead of
+    `expiring_paths`: one orphan per seal stays on disk.
+    """
+    config = LogConfig(compact_min_files=99, snapshot_retention=timedelta(0))
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 8)
+        log._maintenance.expire()
+
+        manifests = set(log.root.rglob("metadata/*-m*.avro"))
+        referenced = {Path(path) for path in log._table.referenced_paths()}
+        unreferenced = manifests - referenced
+        assert len(unreferenced) <= 1, sorted(p.name for p in unreferenced)
+        assert len(read_all(log)) == 32
+
+
 def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -> None:
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:

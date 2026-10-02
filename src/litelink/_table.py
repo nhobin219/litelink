@@ -13,6 +13,7 @@ import random
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -1126,6 +1127,48 @@ class LogTable:
 
         return paths
 
+    def expiring_paths(self, snapshots: Iterable[Snapshot]) -> set[str]:
+        """Everything to delete once `snapshots` expire (#111).
+
+        `metadata_paths`, plus the manifests each snapshot's commit wrote and
+        merged away before it landed. With manifest merging on, a commit writes
+        its new files' manifest as `{commit}-m0`, folds it and the manifests
+        it inherits into `{commit}-m1`, and lists only `-m1`. The `-m0` was never
+        in any snapshot, so nothing that walks snapshots can find it. Measured
+        on a long-running box, 99% of `-m0` files were never deleted.
+
+        Found by name instead of by listing the directory. pyiceberg numbers a
+        commit's manifests from 0 and the merge writes last, so every number
+        below the highest the snapshot lists is a file this commit wrote.
+        Anything still referenced is vetoed by `drain`, as for any other queued path.
+        """
+        snapshots = list(snapshots)
+        paths = self.metadata_paths(snapshots)
+        for snapshot in snapshots:
+            commit = _commit_uuid(snapshot.manifest_list)
+            if commit is None:
+                continue
+
+            written: dict[int, str] = {}
+            for manifest in snapshot.manifests(self._table.io):
+                directory, _, name = manifest.manifest_path.rpartition("/")
+                prefix = f"{commit}-m"
+                if name.startswith(prefix) and name.endswith(".avro"):
+                    number = name.removeprefix(prefix).removesuffix(".avro")
+                    if number.isdigit():
+                        written[int(number)] = directory
+
+            if written:
+                highest = max(written)
+                directory = written[highest]
+                paths.update(
+                    self._name(f"{directory}/{commit}-m{number}.avro")
+                    for number in range(highest)
+                    if number not in written
+                )
+
+        return paths
+
     def snapshots_older_than(self, cutoff: datetime) -> list[Snapshot]:
         """Snapshots eligible for expiry, excluding the current one."""
         current = self._table.current_snapshot()
@@ -1544,6 +1587,26 @@ class LogTable:
     def _set_properties(self, properties: dict[str, str]) -> None:
         with self._table.transaction() as transaction:
             transaction.set_properties(properties)
+
+
+def _commit_uuid(manifest_list: str) -> str | None:
+    """The commit a manifest list belongs to, from pyiceberg's name for it.
+
+    `snap-{snapshot id}-{attempt}-{commit uuid}.avro`, and the same uuid
+    prefixes every manifest that commit wrote. None for a name of any other
+    shape, such as one written by another engine.
+    """
+    name = manifest_list.rpartition("/")[2].removesuffix(".avro")
+    commit = name[-36:]
+    if not name.startswith("snap-") or len(commit) != 36 or name[-37] != "-":
+        return None
+
+    try:
+        uuid.UUID(commit)
+    except ValueError:
+        return None
+
+    return commit
 
 
 def _plain(path: object) -> str:

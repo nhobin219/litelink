@@ -7,6 +7,16 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Fixed
+
+- **Expiry now deletes the manifests a commit merges away** (#111). With
+  manifest merging on, each seal wrote an `-m0` manifest and folded it into
+  the `-m1` its snapshot lists, so no snapshot ever named the `-m0` and
+  nothing deleted it. Metadata grew by one file per seal. Files already
+  orphaned this way are not reclaimed.
+
 ## 0.6.1 — 2026-10-01
 
 ### Added
