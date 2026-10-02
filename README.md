@@ -25,12 +25,6 @@ already holds. Through all of it the log stays one queryable unit: a read sees e
 exactly once, whichever tier holds it, and maintenance runs beside appends rather than in
 front of them.
 
-It's built for the thing every capture pipeline hand-rolls badly: getting a stream of
-observations onto disk durably, into well-sized Parquet, and eventually into object storage.
-Doing that by hand goes wrong the same way every time: one production capture system had
-125,884 objects, 62.5% of them under 16 KiB, Parquet files at 2 rows each, a compaction
-routine nothing ever scheduled, and an in-memory buffer a `SIGKILL` emptied.
-
 **The Iceberg table is the product.** The usual shape is a write path in one system and an
 analytical store in another, with a job copying between them. Here they are one log, and the
 Parquet a row is sealed into is the Parquet DuckDB, or any other Iceberg engine, reads. litelink
