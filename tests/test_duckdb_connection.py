@@ -219,3 +219,84 @@ def test_an_unprovisioned_machine_gets_the_message_that_fixes_it(
 
     assert "`iceberg` extension is not installed" in str(caught.value)
     assert "just duckdb-extensions" in str(caught.value)
+
+
+def settings(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    rows = connection.execute(
+        "SELECT name, value FROM duckdb_settings() WHERE name IN ("
+        "'enable_external_file_cache', 'cache_httpfs_type',"
+        " 'cache_httpfs_cache_directory', 'cache_httpfs_min_disk_bytes_for_cache',"
+        " 'cache_httpfs_disk_cache_reader_enable_memory_cache')"
+    ).fetchall()
+
+    return {str(name): str(value) for name, value in rows}
+
+
+OPTIONS = litelink.S3Options(
+    endpoint="http://127.0.0.1:9000", access_key="key", secret_key="secret"
+)
+
+
+def test_a_remote_connection_caches_in_memory_and_on_disk_by_default(
+    isolated_read_cache: Path,
+) -> None:
+    """Both layers on, the disk cache at the per-user default, bounded by its
+    volume (#118).
+
+    `cache_httpfs` switches DuckDB's own memory cache OFF when it loads, so a
+    connection that merely loaded it would serve every repeat read from disk.
+    Falsify by dropping the `enable_external_file_cache` line from
+    `install_read_cache`: it reads false.
+    """
+    import shutil
+
+    connection = litelink.duckdb_connection(OPTIONS, remote=True)
+
+    found = settings(connection)
+    expected = isolated_read_cache / "litelink" / "duckdb"
+    assert "cache_httpfs" in loaded(connection)
+    assert found["cache_httpfs_type"] == "on_disk"
+    assert found["cache_httpfs_cache_directory"] == str(expected)
+    assert expected.is_dir()
+    assert found["enable_external_file_cache"] == "true"
+    assert found["cache_httpfs_disk_cache_reader_enable_memory_cache"] == "true"
+    # 0.8 full means 20% of the volume kept free, not the extension's 5%.
+    floor = int(found["cache_httpfs_min_disk_bytes_for_cache"])
+    assert floor == int(shutil.disk_usage(expected).total * (1 - 0.8))
+
+
+def test_each_cache_layer_turns_off_on_its_own(tmp_path: Path) -> None:
+    """`memory_cache=False` turns off every RAM layer, `cache_httpfs`'s own
+    read-through cache included; `disk_cache=False` never loads the extension;
+    `disk_cache_path` is used as given.
+
+    Falsify by leaving `cache_httpfs`'s reader cache on when `memory_cache` is
+    False: ~128 MB per process of RAM caching the flag claimed to turn off.
+    """
+    no_memory = litelink.duckdb_connection(
+        OPTIONS, remote=True, memory_cache=False, disk_cache_path=tmp_path
+    )
+    found = settings(no_memory)
+    assert found["enable_external_file_cache"] == "false"
+    assert found["cache_httpfs_disk_cache_reader_enable_memory_cache"] == "false"
+    assert found["cache_httpfs_cache_directory"] == str(tmp_path)
+
+    no_disk = litelink.duckdb_connection(OPTIONS, remote=True, disk_cache=False)
+    assert "cache_httpfs" not in loaded(no_disk)
+    assert settings(no_disk)["enable_external_file_cache"] == "true"
+
+
+@pytest.mark.parametrize("limit", [0.0, -0.1, 1.5])
+def test_a_volume_limit_outside_zero_to_one_is_refused(limit: float) -> None:
+    """How full the cache's volume may get is a share; 0 would evict
+    everything at once and above 1 can never be reached."""
+    with pytest.raises(ValueError, match="disk_cache_volume_limit"):
+        litelink.duckdb_connection(OPTIONS, remote=True, disk_cache_volume_limit=limit)
+
+
+def test_a_local_connection_installs_no_cache() -> None:
+    """Only an S3 published table goes through httpfs, so a local read path
+    loads no cache extension at all."""
+    connection = litelink.duckdb_connection()
+
+    assert "cache_httpfs" not in loaded(connection)

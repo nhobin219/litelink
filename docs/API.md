@@ -103,7 +103,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
-| **`+ WriteHandle`** — published table | `publish` · `hydrate` · `rewrite_published` · `retire` |
+| **`+ WriteHandle`** — published table | `publish` · `rewrite_published` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` · `set_published` · `set_sort_by` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
 
@@ -418,8 +418,15 @@ FROM iceberg_scan('s3://bucket/prefix/trades',
 extensions litelink's platform wheels bundle, so the first read is not a network fetch (§7):
 
 ```python
-litelink.duckdb_connection(s3: S3Options | None = None, *, remote: bool = False)
-    -> duckdb.DuckDBPyConnection
+litelink.duckdb_connection(
+    s3: S3Options | None = None,
+    *,
+    remote: bool = False,
+    memory_cache: bool = True,
+    disk_cache: bool = True,
+    disk_cache_path: str | PathLike | None = None,   # $XDG_CACHE_HOME/litelink/duckdb
+    disk_cache_volume_limit: float = 0.8,
+) -> duckdb.DuckDBPyConnection
 
 con = litelink.duckdb_connection(remote=True)     # credentials from the environment
 con.sql("SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/trades',"
@@ -432,6 +439,30 @@ missing extension raises `ExtensionMissing`, naming how to provision it rather t
 `INSTALL` advice, and a machine with no credentials at all raises `RuntimeError` naming the
 three ways to supply them. Each call builds a new connection, about half a second of
 `LOAD iceberg`, so hold on to one.
+
+**Reads from S3 are cached, in memory and on disk, by default** (#118). This is what replaced
+`hydrate`: a cache holds what is actually read, needs no write to either table, and survives
+restarts.
+
+| Parameter | Layer | Lifetime |
+| --- | --- | --- |
+| `memory_cache` | DuckDB's external file cache | the connection's |
+| `disk_cache` | the `cache_httpfs` extension, on disk, in `disk_cache_path` | across restarts and processes |
+
+- **The disk cache is shared.** The default path, `$XDG_CACHE_HOME/litelink/duckdb` (or
+  `~/.cache/litelink/duckdb`), serves every log and every process on the machine. That is safe
+  because Iceberg never reuses a file name: a cached block is never stale.
+- **`disk_cache_volume_limit` bounds it by how full its VOLUME may get**, not by its own size:
+  the cache evicts once the volume is 80% full, counting everything on that volume. If other
+  data fills the disk, the cache shrinks, possibly to nothing, so the log's own writes come
+  first. `cache_httpfs` has no byte cap of its own, and left alone keeps only 5% free.
+- **`memory_cache=False` turns off every RAM layer**, `cache_httpfs`'s own read-through cache
+  included.
+- **Only an S3 published table is cached.** A local one is already on disk.
+- **`cache_httpfs` is bundled in the platform wheels.** Elsewhere, `just duckdb-extensions
+  --remote` installs it, and without it a disk-cached connection raises `ExtensionMissing`.
+
+`litelink.new`, `open` and `restore` take the same four parameters, for the log's own reader.
 
 ```python
 litelink.install_s3_secret(connection, s3: S3Options | None = None) -> None
@@ -559,7 +590,6 @@ takes no claim and never raises.
 
 ```python
 log.publish(*, flush: bool = False) -> None
-log.hydrate(since) -> None            # since: timedelta
 log.rewrite_published() -> None
 ```
 
@@ -580,14 +610,14 @@ depends on it**. All three raise `RuntimeError` when another owner holds the cla
 `<root>/<name>/published`. The pipeline is the same either way — a local-only log publishes,
 evicts and retires exactly like one on S3, and any Iceberg engine reads its table through
 `version-hint.text`. Its cost is disk: the local published table keeps everything, until truncation
-lands (a follow-up). `wal_replication`, `replication_config()`, `restore` and `hydrate` need
-a remote one: the WAL replica exists to get rows off the machine, and a local published table
-is on this disk already.
+lands (a follow-up). `wal_replication`, `replication_config()` and `restore` need a remote
+one: the WAL replica exists to get rows off the machine, and a local published table is on
+this disk already.
 
-`hydrate(since)` re-registers published files back into the staging table. Raising
-`staging_retention` is an operation rather than a config change: without this, a raised setting
-applies only to data captured afterwards. `since` is measured against when the published table took
-each file.
+**Reading history often is the reader's cache's job, not staging's.** `hydrate`, which copied
+published files back into the staging table, is gone (#118). A reader caches what it reads from
+the published table, on disk by default; see `duckdb_connection`. Raising `staging_retention`
+applies to data captured afterwards.
 
 `rewrite_published` merges undersized files already in the published table. An operation, not a policy —
 nothing calls it on a schedule, and normal operation does not need it, because publish pushes
@@ -698,7 +728,6 @@ Afterwards:
 | `open(root, name)` | `RetiredError`, the same message |
 | `open(root, name, read_only=True)` | allowed; reads come from the published table |
 | `restore(...)` | `RetiredError`, from the published table's `litelink.retired` or the replica's closed buffer |
-| `hydrate(since)` | allowed; it adds no rows, only brings files back to local disk |
 | `column_statistics(tier="published")` | the whole log |
 
 **Appends are refused by SQLite**: a trigger on the buffer refuses every insert once the
@@ -924,8 +953,8 @@ readable; one it left mid-change is refused with the release that can finish it 
 ## Rules that cut across
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,
-`append`, `ingest`, `seal`, `await_seal`, `advance`, `compact`, `evict`, `expire`,
-`publish`, `hydrate`, `rewrite_published`, `retire`, `set_config`, `set_published` and
+`append`, `ingest`, `seal`, `await_seal`, `advance`, `compact`, `publish`, `evict`,
+`reclaim`, `sweep`, `rewrite_published`, `retire`, `set_config`, `set_published` and
 `set_sort_by` are absent from `LogHandle`.
 Everything observational and both read paths are there.
 
@@ -939,7 +968,7 @@ with overloads, and so does this, so the misuse is caught before it runs.
 intended topology; multiple machines write separate logs and readers union.
 
 **The claim decides who does the work, not the caller.** `advance`, its routines, `publish`,
-`hydrate`, `rewrite_published`, `retire` and the three setters all coordinate through rows in
+`rewrite_published`, `retire` and the three setters all coordinate through rows in
 SQLite, so a second caller is refused with `RuntimeError` rather than duplicating the work — and that holds
 between threads and between processes on identical terms.
 

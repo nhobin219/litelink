@@ -287,6 +287,18 @@ end_offset=…)`) can skip it.
 `column_statistics(tier=…)` gives every column's bounds and counts without opening a data
 file, per tier (`"staging"`, `"published"` below it, `"buffer"`) or for the whole log.
 
+**Reads from an S3 published table are cached**, in memory for the connection and on disk
+across restarts, by default. The disk cache lives in `~/.cache/litelink/duckdb` (or
+`$XDG_CACHE_HOME`), is shared by every log and process on the machine, and evicts once its
+disk is 80% full, counting everything on that disk. Iceberg never reuses a file name, so a
+cached block is never stale. Tune it per handle or connection:
+
+```python
+litelink.open("data", "trades", read_only=True,
+              memory_cache=True, disk_cache=True,
+              disk_cache_path="/var/cache/trades", disk_cache_volume_limit=0.8)
+```
+
 **`retire()` ends a log for good.** It pushes every row to the published table, empties the
 staging table and the buffer, and records the retirement by giving the buffer an end and
 marking the published table. After that the log opens for reading only, and `append`,

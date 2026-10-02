@@ -22,6 +22,13 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: `hydrate()` is removed** (#118). It copied a time window of
+  published files back into staging whether anyone read them or not; the
+  reader's disk cache (above) keeps what is actually read, across restarts,
+  without writing to either table. A replayed retired log reads through it
+  too. Rows needed readable with no network at all need `staging_retention`
+  raised before they are evicted.
+
 - **Breaking: `evict(table)` and `reclaim(table)`, one set of verbs for every
   table** (#122). `seal` and `publish` only move data; every deletion is
   `evict`'s, and every return of disk is `reclaim`'s.
@@ -86,6 +93,17 @@ minor version carries breaking changes.
   pass. Drop the argument.
 
 ### Added
+
+- **Reads from an S3 published table are cached** (#118), replacing `hydrate`.
+  `duckdb_connection`, `new`, `open` and `restore` take `memory_cache=True`
+  (DuckDB's external file cache, for the connection's lifetime),
+  `disk_cache=True` (the `cache_httpfs` extension on disk, surviving
+  restarts), `disk_cache_path=None` (default `$XDG_CACHE_HOME/litelink/duckdb`,
+  shared by every log and process on the machine) and
+  `disk_cache_volume_limit=0.8` (the cache evicts once its VOLUME is that full,
+  counting everything on it). `cache_httpfs` is bundled in the platform wheels
+  and installed by `just duckdb-extensions --remote`; without it a
+  disk-cached connection raises `ExtensionMissing`.
 
 - **`sweep(table=None)`**, a routine of its own (#117). It takes no claim, so
   an orchestrator can run it on its own schedule, in another process, or in a

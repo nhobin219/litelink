@@ -946,14 +946,12 @@ class Maintenance:
 
             self._enqueue(dropped)
             self._table.evict_below(boundary)
-            # Re-dated to the commit, like every other supersession. Eviction
-            # needs it without any failure at all: `hydrate` re-registers a
-            # file under the very path the queue still holds, drain's veto then
-            # preserves that entry rather than draining it, and the re-enqueue
-            # when the hydrated file is evicted again is an INSERT OR IGNORE
-            # that keeps the FIRST eviction's stamp — from `staging_retention`
-            # ago. Measured: files unlinked 0.078 s after leaving the table
-            # against a three-second grace.
+            # Re-dated to the commit, like every other supersession: the paths
+            # were queued before it, and the grace is about readers holding
+            # them, which starts when the commit lands. (The case that first
+            # needed it with no failure at all was `hydrate` re-registering a
+            # queued path, whose re-enqueue kept the first eviction's stamp —
+            # removed in #118; the commit-time rule stands without it.)
             self._buffer.restamp_deletions(
                 (self._key(p) for p in dropped), int(datetime.now(UTC).timestamp())
             )
@@ -1314,9 +1312,8 @@ class Maintenance:
         A file neither knows is treated as newly written, so it is never
         evicted on an age nobody recorded. That is the safe direction — the
         cost is disk, and the alternative is deleting data because its age was
-        unknown. It applies to files this database never saw, which after
-        `hydrate` records what it restores is only files from a version that
-        did not keep them.
+        unknown. It applies to files this database never saw: files from a
+        version that did not keep these records.
         """
         named = self._ages().get(self._key(data_file.path))
         if named is not None:
@@ -1473,13 +1470,11 @@ class Maintenance:
         # Claimed, because this UNLINKS. §4a calls expiry safe to run
         # claimless on the grounds that it is a metadata commit ordered by CAS,
         # and that is true of the expiry; it is not true of the deletion that
-        # follows it. Consulting the table without declaring anything leaves
-        # the window every other pass here was made to close: `hydrate`
-        # re-registers a file under the very name the queue still holds — it
-        # reuses the published key deliberately — and it can commit that
-        # between this veto being read and the file being unlinked. The staging
-        # table then references a file that is not there, and every scan over
-        # that range raises until eviction ages the entry out.
+        # follows it. The case this claim was written for — `hydrate`
+        # re-registering a file under the very name the queue still holds,
+        # between the veto and the unlink — went with `hydrate` (#118). Whether
+        # anything else can re-register a queued name, and so whether the
+        # claim can go, is the second half of #118; until then it stays.
         #
         # The whole log, since the queue names files from anywhere in it. A
         # refusal costs nothing: the entries stay due and the next pass takes
@@ -1509,11 +1504,8 @@ class Maintenance:
                 # Still ours, asked before EVERY deletion rather than once at
                 # the top. The unlink is this pass's commit, and §4a's rule
                 # applies to it like any other: holding a claim is asked again
-                # at the commit. Past the TTL, a `hydrate` may lawfully take the
-                # whole log, register a file under the very name still queued
-                # here, and release; this would then unlink it against a stale
-                # veto and leave the staging table pointing at a file that is
-                # not there.
+                # at the commit, and a claim past its TTL may lawfully have been
+                # taken by another owner meanwhile.
                 #
                 # Entries left behind cost nothing: they stay due.
                 checkpoint(sweep.renew)

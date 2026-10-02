@@ -396,6 +396,12 @@ def test_no_document_states_the_pre_0_2_path_as_current() -> None:
             if "/litelink/" not in line or "github.com" in line:
                 continue
 
+            # The reader's disk cache (#118) is a per-user directory named
+            # after the package, not a log path, so the segment means nothing
+            # about the layout there.
+            if "cache/litelink/" in line or "XDG_CACHE_HOME/litelink/" in line:
+                continue
+
             # The PARAGRAPH, not the line: these documents wrap at 100 columns,
             # so the sentence that marks a passage as history — "Before 0.2 it
             # was not so ..." — routinely opens several lines above the path it

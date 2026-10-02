@@ -63,11 +63,11 @@ jobs:
           for wheel in platform_wheels:
               names = zipfile.ZipFile(wheel).namelist()
               assert any(n.endswith(".bin/litestream") for n in names), f"{wheel.name}: no litestream"
-              for extension in ("avro", "iceberg", "httpfs"):
+              for extension in ("avro", "iceberg", "httpfs", "cache_httpfs"):
                   assert any(n.endswith(f"{extension}.duckdb_extension") for n in names), (
                       f"{wheel.name}: no {extension}"
                   )
-              print(f"{wheel.name}: litestream + avro + iceberg + httpfs")
+              print(f"{wheel.name}: litestream + avro + iceberg + httpfs + cache_httpfs")
           PY
 
       - uses: actions/upload-artifact@v4

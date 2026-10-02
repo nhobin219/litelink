@@ -53,7 +53,7 @@ from litelink._maintenance import (
     stable_prefix,
 )
 from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import Reader, duckdb_connection
+from litelink._read import ReadCache, Reader, duckdb_connection
 from litelink._replication import flush, litestream_config, restore_buffer
 from litelink._s3 import S3Options
 from litelink._statistics import (
@@ -1248,6 +1248,10 @@ class WriteHandle(LocalReadHandle):
         published: str | None = None,
         s3: S3Options | None = None,
         start_offset: int = 1,
+        memory_cache: bool = True,
+        disk_cache: bool = True,
+        disk_cache_path: PathLike[str] | str | None = None,
+        disk_cache_volume_limit: float = 0.8,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
 
@@ -1429,6 +1433,9 @@ class WriteHandle(LocalReadHandle):
                 buffer,
                 duckdb_connection,
                 published=remote,
+                cache=ReadCache(
+                    memory_cache, disk_cache, disk_cache_path, disk_cache_volume_limit
+                ),
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
             config=settings,
@@ -1451,6 +1458,10 @@ class WriteHandle(LocalReadHandle):
         name: str,
         *,
         s3: S3Options | None = None,
+        memory_cache: bool = True,
+        disk_cache: bool = True,
+        disk_cache_path: PathLike[str] | str | None = None,
+        disk_cache_volume_limit: float = 0.8,
     ) -> Self:
         """Open an existing log, and recover it.
 
@@ -1538,6 +1549,9 @@ class WriteHandle(LocalReadHandle):
                 buffer,
                 duckdb_connection,
                 published=remote,
+                cache=ReadCache(
+                    memory_cache, disk_cache, disk_cache_path, disk_cache_volume_limit
+                ),
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
             config=config,
@@ -1578,6 +1592,10 @@ class WriteHandle(LocalReadHandle):
         published: str,
         s3: S3Options | None = None,
         binary: str | None = None,
+        memory_cache: bool = True,
+        disk_cache: bool = True,
+        disk_cache_path: PathLike[str] | str | None = None,
+        disk_cache_volume_limit: float = 0.8,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 
@@ -1973,7 +1991,15 @@ class WriteHandle(LocalReadHandle):
 
             raise
 
-        log = cls.open(layout.root, name, s3=options)
+        log = cls.open(
+            layout.root,
+            name,
+            s3=options,
+            memory_cache=memory_cache,
+            disk_cache=disk_cache,
+            disk_cache_path=disk_cache_path,
+            disk_cache_volume_limit=disk_cache_volume_limit,
+        )
 
         # The published table's row taken afresh. The staging table was rebuilt
         # empty and every published file now sits below it, so nothing a
@@ -4186,7 +4212,8 @@ class WriteHandle(LocalReadHandle):
         log can start at the one after. Reads still work: `open(...,
         read_only=True)` reads the published table, and so does any Iceberg
         engine.
-        `hydrate` still works too, for a retired log someone replays often.
+        A retired log someone replays often reads it through the reader's
+        disk cache, which keeps what is read across restarts (#118).
 
         Steps, each safe to re-run — a crash leaves the log `retiring`, and
         calling this again finishes it:
@@ -4278,142 +4305,6 @@ class WriteHandle(LocalReadHandle):
         """Ship `buffer.db` to its WAL replica now, when one is being kept."""
         if self.config.wal_replication:
             flush(self._layout)
-
-    def hydrate(self, since: timedelta) -> None:
-        """Re-register published files into the staging table (§8).
-
-        Raising `staging_retention` is an operation, not a config change:
-        without this, a raised setting applies only to data captured afterwards.
-
-        `since` is measured against when the PUBLISHED table took each file,
-        which is the only age still on record — the staging snapshots that once
-        dated them went with the eviction, and the library stamps no timestamp
-        of its own (§2). So this reads "bring back what was published in the
-        last week", not "what was captured then"; for a stream that fell behind,
-        those differ.
-
-        Files are copied down and registered under the name they have remotely,
-        so hydrating twice writes the same paths rather than accumulating
-        copies, and one interrupted halfway is finished by the next run. Only
-        ranges strictly below what the staging table already holds are
-        considered, which is what keeps files contiguous and non-overlapping
-        (§4) — the published table's copy of a range the staging table still has
-        would otherwise be added a second time and every row in it read twice.
-
-        A hydrated file is not re-measured: its `extent` row carries the size
-        recorded for its published copy, and where none was recorded it counts
-        as full, which is what an unknown size means everywhere else — so
-        compaction will not merge it, and `publish` will not push it back to
-        the published table it just came from. Eviction still applies to it,
-        which is the point: this is temporary unless `staging_retention` is
-        raised too.
-
-        Needs a remote published table, like `restore` and
-        `replication_config`: a local one is on this disk already, so copying
-        from it buys nothing.
-        """
-        if not self._published.remote():
-            msg = (
-                f"hydrate() needs a remote published table (s3://); this log publishes to "
-                f"{self.published}, which is on this disk already — reads below "
-                f"the staging table get its rows from there"
-            )
-            raise ValueError(msg)
-
-        # The maintenance lease, because this writes the staging table and
-        # copies files into the data directory — the same two things eviction
-        # and compaction do, and for the same reason they must not overlap.
-        lease = self._lease(MAINTAIN_ROLE)
-        if not lease.acquire():
-            msg = "another owner holds a claim over this range"
-            raise RuntimeError(msg)
-
-        try:
-            self._pull(lease, since)
-        finally:
-            lease.release()
-
-    def _pull(self, lease: Claim, since: timedelta) -> None:
-        """Copy down and register everything published since `since`."""
-        published = self._published.require()
-        self._table.reload()
-
-        covered = self._table.span()
-        # Nothing in staging means nothing to sit below, so everything
-        # qualifies.
-        floor = covered[0] if covered is not None else None
-        cutoff = datetime.now(UTC) - since
-        added = published.snapshot_ages()
-        held = self._maintenance.memory()
-
-        eligible = [
-            data_file
-            for data_file in published.data_files()
-            if (floor is None or data_file.end <= floor)
-            and (stamped := added.get(data_file.path)) is not None
-            and stamped.replace(tzinfo=UTC) >= cutoff
-        ]
-
-        # DOWNWARD from the staging floor, and only across an unbroken join.
-        #
-        # Registering upward left a hole no later run could fill. The first
-        # file restored becomes the new lowest staging range, so a failure
-        # before the next one — a lost lease, a network error, or a `since`
-        # window that selected a non-contiguous set because `rewrite_published`
-        # re-dated a middle file — leaves the gap ABOVE what was restored. The
-        # next run takes its floor from that new lower bound, finds the gap no
-        # longer below it, and skips it for ever. `_union` bounds the published
-        # leg by the staging floor, so those offsets are then served by neither
-        # tier: rows silently missing from every query.
-        #
-        # Downward, every step keeps the staging range contiguous, so an
-        # interruption is just a range that starts higher than intended and the
-        # next run continues from there. Stopping at a gap rather than stepping
-        # over it is the same rule: what cannot be joined onto cannot be
-        # restored without creating one.
-        for data_file in sorted(eligible, key=lambda f: f.end, reverse=True):
-            if floor is not None and data_file.end != floor:
-                break
-
-            checkpoint(lease.renew)
-            rel_path = published.key(data_file.path)
-            destination = self._layout.absolute(rel_path)
-            published.fetch(data_file.path, destination)
-            # Asked AGAIN, after the fetch and before the commit. The download
-            # is a whole file rather than a stream, so it is the slow leg, and
-            # the checkpoint above only says the claim was held before it. Past
-            # the TTL, `drain` may lawfully take the whole log and unlink this
-            # very name — the queue still holds it, since it is the eviction
-            # that motivated the hydrate — and its own per-deletion renewal
-            # cannot help, because there `drain` is the legitimate holder and
-            # this is the lapsed one. Registering afterwards points the table
-            # at a file that is not on disk: every scan over the range raises,
-            # and `record_file` stamps it fresh so eviction cannot age it out
-            # for a whole `staging_retention`, while a re-run of `hydrate` skips
-            # the range because the staging floor now covers it.
-            checkpoint(lease.renew)
-            # No `end`: that check exists to decline a range the
-            # table already covers, and every range here is deliberately below
-            # what it covers. The filter above is what prevents an overlap.
-            self._table.register([str(destination)])
-            # An `extent` row for the staging copy, carrying what the published
-            # table's copy holds. Restored data is subject to
-            # `staging_retention` like anything else, and eviction dates a file
-            # by this record — so a hydrated file without one would sit
-            # undateable, treated as newly written, and never leave again.
-            # A file the published table never measured counts as FULL,
-            # matching what this promises above. Zero was the opposite, and it
-            # was dormant only while a watermark kept hydrated files out of
-            # every size consumer — removing the watermark is what wakes it: a
-            # file recorded at zero bytes is a permanent compaction candidate
-            # that merging can never make big enough to stop being one.
-            self._buffer.record_file(
-                rel_path,
-                data_file.start,
-                data_file.end,
-                held.get(data_file.path, self.config.compact_size),
-            )
-            floor = data_file.start
 
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:

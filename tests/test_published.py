@@ -180,13 +180,15 @@ def test_rewrite_published_works_on_a_local_published_table(tmp_path: Path) -> N
         ), "released once the published table expired the snapshots naming them"
 
 
-def test_replication_restore_and_hydrate_need_a_remote_published_table(
+def test_replication_and_restore_need_a_remote_published_table(
     tmp_path: Path,
 ) -> None:
     """The WAL replica gets unsealed rows off this machine, and a local
-    published table is on it; `hydrate` would copy files from this disk to this disk.
+    published table is on it, so replication has nowhere to ship to and a
+    restore nothing off-box to restore from.
 
-    Falsify by removing the `remote()` check from `hydrate`: it runs.
+    Falsify by removing the remote check from `replication_config`: it returns
+    a config.
     """
     with pytest.raises(ValueError, match="remote published table"):
         local_log(tmp_path, wal_replication=True)
@@ -194,9 +196,6 @@ def test_replication_restore_and_hydrate_need_a_remote_published_table(
     with local_log(tmp_path) as log:
         with pytest.raises(ValueError, match="remote"):
             log.replication_config()
-
-        with pytest.raises(ValueError, match="remote published table"):
-            log.hydrate(timedelta(days=1))
 
     with pytest.raises(ValueError, match="remote published table"):
         litelink.restore(tmp_path / "elsewhere", "s", published=f"file://{tmp_path}/x")

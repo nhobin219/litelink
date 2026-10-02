@@ -451,11 +451,11 @@ duckdb-extension-checksums:
     uv run python - <<'PY'
     import hashlib, sys, urllib.request
     sys.path.insert(0, "scripts")
-    from vendor_duckdb_extension import BASE, DUCKDB_VERSION, EXTENSIONS, PLATFORMS
+    from vendor_duckdb_extension import DUCKDB_VERSION, EXTENSIONS, PLATFORMS, extension_url
     print("CHECKSUMS = {")
     for platform in PLATFORMS.values():
         for name in EXTENSIONS:
-            url = f"{BASE}/v{DUCKDB_VERSION}/{platform}/{name}.duckdb_extension.gz"
+            url = extension_url(DUCKDB_VERSION, platform, name)
             request = urllib.request.Request(url, headers={"User-Agent": "litelink-vendor"})
             with urllib.request.urlopen(request, timeout=300) as response:
                 digest = hashlib.sha256(response.read()).hexdigest()

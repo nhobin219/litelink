@@ -33,7 +33,7 @@ from litelink._handle import (
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import Reader, duckdb_connection
+from litelink._read import ReadCache, Reader, duckdb_connection
 from litelink._table import LogTable
 
 if TYPE_CHECKING:
@@ -50,6 +50,10 @@ def open(  # noqa: A001
     *,
     read_only: Literal[False] = False,
     s3: S3Options | None = None,
+    memory_cache: bool = True,
+    disk_cache: bool = True,
+    disk_cache_path: PathLike[str] | str | None = None,
+    disk_cache_volume_limit: float = 0.8,
 ) -> WriteHandle: ...
 
 
@@ -60,6 +64,10 @@ def open(  # noqa: A001
     *,
     read_only: Literal[True],
     s3: S3Options | None = None,
+    memory_cache: bool = True,
+    disk_cache: bool = True,
+    disk_cache_path: PathLike[str] | str | None = None,
+    disk_cache_volume_limit: float = 0.8,
 ) -> LocalReadHandle: ...
 
 
@@ -69,6 +77,10 @@ def open(  # noqa: A001
     *,
     read_only: bool = False,
     s3: S3Options | None = None,
+    memory_cache: bool = True,
+    disk_cache: bool = True,
+    disk_cache_path: PathLike[str] | str | None = None,
+    disk_cache_volume_limit: float = 0.8,
 ) -> LogHandle:
     """Open an existing log, for writing or for reading beside its writer.
 
@@ -112,7 +124,16 @@ def open(  # noqa: A001
 
         config = _validated_shape(layout, buffer, name)
         remote = Published(layout, buffer, s3)
-        reader = Reader(layout, table, buffer, duckdb_connection, published=remote)
+        reader = Reader(
+            layout,
+            table,
+            buffer,
+            duckdb_connection,
+            published=remote,
+            cache=ReadCache(
+                memory_cache, disk_cache, disk_cache_path, disk_cache_volume_limit
+            ),
+        )
         if read_only:
             return LocalReadHandle(
                 layout=layout,
@@ -215,8 +236,13 @@ def new(
     published: str | None = None,
     s3: S3Options | None = None,
     start_offset: int = 1,
+    memory_cache: bool = True,
+    disk_cache: bool = True,
+    disk_cache_path: PathLike[str] | str | None = None,
+    disk_cache_volume_limit: float = 0.8,
 ) -> WriteHandle:
-    """Create a log. See `litelink.new` for the shape it fixes and why."""
+    """Create a log. See `litelink.new` for the shape it fixes and why, and
+    `duckdb_connection` for the cache parameters."""
     return WriteHandle.new(
         root,
         name,
@@ -226,6 +252,10 @@ def new(
         published=published,
         s3=s3,
         start_offset=start_offset,
+        memory_cache=memory_cache,
+        disk_cache=disk_cache,
+        disk_cache_path=disk_cache_path,
+        disk_cache_volume_limit=disk_cache_volume_limit,
     )
 
 
@@ -236,15 +266,24 @@ def restore(
     published: str,
     s3: S3Options | None = None,
     binary: str | None = None,
+    memory_cache: bool = True,
+    disk_cache: bool = True,
+    disk_cache_path: PathLike[str] | str | None = None,
+    disk_cache_volume_limit: float = 0.8,
 ) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
-    assigned. See `litelink.restore`."""
+    assigned. See `litelink.restore`, and `duckdb_connection` for the cache
+    parameters."""
     return WriteHandle.restore(
         root,
         name,
         published=published,
         s3=s3,
         binary=binary,
+        memory_cache=memory_cache,
+        disk_cache=disk_cache,
+        disk_cache_path=disk_cache_path,
+        disk_cache_volume_limit=disk_cache_volume_limit,
     )
 
 

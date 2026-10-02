@@ -29,7 +29,6 @@ from pyiceberg.io.pyarrow import PyArrowFileIO, schema_to_pyarrow
 from pyiceberg.table import StaticTable
 from pyiceberg.transforms import IdentityTransform
 
-from litelink._fs import fsync
 from litelink._predicates import offset_below, offset_in
 from litelink._s3 import S3Options
 from litelink._statistics import TierStatistics, rollup
@@ -1410,29 +1409,6 @@ class LogTable:
             # here would be reporting a failure that did not happen.
             return
 
-    def fetch(self, path: str, destination: Path) -> None:
-        """Download a file out of this table's warehouse. Inverse of `put`.
-
-        Through the catalog's own FileIO for the same reason `put` is: the
-        credentials that reach the published table are the ones the table was
-        opened with, so there is no second client to configure and no way to
-        read from somewhere the table does not point.
-
-        Whole-file, not streamed. These are `target_compact_size` files, the
-        same amount compaction holds in memory to write one, and the caller is
-        an explicit operation rather than anything on a read path.
-        """
-        payload = self._table.io.new_input(path).open().read()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        # Written under a temporary name and renamed, so a crash cannot leave a
-        # short file under a name the table is about to reference. Rename is
-        # atomic within a directory; the fsync is what makes the bytes precede
-        # it (§2).
-        staged = destination.with_name(f"{destination.name}.partial")
-        staged.write_bytes(payload)
-        fsync(staged)
-        staged.replace(destination)
-
     def remove(self, path: str) -> None:
         """Delete a file from this table's warehouse.
 
@@ -1441,15 +1417,6 @@ class LogTable:
         somewhere the table does not point.
         """
         self._table.io.delete(path)
-
-    def key(self, path: str) -> str:
-        """The warehouse-relative name of a file in this table.
-
-        The inverse of `uri`, and what lets a published file be placed locally
-        under the same name it has remotely — so hydrating twice writes the
-        same path rather than accumulating copies.
-        """
-        return path.removeprefix(self._warehouse.rstrip("/") + "/")
 
     def register(
         self,

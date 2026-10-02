@@ -21,6 +21,7 @@ _BUCKET = "LITELINK_TEST_BUCKET"
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 
 def options() -> S3Options:
@@ -127,3 +128,20 @@ def bucket(s3: S3Options) -> Iterator[str]:
         # nothing wrote to it.
         with contextlib.suppress(Exception):
             fs.rm(location, recursive=True)
+
+
+@pytest.fixture(autouse=True)
+def isolated_read_cache(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """The reader's default disk cache, kept out of the real `~/.cache` (#118).
+
+    `duckdb_connection(remote=True)` caches S3 reads on disk by default, under
+    `$XDG_CACHE_HOME/litelink/duckdb`. Without this every remote test would
+    write into the home directory of whoever runs the suite, and share blocks
+    between tests that should not see each other's reads.
+    """
+    home = tmp_path_factory.mktemp("xdg-cache")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home))
+
+    return home
