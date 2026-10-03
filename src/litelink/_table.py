@@ -14,11 +14,13 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pyarrow.fs import FileSelector, FileType
-from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.catalog import METADATA_LOCATION, Catalog
+from pyiceberg.catalog.sql import IcebergTables, SqlCatalog
 from pyiceberg.conversions import from_bytes
 from pyiceberg.exceptions import (
     CommitFailedException,
@@ -26,15 +28,18 @@ from pyiceberg.exceptions import (
 )
 from pyiceberg.io import load_file_io
 from pyiceberg.io.pyarrow import PyArrowFileIO, schema_to_pyarrow
+from pyiceberg.serializers import FromInputFile
 from pyiceberg.table import StaticTable
+from pyiceberg.table import Table as IcebergTable
 from pyiceberg.transforms import IdentityTransform
+from pyiceberg.typedef import EMPTY_DICT
 
 from litelink._predicates import offset_below, offset_in
 from litelink._s3 import S3Options
 from litelink._statistics import TierStatistics, rollup
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
     from datetime import datetime
     from pathlib import Path
 
@@ -44,6 +49,7 @@ if TYPE_CHECKING:
     from pyiceberg.schema import Schema
     from pyiceberg.table import Table
     from pyiceberg.table.snapshots import Snapshot
+    from pyiceberg.typedef import Properties
 
     from litelink._layout import Layout
 
@@ -97,6 +103,86 @@ class DataFile:
     # The offsets it holds, `[start, end)` like every range in litelink.
     start: int
     end: int
+
+
+# The FileIOs this process has built, by the properties and scheme they were
+# built for. Bounded, because explicit credentials that rotate make new keys;
+# what falls out is freed like any other unreferenced FileIO.
+_FILE_IOS: OrderedDict[tuple[tuple[tuple[str, str], ...], str], FileIO] = OrderedDict()
+_FILE_IOS_LIMIT = 64
+_FILE_IOS_LOCK = threading.Lock()
+
+
+def shared_file_io(properties: Mapping[str, str], location: str | None) -> FileIO:
+    """The process's one FileIO for `properties` and `location`'s scheme (#137).
+
+    pyiceberg builds a new FileIO on every `load_table` and every commit, and
+    each brings its own `S3FileSystem` — credentials, client, connection pool.
+    Its `PyArrowFileIO` also sits in a reference cycle (`fs_by_scheme` is an
+    `lru_cache` of a bound method), so reference counting never frees one: its
+    connections close only when the cycle collector runs. Python 3.14's
+    collector is incremental and falls behind a reader that reloads every few
+    milliseconds — measured, 1,013 open S3 connections against 53 on 3.13, until
+    the object store ran out of file descriptors.
+
+    Shared instead: every load and commit with the same properties reuses one
+    FileIO, and so one connection pool. The scheme is part of the key because
+    pyiceberg picks the implementation from it. Safe to share across threads:
+    pyarrow's filesystems are thread-safe, and a FileIO holds nothing else.
+    """
+    scheme = location.partition("://")[0] if location and "://" in location else ""
+    key = (tuple(sorted(properties.items())), scheme)
+    with _FILE_IOS_LOCK:
+        io = _FILE_IOS.get(key)
+        if io is not None:
+            _FILE_IOS.move_to_end(key)
+            return io
+
+        io = load_file_io(dict(properties), location)
+        _FILE_IOS[key] = io
+        while len(_FILE_IOS) > _FILE_IOS_LIMIT:
+            _FILE_IOS.popitem(last=False)
+
+        return io
+
+
+class _Catalog(SqlCatalog):
+    """`SqlCatalog`, loading and committing through `shared_file_io`.
+
+    Two overrides, because a load builds two FileIOs: one to read the metadata
+    file, which `SqlCatalog` gets from `load_file_io` directly, and the table's
+    own, from `_load_file_io`. `_convert_orm_to_iceberg` is pyiceberg 0.11's
+    body with only that first call changed; the FileIO-count test in
+    `test_publish` fails if an upgrade routes around either.
+    """
+
+    def _load_file_io(
+        self, properties: Properties = EMPTY_DICT, location: str | None = None
+    ) -> FileIO:
+        return shared_file_io({**self.properties, **properties}, location)
+
+    def _convert_orm_to_iceberg(self, orm_table: IcebergTables) -> Table:
+        if not (metadata_location := orm_table.metadata_location):
+            msg = f"Table property {METADATA_LOCATION} is missing"
+            raise NoSuchTableError(msg)
+
+        if not (table_namespace := orm_table.table_namespace):
+            msg = f"Table property {IcebergTables.table_namespace} is missing"
+            raise NoSuchTableError(msg)
+
+        if not (table_name := orm_table.table_name):
+            msg = f"Table property {IcebergTables.table_name} is missing"
+            raise NoSuchTableError(msg)
+
+        io = shared_file_io(self.properties, metadata_location)
+        metadata = FromInputFile.table_metadata(io.new_input(metadata_location))
+        return IcebergTable(
+            identifier=Catalog.identifier_to_tuple(table_namespace) + (table_name,),
+            metadata=metadata,
+            metadata_location=metadata_location,
+            io=self._load_file_io(metadata.properties, metadata_location),
+            catalog=self,
+        )
 
 
 # The catalog names each `SqlCatalog` is built with, and the key its rows are
@@ -326,7 +412,7 @@ def published_span(
     two — the caller decides whether a bad minute in object storage is fatal,
     and `_refuse_published_ahead` treats it as "cannot tell" and passes.
     """
-    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    io = shared_file_io(options.resolved().catalog_properties(), prefix)
     location = _published_location(io, layout, prefix)
     if location is None:
         return None
@@ -350,7 +436,7 @@ def published_retired(
     with no catalog involved — so `restore` can ask before it builds anything.
     None when the published table has no hint or records no retirement.
     """
-    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    io = shared_file_io(options.resolved().catalog_properties(), prefix)
     location = _published_location(io, layout, prefix)
     if location is None:
         return None
@@ -376,7 +462,7 @@ def published_columns(
     "nothing has been pushed there" and "not a litelink published table" —
     neither of which the caller can conclude anything from.
     """
-    io = load_file_io(options.resolved().catalog_properties(), prefix)
+    io = shared_file_io(options.resolved().catalog_properties(), prefix)
     location = _published_location(io, layout, prefix)
     if location is None:
         return None
@@ -506,7 +592,7 @@ class LogTable:
 
     @staticmethod
     def _catalog_for(layout: Layout) -> SqlCatalog:
-        return SqlCatalog(
+        return _Catalog(
             catalog_name(layout.catalog_db, STAGING_CATALOG),
             uri=layout.catalog_uri,
             warehouse=layout.warehouse_uri,
@@ -581,7 +667,7 @@ class LogTable:
                 msg = f"no published table at {prefix!r} yet"
                 raise PublishedAbsent(msg)
 
-        catalog = SqlCatalog(
+        catalog = _Catalog(
             catalog_name(layout.published_db, PUBLISHED_CATALOG),
             uri=layout.published_catalog_uri,
             warehouse=prefix,
@@ -669,7 +755,7 @@ class LogTable:
             # involved — that is one GET of a known key, not the paginated walk
             # of the prefix this design refuses everywhere else.
             published = _published_location(
-                load_file_io(options.resolved().catalog_properties(), prefix),
+                shared_file_io(options.resolved().catalog_properties(), prefix),
                 layout,
                 prefix,
             )
