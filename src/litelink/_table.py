@@ -151,7 +151,7 @@ class _Catalog(SqlCatalog):
 
     Two overrides, because a load builds two FileIOs: one to read the metadata
     file, which `SqlCatalog` gets from `load_file_io` directly, and the table's
-    own, from `_load_file_io`. `_convert_orm_to_iceberg` is pyiceberg 0.11's
+    own, from `_load_file_io`. `_convert_orm_to_iceberg` is pyiceberg 0.12's
     body with only that first call changed; the FileIO-count test in
     `test_publish` fails if an upgrade routes around either.
     """

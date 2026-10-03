@@ -26,6 +26,10 @@ minor version carries breaking changes.
   1,024 open-file limit on either side. litelink now reuses one FileIO per set
   of properties for every load and commit in the process. It was wasted work
   on every Python version; 3.14 made it visible.
+- **pyiceberg is now `>=0.12.0,<0.13`.** It was `>=0.11.1` with no cap, so
+  installs had been getting 0.12.0, released after the last lock, untested.
+  litelink is now tested on 0.12.0, and the cap keeps the next minor out until
+  it is.
 - **The preflight clock-check test no longer fails at random on `tsc` hosts.**
   It counted `subprocess`'s own wait as the check reading the clock.
 
