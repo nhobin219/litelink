@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -23,6 +23,8 @@ import litelink
 from litelink._preflight import Check, Report, preflight
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from litelink._s3 import S3Options
 
 pytestmark = pytest.mark.s3
@@ -200,16 +202,58 @@ def test_the_clock_check_does_not_sample_and_does_not_fail(
     It also must not fail: this is a risk, not a defect, and refusing to
     provision over it would be wrong on the many guests that are fine.
     """
+    import subprocess
+    from pathlib import Path
+
+    from litelink import _preflight
     from litelink._preflight import _clocksource
+
+    # Through the branch that runs `systemd-detect-virt`, on every host: only a
+    # `tsc` clocksource reaches it, and that is what made this flaky where it
+    # was. The sysfs reads say `tsc`; `subprocess.run` sleeps first, as its own
+    # wait may, so a trap that counted stdlib calls fails here every time.
+    real_read = Path.read_text
+    sysfs = {
+        "current_clocksource": "tsc\n",
+        "available_clocksource": "tsc kvm-clock\n",
+    }
+
+    def read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name in sysfs and "clocksource" in str(self.parent):
+            return sysfs[self.name]
+
+        return real_read(self, *args, **kwargs)
+
+    real_run = subprocess.run
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(0)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(_preflight.subprocess, "run", run)
 
     reads: list[str] = []
 
-    def sampled(*_: object) -> float:
-        # Recorded as well as raised: the check catches what goes wrong
-        # inside it, and would swallow the raise.
-        reads.append("read")
-        msg = "the clock check read the clock"
-        raise AssertionError(msg)
+    def trap(name: str) -> Callable[..., object]:
+        real = getattr(time, name)
+
+        def sampled(*args: object) -> object:
+            # Only litelink's own calls count. The check runs
+            # `systemd-detect-virt` through `subprocess`, which may sleep while
+            # it reaps the child — a race between the child exiting and the
+            # wait, so trapping it made this fail about half the time.
+            caller = sys._getframe(1).f_globals.get("__name__", "")
+            if not caller.startswith("litelink"):
+                return real(*args)
+
+            # Recorded as well as raised: the check catches what goes wrong
+            # inside it, and would swallow the raise.
+            reads.append(f"{caller}: time.{name}")
+            msg = "the clock check read the clock"
+            raise AssertionError(msg)
+
+        return sampled
 
     for clock in (
         "monotonic",
@@ -222,12 +266,12 @@ def test_the_clock_check_does_not_sample_and_does_not_fail(
         "clock_gettime_ns",
         "sleep",
     ):
-        monkeypatch.setattr(time, clock, sampled)
+        monkeypatch.setattr(time, clock, trap(clock))
 
     check = _clocksource()
     monkeypatch.undo()
 
-    assert not reads, "the clock check read the clock; sampling cannot prove it"
+    assert not reads, f"the clock check read the clock: {reads}"
 
     assert check.ok, "a clock risk must never fail provisioning"
 

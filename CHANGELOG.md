@@ -15,6 +15,24 @@ minor version carries breaking changes.
   dependencies all install on 3.14 and the full suite passes there. CI tests
   the floor and the top, 3.11 and 3.14.
 
+### Fixed
+
+- **A process no longer builds a new S3 client on every table load and
+  commit** (#137). pyiceberg makes a FileIO, with its own `S3FileSystem` and
+  connection pool, per `load_table` and per commit, and each sits in a
+  reference cycle that only the cycle collector frees. On Python 3.14, whose
+  collector is incremental, a reader reloading the published table every few
+  milliseconds held over a thousand idle S3 connections, enough to exhaust a
+  1,024 open-file limit on either side. litelink now reuses one FileIO per set
+  of properties for every load and commit in the process. It was wasted work
+  on every Python version; 3.14 made it visible.
+- **pyiceberg is now `>=0.12.0,<0.13`.** It was `>=0.11.1` with no cap, so
+  installs had been getting 0.12.0, released after the last lock, untested.
+  litelink is now tested on 0.12.0, and the cap keeps the next minor out until
+  it is.
+- **The preflight clock-check test no longer fails at random on `tsc` hosts.**
+  It counted `subprocess`'s own wait as the check reading the clock.
+
 ## 0.8.0 — 2026-10-03
 
 ### Changed

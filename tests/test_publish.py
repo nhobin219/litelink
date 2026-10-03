@@ -2768,3 +2768,75 @@ def test_a_disk_cached_connection_shares_published_reads_by_key(
     # The control: another key fills its own.
     read("stream-2")
     assert cached("stream-2") == filled
+
+
+def test_advance_cycles_and_reloads_reuse_one_file_io(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every load and commit of a table reuses the process's FileIO for it (#137).
+
+    pyiceberg builds a FileIO per `load_table` and per commit, each with its
+    own `S3FileSystem` and connection pool, and each in a reference cycle that
+    only the cycle collector frees. On Python 3.14 a reader reloading every few
+    milliseconds held 1,013 open S3 connections. Counted here rather than
+    measured in sockets, so the answer does not depend on when a collector runs.
+
+    Across full `advance()` cycles in which every step has work — seal,
+    compact, publish, eviction (`staging_rows`), both expiries and drains
+    (zero retention) — with a read between them, and across many bare reloads
+    of both tables.
+
+    Falsify by dropping either `_Catalog` override: every reload and commit
+    builds a new FileIO, two per load without either.
+    """
+    from pyiceberg.io.pyarrow import PyArrowFileIO
+
+    with litelink.new(
+        tmp_path,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=LogConfig(
+            target_seal_size=4096,
+            target_compact_size=16 * 1024,
+            compact_min_files=2,
+            staging_rows=100,
+            staging_snapshot_retention=timedelta(seconds=0),
+            published_snapshot_retention=timedelta(seconds=0),
+        ),
+        published=f"s3://{bucket}/prefix",
+        s3_options=s3,
+    ) as log:
+        # Warm: the first cycle builds each table's FileIO once.
+        log.extend(rows(200))
+        log.advance(flush=True)
+        published = log._published.table()
+        assert published is not None
+
+        built: list[object] = []
+        real_init = PyArrowFileIO.__init__
+
+        def counting(self: PyArrowFileIO, *args: object, **kwargs: object) -> None:
+            built.append(self)
+            real_init(self, *args, **kwargs)  # ty: ignore[invalid-argument-type]
+
+        monkeypatch.setattr(PyArrowFileIO, "__init__", counting)
+
+        snapshots = published.snapshot_count()
+        for cycle in range(1, 6):
+            log.extend(rows(300))
+            log.advance(flush=True)
+            assert log.scan(columns=[OFFSET]).read_all().num_rows == 200 + 300 * cycle
+
+        for _ in range(50):
+            published.reload()
+            log._table.reload()
+
+        # Every step had work: everything published, staging evicted to its
+        # floor, and the published table expired down from its pushes.
+        assert log.published_through() >= log.end_offset() - 1
+        assert log.staging_rows() < log.end_offset() - 1
+        assert published.snapshot_count() <= snapshots
+        assert built == [], (
+            f"{len(built)} FileIOs built across advance cycles and reloads"
+        )

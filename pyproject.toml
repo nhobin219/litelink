@@ -37,7 +37,11 @@ dependencies = [
     # the package regains the dependency the bundling exists to remove.
     "duckdb>=1.5.5,<1.5.6",
     "pyarrow>=17.0.0",
-    "pyiceberg[pyarrow,sql-sqlite]>=0.11.1",
+    # Capped at the newest minor the suite has run on. litelink overrides two
+    # of `SqlCatalog`'s private methods (`_table._Catalog`, #137), whose
+    # signatures pyiceberg changes between minors, so an unbounded range lets a
+    # release break installs with nothing tested against it.
+    "pyiceberg[pyarrow,sql-sqlite]>=0.12.0,<0.13",
     "xxhash>=3.6.0",
 ]
 
