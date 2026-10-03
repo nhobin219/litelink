@@ -950,9 +950,36 @@ cat /sys/devices/system/clocksource/clocksource0/current_clocksource
 
 The known trigger is a virtual machine using the `tsc` clocksource, where the TSC is not
 guaranteed synchronised across vCPUs — a KVM guest booted with `clocksource=tsc` is the
-reported case, at 4 regressions in 45 seconds and 13 panics in 15 minutes. Switching to
-`kvm-clock` fixed it; make the change persistent, because a sysfs write does not survive
-reboot.
+reported case, at 4 regressions in 45 seconds and 13 panics in 15 minutes. On `kvm-clock`, the
+paravirtualised clock that exists for exactly this, it measured 0 in the same window. It is not
+only litestream: every elapsed-time measurement on such a box is occasionally wrong; litestream
+is just the process that treats a negative interval as fatal.
+
+**On a KVM guest, use `kvm-clock`, and make it persistent** — a write to sysfs does not survive
+a reboot. A oneshot unit that selects it early in boot:
+
+```ini
+# /etc/systemd/system/clocksource-kvm.service
+[Unit]
+Description=Select kvm-clock as the system clocksource
+DefaultDependencies=no
+After=sysinit.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource'
+
+[Install]
+WantedBy=sysinit.target
+```
+
+```bash
+grep -qw kvm-clock /sys/devices/system/clocksource/clocksource0/available_clocksource  # a KVM guest
+sudo systemctl daemon-reload && sudo systemctl enable --now clocksource-kvm
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource                   # kvm-clock
+```
 
 `python -m litelink` warns when it sees that combination:
 

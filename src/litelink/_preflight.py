@@ -292,7 +292,9 @@ def _clocksource() -> Check:
     better = [c for c in available if c != "tsc"]
     remedy = (
         f" A paravirtualised source is available: {', '.join(better)}. Switching "
-        f"needs to be made persistent — a sysfs write does not survive reboot."
+        f"needs to be made persistent — a sysfs write does not survive reboot; "
+        f"litelink's docs/API.md, 'The sidecar needs a monotonic clock', has a "
+        f"systemd unit that does it."
         if better
         else ""
     )
