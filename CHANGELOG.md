@@ -7,6 +7,14 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **Python 3.14 support.** `requires-python` is now `>=3.11,<3.15`; the
+  dependencies all install on 3.14 and the full suite passes there. CI tests
+  the floor and the top, 3.11 and 3.14.
+
 ## 0.8.0 — 2026-10-03
 
 ### Changed

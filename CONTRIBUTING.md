@@ -101,7 +101,7 @@ be asked to fix the spec, because a document that lies is worse than a missing o
 ## Pull requests
 
 Branch from `main`, keep the PR to one thread of work, and make sure `just check` is green
-before pushing — CI runs the same four gates on Python 3.11 and 3.13, and `CI success` is the
+before pushing — CI runs the same four gates on Python 3.11 and 3.14, and `CI success` is the
 required check.
 
 Say what you changed and why in the description. If you found something on the way that you

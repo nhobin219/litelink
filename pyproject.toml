@@ -9,8 +9,8 @@ authors = [
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 # 3.11, not 3.10: 3.10 reaches end of life in October 2026, and nothing here
-# needs to run on it. pyiceberg 0.11 caps at <3.14, so that is the live range.
-requires-python = ">=3.11,<3.14"
+# needs to run on it. Capped at the newest release the suite has run on.
+requires-python = ">=3.11,<3.15"
 keywords = ["iceberg", "capture", "sqlite", "parquet", "append-only"]
 classifiers = [
     "Development Status :: 3 - Alpha",

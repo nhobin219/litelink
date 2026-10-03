@@ -148,9 +148,9 @@ jobs:
       fail-fast: false
       matrix:
         # The declared floor and the current top of the supported range. The
-        # floor is what .python-version pins locally, so a 3.13-only regression
+        # floor is what .python-version pins locally, so a 3.14-only regression
         # is the one CI catches that a dev machine does not.
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
