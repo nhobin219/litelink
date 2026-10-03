@@ -47,7 +47,7 @@ PLATFORMS = {
 #     "An error occurred while trying to automatically install ... 'avro'"
 # So a bundle that carries `iceberg` without `avro` is not offline-capable, and
 # the failure appears only once everything else has been provisioned correctly.
-EXTENSIONS = ("avro", "iceberg", "httpfs", "cache_httpfs")
+EXTENSIONS = ("avro", "iceberg", "httpfs", "cache_httpfs", "aws")
 
 # Extensions DuckDB publishes from its COMMUNITY repository rather than the core
 # one: a different host, signed with the community key. `cache_httpfs` is the
@@ -98,6 +98,10 @@ CHECKSUMS = {
     "linux_arm64/cache_httpfs": "408964419cb536835ee8543cbd8207d445c1600e46200530985046334a64510d",
     "osx_amd64/cache_httpfs": "7bb635f9a920276b8d9b0e9559cd2df9bc597139fa7773ced1b34a9ce45ad007",
     "osx_arm64/cache_httpfs": "7acd41c5a07a913abeae004100b34ee4cf7e0c68e41e1ec4338f6e38d21a47d8",
+    "linux_amd64/aws": "7454a7830b21e678f1700c6cc428540be3a688e959c81515fd1bfc0a538db3b3",
+    "linux_arm64/aws": "c0c2ff813d07a1f69a3c06fb69663b93299f1145dbaab9aaeee1be4003da7170",
+    "osx_amd64/aws": "99daaf77a77d203d550f4eba9a6f56acb4f5062401f372c312bcaad21b4cc2f5",
+    "osx_arm64/aws": "2bde12c71c010ef3e4e510504dce276eb4ae77dea150ade1a4de632832604bbf",
 }
 
 

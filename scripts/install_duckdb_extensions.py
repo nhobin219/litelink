@@ -54,7 +54,7 @@ READ_PATH = ("iceberg", "avro")
 # why they are opt-in rather than part of the required set. `cache_httpfs` is
 # the reader's on-disk block cache over httpfs (#118), and comes from DuckDB's
 # COMMUNITY repository rather than the core one.
-REMOTE = ("httpfs", "cache_httpfs")
+REMOTE = ("httpfs", "aws", "cache_httpfs")
 COMMUNITY = frozenset({"cache_httpfs"})
 
 

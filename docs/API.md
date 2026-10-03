@@ -438,7 +438,8 @@ litelink.duckdb_connection(
 
 It loads `avro` and `iceberg`. **`s3_options` is what makes a connection read S3**: given, it
 also loads `httpfs` and creates the S3 secret from those options, and an empty `S3Options()`
-takes everything from the environment and then the AWS credential chain. Without it nothing S3
+takes everything from the environment and then the AWS credential chain. A chain secret also
+loads `aws`, which resolves it; explicit keys don't need it. Without it nothing S3
 is loaded, so a local reader pays nothing for it.
 
 ```python
@@ -478,7 +479,7 @@ actually read from S3, needs no write to either table, and survives restarts; it
   cap of its own, and left alone keeps only 5% free.
 - **`memory_cache=False` turns off every RAM layer**, `cache_httpfs`'s own read-through cache
   included.
-- **`cache_httpfs` is bundled in the platform wheels.** Elsewhere, `just duckdb-extensions
+- **`cache_httpfs` and `aws` are bundled in the platform wheels.** Elsewhere, `just duckdb-extensions
   --remote` installs it, and without it `disk_cache=True` raises `ExtensionMissing`.
 
 ```python

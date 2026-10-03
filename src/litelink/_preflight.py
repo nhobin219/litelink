@@ -351,8 +351,10 @@ def preflight(
     checks: list[Check] = [_read_path()]
     if published is not None:
         checks.append(_extension("httpfs", required=False))
-        # The reader's disk cache (#118), on by default for an S3 published
-        # table: a machine missing it fails its first remote read.
+        # What a credential-chain secret (a profile, instance metadata, SSO)
+        # needs to resolve; explicit keys do not.
+        checks.append(_extension("aws", required=False))
+        # The reader's disk cache (#118), for a connection that asks for one.
         checks.append(_extension("cache_httpfs", required=False))
         checks.append(_published(published, name, s3_options))
 
