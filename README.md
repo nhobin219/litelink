@@ -298,6 +298,13 @@ offset window so nothing the dead machine served is reissued.
 litelink emits the litestream config; your supervisor runs the binary. Full walkthrough in
 [`examples/`](examples/) and [`docs/RUNTIME.md`](docs/RUNTIME.md).
 
+**On a KVM guest, run on the `kvm-clock` clocksource before turning on `wal_replication`.**
+litestream panics on a single backwards tick of the monotonic clock, and a KVM guest on `tsc`
+produces them. The sidecar then crash-loops while logging healthy syncs, and the WAL stops
+being replicated without anything saying so. `python -m litelink` warns about it, and
+[`docs/API.md`](docs/API.md#the-sidecar-needs-a-monotonic-clock) has a systemd unit that makes
+`kvm-clock` stick across reboots.
+
 ## On disk
 
 One directory per stream, holding everything that stream owns — and the published prefix
