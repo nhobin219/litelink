@@ -552,25 +552,25 @@ def test_an_ingested_range_survives_the_whole_published_table_cycle(
         assert log.append(rows(1)[0]) == 3401
 
 
-def test_a_loaded_range_reaches_the_published_table_whole(
-    tmp_path: Path, bucket: str, s3: S3Options
+@pytest.mark.parametrize("replicated", [True, False])
+def test_a_load_flushes_its_tail_by_default_only_when_the_wal_is_replicated(
+    tmp_path: Path, bucket: str, s3: S3Options, replicated: bool
 ) -> None:
-    """No tail left behind, which is the whole point of loading under a published table.
+    """A loaded range gets the same durability as an appended one.
 
-    A load's rows never enter the buffer, so WAL replication cannot carry them
-    and the published table is their ONLY second copy. This used to assert the opposite
-    — that one `publish()` reached everything except the short last file, because
-    `stable_prefix` holds a trailing run still under the compaction budget. The
-    lag was documented and was said to terminate once roughly another budget of
-    rows arrived above it.
+    With `wal_replication`, an appended row is off-box from its commit, and a
+    load's rows never enter the buffer the replica ships — so the published
+    table is their only off-box copy, and the default flushes the short last
+    file that `stable_prefix` would hold back. On a quiet stream that tail
+    otherwise stays on one disk indefinitely: 113,399 rows on the deployment
+    that found it.
 
-    On a stream that goes quiet it does not terminate. Measured on a real
-    deployment: 113,399 loaded rows on one disk, `coverage()` reporting no gap,
-    for as long as the stream stayed slow. So `ingest` now pushes its own output
-    with `flush=True`, and the assertion flips.
+    Without it, an appended trailing run stays local until it fills, and so
+    does a load's: the default does not flush, and the tail merges with what
+    is sealed after it instead of becoming an undersized published file.
 
-    Falsify by passing `publish=False`: `published_through()` drops back below `hi`
-    and the tail file is local-only again.
+    Falsify by always flushing (the unreplicated case pushes the tail), or by
+    never flushing (the replicated case leaves it behind).
     """
     with litelink.new(
         tmp_path,
@@ -583,22 +583,28 @@ def test_a_loaded_range_reaches_the_published_table_whole(
             compact_min_files=2,
             staging_snapshot_retention=timedelta(seconds=0),
             published_snapshot_retention=timedelta(seconds=0),
+            wal_replication=replicated,
         ),
         published=f"s3://{bucket}/prefix",
         s3_options=s3,
     ) as log:
         _, hi = log.ingest(table(3000)) or (0, 0)
 
-        # No explicit publish: the load pushed its own output, tail included.
-        assert log.published_through() >= hi - 1, (
-            "the loaded range is not second-copied"
-        )
-        assert log.buffered_rows() == 0
+        if replicated:
+            assert log.published_through() >= hi - 1, (
+                "a replicated log's loaded range is not second-copied"
+            )
+        else:
+            assert 0 < log.published_through() < hi - 1, (
+                "an unreplicated log flushed its load's short tail"
+            )
 
-        # And the opt-out still leaves it behind, which is what the flag means.
-        _, hi2 = log.ingest(table(500, start=hi), publish=False) or (0, 0)
+        # Either default can be overridden, and `publish=False` skips the push.
+        _, hi2 = log.ingest(table(500, start=hi), flush=True) or (0, 0)
+        assert log.published_through() >= hi2 - 1
 
-        assert log.published_through() < hi2 - 1
+        _, hi3 = log.ingest(table(500, start=hi2), publish=False) or (0, 0)
+        assert log.published_through() < hi3 - 1
 
 
 # -- the codec (§12) -----------------------------------------------------------

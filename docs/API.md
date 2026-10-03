@@ -275,18 +275,29 @@ top-level column, where it prunes.
 
 ```python
 log.ingest(source: pa.Table | pa.RecordBatchReader, *,
-           publish: bool = True) -> tuple[int, int] | None
+           publish: bool = True, flush: bool | None = None) -> tuple[int, int] | None
 ```
 
 Writes Parquet directly and never puts the rows through SQLite. Returns the offsets it
 assigned as `[start, end)`, or `None` for a source with no rows.
 
 **It pushes its own output to the published table**, compacting first, and
-`publish=False` opts out. Those rows never enter the buffer, so WAL replication cannot carry them
-and the published table is their only second copy — while an ordinary `publish` holds a load's short last
-file back behind `stable_prefix` for a merge a quiet stream never earns. If the push fails the
-load is still durable and the error says so; retry the push, never the load, which would
-reserve a fresh range and duplicate it.
+`publish=False` opts out. If the push fails the load is still durable and the error says so;
+retry the push, never the load, which would reserve a fresh range and duplicate it.
+
+**`flush` decides whether the load's short last file is pushed too, and by default it follows
+`wal_replication`: a loaded range gets the same durability as an appended one.** An ordinary
+`publish` holds back a trailing run still under `target_compact_size`, and a load's last file
+is short unless the load divides evenly.
+
+- **With `wal_replication`**, an appended row is off-box from its commit. A loaded row never
+  enters the buffer the replica ships, so the published table is its only off-box copy, and
+  the default flushes: otherwise a quiet stream leaves the tail on one disk indefinitely.
+- **Without it**, an appended trailing run stays local until it fills, and so does a load's.
+  The default does not flush: the tail merges with what is sealed after it rather than becoming
+  an undersized file in the immutable table, and the source corpus is still a copy of it.
+
+`flush=True` or `flush=False` overrides the default either way.
 
 The buffer exists to make a row durable before it is in Parquet, and a bulk load's source is
 already durable — so every row pushed through it at `synchronous=FULL` pays a second time for
@@ -309,13 +320,11 @@ That is a fact about scope, and it is stated rather than enforced: `ingest` runs
 reads the same flag and the next eviction would drop the buffer's copy of everything already
 captured.
 
-**The published table is a loaded range's only second copy.** When the push did not run, compare
-`published_through()` against the `end - 1` this returns; until they meet, the corpus you
-loaded from is the range's second copy.
-`publish` lags the tail on purpose — it holds back a trailing run still under
-`target_compact_size` — and the run settles once roughly another
-`target_compact_size` of rows sits above it, whether from capture or from the
-next `ingest`.
+**When the push did not cover the load** — `publish=False`, an unflushed tail, or a push that
+failed — compare `published_through()` against the `end - 1` this returns; until they meet, the
+corpus you loaded from is the range's second copy. An unflushed tail settles once roughly
+another `target_compact_size` of rows sits above it, whether from capture or from the next
+`ingest`.
 
 **A load that fails costs its reservation.** The offsets of the file being written are gone,
 leaving a gap. Files stay non-overlapping and adjacent in offset order, which is what §6
