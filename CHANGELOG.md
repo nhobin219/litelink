@@ -7,6 +7,20 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Changed
+
+- **`ingest()` flushes its short last file by default only when the log
+  replicates its WAL** (`flush=None`). A loaded range now gets the same
+  durability as an appended one. With `wal_replication`, the published table
+  is a loaded row's only off-box copy, so the tail is pushed as before.
+  Without it, an appended trailing run stays local until it fills, and now so
+  does a load's: it merges with what is sealed after it instead of becoming an
+  undersized file in the published table. **On a log without
+  `wal_replication`, `ingest()` no longer pushes the tail**; pass
+  `flush=True` to keep the old behaviour.
+
 ## 0.7.0 — 2026-10-02
 
 > **⚠️ `seal()` CHANGED MEANING — CHECK EVERY CALL.** A bare `seal()` used

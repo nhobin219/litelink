@@ -79,7 +79,7 @@ whole log for the load. Eviction, reclaiming and the sweeps are left to the next
   │ staging                   │   the whole log is claimed for the load
   └───────────────────────────┘
                 │  compact()            merges only small files already in staging
-                │  publish(flush=True)  the load's only second copy, last short file included
+                │  publish(flush=…)     the short last file too, by default iff wal_replication
                 ▼
   ┌───────────────────────────┐
   │ published                 │   skip with ingest(..., publish=False)

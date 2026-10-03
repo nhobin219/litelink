@@ -2173,6 +2173,7 @@ class WriteHandle(LocalReadHandle):
         source: pa.Table | pa.RecordBatchReader,
         *,
         publish: bool = True,
+        flush: bool | None = None,
     ) -> tuple[int, int] | None:
         """Write Arrow straight into the immutable tier (§13.4). Returns the
         offsets it took as `[start, end)` — half-open, like every range
@@ -2213,66 +2214,57 @@ class WriteHandle(LocalReadHandle):
         not acceptable. `ingest` is called BY the single writer, in its process,
         and that is part of the contract rather than something checked.
 
-        **`wal_replication` is not refused, and the reason it once was is worth
-        recording.** WAL shipping genuinely cannot carry a bulk range: with
-        replication on the buffer IS the off-box copy until the published table
-        has the range (§3a), and these rows never enter the buffer. Reproduced
-        against a zero-lag replica: 920 rows acknowledged, 420 restored,
-        `recovery()` reporting plain success.
+        **`wal_replication` is not refused.** WAL shipping cannot carry a bulk
+        range: with replication on the buffer IS the off-box copy until the
+        published table has the range (§3a), and these rows never enter the
+        buffer. Reproduced against a zero-lag replica: 920 rows acknowledged,
+        420 restored, `recovery()` reporting plain success.
 
-        That is a true statement about SCOPE, and it was briefly turned into a
-        refusal — load with replication off, turn it on afterwards. Which is
+        Refusing — load with replication off, turn it on afterwards — would be
         strictly worse, because `evict("buffer")` reads the same flag: turn
         replication off and the next eviction stops retaining its rows, so the
         buffer's copy of everything ALREADY captured is dropped. Measured on a
         replicated log with a published table: 300 sealed rows retained in the
         buffer, `set_config(wal_replication=False)`, one more seal, and all 300
-        are gone from it with the published table holding none — 350
-        acknowledged rows in local Parquet alone. To load rows that could never
-        be replicated, the workaround stripped the off-box copy from rows that
-        were.
-
-        It also fixed nothing: the range is uncovered until `publish` either way,
-        and `recovery()` reports plain success either way. A refusal that
-        relocates an exposure, adds a second one, and leaves the reporting
-        defect untouched is not a safety measure. What the caller needs is the
-        scope stated, which is the paragraph below.
+        are gone from it with the published table holding none. The range is
+        uncovered until `publish` either way; what closes it is the push below,
+        flushed by default on a replicated log.
 
         **This pushes its own output to the published table**, and
-        `publish=False` opts out. That is the fix for the paragraph below, which
-        described the old behaviour: a load's rows never enter the buffer, so
-        WAL replication cannot carry them and the published table is their only
-        second copy — while an ordinary `publish` held the load's short last
-        file back behind `stable_prefix`. On a stream that then went quiet the
-        run never settled. Measured on the deployment that found it: 113,399
-        rows on one disk, with `coverage()` reporting no gap.
+        `publish=False` opts out. The push runs after the load is durable, so a
+        failure leaves the rows loaded and raises saying so — retry the push,
+        never the load, which would reserve a fresh range and duplicate it.
 
-        The push runs after the load is durable, so a failure leaves the rows
-        loaded and raises saying so — retry the push, never the load, which
-        would reserve a fresh range and duplicate it.
-
-        **The published table is still a loaded range's only second copy**,
-        which is what the push above is for. An ORDINARY `publish` is not enough
-        and that is why this does not call one: `stable_prefix` holds back a
+        **`flush` decides whether the load's short last file goes too, and by
+        default it follows `wal_replication`: a loaded range gets the same
+        durability as an appended one.** An ordinary `publish` holds back a
         trailing run still under `target_compact_size`, because a run with room
         in it may yet take files that have not been written — and the last file
-        of a load is short unless the load divides evenly. Measured: 3000 rows
-        loaded into 11 files, one `publish()`, `published_through()` 2830, the
-        last 170 rows in one staging file with `coverage()` reporting no gap.
+        of a load is short unless the load divides evenly.
 
-        That was documented as terminating, since the run settles once roughly
-        another `target_compact_size` of rows arrives above it. On a stream that
-        goes quiet it does not: 113,399 loaded rows sat on one disk on the
-        deployment that found this, across nine streams and ~698,000 rows. The
-        window scaled by the arrival rate, and a slow stream has none.
+        - **With `wal_replication`**, an appended row has an off-box copy from
+          the moment it commits: the WAL replica, and the buffer keeps it until
+          the published table has it (§3a). Loaded rows never enter the buffer,
+          so nothing the replica ships contains them, and the published table
+          is their only off-box copy. So the default flushes: holding the tail
+          back would leave a range that replication promises to cover on one
+          disk for as long as the stream stays quiet. Measured on the deployment
+          that found it: 113,399 loaded rows on one disk across nine streams,
+          with `coverage()` reporting no gap.
+        - **Without it**, an appended row's only copy is local until `publish`
+          pushes it, and a quiet stream's trailing run stays local the same way.
+          So the default does not flush: the tail stays in staging and merges
+          with what is sealed after it, rather than becoming an undersized file
+          in the immutable table. The source corpus is still a second copy of
+          those rows, which is more than an appended row has.
+
+        `flush=True` or `flush=False` overrides the default either way;
+        `publish=False` skips the push, and `flush` with it.
 
         **Compare `published_through()` against the `end - 1` this returns
-        whenever the push did not run** — `publish=False`, or a push that raised
-        after the load had landed. Until they meet, the corpus you loaded from
-        is the range's second copy, which is the same durability this path's
-        whole premise rests on: the source is already durable, which is why the
-        buffer is not in the way. Do not enable replication expecting it to
-        close that window — nothing it ships contains these rows.
+        whenever the push did not cover the load** — `publish=False`, an
+        unflushed tail, or a push that raised after the load had landed. Until
+        they meet, the corpus you loaded from is the range's second copy.
 
         Files come out sized at `target_compact_size` and sorted by `sort_by`,
         which is what makes them indistinguishable from a compacted file and so
@@ -2334,9 +2326,13 @@ class WriteHandle(LocalReadHandle):
         # it merges files the push would then take instead, which is the same
         # rows by another name.
         #
-        # `flush`, because the trailing run is precisely what has no
-        # second copy — `stable_prefix` holds a load's short last file back for
-        # a merge that a quiet stream never earns.
+        # `flush` by default only when the log replicates its WAL: then the
+        # trailing run is the one part of the log with no off-box copy, since
+        # `stable_prefix` holds a load's short last file back for a merge a
+        # quiet stream never earns. Read at the call, like every setting.
+        if flush is None:
+            flush = self.config.wal_replication
+
         if loaded is not None and publish:
             try:
                 # COMPACT first, and it is not tidiness. The push below takes
@@ -2348,7 +2344,7 @@ class WriteHandle(LocalReadHandle):
                 # Measured on five small seals: six undersized objects pushed
                 # without this, one with it.
                 self.compact()
-                self.publish(flush=True)
+                self.publish(flush=flush)
             except Exception as exc:
                 # The LOAD succeeded and its rows are durable in Parquet; only
                 # the second copy is missing. Saying so leading with that is the
@@ -2358,7 +2354,7 @@ class WriteHandle(LocalReadHandle):
                     f"loaded offsets [{loaded[0]}, {loaded[1]}) successfully, but "
                     f"could not push them to the published table: {exc}. The rows are in "
                     f"local Parquet and are NOT yet second-copied; retry with "
-                    f"publish(flush=True) rather than re-running the "
+                    f"publish(flush={flush}) rather than re-running the "
                     f"load, which would reserve a new range"
                 )
                 raise RuntimeError(msg) from exc
