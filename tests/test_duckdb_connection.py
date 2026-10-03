@@ -8,7 +8,7 @@ and a missing extension raised as `ExtensionMissing` naming the fix.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import pytest
@@ -147,6 +147,48 @@ def test_no_credentials_anywhere_names_the_fix(
 
     assert "AWS_ACCESS_KEY_ID" in str(caught.value)
     assert isinstance(caught.value.__cause__, duckdb.Error)
+
+
+def test_a_credential_chain_loads_aws_itself_without_autoloading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A chain secret needs DuckDB's `aws` extension, and litelink loads it.
+
+    Left to DuckDB, creating a `credential_chain` secret autoinstalls `aws`:
+    online that is a silent download the bundling exists to prevent, and
+    offline it fails, which `create_secret` then reported as missing
+    credentials while the profile was right there. A checkout never showed it,
+    because its DuckDB home already held `aws` and autoload found it.
+
+    So DuckDB's autoinstall and autoload are switched off here, and the secret
+    is created from a profile: it works only if litelink loads `aws` itself.
+
+    Falsify by dropping the `aws` load from `load_s3_extensions`: the secret
+    fails to create and this raises.
+    """
+    aws_environment(monkeypatch, tmp_path, credentials=True)
+    monkeypatch.setenv("AWS_REGION", "eu-west-2")
+    real_connect = duckdb.connect
+
+    def connect(*args: Any, **kwargs: Any) -> duckdb.DuckDBPyConnection:
+        config = {
+            **kwargs.pop("config", {}),
+            "autoinstall_known_extensions": False,
+            "autoload_known_extensions": False,
+        }
+        return real_connect(*args, config=config, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", connect)
+    connection = litelink.duckdb_connection(s3_options=litelink.S3Options())
+
+    assert "aws" in loaded(connection)
+    assert "provider=credential_chain" in secrets(connection)["litelink_s3"]
+
+    # Explicit keys need only `httpfs`, so `aws` is not loaded for them.
+    keyed = litelink.duckdb_connection(
+        s3_options=litelink.S3Options(access_key="key", secret_key="secret")
+    )
+    assert "aws" not in loaded(keyed)
 
 
 def test_a_secret_installed_on_a_connection_reaches_its_cursors() -> None:

@@ -26,6 +26,14 @@ minor version carries breaking changes.
   1,024 open-file limit on either side. litelink now reuses one FileIO per set
   of properties for every load and commit in the process. It was wasted work
   on every Python version; 3.14 made it visible.
+- **Reading S3 with credentials from a profile, instance metadata or SSO no
+  longer needs the network, or fails offline as "no S3 credentials".** That
+  `credential_chain` secret needs DuckDB's `aws` extension, which litelink
+  neither bundled nor loaded, so DuckDB downloaded it on first use: silently
+  online, and offline a failure blamed on missing credentials. The platform
+  wheels now bundle `aws` (about 28 MB more installed) and litelink loads it
+  whenever the secret uses the chain; `python -m litelink` checks for it.
+  Explicit keys never needed it.
 - **pyiceberg is now `>=0.12.0,<0.13`.** It was `>=0.11.1` with no cap, so
   installs had been getting 0.12.0, released after the last lock, untested.
   litelink is now tested on 0.12.0, and the cap keeps the next minor out until

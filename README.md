@@ -129,7 +129,7 @@ machine reads the published table with no litelink at all.
 
 Wheels for Linux and macOS on x86-64 and arm64 carry a checksum-verified litestream and the
 DuckDB extensions litelink loads, so a box with no egress still reads, writes and restores.
-That costs ~124 MB. Run `python -m litelink` to check a machine before you rely on it; see
+That costs ~152 MB. Run `python -m litelink` to check a machine before you rely on it; see
 [`docs/RUNTIME.md`](docs/RUNTIME.md) for anywhere else.
 
 ## API

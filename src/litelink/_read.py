@@ -234,6 +234,31 @@ def load_extension(
         raise ExtensionMissing(msg) from exc
 
 
+def uses_credential_chain(options: S3Options) -> bool:
+    """Whether `secret_sql` builds a `credential_chain` secret for `options`.
+
+    A chain secret needs DuckDB's `aws` extension, which resolves the chain;
+    `httpfs` alone cannot. Explicit keys make a plain `config` secret and need
+    only `httpfs`.
+    """
+    return options.access_key is None or options.secret_key is None
+
+
+def load_s3_extensions(
+    connection: duckdb.DuckDBPyConnection, options: S3Options
+) -> None:
+    """`httpfs`, and `aws` when the secret will use the credential chain.
+
+    `aws` is loaded explicitly, from the bundle or this machine's DuckDB home,
+    like every other extension here. Left to DuckDB, creating a chain secret
+    autoinstalls it: a silent download online, and offline a failure that
+    reads as missing credentials when the profile is right there.
+    """
+    load_extension(connection, "httpfs", remote=True)
+    if uses_credential_chain(options):
+        load_extension(connection, "aws", remote=True)
+
+
 def create_secret(target: duckdb.DuckDBPyConnection, options: S3Options) -> None:
     """Create or replace the S3 secret on `target`, from resolved `options`.
 
@@ -261,7 +286,8 @@ def create_secret(target: duckdb.DuckDBPyConnection, options: S3Options) -> None
 def install_s3_secret(
     connection: duckdb.DuckDBPyConnection, s3_options: S3Options | None = None
 ) -> None:
-    """Load `httpfs` and create or replace the S3 secret on `connection`.
+    """Load `httpfs` (and `aws` for a credential chain) and create or replace
+    the S3 secret on `connection`.
 
     What `duckdb_connection(s3_options=...)` does after loading the read path, for
     a connection litelink did not build — one shared database handing out
@@ -275,8 +301,9 @@ def install_s3_secret(
     provisioned, and `RuntimeError`, naming the fix, if no credentials are
     found.
     """
-    load_extension(connection, "httpfs", remote=True)
-    create_secret(connection, (s3_options or S3Options()).resolved())
+    resolved = (s3_options or S3Options()).resolved()
+    load_s3_extensions(connection, resolved)
+    create_secret(connection, resolved)
 
 
 # Extensions published from DuckDB's COMMUNITY repository rather than the core
@@ -500,6 +527,7 @@ class Reader:
         # answer never touches the network (I5).
         self._published = published
         self._remote_ready = False
+        self._aws_ready = False
         # Which tiers a query needs, per tier (#90). Read from disk per query;
         # it re-decodes only when a write has bumped the tier rows' generation.
         self._stored = StoredTiers(buffer)
@@ -556,14 +584,21 @@ class Reader:
             # extension to load and no credentials to install.
             return location, covered
 
+        options = self._published.s3.resolved()
+        # Once per connection each. `httpfs` and `aws` are not in the local
+        # read path, so a log whose queries never need the remote published
+        # table never pays for them — §7's rule that a hot read is offline.
+        # Credentials are resolved per query, so `aws` is loaded the first time
+        # one resolves to the chain rather than only at the first.
         if not self._remote_ready:
-            # Once per connection. `httpfs` is not in the local read path, so a
-            # log whose queries never need the remote published table never
-            # pays for it — §7's rule that a hot read is offline.
             load_extension(self._connect(), "httpfs", remote=True)
             self._remote_ready = True
 
-        create_secret(cursor, self._published.s3.resolved())
+        if not self._aws_ready and uses_credential_chain(options):
+            load_extension(self._connect(), "aws", remote=True)
+            self._aws_ready = True
+
+        create_secret(cursor, options)
 
         return location, covered
 

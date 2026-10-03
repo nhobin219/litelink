@@ -1939,8 +1939,8 @@ The consequence worth planning for is that local disk holds roughly
    its CI; an application that `pip install`s the library runs neither, so it got the read path
    and no extensions, and its first read was the network read the design says it is not.
 
-   Since v0.1.0 the platform wheels carry `iceberg`, `avro` and `httpfs` built for the DuckDB
-   they pin, alongside a checksum-verified litestream, and `python -m litelink` reports what a
+   The platform wheels carry `iceberg`, `avro`, `httpfs`, `cache_httpfs` and `aws` built for
+   the DuckDB they pin, alongside a checksum-verified litestream, and `python -m litelink` reports what a
    machine is missing. Verified with no network, nothing on PATH and an empty DuckDB home.
 
    Two things the closing turned up. `avro` is not requested by litelink at all — `iceberg`
