@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from litelink._buffer import _NO_ROW_LIMIT, Buffer
+from litelink._buffer import _NO_ROW_LIMIT, PUBLISHED_THROUGH_KEY, Buffer
 from litelink._claim import new_owner
 from litelink._fs import write_parquet
 from litelink._published import Published
@@ -310,7 +310,7 @@ class Maintenance:
 
     # -- compaction ---------------------------------------------------------
 
-    PUBLISHED_THROUGH_KEY = "published_through"
+    PUBLISHED_THROUGH_KEY = PUBLISHED_THROUGH_KEY
 
     def published_through(self) -> int:
         """Highest offset the published table is known to hold, 0 if none (§5,
@@ -319,49 +319,41 @@ class Maintenance:
         A prefix, always: files cover contiguous non-overlapping ranges (§4)
         and `publish` pushes them in order, so one integer describes it.
 
-        Cached in `meta` rather than read from the published table, so eviction
-        can ask a keyed read instead of a network round trip to find out what it
-        may drop.
+        Kept in `meta` rather than read from the published table, so eviction
+        asks a keyed read instead of a network round trip to find out what it
+        may drop — and keeps working on a machine cut off from object storage.
         """
         recorded = self._buffer.get_meta(self.PUBLISHED_THROUGH_KEY)
 
         return 0 if recorded is None else int(recorded)
 
     def published_prefix(
-        self, files: Sequence[DataFile], prefix: str | None, *, include_intents: bool
+        self, files: Sequence[DataFile], *, include_intents: bool
     ) -> int:
         """The `end` of the longest prefix of `files` the published table holds
         (§4a), or 0 when it holds none of it.
 
-        I4 asked of segments. A file is the published table's business if the
-        published table holds THAT FILE'S ROWS, which `publish` wrote down when
-        it pushed it. The walk stops at the first file not fully held, so the
-        answer stays a prefix — which is what eviction needs, since it removes
-        one.
+        A file is the published table's business if the published table holds
+        THAT FILE'S ROWS. The walk stops at the first file not fully held, so
+        the answer stays a prefix — which is what eviction needs, since it
+        removes one.
 
         **Coverage, not equality.** The two tiers cut the same rows into files
-        independently, and asking whether a staging range EQUALS a published one
-        is wrong whenever they differ — and a published table re-cut by an
-        earlier version does — so every staging file would match nothing, for
-        ever: eviction would clamp to zero and stop, and compaction would stop
-        seeing published files as the published table's business and merge
-        across its span. Neither would heal, because nothing re-cuts the
-        published table back.
+        independently, so a staging file is held when its range lies inside
+        what the published table covers, whatever the published files' own
+        boundaries.
 
-        Exact rather than conservative in both directions, and that is the
-        point. A watermark had to be raised before a register to cover the crash
-        between the two, so it named ranges the published table might not hold,
-        and it had to be reset when the log was re-pointed, so it went backwards
-        past ranges the published table did hold. Neither is expressible here:
-        the row is written when the copy exists, and it names the bucket it went
-        to.
+        What the published table covers is `Buffer.published_ranges`: the
+        watermark `publish` raises only after a register lands, plus — for
+        compaction's question, `include_intents` — the copies a push has
+        intended and not yet confirmed.
         """
         ordered = sorted(files, key=lambda f: f.start)
         if not ordered:
             return 0
 
         covered = self._buffer.published_ranges(
-            prefix, ordered[0].start, include_intents=include_intents
+            ordered[0].start, include_intents=include_intents
         )
         reached = 0
         for data_file in ordered:
@@ -422,7 +414,7 @@ class Maintenance:
         # published at, as the published copy does. What it buys is that no merge can ever straddle a range a
         # published table holds. `_push` applies the same exclusion, or the two
         # deadlock.
-        published = self.published_prefix(local, None, include_intents=True)
+        published = self.published_prefix(local, include_intents=True)
         pending = [f for f in local if f.end > published]
 
         # One read, so the two limits describe the same policy.
@@ -517,7 +509,7 @@ class Maintenance:
         # what the published table holds makes every push refuse in
         # `_refuse_straddle`: the watermark never advances again, and eviction
         # pins on it.
-        published = self.published_prefix(current, None, include_intents=True)
+        published = self.published_prefix(current, include_intents=True)
         if any(f.start < published for f in run):
             claim.release()
 
@@ -685,9 +677,7 @@ class Maintenance:
         self._table.reload()
         files = self._table.data_files()
         if self.config.wal_replication and self._published.remote():
-            boundary = self.published_prefix(
-                files, self._published.uri, include_intents=False
-            )
+            boundary = self.published_prefix(files, include_intents=False)
         else:
             boundary = max((f.end for f in files), default=0)
 
@@ -791,7 +781,7 @@ class Maintenance:
             # I4 asks whether the published table HAS it, so intents are
             # excluded: deleting the only staging copy on the strength of an
             # intended one is the loss this whole record exists to prevent.
-            self.published_prefix(files, self._published.uri, include_intents=False),
+            self.published_prefix(files, include_intents=False),
         )
 
         # Snapped DOWN to a file boundary, against the list as it is now. The

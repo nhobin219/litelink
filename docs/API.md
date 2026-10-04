@@ -51,7 +51,8 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
              s3_options=None, start_offset=1)              -> WriteHandle
 litelink.open(root, name, *, s3_options=None)              -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
-litelink.restore(root, name, *, published, s3_options=None, binary=None) -> WriteHandle
+litelink.restore(root, name, *, published, s3_options=None, binary=None,
+                 replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
 ```
 
 **`open` is overloaded on the `read_only` literal**, so the type you get is static:
@@ -135,7 +136,8 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, published=None, s
              start_offset=1) -> WriteHandle
 litelink.open(root, name, *, s3_options=None) -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
-litelink.restore(root, name, *, published, s3_options=None, binary=None) -> WriteHandle
+litelink.restore(root, name, *, published, s3_options=None, binary=None,
+                 replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
 ```
 
 **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
@@ -168,7 +170,45 @@ process.
 not the one that wrote it: restores `buffer.db` from the WAL replica, rebuilds the local
 Iceberg table *empty*, adopts the published table through `version-hint.text`, and reserves an offset
 window so nothing the dead machine served is reissued. `binary` names the litestream
-executable if it is not on `PATH`. It refuses a root that already holds this log
+executable if it is not on `PATH`.
+
+**With no WAL replica, `restore` rebuilds the log from its published table** (#144) — a log that
+ran with `wal_replication` off, or whose published table is a local directory. The published
+table is then everything that can be recovered; rows the dead machine had buffered or sealed but
+not published are gone. The log comes back at its own name, with no seam: its schema and
+`sort_by` read from the published table (`publish` records them there; a table only an older
+version published has them derived from its Iceberg schema, Arrow field metadata excepted), the
+default `LogConfig` — call `set_config` to restore a deployment's policy — and the offset counter
+above everything the old log is known to have issued, plus a 2^40 fence. Known means the
+`litelink.issued_through` every publish records in its commit — at least the published end — or, for
+a table only an older version published, the end itself; the fence covers what the dead machine
+issued after its last publish, so no offset a reader saw names a different row.
+
+**A restore resumes above the freshest record of what the old log issued, by that record's
+reserve**, and each reserve covers what can have been issued after its own record:
+
+| Record | Unseen after it | Reserve |
+| --- | --- | --- |
+| the WAL replica's sequence | replication lag | `replica_reserve`, 2^20 |
+| the published table's `litelink.issued_through`, or its end on a table only an older version published | everything issued since the last publish | `published_reserve`, 2^40 |
+
+A healthy replica is ahead of the last publish, so its record decides. A replica whose sidecar
+stopped shipping is behind it, and the published record decides, with the larger reserve. With no
+replica the published record is all there is.
+
+**Delete the replica when you turn WAL replication off.** A replica is always used when one
+exists, for its unpublished rows and its settings, and offsets alone cannot tell a few seconds of
+lag from a replica abandoned months ago. One left behind is still found: its offsets are safe, since
+the published record is fresher and decides, but the log comes back with the settings it had when
+replication stopped. The replica is `<published>/<name>/_wal`.
+
+**2^40 serves the unstamped end as well as the stamp.** From the published end, what is unseen also
+includes what the log had not published at its last push. That is bounded by what fits locally
+unpublished (the buffer and the staging files publish had not pushed yet), at most millions of rows
+against 2^40's 1.1 trillion. A wider default would buy nothing and spend the int64 offset space each
+replica-less restore consumes: 2^40 leaves room for about 8 million of them, 2^60 for 8. A replica, when there is one, is always used: it
+can only be fresher. A replica that exists but can't be reached (a missing bucket, refused
+credentials) raises rather than falling back, and the fallback logs a warning saying what it did. It refuses a root that already holds this log
 (`FileExistsError`) or whose `litestream.yml` replicates a different one. Split-brain is not
 detected — if the primary is alive you now have two writers on one published table.
 
@@ -386,7 +426,7 @@ has moved its rows there. A bounded hot query stays local however much has been 
 
 The published table's row changes when eviction moves rows below the staging table: eviction widens it
 before its commit. `publish` leaves it alone. It is recomputed from the
-published table's manifests at the first `publish`, on a re-point, at `restore`, and at `open` for a log
+published table's manifests at the first `publish`, at `restore`, and at `open` for a log
 written before it existed. With no row, the published table is read.
 
 `sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. Both return a
@@ -687,9 +727,9 @@ depends on it**. All three raise `RuntimeError` when another owner holds the cla
 `<root>/<name>/published`. The pipeline is the same either way — a local-only log publishes,
 evicts and retires exactly like one on S3, and any Iceberg engine reads its table through
 `version-hint.text`. Its cost is disk: the local published table keeps everything, until truncation
-lands (a follow-up). `wal_replication`, `replication_config()` and `restore` need a remote
-one: the WAL replica exists to get rows off the machine, and a local published table is on
-this disk already.
+lands (a follow-up). `wal_replication` and `replication_config()` need a remote one: the WAL
+replica exists to get rows off the machine, and a local published table is on this disk
+already. `restore` rebuilds from a local one, from the published table alone.
 
 **Nothing copies published files back into the staging table.** A reader on another machine
 caches what it reads instead; see `duckdb_connection`. Raising `staging_retention` applies to

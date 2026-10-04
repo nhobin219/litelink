@@ -7,6 +7,41 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`restore` rebuilds a log from its published table when there is no WAL
+  replica** (#144) — a log that ran with `wal_replication` off, or published
+  to a local directory. The log comes back at its own name, above every
+  offset the old log is known to have issued plus a 2^40 fence, with its
+  schema and `sort_by` read from the published table and the default
+  `LogConfig` (call `set_config` to restore a deployment's policy). Rows the
+  dead machine had not published are not recovered. A replica, when there is
+  one, is still used; an unreachable one raises rather than falling back.
+- **`publish` stamps the log's Arrow schema and `sort_by` on its published
+  table** (`litelink.arrow_schema`, `litelink.sort_by`), once, so such a
+  restore rebuilds the log exactly, and records `litelink.issued_through`
+  with every push, so it never reissues an offset. A table published only by
+  an older version has the shape derived from its Iceberg schema instead,
+  without Arrow field metadata.
+- **A restore resumes above the freshest record of what the old log issued**,
+  by that record's reserve: `restore(..., replica_reserve=2**20,
+  published_reserve=2**40)`. A replica whose sidecar stopped shipping is
+  behind the last publish's `issued_through`, so the published record decides
+  and the larger reserve applies. Delete a log's replica when turning WAL
+  replication off: one left behind is still used, and the log comes back with
+  the settings it had when replication stopped.
+
+### Changed
+
+- **What the published table holds is recorded as one range, not a row per
+  pushed file.** Eviction and compaction read the reconciled
+  `published_through` watermark (plus in-flight intents, for compaction)
+  instead of `extent` rows naming published copies, so `buffer.db` no longer
+  grows with the published history. A writer's `open` folds an existing log's
+  rows into the watermark.
+
 ## 0.9.0 — 2026-10-04
 
 ### Added

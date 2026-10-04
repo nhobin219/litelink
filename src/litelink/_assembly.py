@@ -22,6 +22,8 @@ from litelink._buffer import (
     Buffer,
 )
 from litelink._handle import (
+    PUBLISHED_RESTORE_RESERVE,
+    RESTORE_RESERVE,
     LocalReadHandle,
     LogConfig,
     LogHandle,
@@ -145,6 +147,10 @@ def open(  # noqa: A001
     if not buffer.get_meta(PUBLISHED_KEY):
         buffer.set_meta(PUBLISHED_KEY, layout.default_published)
 
+    # A log written by 0.8 or earlier recorded a row per pushed file; the
+    # watermark carries the same coverage as one range (§4a).
+    buffer.adopt_published_coverage(str(buffer.get_meta(PUBLISHED_KEY)))
+
     handle.recover()
     handle._backfill_manifest()  # noqa: SLF001
 
@@ -236,6 +242,8 @@ def restore(
     published: str,
     s3_options: S3Options | None = None,
     binary: str | None = None,
+    replica_reserve: int = RESTORE_RESERVE,
+    published_reserve: int = PUBLISHED_RESTORE_RESERVE,
 ) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
     assigned. See `litelink.restore`."""
@@ -245,6 +253,8 @@ def restore(
         published=published,
         s3_options=s3_options,
         binary=binary,
+        replica_reserve=replica_reserve,
+        published_reserve=published_reserve,
     )
 
 

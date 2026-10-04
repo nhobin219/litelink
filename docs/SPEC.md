@@ -485,6 +485,22 @@ window rather than resuming at the replica's frontier (I9).
 If it dies, SQLite is unaffected: you lose replication, not data. That is why it does not
 violate the no-network-in-the-write-path property.
 
+**With no replica, a restore rebuilds the log from its published table** (#144). A log that
+ran with `wal_replication` off never shipped `buffer.db`, but its published table holds every row
+it published, and that is everything that can be recovered. So the restore acts as if there had
+never been a SQLite database: a fresh `buffer.db` at the log's own name, its schema and
+`sort_by` read from the published table's `litelink.arrow_schema` and `litelink.sort_by`
+properties (which `publish` stamps; derived from the Iceberg schema for a table only an older
+version published), the published table adopted with the watermark at its end, and the offset
+counter above everything the old log is known to have issued, plus `PUBLISHED_RESTORE_RESERVE`
+(2^40). Offsets the old log issued but never published may have reached readers, and the published
+end trails them by everything it had not published — without bound. So every push records
+`litelink.issued_through` in the commit that registers it, the rebuild starts above the larger of
+that and the end, and the fence, far wider than a WAL restore's `RESTORE_RESERVE`, covers what was
+issued after the last publish. A replica is always preferred when
+there is one, since it can only be fresher; litestream exits cleanly and writes nothing only when
+there is none, and a missing bucket or refused credentials still raise.
+
 **A restored buffer holding sealed rows needs no reconciliation.** The read boundary (§7)
 comes from the table's committed max offset, so those rows fall outside the buffer's
 contribution automatically. That is what makes holding them affordable above, and it is
@@ -898,7 +914,7 @@ leg to `offset < 1`, and the range is served by exactly one tier either way.
 - **owner and expiry on a claim**: in-flight or abandoned — the only question the data
   cannot answer.
 
-### Where a segment lives is a property of the segment, not a watermark
+### What the published table holds is one range
 
 The tiers are four steps, and only three of them are tiers:
 
@@ -909,49 +925,43 @@ compacted files   the read-optimised baseline that replaces them
         └── stored locally, or in the published table, or both
 ```
 
-The fourth step is not a tier. A compacted file in the published table is the **same file in a
-second place**, and litelink already records that per file: `publish` calls `record_file` with
-the published table's URI, so `extent` holds a row per pushed file naming exactly where its copy
-went. `published_through` is a global summary of facts that are already durable per segment.
+The fourth step is not a tier. A compacted file in the published table is the **same rows in
+a second place**, and what eviction has to know is which rows those are. That is one range:
 
-That summary is the single most expensive line in this design, because it is **the only
-boundary in the system that can move backwards.** Offsets are immutable, seal cuts only
-advance, compaction only merges forward — and then a re-point resets the published watermark
-to zero. Every reader that cached the old position is wrong at once, and there is no
-ordering of the writes that fixes it, because the problem is not the write ordering; it is
-that a per-segment fact was compressed into one mutable number and then had to be
-un-compressed by inference.
+> A local file may be dropped only if its offsets lie within `[published_from,
+> published_through]`, the range the log's published table holds.
 
-**So do not compress it.** I4 is asked of a file, not of a watermark:
+**`published_through` is safe to act on because it only rises.** `publish` writes it after a
+register lands, never before, and every push reconciles it against the published table's own
+span, so a crash between the register and the write leaves it low (the safe direction for
+eviction) until the next push raises it. A log's published table is fixed when the log is
+created and nothing rewrites it, so no write ever has to lower it, and `raise_meta` refuses to.
+A range that cannot move backwards cannot leave a cached position wrong.
 
-> A local file may be dropped only if `extent` holds a row for the same offset range whose
-> `rel_path` names a copy in the published table this log is configured for.
+**One range is enough because `publish` pushes a prefix.** It uploads the staging files above
+the published span in offset order and registers them in one commit, so the published table is
+contiguous from where it begins. A gap below the watermark is a gap in the log's offsets — a
+restore's fence, a failed load's reservation — which holds no rows anywhere.
 
-An equality check on a recorded value, and the consequences fall out:
+`published_from` is absent on every log but one kind: a log re-pointed before 0.7, whose
+current published table can begin above the log's first offset. A writer's `open` records where
+it begins, from the per-file rows such a log carries, so nothing below it reads as published.
 
-- **Nothing resets.** A re-point changes where the NEXT file goes. Files already pushed keep
-  naming the bucket that holds them, so no boundary moves backwards and no cached position
-  becomes wrong.
-- **Identity stops being inferred.** "Is this mine?" is a comparison against a URI the log
-  wrote down, not an inference from a prefix, a catalog row keyed by table id, or a
-  process's memory of its own configuration.
-- **Several published tables coexist.** Old ranges name the old bucket and new ranges the new one,
-  which is half of what makes re-attaching to a published table that already holds data
-  expressible. The other half is the published table naming its own current metadata: `SqlCatalog`
-  keeps that pointer in the catalog, so the local `published.db` row was the only thing that
-  had it, and a re-point drops that row. Each commit now writes `version-hint.text` beside
-  the metadata, and `open_published` registers from it instead of creating an empty table.
-- **The compaction frontier goes.** `published_pending` exists to stop a merge straddling a
-  range the published table may hold; per segment, compaction skips a file that records a published
-  copy and needs no frontier, no crash window between writing it and using it, and no
-  reconciliation to retire it.
+**Compaction asks the overstating question; eviction the understating one.** Compaction must
+not merge across a range the published table might hold, or it makes a staging file whose
+boundaries line up with nothing published, which nothing re-cuts — so it also counts
+`extent_intent`, the copies a push has intended before uploading them. Eviction must not drop
+the only copy, so it counts the watermark alone. `confirm_published` raises the watermark and
+retires the push's intents in one transaction, so there is no moment covered by neither.
 
-`published_through` may remain as a derived `MAX(...)` for the push floor and for display.
-What it may not be again is the thing that authorises a deletion.
+**`extent` describes staging only.** It records each staging file's range and the bytes its rows
+held, and nothing about published copies — so it does not grow with the published history, and
+a restore holds the same kind of `extent` however it was rebuilt (#144). Logs written by 0.8 and
+earlier recorded a row per pushed file; a writer's `open` folds those into the watermark.
 
-**There is no local-only exception.** Every log has a published table (#98) — a local directory when
-no remote one is given — so I4 is never vacuous: a local-only log's eviction clamps against
-its local published table's records exactly as an S3 log's does.
+**There is no local-only exception.** Every log has a published table (#98) — a local directory
+when no remote one is given — so I4 is never vacuous: a local-only log's eviction clamps
+against its local published table's range exactly as an S3 log's does.
 
 It is tempting to require that a file be compacted before eviction will take it, since only
 compacted files are ever pushed. **Resist it.** The reason to hold a file back is
@@ -975,29 +985,9 @@ So eviction, in both configurations, is one rule: **drop what retention no longe
 except what a live claim covers, and except — where a published table is configured — what has no
 recorded copy in it.**
 
-**Implemented.** `published_pending` and the frontier are gone; `published_prefix` walks the
-local files and stops at the first without a recorded copy, and both compaction and eviction
-ask it. Compaction skipping published files is not optional here — it is what keeps a local
-range and its published range the same range, so the per-segment test can match them at all.
-
-One window survives the change and closes differently. The row naming a file's published copy
-is written after the register, so a crash between the two leaves the published table holding a range
-nothing local records. Nothing is promised beforehand to cover it — that is what made the
-watermark inexact in both directions — so the next push backfills from the published table's own
-manifest, which it reads anyway.
-
-`published_through` remains as a derived cache, for the push floor and for display. It no
-longer authorises a deletion, which was the whole of the problem.
-
-**Coverage, not equality.** The two tiers cut the same rows into files independently, so
-asking whether a local range EQUALS a published one is wrong whenever they differ — a
-published table written by an earlier version's re-cut, for one. Under an equality test every
-local file then matches nothing, for ever: eviction clamps to zero and stops, and compaction
-stops treating published files as the published table's business and merges across its extent,
-which `register` admits as a partial overlap and the published table keeps as duplicate rows.
-Neither heals, because nothing rewrites the published table.
-The question I4 actually asks is whether the published table holds the ROWS, so adjacent published
-files join and a gap ends the answer.
+**Coverage, not equality.** The two tiers cut the same rows into files independently, so a
+staging file is held when its range lies inside what the published table covers, whatever the
+published files' own boundaries.
 
 ### One copy of a fact, in the log
 
@@ -1040,7 +1030,7 @@ decision binds the policy to a local first: fresh per decision, coherent within 
 Where a torn read would merely produce an odd file size it is harmless, because the policy
 is a POLICY — it decides how big to cut and when to merge, never which rows go where. The
 one place it could have been an invariant is `runs`, shared by compaction and `publish` so the
-two cannot disagree about what is in play, and per-segment I4 closes that: a file the
+two cannot disagree about what is in play, and I4 closes that: a file the
 published table holds is never merged again.
 
 What this does NOT cover: a pyiceberg table handle is a point-in-time snapshot of REMOTE

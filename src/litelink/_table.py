@@ -159,7 +159,13 @@ class _Catalog(SqlCatalog):
     def _load_file_io(
         self, properties: Properties = EMPTY_DICT, location: str | None = None
     ) -> FileIO:
-        return shared_file_io({**self.properties, **properties}, location)
+        # litelink's own table properties say nothing to a FileIO, and some
+        # change with every push (`ISSUED_PROPERTY`): left in the key, each
+        # push would build a new FileIO, which is the leak this prevents.
+        relevant = {
+            k: v for k, v in properties.items() if not k.startswith("litelink.")
+        }
+        return shared_file_io({**self.properties, **relevant}, location)
 
     def _convert_orm_to_iceberg(self, orm_table: IcebergTables) -> Table:
         if not (metadata_location := orm_table.metadata_location):
@@ -470,6 +476,107 @@ def published_columns(
     table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
 
     return tuple(field.name for field in table.schema().fields)
+
+
+# The log's own shape, carried on its published table so a restore with no
+# WAL replica can rebuild the log exactly (#144). Iceberg has one string type
+# and one binary type and keeps no Arrow field metadata, so its schema alone
+# cannot say what the log declared: `SCHEMA_PROPERTY` is the declared Arrow
+# schema as hex IPC, exactly as `buffer.db` stores it, and `SORT_PROPERTY`
+# the `sort_by` as JSON.
+SCHEMA_PROPERTY = "litelink.arrow_schema"
+SORT_PROPERTY = "litelink.sort_by"
+
+# The highest offset the log had issued when it last published, set by every
+# push in the commit that registers it. The published table's end trails what
+# the log issued by everything it had buffered, sealed or loaded and not yet
+# published; a restore with no WAL replica starts above this, not only above
+# the end, or it would hand those offsets to different rows (#144).
+ISSUED_PROPERTY = "litelink.issued_through"
+
+
+def published_issued_through(
+    layout: Layout, prefix: str, options: S3Options
+) -> int | None:
+    """`ISSUED_PROPERTY` of the published table at `prefix`, or None when it
+    has none — no table, or one only an older version published."""
+    io = shared_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    raw = table.properties.get(ISSUED_PROPERTY)
+
+    return None if raw is None else int(raw)
+
+
+def published_shape(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[pa.Schema, tuple[str, ...]] | None:
+    """The schema and `sort_by` of the log whose published table is at
+    `prefix`, read from the bucket alone — or None when there is no table.
+
+    From the table's `SCHEMA_PROPERTY` and `SORT_PROPERTY`, which `publish`
+    stamps on every published table. A table published only by an older
+    version has neither, and then both are derived: the schema from the
+    Iceberg schema, converted to Arrow with pyiceberg's `large_*` types
+    narrowed back to the plain ones `new` takes (order, types and nullability
+    convert one to one; Arrow field metadata does not survive), and `sort_by`
+    from the table's declared sort order.
+    """
+    import pyarrow as pa
+
+    io = shared_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    raw_schema = table.properties.get(SCHEMA_PROPERTY)
+    raw_sort = table.properties.get(SORT_PROPERTY)
+    if raw_schema is not None and raw_sort is not None:
+        schema = pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
+        return schema, tuple(json.loads(raw_sort))
+
+    converted = schema_to_pyarrow(table.schema(), include_field_ids=False)
+    fields = [_narrow(field) for field in converted if field.name != OFFSET_COLUMN]
+    iceberg_schema = table.schema()
+    sort_by = tuple(
+        iceberg_schema.find_column_name(sort_field.source_id) or ""
+        for sort_field in table.sort_order().fields
+    )
+
+    return pa.schema(fields), sort_by
+
+
+OFFSET_COLUMN = "litelink_offset"
+
+
+def _narrow(field: pa.Field) -> pa.Field:
+    """`field` with pyiceberg's `large_*` Arrow types narrowed to the plain
+    ones, recursively, and no metadata."""
+    import pyarrow as pa
+
+    def narrow(kind: pa.DataType) -> pa.DataType:
+        if pa.types.is_large_string(kind):
+            return pa.string()
+
+        if pa.types.is_large_binary(kind):
+            return pa.binary()
+
+        if pa.types.is_large_list(kind) or pa.types.is_list(kind):
+            return pa.list_(_narrow(kind.value_field))
+
+        if pa.types.is_map(kind):
+            return pa.map_(_narrow(kind.key_field), _narrow(kind.item_field))
+
+        if pa.types.is_struct(kind):
+            return pa.struct([_narrow(kind.field(i)) for i in range(kind.num_fields)])
+
+        return kind
+
+    return pa.field(field.name, narrow(field.type), nullable=field.nullable)
 
 
 class LogTable:
@@ -1505,8 +1612,10 @@ class LogTable:
         end: int | None = None,
         published_through: int = 0,
         start: int | None = None,
+        properties: dict[str, str] | None = None,
     ) -> bool:
-        """Add already-written files to the table, in ONE commit (§4 step 2).
+        """Add already-written files to the table, in ONE commit (§4 step 2),
+        with `properties` set in the same commit.
 
         `add_files` rather than `append`: pyiceberg's append writes the file
         itself and commits afterwards, so a crash in between orphans a file
@@ -1557,7 +1666,10 @@ class LogTable:
 
             self._refuse_straddle(start)
             added = True
-            self._table.add_files(paths)
+            with self._table.transaction() as transaction:
+                transaction.add_files(paths)
+                if properties:
+                    transaction.set_properties(properties)
 
         self._commit(add)
 

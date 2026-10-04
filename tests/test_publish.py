@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import uuid
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -27,7 +28,13 @@ import pytest
 import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._buffer import Buffer
-from litelink._handle import OFFSET, RESTORE_RESERVE, LogHandle, table_schema
+from litelink._handle import (
+    OFFSET,
+    PUBLISHED_RESTORE_RESERVE,
+    RESTORE_RESERVE,
+    LogHandle,
+    table_schema,
+)
 from litelink._layout import Layout
 from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import secret_sql
@@ -547,29 +554,24 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
         log.seal()
         log.publish()
         local = log._table.data_files()
-        settled = log._maintenance.published_prefix(
-            local, log._published.uri, include_intents=False
-        )
+        settled = log._maintenance.published_prefix(local, include_intents=False)
 
         assert settled > 0
 
         # The register landed; the rows recording it did not.
         with log._buffer._lock:
-            log._buffer._con.execute("DELETE FROM extent WHERE rel_path LIKE 's3://%'")
+            log._buffer._con.execute("DELETE FROM meta WHERE k = 'published_through'")
             log._buffer._con.commit()
 
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == 0
-        ), "the setup must actually reproduce the crash"
+        assert log._maintenance.published_prefix(local, include_intents=False) == 0, (
+            "the setup must actually reproduce the crash"
+        )
 
         log.publish()
 
         assert (
             log._maintenance.published_prefix(
-                log._table.data_files(), log._published.uri, include_intents=False
+                log._table.data_files(), include_intents=False
             )
             == settled
         ), "the published table's manifest says what it holds; recover from it"
@@ -599,12 +601,12 @@ def test_the_backfill_sees_copies_another_process_pushed(
             writer.seal()
             writer.publish()
             grown = writer._maintenance.published_prefix(
-                writer._table.data_files(), writer._published.uri, include_intents=False
+                writer._table.data_files(), include_intents=False
             )
 
             with other._buffer._lock:
                 other._buffer._con.execute(
-                    "DELETE FROM extent WHERE rel_path LIKE 's3://%'"
+                    "DELETE FROM meta WHERE k = 'published_through'"
                 )
                 other._buffer._con.commit()
 
@@ -613,7 +615,6 @@ def test_the_backfill_sees_copies_another_process_pushed(
             assert (
                 other._maintenance.published_prefix(
                     other._table.data_files(),
-                    other._published.uri,
                     include_intents=False,
                 )
                 == grown
@@ -780,20 +781,26 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
 
 
 def _crash_before_recording(log: WriteHandle) -> None:
-    """Publish, dying between the register and the rows recording it."""
-    original = Buffer.record_file
+    """Publish, dying between the register and the confirm that records it —
+    the call naming the copies that landed. Reconciliation's own confirm,
+    before anything is uploaded, names none and goes through."""
+    original = Buffer.confirm_published
 
-    def dying(*args: object, **kwargs: object) -> None:
-        msg = "crash between the register and the record"
-        raise RuntimeError(msg)
+    def dying(self: Buffer, through: int, landed: Iterable[str] = ()) -> None:
+        paths = list(landed)
+        if paths:
+            msg = "crash between the register and the record"
+            raise RuntimeError(msg)
 
-    Buffer.record_file = dying
+        original(self, through, paths)
+
+    Buffer.confirm_published = dying
     try:
         with pytest.raises(RuntimeError, match="crash between"):
             log.publish()
 
     finally:
-        Buffer.record_file = original
+        Buffer.confirm_published = original
 
 
 def test_a_register_without_its_rows_cannot_wedge_the_log(
@@ -846,13 +853,10 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
         local = log._table.data_files()
 
-        assert log._maintenance.published_prefix(local, None, include_intents=True) > 0
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == 0
-        ), "eviction must not see an intended copy as a landed one"
+        assert log._maintenance.published_prefix(local, include_intents=True) > 0
+        assert log._maintenance.published_prefix(local, include_intents=False) == 0, (
+            "eviction must not see an intended copy as a landed one"
+        )
 
         # The ingredient that turns the crash into a permanent stall.
         log.set_config(replace(config, target_compact_size=1 << 20))
@@ -943,25 +947,20 @@ def test_two_owners_intending_one_path_do_not_collide(
         assert intents[0] == (path, 1, 101, 8192), "the later intent must win"
 
 
-def test_a_healed_row_carries_the_measured_bytes(
+def test_a_healed_crash_raises_the_watermark_and_retires_the_intents(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The test the plan mandated, which the first build shipped without.
+    """After a crash between the register and the confirm, the next publish
+    reconciles against the published table's manifest: the watermark reaches
+    the span's end and every intent the manifest holds is retired, together.
 
-    The `bytes` column on an intent exists for exactly one reader: rule 1,
-    healing a crash with the only measurement that survives it. Without this
-    assertion the whole suite passes against a reconciliation that records the
-    compact target everywhere — which is what the first build did, because rule
-    2 re-fired for the paths rule 1 had just confirmed and its conflict clause
-    overwrote them.
-
-    What that costs is not cosmetic: a recorded size is what sizes every later
-    decision about that file, and nothing re-measures a published file.
+    Falsify by dropping reconciliation's `confirm_published`: the watermark
+    stays where the crash left it and the intents stay behind.
     """
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=64 * 1024,
+        target_compact_size=16 * 1024,
         compact_min_files=2,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
@@ -983,28 +982,19 @@ def test_a_healed_row_carries_the_measured_bytes(
 
         _crash_before_recording(log)
 
-        intended = {
-            path: size
-            for path, _, _, size in log._buffer.intents(log._published.uri or "")
-        }
+        published = log._published.require()
+        published.reload()
+        span = published.span()
 
-        assert intended, "the crash must leave intents behind"
-        assert all(size != config.compact_size for size in intended.values()), (
-            "the fixture must not coincide with the default it is testing for"
-        )
+        assert span is not None
+        assert log._buffer.intents(log._published.uri or ""), "the crash left intents"
+        assert log.published_through() < span[1] - 1, "the crash left the watermark"
 
         log.publish()
 
-        healed = {
-            path: size
-            for path, size in log._buffer.file_bytes().items()
-            if path in intended
-        }
-
-        assert healed, "the intents were never confirmed"
-        assert healed == intended, (
-            "a healed row must carry the bytes its intent measured, not the "
-            f"compact default: {healed} != {intended}"
+        assert log.published_through() >= span[1] - 1
+        assert not log._buffer.intents(log._published.uri or ""), (
+            "intents the manifest holds were not retired"
         )
 
 
@@ -2888,3 +2878,320 @@ def test_advance_cycles_and_reloads_reuse_one_file_io(
         assert built == [], (
             f"{len(built)} FileIOs built across advance cycles and reloads"
         )
+
+
+# -- restore without a WAL replica (#144) --------------------------------------
+
+
+def offset_list(table: pa.Table) -> list[int]:
+    return [int(offset) for offset in table.column(OFFSET).to_pylist()]
+
+
+def _restore_settings() -> LogConfig:
+    """`published_log`'s settings, with eviction on so the cycles after a
+    restore exercise it."""
+    return LogConfig(
+        target_seal_size=64 * 1024,
+        target_compact_size=64 * 1024,
+        compact_min_files=2,
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
+        staging_retention=timedelta(0),
+        staging_rows=0,
+    )
+
+
+def test_restore_without_a_replica_rebuilds_the_log_from_its_published_table(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A log that never replicated its WAL, its machine gone, comes back from
+    its published table at its own name and keeps working.
+
+    It continues at the published end plus the restore fence, holds the same
+    schema and `sort_by`, reads every published row, and then runs real seal,
+    compact, publish, evict and reclaim cycles — rows the dead machine had not
+    published are gone, as there was no other copy of them.
+
+    Falsify by restoring the `FileNotFoundError` for an absent replica: this
+    raises instead of rebuilding.
+    """
+    first = tmp_path / "first"
+    with published_log(first, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        published_end = log.published_through() + 1
+
+        assert published_end == log.end_offset(), "the setup publishes everything"
+
+        # Acknowledged and never published: lost with the machine.
+        log.extend(rows(50))
+
+    shutil.rmtree(first)
+    where = f"s3://{bucket}/prefix"
+    with litelink.restore(
+        tmp_path / "second", "s", published=where, s3_options=s3
+    ) as revived:
+        report = revived.recovery()
+
+        assert report is not None
+        resumed = published_end + PUBLISHED_RESTORE_RESERVE
+
+        assert revived.end_offset() == resumed
+        assert report.skipped == (published_end, resumed)
+        assert revived.schema == SCHEMA
+        assert revived.sort_by == ("event_ts",)
+        assert revived.scan().read_all().num_rows == ROWS
+
+        revived.set_config(_restore_settings())
+        for _ in range(3):
+            revived.extend(rows(300))
+            revived.advance(flush=True)
+
+        assert revived.published_through() == revived.end_offset() - 1
+        assert revived.staging_rows() == 0, "eviction did not run after the restore"
+        offsets = offset_list(revived.scan(columns=[OFFSET]).read_all())
+
+        assert len(offsets) == ROWS + 900
+        assert len(set(offsets)) == len(offsets), "a row was read twice"
+        assert max(offsets) == revived.end_offset() - 1
+
+
+def test_restore_without_a_replica_starts_above_what_the_log_issued(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The published end trails what the log issued by everything it had not
+    published yet, so a rebuild starts above the `litelink.issued_through` the
+    last publish recorded, not only above the end — or it hands those offsets,
+    already returned by `append` and seen by readers, to different rows.
+
+    Falsify by starting at the published end alone: the restored log resumes
+    below the recorded issue.
+    """
+    first = tmp_path / "first"
+    with published_log(first, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal()
+        # Without `flush` the trailing run stays local, so the log has issued
+        # past what the published table holds when this push records it.
+        log.publish()
+        published_end = log.published_through() + 1
+        issued = log.end_offset() - 1
+
+        assert issued >= published_end, "the setup must issue past the push"
+
+    shutil.rmtree(first)
+    with litelink.restore(
+        tmp_path / "second", "s", published=f"s3://{bucket}/prefix", s3_options=s3
+    ) as revived:
+        assert revived.end_offset() == issued + 1 + PUBLISHED_RESTORE_RESERVE
+
+
+def test_a_restore_reserve_overrides_the_fence(tmp_path: Path) -> None:
+    """`published_reserve` replaces the rebuild's default, measured from the
+    same record; and a reserve that is not a non-negative integer is refused
+    before anything is created."""
+    where = f"file://{tmp_path / 'published'}"
+    first = tmp_path / "first"
+    with litelink.new(
+        first,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=_restore_settings(),
+        published=where,
+    ) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        issued = log.end_offset() - 1
+
+    shutil.rmtree(first)
+    for name in ("replica_reserve", "published_reserve"):
+        for bad in (-1, 2.5, True):
+            with pytest.raises(ValueError, match=name):
+                litelink.restore(tmp_path / "bad", "s", published=where, **{name: bad})  # ty: ignore[invalid-argument-type]
+
+            assert not (tmp_path / "bad").exists()
+
+    with litelink.restore(
+        tmp_path / "second", "s", published=where, published_reserve=1000
+    ) as revived:
+        assert revived.end_offset() == issued + 1 + 1000
+
+
+def test_restore_without_a_replica_derives_the_shape_from_an_older_table(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A published table only an older version wrote carries no shape
+    properties, and the schema and `sort_by` come from its Iceberg schema and
+    declared sort order instead.
+
+    Falsify by reading only the properties: the restore finds no shape.
+    """
+    from litelink._table import SCHEMA_PROPERTY, SORT_PROPERTY
+
+    first = tmp_path / "first"
+    with published_log(first, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        table = log._published.require()._table  # noqa: SLF001
+
+        assert SCHEMA_PROPERTY in table.properties, "publish stamps the shape"
+
+        with table.transaction() as transaction:
+            transaction.remove_properties(SCHEMA_PROPERTY, SORT_PROPERTY)
+
+    shutil.rmtree(first)
+    with litelink.restore(
+        tmp_path / "second", "s", published=f"s3://{bucket}/prefix", s3_options=s3
+    ) as revived:
+        assert revived.schema == SCHEMA
+        assert revived.sort_by == ("event_ts",)
+        assert revived.scan().read_all().num_rows == ROWS
+
+
+def test_restore_without_a_replica_or_a_published_table_refuses(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """No replica and no published rows: nothing to restore, and nothing left
+    behind on disk."""
+    target = tmp_path / "second"
+    with pytest.raises(FileNotFoundError, match="no published rows"):
+        litelink.restore(target, "s", published=f"s3://{bucket}/nothing", s3_options=s3)
+
+    assert not (target / "s" / "buffer.db").exists()
+    assert not (target / "s" / "catalog.db").exists()
+
+
+def test_restore_rebuilds_from_a_local_published_table(tmp_path: Path) -> None:
+    """A local published table has no replica beside it, so restore rebuilds
+    from the table directly — a published directory on a volume that outlived
+    the log's own."""
+    where = f"file://{tmp_path / 'published'}"
+    first = tmp_path / "first"
+    with litelink.new(
+        first,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=_restore_settings(),
+        published=where,
+    ) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        published_end = log.published_through() + 1
+
+    shutil.rmtree(first)
+    with litelink.restore(tmp_path / "second", "s", published=where) as revived:
+        assert revived.end_offset() == published_end + PUBLISHED_RESTORE_RESERVE
+        assert revived.scan().read_all().num_rows == ROWS
+        revived.extend(rows(100))
+        revived.advance(flush=True)
+
+        assert revived.scan().read_all().num_rows == ROWS + 100
+
+
+def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """With the WAL replicated, the buffer keeps rows until the published table
+    has them, and eviction can empty staging while it still does. An open group
+    rebuilt then must start above the published end, or it adopts rows already
+    sealed and published and seals them a second time — a file the seal's
+    register declines, since the published table holds the range, but a whole
+    rewrite of the band for nothing.
+
+    Falsify by seeding from staging's `extent` alone (`_seed_group`): the
+    reopened log's seal finds the published rows to write.
+    """
+    with published_log(
+        tmp_path,
+        bucket,
+        s3,
+        wal_replication=True,
+        staging_retention=timedelta(0),
+        staging_rows=0,
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.evict("staging")
+        log.reclaim("staging")
+
+        assert log.staging_rows() == 0, "the setup must evict staging to nothing"
+        assert log.buffered_rows() > 0, "and keep the published rows buffered"
+
+        # What a sealer dying with the open group closed leaves behind.
+        with log._buffer._lock:  # noqa: SLF001
+            log._buffer._con.execute(  # noqa: SLF001
+                "DELETE FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+            )
+            log._buffer._con.commit()  # noqa: SLF001
+
+    with litelink.open(tmp_path, "s", s3_options=s3) as reopened:
+        # Everything is sealed and published, so there is nothing to seal. A
+        # group that adopted the buffered rows writes them out again; the
+        # seal's register then declines the file, since the published table
+        # holds the range, so it lands nowhere — which is why this asserts on
+        # the seal and not on what is read.
+        assert reopened.seal(flush=True) is None, "a published row was sealed again"
+        assert reopened.scan().read_all().num_rows == ROWS
+
+
+def _snapshot_buffer(primary: Path, target: Path) -> int:
+    """Copy the primary's `buffer.db` to `target/s`, as a replica would hold it,
+    and return the highest offset it records as issued."""
+    (target / "s").mkdir(parents=True)
+    source = sqlite3.connect(Layout(primary, "s").buffer_db)
+    copy = sqlite3.connect(Layout(target, "s").buffer_db)
+    source.backup(copy)
+    source.close()
+    copy.close()
+
+    con = sqlite3.connect(Layout(target, "s").buffer_db)
+    try:
+        row = con.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+        ).fetchone()
+    finally:
+        con.close()
+
+    return int(row[0]) if row else 0
+
+
+def test_a_replica_behind_the_last_publish_resumes_above_the_published_record(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A replica that still holds unpublished rows is used — but when its
+    sidecar stopped shipping before the last publish, the published record of
+    what the log issued is fresher, and the log resumes above THAT, by
+    `published_reserve`: the replica's own reserve covers only replication
+    lag.
+
+    Falsify by fencing from the replica alone: the log resumes at the
+    replica's sequence plus 2^20, inside offsets the last publish recorded as
+    issued.
+    """
+    primary = tmp_path / "primary"
+    with published_log(primary, bucket, s3) as log:
+        log.extend(rows(800))
+        log.seal()
+        # The replica, as it stood when its sidecar stopped: 800 issued, none
+        # of it published yet.
+        replica = _snapshot_buffer(primary, tmp_path / "second")
+        # The primary carries on issuing, and publishes only part of it.
+        log.extend(rows(800))
+        log.publish()
+        published_end = log.published_through() + 1
+        issued = log.end_offset() - 1
+
+    assert published_end <= replica < issued, "the case is not set up"
+
+    with litelink.restore(
+        tmp_path / "second", "s", published=f"s3://{bucket}/prefix", s3_options=s3
+    ) as revived:
+        assert revived.end_offset() == issued + 1 + PUBLISHED_RESTORE_RESERVE
+        # And the replica's unpublished rows came back with it.
+        report = revived.recovery()
+
+        assert report is not None
+        assert report.recovered > 0

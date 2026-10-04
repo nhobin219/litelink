@@ -214,9 +214,7 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
 
         # The published table now holds the first file, and only that one.
         first = min(log._table.data_files(), key=lambda f: f.start)
-        log._buffer.record_file(
-            f"s3://bucket/prefix/data/{first.start}.parquet", first.start, first.end, 1
-        )
+        log._buffer.confirm_published(first.end - 1)
         log.evict()
 
         assert log.staging_files() == before - 1, "did not evict what was published"
@@ -1145,13 +1143,7 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
         assert len(files) >= 4
 
         # The published table holds the first two.
-        for data_file in files[:2]:
-            log._buffer.record_file(
-                f"s3://bucket/prefix/data/{data_file.start}.parquet",
-                data_file.start,
-                data_file.end,
-                1,
-            )
+        log._buffer.confirm_published(files[1].end - 1)
 
         boundary = files[1].end - 1
         log.compact()
@@ -1167,7 +1159,9 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
 
 
 def test_a_gap_in_the_published_table_stops_the_walk(tmp_path: Path) -> None:
-    """Coverage must join adjacent files without inventing rows between them."""
+    """Coverage must join adjacent ranges without inventing rows between them:
+    the watermark covers the first file, an in-flight copy the third, and
+    nothing the second."""
     log = litelink.new(
         tmp_path,
         "s",
@@ -1180,19 +1174,18 @@ def test_a_gap_in_the_published_table_stops_the_walk(tmp_path: Path) -> None:
         files = sorted(log._table.data_files(), key=lambda f: f.start)
 
         # The first file, then a hole, then the third.
-        log._buffer.record_file(
-            "s3://bucket/prefix/data/a.parquet", files[0].start, files[0].end, 1
-        )
-        log._buffer.record_file(
-            "s3://bucket/prefix/data/c.parquet", files[2].start, files[2].end, 1
+        log._buffer.confirm_published(files[0].end - 1)
+        log._buffer.intend_file(
+            "s3://bucket/prefix/s/data/c.parquet", files[2].start, files[2].end, 1
         )
 
-        assert (
-            log._maintenance.published_prefix(
-                files, log._published.uri, include_intents=False
-            )
-            == files[0].end
-        ), "a range the published table does not hold must stop the walk"
+        for include_intents in (False, True):
+            assert (
+                log._maintenance.published_prefix(
+                    files, include_intents=include_intents
+                )
+                == files[0].end
+            ), "a range the published table does not hold must stop the walk"
 
 
 def test_a_merge_will_not_resurrect_rows_evicted_since_it_chose_its_run(
@@ -1570,23 +1563,27 @@ def test_the_published_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
 
         for trial in range(40):
             with log._buffer._lock:
+                log._buffer._con.execute("DELETE FROM extent_intent")
                 log._buffer._con.execute(
-                    "DELETE FROM extent WHERE rel_path LIKE 's3://%'"
+                    "DELETE FROM meta WHERE k = 'published_through'"
                 )
                 log._buffer._con.commit()
 
-            # A random subset of the files gets a published copy.
+            # A watermark anywhere, mid-file included, and in-flight copies of
+            # a random subset of the files.
+            last = files[-1].end
+            log._buffer.confirm_published(random.randrange(0, last + 1) - 1)
             for index, data_file in enumerate(files):
                 if random.random() < 0.6:
-                    log._buffer.record_file(
-                        f"s3://bucket/prefix/data/{trial}-{index}.parquet",
+                    log._buffer.intend_file(
+                        f"s3://bucket/prefix/s/data/{trial}-{index}.parquet",
                         data_file.start,
                         data_file.end,
                         1,
                     )
 
             frozen = log._maintenance.published_prefix(
-                files, "s3://bucket/prefix", include_intents=False
+                files, include_intents=random.random() < 0.5
             )
             below = [f for f in files if f.start < frozen]
             above = [f for f in files if f.start >= frozen]
@@ -1601,7 +1598,7 @@ def test_the_published_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
 def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
     """The union is one query, so it is one snapshot.
 
-    Read as two statements, `extent` and `extent_intent` are two separate WAL
+    Read as two statements, the watermark and `extent_intent` are two separate WAL
     reads — and a confirm committing between them moves a range out of the
     first after the second was taken, so it appears in NEITHER. Compaction's
     read is safe only when it overstates coverage; that understates it, which
@@ -1619,14 +1616,14 @@ def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
         statements: list[str] = []
 
         def watching(sql: str) -> None:
-            if "extent" in sql and "SELECT" in sql:
+            if ("extent" in sql or "meta" in sql) and "SELECT" in sql:
                 statements.append(sql)
 
         # SQLite's own hook: `Connection.execute` is read-only and cannot be
         # wrapped.
         log._buffer._con.set_trace_callback(watching)
         try:
-            log._buffer.published_ranges("s3://bucket/prefix", 0, include_intents=True)
+            log._buffer.published_ranges(0, include_intents=True)
 
         finally:
             log._buffer._con.set_trace_callback(None)
@@ -1636,6 +1633,7 @@ def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
             "disagree and a range can fall out of both"
         )
         assert "extent_intent" in statements[0], "the intents must be in that statement"
+        assert "meta" in statements[0], "and the watermark"
 
 
 def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:

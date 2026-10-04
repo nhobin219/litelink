@@ -35,6 +35,7 @@ import pyarrow.compute as pc
 from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._buffer import (
+    PUBLISHED_THROUGH_KEY,
     SCHEMA_KEY,
     SORT_KEY,
     START_OFFSET_KEY,
@@ -70,10 +71,15 @@ from litelink._statistics import (
     whole_log,
 )
 from litelink._table import (
+    ISSUED_PROPERTY,
     RETIRED_PROPERTY,
+    SCHEMA_PROPERTY,
+    SORT_PROPERTY,
     LogTable,
     forget_published_entry,
+    published_issued_through,
     published_retired,
+    published_shape,
     published_span,
 )
 from litelink._tiers import PUBLISHED as PUBLISHED_TIER
@@ -163,6 +169,16 @@ _SORT_KEY = SORT_KEY
 # int64. It errs large on purpose: a gap is visible to a consumer, and a
 # rewind looks like ordinary operation.
 RESTORE_RESERVE = 1 << 20
+
+# The fence a restore with no WAL replica leaves above what the log is known to
+# have issued (#144). `RESTORE_RESERVE` only has to cover replication lag,
+# measured from the replica's own sequence. Without a replica the best record
+# is the last publish's `litelink.issued_through`, and the dead machine may
+# have issued any number of offsets after it — for as long as publishing was
+# behind or down. 2^40 is over a trillion: 127 days of unpublished appends at
+# 100,000 rows a second. Offsets may have gaps (`start_offset`, a failed load),
+# and an int64 holds millions of fences this wide.
+PUBLISHED_RESTORE_RESERVE = 1 << 40
 
 
 # How many staged files one Iceberg commit takes.
@@ -1350,6 +1366,37 @@ class WriteHandle(LocalReadHandle):
             if covered is not None:
                 raise _foreign_published(published)
 
+        return cls._create(
+            layout,
+            schema=schema,
+            order=order,
+            settings=settings,
+            published=published,
+            s3_options=s3_options,
+            first_offset=start_offset,
+            # Recorded only when there IS a reserve. Absent means "started at
+            # 1", which a backfill must read as "no reserve" rather than "a
+            # reserve of nothing" — a log created at 1 and later restored has a
+            # gap below its offsets too, and that gap is a fence.
+            meta={_START_OFFSET_KEY: str(start_offset)} if start_offset > 1 else {},
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        layout: Layout,
+        *,
+        schema: pa.Schema,
+        order: tuple[str, ...],
+        settings: LogConfig,
+        published: str | None,
+        s3_options: S3Options | None,
+        first_offset: int,
+        meta: Mapping[str, str],
+    ) -> Self:
+        """Create the log's files, its first appended row taking `first_offset`,
+        with `meta` written beside its shape. `new`, and `restore` rebuilding a
+        log from its published table, once each has decided what to create."""
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
         buffer = Buffer.open(
@@ -1367,8 +1414,8 @@ class WriteHandle(LocalReadHandle):
         # Seeding AFTER them leaves one whose crash yields a log that reopens
         # silently at offset 1 — and `litelink.new` then refuses to retry, because
         # the buffer exists. The reserve would be lost with no error anywhere.
-        if start_offset > 1:
-            buffer.seed_offsets(start_offset)
+        if first_offset > 1:
+            buffer.seed_offsets(first_offset)
 
         buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
         # One transaction. `validate` has just accepted the policy and the
@@ -1384,12 +1431,7 @@ class WriteHandle(LocalReadHandle):
                 # so the location the publish fences compare is the stored one.
                 _PUBLISHED_KEY: (published or "").rstrip("/")
                 or layout.default_published,
-                # Recorded only when there IS a reserve. Absent means
-                # "started at 1", which a backfill must read as "no reserve"
-                # rather than "a reserve of nothing" — a log created at 1 and
-                # later restored has a gap below its offsets too, and that gap
-                # is a fence.
-                **({_START_OFFSET_KEY: str(start_offset)} if start_offset > 1 else {}),
+                **meta,
             }
         )
 
@@ -1559,6 +1601,8 @@ class WriteHandle(LocalReadHandle):
         published: str,
         s3_options: S3Options | None = None,
         binary: str | None = None,
+        replica_reserve: int = RESTORE_RESERVE,
+        published_reserve: int = PUBLISHED_RESTORE_RESERVE,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 
@@ -1594,6 +1638,29 @@ class WriteHandle(LocalReadHandle):
         republishes the hint over it, destroying the pointer this recovery
         depends on. Stale is worse than absent, and absent is already handled.
 
+        **The restored log resumes above the freshest record of what the old
+        log issued, by that record's reserve**, so no offset a reader saw names
+        a different row. There are two records, and each reserve covers what
+        can have been issued after its own:
+
+        - **The WAL replica's sequence.** Unseen after it: replication lag, so
+          `replica_reserve` (2^20).
+        - **The published table's `litelink.issued_through`**, recorded by
+          every push — or its end, for a table only an older version published.
+          Unseen after it: everything issued since the last publish, for as
+          long as publishing was behind or down, so `published_reserve` (2^40).
+
+        The freshest one decides: a healthy replica is ahead of the last
+        publish, and a replica whose sidecar stopped shipping is not. With no
+        replica, the published record is all there is.
+
+        **A replica is always used when there is one**, for its unpublished
+        rows and its settings. A replica left behind when WAL replication was
+        turned off is still found, and the log comes back with the settings it
+        had then — its offsets are safe, since the published record is fresher
+        and decides. Delete the replica (`<published>/<name>/_wal`) when turning
+        replication off.
+
         **`catalog.db` is not restored either**, and stays in the replication
         set regardless: same-machine recovery is where its absolute paths still
         resolve, and it is the only record of which Parquet the staging table is
@@ -1604,13 +1671,14 @@ class WriteHandle(LocalReadHandle):
         # as a YAML parse error from the litestream subprocess, after the root
         # has already been created.
         validate_published(published)
-        if not is_remote(published):
-            msg = (
-                f"restore needs a remote published table (s3://), not {published!r}: it "
-                f"recovers a log from the WAL replica beside it, and only a "
-                f"remote published table has one"
-            )
-            raise ValueError(msg)
+        for label, value in (
+            ("replica_reserve", replica_reserve),
+            ("published_reserve", published_reserve),
+        ):
+            # `bool` is an int to Python, and never what a caller means here.
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                msg = f"{label} must be a non-negative integer, not {value!r}"
+                raise ValueError(msg)
 
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
@@ -1683,6 +1751,11 @@ class WriteHandle(LocalReadHandle):
                 raise FileExistsError(msg)
 
         options = s3_options or S3Options()
+        if not is_remote(published) and not resuming:
+            # A local published table has no WAL replica beside it, so there is
+            # nothing to pull: the log is rebuilt from the table.
+            return cls._restore_published(layout, published, options, published_reserve)
+
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
 
@@ -1698,15 +1771,12 @@ class WriteHandle(LocalReadHandle):
             restore_buffer(config_path, layout.buffer_db, options, binary)
 
         if not layout.buffer_db.exists():
-            # Both readings: nothing in the arguments separates a log that
-            # never replicated from `name`/`published` naming no log at all.
-            msg = (
-                f"no replica of {layout.buffer_db.name} under {published} — there is "
-                f"nothing to restore. A log with wal_replication off has no off-box "
-                f"copy of its unsealed rows and cannot be recovered onto another "
-                f"machine, or `name` and `published` do not describe a log that exists"
-            )
-            raise FileNotFoundError(msg)
+            # No replica: litestream found none, and said so by exiting cleanly
+            # and writing nothing — a bucket it cannot reach or credentials it
+            # is refused raise above instead. The published table is then all
+            # that can be recovered, and the log is rebuilt from it.
+            config_path.unlink(missing_ok=True)
+            return cls._restore_published(layout, published, options, published_reserve)
 
         # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `published`
         # is a caller bug and has to be loud.
@@ -1829,7 +1899,9 @@ class WriteHandle(LocalReadHandle):
         # root without it cannot be opened by anything.
         buffer = Buffer.open(layout.buffer_db, schema)
         try:
-            released, resumed = buffer.strip_local_state(RESTORE_RESERVE)
+            released, resumed = buffer.strip_local_state(replica_reserve)
+            # The first offset past what the replica records the log issued.
+            replica_known = resumed - replica_reserve
 
             # ADOPTED, explicitly. `published.db` was deliberately not restored,
             # so nothing here has a catalog row for the published table — and an
@@ -1918,7 +1990,24 @@ class WriteHandle(LocalReadHandle):
             # during a sidecar outage and now takes one `reserve` that ships
             # almost no WAL. The hazard is lag plus restore either way, so it
             # is closed here rather than by refusing the load.
-            wanted = frontier + RESTORE_RESERVE
+            # And above what the last publish recorded the log had issued: a
+            # replica whose sidecar stopped shipping can trail it by far more
+            # than any fence sized for replication lag.
+            # Every push records what the log had issued in the commit that
+            # registers it, so where the stamp exists it is at least the
+            # published end; only a table an older version published has none.
+            issued = published_issued_through(layout, published, options)
+            published_known = frontier if issued is None else issued + 1
+            # The FRESHER record decides, by its own reserve: each covers what
+            # can have been issued after it. A replica ahead of the last publish
+            # leaves only replication lag unseen; a published record ahead of
+            # the replica — its sidecar stopped shipping — leaves everything
+            # since the last publish.
+            if published_known > replica_known:
+                wanted = published_known + published_reserve
+            else:
+                wanted = replica_known + replica_reserve
+
             if wanted > resumed:
                 resumed = buffer.reserve(wanted - resumed)[1]
         finally:
@@ -2004,6 +2093,100 @@ class WriteHandle(LocalReadHandle):
             recovered=released,
             resumed_at=resumed,
             skipped=(held_end, resumed),
+        )
+
+        return log
+
+    @classmethod
+    def _restore_published(
+        cls,
+        layout: Layout,
+        published: str,
+        options: S3Options,
+        reserve: int = PUBLISHED_RESTORE_RESERVE,
+    ) -> Self:
+        """Rebuild a log from its published table, when there is no WAL
+        replica to restore (#144).
+
+        With no replica, the published table is everything that can be
+        recovered: rows that were buffered, or sealed into staging but not yet
+        published, went with the machine. So the log is rebuilt as if it had
+        never had a `buffer.db` — at its own name, with no seam:
+
+        - **its shape from the published table**: the declared Arrow schema and
+          `sort_by` that `publish` stamps on it (`published_shape`), derived
+          from the Iceberg schema for a table only an older version published;
+        - **the default `LogConfig`**, which is the one thing a published table
+          does not carry; `set_config` restores a deployment's policy;
+        - **the published table adopted** as the log's own, its watermark at
+          the table's end;
+        - **the offset counter above everything the old log is known to have
+          issued, plus `PUBLISHED_RESTORE_RESERVE`**: offsets the old log issued
+          but never published may have reached readers, and must never name
+          different rows. Known means the published end, or the
+          `litelink.issued_through` the last publish recorded when that is
+          higher; the fence covers what was issued after it.
+        """
+        covered = published_span(layout, published, options)
+        shape = published_shape(layout, published, options)
+        if covered is None or shape is None:
+            msg = (
+                f"no replica of {layout.buffer_db.name} under {published}, and no "
+                f"published rows there to rebuild the log from — so there is nothing "
+                f"to restore. Check `name` and `published`; a log that never published "
+                f"is started afresh with `new`"
+            )
+            raise FileNotFoundError(msg)
+
+        recorded_retirement = published_retired(layout, published, options)
+        if recorded_retirement is not None:
+            raise RetiredError.of(
+                {"state": "retired", "published": published, **recorded_retirement},
+                layout.name,
+            )
+
+        schema, sort_by = shape
+        settings = LogConfig()
+        validate(schema, sort_by, settings, published)
+        frontier = covered[1]
+        # Every push records what the log had issued in the commit that
+        # registers it, so where the stamp exists it is at least the published
+        # end. A table only an older version published has none, and the end
+        # is all there is.
+        issued = published_issued_through(layout, published, options)
+        known = frontier if issued is None else issued + 1
+        first = known + reserve
+        _log.warning(
+            "litelink: no WAL replica of %s under %s; rebuilding the log from its "
+            "published table, which holds offsets below %d. Rows the old machine "
+            "had not published are not recovered.",
+            layout.name,
+            published,
+            frontier,
+        )
+        log = cls._create(
+            layout,
+            schema=schema,
+            order=sort_by,
+            settings=settings,
+            published=published,
+            s3_options=options,
+            first_offset=first,
+            meta={PUBLISHED_THROUGH_KEY: str(frontier - 1)},
+        )
+        # Adopted now, as a WAL restore does, so reads reach the published rows
+        # from the first query rather than after the first maintenance pass.
+        if log._published.table(repair=True) is None:  # noqa: SLF001
+            msg = (
+                f"rebuilt the log but could not adopt the published table at "
+                f"{published!r}"
+            )
+            raise RuntimeError(msg)
+
+        log._restored_from = _Recovery(  # noqa: SLF001
+            recovered=0,
+            resumed_at=first,
+            skipped=(frontier, first),
         )
 
         return log
@@ -3150,7 +3333,7 @@ class WriteHandle(LocalReadHandle):
             return len(pending)
 
         config = self.config
-        frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
+        frozen = self._maintenance.published_prefix(pending, include_intents=True)
         head = [f for f in pending if f.start >= frozen]
 
         return (len(pending) - len(head)) + stable_prefix(
@@ -3222,6 +3405,19 @@ class WriteHandle(LocalReadHandle):
         # frontier against a published table that has since grown past it.
         published.reload()
 
+        # The log's own shape, on its published table, so a restore with no WAL
+        # replica can rebuild the log exactly (#144). Stamped once: a new table
+        # at its first publish, an older one at the first publish after an upgrade.
+        if published.properties.get(SCHEMA_PROPERTY) is None:
+            raw_schema = self._buffer.get_meta(_SCHEMA_KEY)
+            if raw_schema is not None:
+                published.set_properties(
+                    {
+                        SCHEMA_PROPERTY: raw_schema,
+                        SORT_PROPERTY: json.dumps(list(self._buffer.sort_by())),
+                    }
+                )
+
         # The published table's tier row, if nothing has computed one yet: a
         # log given a published table at `new`, one written before the manifest
         # existed, one re-pointed where the published table could not be read.
@@ -3258,101 +3454,42 @@ class WriteHandle(LocalReadHandle):
         covered = published.span()
         floor = 0 if covered is None else covered[1]
 
-        # The watermark reconciled against the published table itself. It is a
-        # cache of what the published table holds — kept for the push floor and
-        # for display, and no longer for anything that authorises a deletion —
-        # so a commit that landed while the `meta` write after it did not would
-        # leave it behind for ever: the next pass computes `floor` from the
-        # published table, finds nothing left to push, and never revisits it.
+        # RECONCILIATION against the published table's own manifest, which is
+        # the truth, matched by path. The watermark is written after a register
+        # lands, so a crash between the two leaves the published table holding
+        # a range the watermark does not name yet: raised here to the span's
+        # end, it covers that range again, and the intents of copies the
+        # manifest holds are retired with it — one transaction, so compaction
+        # never sees a moment with neither (`confirm_published`).
         #
-        # Compared and written in one transaction, not read and then written.
-        # Reconciling against a published table the log has been pointed away
-        # from is the loss this path is here to prevent, and a guard that reads
-        # first only reports where the published table was.
-        # Stored as the last offset held, so one below the span's end.
-        confirmed = max(self._maintenance.published_through(), floor - 1)
-        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: confirmed})
-
-        memory = self._maintenance.memory()
-
-        # BACKFILL, and it is what makes I4-per-segment recoverable. The row
-        # naming a file's published copy is written after the register, so a
-        # crash between the two leaves the published table holding a range that
-        # nothing in `buffer.db` records — and compaction, which now decides
-        # from those rows, would merge it into a file spanning the published
-        # table's span. The next push would register a partial overlap, which
-        # `register` admits.
-        #
-        # The published table's own manifest is the truth, so recover from it
-        # rather than promising anything beforehand. Reading it costs nothing
-        # extra: `span()` above already walked it.
-        # Bounded by the staging window, not by the published table. Every
-        # decision the rows feed — what compaction may merge, what eviction may
-        # drop — is about files the staging table still holds, so a published
-        # file entirely below them changes no answer. Unbounded, this read and
-        # this loop grew with the published table and ran on every single
-        # publish pass.
-        # Bound before the first use. The backfill below sizes an unmeasured
-        # published file by the compact target, and `stable_prefix` groups by
-        # the same policy — two reads, and nothing that makes them agree.
-        config = self.config
-        local = self._table.data_files()
-        base = min((f.start for f in local), default=0)
-
-        # RECONCILIATION, matched by path in the published table's manifest
-        # rather than by offset range. Range matching reads plausibly and is
-        # wrong: a rewrite's intents name new objects over a range the stale
-        # files being replaced still cover, so a crashed rewrite's dead intents
-        # would be confirmed rather than dropped.
+        # Matched by PATH rather than by offset range. Range matching reads
+        # plausibly and is wrong: an intent can name an object over a range
+        # another file already covers, so a crashed push's dead intents would be
+        # confirmed rather than dropped.
         #
         # Bounds differ between the two reads and must. The manifest walk is
         # bounded by the staging window, or it grows with the published table
         # and runs on every publish pass. The intent read is unbounded, because
         # an intent below the window has to be reachable to be dropped.
-        held_paths = {f.path: f for f in published.data_files() if f.end > base}
-        recorded = {
-            path for path, _, _, _ in self._buffer.published_records(pinned or "", base)
-        }
-        intended = {
-            path: (start, end, size)
-            for path, start, end, size in self._buffer.intents(pinned or "")
-        }
-
-        # ONE rule per path, decided by which of the two tables holds it. An
-        # earlier shape ran the rules as separate loops over a `recorded` set
-        # snapshotted before either — so rule 2 re-fired for every path rule 1
-        # had just confirmed, and `record_file`'s conflict clause overwrote the
-        # intent's measured bytes with the default. That made the `bytes`
-        # column dead in every reachable path: the rewrite tail this exists to
-        # size correctly was durably recorded as full, and nothing re-measures
-        # a published file.
-        for path, landed in held_paths.items():
-            recovered = intended.get(path)
-            if recovered is not None:
-                # 1. The register landed. Confirm it with the bytes the intent
-                #    carried — the only measurement that survives a crash
-                #    between a rewrite's commit and its confirm.
-                start, end, size = recovered
-                self._buffer.record_file(path, start, end, size)
-            elif path not in recorded:
-                # 2. In the manifest with no row of either kind: the backfill
-                #    this rule grew out of.
-                self._buffer.record_file(
-                    path,
-                    landed.start,
-                    landed.end,
-                    memory.get(path, config.compact_size),
-                )
-
+        local = self._table.data_files()
+        base = min((f.start for f in local), default=0)
+        held_paths = {f.path for f in published.data_files() if f.end > base}
+        intended = [path for path, _, _, _ in self._buffer.intents(pinned or "")]
+        self._buffer.confirm_published(
+            floor - 1, [path for path in intended if path in held_paths]
+        )
         for path in intended:
             if path not in held_paths:
-                # 3. Nothing in the manifest holds that path, so the register
-                #    never landed and the intent is dead. Below the staging
-                #    window this also drops intents whose register DID land —
-                #    the manifest walk is bounded — and their sizes are then
-                #    never measured. No reader below the window asks.
+                # Nothing in the manifest holds that path, so the register
+                # never landed and the intent is dead. Below the staging window
+                # this also drops intents whose register DID land — the manifest
+                # walk is bounded — and the watermark covers those already.
                 self._buffer.forget_intent(path)
 
+        # Bound once, so `stable_prefix` and the intents below size files by
+        # the same policy.
+        config = self.config
+        memory = self._maintenance.memory()
         pending = [f for f in self._table.data_files() if f.end > floor]
         # `stable_prefix` holds a file back when compaction might still merge
         # it, and compaction refuses to merge anything some published table
@@ -3448,35 +3585,21 @@ class WriteHandle(LocalReadHandle):
             # that cannot happen; this is the check that holds regardless of
             # whether the arrangement has a gap.
             start=uploaded[0][0].start,
+            # What the log has issued, recorded with the rows that land, so a
+            # restore with no replica knows what not to issue again (#144).
+            properties={ISSUED_PROPERTY: str(self._buffer.next_offset() - 1)},
         ):
             return
 
-        for data_file, rel_path in uploaded:
-            # The published table's copy holds what the staging one did, and
-            # this is the only moment both names are known. Nothing could
-            # re-derive it afterwards: the staging entry goes when the staging
-            # file is unlinked, and a Parquet footer records what the rows
-            # compressed from, not what the appender counted them as.
-            #
-            # For every file, with the same default the intent used. The guard
-            # that used to skip unmeasured ones was a hole: in a takeover the
-            # confirm is the only thing that recreates rows a rival's
-            # reconciliation dropped, so skipping any file reopens the window
-            # for exactly the files the intent was added to protect.
-            #
-            # Same span, second location.
-            self._buffer.record_file(
-                published.uri(rel_path),
-                data_file.start,
-                data_file.end,
-                memory.get(data_file.path, config.compact_size),
-            )
-
         # After the register, never before: the watermark is a promise that the
-        # published table HAS the range. Stored as the last offset held, and
+        # published table HAS the range, and eviction acts on it. Raised and the
+        # intents retired together (`confirm_published`), so compaction never
+        # sees a moment covered by neither. Stored as the last offset held, and
         # never lowered: another publish on a disjoint range (#118) can have
         # recorded a higher one while this push was registering.
-        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: last.end - 1})
+        self._buffer.confirm_published(
+            last.end - 1, [published.uri(rel_path) for _, rel_path in uploaded]
+        )
 
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.
