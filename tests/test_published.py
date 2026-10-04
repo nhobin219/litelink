@@ -146,12 +146,13 @@ def test_retiring_a_local_only_log_keeps_every_row(tmp_path: Path) -> None:
         assert offsets(reader) == list(range(1, total + 1))
 
 
-def test_replication_and_restore_need_a_remote_published_table(
+def test_replication_needs_a_remote_published_table(
     tmp_path: Path,
 ) -> None:
     """The WAL replica gets unsealed rows off this machine, and a local
-    published table is on it, so replication has nowhere to ship to and a
-    restore nothing off-box to restore from.
+    published table is on it, so replication has nowhere to ship to. A restore
+    from a local one rebuilds from the table alone (#144), and with nothing
+    there it says so.
 
     Falsify by removing the remote check from `replication_config`: it returns
     a config.
@@ -163,7 +164,7 @@ def test_replication_and_restore_need_a_remote_published_table(
         with pytest.raises(ValueError, match="remote"):
             log.replication_config()
 
-    with pytest.raises(ValueError, match="remote published table"):
+    with pytest.raises(FileNotFoundError, match="no published rows"):
         litelink.restore(tmp_path / "elsewhere", "s", published=f"file://{tmp_path}/x")
 
 

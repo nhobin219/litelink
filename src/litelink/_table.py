@@ -159,7 +159,13 @@ class _Catalog(SqlCatalog):
     def _load_file_io(
         self, properties: Properties = EMPTY_DICT, location: str | None = None
     ) -> FileIO:
-        return shared_file_io({**self.properties, **properties}, location)
+        # litelink's own table properties say nothing to a FileIO, and some
+        # change with every push (`ISSUED_PROPERTY`): left in the key, each
+        # push would build a new FileIO, which is the leak this prevents.
+        relevant = {
+            k: v for k, v in properties.items() if not k.startswith("litelink.")
+        }
+        return shared_file_io({**self.properties, **relevant}, location)
 
     def _convert_orm_to_iceberg(self, orm_table: IcebergTables) -> Table:
         if not (metadata_location := orm_table.metadata_location):
