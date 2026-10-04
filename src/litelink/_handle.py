@@ -77,6 +77,7 @@ from litelink._table import (
     SORT_PROPERTY,
     LogTable,
     forget_published_entry,
+    narrow,
     published_issued_through,
     published_retired,
     published_shape,
@@ -349,6 +350,88 @@ class _Recovery:
     resumed_at: int
     # `[start, end)`, half-open like every range litelink reports.
     skipped: tuple[int, int]
+
+
+def _refuse_other_shape(
+    source: str,
+    recorded: pa.Schema,
+    recorded_sort: tuple[str, ...],
+    schema: pa.Schema | None,
+    sort_by: Sequence[str] | None,
+) -> None:
+    """Refuse a caller's `schema` or `sort_by` that differs from the shape
+    `source` records exactly. Either may be omitted."""
+    problems: list[str] = []
+    if schema is not None and not schema.equals(recorded, check_metadata=True):
+        problems += _schema_differences(schema, recorded, exact=True)
+        problems = problems or ["the field metadata differs"]
+
+    if sort_by is not None and tuple(sort_by) != recorded_sort:
+        problems.append(f"sort_by is {tuple(sort_by)!r}, not {recorded_sort!r}")
+
+    if problems:
+        msg = f"the shape given does not match the one {source} records: " + "; ".join(
+            problems
+        )
+        raise ValueError(msg)
+
+
+def _refuse_unlike_iceberg(
+    schema: pa.Schema,
+    sort_by: tuple[str, ...],
+    iceberg: pa.Schema,
+    declared_sort: tuple[str, ...],
+) -> None:
+    """Refuse a caller's shape that disagrees with what an unstamped published
+    table's Iceberg metadata does record: its columns, their order, their types
+    up to `large_*`, their nullability, and its declared sort order."""
+    narrowed = pa.schema([narrow(field) for field in schema])
+    problems = _schema_differences(narrowed, iceberg, exact=False)
+    if sort_by != declared_sort:
+        problems.append(
+            f"sort_by is {sort_by!r}, but the table declares {declared_sort!r}"
+        )
+
+    if problems:
+        msg = "the shape given does not match the published table: " + "; ".join(
+            problems
+        )
+        raise ValueError(msg)
+
+
+def _schema_differences(
+    given: pa.Schema, recorded: pa.Schema, *, exact: bool
+) -> list[str]:
+    """What differs between two schemas, column by column."""
+    problems: list[str] = []
+    if given.names != recorded.names:
+        missing = [n for n in recorded.names if n not in given.names]
+        extra = [n for n in given.names if n not in recorded.names]
+        if missing:
+            problems.append(f"missing columns {missing}")
+
+        if extra:
+            problems.append(f"columns the table lacks {extra}")
+
+        if not missing and not extra:
+            problems.append(f"columns in the order {given.names}, not {recorded.names}")
+
+        return problems
+
+    for mine, theirs in zip(given, recorded, strict=True):
+        if mine.type != theirs.type:
+            problems.append(f"{mine.name!r} is {mine.type}, not {theirs.type}")
+
+        if mine.nullable != theirs.nullable:
+            problems.append(
+                f"{mine.name!r} is {'nullable' if mine.nullable else 'not nullable'}, "
+                f"not {'nullable' if theirs.nullable else 'not nullable'}"
+            )
+
+        if exact and mine.metadata != theirs.metadata:
+            problems.append(f"{mine.name!r} carries different field metadata")
+
+    return problems
 
 
 def _foreign_published(published: str) -> ValueError:
@@ -1601,6 +1684,9 @@ class WriteHandle(LocalReadHandle):
         published: str,
         s3_options: S3Options | None = None,
         binary: str | None = None,
+        schema: pa.Schema | None = None,
+        sort_by: Sequence[str] | None = None,
+        config: LogConfig | None = None,
         replica_reserve: int = RESTORE_RESERVE,
         published_reserve: int = PUBLISHED_RESTORE_RESERVE,
     ) -> Self:
@@ -1637,6 +1723,22 @@ class WriteHandle(LocalReadHandle):
         1061. Worse, the next publish pass commits onto that lineage and
         republishes the hint over it, destroying the pointer this recovery
         depends on. Stale is worse than absent, and absent is already handled.
+
+        **The log's shape comes from whatever records it exactly, and the
+        caller supplies what nothing does.** A replica's `buffer.db` carries
+        the declared schema and `sort_by`, and so does a published table any
+        0.10+ publish has stamped (`litelink.arrow_schema`,
+        `litelink.sort_by`); a `schema` or `sort_by` passed as well must match
+        them exactly. A published table no 0.10+ publish stamped records
+        neither exactly — Iceberg has one string type and one binary type and
+        keeps no Arrow field metadata — so rebuilding from one REQUIRES both,
+        checked against what Iceberg does record: the columns, their order,
+        types up to `large_*`, nullability, and the declared sort order.
+
+        **`config`** is the policy the restored log runs under, validated
+        against its shape before anything is created. Without it, a replica's
+        recorded config is kept, and a rebuild from the published table — which
+        carries none — uses `LogConfig()`.
 
         **The restored log resumes above the freshest record of what the old
         log issued, by that record's reserve**, so no offset a reader saw names
@@ -1754,7 +1856,15 @@ class WriteHandle(LocalReadHandle):
         if not is_remote(published) and not resuming:
             # A local published table has no WAL replica beside it, so there is
             # nothing to pull: the log is rebuilt from the table.
-            return cls._restore_published(layout, published, options, published_reserve)
+            return cls._restore_published(
+                layout,
+                published,
+                options,
+                published_reserve,
+                schema=schema,
+                sort_by=sort_by,
+                config=config,
+            )
 
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
@@ -1776,7 +1886,15 @@ class WriteHandle(LocalReadHandle):
             # is refused raise above instead. The published table is then all
             # that can be recovered, and the log is rebuilt from it.
             config_path.unlink(missing_ok=True)
-            return cls._restore_published(layout, published, options, published_reserve)
+            return cls._restore_published(
+                layout,
+                published,
+                options,
+                published_reserve,
+                schema=schema,
+                sort_by=sort_by,
+                config=config,
+            )
 
         # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `published`
         # is a caller bug and has to be loud.
@@ -1878,8 +1996,15 @@ class WriteHandle(LocalReadHandle):
             )
             raise ValueError(msg)
 
-        schema = pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
-        sort_by = tuple(json.loads(raw_sort))
+        recorded_schema = pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
+        recorded_sort = tuple(json.loads(raw_sort))
+        _refuse_other_shape(
+            "the replica", recorded_schema, recorded_sort, schema, sort_by
+        )
+        schema = recorded_schema
+        sort_by = recorded_sort
+        if config is not None:
+            validate(schema, sort_by, config, published)
 
         # EVERY OTHER DURABLE WRITE FIRST; `LogTable.create` LAST.
         #
@@ -2044,6 +2169,8 @@ class WriteHandle(LocalReadHandle):
             raise
 
         log = cls.open(layout.root, name, s3_options=options)
+        if config is not None:
+            log.set_config(config)
 
         # The published table's row taken afresh. The staging table was rebuilt
         # empty and every published file now sits below it, so nothing a
@@ -2104,6 +2231,10 @@ class WriteHandle(LocalReadHandle):
         published: str,
         options: S3Options,
         reserve: int = PUBLISHED_RESTORE_RESERVE,
+        *,
+        schema: pa.Schema | None = None,
+        sort_by: Sequence[str] | None = None,
+        config: LogConfig | None = None,
     ) -> Self:
         """Rebuild a log from its published table, when there is no WAL
         replica to restore (#144).
@@ -2113,11 +2244,10 @@ class WriteHandle(LocalReadHandle):
         published, went with the machine. So the log is rebuilt as if it had
         never had a `buffer.db` — at its own name, with no seam:
 
-        - **its shape from the published table**: the declared Arrow schema and
-          `sort_by` that `publish` stamps on it (`published_shape`), derived
-          from the Iceberg schema for a table only an older version published;
-        - **the default `LogConfig`**, which is the one thing a published table
-          does not carry; `set_config` restores a deployment's policy;
+        - **its shape** from the published table's stamp, or from the caller
+          for a table no 0.10+ publish stamped (see `restore`);
+        - **the caller's `config`**, or `LogConfig()`, since a published table
+          carries none;
         - **the published table adopted** as the log's own, its watermark at
           the table's end;
         - **the offset counter above everything the old log is known to have
@@ -2145,9 +2275,27 @@ class WriteHandle(LocalReadHandle):
                 layout.name,
             )
 
-        schema, sort_by = shape
-        settings = LogConfig()
-        validate(schema, sort_by, settings, published)
+        if shape.schema is not None and shape.sort_by is not None:
+            _refuse_other_shape(
+                "the published table", shape.schema, shape.sort_by, schema, sort_by
+            )
+            schema, order = shape.schema, shape.sort_by
+        else:
+            if schema is None or sort_by is None:
+                msg = (
+                    f"the published table at {published} was written before litelink "
+                    f"recorded a log's shape on it, and Iceberg cannot record it "
+                    f"exactly — one string type, one binary type, no Arrow field "
+                    f"metadata. Pass the log's `schema` and `sort_by` to restore; they "
+                    f"are checked against what the table does record"
+                )
+                raise ValueError(msg)
+
+            order = tuple(sort_by)
+            _refuse_unlike_iceberg(schema, order, shape.iceberg, shape.declared_sort)
+
+        settings = config or LogConfig()
+        validate(schema, order, settings, published)
         frontier = covered[1]
         # Every push records what the log had issued in the commit that
         # registers it, so where the stamp exists it is at least the published
@@ -2167,7 +2315,7 @@ class WriteHandle(LocalReadHandle):
         log = cls._create(
             layout,
             schema=schema,
-            order=sort_by,
+            order=order,
             settings=settings,
             published=published,
             s3_options=options,

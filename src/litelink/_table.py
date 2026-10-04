@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from pyarrow.fs import FileSelector, FileType
 from pyiceberg.catalog import METADATA_LOCATION, Catalog
@@ -511,20 +511,29 @@ def published_issued_through(
     return None if raw is None else int(raw)
 
 
+class PublishedShape(NamedTuple):
+    """What a published table records about its log's shape.
+
+    `schema` and `sort_by` are the stamped originals — the declared Arrow
+    schema and `sort_by` exactly — or None for a table no 0.10+ publish has
+    stamped. `iceberg` and `declared_sort` are what Iceberg itself records:
+    the table's schema as Arrow with `large_*` types narrowed and no metadata,
+    and its declared sort order. Those are not the log's shape: Iceberg has
+    one string type and one binary type and keeps no Arrow field metadata, so
+    they are only what a caller's shape can be checked against.
+    """
+
+    schema: pa.Schema | None
+    sort_by: tuple[str, ...] | None
+    iceberg: pa.Schema
+    declared_sort: tuple[str, ...]
+
+
 def published_shape(
     layout: Layout, prefix: str, options: S3Options
-) -> tuple[pa.Schema, tuple[str, ...]] | None:
-    """The schema and `sort_by` of the log whose published table is at
-    `prefix`, read from the bucket alone — or None when there is no table.
-
-    From the table's `SCHEMA_PROPERTY` and `SORT_PROPERTY`, which `publish`
-    stamps on every published table. A table published only by an older
-    version has neither, and then both are derived: the schema from the
-    Iceberg schema, converted to Arrow with pyiceberg's `large_*` types
-    narrowed back to the plain ones `new` takes (order, types and nullability
-    convert one to one; Arrow field metadata does not survive), and `sort_by`
-    from the table's declared sort order.
-    """
+) -> PublishedShape | None:
+    """What the published table at `prefix` records about its log's shape,
+    read from the bucket alone — or None when there is no table."""
     import pyarrow as pa
 
     io = shared_file_io(options.resolved().catalog_properties(), prefix)
@@ -535,30 +544,35 @@ def published_shape(
     table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
     raw_schema = table.properties.get(SCHEMA_PROPERTY)
     raw_sort = table.properties.get(SORT_PROPERTY)
-    if raw_schema is not None and raw_sort is not None:
-        schema = pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
-        return schema, tuple(json.loads(raw_sort))
-
     converted = schema_to_pyarrow(table.schema(), include_field_ids=False)
-    fields = [_narrow(field) for field in converted if field.name != OFFSET_COLUMN]
     iceberg_schema = table.schema()
-    sort_by = tuple(
-        iceberg_schema.find_column_name(sort_field.source_id) or ""
-        for sort_field in table.sort_order().fields
-    )
 
-    return pa.schema(fields), sort_by
+    return PublishedShape(
+        schema=(
+            None
+            if raw_schema is None
+            else pa.ipc.read_schema(pa.py_buffer(bytes.fromhex(raw_schema)))
+        ),
+        sort_by=None if raw_sort is None else tuple(json.loads(raw_sort)),
+        iceberg=pa.schema(
+            [narrow(field) for field in converted if field.name != OFFSET_COLUMN]
+        ),
+        declared_sort=tuple(
+            iceberg_schema.find_column_name(sort_field.source_id) or ""
+            for sort_field in table.sort_order().fields
+        ),
+    )
 
 
 OFFSET_COLUMN = "litelink_offset"
 
 
-def _narrow(field: pa.Field) -> pa.Field:
+def narrow(field: pa.Field) -> pa.Field:
     """`field` with pyiceberg's `large_*` Arrow types narrowed to the plain
     ones, recursively, and no metadata."""
     import pyarrow as pa
 
-    def narrow(kind: pa.DataType) -> pa.DataType:
+    def narrow_type(kind: pa.DataType) -> pa.DataType:
         if pa.types.is_large_string(kind):
             return pa.string()
 
@@ -566,17 +580,17 @@ def _narrow(field: pa.Field) -> pa.Field:
             return pa.binary()
 
         if pa.types.is_large_list(kind) or pa.types.is_list(kind):
-            return pa.list_(_narrow(kind.value_field))
+            return pa.list_(narrow(kind.value_field))
 
         if pa.types.is_map(kind):
-            return pa.map_(_narrow(kind.key_field), _narrow(kind.item_field))
+            return pa.map_(narrow(kind.key_field), narrow(kind.item_field))
 
         if pa.types.is_struct(kind):
-            return pa.struct([_narrow(kind.field(i)) for i in range(kind.num_fields)])
+            return pa.struct([narrow(kind.field(i)) for i in range(kind.num_fields)])
 
         return kind
 
-    return pa.field(field.name, narrow(field.type), nullable=field.nullable)
+    return pa.field(field.name, narrow_type(field.type), nullable=field.nullable)
 
 
 class LogTable:

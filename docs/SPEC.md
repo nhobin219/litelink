@@ -490,8 +490,9 @@ ran with `wal_replication` off never shipped `buffer.db`, but its published tabl
 it published, and that is everything that can be recovered. So the restore acts as if there had
 never been a SQLite database: a fresh `buffer.db` at the log's own name, its schema and
 `sort_by` read from the published table's `litelink.arrow_schema` and `litelink.sort_by`
-properties (which `publish` stamps; derived from the Iceberg schema for a table only an older
-version published), the published table adopted with the watermark at its end, and the offset
+properties (which `publish` stamps; for a table no 0.10+ publish stamped, the caller passes both,
+checked against what Iceberg records, since Iceberg cannot record them exactly), the published
+table adopted with the watermark at its end, and the offset
 counter above everything the old log is known to have issued, plus `PUBLISHED_RESTORE_RESERVE`
 (2^40). Offsets the old log issued but never published may have reached readers, and the published
 end trails them by everything it had not published — without bound. So every push records

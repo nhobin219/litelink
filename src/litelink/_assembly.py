@@ -242,6 +242,9 @@ def restore(
     published: str,
     s3_options: S3Options | None = None,
     binary: str | None = None,
+    schema: pa.Schema | None = None,
+    sort_by: Sequence[str] | None = None,
+    config: LogConfig | None = None,
     replica_reserve: int = RESTORE_RESERVE,
     published_reserve: int = PUBLISHED_RESTORE_RESERVE,
 ) -> WriteHandle:
@@ -253,6 +256,9 @@ def restore(
         published=published,
         s3_options=s3_options,
         binary=binary,
+        schema=schema,
+        sort_by=sort_by,
+        config=config,
         replica_reserve=replica_reserve,
         published_reserve=published_reserve,
     )

@@ -7,6 +7,26 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`restore(..., schema=None, sort_by=None, config=None)`.** `config` is
+  the policy the restored log runs under, validated before anything is
+  created; without it a replica's recorded config is kept and a rebuild uses
+  `LogConfig()`. `schema` and `sort_by` must match the shape a replica or a
+  stamped published table records exactly.
+
+### Fixed
+
+- **A rebuild from a published table no 0.10+ publish stamped no longer
+  guesses the log's shape.** 0.10.0 derived it from the Iceberg schema, which
+  narrows `large_binary` and `large_string` and drops Arrow field metadata,
+  and succeeded silently with a schema the log never declared. It now
+  requires the caller's `schema` and `sort_by`, checked against what Iceberg
+  does record: columns, order, types up to `large_*`, nullability and the
+  declared sort order.
+
 ## 0.10.0 — 2026-10-04
 
 ### Added

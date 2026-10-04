@@ -52,6 +52,7 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
 litelink.open(root, name, *, s3_options=None)              -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, binary=None,
+                 schema=None, sort_by=None, config=None,
                  replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
 ```
 
@@ -137,6 +138,7 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, published=None, s
 litelink.open(root, name, *, s3_options=None) -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, binary=None,
+                 schema=None, sort_by=None, config=None,
                  replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
 ```
 
@@ -175,14 +177,25 @@ executable if it is not on `PATH`.
 **With no WAL replica, `restore` rebuilds the log from its published table** (#144) — a log that
 ran with `wal_replication` off, or whose published table is a local directory. The published
 table is then everything that can be recovered; rows the dead machine had buffered or sealed but
-not published are gone. The log comes back at its own name, with no seam: its schema and
-`sort_by` read from the published table (`publish` records them there; a table only an older
-version published has them derived from its Iceberg schema, Arrow field metadata excepted), the
-default `LogConfig` — call `set_config` to restore a deployment's policy — and the offset counter
+not published are gone. The log comes back at its own name, with no seam: its shape (below), the
+`config` you pass or `LogConfig()`, and the offset counter
 above everything the old log is known to have issued, plus a 2^40 fence. Known means the
 `litelink.issued_through` every publish records in its commit — at least the published end — or, for
 a table only an older version published, the end itself; the fence covers what the dead machine
 issued after its last publish, so no offset a reader saw names a different row.
+
+**The shape comes from whatever records it exactly; you supply what nothing does.**
+
+| Source | Schema and `sort_by` | A `schema`/`sort_by` you pass |
+| --- | --- | --- |
+| a WAL replica | its `buffer.db`'s, exactly | must match exactly |
+| a published table stamped by a 0.10+ publish | its `litelink.arrow_schema` and `litelink.sort_by` | must match exactly |
+| a published table no 0.10+ publish stamped | **yours, required** | checked against what Iceberg records: columns, order, types up to `large_*`, nullability, the declared sort order |
+
+Iceberg has one string type and one binary type and keeps no Arrow field metadata, so an unstamped
+table cannot say what the log declared, and nothing guesses. `config` is validated against the
+shape before anything is created; without it a replica's recorded config is kept, and a rebuild
+uses `LogConfig()`.
 
 **A restore resumes above the freshest record of what the old log issued, by that record's
 reserve**, and each reserve covers what can have been issued after its own record:
