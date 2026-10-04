@@ -35,6 +35,7 @@ import pyarrow.compute as pc
 from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._buffer import (
+    PUBLISHED_THROUGH_KEY,
     SCHEMA_KEY,
     SORT_KEY,
     START_OFFSET_KEY,
@@ -71,9 +72,12 @@ from litelink._statistics import (
 )
 from litelink._table import (
     RETIRED_PROPERTY,
+    SCHEMA_PROPERTY,
+    SORT_PROPERTY,
     LogTable,
     forget_published_entry,
     published_retired,
+    published_shape,
     published_span,
 )
 from litelink._tiers import PUBLISHED as PUBLISHED_TIER
@@ -1350,6 +1354,37 @@ class WriteHandle(LocalReadHandle):
             if covered is not None:
                 raise _foreign_published(published)
 
+        return cls._create(
+            layout,
+            schema=schema,
+            order=order,
+            settings=settings,
+            published=published,
+            s3_options=s3_options,
+            first_offset=start_offset,
+            # Recorded only when there IS a reserve. Absent means "started at
+            # 1", which a backfill must read as "no reserve" rather than "a
+            # reserve of nothing" — a log created at 1 and later restored has a
+            # gap below its offsets too, and that gap is a fence.
+            meta={_START_OFFSET_KEY: str(start_offset)} if start_offset > 1 else {},
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        layout: Layout,
+        *,
+        schema: pa.Schema,
+        order: tuple[str, ...],
+        settings: LogConfig,
+        published: str | None,
+        s3_options: S3Options | None,
+        first_offset: int,
+        meta: Mapping[str, str],
+    ) -> Self:
+        """Create the log's files, its first appended row taking `first_offset`,
+        with `meta` written beside its shape. `new`, and `restore` rebuilding a
+        log from its published table, once each has decided what to create."""
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
         buffer = Buffer.open(
@@ -1367,8 +1402,8 @@ class WriteHandle(LocalReadHandle):
         # Seeding AFTER them leaves one whose crash yields a log that reopens
         # silently at offset 1 — and `litelink.new` then refuses to retry, because
         # the buffer exists. The reserve would be lost with no error anywhere.
-        if start_offset > 1:
-            buffer.seed_offsets(start_offset)
+        if first_offset > 1:
+            buffer.seed_offsets(first_offset)
 
         buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
         # One transaction. `validate` has just accepted the policy and the
@@ -1384,12 +1419,7 @@ class WriteHandle(LocalReadHandle):
                 # so the location the publish fences compare is the stored one.
                 _PUBLISHED_KEY: (published or "").rstrip("/")
                 or layout.default_published,
-                # Recorded only when there IS a reserve. Absent means
-                # "started at 1", which a backfill must read as "no reserve"
-                # rather than "a reserve of nothing" — a log created at 1 and
-                # later restored has a gap below its offsets too, and that gap
-                # is a fence.
-                **({_START_OFFSET_KEY: str(start_offset)} if start_offset > 1 else {}),
+                **meta,
             }
         )
 
@@ -1604,13 +1634,6 @@ class WriteHandle(LocalReadHandle):
         # as a YAML parse error from the litestream subprocess, after the root
         # has already been created.
         validate_published(published)
-        if not is_remote(published):
-            msg = (
-                f"restore needs a remote published table (s3://), not {published!r}: it "
-                f"recovers a log from the WAL replica beside it, and only a "
-                f"remote published table has one"
-            )
-            raise ValueError(msg)
 
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
@@ -1683,6 +1706,11 @@ class WriteHandle(LocalReadHandle):
                 raise FileExistsError(msg)
 
         options = s3_options or S3Options()
+        if not is_remote(published) and not resuming:
+            # A local published table has no WAL replica beside it, so there is
+            # nothing to pull: the log is rebuilt from the table.
+            return cls._restore_published(layout, published, options)
+
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
 
@@ -1698,15 +1726,12 @@ class WriteHandle(LocalReadHandle):
             restore_buffer(config_path, layout.buffer_db, options, binary)
 
         if not layout.buffer_db.exists():
-            # Both readings: nothing in the arguments separates a log that
-            # never replicated from `name`/`published` naming no log at all.
-            msg = (
-                f"no replica of {layout.buffer_db.name} under {published} — there is "
-                f"nothing to restore. A log with wal_replication off has no off-box "
-                f"copy of its unsealed rows and cannot be recovered onto another "
-                f"machine, or `name` and `published` do not describe a log that exists"
-            )
-            raise FileNotFoundError(msg)
+            # No replica: litestream found none, and said so by exiting cleanly
+            # and writing nothing — a bucket it cannot reach or credentials it
+            # is refused raise above instead. The published table is then all
+            # that can be recovered, and the log is rebuilt from it.
+            config_path.unlink(missing_ok=True)
+            return cls._restore_published(layout, published, options)
 
         # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `published`
         # is a caller bug and has to be loud.
@@ -2004,6 +2029,87 @@ class WriteHandle(LocalReadHandle):
             recovered=released,
             resumed_at=resumed,
             skipped=(held_end, resumed),
+        )
+
+        return log
+
+    @classmethod
+    def _restore_published(
+        cls, layout: Layout, published: str, options: S3Options
+    ) -> Self:
+        """Rebuild a log from its published table, when there is no WAL
+        replica to restore (#144).
+
+        With no replica, the published table is everything that can be
+        recovered: rows that were buffered, or sealed into staging but not yet
+        published, went with the machine. So the log is rebuilt as if it had
+        never had a `buffer.db` — at its own name, with no seam:
+
+        - **its shape from the published table**: the declared Arrow schema and
+          `sort_by` that `publish` stamps on it (`published_shape`), derived
+          from the Iceberg schema for a table only an older version published;
+        - **the default `LogConfig`**, which is the one thing a published table
+          does not carry; `set_config` restores a deployment's policy;
+        - **the published table adopted** as the log's own, its watermark at
+          the table's end;
+        - **the offset counter at that end plus `RESTORE_RESERVE`**, as a WAL
+          restore fences: offsets the old log issued but never published may
+          have reached readers, and must never name different rows.
+        """
+        covered = published_span(layout, published, options)
+        shape = published_shape(layout, published, options)
+        if covered is None or shape is None:
+            msg = (
+                f"no replica of {layout.buffer_db.name} under {published}, and no "
+                f"published rows there to rebuild the log from — so there is nothing "
+                f"to restore. Check `name` and `published`; a log that never published "
+                f"is started afresh with `new`"
+            )
+            raise FileNotFoundError(msg)
+
+        recorded_retirement = published_retired(layout, published, options)
+        if recorded_retirement is not None:
+            raise RetiredError.of(
+                {"state": "retired", "published": published, **recorded_retirement},
+                layout.name,
+            )
+
+        schema, sort_by = shape
+        settings = LogConfig()
+        validate(schema, sort_by, settings, published)
+        frontier = covered[1]
+        first = frontier + RESTORE_RESERVE
+        _log.warning(
+            "litelink: no WAL replica of %s under %s; rebuilding the log from its "
+            "published table, which holds offsets below %d. Rows the old machine "
+            "had not published are not recovered.",
+            layout.name,
+            published,
+            frontier,
+        )
+        log = cls._create(
+            layout,
+            schema=schema,
+            order=sort_by,
+            settings=settings,
+            published=published,
+            s3_options=options,
+            first_offset=first,
+            meta={PUBLISHED_THROUGH_KEY: str(frontier - 1)},
+        )
+        # Adopted now, as a WAL restore does, so reads reach the published rows
+        # from the first query rather than after the first maintenance pass.
+        if log._published.table(repair=True) is None:  # noqa: SLF001
+            msg = (
+                f"rebuilt the log but could not adopt the published table at "
+                f"{published!r}"
+            )
+            raise RuntimeError(msg)
+
+        log._restored_from = _Recovery(  # noqa: SLF001
+            recovered=0,
+            resumed_at=first,
+            skipped=(frontier, first),
         )
 
         return log
@@ -3221,6 +3327,19 @@ class WriteHandle(LocalReadHandle):
         # it into a durable watermark, and a stale answer here retires the
         # frontier against a published table that has since grown past it.
         published.reload()
+
+        # The log's own shape, on its published table, so a restore with no WAL
+        # replica can rebuild the log exactly (#144). Stamped once: a new table
+        # at its first publish, an older one at the first publish after an upgrade.
+        if published.properties.get(SCHEMA_PROPERTY) is None:
+            raw_schema = self._buffer.get_meta(_SCHEMA_KEY)
+            if raw_schema is not None:
+                published.set_properties(
+                    {
+                        SCHEMA_PROPERTY: raw_schema,
+                        SORT_PROPERTY: json.dumps(list(self._buffer.sort_by())),
+                    }
+                )
 
         # The published table's tier row, if nothing has computed one yet: a
         # log given a published table at `new`, one written before the manifest

@@ -168,7 +168,18 @@ process.
 not the one that wrote it: restores `buffer.db` from the WAL replica, rebuilds the local
 Iceberg table *empty*, adopts the published table through `version-hint.text`, and reserves an offset
 window so nothing the dead machine served is reissued. `binary` names the litestream
-executable if it is not on `PATH`. It refuses a root that already holds this log
+executable if it is not on `PATH`.
+
+**With no WAL replica, `restore` rebuilds the log from its published table** (#144) — a log that
+ran with `wal_replication` off, or whose published table is a local directory. The published
+table is then everything that can be recovered; rows the dead machine had buffered or sealed but
+not published are gone. The log comes back at its own name, with no seam: its schema and
+`sort_by` read from the published table (`publish` records them there; a table only an older
+version published has them derived from its Iceberg schema, Arrow field metadata excepted), the
+default `LogConfig` — call `set_config` to restore a deployment's policy — and the offset counter
+at the published end plus the restore reserve. A replica, when there is one, is always used: it
+can only be fresher. A replica that exists but can't be reached (a missing bucket, refused
+credentials) raises rather than falling back, and the fallback logs a warning saying what it did. It refuses a root that already holds this log
 (`FileExistsError`) or whose `litestream.yml` replicates a different one. Split-brain is not
 detected — if the primary is alive you now have two writers on one published table.
 
@@ -386,7 +397,7 @@ has moved its rows there. A bounded hot query stays local however much has been 
 
 The published table's row changes when eviction moves rows below the staging table: eviction widens it
 before its commit. `publish` leaves it alone. It is recomputed from the
-published table's manifests at the first `publish`, on a re-point, at `restore`, and at `open` for a log
+published table's manifests at the first `publish`, at `restore`, and at `open` for a log
 written before it existed. With no row, the published table is read.
 
 `sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. Both return a
@@ -685,9 +696,9 @@ depends on it**. All three raise `RuntimeError` when another owner holds the cla
 `<root>/<name>/published`. The pipeline is the same either way — a local-only log publishes,
 evicts and retires exactly like one on S3, and any Iceberg engine reads its table through
 `version-hint.text`. Its cost is disk: the local published table keeps everything, until truncation
-lands (a follow-up). `wal_replication`, `replication_config()` and `restore` need a remote
-one: the WAL replica exists to get rows off the machine, and a local published table is on
-this disk already.
+lands (a follow-up). `wal_replication` and `replication_config()` need a remote one: the WAL
+replica exists to get rows off the machine, and a local published table is on this disk
+already. `restore` rebuilds from a local one, from the published table alone.
 
 **Nothing copies published files back into the staging table.** A reader on another machine
 caches what it reads instead; see `duckdb_connection`. Raising `staging_retention` applies to

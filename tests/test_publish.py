@@ -2872,3 +2872,196 @@ def test_advance_cycles_and_reloads_reuse_one_file_io(
         assert built == [], (
             f"{len(built)} FileIOs built across advance cycles and reloads"
         )
+
+
+# -- restore without a WAL replica (#144) --------------------------------------
+
+
+def offset_list(table: pa.Table) -> list[int]:
+    return [int(offset) for offset in table.column(OFFSET).to_pylist()]
+
+
+def _restore_settings() -> LogConfig:
+    """`published_log`'s settings, with eviction on so the cycles after a
+    restore exercise it."""
+    return LogConfig(
+        target_seal_size=64 * 1024,
+        target_compact_size=64 * 1024,
+        compact_min_files=2,
+        staging_snapshot_retention=timedelta(seconds=0),
+        published_snapshot_retention=timedelta(seconds=0),
+        staging_retention=timedelta(0),
+        staging_rows=0,
+    )
+
+
+def test_restore_without_a_replica_rebuilds_the_log_from_its_published_table(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A log that never replicated its WAL, its machine gone, comes back from
+    its published table at its own name and keeps working.
+
+    It continues at the published end plus the restore fence, holds the same
+    schema and `sort_by`, reads every published row, and then runs real seal,
+    compact, publish, evict and reclaim cycles — rows the dead machine had not
+    published are gone, as there was no other copy of them.
+
+    Falsify by restoring the `FileNotFoundError` for an absent replica: this
+    raises instead of rebuilding.
+    """
+    first = tmp_path / "first"
+    with published_log(first, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        published_end = log.published_through() + 1
+
+        assert published_end == log.end_offset(), "the setup publishes everything"
+
+        # Acknowledged and never published: lost with the machine.
+        log.extend(rows(50))
+
+    shutil.rmtree(first)
+    where = f"s3://{bucket}/prefix"
+    with litelink.restore(
+        tmp_path / "second", "s", published=where, s3_options=s3
+    ) as revived:
+        report = revived.recovery()
+
+        assert report is not None
+        assert revived.end_offset() == published_end + RESTORE_RESERVE
+        assert report.skipped == (published_end, published_end + RESTORE_RESERVE)
+        assert revived.schema == SCHEMA
+        assert revived.sort_by == ("event_ts",)
+        assert revived.scan().read_all().num_rows == ROWS
+
+        revived.set_config(_restore_settings())
+        for _ in range(3):
+            revived.extend(rows(300))
+            revived.advance(flush=True)
+
+        assert revived.published_through() == revived.end_offset() - 1
+        assert revived.staging_rows() == 0, "eviction did not run after the restore"
+        offsets = offset_list(revived.scan(columns=[OFFSET]).read_all())
+
+        assert len(offsets) == ROWS + 900
+        assert len(set(offsets)) == len(offsets), "a row was read twice"
+        assert max(offsets) == revived.end_offset() - 1
+
+
+def test_restore_without_a_replica_derives_the_shape_from_an_older_table(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A published table only an older version wrote carries no shape
+    properties, and the schema and `sort_by` come from its Iceberg schema and
+    declared sort order instead.
+
+    Falsify by reading only the properties: the restore finds no shape.
+    """
+    from litelink._table import SCHEMA_PROPERTY, SORT_PROPERTY
+
+    first = tmp_path / "first"
+    with published_log(first, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        table = log._published.require()._table  # noqa: SLF001
+
+        assert SCHEMA_PROPERTY in table.properties, "publish stamps the shape"
+
+        with table.transaction() as transaction:
+            transaction.remove_properties(SCHEMA_PROPERTY, SORT_PROPERTY)
+
+    shutil.rmtree(first)
+    with litelink.restore(
+        tmp_path / "second", "s", published=f"s3://{bucket}/prefix", s3_options=s3
+    ) as revived:
+        assert revived.schema == SCHEMA
+        assert revived.sort_by == ("event_ts",)
+        assert revived.scan().read_all().num_rows == ROWS
+
+
+def test_restore_without_a_replica_or_a_published_table_refuses(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """No replica and no published rows: nothing to restore, and nothing left
+    behind on disk."""
+    target = tmp_path / "second"
+    with pytest.raises(FileNotFoundError, match="no published rows"):
+        litelink.restore(target, "s", published=f"s3://{bucket}/nothing", s3_options=s3)
+
+    assert not (target / "s" / "buffer.db").exists()
+    assert not (target / "s" / "catalog.db").exists()
+
+
+def test_restore_rebuilds_from_a_local_published_table(tmp_path: Path) -> None:
+    """A local published table has no replica beside it, so restore rebuilds
+    from the table directly — a published directory on a volume that outlived
+    the log's own."""
+    where = f"file://{tmp_path / 'published'}"
+    first = tmp_path / "first"
+    with litelink.new(
+        first,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=_restore_settings(),
+        published=where,
+    ) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        published_end = log.published_through() + 1
+
+    shutil.rmtree(first)
+    with litelink.restore(tmp_path / "second", "s", published=where) as revived:
+        assert revived.end_offset() == published_end + RESTORE_RESERVE
+        assert revived.scan().read_all().num_rows == ROWS
+        revived.extend(rows(100))
+        revived.advance(flush=True)
+
+        assert revived.scan().read_all().num_rows == ROWS + 100
+
+
+def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """With the WAL replicated, the buffer keeps rows until the published table
+    has them, and eviction can empty staging while it still does. An open group
+    rebuilt then must start above the published end, or it adopts rows already
+    sealed and published and seals them a second time — a file the seal's
+    register declines, since the published table holds the range, but a whole
+    rewrite of the band for nothing.
+
+    Falsify by seeding from staging's `extent` alone (`_seed_group`): the
+    reopened log's seal finds the published rows to write.
+    """
+    with published_log(
+        tmp_path,
+        bucket,
+        s3,
+        wal_replication=True,
+        staging_retention=timedelta(0),
+        staging_rows=0,
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.evict("staging")
+        log.reclaim("staging")
+
+        assert log.staging_rows() == 0, "the setup must evict staging to nothing"
+        assert log.buffered_rows() > 0, "and keep the published rows buffered"
+
+        # What a sealer dying with the open group closed leaves behind.
+        with log._buffer._lock:  # noqa: SLF001
+            log._buffer._con.execute(  # noqa: SLF001
+                "DELETE FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+            )
+            log._buffer._con.commit()  # noqa: SLF001
+
+    with litelink.open(tmp_path, "s", s3_options=s3) as reopened:
+        # Everything is sealed and published, so there is nothing to seal. A
+        # group that adopted the buffered rows writes them out again; the
+        # seal's register then declines the file, since the published table
+        # holds the range, so it lands nowhere — which is why this asserts on
+        # the seal and not on what is read.
+        assert reopened.seal(flush=True) is None, "a published row was sealed again"
+        assert reopened.scan().read_all().num_rows == ROWS

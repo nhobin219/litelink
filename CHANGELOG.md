@@ -7,6 +7,33 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`restore` rebuilds a log from its published table when there is no WAL
+  replica** (#144) — a log that ran with `wal_replication` off, or published
+  to a local directory. The log comes back at its own name, at the published
+  end plus the restore reserve, with its schema and `sort_by` read from the
+  published table and the default `LogConfig` (call `set_config` to restore a
+  deployment's policy). Rows the dead machine had not published are not
+  recovered. A replica, when there is one, is still used; an unreachable one
+  raises rather than falling back.
+- **`publish` stamps the log's Arrow schema and `sort_by` on its published
+  table** (`litelink.arrow_schema`, `litelink.sort_by`), once, so such a
+  restore rebuilds the log exactly. A table published only by an older
+  version has them derived from its Iceberg schema instead, without Arrow
+  field metadata.
+
+### Changed
+
+- **What the published table holds is recorded as one range, not a row per
+  pushed file.** Eviction and compaction read the reconciled
+  `published_through` watermark (plus in-flight intents, for compaction)
+  instead of `extent` rows naming published copies, so `buffer.db` no longer
+  grows with the published history. A writer's `open` folds an existing log's
+  rows into the watermark.
+
 ## 0.9.0 — 2026-10-04
 
 ### Added
