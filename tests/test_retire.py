@@ -164,6 +164,52 @@ def test_retire_expires_before_it_sweeps_and_the_sweep_reads_no_data_files(
         assert marker["state"] == "retired"
 
 
+def test_retire_deletes_what_it_queued_without_waiting_out_the_grace(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A retired log takes no more passes, so whatever it leaves queued for
+    deletion is never deleted (#153). `retire` drains its queue at once instead
+    of after the grace — keeping anything a live snapshot still names.
+
+    Falsify by draining with the configured grace: the unreferenced object is
+    still queued, and still in the bucket, after `retire`.
+    """
+    import datetime as dt
+
+    with published_log(
+        tmp_path, bucket, s3, published_snapshot_retention=timedelta(hours=1)
+    ) as log:
+        log.extend(rows(ROWS))
+        log.seal(flush=True)
+        log.publish(flush=True)
+        published = log._published.require()  # noqa: SLF001
+        published.reload()
+        location = published.metadata_location.rpartition("/metadata/")[0]
+        io = published._table.io  # noqa: SLF001
+
+        # An object nothing references, queued just now: due only in an hour.
+        stray = f"{location}/metadata/stray-m0.avro"
+        with io.new_output(stray).create(overwrite=True) as out:
+            out.write(b"x")
+
+        # And a file the current snapshot still names, queued by mistake: its
+        # manifest list, which the drains' reference check protects.
+        current = published._table.current_snapshot()  # noqa: SLF001
+        assert current is not None
+        live = current.manifest_list
+        now = int(dt.datetime.now(dt.UTC).timestamp())
+        log._buffer.enqueue_deletions([stray, live], now)  # noqa: SLF001
+
+        log.retire()
+        queued = set(log._buffer.queued_deletions())  # noqa: SLF001
+
+        assert stray not in queued, (
+            "retire left a queued file for a pass that never comes"
+        )
+        assert not io.new_input(stray).exists(), "and it is still in the bucket"
+        assert io.new_input(live).exists(), "a file the table still names was deleted"
+
+
 def test_a_retired_log_takes_no_rows_from_any_handle(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:

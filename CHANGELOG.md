@@ -19,6 +19,12 @@ minor version carries breaking changes.
   log that ran under a version with no published expiry (5,069 snapshots)
   grew past an 8 GB machine — leaving the log stuck retiring. Re-running
   `retire()` on such a log finishes it.
+- **`retire()` deletes the files its expiry queued at once, instead of after
+  the snapshot-retention grace** (#153). A retired log takes no more passes,
+  so anything left queued was never deleted — most of a long-lived log's
+  metadata. Files a live snapshot still names are kept, as in every drain.
+  A scan still reading an already-expired snapshot of a log being retired
+  can lose its files.
 
 ## 0.10.1 — 2026-10-04
 
