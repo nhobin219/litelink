@@ -7,6 +7,26 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`litelink.current_metadata(location, *, s3_options=None)`** returns the
+  current `metadata.json` of a published table, read from its
+  `version-hint.text` outside DuckDB (#141). A `disk_cache=True` reader scans
+  that path to see each new publish.
+
+### Fixed
+
+- **A `disk_cache=True` reader no longer silently reads an old snapshot**
+  (#141). `cache_httpfs` cached `version-hint.text`, the one file a reader
+  touches that changes, so scanning a table by its directory stayed on the
+  first snapshot it saw — across restarts, from the disk cache. The hint is now
+  excluded from the disk cache. Within one process `cache_httpfs`'s file-handle
+  cache still keeps the hint's handle, so such a scan now fails DuckDB's ETag
+  check instead of returning old rows; resolve the table with
+  `current_metadata`, as the docs now show.
+
 ## 0.8.1 — 2026-10-03
 
 ### Added

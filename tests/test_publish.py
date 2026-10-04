@@ -2770,6 +2770,54 @@ def test_a_disk_cached_connection_shares_published_reads_by_key(
     assert cached("stream-2") == filled
 
 
+def test_a_disk_cached_reader_sees_new_publishes_through_current_metadata(
+    tmp_path: Path, bucket: str, s3: S3Options, isolated_read_cache: Path
+) -> None:
+    """A disk-cached reader that resolves the table with `current_metadata`
+    reads each new publish, on the same connection and on a new one (#141).
+
+    `cache_httpfs` caches `version-hint.text` like any file, so a scan of the
+    table directory on such a connection stays on its first snapshot, or with
+    the hint excluded from the disk cache, fails DuckDB's ETag check through
+    the cached file handle. `current_metadata` reads the hint outside DuckDB,
+    and the metadata path it returns is immutable, so the cache is right for it.
+
+    Falsify by resolving the hint through the connection instead
+    (`iceberg_scan('<location>', version_name_format=…)`): the second read
+    raises the ETag error, or without the exclusion returns the first count.
+    """
+    root = tmp_path / "log"
+    with published_log(root, bucket, s3) as log:
+        log.extend(rows(250))
+        log.advance(flush=True)
+        published = log._published.require()  # noqa: SLF001
+        location = published.metadata_location.rpartition("/metadata/")[0]
+
+        def count(connection: duckdb.DuckDBPyConnection) -> int:
+            metadata = litelink.current_metadata(location, s3_options=s3)
+            (found,) = connection.execute(
+                f"SELECT count(*) FROM iceberg_scan('{metadata}')"
+            ).fetchone() or (0,)
+            return int(found)
+
+        connection = litelink.duckdb_connection(
+            s3_options=s3, disk_cache=True, cache_key="reader"
+        )
+        assert count(connection) == 250
+        assert litelink.current_metadata(location, s3_options=s3) == (
+            published.metadata_location
+        )
+
+        log.extend(rows(50))
+        log.advance(flush=True)
+
+        assert count(connection) == 300, "the same connection read a stale snapshot"
+        fresh = litelink.duckdb_connection(
+            s3_options=s3, disk_cache=True, cache_key="reader"
+        )
+        assert count(fresh) == 300, "a new connection read a stale snapshot"
+
+
 def test_advance_cycles_and_reloads_reuse_one_file_io(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:

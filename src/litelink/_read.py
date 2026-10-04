@@ -364,6 +364,10 @@ class ReadCache:
             raise ValueError(msg)
 
 
+# Every Iceberg table's version hint, whatever its location.
+_HINT_EXCLUSION = r".*/metadata/version-hint\.text$"
+
+
 def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) -> None:
     """Configure `connection`'s read caches as `cache` says (#118).
 
@@ -416,10 +420,73 @@ def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) 
             "SET GLOBAL cache_httpfs_disk_cache_reader_enable_memory_cache = ?",
             [cache.memory_cache],
         )
+        # The one object a reader touches that changes (#141). Excluded from
+        # the disk cache, so a stale hint is never served from disk, in this
+        # process or a later one. Not enough on its own: the file-handle cache
+        # ignores exclusions and keeps the hint's handle for up to an hour, so
+        # a later read of it in this process fails DuckDB's ETag check rather
+        # than seeing the new one — measured; without the exclusion it silently
+        # returned the old snapshot. Readers resolve the hint with
+        # `current_metadata` instead. Exclusions belong to the database and
+        # are not deduplicated, so added once.
+        excluded = {
+            row[0]
+            for row in connection.execute(
+                "SELECT * FROM cache_httpfs_list_exclusion_regex()"
+            ).fetchall()
+        }
+        if _HINT_EXCLUSION not in excluded:
+            connection.execute(
+                "SELECT cache_httpfs_add_exclusion_regex(?)", [_HINT_EXCLUSION]
+            ).fetchall()
 
     connection.execute(
         "SET GLOBAL enable_external_file_cache = ?", [cache.memory_cache]
     )
+
+
+def current_metadata(location: str, *, s3_options: S3Options | None = None) -> str:
+    """The current `metadata.json` of the published table at `location` (#141).
+
+    Read from the table's `metadata/version-hint.text`, outside DuckDB, so that
+    no DuckDB cache can serve an old one. Scan the path this returns:
+
+        con = litelink.duckdb_connection(s3_options=options, disk_cache=True)
+        metadata = litelink.current_metadata("s3://bucket/prefix/trades",
+                                             s3_options=options)
+        con.sql(f"SELECT count(*) FROM iceberg_scan('{metadata}')")
+
+    **The hint is the one object a reader touches that changes.** Metadata,
+    manifest and data files are written once under unique names, so every
+    cache is correct for them. Resolved through a connection with
+    `disk_cache=True`, the hint itself goes through `cache_httpfs`, whose
+    file-handle cache keeps the first handle for up to an hour — so
+    `iceberg_scan('s3://…/trades', version_name_format=…)` there fails an ETag
+    check once the table has published again, rather than reading the new
+    snapshot. Call this per read that should see new publishes; it is one
+    small GET.
+
+    `location` is the published table's location, `s3://…` or `file:///…`.
+    Raises `FileNotFoundError` when it has no hint — nothing has been
+    published there, or it is not a table that writes one.
+    """
+    from litelink._table import VERSION_HINT, shared_file_io
+
+    base = location.rstrip("/")
+    properties = (s3_options or S3Options()).resolved().catalog_properties()
+    hint = shared_file_io(properties, base).new_input(f"{base}/metadata/{VERSION_HINT}")
+    if not hint.exists():
+        msg = (
+            f"no {VERSION_HINT} under {base}/metadata: nothing has been published there"
+        )
+        raise FileNotFoundError(msg)
+
+    version = hint.open().read().decode().strip()
+    if not version:
+        msg = f"{base}/metadata/{VERSION_HINT} is empty"
+        raise FileNotFoundError(msg)
+
+    return f"{base}/metadata/{version}.metadata.json"
 
 
 def duckdb_connection(
@@ -444,11 +511,15 @@ def duckdb_connection(
     AWS credential chain. A machine with no credentials at all raises
     `RuntimeError` naming the fix, here rather than as a 403 at the first
     query. Without it nothing S3 is loaded, so a local reader pays nothing for
-    it. Reading a published table on S3 from another machine:
+    it. Reading a published table on S3 from another machine, through the
+    table's current metadata (`current_metadata`, which a `disk_cache`
+    connection needs to see new publishes):
 
-        con = litelink.duckdb_connection(s3_options=litelink.S3Options())
-        con.sql("SELECT count(*) FROM iceberg_scan('s3://bucket/prefix/trades',"
-                " version_name_format = '%s%s.metadata.json')")
+        options = litelink.S3Options()
+        con = litelink.duckdb_connection(s3_options=options)
+        metadata = litelink.current_metadata("s3://bucket/prefix/trades",
+                                             s3_options=options)
+        con.sql(f"SELECT count(*) FROM iceberg_scan('{metadata}')")
 
     **Reads are cached** (#118), in two layers:
 
