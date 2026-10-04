@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import uuid
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -774,20 +775,26 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
 
 
 def _crash_before_recording(log: WriteHandle) -> None:
-    """Publish, dying between the register and the rows recording it."""
-    original = Buffer.record_file
+    """Publish, dying between the register and the confirm that records it —
+    the call naming the copies that landed. Reconciliation's own confirm,
+    before anything is uploaded, names none and goes through."""
+    original = Buffer.confirm_published
 
-    def dying(*args: object, **kwargs: object) -> None:
-        msg = "crash between the register and the record"
-        raise RuntimeError(msg)
+    def dying(self: Buffer, through: int, landed: Iterable[str] = ()) -> None:
+        paths = list(landed)
+        if paths:
+            msg = "crash between the register and the record"
+            raise RuntimeError(msg)
 
-    Buffer.record_file = dying
+        original(self, through, paths)
+
+    Buffer.confirm_published = dying
     try:
         with pytest.raises(RuntimeError, match="crash between"):
             log.publish()
 
     finally:
-        Buffer.record_file = original
+        Buffer.confirm_published = original
 
 
 def test_a_register_without_its_rows_cannot_wedge_the_log(
@@ -934,25 +941,20 @@ def test_two_owners_intending_one_path_do_not_collide(
         assert intents[0] == (path, 1, 101, 8192), "the later intent must win"
 
 
-def test_a_healed_row_carries_the_measured_bytes(
+def test_a_healed_crash_raises_the_watermark_and_retires_the_intents(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """The test the plan mandated, which the first build shipped without.
+    """After a crash between the register and the confirm, the next publish
+    reconciles against the published table's manifest: the watermark reaches
+    the span's end and every intent the manifest holds is retired, together.
 
-    The `bytes` column on an intent exists for exactly one reader: rule 1,
-    healing a crash with the only measurement that survives it. Without this
-    assertion the whole suite passes against a reconciliation that records the
-    compact target everywhere — which is what the first build did, because rule
-    2 re-fired for the paths rule 1 had just confirmed and its conflict clause
-    overwrote them.
-
-    What that costs is not cosmetic: a recorded size is what sizes every later
-    decision about that file, and nothing re-measures a published file.
+    Falsify by dropping reconciliation's `confirm_published`: the watermark
+    stays where the crash left it and the intents stay behind.
     """
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=64 * 1024,
+        target_compact_size=16 * 1024,
         compact_min_files=2,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
@@ -974,28 +976,19 @@ def test_a_healed_row_carries_the_measured_bytes(
 
         _crash_before_recording(log)
 
-        intended = {
-            path: size
-            for path, _, _, size in log._buffer.intents(log._published.uri or "")
-        }
+        published = log._published.require()
+        published.reload()
+        span = published.span()
 
-        assert intended, "the crash must leave intents behind"
-        assert all(size != config.compact_size for size in intended.values()), (
-            "the fixture must not coincide with the default it is testing for"
-        )
+        assert span is not None
+        assert log._buffer.intents(log._published.uri or ""), "the crash left intents"
+        assert log.published_through() < span[1] - 1, "the crash left the watermark"
 
         log.publish()
 
-        healed = {
-            path: size
-            for path, size in log._buffer.file_bytes().items()
-            if path in intended
-        }
-
-        assert healed, "the intents were never confirmed"
-        assert healed == intended, (
-            "a healed row must carry the bytes its intent measured, not the "
-            f"compact default: {healed} != {intended}"
+        assert log.published_through() >= span[1] - 1
+        assert not log._buffer.intents(log._published.uri or ""), (
+            "intents the manifest holds were not retired"
         )
 
 
