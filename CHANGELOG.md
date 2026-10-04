@@ -15,16 +15,21 @@ minor version carries breaking changes.
   replica** (#144) — a log that ran with `wal_replication` off, or published
   to a local directory. The log comes back at its own name, above every
   offset the old log is known to have issued plus a 2^40 fence, with its
-  schema and `sort_by` read from the published table and the default `LogConfig` (call `set_config` to restore a
-  deployment's policy). Rows the dead machine had not published are not
-  recovered. A replica, when there is one, is still used; an unreachable one
-  raises rather than falling back.
+  schema and `sort_by` read from the published table and the default
+  `LogConfig` (call `set_config` to restore a deployment's policy). Rows the
+  dead machine had not published are not recovered. A replica, when there is
+  one, is still used; an unreachable one raises rather than falling back.
 - **`publish` stamps the log's Arrow schema and `sort_by` on its published
   table** (`litelink.arrow_schema`, `litelink.sort_by`), once, so such a
   restore rebuilds the log exactly, and records `litelink.issued_through`
-  with every push, so it never reissues an offset. A table published only by an older
-  version has them derived from its Iceberg schema instead, without Arrow
-  field metadata.
+  with every push, so it never reissues an offset. A table published only by
+  an older version has the shape derived from its Iceberg schema instead,
+  without Arrow field metadata.
+- **`restore(..., reserve=None)`** overrides how many offsets a restore
+  skips. None keeps 2^20 with a WAL replica and 2^40 without one. A restore
+  with a replica also starts above the last publish's `issued_through`, so a
+  replica that fell far behind cannot make it reissue offsets the log had
+  already handed out.
 
 ### Changed
 

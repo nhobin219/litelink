@@ -240,6 +240,7 @@ def restore(
     published: str,
     s3_options: S3Options | None = None,
     binary: str | None = None,
+    reserve: int | None = None,
 ) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
     assigned. See `litelink.restore`."""
@@ -249,6 +250,7 @@ def restore(
         published=published,
         s3_options=s3_options,
         binary=binary,
+        reserve=reserve,
     )
 
 

@@ -2986,6 +2986,36 @@ def test_restore_without_a_replica_starts_above_what_the_log_issued(
         assert revived.end_offset() == issued + 1 + PUBLISHED_RESTORE_RESERVE
 
 
+def test_a_restore_reserve_overrides_the_fence(tmp_path: Path) -> None:
+    """`reserve` replaces the default fence, measured from the same point; and
+    a negative or fractional one is refused before anything is created."""
+    where = f"file://{tmp_path / 'published'}"
+    first = tmp_path / "first"
+    with litelink.new(
+        first,
+        "s",
+        schema=SCHEMA,
+        sort_by=("event_ts",),
+        config=_restore_settings(),
+        published=where,
+    ) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+        issued = log.end_offset() - 1
+
+    shutil.rmtree(first)
+    for bad in (-1, 2.5):
+        with pytest.raises(ValueError, match="reserve"):
+            litelink.restore(tmp_path / "bad", "s", published=where, reserve=bad)  # ty: ignore[invalid-argument-type]
+
+        assert not (tmp_path / "bad").exists()
+
+    with litelink.restore(
+        tmp_path / "second", "s", published=where, reserve=1000
+    ) as revived:
+        assert revived.end_offset() == issued + 1 + 1000
+
+
 def test_restore_without_a_replica_derives_the_shape_from_an_older_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
