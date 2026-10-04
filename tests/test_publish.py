@@ -2987,9 +2987,9 @@ def test_restore_without_a_replica_starts_above_what_the_log_issued(
 
 
 def test_a_restore_reserve_overrides_the_fence(tmp_path: Path) -> None:
-    """`published_reserve` replaces the rebuild's default fence, measured from
-    the same point; and a reserve that is not a non-negative integer is
-    refused before anything is created."""
+    """`reserve` replaces the default fence, measured from the same point; and
+    one that is not a non-negative integer is refused before anything is
+    created."""
     where = f"file://{tmp_path / 'published'}"
     first = tmp_path / "first"
     with litelink.new(
@@ -3005,15 +3005,14 @@ def test_a_restore_reserve_overrides_the_fence(tmp_path: Path) -> None:
         issued = log.end_offset() - 1
 
     shutil.rmtree(first)
-    for name in ("wal_reserve", "published_reserve"):
-        for bad in (-1, 2.5, True):
-            with pytest.raises(ValueError, match=name):
-                litelink.restore(tmp_path / "bad", "s", published=where, **{name: bad})  # ty: ignore[invalid-argument-type]
+    for bad in (-1, 2.5, True):
+        with pytest.raises(ValueError, match="reserve"):
+            litelink.restore(tmp_path / "bad", "s", published=where, reserve=bad)  # ty: ignore[invalid-argument-type]
 
-            assert not (tmp_path / "bad").exists()
+        assert not (tmp_path / "bad").exists()
 
     with litelink.restore(
-        tmp_path / "second", "s", published=where, published_reserve=1000
+        tmp_path / "second", "s", published=where, reserve=1000
     ) as revived:
         assert revived.end_offset() == issued + 1 + 1000
 

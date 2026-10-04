@@ -22,8 +22,6 @@ from litelink._buffer import (
     Buffer,
 )
 from litelink._handle import (
-    PUBLISHED_RESTORE_RESERVE,
-    RESTORE_RESERVE,
     LocalReadHandle,
     LogConfig,
     LogHandle,
@@ -242,8 +240,7 @@ def restore(
     published: str,
     s3_options: S3Options | None = None,
     binary: str | None = None,
-    wal_reserve: int = RESTORE_RESERVE,
-    published_reserve: int = PUBLISHED_RESTORE_RESERVE,
+    reserve: int | None = None,
 ) -> WriteHandle:
     """Take over a log whose machine is gone, fencing the offsets it may have
     assigned. See `litelink.restore`."""
@@ -253,8 +250,7 @@ def restore(
         published=published,
         s3_options=s3_options,
         binary=binary,
-        wal_reserve=wal_reserve,
-        published_reserve=published_reserve,
+        reserve=reserve,
     )
 
 

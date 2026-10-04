@@ -52,7 +52,7 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
 litelink.open(root, name, *, s3_options=None)              -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, binary=None,
-                 wal_reserve=2**20, published_reserve=2**40) -> WriteHandle
+                 reserve=None) -> WriteHandle
 ```
 
 **`open` is overloaded on the `read_only` literal**, so the type you get is static:
@@ -137,7 +137,7 @@ litelink.new(root, name, *, schema, sort_by=None, config=None, published=None, s
 litelink.open(root, name, *, s3_options=None) -> WriteHandle
 litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, binary=None,
-                 wal_reserve=2**20, published_reserve=2**40) -> WriteHandle
+                 reserve=None) -> WriteHandle
 ```
 
 **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
@@ -184,11 +184,10 @@ above everything the old log is known to have issued, plus a 2^40 fence. Known m
 a table only an older version published, the end itself; the fence covers what the dead machine
 issued after its last publish, so no offset a reader saw names a different row.
 
-**The two reserves are those fences, and both are plain integers.** `wal_reserve` (2^20) applies
-when restoring from a replica, above both the replica's own sequence and the recorded
-`issued_through`, so a sidecar that stopped shipping cannot make it reissue what the last publish
-saw; it only has to cover replication lag. `published_reserve` (2^40) applies when rebuilding from
-the published table, and has to cover everything issued after the last publish. A replica, when there is one, is always used: it
+**`reserve` overrides the fence**, on whichever path the restore takes. None is 2^20 with a
+replica, which only has to cover replication lag, and 2^40 without one. A restore with a replica
+also starts above the recorded `issued_through`, so a sidecar that stopped shipping cannot make it
+reissue what the last publish saw. A replica, when there is one, is always used: it
 can only be fresher. A replica that exists but can't be reached (a missing bucket, refused
 credentials) raises rather than falling back, and the fallback logs a warning saying what it did. It refuses a root that already holds this log
 (`FileExistsError`) or whose `litestream.yml` replicates a different one. Split-brain is not

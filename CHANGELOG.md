@@ -25,12 +25,11 @@ minor version carries breaking changes.
   with every push, so it never reissues an offset. A table published only by
   an older version has the shape derived from its Iceberg schema instead,
   without Arrow field metadata.
-- **`restore(..., wal_reserve=2**20, published_reserve=2**40)`** set how
-  many offsets a restore skips: `wal_reserve` when restoring from a WAL
-  replica, `published_reserve` when rebuilding from the published table. A
-  restore with a replica also starts above the last publish's
-  `issued_through`, so a replica that fell far behind cannot make it reissue
-  offsets the log had already handed out.
+- **`restore(..., reserve=None)`** overrides how many offsets a restore
+  skips. None keeps 2^20 with a WAL replica and 2^40 without one. A restore
+  with a replica also starts above the last publish's `issued_through`, so a
+  replica that fell far behind cannot make it reissue offsets the log had
+  already handed out.
 
 ### Changed
 

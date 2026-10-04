@@ -1601,8 +1601,7 @@ class WriteHandle(LocalReadHandle):
         published: str,
         s3_options: S3Options | None = None,
         binary: str | None = None,
-        wal_reserve: int = RESTORE_RESERVE,
-        published_reserve: int = PUBLISHED_RESTORE_RESERVE,
+        reserve: int | None = None,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 
@@ -1638,14 +1637,13 @@ class WriteHandle(LocalReadHandle):
         republishes the hint over it, destroying the pointer this recovery
         depends on. Stale is worse than absent, and absent is already handled.
 
-        **The reserves are how many offsets to skip** above everything the old
-        log is known to have issued, so no offset a reader saw names a
-        different row. `wal_reserve` (2^20) applies when restoring from a WAL
-        replica, above the replica's own sequence and the `issued_through` the
-        last publish recorded: it only has to cover replication lag.
-        `published_reserve` (2^40) applies when rebuilding from the published
-        table, above that `issued_through`: it has to cover everything issued
-        after the last publish.
+        **`reserve` is how many offsets to skip** above everything the old log
+        is known to have issued, so no offset a reader saw names a different
+        row. Known means the replica's sequence and the `issued_through` the
+        last publish recorded, or with no replica that `issued_through` alone.
+        None is `RESTORE_RESERVE` (2^20) with a replica, which only has to
+        cover replication lag, and `PUBLISHED_RESTORE_RESERVE` (2^40) without
+        one, which has to cover everything issued after the last publish.
 
         **`catalog.db` is not restored either**, and stays in the replication
         set regardless: same-machine recovery is where its absolute paths still
@@ -1657,14 +1655,12 @@ class WriteHandle(LocalReadHandle):
         # as a YAML parse error from the litestream subprocess, after the root
         # has already been created.
         validate_published(published)
-        for label, value in (
-            ("wal_reserve", wal_reserve),
-            ("published_reserve", published_reserve),
+        # `bool` is an int to Python, and never what a caller means here.
+        if reserve is not None and (
+            not isinstance(reserve, int) or isinstance(reserve, bool) or reserve < 0
         ):
-            # `bool` is an int to Python, and never what a caller means here.
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                msg = f"{label} must be a non-negative integer, not {value!r}"
-                raise ValueError(msg)
+            msg = f"reserve must be a non-negative integer, not {reserve!r}"
+            raise ValueError(msg)
 
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
@@ -1740,7 +1736,12 @@ class WriteHandle(LocalReadHandle):
         if not is_remote(published) and not resuming:
             # A local published table has no WAL replica beside it, so there is
             # nothing to pull: the log is rebuilt from the table.
-            return cls._restore_published(layout, published, options, published_reserve)
+            return cls._restore_published(
+                layout,
+                published,
+                options,
+                PUBLISHED_RESTORE_RESERVE if reserve is None else reserve,
+            )
 
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
@@ -1762,7 +1763,12 @@ class WriteHandle(LocalReadHandle):
             # is refused raise above instead. The published table is then all
             # that can be recovered, and the log is rebuilt from it.
             config_path.unlink(missing_ok=True)
-            return cls._restore_published(layout, published, options, published_reserve)
+            return cls._restore_published(
+                layout,
+                published,
+                options,
+                PUBLISHED_RESTORE_RESERVE if reserve is None else reserve,
+            )
 
         # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `published`
         # is a caller bug and has to be loud.
@@ -1885,7 +1891,8 @@ class WriteHandle(LocalReadHandle):
         # root without it cannot be opened by anything.
         buffer = Buffer.open(layout.buffer_db, schema)
         try:
-            released, resumed = buffer.strip_local_state(wal_reserve)
+            fence = RESTORE_RESERVE if reserve is None else reserve
+            released, resumed = buffer.strip_local_state(fence)
 
             # ADOPTED, explicitly. `published.db` was deliberately not restored,
             # so nothing here has a catalog row for the published table — and an
@@ -1982,7 +1989,7 @@ class WriteHandle(LocalReadHandle):
             # published end; only a table an older version published has none.
             issued = published_issued_through(layout, published, options)
             known = frontier if issued is None else issued + 1
-            wanted = known + wal_reserve
+            wanted = known + fence
             if wanted > resumed:
                 resumed = buffer.reserve(wanted - resumed)[1]
         finally:
