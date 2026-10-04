@@ -1601,7 +1601,8 @@ class WriteHandle(LocalReadHandle):
         published: str,
         s3_options: S3Options | None = None,
         binary: str | None = None,
-        reserve: int | None = None,
+        wal_reserve: int = RESTORE_RESERVE,
+        published_reserve: int = PUBLISHED_RESTORE_RESERVE,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 
@@ -1637,13 +1638,14 @@ class WriteHandle(LocalReadHandle):
         republishes the hint over it, destroying the pointer this recovery
         depends on. Stale is worse than absent, and absent is already handled.
 
-        **`reserve` is how many offsets to skip** above everything the old log
-        is known to have issued — the replica's sequence, or with no replica
-        the published table's end, and in both cases the `issued_through` the
-        last publish recorded. None is `RESTORE_RESERVE` (2^20) with a replica,
-        which only has to cover replication lag, and `PUBLISHED_RESTORE_RESERVE`
-        (2^40) without one, which has to cover everything issued after the last
-        publish.
+        **The reserves are how many offsets to skip** above everything the old
+        log is known to have issued, so no offset a reader saw names a
+        different row. `wal_reserve` (2^20) applies when restoring from a WAL
+        replica, above the replica's own sequence and the `issued_through` the
+        last publish recorded: it only has to cover replication lag.
+        `published_reserve` (2^40) applies when rebuilding from the published
+        table, above that `issued_through`: it has to cover everything issued
+        after the last publish.
 
         **`catalog.db` is not restored either**, and stays in the replication
         set regardless: same-machine recovery is where its absolute paths still
@@ -1655,9 +1657,14 @@ class WriteHandle(LocalReadHandle):
         # as a YAML parse error from the litestream subprocess, after the root
         # has already been created.
         validate_published(published)
-        if reserve is not None and (not isinstance(reserve, int) or reserve < 0):
-            msg = f"reserve must be a non-negative integer, not {reserve!r}"
-            raise ValueError(msg)
+        for label, value in (
+            ("wal_reserve", wal_reserve),
+            ("published_reserve", published_reserve),
+        ):
+            # `bool` is an int to Python, and never what a caller means here.
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                msg = f"{label} must be a non-negative integer, not {value!r}"
+                raise ValueError(msg)
 
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
@@ -1733,7 +1740,7 @@ class WriteHandle(LocalReadHandle):
         if not is_remote(published) and not resuming:
             # A local published table has no WAL replica beside it, so there is
             # nothing to pull: the log is rebuilt from the table.
-            return cls._restore_published(layout, published, options, reserve)
+            return cls._restore_published(layout, published, options, published_reserve)
 
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
@@ -1755,7 +1762,7 @@ class WriteHandle(LocalReadHandle):
             # is refused raise above instead. The published table is then all
             # that can be recovered, and the log is rebuilt from it.
             config_path.unlink(missing_ok=True)
-            return cls._restore_published(layout, published, options, reserve)
+            return cls._restore_published(layout, published, options, published_reserve)
 
         # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `published`
         # is a caller bug and has to be loud.
@@ -1878,8 +1885,7 @@ class WriteHandle(LocalReadHandle):
         # root without it cannot be opened by anything.
         buffer = Buffer.open(layout.buffer_db, schema)
         try:
-            fence = RESTORE_RESERVE if reserve is None else reserve
-            released, resumed = buffer.strip_local_state(fence)
+            released, resumed = buffer.strip_local_state(wal_reserve)
 
             # ADOPTED, explicitly. `published.db` was deliberately not restored,
             # so nothing here has a catalog row for the published table — and an
@@ -1971,9 +1977,12 @@ class WriteHandle(LocalReadHandle):
             # And above what the last publish recorded the log had issued: a
             # replica whose sidecar stopped shipping can trail it by far more
             # than any fence sized for replication lag.
+            # Every push records what the log had issued in the commit that
+            # registers it, so where the stamp exists it is at least the
+            # published end; only a table an older version published has none.
             issued = published_issued_through(layout, published, options)
-            known = max(frontier, 0 if issued is None else issued + 1)
-            wanted = known + fence
+            known = frontier if issued is None else issued + 1
+            wanted = known + wal_reserve
             if wanted > resumed:
                 resumed = buffer.reserve(wanted - resumed)[1]
         finally:
@@ -2069,7 +2078,7 @@ class WriteHandle(LocalReadHandle):
         layout: Layout,
         published: str,
         options: S3Options,
-        reserve: int | None = None,
+        reserve: int = PUBLISHED_RESTORE_RESERVE,
     ) -> Self:
         """Rebuild a log from its published table, when there is no WAL
         replica to restore (#144).
@@ -2121,7 +2130,7 @@ class WriteHandle(LocalReadHandle):
         # is all there is.
         issued = published_issued_through(layout, published, options)
         known = frontier if issued is None else issued + 1
-        first = known + (PUBLISHED_RESTORE_RESERVE if reserve is None else reserve)
+        first = known + reserve
         _log.warning(
             "litelink: no WAL replica of %s under %s; rebuilding the log from its "
             "published table, which holds offsets below %d. Rows the old machine "
