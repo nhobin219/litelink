@@ -3574,6 +3574,14 @@ class WriteHandle(LocalReadHandle):
                     }
                 )
 
+        # The metadata retention properties, re-applied as a writer's `open`
+        # re-applies them to the staging table (#155). They are what keeps the
+        # table's `metadata.json` files bounded and its manifests merged, and a
+        # table can lose one — changed by hand or by another engine, adopted
+        # from elsewhere, or older than a property a release adds. A check
+        # that commits only when one is missing or wrong.
+        published.ensure_metadata_properties()
+
         # The published table's tier row, if nothing has computed one yet: a
         # log given a published table at `new`, one written before the manifest
         # existed, one re-pointed where the published table could not be read.
