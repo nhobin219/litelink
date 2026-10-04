@@ -25,7 +25,9 @@ minor version carries breaking changes.
   excluded from the disk cache. Within one process `cache_httpfs`'s file-handle
   cache still keeps the hint's handle, so such a scan now fails DuckDB's ETag
   check instead of returning old rows; resolve the table with
-  `current_metadata`, as the docs now show.
+  `current_metadata`, as the docs now show. That holds for scans only: reading
+  the hint itself through such a connection (`read_text('…/version-hint.text')`)
+  still returns the old one, silently.
 
 ## 0.8.1 — 2026-10-03
 
