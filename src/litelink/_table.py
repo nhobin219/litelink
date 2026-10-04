@@ -1314,6 +1314,19 @@ class LogTable:
             for path in self._table.inspect.all_files()["file_path"].to_pylist()
         } | self.metadata_paths(self._table.snapshots())
 
+    def referenced_metadata(self) -> set[str]:
+        """Every metadata file a live snapshot or the table itself still needs:
+        the manifest lists and manifests of every snapshot, and the
+        `metadata.json` files the table names.
+
+        What the sweep compares its listing against (#152). It deletes only
+        metadata, so data-file paths are no part of its decision — and reading
+        them is `inspect.all_files()`, every entry of every snapshot's
+        manifests, which on a table carrying thousands of snapshots outgrows
+        the machine. This reads manifest lists only.
+        """
+        return self.metadata_paths(self._table.snapshots()) | self.live_metadata()
+
     def metadata_paths(self, snapshots: Iterable[Snapshot]) -> set[str]:
         """Manifest lists and manifests belonging to `snapshots`.
 

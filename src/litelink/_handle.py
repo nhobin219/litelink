@@ -4073,10 +4073,14 @@ class WriteHandle(LocalReadHandle):
         4. evict the whole staging table, and check nothing is left local;
         5. record the retirement on the published table (`litelink.retired`),
            so `restore` refuses whatever a replica says;
-        6. delete every stranded metadata file in both tables — what a commit
+        6. expire both tables' snapshots past their retention, as `advance`
+           does — a table that carried thousands of snapshots goes down to the
+           few its retention keeps, which is what makes the sweep after it
+           cheap (#152);
+        7. delete every stranded metadata file in both tables — what a commit
            that lost its pointer swap or crashed left behind (#113). A retired
            log takes no more passes, so the sweep gets no later chance;
-        7. narrow the buffer's range to `[end, end)`, empty, and flush the WAL
+        8. narrow the buffer's range to `[end, end)`, empty, and flush the WAL
            replica again. That empty range is what reads as `retired` rather
            than `retiring`, and what lets every read skip the buffer.
 
@@ -4133,6 +4137,13 @@ class WriteHandle(LocalReadHandle):
         finally:
             claim.release()
 
+        # Expired first, as `advance` does (#152). A log that ran under a
+        # version with no published expiry can carry thousands of snapshots,
+        # each with its own manifest of every file, and everything that walks
+        # them grows with that; expiry takes the table down to the snapshots
+        # its retention keeps. Each drains what has come due after.
+        self._maintenance.expire()
+        self._maintenance.expire_published()
         # Every stranded metadata file in both tables, all at once (#113). A
         # retired log takes no more passes, so this is the sweep's last chance
         # — and the manifests merged away before #112 are a backlog of

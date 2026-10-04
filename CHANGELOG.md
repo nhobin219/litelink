@@ -7,6 +7,19 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Fixed
+
+- **`retire()` completes on a log whose published table carried thousands of
+  snapshots** (#152). It now expires both tables' snapshots past their
+  retention before its sweep, as `advance` does, and the sweep reads metadata
+  references only. It read every data file's path through pyiceberg's
+  `inspect.all_files()` — every entry of every snapshot's manifests, which a
+  log that ran under a version with no published expiry (5,069 snapshots)
+  grew past an 8 GB machine — leaving the log stuck retiring. Re-running
+  `retire()` on such a log finishes it.
+
 ## 0.10.1 — 2026-10-04
 
 ### Added

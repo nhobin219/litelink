@@ -101,6 +101,69 @@ def test_a_retired_log_is_all_published_and_nothing_in_staging(
         ), "a retired log is all published"
 
 
+def test_retire_expires_before_it_sweeps_and_the_sweep_reads_no_data_files(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A published table that carried a snapshot per publish — a log that ran
+    under a version with no published expiry — is expired before `retire`
+    sweeps it, and the sweep reads metadata references only (#152).
+
+    `referenced_paths` reaches `inspect.all_files()`, every entry of every
+    snapshot's manifests: on a 5,069-snapshot table it outgrew an 8 GB machine
+    and left the log stuck retiring. Asserted structurally, by what the sweep
+    sees and calls, rather than by memory.
+
+    Falsify by dropping the expiry from `retire` (the sweep finds every
+    publish's snapshot), or by sweeping against `referenced_paths` (the sweep
+    calls it).
+    """
+    from litelink._maintenance import Maintenance
+    from litelink._table import LogTable
+
+    with published_log(tmp_path, bucket, s3) as log:
+        # A publish per batch and no expiry between them: a snapshot each.
+        for _ in range(12):
+            log.extend(rows(50))
+            log.seal(flush=True)
+            log.publish(flush=True)
+
+        published = log._published.require()  # noqa: SLF001
+        published.reload()
+
+        assert published.snapshot_count() >= 12, "the setup must accumulate snapshots"
+
+        seen: list[int] = []
+        sweeping = False
+        real_sweep = Maintenance.sweep_everything
+        real_referenced = LogTable.referenced_paths
+
+        def sweep(self: Maintenance) -> dict[str, int]:
+            nonlocal sweeping
+            table = self._published.table()  # noqa: SLF001
+            assert table is not None
+            table.reload()
+            seen.append(table.snapshot_count())
+            sweeping = True
+            try:
+                return real_sweep(self)
+            finally:
+                sweeping = False
+
+        def referenced(self: LogTable) -> set[str]:
+            assert not sweeping, "the sweep read every data file's path"
+            return real_referenced(self)
+
+        monkeypatch.setattr(Maintenance, "sweep_everything", sweep)
+        monkeypatch.setattr(LogTable, "referenced_paths", referenced)
+        log.retire()
+
+        # Zero published retention: only the current snapshot survives.
+        assert seen == [1], f"the sweep saw {seen} published snapshots"
+        marker = log._buffer.retired()  # noqa: SLF001
+        assert marker is not None
+        assert marker["state"] == "retired"
+
+
 def test_a_retired_log_takes_no_rows_from_any_handle(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:

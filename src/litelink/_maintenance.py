@@ -1268,7 +1268,7 @@ class Maintenance:
         anchors = table.anchors()
         listed = table.metadata_files()
         table.reload()
-        live = table.referenced_paths() | table.live_metadata()
+        live = table.referenced_metadata()
 
         if not anchors <= {path for path, _ in listed}:
             if listed:
