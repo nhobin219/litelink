@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -3018,15 +3019,9 @@ def test_a_restore_reserve_overrides_the_fence(tmp_path: Path) -> None:
         assert revived.end_offset() == issued + 1 + 1000
 
 
-def test_restore_without_a_replica_derives_the_shape_from_an_older_table(
-    tmp_path: Path, bucket: str, s3: S3Options
-) -> None:
-    """A published table only an older version wrote carries no shape
-    properties, and the schema and `sort_by` come from its Iceberg schema and
-    declared sort order instead.
-
-    Falsify by reading only the properties: the restore finds no shape.
-    """
+def _unstamped_published_log(tmp_path: Path, bucket: str, s3: S3Options) -> str:
+    """A published log whose table carries no shape properties — as one only
+    an older version published — and whose machine is gone. Returns where."""
     from litelink._table import SCHEMA_PROPERTY, SORT_PROPERTY
 
     first = tmp_path / "first"
@@ -3041,12 +3036,110 @@ def test_restore_without_a_replica_derives_the_shape_from_an_older_table(
             transaction.remove_properties(SCHEMA_PROPERTY, SORT_PROPERTY)
 
     shutil.rmtree(first)
+
+    return f"s3://{bucket}/prefix"
+
+
+def test_a_rebuild_from_an_unstamped_table_requires_the_shape(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A published table no 0.10+ publish stamped cannot say what the log
+    declared — Iceberg narrows `large_*` types and keeps no field metadata —
+    so the rebuild refuses without the caller's `schema` and `sort_by`, and
+    with them, checks them against what Iceberg does record.
+
+    Falsify by deriving the shape from Iceberg: the first restore succeeds.
+    """
+    where = _unstamped_published_log(tmp_path, bucket, s3)
+    target = tmp_path / "second"
+
+    for given in ({}, {"schema": SCHEMA}, {"sort_by": ("event_ts",)}):
+        with pytest.raises(ValueError, match="Pass the log's `schema` and `sort_by`"):
+            litelink.restore(target, "s", published=where, s3_options=s3, **given)  # ty: ignore[invalid-argument-type]
+
+        assert not (target / "s" / "buffer.db").exists()
+
+    retyped = pa.schema(
+        [pa.field("event_ts", pa.int32()), SCHEMA.field("key"), SCHEMA.field("payload")]
+    )
+    for schema, sort_by, problem in (
+        (retyped, ("event_ts",), "'event_ts' is int32, not int64"),
+        (
+            pa.schema(
+                [SCHEMA.field("key"), SCHEMA.field("event_ts"), SCHEMA.field("payload")]
+            ),
+            ("event_ts",),
+            "order",
+        ),
+        (
+            pa.schema([*SCHEMA, pa.field("extra", pa.string())]),
+            ("event_ts",),
+            "columns the table lacks",
+        ),
+        (SCHEMA, ("key",), "the table declares"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(problem)):
+            litelink.restore(
+                target,
+                "s",
+                published=where,
+                s3_options=s3,
+                schema=schema,
+                sort_by=sort_by,
+            )
+
+        assert not (target / "s" / "buffer.db").exists()
+
+    # `large_string` is what Iceberg cannot tell from `string`, so it is
+    # accepted — and kept, exactly as given.
+    wide = pa.schema(
+        [
+            SCHEMA.field("event_ts"),
+            pa.field("key", pa.large_string()),
+            SCHEMA.field("payload"),
+        ]
+    )
     with litelink.restore(
-        tmp_path / "second", "s", published=f"s3://{bucket}/prefix", s3_options=s3
+        target, "s", published=where, s3_options=s3, schema=wide, sort_by=("event_ts",)
     ) as revived:
-        assert revived.schema == SCHEMA
+        assert revived.schema == wide
         assert revived.sort_by == ("event_ts",)
         assert revived.scan().read_all().num_rows == ROWS
+
+
+def test_a_shape_given_with_a_stamped_table_must_match_it(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A stamped table records the shape exactly, so a caller's must equal it;
+    and `config` is the policy the rebuilt log runs under."""
+    first = tmp_path / "first"
+    with published_log(first, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.advance(flush=True)
+
+    shutil.rmtree(first)
+    where = f"s3://{bucket}/prefix"
+    target = tmp_path / "second"
+    wide = pa.schema(
+        [
+            SCHEMA.field("event_ts"),
+            pa.field("key", pa.large_string()),
+            SCHEMA.field("payload"),
+        ]
+    )
+    with pytest.raises(ValueError, match="'key' is large_string, not string"):
+        litelink.restore(target, "s", published=where, s3_options=s3, schema=wide)
+
+    with pytest.raises(ValueError, match="sort_by is"):
+        litelink.restore(target, "s", published=where, s3_options=s3, sort_by=("key",))
+
+    assert not (target / "s" / "buffer.db").exists()
+
+    config = _restore_settings()
+    with litelink.restore(
+        target, "s", published=where, s3_options=s3, schema=SCHEMA, config=config
+    ) as revived:
+        assert revived.config == config
 
 
 def test_restore_without_a_replica_or_a_published_table_refuses(
@@ -3195,3 +3288,38 @@ def test_a_replica_behind_the_last_publish_resumes_above_the_published_record(
 
         assert report is not None
         assert report.recovered > 0
+
+
+def test_a_replica_restore_checks_a_given_shape_and_applies_config(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A replica's `buffer.db` records the shape exactly, so a caller's must
+    match it, refused before anything is built; and `config` replaces the
+    replica's recorded policy."""
+    primary = tmp_path / "primary"
+    with published_log(primary, bucket, s3) as log:
+        log.extend(rows(800))
+        log.seal()
+        _snapshot_buffer(primary, tmp_path / "second")
+
+    where = f"s3://{bucket}/prefix"
+    wide = pa.schema(
+        [
+            SCHEMA.field("event_ts"),
+            pa.field("key", pa.large_string()),
+            SCHEMA.field("payload"),
+        ]
+    )
+    with pytest.raises(ValueError, match="the replica records"):
+        litelink.restore(
+            tmp_path / "second", "s", published=where, s3_options=s3, schema=wide
+        )
+
+    assert not (tmp_path / "second" / "s" / "catalog.db").exists()
+
+    config = _restore_settings()
+    with litelink.restore(
+        tmp_path / "second", "s", published=where, s3_options=s3, config=config
+    ) as revived:
+        assert revived.config == config
+        assert revived.schema == SCHEMA
