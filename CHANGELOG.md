@@ -25,11 +25,13 @@ minor version carries breaking changes.
   with every push, so it never reissues an offset. A table published only by
   an older version has the shape derived from its Iceberg schema instead,
   without Arrow field metadata.
-- **`restore(..., reserve=None)`** overrides how many offsets a restore
-  skips. None keeps 2^20 with a WAL replica and 2^40 without one. A restore
-  with a replica also starts above the last publish's `issued_through`, so a
-  replica that fell far behind cannot make it reissue offsets the log had
-  already handed out.
+- **A restore resumes above the freshest record of what the old log issued**,
+  by that record's reserve: `restore(..., replica_reserve=2**20,
+  published_reserve=2**40)`. A replica whose sidecar stopped shipping is
+  behind the last publish's `issued_through`, so the published record decides
+  and the larger reserve applies. Delete a log's replica when turning WAL
+  replication off: one left behind is still used, and the log comes back with
+  the settings it had when replication stopped.
 
 ### Changed
 

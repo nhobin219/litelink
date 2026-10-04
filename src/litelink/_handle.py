@@ -1601,7 +1601,8 @@ class WriteHandle(LocalReadHandle):
         published: str,
         s3_options: S3Options | None = None,
         binary: str | None = None,
-        reserve: int | None = None,
+        replica_reserve: int = RESTORE_RESERVE,
+        published_reserve: int = PUBLISHED_RESTORE_RESERVE,
     ) -> Self:
         """Recover a log onto a machine that is not the one that wrote it (§3a).
 
@@ -1637,13 +1638,28 @@ class WriteHandle(LocalReadHandle):
         republishes the hint over it, destroying the pointer this recovery
         depends on. Stale is worse than absent, and absent is already handled.
 
-        **`reserve` is how many offsets to skip** above everything the old log
-        is known to have issued, so no offset a reader saw names a different
-        row. Known means the replica's sequence and the `issued_through` the
-        last publish recorded, or with no replica that `issued_through` alone.
-        None is `RESTORE_RESERVE` (2^20) with a replica, which only has to
-        cover replication lag, and `PUBLISHED_RESTORE_RESERVE` (2^40) without
-        one, which has to cover everything issued after the last publish.
+        **The restored log resumes above the freshest record of what the old
+        log issued, by that record's reserve**, so no offset a reader saw names
+        a different row. There are two records, and each reserve covers what
+        can have been issued after its own:
+
+        - **The WAL replica's sequence.** Unseen after it: replication lag, so
+          `replica_reserve` (2^20).
+        - **The published table's `litelink.issued_through`**, recorded by
+          every push — or its end, for a table only an older version published.
+          Unseen after it: everything issued since the last publish, for as
+          long as publishing was behind or down, so `published_reserve` (2^40).
+
+        The freshest one decides: a healthy replica is ahead of the last
+        publish, and a replica whose sidecar stopped shipping is not. With no
+        replica, the published record is all there is.
+
+        **A replica is always used when there is one**, for its unpublished
+        rows and its settings. A replica left behind when WAL replication was
+        turned off is still found, and the log comes back with the settings it
+        had then — its offsets are safe, since the published record is fresher
+        and decides. Delete the replica (`<published>/<name>/_wal`) when turning
+        replication off.
 
         **`catalog.db` is not restored either**, and stays in the replication
         set regardless: same-machine recovery is where its absolute paths still
@@ -1655,12 +1671,14 @@ class WriteHandle(LocalReadHandle):
         # as a YAML parse error from the litestream subprocess, after the root
         # has already been created.
         validate_published(published)
-        # `bool` is an int to Python, and never what a caller means here.
-        if reserve is not None and (
-            not isinstance(reserve, int) or isinstance(reserve, bool) or reserve < 0
+        for label, value in (
+            ("replica_reserve", replica_reserve),
+            ("published_reserve", published_reserve),
         ):
-            msg = f"reserve must be a non-negative integer, not {reserve!r}"
-            raise ValueError(msg)
+            # `bool` is an int to Python, and never what a caller means here.
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                msg = f"{label} must be a non-negative integer, not {value!r}"
+                raise ValueError(msg)
 
         layout = Layout(Path(root), name)
         # A buffer with no TABLE for this log is a restore interrupted before
@@ -1736,12 +1754,7 @@ class WriteHandle(LocalReadHandle):
         if not is_remote(published) and not resuming:
             # A local published table has no WAL replica beside it, so there is
             # nothing to pull: the log is rebuilt from the table.
-            return cls._restore_published(
-                layout,
-                published,
-                options,
-                PUBLISHED_RESTORE_RESERVE if reserve is None else reserve,
-            )
+            return cls._restore_published(layout, published, options, published_reserve)
 
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
@@ -1763,12 +1776,7 @@ class WriteHandle(LocalReadHandle):
             # is refused raise above instead. The published table is then all
             # that can be recovered, and the log is rebuilt from it.
             config_path.unlink(missing_ok=True)
-            return cls._restore_published(
-                layout,
-                published,
-                options,
-                PUBLISHED_RESTORE_RESERVE if reserve is None else reserve,
-            )
+            return cls._restore_published(layout, published, options, published_reserve)
 
         # THE BUFFER IS THE AUTHORITY ON IDENTITY, so a conflicting `published`
         # is a caller bug and has to be loud.
@@ -1891,8 +1899,9 @@ class WriteHandle(LocalReadHandle):
         # root without it cannot be opened by anything.
         buffer = Buffer.open(layout.buffer_db, schema)
         try:
-            fence = RESTORE_RESERVE if reserve is None else reserve
-            released, resumed = buffer.strip_local_state(fence)
+            released, resumed = buffer.strip_local_state(replica_reserve)
+            # The first offset past what the replica records the log issued.
+            replica_known = resumed - replica_reserve
 
             # ADOPTED, explicitly. `published.db` was deliberately not restored,
             # so nothing here has a catalog row for the published table — and an
@@ -1988,8 +1997,17 @@ class WriteHandle(LocalReadHandle):
             # registers it, so where the stamp exists it is at least the
             # published end; only a table an older version published has none.
             issued = published_issued_through(layout, published, options)
-            known = frontier if issued is None else issued + 1
-            wanted = known + fence
+            published_known = frontier if issued is None else issued + 1
+            # The FRESHER record decides, by its own reserve: each covers what
+            # can have been issued after it. A replica ahead of the last publish
+            # leaves only replication lag unseen; a published record ahead of
+            # the replica — its sidecar stopped shipping — leaves everything
+            # since the last publish.
+            if published_known > replica_known:
+                wanted = published_known + published_reserve
+            else:
+                wanted = replica_known + replica_reserve
+
             if wanted > resumed:
                 resumed = buffer.reserve(wanted - resumed)[1]
         finally:

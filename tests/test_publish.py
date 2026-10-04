@@ -2987,9 +2987,9 @@ def test_restore_without_a_replica_starts_above_what_the_log_issued(
 
 
 def test_a_restore_reserve_overrides_the_fence(tmp_path: Path) -> None:
-    """`reserve` replaces the default fence, measured from the same point; and
-    one that is not a non-negative integer is refused before anything is
-    created."""
+    """`published_reserve` replaces the rebuild's default, measured from the
+    same record; and a reserve that is not a non-negative integer is refused
+    before anything is created."""
     where = f"file://{tmp_path / 'published'}"
     first = tmp_path / "first"
     with litelink.new(
@@ -3005,14 +3005,15 @@ def test_a_restore_reserve_overrides_the_fence(tmp_path: Path) -> None:
         issued = log.end_offset() - 1
 
     shutil.rmtree(first)
-    for bad in (-1, 2.5, True):
-        with pytest.raises(ValueError, match="reserve"):
-            litelink.restore(tmp_path / "bad", "s", published=where, reserve=bad)  # ty: ignore[invalid-argument-type]
+    for name in ("replica_reserve", "published_reserve"):
+        for bad in (-1, 2.5, True):
+            with pytest.raises(ValueError, match=name):
+                litelink.restore(tmp_path / "bad", "s", published=where, **{name: bad})  # ty: ignore[invalid-argument-type]
 
-        assert not (tmp_path / "bad").exists()
+            assert not (tmp_path / "bad").exists()
 
     with litelink.restore(
-        tmp_path / "second", "s", published=where, reserve=1000
+        tmp_path / "second", "s", published=where, published_reserve=1000
     ) as revived:
         assert revived.end_offset() == issued + 1 + 1000
 
@@ -3134,3 +3135,63 @@ def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
         # the seal and not on what is read.
         assert reopened.seal(flush=True) is None, "a published row was sealed again"
         assert reopened.scan().read_all().num_rows == ROWS
+
+
+def _snapshot_buffer(primary: Path, target: Path) -> int:
+    """Copy the primary's `buffer.db` to `target/s`, as a replica would hold it,
+    and return the highest offset it records as issued."""
+    (target / "s").mkdir(parents=True)
+    source = sqlite3.connect(Layout(primary, "s").buffer_db)
+    copy = sqlite3.connect(Layout(target, "s").buffer_db)
+    source.backup(copy)
+    source.close()
+    copy.close()
+
+    con = sqlite3.connect(Layout(target, "s").buffer_db)
+    try:
+        row = con.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+        ).fetchone()
+    finally:
+        con.close()
+
+    return int(row[0]) if row else 0
+
+
+def test_a_replica_behind_the_last_publish_resumes_above_the_published_record(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A replica that still holds unpublished rows is used — but when its
+    sidecar stopped shipping before the last publish, the published record of
+    what the log issued is fresher, and the log resumes above THAT, by
+    `published_reserve`: the replica's own reserve covers only replication
+    lag.
+
+    Falsify by fencing from the replica alone: the log resumes at the
+    replica's sequence plus 2^20, inside offsets the last publish recorded as
+    issued.
+    """
+    primary = tmp_path / "primary"
+    with published_log(primary, bucket, s3) as log:
+        log.extend(rows(800))
+        log.seal()
+        # The replica, as it stood when its sidecar stopped: 800 issued, none
+        # of it published yet.
+        replica = _snapshot_buffer(primary, tmp_path / "second")
+        # The primary carries on issuing, and publishes only part of it.
+        log.extend(rows(800))
+        log.publish()
+        published_end = log.published_through() + 1
+        issued = log.end_offset() - 1
+
+    assert published_end <= replica < issued, "the case is not set up"
+
+    with litelink.restore(
+        tmp_path / "second", "s", published=f"s3://{bucket}/prefix", s3_options=s3
+    ) as revived:
+        assert revived.end_offset() == issued + 1 + PUBLISHED_RESTORE_RESERVE
+        # And the replica's unpublished rows came back with it.
+        report = revived.recovery()
+
+        assert report is not None
+        assert report.recovered > 0
