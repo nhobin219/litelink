@@ -3150,7 +3150,7 @@ class WriteHandle(LocalReadHandle):
             return len(pending)
 
         config = self.config
-        frozen = self._maintenance.published_prefix(pending, None, include_intents=True)
+        frozen = self._maintenance.published_prefix(pending, include_intents=True)
         head = [f for f in pending if f.start >= frozen]
 
         return (len(pending) - len(head)) + stable_prefix(
@@ -3258,101 +3258,42 @@ class WriteHandle(LocalReadHandle):
         covered = published.span()
         floor = 0 if covered is None else covered[1]
 
-        # The watermark reconciled against the published table itself. It is a
-        # cache of what the published table holds — kept for the push floor and
-        # for display, and no longer for anything that authorises a deletion —
-        # so a commit that landed while the `meta` write after it did not would
-        # leave it behind for ever: the next pass computes `floor` from the
-        # published table, finds nothing left to push, and never revisits it.
+        # RECONCILIATION against the published table's own manifest, which is
+        # the truth, matched by path. The watermark is written after a register
+        # lands, so a crash between the two leaves the published table holding
+        # a range the watermark does not name yet: raised here to the span's
+        # end, it covers that range again, and the intents of copies the
+        # manifest holds are retired with it — one transaction, so compaction
+        # never sees a moment with neither (`confirm_published`).
         #
-        # Compared and written in one transaction, not read and then written.
-        # Reconciling against a published table the log has been pointed away
-        # from is the loss this path is here to prevent, and a guard that reads
-        # first only reports where the published table was.
-        # Stored as the last offset held, so one below the span's end.
-        confirmed = max(self._maintenance.published_through(), floor - 1)
-        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: confirmed})
-
-        memory = self._maintenance.memory()
-
-        # BACKFILL, and it is what makes I4-per-segment recoverable. The row
-        # naming a file's published copy is written after the register, so a
-        # crash between the two leaves the published table holding a range that
-        # nothing in `buffer.db` records — and compaction, which now decides
-        # from those rows, would merge it into a file spanning the published
-        # table's span. The next push would register a partial overlap, which
-        # `register` admits.
-        #
-        # The published table's own manifest is the truth, so recover from it
-        # rather than promising anything beforehand. Reading it costs nothing
-        # extra: `span()` above already walked it.
-        # Bounded by the staging window, not by the published table. Every
-        # decision the rows feed — what compaction may merge, what eviction may
-        # drop — is about files the staging table still holds, so a published
-        # file entirely below them changes no answer. Unbounded, this read and
-        # this loop grew with the published table and ran on every single
-        # publish pass.
-        # Bound before the first use. The backfill below sizes an unmeasured
-        # published file by the compact target, and `stable_prefix` groups by
-        # the same policy — two reads, and nothing that makes them agree.
-        config = self.config
-        local = self._table.data_files()
-        base = min((f.start for f in local), default=0)
-
-        # RECONCILIATION, matched by path in the published table's manifest
-        # rather than by offset range. Range matching reads plausibly and is
-        # wrong: a rewrite's intents name new objects over a range the stale
-        # files being replaced still cover, so a crashed rewrite's dead intents
-        # would be confirmed rather than dropped.
+        # Matched by PATH rather than by offset range. Range matching reads
+        # plausibly and is wrong: an intent can name an object over a range
+        # another file already covers, so a crashed push's dead intents would be
+        # confirmed rather than dropped.
         #
         # Bounds differ between the two reads and must. The manifest walk is
         # bounded by the staging window, or it grows with the published table
         # and runs on every publish pass. The intent read is unbounded, because
         # an intent below the window has to be reachable to be dropped.
-        held_paths = {f.path: f for f in published.data_files() if f.end > base}
-        recorded = {
-            path for path, _, _, _ in self._buffer.published_records(pinned or "", base)
-        }
-        intended = {
-            path: (start, end, size)
-            for path, start, end, size in self._buffer.intents(pinned or "")
-        }
-
-        # ONE rule per path, decided by which of the two tables holds it. An
-        # earlier shape ran the rules as separate loops over a `recorded` set
-        # snapshotted before either — so rule 2 re-fired for every path rule 1
-        # had just confirmed, and `record_file`'s conflict clause overwrote the
-        # intent's measured bytes with the default. That made the `bytes`
-        # column dead in every reachable path: the rewrite tail this exists to
-        # size correctly was durably recorded as full, and nothing re-measures
-        # a published file.
-        for path, landed in held_paths.items():
-            recovered = intended.get(path)
-            if recovered is not None:
-                # 1. The register landed. Confirm it with the bytes the intent
-                #    carried — the only measurement that survives a crash
-                #    between a rewrite's commit and its confirm.
-                start, end, size = recovered
-                self._buffer.record_file(path, start, end, size)
-            elif path not in recorded:
-                # 2. In the manifest with no row of either kind: the backfill
-                #    this rule grew out of.
-                self._buffer.record_file(
-                    path,
-                    landed.start,
-                    landed.end,
-                    memory.get(path, config.compact_size),
-                )
-
+        local = self._table.data_files()
+        base = min((f.start for f in local), default=0)
+        held_paths = {f.path for f in published.data_files() if f.end > base}
+        intended = [path for path, _, _, _ in self._buffer.intents(pinned or "")]
+        self._buffer.confirm_published(
+            floor - 1, [path for path in intended if path in held_paths]
+        )
         for path in intended:
             if path not in held_paths:
-                # 3. Nothing in the manifest holds that path, so the register
-                #    never landed and the intent is dead. Below the staging
-                #    window this also drops intents whose register DID land —
-                #    the manifest walk is bounded — and their sizes are then
-                #    never measured. No reader below the window asks.
+                # Nothing in the manifest holds that path, so the register
+                # never landed and the intent is dead. Below the staging window
+                # this also drops intents whose register DID land — the manifest
+                # walk is bounded — and the watermark covers those already.
                 self._buffer.forget_intent(path)
 
+        # Bound once, so `stable_prefix` and the intents below size files by
+        # the same policy.
+        config = self.config
+        memory = self._maintenance.memory()
         pending = [f for f in self._table.data_files() if f.end > floor]
         # `stable_prefix` holds a file back when compaction might still merge
         # it, and compaction refuses to merge anything some published table
@@ -3451,32 +3392,15 @@ class WriteHandle(LocalReadHandle):
         ):
             return
 
-        for data_file, rel_path in uploaded:
-            # The published table's copy holds what the staging one did, and
-            # this is the only moment both names are known. Nothing could
-            # re-derive it afterwards: the staging entry goes when the staging
-            # file is unlinked, and a Parquet footer records what the rows
-            # compressed from, not what the appender counted them as.
-            #
-            # For every file, with the same default the intent used. The guard
-            # that used to skip unmeasured ones was a hole: in a takeover the
-            # confirm is the only thing that recreates rows a rival's
-            # reconciliation dropped, so skipping any file reopens the window
-            # for exactly the files the intent was added to protect.
-            #
-            # Same span, second location.
-            self._buffer.record_file(
-                published.uri(rel_path),
-                data_file.start,
-                data_file.end,
-                memory.get(data_file.path, config.compact_size),
-            )
-
         # After the register, never before: the watermark is a promise that the
-        # published table HAS the range. Stored as the last offset held, and
+        # published table HAS the range, and eviction acts on it. Raised and the
+        # intents retired together (`confirm_published`), so compaction never
+        # sees a moment covered by neither. Stored as the last offset held, and
         # never lowered: another publish on a disjoint range (#118) can have
         # recorded a higher one while this push was registering.
-        self._buffer.raise_meta({Maintenance.PUBLISHED_THROUGH_KEY: last.end - 1})
+        self._buffer.confirm_published(
+            last.end - 1, [published.uri(rel_path) for _, rel_path in uploaded]
+        )
 
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.

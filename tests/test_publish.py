@@ -547,29 +547,24 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
         log.seal()
         log.publish()
         local = log._table.data_files()
-        settled = log._maintenance.published_prefix(
-            local, log._published.uri, include_intents=False
-        )
+        settled = log._maintenance.published_prefix(local, include_intents=False)
 
         assert settled > 0
 
         # The register landed; the rows recording it did not.
         with log._buffer._lock:
-            log._buffer._con.execute("DELETE FROM extent WHERE rel_path LIKE 's3://%'")
+            log._buffer._con.execute("DELETE FROM meta WHERE k = 'published_through'")
             log._buffer._con.commit()
 
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == 0
-        ), "the setup must actually reproduce the crash"
+        assert log._maintenance.published_prefix(local, include_intents=False) == 0, (
+            "the setup must actually reproduce the crash"
+        )
 
         log.publish()
 
         assert (
             log._maintenance.published_prefix(
-                log._table.data_files(), log._published.uri, include_intents=False
+                log._table.data_files(), include_intents=False
             )
             == settled
         ), "the published table's manifest says what it holds; recover from it"
@@ -599,12 +594,12 @@ def test_the_backfill_sees_copies_another_process_pushed(
             writer.seal()
             writer.publish()
             grown = writer._maintenance.published_prefix(
-                writer._table.data_files(), writer._published.uri, include_intents=False
+                writer._table.data_files(), include_intents=False
             )
 
             with other._buffer._lock:
                 other._buffer._con.execute(
-                    "DELETE FROM extent WHERE rel_path LIKE 's3://%'"
+                    "DELETE FROM meta WHERE k = 'published_through'"
                 )
                 other._buffer._con.commit()
 
@@ -613,7 +608,6 @@ def test_the_backfill_sees_copies_another_process_pushed(
             assert (
                 other._maintenance.published_prefix(
                     other._table.data_files(),
-                    other._published.uri,
                     include_intents=False,
                 )
                 == grown
@@ -846,13 +840,10 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
 
         local = log._table.data_files()
 
-        assert log._maintenance.published_prefix(local, None, include_intents=True) > 0
-        assert (
-            log._maintenance.published_prefix(
-                local, log._published.uri, include_intents=False
-            )
-            == 0
-        ), "eviction must not see an intended copy as a landed one"
+        assert log._maintenance.published_prefix(local, include_intents=True) > 0
+        assert log._maintenance.published_prefix(local, include_intents=False) == 0, (
+            "eviction must not see an intended copy as a landed one"
+        )
 
         # The ingredient that turns the crash into a permanent stall.
         log.set_config(replace(config, target_compact_size=1 << 20))

@@ -60,6 +60,19 @@ SCHEMA_KEY = "arrow_schema"
 # reserve. The recorded value is the only thing that separates the two.
 START_OFFSET_KEY = "start_offset"
 
+# The last offset the published table holds — written by `publish` only after
+# a register lands, reconciled against the published table's own span, and
+# never lowered (`raise_meta`). The published table is fixed when the log is
+# created and nothing rewrites it, so this only ever rises: it is the published
+# coverage eviction and compaction read (§4a). `Maintenance.PUBLISHED_THROUGH_KEY`.
+PUBLISHED_THROUGH_KEY = "published_through"
+
+# Where the published table's coverage begins, recorded only for a log
+# re-pointed before 0.7, whose current published table may start above the
+# log's first offset. Absent means the published table holds everything from
+# the start of the log up to `PUBLISHED_THROUGH_KEY`.
+PUBLISHED_FROM_KEY = "published_from"
+
 # Bumped at every change to a stored tier (#90), so a reader's decoded copy is
 # never kept past a write. See `_tiers`.
 TIER_GENERATION = "tier_generation"
@@ -898,11 +911,17 @@ class Buffer:
             ).fetchone():
                 return
 
-            covered = int(
+            # Above every staging file AND everything published: a log whose
+            # staging was evicted to nothing still has buffered rows the
+            # published table holds — kept for the WAL replica — and an open
+            # group adopting them would seal them again.
+            filed = int(
                 self._con.execute(
                     "SELECT coalesce(max(end_offset), 0) FROM extent"
                 ).fetchone()[0]
             )
+            published = _meta_value(self._con, PUBLISHED_THROUGH_KEY)
+            covered = max(filed, 0 if published is None else int(published) + 1)
             start = self._con.execute(
                 'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
                 (covered,),
@@ -1758,29 +1777,21 @@ class Buffer:
         return {str(row[0]): int(row[1]) for row in rows}
 
     def record_file(self, rel_path: str, start: int, end: int, held: int) -> None:
-        """Record a second file holding an extent the log already has.
+        """Record a staging file the seal has committed: its range, and what its
+        rows held in memory.
 
-        What `publish` calls when it pushes: the published table's copy covers
-        the same offsets and holds the same bytes, so it gets its own row under
-        its own URI rather than a measurement of its own. It could not be
-        measured again anyway — nothing recoverable from a Parquet file is the
-        appender's count of what those rows cost in memory, and the staging row
-        goes when the staging file is unlinked.
+        Iceberg has no per-file field to hang the measurement on: v2's
+        data-file metadata is a fixed set — column sizes, value counts,
+        encryption key metadata — with nothing user-extensible, and `add_files`
+        offers no way to attach one. So the coordinator that already records
+        every path before its file exists (I16) records this too.
 
-        This is why the mapping lives here. Iceberg has no per-file field to
-        hang it on: v2's data-file metadata is a fixed set — column sizes,
-        value counts, encryption key metadata — with nothing user-extensible,
-        and `add_files` offers no way to attach one. Table properties are per
-        table. So the coordinator that already records every path before its
-        file exists (I16) records this too, for both tiers, in one shape.
+        Published copies get no row. What the published table holds is one
+        range, `[published_from, published_through]`, which `confirm_published`
+        moves; a row per pushed file would only grow with the published history
+        and describe what a restore cannot rebuild.
         """
-        with self._transaction():
-            # The upsert is untouched. What is new is the `forget_intent`
-            # beside it: recording the copy and retiring the intent are one
-            # fact, and a crash between two statements would leave the log
-            # believing both. The upsert also has to be able to write a row
-            # from nothing, because an owner that took over a lapsed claim may
-            # have dropped this push's intents while its register was in flight.
+        with self._lock:
             self._con.execute(
                 "INSERT INTO extent"
                 " (start_offset, end_offset, bytes, rel_path, named_at)"
@@ -1788,9 +1799,79 @@ class Buffer:
                 " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
                 (start, end, held, rel_path),
             )
+
+    def confirm_published(self, through: int, landed: Iterable[str] = ()) -> None:
+        """The published table holds everything up to `through`: raise the
+        watermark, retire the intents of the copies that `landed`, and drop
+        pre-0.9 rows the watermark now covers.
+
+        One transaction, and the order inside it is what matters. The intents
+        are what compaction reads while a register is in flight, and the
+        watermark is what it reads after; retired first, a compaction reading
+        between the two would see neither and could merge across a range the
+        published table holds — a straddle nothing re-cuts, after which every
+        push is refused. Raised together, there is no moment with neither.
+
+        The watermark never goes down: another publish on a disjoint range can
+        have recorded a higher one while this push was registering (#118).
+        """
+        paths = list(landed)
+        with self._transaction():
+            current = _meta_value(self._con, PUBLISHED_THROUGH_KEY)
+            raised = max(through, -1 if current is None else int(current))
+            if raised >= 0:
+                _write_meta(self._con, {PUBLISHED_THROUGH_KEY: str(raised)})
+
+            for path in paths:
+                self._con.execute(
+                    "DELETE FROM extent_intent WHERE rel_path = ?", (path,)
+                )
+
+            # Rows naming published copies were written by 0.8 and earlier.
+            # Below the watermark they say nothing it does not.
             self._con.execute(
-                "DELETE FROM extent_intent WHERE rel_path = ?", (rel_path,)
+                "DELETE FROM extent WHERE rel_path LIKE '%://%' AND end_offset <= ?",
+                (raised + 1,),
             )
+
+    def adopt_published_coverage(self, location: str) -> None:
+        """Move a pre-0.9 log's per-file published rows onto the watermark.
+
+        0.8 and earlier recorded a row per pushed file, and eviction read those.
+        The watermark carries the same fact as one range — except for a log
+        re-pointed before 0.7, whose current published table may begin above
+        the log's first offset: its rows name more than one published table.
+        For that log only, where the current table's coverage begins is kept
+        as `published_from`, so nothing below it reads as published.
+
+        Rows under the current table and covered by the watermark go, as
+        `confirm_published` would drop them. Rows above it — a register that
+        landed before a crash, its watermark not yet reconciled — stay until
+        the next publish reconciles them, and compaction keeps reading them in
+        the meantime.
+        """
+        boundary = location.rstrip("/") + "/"
+        with self._transaction():
+            rows = self._con.execute(
+                "SELECT rel_path, start_offset FROM extent WHERE rel_path LIKE '%://%'"
+            ).fetchall()
+            if not rows:
+                return
+
+            ours = [
+                int(start) for path, start in rows if str(path).startswith(boundary)
+            ]
+            foreign = len(ours) < len(rows)
+            if foreign and ours and _meta_value(self._con, PUBLISHED_FROM_KEY) is None:
+                _write_meta(self._con, {PUBLISHED_FROM_KEY: str(min(ours))})
+
+            current = _meta_value(self._con, PUBLISHED_THROUGH_KEY)
+            if current is not None:
+                self._con.execute(
+                    "DELETE FROM extent"
+                    " WHERE rel_path LIKE '%://%' AND end_offset <= ?",
+                    (int(current) + 1,),
+                )
 
     def intend_file(self, rel_path: str, start: int, end: int, held: int) -> None:
         """Record a copy this log is ABOUT to write, before it writes it.
@@ -1831,31 +1912,6 @@ class Buffer:
         with self._lock:
             rows = self._con.execute(
                 "SELECT rel_path, start_offset, end_offset, bytes FROM extent_intent"
-            ).fetchall()
-
-        return [
-            (str(r[0]), int(r[1]), int(r[2]), int(r[3]))
-            for r in rows
-            if str(r[0]).startswith(boundary)
-        ]
-
-    def published_records(
-        self, prefix: str, floor: int
-    ) -> list[tuple[str, int, int, int]]:
-        """Landed copies under `prefix`, keyed by PATH: `(rel_path, start, end,
-        bytes)`.
-
-        Reconciliation matches by path, and `published_ranges` answers in bare
-        offsets — so it cannot serve. Bounded by `floor` like the manifest walk
-        beside it, or it grows with the published table and runs on every
-        publish pass.
-        """
-        boundary = prefix.rstrip("/") + "/"
-        with self._lock:
-            rows = self._con.execute(
-                "SELECT rel_path, start_offset, end_offset, bytes FROM extent"
-                " WHERE rel_path IS NOT NULL AND end_offset > ?",
-                (floor,),
             ).fetchall()
 
         return [
@@ -1938,63 +1994,63 @@ class Buffer:
             return _meta_value(self._con, key)
 
     def published_ranges(
-        self, prefix: str | None, floor: int, *, include_intents: bool
+        self, floor: int, *, include_intents: bool
     ) -> list[tuple[int, int]]:
-        """Offset ranges a published table holds or is about to, under `prefix`.
+        """Offset ranges the published table holds, or is about to, above
+        `floor`.
 
         `include_intents` is keyword-only and has no default, so every caller
-        states which question it is asking. Compaction asks whether ANY
-        published table might hold a range, and is safe overstating it; eviction
-        asks whether one DOES, and is safe only understating. Getting that
-        backwards at one call site would be silent, which is the whole reason
-        this parameter is awkward to pass.
+        states which question it is asking. Compaction asks whether the
+        published table MIGHT hold a range, and is safe overstating it;
+        eviction asks whether it DOES, and is safe only understating. Getting
+        that backwards at one call site would be silent, which is the whole
+        reason this parameter is awkward to pass.
 
-        I4 asked of segments rather than of a watermark (§4a). `publish` records
-        where each pushed file's copy went, so the published table's contents
-        are already durable here per file — a watermark summarising them is a
-        second copy of the same fact, and the only boundary in the log that can
-        move backwards.
+        **What the published table holds is one range**, `[published_from,
+        published_through]` (§4a). `publish` raises the watermark only after a
+        register lands and reconciles it against the published table's span, a
+        log's published table is fixed when it is created, and nothing rewrites
+        it — so the range only grows, and a gap below it is a gap in the log's
+        offsets, holding no rows anywhere.
 
-        Bounded by `floor` rather than by the prefix alone: the published table
-        grows without limit and this only ever asks about ranges the staging
-        table still holds, which compaction bounds. The prefix match is applied
-        in Python because SQLite's `LIKE` would not use the index that `floor`
-        selects on.
+        With intents, compaction's question also covers a register in flight
+        (`extent_intent`), and rows a pre-0.9 log recorded per pushed file that
+        no publish has yet folded into the watermark.
+
+        Bounded by `floor`, the staging table's lowest offset: every caller asks
+        about files the staging table still holds.
         """
-        # `None` means ANY published table, not the configured one. Two
-        # questions ask this and they are not the same question. I4 asks whether
-        # THIS published table holds a file, because it authorises a deletion.
-        # Compaction asks whether ANY published table does, because it decides
-        # whether merging could create a range no published table's cuts line up
-        # with — and pointing away does not make those copies stop existing.
-        boundary = None if prefix is None else prefix.rstrip("/") + "/"
-        # ONE statement, so one snapshot. Read as two, the tables are two
-        # separate WAL reads and a `record_file` committing between them moves
-        # a range out of the first and into the second AFTER the second was
-        # taken — so it appears in neither, and compaction's read, which is
-        # safe only when it OVERSTATES coverage, momentarily understates it.
-        # That is the straddle this whole record exists to prevent, reopened by
-        # the shape of the query rather than by the design.
-        sql = (
-            "SELECT start_offset, end_offset, rel_path FROM extent"
-            " WHERE end_offset > ? AND rel_path IS NOT NULL"
+        # ONE statement, so one snapshot. Read separately, a
+        # `confirm_published` committing in between moves a range out of the
+        # intents and into the watermark AFTER the watermark was read — so it
+        # appears in neither, and compaction's read, which is safe only when
+        # it OVERSTATES coverage, momentarily understates it.
+        watermark = (
+            "SELECT coalesce(CAST((SELECT v FROM meta WHERE k = ?) AS INTEGER), 0),"
+            " CAST((SELECT v FROM meta WHERE k = ?) AS INTEGER) + 1"
+            " WHERE (SELECT v FROM meta WHERE k = ?) IS NOT NULL"
         )
-        args: tuple[int, ...] = (floor,)
+        args: tuple[object, ...] = (
+            PUBLISHED_FROM_KEY,
+            PUBLISHED_THROUGH_KEY,
+            PUBLISHED_THROUGH_KEY,
+        )
+        sql = watermark
         if include_intents:
             sql += (
                 " UNION ALL"
-                " SELECT start_offset, end_offset, rel_path FROM extent_intent"
+                " SELECT start_offset, end_offset FROM extent_intent"
                 " WHERE end_offset > ?"
+                " UNION ALL"
+                " SELECT start_offset, end_offset FROM extent"
+                " WHERE rel_path LIKE '%://%' AND end_offset > ?"
             )
-            args = (floor, floor)
+            args = (*args, floor, floor)
 
         with self._lock:
             rows = self._con.execute(sql, args).fetchall()
 
-        def wanted(path: str) -> bool:
-            return path.startswith(boundary) if boundary is not None else "://" in path
-
-        return sorted((start, end) for start, end, path in rows if wanted(path))
+        return sorted((int(start), int(end)) for start, end in rows if end > start)
 
     def set_meta_moved(self, key: str, value: str, reset: Mapping[str, str]) -> bool:
         """Record `value`, applying `reset` only if it is a MOVE.
@@ -2659,11 +2715,11 @@ class Buffer:
         to a box which no longer exists, and some of what it says is about that
         box rather than about the log. Returns `(released, next_offset)`.
 
-        - **`extent` rows naming LOCAL files** go. They name Parquet on the
-          machine that died, so `file_bytes` — and through it `memory`, which
-          sizes merges — would describe files nothing can open. Rows naming
-          PUBLISHED copies stay: that is the coverage I4 acts on, and it is
-          still true.
+        - **`extent` rows** go. They name Parquet on the machine that died, so
+          `file_bytes` — and through it `memory`, which sizes merges — would
+          describe files nothing can open. What the published table holds is
+          the watermark, which stays, and the restore reconciles it against the
+          published table itself.
 
           Narrower than it first looks, and worth saying so: compaction decides
           what to merge from the Iceberg table's `data_files`, not from these
@@ -2708,9 +2764,7 @@ class Buffer:
         Finally the offset sequence is raised by `reserve`. See `litelink.restore`.
         """
         with self._transaction():
-            self._con.execute(
-                "DELETE FROM extent WHERE rel_path IS NULL OR rel_path NOT LIKE '%://%'"
-            )
+            self._con.execute("DELETE FROM extent")
             self._con.execute(
                 "DELETE FROM pending_delete WHERE rel_path NOT LIKE '%://%'"
             )
