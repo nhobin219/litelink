@@ -959,7 +959,7 @@ class Maintenance:
         self._buffer.restamp_deletions(retiring, int(datetime.now(UTC).timestamp()))
         self.drain_published()
 
-    def drain_published(self) -> None:
+    def drain_published(self, grace: timedelta | None = None) -> None:
         """Delete the published table's queued objects whose grace has passed.
 
         No claim, for the reason `drain` gives. A re-point mid-drain cannot
@@ -971,7 +971,7 @@ class Maintenance:
         if published is None:
             return
 
-        self._drain_published(published, None)
+        self._drain_published(published, None, grace=grace)
 
     def sweep_staging(self) -> None:
         """One pass of the staging table's stranded-metadata sweep (`_sweep`).
@@ -991,8 +991,9 @@ class Maintenance:
                 "published", published, self.config.published_snapshot_retention
             )
 
-    def drain(self) -> None:
-        """Delete staging files whose grace period has passed.
+    def drain(self, grace: timedelta | None = None) -> None:
+        """Delete staging files whose grace period has passed — the table's
+        snapshot retention, or `grace` when given (`retire` passes zero).
 
         A keyed read of `pending_delete`, not a directory walk. Every file this
         library creates has its path written to SQLite before it is written to
@@ -1004,7 +1005,8 @@ class Maintenance:
         """
         # Read against the CURRENT retention, so lowering it takes effect on
         # files already queued.
-        cutoff = datetime.now(UTC) - self.config.staging_snapshot_retention
+        wait = self.config.staging_snapshot_retention if grace is None else grace
+        cutoff = datetime.now(UTC) - wait
         due = [
             p
             for p in self._buffer.due_deletions(int(cutoff.timestamp()))
@@ -1052,14 +1054,25 @@ class Maintenance:
             self._buffer.forget_deletion(rel_path)
 
     def _drain_published(
-        self, published: LogTable, renew: Callable[[], bool] | None
+        self,
+        published: LogTable,
+        renew: Callable[[], bool] | None,
+        *,
+        grace: timedelta | None = None,
     ) -> None:
-        """Delete the published table's queued objects whose grace has passed.
+        """Delete the published table's queued objects whose grace has passed —
+        `published_snapshot_retention`, or `grace` when given.
 
         `renew` is the caller's claim, checked before each delete, when there
         is one; `drain_published` holds none (see `drain`).
+
+        **With no claim to renew, the deletes run in parallel**, as the sweep's
+        do: one object-store delete is a round trip, and `retire` drains every
+        file its expiry just queued — thousands, on a table that carried a
+        snapshot per publish (#153).
         """
-        cutoff = datetime.now(UTC) - self.config.published_snapshot_retention
+        wait = self.config.published_snapshot_retention if grace is None else grace
+        cutoff = datetime.now(UTC) - wait
         due = [
             p
             for p in self._buffer.due_deletions(int(cutoff.timestamp()))
@@ -1095,6 +1108,7 @@ class Maintenance:
 
         referenced = published.referenced_paths()
 
+        deletable: list[str] = []
         for uri in due:
             if uri in referenced:
                 continue
@@ -1115,12 +1129,27 @@ class Maintenance:
             if not uri.startswith(ours):
                 continue
 
-            # Before every deletion, for the reason `drain` gives: one remote
-            # round trip each, measured at ~650 ms, adds up past a TTL.
-            checkpoint(renew)
+            deletable.append(uri)
+
+        def remove(uri: str) -> None:
             with contextlib.suppress(FileNotFoundError):
                 published.remove(uri)
 
+        if renew is None:
+            with ThreadPoolExecutor(max_workers=SWEEP_THREADS) as pool:
+                # `list` so the first failure raises here, not silently.
+                list(pool.map(remove, deletable))
+
+            for uri in deletable:
+                self._buffer.forget_deletion(uri)
+
+            return
+
+        for uri in deletable:
+            # Before every deletion, for the reason `drain` gives: one remote
+            # round trip each, measured at ~650 ms, adds up past a TTL.
+            checkpoint(renew)
+            remove(uri)
             self._buffer.forget_deletion(uri)
 
     # -- the stranded-metadata sweep (#113) ---------------------------------
@@ -1268,7 +1297,7 @@ class Maintenance:
         anchors = table.anchors()
         listed = table.metadata_files()
         table.reload()
-        live = table.referenced_paths() | table.live_metadata()
+        live = table.referenced_metadata()
 
         if not anchors <= {path for path, _ in listed}:
             if listed:
