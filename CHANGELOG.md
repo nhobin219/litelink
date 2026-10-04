@@ -25,6 +25,12 @@ minor version carries breaking changes.
   metadata. Files a live snapshot still names are kept, as in every drain.
   A scan still reading an already-expired snapshot of a log being retired
   can lose its files.
+- **`publish` re-applies the published table's metadata-retention
+  properties** (#155), as a writer's `open` already does for the staging
+  table: `write.metadata.delete-after-commit.enabled`,
+  `write.metadata.previous-versions-max` and manifest merging. A published
+  table that lost one (changed by hand, adopted from elsewhere, or older than
+  a property) gets it back, and its `metadata.json` files stay bounded.
 
 ## 0.10.1 — 2026-10-04
 

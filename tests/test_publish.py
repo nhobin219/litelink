@@ -3328,3 +3328,37 @@ def test_a_replica_restore_checks_a_given_shape_and_applies_config(
     ) as revived:
         assert revived.config == config
         assert revived.schema == SCHEMA
+
+
+def test_publish_reapplies_the_published_tables_metadata_properties(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A published table that lost a metadata-retention property gets it back
+    at the next publish, as a writer's `open` restores them on staging (#155).
+    Without them its `metadata.json` files are never deleted.
+
+    Falsify by dropping `ensure_metadata_properties` from `_push`: the property
+    stays missing.
+    """
+    from litelink._table import METADATA_PROPERTIES
+
+    key = "write.metadata.previous-versions-max"
+    with published_log(tmp_path, bucket, s3) as log:
+        log.extend(rows(100))
+        log.publish(flush=True)
+        published = log._published.require()  # noqa: SLF001
+
+        def strip() -> None:
+            with published._table.transaction() as transaction:  # noqa: SLF001
+                transaction.remove_properties(key)
+
+        published._commit(strip)  # noqa: SLF001
+        published.reload()
+
+        assert key not in published.properties, "the setup must remove it"
+
+        log.extend(rows(100))
+        log.publish(flush=True)
+        published.reload()
+
+        assert published.properties.get(key) == METADATA_PROPERTIES[key]
