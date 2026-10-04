@@ -3028,12 +3028,17 @@ def _unstamped_published_log(tmp_path: Path, bucket: str, s3: S3Options) -> str:
     with published_log(first, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.advance(flush=True)
-        table = log._published.require()._table  # noqa: SLF001
+        published = log._published.require()  # noqa: SLF001
 
-        assert SCHEMA_PROPERTY in table.properties, "publish stamps the shape"
+        assert SCHEMA_PROPERTY in published.properties, "publish stamps the shape"
 
-        with table.transaction() as transaction:
-            transaction.remove_properties(SCHEMA_PROPERTY, SORT_PROPERTY)
+        # Through litelink's commit, which republishes `version-hint.text` —
+        # a raw pyiceberg transaction leaves the hint on the stamped metadata.
+        def unstamp() -> None:
+            with published._table.transaction() as transaction:  # noqa: SLF001
+                transaction.remove_properties(SCHEMA_PROPERTY, SORT_PROPERTY)
+
+        published._commit(unstamp)  # noqa: SLF001
 
     shutil.rmtree(first)
 
