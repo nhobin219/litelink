@@ -492,8 +492,12 @@ never been a SQLite database: a fresh `buffer.db` at the log's own name, its sch
 `sort_by` read from the published table's `litelink.arrow_schema` and `litelink.sort_by`
 properties (which `publish` stamps; derived from the Iceberg schema for a table only an older
 version published), the published table adopted with the watermark at its end, and the offset
-counter at that end plus `RESTORE_RESERVE` — the same fence, for the same reason: offsets the old
-log issued but never published may have reached readers. A replica is always preferred when
+counter above everything the old log is known to have issued, plus `PUBLISHED_RESTORE_RESERVE`
+(2^40). Offsets the old log issued but never published may have reached readers, and the published
+end trails them by everything it had not published — without bound. So every push records
+`litelink.issued_through` in the commit that registers it, the rebuild starts above the larger of
+that and the end, and the fence, far wider than a WAL restore's `RESTORE_RESERVE`, covers what was
+issued after the last publish. A replica is always preferred when
 there is one, since it can only be fresher; litestream exits cleanly and writes nothing only when
 there is none, and a missing bucket or refused credentials still raise.
 

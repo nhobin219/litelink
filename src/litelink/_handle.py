@@ -71,11 +71,13 @@ from litelink._statistics import (
     whole_log,
 )
 from litelink._table import (
+    ISSUED_PROPERTY,
     RETIRED_PROPERTY,
     SCHEMA_PROPERTY,
     SORT_PROPERTY,
     LogTable,
     forget_published_entry,
+    published_issued_through,
     published_retired,
     published_shape,
     published_span,
@@ -167,6 +169,16 @@ _SORT_KEY = SORT_KEY
 # int64. It errs large on purpose: a gap is visible to a consumer, and a
 # rewind looks like ordinary operation.
 RESTORE_RESERVE = 1 << 20
+
+# The fence a restore with no WAL replica leaves above what the log is known to
+# have issued (#144). `RESTORE_RESERVE` only has to cover replication lag,
+# measured from the replica's own sequence. Without a replica the best record
+# is the last publish's `litelink.issued_through`, and the dead machine may
+# have issued any number of offsets after it — for as long as publishing was
+# behind or down. 2^40 is over a trillion: 127 days of unpublished appends at
+# 100,000 rows a second. Offsets may have gaps (`start_offset`, a failed load),
+# and an int64 holds millions of fences this wide.
+PUBLISHED_RESTORE_RESERVE = 1 << 40
 
 
 # How many staged files one Iceberg commit takes.
@@ -2052,9 +2064,12 @@ class WriteHandle(LocalReadHandle):
           does not carry; `set_config` restores a deployment's policy;
         - **the published table adopted** as the log's own, its watermark at
           the table's end;
-        - **the offset counter at that end plus `RESTORE_RESERVE`**, as a WAL
-          restore fences: offsets the old log issued but never published may
-          have reached readers, and must never name different rows.
+        - **the offset counter above everything the old log is known to have
+          issued, plus `PUBLISHED_RESTORE_RESERVE`**: offsets the old log issued
+          but never published may have reached readers, and must never name
+          different rows. Known means the published end, or the
+          `litelink.issued_through` the last publish recorded when that is
+          higher; the fence covers what was issued after it.
         """
         covered = published_span(layout, published, options)
         shape = published_shape(layout, published, options)
@@ -2078,7 +2093,9 @@ class WriteHandle(LocalReadHandle):
         settings = LogConfig()
         validate(schema, sort_by, settings, published)
         frontier = covered[1]
-        first = frontier + RESTORE_RESERVE
+        issued = published_issued_through(layout, published, options)
+        first = max(frontier, 0 if issued is None else issued + 1)
+        first += PUBLISHED_RESTORE_RESERVE
         _log.warning(
             "litelink: no WAL replica of %s under %s; rebuilding the log from its "
             "published table, which holds offsets below %d. Rows the old machine "
@@ -3508,6 +3525,9 @@ class WriteHandle(LocalReadHandle):
             # that cannot happen; this is the check that holds regardless of
             # whether the arrangement has a gap.
             start=uploaded[0][0].start,
+            # What the log has issued, recorded with the rows that land, so a
+            # restore with no replica knows what not to issue again (#144).
+            properties={ISSUED_PROPERTY: str(self._buffer.next_offset() - 1)},
         ):
             return
 

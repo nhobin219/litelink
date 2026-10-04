@@ -28,7 +28,13 @@ import pytest
 import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._buffer import Buffer
-from litelink._handle import OFFSET, RESTORE_RESERVE, LogHandle, table_schema
+from litelink._handle import (
+    OFFSET,
+    PUBLISHED_RESTORE_RESERVE,
+    RESTORE_RESERVE,
+    LogHandle,
+    table_schema,
+)
 from litelink._layout import Layout
 from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import secret_sql
@@ -2928,8 +2934,10 @@ def test_restore_without_a_replica_rebuilds_the_log_from_its_published_table(
         report = revived.recovery()
 
         assert report is not None
-        assert revived.end_offset() == published_end + RESTORE_RESERVE
-        assert report.skipped == (published_end, published_end + RESTORE_RESERVE)
+        resumed = published_end + PUBLISHED_RESTORE_RESERVE
+
+        assert revived.end_offset() == resumed
+        assert report.skipped == (published_end, resumed)
         assert revived.schema == SCHEMA
         assert revived.sort_by == ("event_ts",)
         assert revived.scan().read_all().num_rows == ROWS
@@ -2946,6 +2954,36 @@ def test_restore_without_a_replica_rebuilds_the_log_from_its_published_table(
         assert len(offsets) == ROWS + 900
         assert len(set(offsets)) == len(offsets), "a row was read twice"
         assert max(offsets) == revived.end_offset() - 1
+
+
+def test_restore_without_a_replica_starts_above_what_the_log_issued(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """The published end trails what the log issued by everything it had not
+    published yet, so a rebuild starts above the `litelink.issued_through` the
+    last publish recorded, not only above the end — or it hands those offsets,
+    already returned by `append` and seen by readers, to different rows.
+
+    Falsify by starting at the published end alone: the restored log resumes
+    below the recorded issue.
+    """
+    first = tmp_path / "first"
+    with published_log(first, bucket, s3) as log:
+        log.extend(rows(ROWS))
+        log.seal()
+        # Without `flush` the trailing run stays local, so the log has issued
+        # past what the published table holds when this push records it.
+        log.publish()
+        published_end = log.published_through() + 1
+        issued = log.end_offset() - 1
+
+        assert issued >= published_end, "the setup must issue past the push"
+
+    shutil.rmtree(first)
+    with litelink.restore(
+        tmp_path / "second", "s", published=f"s3://{bucket}/prefix", s3_options=s3
+    ) as revived:
+        assert revived.end_offset() == issued + 1 + PUBLISHED_RESTORE_RESERVE
 
 
 def test_restore_without_a_replica_derives_the_shape_from_an_older_table(
@@ -3012,7 +3050,7 @@ def test_restore_rebuilds_from_a_local_published_table(tmp_path: Path) -> None:
 
     shutil.rmtree(first)
     with litelink.restore(tmp_path / "second", "s", published=where) as revived:
-        assert revived.end_offset() == published_end + RESTORE_RESERVE
+        assert revived.end_offset() == published_end + PUBLISHED_RESTORE_RESERVE
         assert revived.scan().read_all().num_rows == ROWS
         revived.extend(rows(100))
         revived.advance(flush=True)

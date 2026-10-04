@@ -177,7 +177,10 @@ not published are gone. The log comes back at its own name, with no seam: its sc
 `sort_by` read from the published table (`publish` records them there; a table only an older
 version published has them derived from its Iceberg schema, Arrow field metadata excepted), the
 default `LogConfig` — call `set_config` to restore a deployment's policy — and the offset counter
-at the published end plus the restore reserve. A replica, when there is one, is always used: it
+above everything the old log is known to have issued, plus a 2^40 fence. Known means the published
+end, or the `litelink.issued_through` every publish records when that is higher; the fence covers
+what the dead machine issued after its last publish, so no offset a reader saw names a different
+row. A replica, when there is one, is always used: it
 can only be fresher. A replica that exists but can't be reached (a missing bucket, refused
 credentials) raises rather than falling back, and the fallback logs a warning saying what it did. It refuses a root that already holds this log
 (`FileExistsError`) or whose `litestream.yml` replicates a different one. Split-brain is not

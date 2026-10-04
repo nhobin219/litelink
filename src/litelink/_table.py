@@ -481,6 +481,29 @@ def published_columns(
 SCHEMA_PROPERTY = "litelink.arrow_schema"
 SORT_PROPERTY = "litelink.sort_by"
 
+# The highest offset the log had issued when it last published, set by every
+# push in the commit that registers it. The published table's end trails what
+# the log issued by everything it had buffered, sealed or loaded and not yet
+# published; a restore with no WAL replica starts above this, not only above
+# the end, or it would hand those offsets to different rows (#144).
+ISSUED_PROPERTY = "litelink.issued_through"
+
+
+def published_issued_through(
+    layout: Layout, prefix: str, options: S3Options
+) -> int | None:
+    """`ISSUED_PROPERTY` of the published table at `prefix`, or None when it
+    has none — no table, or one only an older version published."""
+    io = shared_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    raw = table.properties.get(ISSUED_PROPERTY)
+
+    return None if raw is None else int(raw)
+
 
 def published_shape(
     layout: Layout, prefix: str, options: S3Options
@@ -1583,8 +1606,10 @@ class LogTable:
         end: int | None = None,
         published_through: int = 0,
         start: int | None = None,
+        properties: dict[str, str] | None = None,
     ) -> bool:
-        """Add already-written files to the table, in ONE commit (§4 step 2).
+        """Add already-written files to the table, in ONE commit (§4 step 2),
+        with `properties` set in the same commit.
 
         `add_files` rather than `append`: pyiceberg's append writes the file
         itself and commits afterwards, so a crash in between orphans a file
@@ -1635,7 +1660,10 @@ class LogTable:
 
             self._refuse_straddle(start)
             added = True
-            self._table.add_files(paths)
+            with self._table.transaction() as transaction:
+                transaction.add_files(paths)
+                if properties:
+                    transaction.set_properties(properties)
 
         self._commit(add)
 
