@@ -147,7 +147,7 @@ def open(  # noqa: A001
     if not buffer.get_meta(PUBLISHED_KEY):
         buffer.set_meta(PUBLISHED_KEY, layout.default_published)
 
-    # A log written by 0.8 or earlier recorded a row per pushed file; the
+    # A log written by 0.9 or earlier recorded a row per pushed file; the
     # watermark carries the same coverage as one range (§4a).
     buffer.adopt_published_coverage(str(buffer.get_meta(PUBLISHED_KEY)))
 

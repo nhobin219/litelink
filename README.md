@@ -298,8 +298,9 @@ just demo-replicate    # ship the SQLite WAL, to survive losing the machine
 Clone the repo for these; `just bootstrap` sets up the toolchain. Credentials are never
 written to the log directory — the library reads them from the environment through the
 ordinary AWS chain, so a profile, instance metadata or SSO all work untouched.
-`litelink.restore(root, name, published="s3://...")` rebuilds a log on another box, reserving an
-offset window so nothing the dead machine served is reissued.
+`litelink.restore(root, name, published="s3://...")` rebuilds a log on another box, from its WAL
+replica, or from the published table alone when there is none, reserving an offset window so
+nothing the dead machine served is reissued.
 
 litelink emits the litestream config; your supervisor runs the binary. Full walkthrough in
 [`examples/`](examples/) and [`docs/RUNTIME.md`](docs/RUNTIME.md).

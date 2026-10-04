@@ -1700,7 +1700,8 @@ class WriteHandle(LocalReadHandle):
         restored catalog names files on a machine that is gone, and `open`
         raises `FileNotFoundError`.
 
-        What is recovered, and what is not:
+        What is recovered, and what is not, when a WAL replica of `buffer.db`
+        exists (with none, see "No replica" below):
 
         - **The published table**, in full. It names its own current metadata
           in `version-hint.text`, so it is adopted rather than rebuilt.
@@ -1723,6 +1724,17 @@ class WriteHandle(LocalReadHandle):
         1061. Worse, the next publish pass commits onto that lineage and
         republishes the hint over it, destroying the pointer this recovery
         depends on. Stale is worse than absent, and absent is already handled.
+
+        **`catalog.db` is not restored either**, and stays in the replication
+        set regardless: same-machine recovery is where its absolute paths still
+        resolve, and it is the only record of which Parquet the staging table is
+        made of in a design that refuses directory listing.
+
+        **No replica** — a log that ran with `wal_replication` off, or whose
+        published table is a local directory — and the log is rebuilt from the
+        published table alone (#144): at its own name, with every row the
+        table holds and none it does not. Rows the dead machine had buffered or
+        sealed but not published are gone.
 
         **The log's shape comes from whatever records it exactly, and the
         caller supplies what nothing does.** A replica's `buffer.db` carries
@@ -1763,10 +1775,6 @@ class WriteHandle(LocalReadHandle):
         and decides. Delete the replica (`<published>/<name>/_wal`) when turning
         replication off.
 
-        **`catalog.db` is not restored either**, and stays in the replication
-        set regardless: same-machine recovery is where its absolute paths still
-        resolve, and it is the only record of which Parquet the staging table is
-        made of in a design that refuses directory listing.
         """
         # First, because this path does not go through `validate` — it takes no
         # schema and no config — and a malformed prefix would otherwise surface
@@ -2190,7 +2198,7 @@ class WriteHandle(LocalReadHandle):
         log.write_replication_config()
 
         # DERIVED from the highest offset anything still holds, not from
-        # `resumed - RESTORE_RESERVE`. A resumed restore reserves twice, so
+        # `resumed` minus the reserve. A resumed restore reserves twice, so
         # subtracting one window named only the last of them — measured, a log
         # that skipped 1101..2098252 reported 1049677..2098252.
         #

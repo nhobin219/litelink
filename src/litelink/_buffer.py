@@ -1803,7 +1803,7 @@ class Buffer:
     def confirm_published(self, through: int, landed: Iterable[str] = ()) -> None:
         """The published table holds everything up to `through`: raise the
         watermark, retire the intents of the copies that `landed`, and drop
-        pre-0.9 rows the watermark now covers.
+        pre-0.10 rows the watermark now covers.
 
         One transaction, and the order inside it is what matters. The intents
         are what compaction reads while a register is in flight, and the
@@ -1827,7 +1827,7 @@ class Buffer:
                     "DELETE FROM extent_intent WHERE rel_path = ?", (path,)
                 )
 
-            # Rows naming published copies were written by 0.8 and earlier.
+            # Rows naming published copies were written by 0.9 and earlier.
             # Below the watermark they say nothing it does not.
             self._con.execute(
                 "DELETE FROM extent WHERE rel_path LIKE '%://%' AND end_offset <= ?",
@@ -1835,9 +1835,9 @@ class Buffer:
             )
 
     def adopt_published_coverage(self, location: str) -> None:
-        """Move a pre-0.9 log's per-file published rows onto the watermark.
+        """Move a pre-0.10 log's per-file published rows onto the watermark.
 
-        0.8 and earlier recorded a row per pushed file, and eviction read those.
+        0.9 and earlier recorded a row per pushed file, and eviction read those.
         The watermark carries the same fact as one range — except for a log
         re-pointed before 0.7, whose current published table may begin above
         the log's first offset: its rows name more than one published table.
@@ -2014,7 +2014,7 @@ class Buffer:
         offsets, holding no rows anywhere.
 
         With intents, compaction's question also covers a register in flight
-        (`extent_intent`), and rows a pre-0.9 log recorded per pushed file that
+        (`extent_intent`), and rows a pre-0.10 log recorded per pushed file that
         no publish has yet folded into the watermark.
 
         Bounded by `floor`, the staging table's lowest offset: every caller asks

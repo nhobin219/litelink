@@ -496,11 +496,16 @@ table adopted with the watermark at its end, and the offset
 counter above everything the old log is known to have issued, plus `PUBLISHED_RESTORE_RESERVE`
 (2^40). Offsets the old log issued but never published may have reached readers, and the published
 end trails them by everything it had not published — without bound. So every push records
-`litelink.issued_through` in the commit that registers it, the rebuild starts above the larger of
-that and the end, and the fence, far wider than a WAL restore's `RESTORE_RESERVE`, covers what was
-issued after the last publish. A replica is always preferred when
-there is one, since it can only be fresher; litestream exits cleanly and writes nothing only when
-there is none, and a missing bucket or refused credentials still raise.
+`litelink.issued_through` in the commit that registers it, and the rebuild starts above it — or
+above the end, for a table only an older version published — by a fence far wider than a WAL
+restore's `RESTORE_RESERVE`, covering what was issued after the last publish. Generally, a restore
+resumes above whichever record of what the log issued is freshest, the replica's sequence or the
+published one, by that record's reserve (`litelink.restore`).
+
+A replica, when there is one, is always used, for its unpublished rows and its settings: offsets
+alone cannot tell a lagging replica from one abandoned when WAL replication was turned off, which
+is why the docs say to delete it then. litestream exits cleanly and writes nothing only when there
+is no replica; a missing bucket or refused credentials still raise.
 
 **A restored buffer holding sealed rows needs no reconciliation.** The read boundary (§7)
 comes from the table's committed max offset, so those rows fall outside the buffer's
@@ -957,7 +962,7 @@ retires the push's intents in one transaction, so there is no moment covered by 
 
 **`extent` describes staging only.** It records each staging file's range and the bytes its rows
 held, and nothing about published copies — so it does not grow with the published history, and
-a restore holds the same kind of `extent` however it was rebuilt (#144). Logs written by 0.8 and
+a restore holds the same kind of `extent` however it was rebuilt (#144). Logs written by 0.9 and
 earlier recorded a row per pushed file; a writer's `open` folds those into the watermark.
 
 **There is no local-only exception.** Every log has a published table (#98) — a local directory
