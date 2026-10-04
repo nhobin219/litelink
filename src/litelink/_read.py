@@ -463,8 +463,10 @@ def current_metadata(location: str, *, s3_options: S3Options | None = None) -> s
     file-handle cache keeps the first handle for up to an hour — so
     `iceberg_scan('s3://…/trades', version_name_format=…)` there fails an ETag
     check once the table has published again, rather than reading the new
-    snapshot. Call this per read that should see new publishes; it is one
-    small GET.
+    snapshot — and reading the hint itself through that connection,
+    `read_text('…/metadata/version-hint.text')`, silently returns the old one.
+    Never read the hint through a disk-cached connection: call this, per read
+    that should see new publishes; it is one small GET.
 
     `location` is the published table's location, `s3://…` or `file:///…`.
     Raises `FileNotFoundError` when it has no hint — nothing has been
@@ -539,6 +541,12 @@ def duckdb_connection(
     caches by stream — asks for it here, with a key it chooses. The cache
     belongs to the DATABASE this builds, shared by all its cursors, so a
     caller pooling connections pools per key. See `install_read_cache`.
+
+    **Never read a table's `version-hint.text` through a `disk_cache`
+    connection** — neither by scanning the table's directory, which fails an
+    ETag check after a new publish, nor with `read_text`, which silently
+    returns the old hint. Resolve the table with `current_metadata` and scan
+    the path it returns.
 
     A new connection per call, which the caller owns. Building one costs about
     a quarter of a second, nearly all of it `LOAD iceberg` (#102), so hold on

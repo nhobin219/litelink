@@ -483,7 +483,9 @@ actually read from S3, needs no write to either table, and survives restarts; it
   cache, so a stale copy is never served from disk; but `cache_httpfs`'s file-handle cache
   ignores exclusions and keeps the hint's handle for up to an hour. So
   `iceberg_scan('<table dir>', version_name_format=…)` on a disk-cached connection fails DuckDB's
-  ETag check once the table has published again, instead of reading the new snapshot.
+  ETag check once the table has published again, instead of reading the new snapshot — and
+  reading the hint itself through it, `read_text('<table dir>/metadata/version-hint.text')`,
+  silently returns the old one. Never read the hint through a disk-cached connection.
   `current_metadata` reads the hint outside DuckDB, and the `metadata.json` path it returns
   never changes, so every cache is correct for it:
 
