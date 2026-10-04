@@ -9,8 +9,8 @@ from litelink import LogConfig, LogHandle, Row, S3Options, WriteHandle, __versio
 ```
 
 Those are the names most code takes; `litelink` also exports `new`, `open`, `restore`,
-`validate_row`, `preflight`, `duckdb_connection`, `install_s3_secret`, `LocalReadHandle`,
-`Coverage`, `RetiredError`, `ExtensionMissing`, `OFFSET`, the statistics types
+`validate_row`, `preflight`, `duckdb_connection`, `current_metadata`, `install_s3_secret`,
+`LocalReadHandle`, `Coverage`, `RetiredError`, `ExtensionMissing`, `OFFSET`, the statistics types
 (`ColumnStatistics`, `TierStatistics`, `Tier`), the preflight report types (`Check`, `Report`)
 and the `manifest` module. The handles are the whole object model — there
 is no session, no client, no catalog handle to hold. A log is a directory under a root, named
@@ -477,6 +477,23 @@ actually read from S3, needs no write to either table, and survives restarts; it
 - **`disk_cache_volume_limit` bounds it by how full its VOLUME may get**, not by its own size:
   it evicts once the volume is 80% full, counting everything on it. `cache_httpfs` has no byte
   cap of its own, and left alone keeps only 5% free.
+- **A disk-cached reader resolves the table with `current_metadata`, per read** (#141). The
+  hint, `metadata/version-hint.text`, is the one object a reader touches that changes; every
+  other file is written once under a unique name. litelink excludes the hint from the disk
+  cache, so a stale copy is never served from disk; but `cache_httpfs`'s file-handle cache
+  ignores exclusions and keeps the hint's handle for up to an hour. So
+  `iceberg_scan('<table dir>', version_name_format=…)` on a disk-cached connection fails DuckDB's
+  ETag check once the table has published again, instead of reading the new snapshot.
+  `current_metadata` reads the hint outside DuckDB, and the `metadata.json` path it returns
+  never changes, so every cache is correct for it:
+
+  ```python
+  litelink.current_metadata(location: str, *, s3_options: S3Options | None = None) -> str
+  con.sql(f"SELECT count(*) FROM iceberg_scan('{litelink.current_metadata(location, s3_options=options)}')")
+  ```
+
+  It raises `FileNotFoundError` when the location has no hint. Connections without the disk cache
+  can scan the directory as before.
 - **`memory_cache=False` turns off every RAM layer**, `cache_httpfs`'s own read-through cache
   included.
 - **`cache_httpfs` and `aws` are bundled in the platform wheels.** Elsewhere, `just duckdb-extensions

@@ -149,6 +149,13 @@ def test_no_credentials_anywhere_names_the_fix(
     assert isinstance(caught.value.__cause__, duckdb.Error)
 
 
+def test_current_metadata_refuses_a_location_with_no_hint(tmp_path: Path) -> None:
+    """No hint means nothing published there, which is an answer, not a path
+    to scan."""
+    with pytest.raises(FileNotFoundError, match="version-hint.text"):
+        litelink.current_metadata(f"file://{tmp_path}/nothing")
+
+
 def test_a_credential_chain_loads_aws_itself_without_autoloading(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -307,6 +314,11 @@ def test_a_disk_cache_is_layered_under_memory_in_the_keyed_directory(
     assert expected.is_dir()
     assert found["enable_external_file_cache"] == "true"
     assert found["cache_httpfs_disk_cache_reader_enable_memory_cache"] == "true"
+    # The version hint is never cached on disk (#141), and is excluded once.
+    exclusions = connection.execute(
+        "SELECT * FROM cache_httpfs_list_exclusion_regex()"
+    ).fetchall()
+    assert exclusions == [(r".*/metadata/version-hint\.text$",)]
     floor = int(found["cache_httpfs_min_disk_bytes_for_cache"])
     assert floor == int(shutil.disk_usage(expected).total * (1 - 0.8))
 

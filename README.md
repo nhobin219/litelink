@@ -237,10 +237,16 @@ log's own handles: on the host that writes a log, it would put back on disk exac
 eviction removed.
 
 ```python
-con = litelink.duckdb_connection(
-    s3_options=litelink.S3Options(), disk_cache=True, cache_key="trades-reader"
-)
+options = litelink.S3Options()
+con = litelink.duckdb_connection(s3_options=options, disk_cache=True, cache_key="trades-reader")
+metadata = litelink.current_metadata("s3://bucket/prefix/trades", s3_options=options)
+con.sql(f"SELECT count(*) FROM iceberg_scan('{metadata}')")
 ```
+
+**With the disk cache, resolve the table with `current_metadata`, per read.** It reads
+`version-hint.text` outside DuckDB and returns the current `metadata.json`. Scanning the table
+by its directory instead resolves the hint through the cache, whose file handle outlives a new
+publish: the scan fails DuckDB's ETag check instead of reading the new snapshot.
 
 ## Reading from another machine
 
