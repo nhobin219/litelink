@@ -30,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from litelink._buffer import _NO_ROW_LIMIT, PUBLISHED_THROUGH_KEY, Buffer
 from litelink._claim import new_owner
@@ -73,7 +74,7 @@ class _SweepState:
 CONFIG_KEY = "config"
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from litelink._buffer import Buffer
     from litelink._config import LogConfig
@@ -143,6 +144,43 @@ def chunks(
 
     if held:
         yield pa.Table.from_batches(held, schema=schema)
+
+
+def input_slices(data_file: DataFile) -> list[tuple[int, int]]:
+    """The offset ranges a merge reads `data_file` in: one per row group when
+    its row groups hold disjoint offsets, else the whole file.
+
+    What bounds a merge's memory by a row group rather than by its largest
+    input. A file `ingest` wrote is up to `target_compact_size` on disk — an
+    unfinished load's tail is an input like a seal — and read whole it is
+    gigabytes of Arrow. Its row groups hold disjoint offsets, because ingest
+    reserves a range per row group, so each is readable alone. A file whose
+    row groups overlap — sorted end to end by `sort_by` — is read whole; such
+    files are seals, or were written by a version that bounded them by memory.
+    """
+    whole = [(data_file.start, data_file.end)]
+    try:
+        meta = pq.ParquetFile(data_file.path).metadata
+        column = meta.schema.to_arrow_schema().get_field_index("litelink_offset")
+        ranges = []
+        for g in range(meta.num_row_groups):
+            stats = meta.row_group(g).column(column).statistics
+            if stats is None or not stats.has_min_max:
+                return whole
+
+            ranges.append((int(stats.min), int(stats.max) + 1))
+    except (OSError, ValueError):
+        return whole
+
+    ranges.sort()
+    if len(ranges) < 2 or any(a[1] > b[0] for a, b in itertools.pairwise(ranges)):
+        return whole
+
+    # The file's own extent at either end, so no row can fall outside a slice.
+    ranges[0] = (data_file.start, ranges[0][1])
+    ranges[-1] = (ranges[-1][0], data_file.end)
+
+    return ranges
 
 
 def row_groups(
@@ -351,27 +389,6 @@ def is_remote(path: str) -> bool:
     identical either side of the network.
     """
     return "://" in path
-
-
-def _undersized_from(
-    run: Sequence[DataFile], held: Mapping[str, int], target: int
-) -> list[DataFile]:
-    """The tail of `run` from its first under-target file, or nothing.
-
-    §6's rule inside one dense segment: everything before the first short file
-    already holds a full target and re-cutting it would rewrite bytes to
-    reproduce them; everything after has to move regardless of its own size,
-    because the shortfall ahead of it shifts every boundary behind it.
-
-    A file whose size was never recorded counts as full, so a published table
-    whose `extent` rows were lost is left alone rather than rewritten on a
-    guess.
-    """
-    for index, data_file in enumerate(run):
-        if held.get(data_file.path, target) < target:
-            return list(run[index:])
-
-    return []
 
 
 class Maintenance:
@@ -654,18 +671,18 @@ class Maintenance:
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tally = _Tally()
-        # Each input read whole, through the table so it comes out in the
-        # current schema, and released before the next is read. Not streamed
-        # within an input: pyiceberg's batch reader casts each filtered batch
-        # to large types, and pyarrow up to 25.0.1 aborts the process casting a
-        # filtered map column (apache/arrow#51029, fixed for 26.0.0). Inputs
-        # are seals, or files under the target, so one is small beside a
-        # 512 MiB output.
-        first = table.scan_range(run[0].start, run[0].end)
+        # Read through the table, so every input comes out in the current
+        # schema, one of its row groups at a time: `input_slices` names each
+        # row group's offsets, and the scan's statistics skip the rest of the
+        # file. Not pyiceberg's batch reader, which casts each filtered batch to
+        # large types — and pyarrow up to 25.0.1 aborts the process casting a
+        # filtered map column (apache/arrow#51029, fixed for 26.0.0).
+        slices = [s for f in run for s in input_slices(f)]
+        first = table.scan_range(*slices[0])
         schema = first.schema
         inputs = itertools.chain(
             [first.to_batches()],
-            (table.scan_range(f.start, f.end).to_batches() for f in run[1:]),
+            (table.scan_range(lo, hi).to_batches() for lo, hi in slices[1:]),
         )
         del first  # held by `inputs` only until it moves past it
         with stream_parquet(dest, schema, config.compression) as write:

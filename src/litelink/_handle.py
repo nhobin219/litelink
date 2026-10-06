@@ -2746,8 +2746,10 @@ class WriteHandle(LocalReadHandle):
                 reader, reader.schema, config.target_row_group_size, cap
             ):
                 rows = chunk.select(shape.columns).cast(shape.schema)
-                # Before the reservation, which is what makes a refusal free:
-                # after it, the chunk's offsets are a permanent hole.
+                # Before this row group's reservation, so a refusal costs no
+                # offsets of its own. Those of the open file's earlier row
+                # groups, reserved and written but not registered, are the
+                # hole a failed load leaves.
                 _refuse_non_finite(rows)
                 start, end = self._buffer.reserve(rows.num_rows)
                 rows = rows.add_column(

@@ -13,6 +13,7 @@ import pytest
 
 import litelink
 import litelink._handle
+import litelink._table
 from litelink import OFFSET, LogConfig, WriteHandle
 from litelink._claim import EVERYTHING, new_owner
 from litelink._layout import Layout
@@ -413,6 +414,48 @@ def test_a_value_the_schema_cannot_hold_costs_no_offsets(tmp_path: Path) -> None
 
         assert log.end_offset() == 1
         assert log._table.span() is None
+
+
+def test_merging_a_loads_tail_reads_it_a_row_group_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load's tail is an input like a seal, and up to `target_compact_size`
+    on disk. Read whole it is that times the compression ratio in Arrow, in one
+    allocation; read a row group at a time, it is bounded like every other
+    input."""
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=64 * 1024,
+        target_row_group_size=8192,
+        compact_min_files=2,
+    )
+    with open_log(tmp_path, config) as log:
+        log.ingest(table(6000), publish=False)
+        tail = log._table.data_files()[-1]
+        assert tail.size < config.compact_size, "the load must leave a tail"
+        assert pq.ParquetFile(tail.path).metadata.num_row_groups > 2
+
+        log.extend(rows(200, start=6000))
+        log.seal(flush=True)
+
+        read: list[int] = []
+        scan_range = litelink._table.LogTable.scan_range
+
+        def spy(self: Any, start: int, end: int) -> pa.Table:
+            got = scan_range(self, start, end)
+            read.append(got.nbytes)
+
+            return got
+
+        monkeypatch.setattr(litelink._table.LogTable, "scan_range", spy)
+        log.compact(flush=True)
+        monkeypatch.undo()
+
+        assert read, "the tail must have been merged"
+        assert max(read) <= 2 * config.target_row_group_size, (
+            f"an input was read whole: {max(read)} bytes"
+        )
+        assert log.scan().read_all().num_rows == 6200
 
 
 # -- ingest: what a failure leaves behind (I2) ---------------------------------
