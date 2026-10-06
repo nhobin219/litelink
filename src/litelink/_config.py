@@ -18,9 +18,10 @@ from datetime import timedelta
 #
 # The two are at odds by nature: §7 wants the seal small because the buffer is
 # what a hot read scans, and both object storage and Parquet want files large.
-# Eight is chosen to be comfortably past the point where per-file overhead
-# dominates — measured at 44 ms to read the offset boundary over 64 files
-# against 1.0 ms over one — while keeping compaction's peak memory, which is
+# Eight is chosen to cut file count by that much — every file a query cannot
+# prune is opened, a footer read and on object storage a request each, which a
+# wide scan or a filter on a column outside `sort_by` pays per file — while
+# keeping compaction's peak memory, which is
 # one run held as a single Arrow table, to something a maintainer process can
 # hold. On the default 8 MiB seal that is 64 MiB.
 COMPACT_MULTIPLE = 8
@@ -122,10 +123,10 @@ class LogConfig:
     # compacted file, once.
     #
     # None means `COMPACT_MULTIPLE` times the seal size, and the conversion is
-    # therefore ON by default. A log gets the benefit at read time too: file
-    # count is a measured cost here, not a reputation — reading the offset
-    # boundary from manifest statistics measured 1.0 ms over one file and 44 ms
-    # over 64.
+    # therefore ON by default. A log gets the benefit at read time too: every
+    # file a query cannot prune is opened. Planning is not where file count
+    # costs — the offset boundary is read from one manifest's entries, measured
+    # at 1.6 ms over one file and 3.0 ms over 64, and cached per table version.
     #
     # It is a MULTIPLE for a reason. Sealed files are uniform, so merging whole
     # files lands exactly on the target when it divides and short when it does

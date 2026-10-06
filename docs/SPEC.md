@@ -1103,8 +1103,10 @@ undersized — every file a seal writes is already the size it was asked to be, 
 is exact and there is no timer to cut early — but because the seal size and the file size
 are two different targets (§12). `target_compact_size` defaults to eight times
 `target_seal_size`, so eight sealed files become one, and that conversion is on **whether
-or not the published table is remote**: file count is a read cost locally too, measured at 1.0 ms to read the
-offset boundary over one file against 44 ms over 64.
+or not the published table is remote**: file count is a read cost locally too. Every file a query
+cannot prune is opened — a footer read, and on object storage a request — which a wide scan or a
+filter on a column outside `sort_by` pays for every file. Planning is cheap either way: the offset
+boundary is read from one manifest, measured at 1.6 ms over one file and 3.0 ms over 64 (#158).
 
 It picks up the deliberate exceptions on the way — an explicit `seal()`, which cuts short by
 definition, and a change to `target_seal_size`, which leaves history sized for the old value.
@@ -1402,19 +1404,20 @@ directly*.
 
 **Fixed is a property of the implementation, not of the design, and it has to be earned.**
 The boundary comes from manifest statistics, and reading those costs time proportional to
-*file count*: measured at 1.0 ms over one file and 44 ms over 64, which at the small-file
-counts an undersized seal produces is most of a read. Two things bring it back to fixed.
+*file count*. Two things keep it fixed.
 
 Read the offset bounds off the manifest entries rather than through a full file-metadata
 materialisation — pyiceberg's `inspect.files()` builds an eighteen-column Arrow table,
 including `readable_metrics`, which decodes the bounds of every column to answer a question
-about one. Roughly half the cost, and it still opens no data file.
+about one. Measured against pyiceberg 0.12: 1.1 ms over one file, 2.0 ms over 64 and 9.8 ms
+over 512 from the manifest entries, against 1.7, 4.1 and 24.5 ms through `inspect.files()`. It
+opens no data file.
 
 Then cache the extent against `metadata_location`. That pointer is the table version, so an
 unchanged pointer is the same snapshot and the extent cannot have moved; a changed one is
 exactly when the manifests must be read again. This does not weaken *"resolve per query,
 never pin"* — the resolve still happens, at ~0.5 ms, and is what decides whether the cache
-stands. Measured warm: 0.38 ms at one file, 1.05 ms at 64, against 44 ms uncached.
+stands. Measured: 1.6 ms over one file and 3.0 ms over 64 uncached, microseconds warm.
 
 What remains proportional after that is the scan itself opening each file, which is the
 cost compaction exists to bound.

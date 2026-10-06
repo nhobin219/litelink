@@ -910,10 +910,10 @@ def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
 ) -> None:
     """Conversion is on by default, including with no published table.
 
-    File count is a measured read cost here rather than a reputation: reading
-    the offset boundary from manifest statistics measured 1.0 ms over one file
-    and 44 ms over 64. A local-only log gets that benefit too, which is why the
-    default is a multiple rather than "same as the seal, convert nothing".
+    File count is a read cost locally too: every file a query cannot prune is
+    opened, which a wide scan pays per file. A local-only log gets that benefit
+    too, which is why the default is a multiple rather than "same as the seal,
+    convert nothing".
     """
     config = LogConfig(target_seal_size=4096, compact_min_files=2)
 
