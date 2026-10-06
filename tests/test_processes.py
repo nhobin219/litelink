@@ -95,6 +95,9 @@ def finish(process: subprocess.Popen[str], role: str) -> str:
 WRITER = """
     config = LogConfig(
         target_seal_size=TARGET,
+        # A few seals' worth on disk, so compaction converts and the runs
+        # still fill — and publish — within the run.
+        target_compact_size=16 * 1024,
         compact_min_files=2,
         staging_retention=timedelta(seconds=0),
         staging_snapshot_retention=timedelta(seconds=0),

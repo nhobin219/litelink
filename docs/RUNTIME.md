@@ -311,15 +311,12 @@ knowable at the moment the seal has to decide, since what compression will achie
 known until after the write. Sizing by the file instead would be sizing by the compression
 ratio: rows per file would swing with the data, and memory per file would be unbounded.
 
-**Everything downstream is stated in the same currency.** A file's uncompressed size is
-recorded by the seal that measured it — the appender's own byte count for exactly those
-rows — carried in the buffer beside the file, added up across a merge, and dropped when the
-file is finally unlinked. Compaction and publish both read it, so neither ever compares a
-compressed size to a memory bound. That mistake is not hypothetical: measuring on disk, the
-system merged eight already-full files into one holding eight times the target and, because
-publish refuses anything compaction may still rewrite, published nothing at all while doing it.
-A file whose size was never recorded counts as full, so an unmeasured file is never
-rewritten on a guess.
+**Compaction is the exception, and states its target on disk.** It streams, so its memory is
+`target_row_group_size` — the Arrow bytes it sorts and writes as one row group — and nothing
+ties the file it writes to what a process can hold. `target_compact_size` is therefore the
+file's size on disk, 512 MiB by default, chosen for readers: a wide scan or a filter outside
+`sort_by` pays a request per file. Runs are chosen by adding up their files' sizes on disk,
+which every manifest entry carries, so no size has to be recorded or estimated to decide one.
 
 That holds only because there is no time-based seal. A timer sealing a quiet stream emits
 a small file every interval for ever, which is what compaction was built to clean up

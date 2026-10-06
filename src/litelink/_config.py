@@ -14,17 +14,41 @@ import json
 from dataclasses import dataclass
 from datetime import timedelta
 
-# How much larger a compacted file is than a sealed one, when nothing says.
+# The size compaction writes files to ON DISK, when nothing says: Iceberg's
+# own `write.target-file-size-bytes`.
 #
-# The two are at odds by nature: §7 wants the seal small because the buffer is
-# what a hot read scans, and both object storage and Parquet want files large.
-# Eight is chosen to cut file count by that much — every file a query cannot
-# prune is opened, a footer read and on object storage a request each, which a
-# wide scan or a filter on a column outside `sort_by` pays per file — while
-# keeping compaction's peak memory, which is
-# one run held as a single Arrow table, to something a maintainer process can
-# hold. On the default 8 MiB seal that is 64 MiB.
-COMPACT_MULTIPLE = 8
+# Larger files cost readers nothing measurable and save the wide ones a great
+# deal. Measured on a gigabyte of synthetic ticks and order-book snapshots
+# (`benchmarks/compaction.py`, #158): against files of 64 MiB of Arrow — 95
+# and 205 of them — 512 MB files cut a `count(*)` over S3 from 190 and 410
+# requests to 4, and a full scan from 570-1,230 to 209-414, while every query
+# measured locally was within noise of the small files.
+#
+# Files land under it: a run is closed once its inputs fill it, and the merge
+# compresses better than they did — by about a third on sealed ticks and
+# order-book snapshots, where 512 MiB of seals merges into about 350-370 MB.
+#
+# What it costs is time in staging. `publish` takes only files compaction has
+# finished with, so a stream publishes in 512 MB steps: at 114 rows a second,
+# 6 to 16 days. Recovery does not wait on it — that is WAL replication's job
+# (§3a) — so the delay is the published table's freshness, not durability.
+DEFAULT_COMPACT_SIZE = 512 * 1024 * 1024
+
+# How much of a compacted file is sorted and written at a time, in Arrow's
+# in-memory bytes, when nothing says.
+#
+# Compaction streams: it reads its inputs in offset order, sorts this much at a
+# time by `sort_by`, and writes it as one row group. So this, not the file
+# size, is what bounds its memory — about 2.5x this at the peak, measured — and
+# a file of any size is written in the same footprint.
+#
+# Sorting a row group rather than the whole file is a choice about reads. A
+# file sorted end to end by a `sort_by` that is not arrival order spreads every
+# offset range across one stretch per sort key: measured, a 100k-offset read
+# went from 4 requests to 27 and 3x the time. Sorted a row group at a time, an
+# offset or time range stays within one or two row groups, as it did when a
+# whole compacted file was this size.
+DEFAULT_ROW_GROUP_SIZE = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,11 +89,9 @@ class LogConfig:
     # once cost N times this, which is the number to divide a memory budget by
     # when choosing read parallelism.
     #
-    # So expect files smaller than this on disk, and set it larger than an
-    # on-disk file target would be. Everything downstream is stated in the same
-    # currency — compaction sizes a merge by what its inputs HOLD, carried in
-    # the `extent` row the seal measured it into, never by what they compressed
-    # to (see `_maintenance.runs`).
+    # So expect sealed files smaller than this on disk. Compaction is where
+    # files are sized on disk (`target_compact_size`), because it streams and
+    # so has no reason to bound a file by memory.
     #
     # The 8 MiB default is §7's row guidance restated — its table puts a 20k-row
     # buffer at 8.0 MB at the 400-byte row it measured, and 20k rows is the
@@ -99,65 +121,43 @@ class LogConfig:
     # is the case that needs this and a library cannot guess the row width.
     target_seal_rows: int | None = None
 
-    # §6. How big a file should END UP, which is not the same question as how
-    # much may sit in the buffer, and the two pull in opposite directions.
+    # §6. How big a file should END UP, ON DISK, which is not the same
+    # question as how much may sit in the buffer, and the two pull in opposite
+    # directions.
     #
     # §7 wants the seal SMALL: the buffer is what a hot read scans, so its size
-    # is read latency. The published table wants files LARGE: measured against
-    # S3, a 9 kB file takes 648 ms to upload and almost all of that is the
-    # round trip, so halving file size doubles the cost of publishing the same
-    # stream.
-    # One knob cannot serve both — it did, and compaction could therefore never
-    # produce a file bigger than a seal, which is why it was a no-op.
+    # is read latency. The published table wants files LARGE: every file a
+    # query cannot prune is opened, a footer read and on object storage a
+    # request each, which a wide scan or a filter on a column outside `sort_by`
+    # pays per file. Planning is not where file count costs — the offset
+    # boundary is read from one manifest's entries, measured at 1.6 ms over one
+    # file and 3.0 ms over 64, and cached per table version.
     #
     # Splitting them gives compaction a job: converting sealed chunks into
     # published-shaped ones. Eligibility follows for free — `publish` only takes
-    # files compaction has finished with, so raising this above the seal size
-    # means a freshly sealed file is a merge candidate and is not published
-    # until it has been converted.
+    # files compaction has finished with, so a freshly sealed file is a merge
+    # candidate and is not published until it has been converted.
     #
     # The price is write amplification, and it is bounded rather than ongoing:
     # every row is written twice locally, once at seal and once at compaction,
     # and read once in between. Bounded because a converted file is already at
-    # the target, so it is never a candidate again — eight seals become one
-    # compacted file, once.
+    # the target, so it is never a candidate again.
     #
-    # None means `COMPACT_MULTIPLE` times the seal size, and the conversion is
-    # therefore ON by default. A log gets the benefit at read time too: every
-    # file a query cannot prune is opened. Planning is not where file count
-    # costs — the offset boundary is read from one manifest's entries, measured
-    # at 1.6 ms over one file and 3.0 ms over 64, and cached per table version.
-    #
-    # It is a MULTIPLE for a reason. Sealed files are uniform, so merging whole
-    # files lands exactly on the target when it divides and short when it does
-    # not: three 1 MiB files against a 4 MiB target give 3 MiB files for ever,
-    # 25% under what was asked for, with nothing to indicate why.
+    # On disk, because compaction streams: its memory is set by
+    # `target_row_group_size`, so nothing ties the file to what a process can
+    # hold. None means `DEFAULT_COMPACT_SIZE`.
     target_compact_size: int | None = None
+    # A row ceiling for the same files, for a log that wants one. None is none.
     target_compact_rows: int | None = None
+    # Arrow bytes compaction sorts and writes as one row group: its memory
+    # bound, and the unit an offset range is localised to inside a file. See
+    # `DEFAULT_ROW_GROUP_SIZE`.
+    target_row_group_size: int = DEFAULT_ROW_GROUP_SIZE
 
     @property
     def compact_size(self) -> int:
-        """The file size compaction aims for.
-
-        `COMPACT_MULTIPLE` times the seal size unless set. On the 8 MiB default
-        seal that is 64 MiB of rows — under Parquet's usual advice once
-        compression is applied, and far above the size at which per-file
-        overhead dominates a scan.
-        """
-        return self.target_compact_size or self.target_seal_size * COMPACT_MULTIPLE
-
-    @property
-    def compact_rows(self) -> int | None:
-        """The row ceiling compaction respects. Scaled like `compact_size`, so
-        setting only the seal's row limit does not silently cap conversion at
-        one seal's worth."""
-        if self.target_compact_rows is not None:
-            return self.target_compact_rows
-
-        if self.target_seal_rows is None:
-            return None
-
-        return self.target_seal_rows * COMPACT_MULTIPLE
+        """The on-disk file size compaction aims for."""
+        return self.target_compact_size or DEFAULT_COMPACT_SIZE
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
@@ -322,6 +322,7 @@ class LogConfig:
                 "target_compact_size": self.target_compact_size,
                 "target_seal_rows": self.target_seal_rows,
                 "target_compact_rows": self.target_compact_rows,
+                "target_row_group_size": self.target_row_group_size,
                 "staging_retention": (
                     None
                     if self.staging_retention is None
@@ -384,6 +385,9 @@ class LogConfig:
             target_seal_rows=raw.get("target_seal_rows", defaults.target_seal_rows),
             target_compact_rows=raw.get(
                 "target_compact_rows", defaults.target_compact_rows
+            ),
+            target_row_group_size=raw.get(
+                "target_row_group_size", defaults.target_row_group_size
             ),
             staging_retention=(
                 retention

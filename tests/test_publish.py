@@ -88,14 +88,13 @@ def published_log(
 ) -> WriteHandle:
     settings: dict[str, object] = {
         "target_seal_size": 64 * 1024,
-        # Conversion off, so these tests are about what reaches the published table and
+        # Conversion off — a one-byte target every file already exceeds on
+        # disk — so these tests are about what reaches the published table and
         # not about what makes a file eligible. By default compaction converts
-        # sealed files into ones eight times larger and `publish` waits for that,
-        # which is correct and has its own test —
-        # `test_only_compacted_files_are_eligible_for_the_published_table`. Leaving it
-        # on here would mean every published table test first had to produce eight
-        # seals' worth of rows to observe anything.
-        "target_compact_size": 64 * 1024,
+        # sealed files into 512 MiB ones and `publish` waits for that, which is
+        # correct and has its own test —
+        # `test_only_compacted_files_are_eligible_for_the_published_table`.
+        "target_compact_size": 1,
         "compact_min_files": 2,
         "staging_snapshot_retention": timedelta(seconds=0),
         "published_snapshot_retention": timedelta(seconds=0),
@@ -219,11 +218,6 @@ def test_only_settled_files_reach_the_published_table(
     storage as an undersized file nothing local can merge away — the published table
     would need a repair pass to fix a sizing decision made here. So a trailing
     small file stays behind, and the watermark stops short of it.
-
-    "Small" is measured in what the file HOLDS, not what it cost to store. The
-    payload here compresses about eight to one, so every file looks starved
-    beside a target stated in uncompressed bytes, and a rule reading sizes off
-    disk pushed nothing at all.
     """
     with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
@@ -232,10 +226,10 @@ def test_only_settled_files_reach_the_published_table(
         log.seal(flush=True)
 
         files = log._table.data_files()
-        held = log._maintenance.memory()
-        assert held[files[-1].path] < log.config.target_seal_size, (
-            "the tail must hold less than a full target to test this"
-        )
+        # A target every full seal meets on disk and the tail does not.
+        target = min(f.size for f in files[:-1])
+        assert files[-1].size < target, "the tail must be under the target"
+        log.set_config(replace(log.config, target_compact_size=target))
 
         log.publish()
 
@@ -706,7 +700,12 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
         tmp_path,
         "s",
         schema=SCHEMA,
-        config=replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2),
+        config=replace(
+            LogConfig(),
+            target_seal_size=8 * 1024,
+            target_compact_size=6 * 1024,  # about two seals on disk
+            compact_min_files=2,
+        ),
         published=where,
         s3_options=s3,
     ) as log:
@@ -747,7 +746,7 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         staging_rows=200,
     )
@@ -822,7 +821,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
@@ -961,7 +960,7 @@ def test_a_healed_crash_raises_the_watermark_and_retires_the_intents(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
@@ -1016,7 +1015,7 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1075,7 +1074,12 @@ def test_without_replication_eviction_does_not_wait_for_the_published_table(
     Falsify by having `evict_buffer` use the published table's coverage
     whenever one is remote: nothing is published, so nothing is dropped.
     """
-    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
+        compact_min_files=2,
+    )
     with litelink.new(
         tmp_path,
         "s",
@@ -1163,7 +1167,12 @@ def test_the_published_table_declares_the_same_sort_order_as_the_log(
     not this library, and the reason `sort_by` was unanswerable from the
     published table alone.
     """
-    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
+        compact_min_files=2,
+    )
     with litelink.new(
         tmp_path,
         "s",
@@ -1206,7 +1215,7 @@ def test_a_log_is_recovered_onto_another_machine(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1325,7 +1334,7 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=16 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
     )
     root = tmp_path / "log"
@@ -1416,6 +1425,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1488,6 +1498,7 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1541,6 +1552,7 @@ def test_creating_a_log_on_another_logs_published_table_is_refused(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1601,6 +1613,7 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1697,8 +1710,8 @@ def test_a_restore_fence_clears_the_published_table_and_not_just_the_replica(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        # Equal to the seal target, so the load emits several files AT the
-        # budget rather than one under it — `stable_prefix` holds back a
+        # Small, so the load emits several files AT the budget on disk
+        # rather than one under it — `stable_prefix` holds back a
         # trailing run with room in it, and a single undersized file would
         # leave the published table exactly where the snapshot left it.
         target_compact_size=8 * 1024,
@@ -1786,6 +1799,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1859,6 +1873,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1940,6 +1955,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
         compact_min_files=2,
         wal_replication=True,
     )
@@ -2192,7 +2208,7 @@ def test_a_handle_that_read_an_empty_published_table_still_sees_it_fill(
     config = replace(
         LogConfig(),
         target_seal_size=64 * 1024,
-        target_compact_size=64 * 1024,
+        target_compact_size=1,
         compact_min_files=2,
         staging_retention=timedelta(0),
         staging_snapshot_retention=timedelta(seconds=0),
@@ -2388,7 +2404,12 @@ def test_restore_refuses_a_buffer_bound_to_another_published_table(
     """
     held = f"s3://{bucket}/held"
     other = f"s3://{bucket}/other"
-    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
+        compact_min_files=2,
+    )
 
     # The published table the caller means, with rows actually in it.
     primary = tmp_path / "primary"
@@ -2441,7 +2462,12 @@ def test_restore_accepts_the_same_published_table_written_with_a_trailing_slash(
     protect, and the operator's escape from it is to guess at punctuation.
     """
     held = f"s3://{bucket}/slash"
-    config = replace(LogConfig(), target_seal_size=8 * 1024, compact_min_files=2)
+    config = replace(
+        LogConfig(),
+        target_seal_size=8 * 1024,
+        target_compact_size=6 * 1024,  # about two seals on disk
+        compact_min_files=2,
+    )
 
     primary = tmp_path / "primary"
     with litelink.new(
@@ -2837,7 +2863,7 @@ def test_advance_cycles_and_reloads_reuse_one_file_io(
         sort_by=("event_ts",),
         config=LogConfig(
             target_seal_size=4096,
-            target_compact_size=16 * 1024,
+            target_compact_size=6 * 1024,  # about two seals on disk
             compact_min_files=2,
             staging_rows=100,
             staging_snapshot_retention=timedelta(seconds=0),
@@ -2893,7 +2919,7 @@ def _restore_settings() -> LogConfig:
     restore exercise it."""
     return LogConfig(
         target_seal_size=64 * 1024,
-        target_compact_size=64 * 1024,
+        target_compact_size=1,
         compact_min_files=2,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),

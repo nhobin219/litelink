@@ -20,6 +20,7 @@ orchestrator can run them on their own schedule or process (#118).
 from __future__ import annotations
 
 import contextlib
+import itertools
 import logging
 import time
 import uuid
@@ -28,9 +29,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+import pyarrow as pa
+
 from litelink._buffer import _NO_ROW_LIMIT, PUBLISHED_THROUGH_KEY, Buffer
 from litelink._claim import new_owner
-from litelink._fs import write_parquet
+from litelink._fs import stream_parquet
+from litelink._layout import is_compacted
 from litelink._published import Published
 from litelink._statistics import rollup
 from litelink._tiers import PublishedTier
@@ -69,9 +73,7 @@ class _SweepState:
 CONFIG_KEY = "config"
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
-
-    import pyarrow as pa
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from litelink._buffer import Buffer
     from litelink._config import LogConfig
@@ -93,10 +95,102 @@ def checkpoint(renew: Callable[[], bool] | None) -> None:
         raise RuntimeError(msg)
 
 
+def chunks(
+    batches: Iterable[pa.RecordBatch],
+    schema: pa.Schema,
+    size: int,
+    row_cap: int | None = None,
+) -> Iterator[pa.Table]:
+    """Rows a row group at a time: `size` of Arrow's in-memory bytes, or
+    `row_cap` rows, whichever comes first.
+
+    A batch that would overshoot is SLICED rather than taken whole, because the
+    source may be one `pa.Table` holding an entire corpus in a single chunk —
+    and then "a group per batch" is one group for the load, which is the split
+    not happening. Slicing an Arrow batch copies nothing.
+
+    The per row cost is averaged over the batch it came from rather than summed
+    per row: a seal counts exactly because it sees rows one at a time and this
+    does not, and paying a per-row measurement to place a row-group boundary
+    would cost more than the boundary is worth.
+
+    A single row larger than the whole budget still becomes a group of one row.
+    That is deliberate — the alternative is a loop that cannot advance.
+    """
+    held: list[pa.RecordBatch] = []
+    measured = 0
+    counted = 0
+    for batch in batches:
+        if not batch.num_rows:
+            continue
+
+        per_row = max(1, batch.nbytes // batch.num_rows)
+        cursor = 0
+        while cursor < batch.num_rows:
+            take = batch.num_rows - cursor
+            if row_cap is not None:
+                take = min(take, row_cap - counted)
+
+            take = min(take, max(1, (size - measured) // per_row))
+            piece = batch.slice(cursor, take)
+            held.append(piece)
+            measured += per_row * piece.num_rows
+            counted += piece.num_rows
+            cursor += take
+            if measured >= size or (row_cap is not None and counted >= row_cap):
+                yield pa.Table.from_batches(held, schema=schema)
+                held, measured, counted = [], 0, 0
+
+    if held:
+        yield pa.Table.from_batches(held, schema=schema)
+
+
+def row_groups(
+    inputs: Iterable[Iterable[pa.RecordBatch]], schema: pa.Schema, size: int
+) -> Iterator[pa.Table]:
+    """A merge's rows, a row group at a time, broken only between inputs.
+
+    Whole inputs are gathered until the next would take the group past `size`
+    Arrow bytes. Breaking between them is what keeps each row group's offsets
+    disjoint from its neighbours': an input is sorted by `sort_by`, so cutting
+    one in two leaves both halves spanning its whole offset range. An input
+    larger than `size` on its own is the exception, and is cut by `chunks` —
+    its pieces overlap each other, and nothing else.
+    """
+    held: list[pa.Table] = []
+    measured = 0
+    for source in inputs:
+        pieces = chunks(source, schema, size)
+        piece = next(pieces, None)
+        if piece is None:
+            continue
+
+        following = next(pieces, None)
+        if following is None:
+            # The whole input fits in one row group.
+            if held and measured + piece.nbytes > size:
+                yield pa.concat_tables(held)
+                held, measured = [], 0
+
+            held.append(piece)
+            measured += piece.nbytes
+            continue
+
+        if held:
+            yield pa.concat_tables(held)
+            held, measured = [], 0
+
+        yield piece
+        yield following
+        yield from pieces
+
+    if held:
+        yield pa.concat_tables(held)
+
+
 def runs(
     files: Sequence[DataFile],
     budget: int,
-    memory: Mapping[str, int],
     rows: int | None = None,
 ) -> list[list[DataFile]]:
     """Adjacent files grouped into merge candidates, each within `budget`.
@@ -107,17 +201,11 @@ def runs(
     file pushed and then merged in staging leaves the published table holding
     rows that have been rewritten underneath it.
 
-    Sizes come from `memory` — what each file holds uncompressed, as the
-    appender counted it — and the budget is `target_compact_size`, which is
-    stated in those same units. That correspondence is the point. Sizing this
-    by the files' size on disk is what the code here used to do, and on data
-    that compresses 8:1 it merged eight files that were each already full, into
-    one holding eight times the memory the target allows.
-
-    A file whose size was never recorded counts as full. Unknown is not zero:
-    treating it as small is what would pull an already-correct file into a
-    rewrite, and the cost of leaving it alone is nothing but a merge that did
-    not happen.
+    Sizes are each file's size ON DISK, from its manifest entry, and the budget
+    is `target_compact_size`, stated in the same units. A merge's output lands
+    under the sum of its inputs — larger row groups compress better — so the
+    budget is what a run's inputs fill, and the file comes out somewhat
+    smaller.
 
     The budget caps the OUTPUT. Merging every adjacent small file without one
     puts no ceiling on the result — a hundred files just under the line become
@@ -126,11 +214,10 @@ def runs(
     file would take it past the budget, and the pass emits several correctly
     sized files instead of one enormous one.
 
-    `rows` is `target_compact_rows`, and it has to be here for the same reason.
-    A seal that cut on the row limit produced a file holding fewer bytes than
-    `target_compact_size`, which by bytes alone looks starved — so compaction
-    would merge exactly the files the row cap just created, straight back past
-    it. Whichever ceiling the seal respected, this respects too.
+    `rows` is `target_compact_rows`, a ceiling a log may set as well; whichever
+    binds first closes the run.
+
+    The trailing run may still be open — see `is_open`.
     """
     limit = rows or _NO_ROW_LIMIT
     grouped: list[list[DataFile]] = []
@@ -138,7 +225,13 @@ def runs(
     held = 0
     counted = 0
     for data_file in files:
-        size = memory.get(data_file.path, budget)
+        # A merge's output counts as full whatever its size. A merge compresses
+        # better than its inputs did — larger row groups — so its output lands
+        # under the budget its inputs filled, by about a third on compressible
+        # data (#158); counted by size, it would join the next run and be
+        # rewritten again, and the file still filling would be rewritten on
+        # every pass. Counted full, every row is compacted exactly once.
+        size = budget if is_compacted(data_file.path) else data_file.size
         # A file already at either ceiling on its own closes the previous run
         # and forms one of its own, which then closes on the next file. No
         # special case needed: it simply never has room for a neighbour.
@@ -156,11 +249,27 @@ def runs(
     return grouped
 
 
+def is_open(
+    run: Sequence[DataFile], files: Sequence[DataFile], budget: int, rows: int | None
+) -> bool:
+    """Whether `run` can still grow: it is the trailing run, and under both
+    ceilings, so files not yet written may join it.
+
+    Compaction waits for an open run, and `publish` holds it back: merged now,
+    it would be merged again — with everything sealed after it — on every pass
+    until it filled.
+    """
+    limit = rows or _NO_ROW_LIMIT
+    held = sum(budget if is_compacted(f.path) else f.size for f in run)
+    counted = sum(f.rows for f in run)
+
+    return run[-1] is files[-1] and held < budget and counted < limit
+
+
 def stable_prefix(
     files: Sequence[DataFile],
     budget: int,
     min_files: int,
-    memory: Mapping[str, int],
     rows: int | None = None,
 ) -> int:
     """How many leading files compaction will never touch again.
@@ -187,17 +296,14 @@ def stable_prefix(
     published table permanently: everything after it is newer, so the watermark
     never advanced again and I4 then pinned local disk too. Not "later" — never.
     """
-    limit = rows or _NO_ROW_LIMIT
     settled = 0
-    for run in runs(files, budget, memory, rows):
+    for run in runs(files, budget, rows):
         if len(run) >= min_files:
             break
 
-        held = sum(memory.get(f.path, budget) for f in run)
-        counted = sum(f.rows for f in run)
         # Room under BOTH ceilings is what makes the trailing run growable. At
         # either one it is finished, and a file that cannot grow is settled.
-        if run[-1] is files[-1] and held < budget and counted < limit:
+        if is_open(run, files, budget, rows):
             break
 
         settled += len(run)
@@ -364,8 +470,9 @@ class Maintenance:
 
         return reached
 
-    def compact(self) -> None:
-        """Merge runs of undersized adjacent files (§6).
+    def compact(self, *, flush: bool = False) -> None:
+        """Merge runs of undersized adjacent files (§6). `flush` merges the
+        trailing run even while it can still grow (see `is_open`).
 
         Real work on the happy path. Not repair — the cut is exact and there is
         no timer to cut early, so every file a seal writes already holds what
@@ -419,13 +526,10 @@ class Maintenance:
 
         # One read, so the two limits describe the same policy.
         config = self.config
-        for run in runs(
-            pending,
-            config.compact_size,
-            self.memory(),
-            config.compact_rows,
-        ):
-            self._merge(run)
+        budget, rows = config.compact_size, config.target_compact_rows
+        for run in runs(pending, budget, rows):
+            if flush or not is_open(run, pending, budget, rows):
+                self._merge(run)
 
     def memory(self) -> dict[str, int]:
         """What each data file holds uncompressed, keyed by the path a
@@ -536,20 +640,46 @@ class Maintenance:
         target: str,
         renew: Callable[[], bool],
     ) -> None:
+        """Write the run's rows to one file, streamed (§6 steps 2-3).
+
+        The inputs are read one at a time, in offset order, through the table
+        so each comes out in the current schema. Every `target_row_group_size`
+        of them is sorted by `sort_by` and written as one row group — so memory
+        is a row group's worth whatever the file's size, and an offset range
+        stays inside one or two row groups (see `DEFAULT_ROW_GROUP_SIZE`).
+        """
         start, end = run[0].start, run[-1].end
-        merged = table.scan_range(start, end)
         order = self.sort_by
-        if order:
-            # Re-sorted, not merely concatenated: concatenation would leave the
-            # row groups carrying each source file's range, which is the
-            # statistic the sort exists to tighten.
-            merged = merged.sort_by([(c, "ascending") for c in order])
-
-        _verify(merged, run, start, end)
-
+        config = self.config
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        write_parquet(merged, dest, self.config.compression)
+        tally = _Tally()
+        # Each input read whole, through the table so it comes out in the
+        # current schema, and released before the next is read. Not streamed
+        # within an input: pyiceberg's batch reader casts each filtered batch
+        # to large types, and pyarrow up to 25.0.1 aborts the process casting a
+        # filtered map column (apache/arrow#51029, fixed for 26.0.0). Inputs
+        # are seals, or files under the target, so one is small beside a
+        # 512 MiB output.
+        first = table.scan_range(run[0].start, run[0].end)
+        schema = first.schema
+        inputs = itertools.chain(
+            [first.to_batches()],
+            (table.scan_range(f.start, f.end).to_batches() for f in run[1:]),
+        )
+        del first  # held by `inputs` only until it moves past it
+        with stream_parquet(dest, schema, config.compression) as write:
+            for group in row_groups(inputs, schema, config.target_row_group_size):
+                if order:
+                    group = group.sort_by([(c, "ascending") for c in order])
+
+                tally.add(group)
+                write(group)
+                # Per row group, not per file: a merge of a 512 MB file runs
+                # for minutes, far past the claim's TTL.
+                checkpoint(renew)
+
+        tally.verify(run, start, end)
 
         # Checked between writing and committing, because those are the two
         # halves a lapsed lease separates. A run outlasting the TTL lets
@@ -1351,8 +1481,9 @@ class Maintenance:
         )
 
 
-def _verify(merged: pa.Table, run: list[DataFile], start: int, end: int) -> None:
-    """§6 step 3, as far as it can be taken.
+@dataclass
+class _Tally:
+    """§6 step 3, as far as it can be taken, kept as the rows stream past.
 
     Row count and the offset range are checked exactly; both are what the
     overwrite's safety argument rests on. Per-column min/max is NOT checked and
@@ -1360,15 +1491,30 @@ def _verify(merged: pa.Table, run: list[DataFile], start: int, end: int) -> None
     source bound is a prefix rather than a value and would compare unequal to a
     correct merge.
     """
-    expected = sum(f.rows for f in run)
-    if merged.num_rows != expected:
-        msg = f"compaction would lose rows: {merged.num_rows} != {expected}"
-        raise RuntimeError(msg)
 
-    # Python's min/max over the materialised column, not pyarrow.compute: pc's
-    # kernels are generated from a runtime registry, so no static checker can
-    # see them. §6 step 2 already holds the whole merge in memory.
-    offsets = merged["litelink_offset"].to_pylist()
-    if min(offsets) != start or max(offsets) != end - 1:
-        msg = "compaction changed the offset extent"
-        raise RuntimeError(msg)
+    rows: int = 0
+    low: int | None = None
+    high: int | None = None
+
+    def add(self, group: pa.Table) -> None:
+        # Python's min/max over the materialised column, not pyarrow.compute:
+        # pc's kernels are generated from a runtime registry, so no static
+        # checker can see them.
+        offsets = group["litelink_offset"].to_pylist()
+        if not offsets:
+            return
+
+        self.rows += len(offsets)
+        low, high = min(offsets), max(offsets)
+        self.low = low if self.low is None else min(self.low, low)
+        self.high = high if self.high is None else max(self.high, high)
+
+    def verify(self, run: list[DataFile], start: int, end: int) -> None:
+        expected = sum(f.rows for f in run)
+        if self.rows != expected:
+            msg = f"compaction would lose rows: {self.rows} != {expected}"
+            raise RuntimeError(msg)
+
+        if self.low != start or self.high != end - 1:
+            msg = "compaction changed the offset extent"
+            raise RuntimeError(msg)

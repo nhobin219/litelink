@@ -46,12 +46,13 @@ from litelink._buffer import (
 )
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
-from litelink._fs import write_parquet
+from litelink._fs import stream_parquet, write_parquet
 from litelink._layout import Layout, is_remote, validate_published
 from litelink._maintenance import (
     CONFIG_KEY,
     Maintenance,
     checkpoint,
+    chunks,
     stable_prefix,
 )
 from litelink._published import PUBLISHED_KEY, Published
@@ -187,9 +188,10 @@ PUBLISHED_RESTORE_RESERVE = 1 << 40
 # A commit costs far more than the write it publishes — 4.1 s against 648 ms,
 # measured against S3 — because it reads each footer and writes a manifest, a
 # manifest list, a fresh `metadata.json` and a new catalog pointer, none of
-# which gets cheaper for holding one file instead of twenty. At `compact_size`
-# and 200-byte rows a 160M-row load is roughly 480 files, which is half an hour
-# of commits alone if each registers on its own.
+# which gets cheaper for holding one file instead of twenty. At the default
+# 512 MiB a load is few files and this rarely binds; under a small
+# `target_compact_size` a 160M-row load is thousands of files, and committing
+# each on its own is hours of commits.
 #
 # What batching costs is a wider window in which a written file is not yet
 # registered. It is not a new KIND of window: every one of these paths is in
@@ -290,56 +292,6 @@ def _float_leaves(
 
 def _chunks_of(column: pa.ChunkedArray | pa.Array) -> list[pa.Array]:
     return column.chunks if isinstance(column, pa.ChunkedArray) else [column]
-
-
-def _chunks(
-    reader: pa.RecordBatchReader, size: int, row_cap: int | None
-) -> Iterator[pa.Table]:
-    """One output file's worth of rows at a time, bounded by memory.
-
-    A batch that would overshoot is SLICED rather than taken whole, because the
-    source may be one `pa.Table` holding the entire corpus in a single chunk —
-    and then "emit a file per batch" is one file for the load, which is the
-    split not happening. Slicing an Arrow batch copies nothing.
-
-    The budget is `target_compact_size` in Arrow's in-memory bytes, and the per
-    row cost is averaged over the batch it came from rather than summed per
-    row: a seal counts exactly because it sees rows one at a time and this does
-    not, and paying a per-row measurement to place a file boundary would cost
-    more than the boundary is worth. Files land near the target rather than on
-    it, which is the tolerance `runs()` already works within — and a file at the
-    target forms a run of one there, so landing near it is what keeps these
-    files out of compaction rather than merely close to a number.
-
-    A single row larger than the whole budget still becomes a file of one row.
-    That is deliberate — the alternative is a loop that cannot advance.
-    """
-    held: list[pa.RecordBatch] = []
-    measured = 0
-    counted = 0
-    for batch in reader:
-        if not batch.num_rows:
-            continue
-
-        per_row = max(1, batch.nbytes // batch.num_rows)
-        cursor = 0
-        while cursor < batch.num_rows:
-            take = batch.num_rows - cursor
-            if row_cap is not None:
-                take = min(take, row_cap - counted)
-
-            take = min(take, max(1, (size - measured) // per_row))
-            piece = batch.slice(cursor, take)
-            held.append(piece)
-            measured += per_row * piece.num_rows
-            counted += piece.num_rows
-            cursor += take
-            if measured >= size or (row_cap is not None and counted >= row_cap):
-                yield pa.Table.from_batches(held, schema=reader.schema)
-                held, measured, counted = [], 0, 0
-
-    if held:
-        yield pa.Table.from_batches(held, schema=reader.schema)
 
 
 @dataclass(frozen=True)
@@ -2605,14 +2557,15 @@ class WriteHandle(LocalReadHandle):
         unflushed tail, or a push that raised after the load had landed. Until
         they meet, the corpus you loaded from is the range's second copy.
 
-        Files come out sized at `target_compact_size` and sorted by `sort_by`,
-        which is what makes them indistinguishable from a compacted file and so
-        born past the maintenance lifecycle: `runs()` closes a run when the next
-        file would exceed the budget, so a file already at it forms a run of
-        one, and `_merge` rewrites only at `compact_min_files`. Sorted WITHIN a
-        file, like a seal's output — offsets are materialised in input order and
-        then permuted by the sort, so the range stays dense while the rows move.
-        "Sorted" and "contiguous" are claims about two different columns.
+        Files come out at `target_compact_size` on disk, written a row group
+        at a time and each row group sorted by `sort_by`, which is what makes
+        them indistinguishable from a compacted file and so born past the
+        maintenance lifecycle: `runs()` closes a run when the next file would
+        exceed the budget, so a file already at it forms a run of one, and
+        `_merge` rewrites only at `compact_min_files`. Sorted WITHIN a row
+        group, as compaction sorts — offsets are materialised in input order
+        and then permuted by the sort, so the range stays dense while the rows
+        move. "Sorted" and "contiguous" are claims about two different columns.
 
         **A load that fails leaves a hole, and that is the accepted cost.** The
         offsets of the reservation being written when it failed are gone; §6
@@ -2681,8 +2634,9 @@ class WriteHandle(LocalReadHandle):
                 # they stay small there for ever. Merging them in staging first
                 # collapses that to the one file a run genuinely cannot fill.
                 # Measured on five small seals: six undersized objects pushed
-                # without this, one with it.
-                self.compact()
+                # without this, one with it. Flushed with the push, so a tail
+                # still filling is merged before it goes too.
+                self.compact(flush=flush)
                 self.publish(flush=flush)
             except Exception as exc:
                 # The LOAD succeeded and its rows are durable in Parquet; only
@@ -2758,13 +2712,14 @@ class WriteHandle(LocalReadHandle):
     ) -> tuple[int, int] | None:
         """The loop: reserve, materialise, sort, write, register in batches.
 
-        **A reservation per output file, not one for the load.** `reserve(n)`
+        **A reservation per row group, not one for the load.** `reserve(n)`
         needs `n` up front and a `RecordBatchReader` cannot say how many rows it
         has; materialising to find out is bounded by memory and defeats the
-        point at 160M rows. Consuming to a file's worth and reserving exactly
-        that many keeps memory at one file, needs no branch between a Table and
-        a reader, and leaves a stream that dies half way with N complete files
-        registered and one reservation lost rather than one enormous one.
+        point at 160M rows. Consuming a row group's worth and reserving exactly
+        that many keeps memory at one row group, needs no branch between a
+        Table and a reader, and leaves a stream that dies half way with N
+        complete files registered and the open file's reservations lost rather
+        than one enormous one.
 
         Ranges stay contiguous with nothing computing or checking it: sequential
         reserves are adjacent, because `reserve` reads and advances one counter.
@@ -2783,12 +2738,13 @@ class WriteHandle(LocalReadHandle):
         config = self.config
         order = self._buffer.sort_by()
         offset_field = shape.table.field(0)
-        # The load's `[first, last)`.
-        first: int | None = None
-        last: int | None = None
-        staged: list[tuple[str, int, int, int]] = []
-        try:
-            for chunk in _chunks(reader, config.compact_size, config.compact_rows):
+        cap = config.target_compact_rows
+
+        def prepared() -> Iterator[tuple[pa.Table, int, int]]:
+            """Each row group's worth: shaped, reserved, numbered, sorted."""
+            for chunk in chunks(
+                reader, reader.schema, config.target_row_group_size, cap
+            ):
                 rows = chunk.select(shape.columns).cast(shape.schema)
                 # Before the reservation, which is what makes a refusal free:
                 # after it, the chunk's offsets are a permanent hole.
@@ -2800,22 +2756,52 @@ class WriteHandle(LocalReadHandle):
                 if order:
                     rows = rows.sort_by([(c, "ascending") for c in order])
 
-                rel_path = self._layout.ingest_path(start, end, uuid.uuid4().hex[:8])
+                yield rows, start, end
+
+        # The load's `[first, last)`.
+        first: int | None = None
+        last: int | None = None
+        staged: list[tuple[str, int, int, int]] = []
+        groups = prepared()
+        try:
+            group = next(groups, None)
+            while group is not None:
+                rows, start, end = group
+                rel_path = self._layout.ingest_path(start, uuid.uuid4().hex[:8])
                 # I2: the path is in SQLite before the bytes are on disk, so a
                 # crash before the commit leaves a file recovery can name rather
                 # than one only a directory scan could find. `claim_output`
-                # rather than `claim_seal` — see `INGEST_ROLE`.
+                # rather than `claim_seal` — see `INGEST_ROLE`. The range is
+                # the first row group's, because the file's end is not known
+                # until it closes; recovery reads only the path.
                 self._buffer.claim_output(start, end, rel_path)
                 dest = self._layout.absolute(rel_path)
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                write_parquet(rows, dest, config.compression)
-                staged.append((rel_path, start, end, rows.nbytes))
+                held = 0
+                counted = 0
+                with stream_parquet(dest, rows.schema, config.compression) as write:
+                    while group is not None:
+                        rows, _, end = group
+                        size = write(rows)
+                        held += rows.nbytes
+                        counted += rows.num_rows
+                        # `DEFAULT_TTL_MS` is 30 s and this path is sized in
+                        # hours, so without a renew per row group the exclusion
+                        # evaporates while the first file is still being written.
+                        checkpoint(lease.renew)
+                        group = next(groups, None)
+                        # The file closes at the target on disk, or before the
+                        # next row group would carry it past the row ceiling.
+                        if size >= config.compact_size or (
+                            cap is not None
+                            and group is not None
+                            and counted + group[0].num_rows > cap
+                        ):
+                            break
+
+                staged.append((rel_path, start, end, held))
                 first = start if first is None else first
                 last = end
-                # `DEFAULT_TTL_MS` is 30 s and this path is sized in hours, so
-                # without a renew per file the exclusion evaporates during the
-                # first `pq.write_table`.
-                checkpoint(lease.renew)
                 if len(staged) >= _INGEST_BATCH:
                     self._commit_staged(staged, lease)
                     staged = []
@@ -2866,10 +2852,8 @@ class WriteHandle(LocalReadHandle):
             raise RuntimeError(msg)
 
         for rel_path, start, end, held in staged:
-            # What the file holds UNCOMPRESSED, which is the currency
-            # `target_compact_size` and every `extent.bytes` are stated in —
-            # never its size on disk, which on data that compresses 8:1 would
-            # have compaction merge eight already-full files into one.
+            # What the file holds UNCOMPRESSED, which is the currency every
+            # `extent.bytes` is stated in.
             #
             # Arrow's own accounting rather than the appender's estimate,
             # which models the same layout and stays at or a little above it
@@ -3496,8 +3480,7 @@ class WriteHandle(LocalReadHandle):
             head,
             config.compact_size,
             config.compact_min_files,
-            self._maintenance.memory(),
-            config.compact_rows,
+            config.target_compact_rows,
         )
 
     def _push(
@@ -3650,9 +3633,6 @@ class WriteHandle(LocalReadHandle):
                 # walk is bounded — and the watermark covers those already.
                 self._buffer.forget_intent(path)
 
-        # Bound once, so `stable_prefix` and the intents below size files by
-        # the same policy.
-        config = self.config
         memory = self._maintenance.memory()
         pending = [f for f in self._table.data_files() if f.end > floor]
         # `stable_prefix` holds a file back when compaction might still merge
@@ -3723,7 +3703,7 @@ class WriteHandle(LocalReadHandle):
                 published.uri(rel_path),
                 data_file.start,
                 data_file.end,
-                memory.get(data_file.path, config.compact_size),
+                memory.get(data_file.path, data_file.size),
             )
             published.put(self._layout.absolute(rel_path), rel_path)
             uploaded.append((data_file, rel_path))
@@ -3842,15 +3822,17 @@ class WriteHandle(LocalReadHandle):
         §6, §8, §12).
 
         `flush=True` pushes everything through, regardless of thresholds: it
-        passes `flush` to `seal` and `publish`, so every buffered row is sealed
-        and every staging file published in this pass — at shutdown, say, to
+        passes `flush` to `seal`, `compact` and `publish`, so every buffered row
+        is sealed, the trailing run merged, and every staging file published in
+        this pass — at shutdown, say, to
         get everything off this machine. The cost is undersized files, in
         staging and in the published table, where they stay.
 
         Data moves first, then cleanup follows behind it:
 
         1. `seal` — buffer to staging;
-        2. `compact` — merges a run once it has `compact_min_files` files;
+        2. `compact` — merges a run once it is closed and has
+           `compact_min_files` files;
         3. `publish` — staging to published, the files compaction is done with;
         4. `evict("buffer")` — rows the next durable copy holds;
         5. `evict("staging")` — files the published table holds, in the same
@@ -3886,7 +3868,7 @@ class WriteHandle(LocalReadHandle):
         # ready and `publish` only takes what compaction is finished with, so
         # a file sealed a moment ago is never touched before its time.
         self.seal(flush=flush)
-        self.compact()
+        self.compact(flush=flush)
 
         # Held, not raised, so the local steps still run on a machine that
         # cannot reach a remote published table (§11).
@@ -3915,8 +3897,13 @@ class WriteHandle(LocalReadHandle):
         self.reclaim("published")
         self.sweep("published")
 
-    def compact(self) -> None:
+    def compact(self, *, flush: bool = False) -> None:
         """Merge undersized staging files into `target_compact_size` ones (§6).
+
+        A run is merged once it is closed: the next file would take it past the
+        target, or it has reached it. The trailing run waits for the files
+        still to come, so each row is compacted once. `flush=True` merges the
+        trailing run too, for a log about to publish everything it holds.
 
         The heavy step of `advance`: it reads and rewrites whole files, while
         eviction and expiry are metadata commits that finish in milliseconds,
@@ -3931,7 +3918,7 @@ class WriteHandle(LocalReadHandle):
         `target_compact_size` — leave a few smaller files, which stay as they
         were written.
         """
-        self._maintenance.compact()
+        self._maintenance.compact(flush=flush)
 
     def evict(
         self,
@@ -4376,23 +4363,26 @@ def validate(
         )
         raise ValueError(msg)
 
-    if config.compact_size < config.target_seal_size:
+    if config.compact_size < 1:
+        msg = f"target_compact_size must be at least 1: {config.compact_size}"
+        raise ValueError(msg)
+
+    if config.target_row_group_size < 1:
         msg = (
-            f"target_compact_size ({config.compact_size}) must be at least "
-            f"target_seal_size ({config.target_seal_size}): compaction converts "
-            "sealed files into larger ones, and a smaller target would ask it "
-            "to shrink a file it just merged, for ever"
+            f"target_row_group_size must be at least 1: {config.target_row_group_size}"
         )
         raise ValueError(msg)
 
     if (
-        config.compact_rows is not None
+        config.target_compact_rows is not None
         and config.target_seal_rows is not None
-        and config.compact_rows < config.target_seal_rows
+        and config.target_compact_rows < config.target_seal_rows
     ):
         msg = (
-            f"target_compact_rows ({config.compact_rows}) must be at least "
-            f"target_seal_rows ({config.target_seal_rows}), for the same reason"
+            f"target_compact_rows ({config.target_compact_rows}) must be at "
+            f"least target_seal_rows ({config.target_seal_rows}): compaction "
+            "converts sealed files into larger ones, and under a lower ceiling "
+            "every sealed file is a run of its own, so nothing would ever merge"
         )
         raise ValueError(msg)
 

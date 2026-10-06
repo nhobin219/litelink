@@ -10,13 +10,14 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 from pyiceberg.catalog.sql import SqlCatalog
 
 import litelink
 import litelink._maintenance as maintenance
 from litelink._claim import EVERYTHING, Claim, new_owner
-from litelink._config import COMPACT_MULTIPLE
+from litelink._config import DEFAULT_COMPACT_SIZE
 from litelink._handle import LogConfig, WriteHandle, validate
 from litelink._layout import Layout
 from litelink._maintenance import _covered, runs, stable_prefix
@@ -38,6 +39,9 @@ def test_compaction_merges_adjacent_small_files(tmp_path: Path) -> None:
         seal_files(log, 4)
         assert len(log._table.data_files()) == 4
 
+        # The trailing run is still open; flushed, it merges now.
+        log.compact(flush=True)
+
         log.advance()
 
         assert len(log._table.data_files()) == 1
@@ -57,21 +61,16 @@ def test_compaction_needs_compact_min_files(tmp_path: Path) -> None:
 
 
 def test_compaction_leaves_full_files_alone(tmp_path: Path) -> None:
-    """In normal operation compaction is a no-op.
+    """A file already at the target on disk forms a run of its own.
 
-    Every file here came from a cut the appender made at `target_seal_size`, so each
-    already holds what a file should. Merging any two would produce one holding
-    twice that. The rule that decides this reads what the files hold in memory,
-    not their size on disk — these compress to a fraction of the target, and
-    judged that way every one of them looks starved.
+    A one-byte target, which every file exceeds, is what makes this test about
+    "already full" rather than about conversion. Under the default these files
+    WOULD merge — correctly, into one published-shaped file. See
+    `test_compaction_converts_sealed_files_into_larger_ones`.
     """
     config = LogConfig(
         target_seal_size=2048,
-        # Equal, which is what makes this test about "already full" rather than
-        # about conversion. The default is eight times the seal size, and under
-        # that these files WOULD merge — correctly, into one published-shaped
-        # file. See `test_compaction_converts_sealed_files_into_larger_ones`.
-        target_compact_size=2048,
+        target_compact_size=1,
         compact_min_files=2,
     )
     with open_log(tmp_path, config) as log:
@@ -96,6 +95,9 @@ def test_compaction_output_is_re_sorted(tmp_path: Path) -> None:
         for ts in (500, 100, 400, 200):
             log.append({"event_ts": ts, "key": "k", "payload": ""})
             log.seal(flush=True)
+
+        # The trailing run is still open; flushed, it merges now.
+        log.compact(flush=True)
 
         log.advance()
 
@@ -404,7 +406,9 @@ def test_no_data_file_is_untracked_through_a_full_lifecycle(tmp_path: Path) -> N
         seal_files(log, 4)
         assert_nothing_untracked(log)
 
-        log.advance()  # compacts; sources are superseded but not yet deletable
+        # Flushed, because the trailing run is still open. Compacts; the
+        # sources are superseded but not yet deletable.
+        log.compact(flush=True)
         on_disk = assert_nothing_untracked(log)
         assert len(on_disk) == 5, "4 sources awaiting deletion, plus the merge"
         assert len(log._buffer.queued_deletions()) == 4
@@ -445,9 +449,10 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
     config = LogConfig(target_seal_size=1 << 30, compact_min_files=2)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.advance()
+        # Flushed, because the trailing run is still open.
+        log.compact(flush=True)
         assert len(log._buffer.queued_deletions()) == 3
-        assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 4
+        assert len(list((tmp_path / "s" / "data").rglob("*.parquet"))) == 4
 
     # Reopen with a grace period short enough that the queue is due. The
     # deadline is evaluated against the CURRENT setting, not one frozen at
@@ -458,10 +463,12 @@ def test_queued_files_are_deleted_once_the_grace_period_passes(tmp_path: Path) -
         staging_snapshot_retention=timedelta(microseconds=1),
     )
     with open_log(tmp_path, impatient) as log:
+        # Staging's files only: `advance` also publishes the merged file,
+        # which lands under `published/`.
         log.advance()
 
         assert log._buffer.queued_deletions() == []
-        assert len(list(tmp_path.rglob("data/**/*.parquet"))) == 1
+        assert len(list((tmp_path / "s" / "data").rglob("*.parquet"))) == 1
         assert len(read_all(log)) == 12
 
 
@@ -608,81 +615,51 @@ def test_manifests_are_merged_rather_than_accumulated(tmp_path: Path) -> None:
         )
 
 
-def sized(*sizes: int) -> tuple[list[DataFile], dict[str, int]]:
-    """Files holding the given uncompressed sizes, adjacent and in order.
-
-    Sizes come as a separate mapping because that is how the real ones do: a
-    file's size on disk is what compression made of it, and what it holds in
-    memory is carried in the buffer beside it.
-    """
-    files, memory, offset = [], {}, 1
-    for size in sizes:
-        path = f"{offset}.parquet"
-        # A deliberately misleading on-disk size: every rule under test must
-        # read `memory`, and any that reaches for `size` gets a wrong answer.
-        files.append(DataFile(path=path, size=1, rows=1, start=offset, end=offset + 1))
-        memory[path] = size
-        offset += 1
-
-    return files, memory
+def sized(*sizes: int) -> list[DataFile]:
+    """Files of the given sizes on disk, adjacent and in order."""
+    return [
+        DataFile(
+            path=f"{offset}.parquet", size=size, rows=1, start=offset, end=offset + 1
+        )
+        for offset, size in enumerate(sizes, start=1)
+    ]
 
 
 def test_a_run_closes_before_it_exceeds_the_budget() -> None:
     """The output cap. Without it, a hundred files just under the line merge
     into one file a hundred times the target."""
-    files, memory = sized(30, 30, 30, 30, 30)
-    grouped = runs(files, 100, memory)
+    grouped = runs(sized(30, 30, 30, 30, 30), 100)
 
     assert [len(run) for run in grouped] == [3, 2]
-    assert all(sum(memory[f.path] for f in run) <= 100 for run in grouped)
+    assert all(sum(f.size for f in run) <= 100 for run in grouped)
 
 
 def test_a_file_over_the_budget_forms_its_own_run() -> None:
     """It has no room for a neighbour, so it must not drag one in."""
-    files, memory = sized(10, 500, 10)
-    grouped = runs(files, 100, memory)
+    grouped = runs(sized(10, 500, 10), 100)
 
-    assert [[memory[f.path] for f in run] for run in grouped] == [[10], [500], [10]]
-
-
-def test_an_unmeasured_file_counts_as_full() -> None:
-    """Unknown is not zero.
-
-    Treating an unrecorded size as small is what pulls an already-correct file
-    into a rewrite; the cost of leaving it alone is only a merge that did not
-    happen.
-    """
-    files, memory = sized(10, 10, 10)
-    del memory[files[1].path]
-
-    assert [len(run) for run in runs(files, 100, memory)] == [1, 1, 1]
+    assert [[f.size for f in run] for run in grouped] == [[10], [500], [10]]
 
 
 def test_the_trailing_run_is_never_settled() -> None:
     """It is under budget, so a file that has not been written yet can still
-    join it — pushing it now would published table something compaction will replace.
+    join it — pushing it now would publish something compaction will replace.
 
     Two files short of `min_files`, so compaction leaves them alone today; it
     is room in the budget, not the merge, that makes them unsettled.
     """
-    files, memory = sized(60, 60, 20)
-
-    assert stable_prefix(files, 100, 3, memory) == 1
+    assert stable_prefix(sized(60, 60, 20), 100, 3) == 1
 
 
 def test_a_full_trailing_run_is_settled() -> None:
     """Nothing more fits, so nothing can change it."""
-    files, memory = sized(60, 60, 100)
-
-    assert stable_prefix(files, 100, 2, memory) == 3
+    assert stable_prefix(sized(60, 60, 100), 100, 2) == 3
 
 
 def test_nothing_before_a_mergeable_run_is_settled() -> None:
     """Compaction is about to rewrite it, and the watermark is a prefix, so the
     files ahead of it cannot be published past it either."""
-    files, memory = sized(200, 200, 10, 10, 10)
-
-    assert stable_prefix(files, 100, 2, memory) == 2
+    assert stable_prefix(sized(200, 200, 10, 10, 10), 100, 2) == 2
 
 
 def test_a_stranded_small_file_is_still_settled() -> None:
@@ -690,26 +667,7 @@ def test_a_stranded_small_file_is_still_settled() -> None:
     forever. A small file between larger neighbours can never be merged — no
     run containing it fits the budget — so waiting for it to grow waits
     forever, and the watermark never advances past it again."""
-    files, memory = sized(98, 5, 98, 200)
-
-    assert stable_prefix(files, 100, 2, memory) == 4
-
-
-def test_sizing_does_not_depend_on_how_well_the_data_compressed() -> None:
-    """What the on-disk rule got wrong.
-
-    These files each hold a full target's worth of rows and compressed to an
-    eighth of it. Judged by their size on disk they all look starved, and
-    compaction merged eight at a time into a file holding eight times the
-    memory the target allows — while `publish`, asking whether a file had reached
-    half the target, found none and left the published table empty. Judged by what they
-    hold, each is already full: nothing to merge, everything archivable.
-    """
-    target = 64 * 1024
-    files, memory = sized(*([target] * 24))
-
-    assert runs(files, target, memory) == [[f] for f in files], "each already full"
-    assert stable_prefix(files, target, 2, memory) == 24
+    assert stable_prefix(sized(98, 5, 98, 200), 100, 2) == 4
 
 
 def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> None:
@@ -833,17 +791,12 @@ def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
 
 
 def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> None:
-    """The job the split gives it.
-
-    With one size knob a compacted file held exactly what a sealed file held,
-    so compaction could repair an undersized file and never produce a large
-    one — which is why it was a no-op in normal operation. Separating the two
-    makes it a conversion stage: seal at the size a hot read wants to scan,
-    compact at the size object storage wants to receive.
-    """
+    """The job the split gives it: seal at the size a hot read wants to scan,
+    compact to the size object storage wants to receive — on disk, where the
+    target is stated."""
     config = LogConfig(
         target_seal_size=4096,
-        target_compact_size=4 * 4096,
+        target_compact_size=1 << 30,
         compact_min_files=2,
         staging_snapshot_retention=timedelta(0),
     )
@@ -851,21 +804,64 @@ def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> No
         log.extend(rows(1200))
         log.seal()
         sealed = log._table.data_files()
-        held = log._maintenance.memory()
-        assert len(sealed) >= 4, "several full seals to convert"
-        assert all(held[f.path] <= 4096 * 1.5 for f in sealed), "seal-sized"
+        assert len(sealed) >= 6, "several full seals to convert"
 
+        # Room for about three seals per file, on disk.
+        target = 3 * max(f.size for f in sealed)
+        log.set_config(replace(config, target_compact_size=target))
         log.advance()
 
         compacted = log._table.data_files()
-        after = log._maintenance.memory()
         assert len(compacted) < len(sealed), "compaction must merge"
-        assert max(after[f.path] for f in compacted) > 4096, (
-            "a compacted file must hold more than a sealed one"
+        assert max(f.size for f in compacted) > max(f.size for f in sealed), (
+            "a compacted file must be larger than a sealed one"
         )
-        assert all(after[f.path] <= 4 * 4096 for f in compacted), (
-            "and no more than the compaction target"
+        assert all(f.size <= target for f in compacted), (
+            "and no larger than the compaction target"
         )
+        assert log.scan().read_all().num_rows == 1200
+
+
+def test_compaction_streams_a_row_group_at_a_time(tmp_path: Path) -> None:
+    """`target_row_group_size` is what compaction holds and sorts, not the
+    file: each row group is sorted by `sort_by` on its own and covers a narrow
+    slice of offsets, while the file as a whole is not re-sorted."""
+    config = LogConfig(
+        target_seal_size=4096,
+        target_row_group_size=8192,
+        compact_min_files=2,
+        staging_snapshot_retention=timedelta(0),
+    )
+    with litelink.new(
+        tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=config
+    ) as log:
+        # Timestamps that fall as offsets rise, so a sort is visible.
+        log.extend(
+            [
+                {"event_ts": 10_000 - i, "key": "k", "payload": "x" * 20}
+                for i in range(1200)
+            ]
+        )
+        log.seal()
+        assert len(log._table.data_files()) >= 4
+
+        # The trailing run is still open; flushed, it merges now.
+        log.compact(flush=True)
+
+        log.advance()
+
+        (merged,) = log._table.data_files()
+        parquet = pq.ParquetFile(merged.path)
+        assert parquet.metadata.num_row_groups > 1, "one row group per 8 KiB"
+        previous_high = -1
+        for g in range(parquet.metadata.num_row_groups):
+            group = parquet.read_row_group(g)
+            stamps = group["event_ts"].to_pylist()
+            offsets = group["litelink_offset"].to_pylist()
+            assert stamps == sorted(stamps), "each row group sorted by sort_by"
+            assert min(offsets) > previous_high, "row groups follow offset order"
+            previous_high = max(offsets)
+
         assert log.scan().read_all().num_rows == 1200
 
 
@@ -882,7 +878,6 @@ def test_only_compacted_files_are_eligible_for_the_published_table(
     """
     config = LogConfig(
         target_seal_size=4096,
-        target_compact_size=8 * 4096,
         compact_min_files=2,
         staging_snapshot_retention=timedelta(0),
     )
@@ -890,14 +885,12 @@ def test_only_compacted_files_are_eligible_for_the_published_table(
         log.extend(rows(200))
         log.seal()
         sealed = log._table.data_files()
-        memory = log._maintenance.memory()
 
         settled = stable_prefix(
             sealed,
             config.compact_size,
             config.compact_min_files,
-            memory,
-            config.compact_rows,
+            config.target_compact_rows,
         )
 
         assert settled == 0, (
@@ -905,19 +898,15 @@ def test_only_compacted_files_are_eligible_for_the_published_table(
         )
 
 
-def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
-    tmp_path: Path,
-) -> None:
+def test_the_compaction_target_defaults_to_iceberg_s(tmp_path: Path) -> None:
     """Conversion is on by default, including with no published table.
 
     File count is a read cost locally too: every file a query cannot prune is
-    opened, which a wide scan pays per file. A local-only log gets that benefit
-    too, which is why the default is a multiple rather than "same as the seal,
-    convert nothing".
+    opened, which a wide scan pays per file.
     """
     config = LogConfig(target_seal_size=4096, compact_min_files=2)
 
-    assert config.compact_size == 4096 * COMPACT_MULTIPLE
+    assert config.compact_size == DEFAULT_COMPACT_SIZE == 512 * 1024 * 1024
 
     with open_log(
         tmp_path, replace(config, staging_snapshot_retention=timedelta(0))
@@ -927,6 +916,9 @@ def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
         before = len(log._table.data_files())
         assert before >= 4
 
+        # The trailing run is still open; flushed, it merges now.
+        log.compact(flush=True)
+
         log.advance()
 
         assert len(log._table.data_files()) < before, (
@@ -935,24 +927,16 @@ def test_the_compaction_target_defaults_to_a_multiple_of_the_seal(
         assert log.scan().read_all().num_rows == 1200
 
 
-def test_row_ceilings_scale_with_the_conversion_too() -> None:
-    """Setting only the seal's row limit must not cap conversion at one seal.
-
-    A ceiling that did not scale would make `compact_rows` equal
-    `target_seal_rows`, so every sealed file would already be at it and nothing
-    would ever merge — the conversion silently off for anyone who set a row
-    limit.
-    """
-    assert LogConfig(target_seal_size=4096, target_seal_rows=100).compact_rows == (
-        100 * COMPACT_MULTIPLE
-    )
-    assert LogConfig(target_seal_size=4096).compact_rows is None
+def test_a_row_ceiling_under_the_seal_s_is_refused() -> None:
+    """Every sealed file would be a run of its own, so nothing would merge."""
+    config = LogConfig(target_seal_rows=100, target_compact_rows=50)
+    with pytest.raises(ValueError, match="target_compact_rows"):
+        validate(SCHEMA, (), config, None)
 
 
-def test_a_compaction_target_under_the_seal_size_is_refused() -> None:
-    """It would ask compaction to shrink a file it just merged, for ever."""
-    config = LogConfig(target_seal_size=8192, target_compact_size=4096)
-    with pytest.raises(ValueError, match="target_compact_size"):
+def test_an_empty_row_group_size_is_refused() -> None:
+    config = LogConfig(target_row_group_size=0)
+    with pytest.raises(ValueError, match="target_row_group_size"):
         validate(SCHEMA, (), config, None)
 
 
@@ -977,7 +961,7 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         before = len(log._table.data_files())
         assert before >= 4
 
-        log.compact()
+        log.compact(flush=True)
         converted = len(log._table.data_files())
         assert converted < before, "compaction must run on its own"
 
@@ -1014,7 +998,7 @@ def test_a_pass_defers_to_a_claim_over_the_range_it_wanted(tmp_path: Path) -> No
         assert held.acquire()
 
         try:
-            log.compact()
+            log.compact(flush=True)
 
             assert len(log._table.data_files()) == before, (
                 "compacted a range another owner had claimed"
@@ -1022,7 +1006,7 @@ def test_a_pass_defers_to_a_claim_over_the_range_it_wanted(tmp_path: Path) -> No
         finally:
             held.release()
 
-        log.compact()
+        log.compact(flush=True)
 
         assert len(log._table.data_files()) < before, "did not compact once free"
 
@@ -1329,7 +1313,7 @@ def test_drain_needs_no_claim_and_still_keeps_what_is_referenced(
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
-        log.compact()
+        log.compact(flush=True)
         live = log._table.data_files()[0]
         # Queued with a stamp long past, while the current snapshot names it:
         # what a compaction's recovery leaves when the commit had in fact
@@ -1664,7 +1648,7 @@ def test_the_deletion_grace_starts_at_the_commit(tmp_path: Path) -> None:
 
         assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
 
-        log.compact()
+        log.compact(flush=True)
 
         # After the merge that superseded them, the clock reads from now.
         overdue = log._buffer.due_deletions(stale + 1)

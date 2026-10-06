@@ -355,8 +355,9 @@ therefore understated: **182,801 rows/s through the buffer against 5,103,266 row
 Arrow straight out.**
 
 Parquet-to-Arrow is yours: hand it `pq.ParquetFile(path).iter_batches()` or a `pa.Table`.
-Memory is bounded at one output file either way. Files come out sorted by `sort_by` and sized
-at `target_compact_size`, so maintenance never has to touch them.
+Memory is bounded at one row group either way: files are written `target_row_group_size` at a
+time, each row group sorted by `sort_by`, and close at `target_compact_size` on disk, so
+maintenance never has to touch them.
 
 **It refuses concurrency rather than surviving it.** The whole log is claimed for the whole
 load, and every acknowledged row must already be in a file — call `seal()` and `await_seal()`
@@ -910,8 +911,9 @@ stay dense across the two, and any engine reads both as one sequence.
 ```python
 target_seal_size      int             = 8 MiB    uncompressed (Arrow) bytes per SEAL
 target_seal_rows      int | None      = None     the other ceiling; whichever is hit FIRST
-target_compact_size   int | None      = None     uncompressed (Arrow) bytes per FILE (None = 8x the seal)
-target_compact_rows   int | None      = None     rows per compacted file (None = 8x)
+target_compact_size   int | None      = None     bytes ON DISK per compacted FILE (None = 512 MiB)
+target_compact_rows   int | None      = None     rows per compacted file (None = no limit)
+target_row_group_size int             = 64 MiB   Arrow bytes compaction sorts and holds at once
 staging_retention     timedelta|None  = None     staging window by TIME (None keeps everything)
 staging_rows          int | None      = None     staging window by ROWS — a floor, not a ceiling
 staging_snapshot_retention    timedelta = 15 min   how long the staging table's expired snapshots survive
@@ -923,13 +925,14 @@ vacuum_free_ratio     float | None    = None     reclaim buffer dead space at th
 compression           str             = "zstd"   Parquet codec: none | snappy | gzip | zstd
 ```
 
-Frozen dataclass, with `to_json`/`from_json` and two derived properties, `compact_size` and
-`compact_rows`. `sort_by` is deliberately not in here — everything above governs future work
-only, so `set_config` needs no rewrite.
+Frozen dataclass, with `to_json`/`from_json` and one derived property, `compact_size`.
+`sort_by` is deliberately not in here — everything above governs future work only, so
+`set_config` needs no rewrite.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
-construction: `compact_min_files` below 2, a compact size below the seal size, `wal_retention`
-without `wal_replication`, `wal_replication` without an s3:// published table, a `vacuum_free_ratio` outside
+construction: `compact_min_files` below 2, a `target_compact_rows` below `target_seal_rows`, a
+`target_row_group_size` below 1, `wal_retention` without `wal_replication`, `wal_replication`
+without an s3:// published table, a `vacuum_free_ratio` outside
 `[0, 1]`, and a `compression` this build cannot write are each refused.
 
 **`vacuum_free_ratio` is about what a RESTORE pays.** SQLite puts pages freed by a delete on a
