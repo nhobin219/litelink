@@ -2747,8 +2747,14 @@ def test_a_disk_cached_connection_shares_published_reads_by_key(
     table's blocks on disk, and a later connection with the same key — another
     process, in production — reuses them rather than fetching from S3.
 
-    Falsify by not calling `install_read_cache` from `duckdb_connection`: no
-    directory is filled.
+    Asked of S3, not of the cache directory: the requests each reader makes for
+    data files, from DuckDB's HTTP log. The query reads the data — a `count(*)`
+    is answered from Iceberg metadata and opens no data file at all — and a
+    count of cached files is a statement about how the cache lays out blocks,
+    not about whether a reader fetched them.
+
+    Falsify by not calling `install_read_cache` from `duckdb_connection`: the
+    second reader fetches every data file again.
     """
     root = tmp_path / "log"
     with published_log(
@@ -2758,36 +2764,36 @@ def test_a_disk_cached_connection_shares_published_reads_by_key(
         log.advance(flush=True)
         metadata = log._published.require().metadata_location  # noqa: SLF001
 
-    def cached(key: str) -> int:
-        return sum(
-            len(files)
-            for _, _, files in os.walk(isolated_read_cache / "litelink" / key)
-        )
+    expected = sum(int(str(row["event_ts"])) for row in rows(ROWS))
 
-    def read(key: str) -> None:
+    def fetched(key: str) -> int:
+        """Data-file requests one reader with `key` made to S3."""
         connection = litelink.duckdb_connection(
             s3_options=s3, disk_cache=True, memory_cache=False, cache_key=key
         )
         try:
-            (count,) = connection.execute(
-                f"SELECT count(*) FROM iceberg_scan('{metadata}')"
+            connection.execute("CALL enable_logging('HTTP')")
+            (total,) = connection.execute(
+                f"SELECT sum(event_ts) FROM iceberg_scan('{metadata}')"
             ).fetchone() or (0,)
-            assert count == ROWS
+            assert total == expected
+            (requests,) = connection.execute(
+                "SELECT count(*) FROM duckdb_logs_parsed('HTTP')"
+                " WHERE request.url LIKE '%.parquet'"
+            ).fetchone() or (0,)
         finally:
             connection.close()
 
-    # An empty key's directory fills: the reads went through the cache.
-    read("stream-1")
-    filled = cached("stream-1")
-    assert filled > 0, "a published read cached nothing"
+        return int(requests)
 
-    # The same key again adds nothing: every block was already there.
-    read("stream-1")
-    assert cached("stream-1") == filled, "the second reader fetched blocks again"
+    assert fetched("stream-1") > 0, "the first reader must fetch the data"
+    assert (isolated_read_cache / "litelink" / "stream-1").exists()
 
-    # The control: another key fills its own.
-    read("stream-2")
-    assert cached("stream-2") == filled
+    # The same key again: every block is on disk already.
+    assert fetched("stream-1") == 0, "the second reader fetched data again"
+
+    # The control: another key fetches for itself.
+    assert fetched("stream-2") > 0
 
 
 def test_a_disk_cached_reader_sees_new_publishes_through_current_metadata(
