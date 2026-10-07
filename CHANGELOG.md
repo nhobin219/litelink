@@ -67,6 +67,13 @@ with `flush` and compacts without it.
 
 ### Added
 
+- **`restore` brings the published table's tail back into staging** (#166).
+  The files after the last one at `target_compact_size` — seals a flushed
+  publish pushed early, an in-progress file uploaded unfinished — return as
+  recompaction candidates under their published paths, so the restored log
+  merges and swaps them as the dead machine would have, rather than leaving
+  them small for good. One download of at most about one target per log.
+
 - **A flushed publish no longer leaves small files in the published table
   for good** (#160). What `publish(flush=True)`, `advance(flush=True)` or
   `ingest`'s tail pushes before compaction is done with it stays a

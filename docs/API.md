@@ -182,6 +182,12 @@ detected — if the primary is alive you now have two writers on one published t
   machine had buffered or sealed but not published are gone. A replica that exists but cannot be
   reached (a missing bucket, refused credentials) raises rather than falling back, and the
   fallback logs a warning saying what it did.
+- **Either way, the published table's tail comes back into staging** (#166): the files after
+  its last one at `target_compact_size`, which the dead machine's compaction was still working
+  on — seals a flushed publish pushed early, an in-progress file uploaded unfinished. They return
+  as recompaction candidates under their published paths, so the restored log merges them and
+  swaps the result in, instead of leaving them small for good. The cost is one download of at
+  most about one target per log, once.
 
 **The shape comes from whatever records it exactly; you supply what nothing does.**
 

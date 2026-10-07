@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from pyiceberg.exceptions import TableAlreadyExistsError
 
 from litelink._buffer import (
@@ -46,7 +47,7 @@ from litelink._buffer import (
 )
 from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import LogConfig
-from litelink._fs import stream_parquet, write_parquet
+from litelink._fs import fsync, stream_parquet, write_parquet
 from litelink._layout import Layout, is_remote, validate_published
 from litelink._maintenance import (
     CONFIG_KEY,
@@ -2147,6 +2148,7 @@ class WriteHandle(LocalReadHandle):
         # rather than the window the log records, and RUNTIME presents this
         # file as the one an operator then runs the sidecar against.
         log.write_replication_config()
+        log._restore_tail()  # noqa: SLF001
 
         # DERIVED from the highest offset anything still holds, not from
         # `resumed` minus the reserve. A resumed restore reserves twice, so
@@ -2290,6 +2292,8 @@ class WriteHandle(LocalReadHandle):
             )
             raise RuntimeError(msg)
 
+        log._restore_tail()  # noqa: SLF001
+
         log._restored_from = _Recovery(  # noqa: SLF001
             recovered=0,
             resumed_at=first,
@@ -2299,6 +2303,75 @@ class WriteHandle(LocalReadHandle):
         return log
 
     # -- settings ----------------------------------------------------------
+
+    def _restore_tail(self) -> None:
+        """Bring the published table's tail back into staging, so compaction
+        finishes what it was doing when the old machine went (#166).
+
+        A restore rebuilds staging empty. The files compaction was still
+        working on — a flushed publish's early seals (#160), an in-progress
+        file uploaded before it was finished — are published, so nothing is
+        lost; but with no local copy nothing could merge them, and they would
+        stay in the published table at that size for good. So they come back:
+        the published files after the last one at `target_compact_size`, under
+        the same paths. They are under the watermark and not settled, so they
+        are recompaction candidates, exactly as on the machine that wrote
+        them: compaction folds them into an in-progress file, eviction keeps
+        them until then, and `publish` swaps the merged file in for them,
+        matching by path.
+
+        **Only the tail.** A small file between full ones was final already.
+        The tail is bounded by about one target, so this is at most that much
+        download per log, once.
+
+        **Ordered as a seal is** (I2): each path is claimed before its bytes
+        exist, so a crash mid-download leaves a file recovery can name, and the
+        whole tail registers in one staging commit. The watermark is raised to
+        the published table's span first: a replica's record of it can be
+        older, and these files must read as published from the start.
+        """
+        published = self._published.table()
+        if published is None:
+            return
+
+        published.reload()
+        files = published.data_files()
+        covered = published.span()
+        if not files or covered is None:
+            return
+
+        target = self.config.compact_size
+        full = [index for index, f in enumerate(files) if f.size >= target]
+        tail = files[full[-1] + 1 :] if full else files
+        paths = [published.relative(f.path) for f in tail]
+        if not tail or None in paths:
+            # Nothing undersized, or a file this log did not write there: its
+            # path would not be this log's, and the swap matches by path.
+            return
+
+        self._buffer.confirm_published(covered[1] - 1)
+        restored: list[tuple[str, DataFile]] = []
+        for data_file, rel_path in zip(tail, paths, strict=True):
+            assert rel_path is not None
+            self._buffer.claim_output(data_file.start, data_file.end, rel_path)
+            dest = self._layout.absolute(rel_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            published.get(data_file.path, dest)
+            fsync(dest)
+            restored.append((rel_path, data_file))
+
+        self._table.register(
+            [str(self._layout.absolute(rel_path)) for rel_path, _ in restored],
+            end=restored[-1][1].end,
+            start=restored[0][1].start,
+        )
+        for rel_path, data_file in restored:
+            meta = pq.ParquetFile(self._layout.absolute(rel_path)).metadata
+            held = sum(
+                meta.row_group(g).total_byte_size for g in range(meta.num_row_groups)
+            )
+            self._buffer.record_file(rel_path, data_file.start, data_file.end, held)
+            self._buffer.clear_compaction(rel_path)
 
     @property
     def _schema(self) -> pa.Schema:
@@ -3748,9 +3821,11 @@ class WriteHandle(LocalReadHandle):
 
         **Only what lines up.** The published files the swap replaces are the
         ones overlapping the merged file's range, and every one of them must
-        lie inside it, from its start, without a gap: the merged file holds
-        exactly their rows plus, for a straddler, the ones above the floor. A
-        file that does not line up — cut by some other writer — is never
+        lie wholly inside it, so the commit's delete removes whole files and
+        nothing else: the merged file holds their rows plus, for a straddler,
+        the ones above the floor. Gaps between them are fine — offsets may skip
+        (a failed load, a restore's reserve), and a gap holds no row anywhere.
+        A file that does not line up — cut by some other writer — is never
         swapped; it is owed nothing, and its rows are published already.
 
         **Ordered like a push** (I2, §6): the intent before the upload, the
@@ -3785,11 +3860,9 @@ class WriteHandle(LocalReadHandle):
                 self._buffer.clear_swap(rel_path)
                 continue
 
-            aligned = bool(replaced) and replaced[0].start == merged.start
-            for before, after in itertools.pairwise(replaced):
-                aligned = aligned and before.end == after.start
-
-            if not aligned or replaced[-1].end > merged.end:
+            if not replaced or any(
+                f.start < merged.start or f.end > merged.end for f in replaced
+            ):
                 _log.warning(
                     "litelink: %s is not swapped into the published table: "
                     "the published files over [%d, %d) do not line up with it",
