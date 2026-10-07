@@ -3477,8 +3477,11 @@ class WriteHandle(LocalReadHandle):
         *,
         flush: bool = False,
         bound: int | None = None,
+        finish: bool = False,
     ) -> None:
         """Upload and register everything above the published table's span.
+        `finish` swaps in every merged file owed a swap, finished or not —
+        for `retire`, after which nothing will finish them.
 
         **`flush` pushes the trailing run too**, which `publish`
         otherwise holds back because compaction may still merge it. Holding it
@@ -3623,7 +3626,9 @@ class WriteHandle(LocalReadHandle):
         memory = self._maintenance.memory()
         # Swaps first: each can raise the floor, and what is pushed after them
         # starts there.
-        floor = self._swap_merged(published, lease, floor, memory, flush=flush)
+        floor = self._swap_merged(
+            published, lease, floor, memory, flush=flush, finish=finish
+        )
         pending = [f for f in self._table.data_files() if f.end > floor]
         # `_settled` holds a file back while compaction may still merge it, and
         # compaction's candidates are exactly the files past the same settled
@@ -3723,6 +3728,7 @@ class WriteHandle(LocalReadHandle):
         memory: dict[str, int],
         *,
         flush: bool = False,
+        finish: bool = False,
     ) -> int:
         """Swap merged staging files in for the published copies of their
         inputs (#160), returning the published floor after them.
@@ -3762,7 +3768,7 @@ class WriteHandle(LocalReadHandle):
             f
             for index, f in enumerate(files)
             if (self._layout.relative(f.path) in owed or f.start < floor < f.end)
-            and (index < unsettled or (flush and f.start < floor < f.end))
+            and (finish or index < unsettled or (flush and f.start < floor < f.end))
         ]
         if not candidates:
             return floor
@@ -4152,7 +4158,11 @@ class WriteHandle(LocalReadHandle):
            the final push;
         2. seal everything buffered;
         3. `publish(flush=True)`, which also releases the rows a
-           `wal_replication` seal was holding;
+           `wal_replication` seal was holding; then `compact(flush=True)`, which
+           folds every file not yet at the target into the in-progress file,
+           and a last push that swaps it in although it is unfinished (#162).
+           A retired log compacts no more, so without this its tail would stay
+           in the published table as the seals a flush pushed early;
         4. evict the whole staging table, and check nothing is left local;
         5. record the retirement on the published table (`litelink.retired`),
            so `restore` refuses whatever a replica says;
@@ -4194,6 +4204,20 @@ class WriteHandle(LocalReadHandle):
             self.await_seal()
 
         self.publish(flush=True)
+        # Everything is published now, so compaction may fold all of it into
+        # the in-progress file (`merges`), and the last push swaps that file in
+        # unfinished: nothing will ever finish it.
+        self.compact(flush=True)
+        lease, bound = self._publish_lease(flush=True)
+        if not lease.acquire():
+            msg = "another owner holds a claim over this range"
+            raise RuntimeError(msg)
+
+        try:
+            self._push(lease, self._published.uri, flush=True, bound=bound, finish=True)
+        finally:
+            lease.release()
+
         # Buffer first, while the staging files that prove the published
         # table holds those rows are still there to ask.
         self._maintenance.evict_buffer()

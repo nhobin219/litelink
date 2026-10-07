@@ -107,6 +107,10 @@ with `flush` and compacts without it.
   `advance(flush=True)` on an interval never uploads a growing file.
   `compact(flush=True)` grows the in-progress file without waiting for a
   step.
+- **`retire()` compacts its tail before it goes.** It publishes with
+  `flush`, folds every file not at the target into the in-progress file, and
+  swaps that in unfinished, so a retired log's published table ends with one
+  file under the target instead of the seals a flush pushed early.
 - **`advance(flush=True)` no longer flushes compaction**, and `ingest` no
   longer merges the trailing run before its flushed push: the seals go as
   they are and are swapped later (see Added), where merging them would make a

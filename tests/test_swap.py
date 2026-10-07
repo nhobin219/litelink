@@ -330,3 +330,31 @@ def test_a_log_that_stops_flushing_still_publishes(tmp_path: Path) -> None:
 
         assert log.published_through() > flushed, "publishing was never stuck"
         assert len(read_all(log)) == PASSES * PER_SEAL
+
+
+def test_retire_swaps_the_tail_in_although_it_is_unfinished(
+    tmp_path: Path,
+) -> None:
+    """A retired log compacts no more, so `retire` folds what a flush pushed
+    early into the in-progress file and swaps it in unfinished: the published
+    table ends with one tail file under the target, not the seals, for good."""
+    with sized_log(tmp_path) as log:
+        for index in range(1, 6):
+            seal(log, index)
+            log.advance(flush=True)
+
+        # Two more seals than the last finished file absorbed, pushed early.
+        for index in range(6, 8):
+            seal(log, index)
+            log.advance(flush=True)
+
+        log.retire()
+
+        *finished_files, tail = published_files(log)
+        target = log.config.compact_size
+        assert all(f.size >= target for f in finished_files), (
+            "only the last file is under the target"
+        )
+        assert tail.end == 8 * PER_SEAL + 1
+        assert log._table.span() is None, "nothing left local"
+        assert len(read_all(log)) == 8 * PER_SEAL
