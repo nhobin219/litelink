@@ -811,7 +811,7 @@ That refresh also forced a correction worth stating on its own: the policy now h
 owner. `WriteHandle` used to keep a copy beside `Maintenance`'s, with the buffer's seal target as a
 third, kept in step by `set_config` writing all three. Two copies is one too many the moment
 anything else can change the policy — refreshing one would leave compaction reading the new
-grouping while `publish` read the old, and `runs` is shared by exactly those two so that they
+grouping while `publish` read the old, and `stretches` is shared by exactly those two so that they
 cannot disagree about which files are still in play. And the refresh happens in
 compaction and in `publish` as well as in eviction, because the shipped topology runs those two
 as SEPARATE PROCESSES: refreshing in one place only keeps them in step within a process,
@@ -857,7 +857,7 @@ where the copy is.
 
 **And `publish` applies the same exclusion, or the two deadlock.** `stable_prefix` holds a file
 back when compaction might still merge it; compaction refuses to merge anything a published table
-holds. Those are one rule, and `runs` is shared between them precisely so they cannot
+holds. Those are one rule, and `stretches` is shared between them precisely so they cannot
 disagree — giving compaction a second input `stable_prefix` could not see was enough to
 break it. After a re-point to a fresh prefix the floor is 0, so files the old published table covers
 return to `pending`, group into a mergeable run under a raised target, and are held back for
@@ -1036,7 +1036,7 @@ decision binds the policy to a local first: fresh per decision, coherent within 
 
 Where a torn read would merely produce an odd file size it is harmless, because the policy
 is a POLICY — it decides how big to cut and when to merge, never which rows go where. The
-one place it could have been an invariant is `runs`, shared by compaction and `publish` so the
+one place it could have been an invariant is `stretches`, shared by compaction and `publish` so the
 two cannot disagree about what is in play, and the settled prefix closes that: compaction, `publish`
 and eviction all read the same one (`unsettled_from`).
 
@@ -1128,20 +1128,22 @@ Hand-written, because `rewrite_data_files` is a Spark procedure with no pyiceber
 equivalent.
 
 The table is unpartitioned (§13), so the compaction unit is a **contiguous offset range**. That
-works because sealed files already cover contiguous, non-overlapping ranges: pick adjacent
-files that together hold less than `target_compact_size`, and their combined range is itself
-contiguous.
+works because sealed files already cover contiguous, non-overlapping ranges: merge adjacent
+files, and their combined range is itself contiguous.
 
-**Files are sized on disk; memory is bounded by the row group.** A run is chosen by adding up
-its files' sizes on disk, from their manifest entries, until the next would pass
-`target_compact_size`. It is merged once it is **closed** — the next file would not fit, or it has
-reached the target — so the trailing run waits for the files still to come, and
-`compact(flush=True)` is what merges it early. **A merge's output is never an input again**: it
-counts as full whatever its size. Without that, every output would be merged again, because a merge
-compresses better than its inputs did — larger row groups — and lands under the target they filled:
-by about a third, measured on sealed files of synthetic ticks and order-book snapshots (#158). So
-each row is compacted exactly once, and a 512 MiB target gives files of about 350-370 MB on
-those streams; data that gains less from larger row groups lands closer to the target. The merge streams: it reads its
+**Files are sized on disk, and cut there.** A file is **full** once it is at
+`target_compact_size` on disk, from its manifest entry, whatever wrote it, and a full file is never
+merged again. The files between full ones form **stretches** (`stretches`); the last, if nothing
+full follows it, is **open** — the in-progress region (#162). Compaction keeps one **in-progress
+file** there and rewrites it with the seals that follow it every step — an eighth of the target —
+until it is full: the merge cuts it on the writer's own `tell()`, at an input boundary, and what
+remains starts the next in-progress file, in the same commit. A finished file therefore lands AT
+the target, overshooting by at most one row group, however much better the merge compressed than
+its inputs did (by about a third on sealed ticks and order-book snapshots, #158). A closed stretch
+— one a full file follows — never grows, and is merged once when it has `compact_min_files`
+files. The cost is local: eight rewrites of a growing file per finished one, about 4.5 writes per
+row, and nothing extra to object storage, because only a finished file is pushed or swapped
+(§5). The merge streams: it reads its
 inputs one at a time in offset order, gathers whole inputs up to `target_row_group_size`
 (default 64 MiB of Arrow), sorts that by `sort_by` and writes it as one row group. Peak memory
 is about 2.5× the row group, whatever the file's size — measured at 285 MB writing a 512 MB file
@@ -1154,10 +1156,10 @@ each row group keeps an offset or time range inside one or two row groups. Row g
 between inputs, never inside one that fits, so their offset ranges stay disjoint.
 
 ```
-1. Select adjacent files under target_compact_size on disk in total, spanning [start, end),
-   counting a previous merge's output as full; require compact_min_files and a closed run.
+1. Take a stretch of adjacent files under target_compact_size on disk: the open one once the
+   files after its first reach a step (target / 8), a closed one at compact_min_files.
 2. Stream them in offset order, target_row_group_size at a time; sort each by `sort_by` and
-   write it as one row group.
+   write it as one row group, cutting a new file at target_compact_size on disk, between inputs.
 3. Verify the row count and the offset extent against the sources.
 4. staging.overwrite(table, overwrite_filter=(offset >= start) & (offset < end))  -- one snapshot
 ```

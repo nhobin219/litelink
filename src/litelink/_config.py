@@ -24,9 +24,9 @@ from datetime import timedelta
 # requests to 4, and a full scan from 570-1,230 to 209-414, while every query
 # measured locally was within noise of the small files.
 #
-# Files land under it: a run is closed once its inputs fill it, and the merge
-# compresses better than they did — by about a third on sealed ticks and
-# order-book snapshots, where 512 MiB of seals merges into about 350-370 MB.
+# Files land AT it: compaction grows one in-progress file a step at a time and
+# cuts it on the writer's own `tell()` (#162), so a finished file overshoots by
+# at most one row group, however much better the merge compressed.
 #
 # What it costs is time in staging. `publish` takes only files compaction has
 # finished with, so a stream publishes in 512 MB steps: at 114 rows a second,

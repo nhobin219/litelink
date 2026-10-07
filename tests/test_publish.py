@@ -703,7 +703,7 @@ def test_the_published_hint_names_the_metadata_the_commit_produced(
         config=replace(
             LogConfig(),
             target_seal_size=8 * 1024,
-            target_compact_size=6 * 1024,  # about two seals on disk
+            target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
             compact_min_files=2,
         ),
         published=where,
@@ -746,7 +746,7 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         staging_rows=200,
     )
@@ -821,7 +821,7 @@ def test_a_register_without_its_rows_cannot_wedge_the_log(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
@@ -960,7 +960,7 @@ def test_a_healed_crash_raises_the_watermark_and_retires_the_intents(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
@@ -1015,7 +1015,7 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1077,7 +1077,7 @@ def test_without_replication_eviction_does_not_wait_for_the_published_table(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
     )
     with litelink.new(
@@ -1170,7 +1170,7 @@ def test_the_published_table_declares_the_same_sort_order_as_the_log(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
     )
     with litelink.new(
@@ -1215,7 +1215,7 @@ def test_a_log_is_recovered_onto_another_machine(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1334,7 +1334,7 @@ def test_a_stale_published_catalog_reads_short_until_it_is_dropped(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
     )
     root = tmp_path / "log"
@@ -1425,7 +1425,7 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1498,7 +1498,7 @@ def test_recovering_a_committed_seal_keeps_the_rows_replication_still_owes(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1552,7 +1552,7 @@ def test_creating_a_log_on_another_logs_published_table_is_refused(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1613,7 +1613,7 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1670,8 +1670,9 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
         for _ in range(3):
             revived.extend(rows(200))
             revived.seal()
-            revived.advance()
-            revived.publish()
+            # Flushed: a few seals are an in-progress file, not a finished one,
+            # and this asks whether publishing can move at all.
+            revived.advance(flush=True)
 
         assert revived.published_through() > ahead, (
             "publish never got past the published table's frontier: the log is wedged"
@@ -1799,7 +1800,7 @@ def test_an_interrupted_restore_cannot_reissue_the_primarys_offsets(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1873,7 +1874,7 @@ def test_a_failed_restore_never_leaves_an_openable_root(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -1955,7 +1956,7 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
         wal_replication=True,
     )
@@ -2407,7 +2408,7 @@ def test_restore_refuses_a_buffer_bound_to_another_published_table(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
     )
 
@@ -2465,7 +2466,7 @@ def test_restore_accepts_the_same_published_table_written_with_a_trailing_slash(
     config = replace(
         LogConfig(),
         target_seal_size=8 * 1024,
-        target_compact_size=6 * 1024,  # about two seals on disk
+        target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
     )
 
@@ -2872,7 +2873,7 @@ def test_advance_cycles_and_reloads_reuse_one_file_io(
         sort_by=("event_ts",),
         config=LogConfig(
             target_seal_size=4096,
-            target_compact_size=6 * 1024,  # about two seals on disk
+            target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
             compact_min_files=2,
             staging_rows=100,
             staging_snapshot_retention=timedelta(seconds=0),

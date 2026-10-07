@@ -2559,9 +2559,10 @@ class WriteHandle(LocalReadHandle):
         Files come out at `target_compact_size` on disk, written a row group
         at a time and each row group sorted by `sort_by`, which is what makes
         them indistinguishable from a compacted file and so born past the
-        maintenance lifecycle: `runs()` closes a run when the next file would
-        exceed the budget, so a file already at it forms a run of one, and
-        `_merge` rewrites only at `compact_min_files`. Sorted WITHIN a row
+        maintenance lifecycle: a file at the target is full, and `stretches`
+        never merges a full file again. The load's last file is short unless
+        the load divides evenly; it is the head of the open stretch, and
+        compaction grows it like an in-progress file. Sorted WITHIN a row
         group, as compaction sorts — offsets are materialised in input order
         and then permuted by the sort, so the range stays dense while the rows
         move. "Sorted" and "contiguous" are claims about two different columns.
@@ -3511,7 +3512,7 @@ class WriteHandle(LocalReadHandle):
         """
         # Read under the claim, the same as everything else that decides what
         # this pass does. The grouping `stable_prefix` computes has to match
-        # the one compaction computes — `runs` is shared so they cannot
+        # the one compaction computes — `stretches` is shared so they cannot
         # disagree — and in the shipped topology they are separate processes,
         # so agreement means both reading the policy the log records rather
         # than the one each happened to open with.
@@ -3622,7 +3623,7 @@ class WriteHandle(LocalReadHandle):
         memory = self._maintenance.memory()
         # Swaps first: each can raise the floor, and what is pushed after them
         # starts there.
-        floor = self._swap_merged(published, lease, floor, memory)
+        floor = self._swap_merged(published, lease, floor, memory, flush=flush)
         pending = [f for f in self._table.data_files() if f.end > floor]
         # `_settled` holds a file back while compaction may still merge it, and
         # compaction's candidates are exactly the files past the same settled
@@ -3715,7 +3716,13 @@ class WriteHandle(LocalReadHandle):
         )
 
     def _swap_merged(
-        self, published: LogTable, lease: Claim, floor: int, memory: dict[str, int]
+        self,
+        published: LogTable,
+        lease: Claim,
+        floor: int,
+        memory: dict[str, int],
+        *,
+        flush: bool = False,
     ) -> int:
         """Swap merged staging files in for the published copies of their
         inputs (#160), returning the published floor after them.
@@ -3724,6 +3731,14 @@ class WriteHandle(LocalReadHandle):
         flushed publish had already pushed (`awaiting_swap`), or when it
         straddles the floor — merged from published candidates and files not
         yet pushed, which one commit both replaces and extends.
+
+        **Only once it is finished** — settled: full, or a stretch compaction
+        will not touch again (#162). The in-progress file is rewritten every
+        step until it is full, and swapping each version would upload a growing
+        file again and again; its rows are published already, as the early
+        copies it will replace. The exception is a straddler under `flush`: its
+        rows above the floor are published nowhere else, and a flush asks for
+        exactly that, at the cost of uploading the file as it stands.
 
         **Only what lines up.** The published files the swap replaces are the
         ones overlapping the merged file's range, and every one of them must
@@ -3741,10 +3756,13 @@ class WriteHandle(LocalReadHandle):
         are deleted by `drain` once no live snapshot names them.
         """
         owed = self._buffer.awaiting_swaps()
+        files = self._table.data_files()
+        unsettled = self._maintenance.unsettled_from(files)
         candidates = [
             f
-            for f in self._table.data_files()
-            if self._layout.relative(f.path) in owed or f.start < floor < f.end
+            for index, f in enumerate(files)
+            if (self._layout.relative(f.path) in owed or f.start < floor < f.end)
+            and (index < unsettled or (flush and f.start < floor < f.end))
         ]
         if not candidates:
             return floor
@@ -3889,8 +3907,8 @@ class WriteHandle(LocalReadHandle):
         Data moves first, then cleanup follows behind it:
 
         1. `seal` — buffer to staging;
-        2. `compact` — merges a run once it is closed and has
-           `compact_min_files` files;
+        2. `compact` — grows the in-progress file a step at a time, and merges
+           a closed stretch of `compact_min_files` files;
         3. `publish` — staging to published, the files compaction is done with;
         4. `evict("buffer")` — rows the next durable copy holds;
         5. `evict("staging")` — files the published table holds, in the same
@@ -3922,22 +3940,32 @@ class WriteHandle(LocalReadHandle):
         hold yet is never evicted, however old. Eviction never deletes data.
         """
         # Sealing first, so what this pass seals is compacted and published in
-        # this pass rather than the next. Compaction only merges a run that is
-        # ready and `publish` only takes what compaction is finished with, so
-        # a file sealed a moment ago is never touched before its time.
+        # this pass rather than the next. Compaction only merges what is ready
+        # and `publish` only takes what compaction is finished with, so a file
+        # sealed a moment ago is never touched before its time.
         self.seal(flush=flush)
-        # Not flushed: a flushed publish sends the trailing run's seals as
-        # they are, and they stay recompaction candidates (#160). Merging that
-        # run now would make one small, final file of it on every flush.
-        self.compact()
 
         # Held, not raised, so the local steps still run on a machine that
         # cannot reach a remote published table (§11).
         failure: Exception | None = None
-        try:
-            self.publish(flush=flush)
-        except Exception as exc:  # noqa: BLE001 — re-raised below
-            failure = exc
+        if flush:
+            # Published BEFORE compacting, so the in-progress file only ever
+            # absorbs seals that are already published (#162). Compacted first,
+            # it would fold this pass's seals into a file that cannot be pushed
+            # until it is finished, and a flush could no longer publish them.
+            # What the flush pushes stays a recompaction candidate (#160).
+            try:
+                self.publish(flush=True)
+            except Exception as exc:  # noqa: BLE001 — re-raised below
+                failure = exc
+
+            self.compact()
+        else:
+            self.compact()
+            try:
+                self.publish()
+            except Exception as exc:  # noqa: BLE001 — re-raised below
+                failure = exc
 
         # Buffer before staging: the buffer's boundary is proved by staging
         # files, which staging eviction is about to remove.
@@ -3961,10 +3989,11 @@ class WriteHandle(LocalReadHandle):
     def compact(self, *, flush: bool = False) -> None:
         """Merge undersized staging files into `target_compact_size` ones (§6).
 
-        A run is merged once it is closed: the next file would take it past the
-        target, or it has reached it. The trailing run waits for the files
-        still to come, so each row is compacted once. `flush=True` merges the
-        trailing run too, for a log about to publish everything it holds.
+        The log's one in-progress file absorbs the seals after it every step —
+        an eighth of the target — until it reaches the target on disk, and is
+        finished (#162); a closed stretch is merged once, at
+        `compact_min_files` files. `flush=True` merges the in-progress region
+        whatever its size.
 
         The heavy step of `advance`: it reads and rewrites whole files, while
         eviction and expiry are metadata commits that finish in milliseconds,

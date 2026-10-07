@@ -37,12 +37,15 @@ minor version carries breaking changes.
   `count(*)` over S3 went from 190-410 requests to 4, full scans from 570-1,230
   to 209-414, with local query times unchanged. `ingest` writes its files the
   same way.
-- **Compaction merges a run once it is closed, and never merges its own output
-  again.** A run whose inputs fill the target (or that the next file would
-  overflow) is merged once. The trailing run waits for more, and its merged
-  file counts as full whatever its size, so every row is compacted exactly
-  once. Merged files therefore land under the target, by about a third on
-  compressible data. `compact(flush=True)` merges the trailing run early.
+- **Compaction grows one in-progress file per log, and finishes it at the
+  target** (#162). Instead of waiting for a run of seals to fill
+  `target_compact_size`, it rewrites the in-progress file with the seals that
+  follow it every step (an eighth of the target), cutting it on the writer's
+  own `tell()` once it is full. A log's staging table holds one in-progress
+  file and under a step of seals, instead of hundreds of seals, and finished
+  files land at the target rather than a third under it. The cost is local:
+  about 4.5 writes per row. Only a finished file is published or swapped.
+  `compact(flush=True)` merges the in-progress region at once.
 - **`advance(flush=True)` no longer flushes compaction**, and `ingest` no
   longer merges the trailing run before its flushed push: the seals go as
   they are and are swapped later (see Added), where merging them would make a
