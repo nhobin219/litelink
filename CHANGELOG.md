@@ -7,7 +7,7 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
-## Unreleased
+## 0.11.0 — 2026-10-07
 
 ### Levers, and how they relate to RPO
 
