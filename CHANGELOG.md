@@ -117,10 +117,10 @@ with `flush` and compacts without it.
   512 MiB files and `publish` swaps those in for the published copies.
   Nothing is lost or duplicated; the cost is local rewrites (about 4.5× the
   staged window) and one re-upload of it, and eviction keeps those files
-  local until they are re-cut. The window is what staging held at upgrade:
-  your retention for a log that set one, the whole log for one on the old
-  default of keeping everything. Raising `target_compact_size` later does the
-  same.
+  local until they are re-cut. Only what staging held at upgrade is re-cut:
+  your retention window for a log that set one, the whole log for one on the
+  old default of keeping everything. Published files no longer in staging are
+  left as they are. Raising `target_compact_size` later does the same.
 
 - **Compaction streams, and sizes files on disk: 512 MiB by default** (#158).
   `target_compact_size` is now bytes on disk, defaulting to 512 MiB (Iceberg's
