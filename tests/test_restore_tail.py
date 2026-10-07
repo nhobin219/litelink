@@ -14,9 +14,12 @@ from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+import pytest
+
 import litelink
 from litelink import LogConfig, WriteHandle
 from litelink._layout import Layout, is_compacted
+from litelink._table import LogTable
 from tests.test_log import SCHEMA, rows
 
 if TYPE_CHECKING:
@@ -169,3 +172,32 @@ def test_eviction_keeps_a_restored_tail_until_it_is_swapped(
         assert local is not None and local[0] <= tail[0] and tail[1] <= local[1], (
             "the restored tail stays local until it is swapped"
         )
+
+
+def test_a_tail_that_cannot_be_downloaded_does_not_fail_the_restore(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log exists and works by the time the tail is fetched, and `restore`
+    refuses to run over a log that exists — so a failed download leaves the
+    tail published at its size, not a restore that cannot be retried."""
+    where = f"s3://{bucket}/unreachable"
+    first = tmp_path / "first"
+    log, config = flushing_log(first, where, s3)
+    log.close()
+    shutil.rmtree(first)
+
+    def refused(self: LogTable, uri: str, destination: Path) -> None:
+        destination.write_bytes(b"partial")
+        msg = "the bucket refused the download"
+        raise OSError(msg)
+
+    monkeypatch.setattr(LogTable, "get", refused)
+    with litelink.restore(
+        tmp_path / "second", "s", published=where, s3_options=s3, config=config
+    ) as restored:
+        monkeypatch.undo()
+        assert restored._table.data_files() == [], "nothing half-registered"
+        assert restored.scan().read_all().num_rows == 3 * PER_SEAL
+        seal(restored, 3)
+        restored.advance(flush=True)
+        assert restored.scan().read_all().num_rows == 4 * PER_SEAL

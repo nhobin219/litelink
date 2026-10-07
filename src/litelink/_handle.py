@@ -2137,6 +2137,9 @@ class WriteHandle(LocalReadHandle):
         # manifest said before the failover describes it. If the published table
         # cannot be read now, the row stays missing and every query reads it
         # until a publish pass can.
+        # The tail first, so the published table's row below is computed from
+        # the staging table as it will stand.
+        log._restore_tail()  # noqa: SLF001
         log._tiers.drop()
         log._backfill_manifest()
 
@@ -2148,7 +2151,6 @@ class WriteHandle(LocalReadHandle):
         # rather than the window the log records, and RUNTIME presents this
         # file as the one an operator then runs the sidecar against.
         log.write_replication_config()
-        log._restore_tail()  # noqa: SLF001
 
         # DERIVED from the highest offset anything still holds, not from
         # `resumed` minus the reserve. A resumed restore reserves twice, so
@@ -2308,6 +2310,13 @@ class WriteHandle(LocalReadHandle):
         """Bring the published table's tail back into staging, so compaction
         finishes what it was doing when the old machine went (#166).
 
+        **Best effort.** The log already exists when this runs, and works
+        without it — the tail stays published, only at its size for good. So a
+        failure here, such as object storage refusing a download, is logged
+        rather than raised: raising would fail a `restore` that in fact
+        succeeded, and `restore` refuses to run over a log that exists. A file
+        half-downloaded is claimed, so the next `open` queues it for deletion.
+
         A restore rebuilds staging empty. The files compaction was still
         working on — a flushed publish's early seals (#160), an in-progress
         file uploaded before it was finished — are published, so nothing is
@@ -2330,6 +2339,17 @@ class WriteHandle(LocalReadHandle):
         the published table's span first: a replica's record of it can be
         older, and these files must read as published from the start.
         """
+        try:
+            self._restore_tail_files()
+        except Exception as exc:  # noqa: BLE001 — logged; see above
+            _log.warning(
+                "litelink: restored %s, but could not bring its published tail "
+                "back into staging (%s); those files stay published at their size",
+                self._layout.directory,
+                exc,
+            )
+
+    def _restore_tail_files(self) -> None:
         published = self._published.table()
         if published is None:
             return
@@ -2372,6 +2392,8 @@ class WriteHandle(LocalReadHandle):
             )
             self._buffer.record_file(rel_path, data_file.start, data_file.end, held)
             self._buffer.clear_compaction(rel_path)
+
+        self._store_staging_statistics()
 
     @property
     def _schema(self) -> pa.Schema:
