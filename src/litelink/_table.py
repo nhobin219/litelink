@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import random
+import shutil
 import sqlite3
 import threading
 import time
@@ -1583,6 +1584,22 @@ class LogTable:
         output = self._table.io.new_output(destination)
         with output.create(overwrite=True) as writing:
             writing.write(payload)
+
+    def relative(self, uri: str) -> str | None:
+        """The root-relative path of a file in this table's warehouse — the
+        inverse of `uri` — or None for a file somewhere else."""
+        prefix = f"{self._warehouse.rstrip('/')}/"
+
+        return uri.removeprefix(prefix) if uri.startswith(prefix) else None
+
+    def get(self, uri: str, destination: Path) -> None:
+        """Download a file of this table to `destination`, streamed, through
+        the same FileIO `put` uploads with (§5)."""
+        with (
+            self._table.io.new_input(uri).open() as reading,
+            destination.open("wb") as writing,
+        ):
+            shutil.copyfileobj(reading, writing, 1 << 20)
 
     def publish_pointer(self) -> None:
         """Record which metadata JSON is current, beside them in the warehouse.
