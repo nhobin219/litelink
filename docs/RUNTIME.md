@@ -371,7 +371,9 @@ never advanced, and I4 pinned local disk with it.
 
 So the published table can gain one small file per explicit seal, and a raised
 `target_compact_size` leaves what is already published at the size it was pushed at. Both stay
-as written: the published table is the log's immutable record, and nothing rewrites it.
+as written. The one rewrite the published table takes is a swap: files a flushed publish pushed
+early are merged by compaction, and `publish` replaces them with the merged file over the same
+rows (#160).
 
 **What would change this.** Compaction rewriting everything downstream of an undersized
 file would keep the published table perfect — merging `[0.1][8][8]` and splitting at the cap moves

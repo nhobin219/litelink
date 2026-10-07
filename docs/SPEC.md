@@ -867,7 +867,7 @@ eviction pins on it, and nothing raises. A file no merge can touch is settled by
 Note what that correction cost the earlier justification: "a file with a published copy is
 already at the target" is false the moment the target is RAISED after the copy was made —
 which is the scenario the exclusion exists for. Such a file stays at the size it was
-published at: the published table is never rewritten.
+published at: the published table is rewritten only by a swap of files compaction merged (#160).
 
 **Opening the published table with `repair` needs the durable location, not a remembered one.** That
 open may drop a catalog entry naming another prefix and create a fresh table at this one;
@@ -941,7 +941,8 @@ a second place**, and what eviction has to know is which rows those are. That is
 register lands, never before, and every push reconciles it against the published table's own
 span, so a crash between the register and the write leaves it low (the safe direction for
 eviction) until the next push raises it. A log's published table is fixed when the log is
-created and nothing rewrites it, so no write ever has to lower it, and `raise_meta` refuses to.
+created, and the only rewrite it takes is a swap over rows it already holds (#160), so no write
+ever has to lower it, and `raise_meta` refuses to.
 A range that cannot move backwards cannot leave a cached position wrong.
 
 **One range is enough because `publish` pushes a prefix.** It uploads the staging files above
@@ -1036,8 +1037,8 @@ decision binds the policy to a local first: fresh per decision, coherent within 
 Where a torn read would merely produce an odd file size it is harmless, because the policy
 is a POLICY — it decides how big to cut and when to merge, never which rows go where. The
 one place it could have been an invariant is `runs`, shared by compaction and `publish` so the
-two cannot disagree about what is in play, and I4 closes that: a file the
-published table holds is never merged again.
+two cannot disagree about what is in play, and the settled prefix closes that: compaction, `publish`
+and eviction all read the same one (`unsettled_from`).
 
 What this does NOT cover: a pyiceberg table handle is a point-in-time snapshot of REMOTE
 state, with no local durable copy to derive from, so `reload()` before deciding remains a
@@ -1077,9 +1078,13 @@ Independent, lazy, restartable, arbitrarily far behind. No read depends on it.
    metadata (§6).
 ```
 
-**Compactions are never replicated.** A file is pushed only once compaction is done with it,
-and compaction refuses to merge anything the published table holds (§4a), so the two tables
-never need the same overwrite applied twice. Nothing rewrites what is already published.
+**A compaction is replicated only as a swap.** Without `flush`, a file is pushed only once
+compaction is done with it. A flushed push sends files earlier, and they stay recompaction
+candidates: compaction merges them, and `publish` replaces their published copies with the merged
+file in one commit over the same rows, extending the table when the merged file reaches past it
+(#160). The swap replaces only published files that lie wholly inside the merged file's range,
+matched by path; anything else is never swapped. The replaced copies go through the same deletion
+queue and drain as expired metadata, so nothing a live snapshot names is deleted.
 
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).

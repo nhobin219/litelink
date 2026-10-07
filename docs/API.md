@@ -617,7 +617,7 @@ whole time, but never reaching Parquet.
 ```python
 log.advance(*, flush=False) -> None
 log.seal(*, flush=False) -> int | None
-log.compact() -> None                            # staging; the published table is never rewritten
+log.compact(*, flush=False) -> None              # staging; flush merges the trailing run too
 log.publish(*, flush=False) -> None
 log.evict(table=None, *, start_offset=None, end_offset=None) -> None  # "buffer" | "staging"
 log.reclaim(table=None, *, min_free_ratio=0.0) -> None  # "buffer" | "staging" | "published"
@@ -745,12 +745,19 @@ already. `restore` rebuilds from a local one, from the published table alone.
 caches what it reads instead; see `duckdb_connection`. Raising `staging_retention` applies to
 data captured afterwards.
 
-**The published table is never rewritten.** It is the log's immutable record, and well-sized by
-construction, since `publish` pushes only files compaction has finished with. The few things
-that leave a smaller file there — a flushed seal or publish, a bulk load's tail, a raised
-`target_compact_size` — leave it as written. To re-cut a log's history at another size, backfill
-it into a new log created with the target you want and `start_offset` at the old log's first
-offset, then `ingest` the old log's rows in offset order, which lands them at the same offsets.
+**The published table is rewritten only by a swap over rows it already holds** (#160). Without
+`flush`, `publish` pushes only files compaction has finished with. A flushed publish (or
+`advance(flush=True)`, or `ingest`'s tail) pushes earlier, and what it pushes stays a
+recompaction candidate: compaction merges it, and the next `publish` replaces the early copies
+with the merged file in one commit, extending the published table when the merged file reaches
+past it. So a maintainer can flush every N seconds to bound how far the published table trails
+the writer, and still end up with files at the compaction target; the cost is a second upload of
+every row pushed early. Eviction keeps a candidate local until its swap lands. What stays small
+is only what compaction will never merge — a file stranded between full neighbours, a retired
+log's last candidates — and files a raised `target_compact_size` left behind. To re-cut a log's
+history at another size, backfill it into a new log created with the target you want and
+`start_offset` at the old log's first offset, then `ingest` the old log's rows in offset order,
+which lands them at the same offsets.
 
 ## Observing
 

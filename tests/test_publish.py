@@ -2542,6 +2542,9 @@ def test_an_otel_log_reads_back_exactly_from_the_published_table(
     rows = [otel_row(n) for n in range(1, 41)]
     config = LogConfig(
         target_seal_rows=10,
+        # Every file final, so eviction drops it once published rather than
+        # keeping it as a recompaction candidate.
+        target_compact_size=1,
         compact_min_files=2,
         staging_retention=timedelta(0),
     )

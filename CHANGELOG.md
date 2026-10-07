@@ -9,6 +9,22 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+### Added
+
+- **A flushed publish no longer leaves small files in the published table
+  for good** (#160). What `publish(flush=True)`, `advance(flush=True)` or
+  `ingest`'s tail pushes before compaction is done with it stays a
+  recompaction candidate: compaction merges it like any other file, and the
+  next `publish` swaps the merged file in for the early copies in one commit
+  over the same rows, extending the published table when the merged file
+  reaches past it. A maintainer can therefore flush every N seconds to bound
+  how far the published table trails the writer — the unsealed buffer too,
+  since a flushed seal cuts it — and still end up with files at
+  `target_compact_size`. The cost is a second upload of every row pushed
+  early. Eviction keeps a candidate local until its swap lands; `retire`
+  still evicts everything. The replaced copies are deleted by the published
+  drain once no live snapshot names them.
+
 ### Changed
 
 - **Compaction streams, and sizes files on disk: 512 MiB by default** (#158).
@@ -26,15 +42,21 @@ minor version carries breaking changes.
   overflow) is merged once. The trailing run waits for more, and its merged
   file counts as full whatever its size, so every row is compacted exactly
   once. Merged files therefore land under the target, by about a third on
-  compressible data. `compact(flush=True)` merges the trailing run early;
-  `advance(flush=True)` passes it, and so does `ingest` before a flushed
-  push.
+  compressible data. `compact(flush=True)` merges the trailing run early.
+- **`advance(flush=True)` no longer flushes compaction**, and `ingest` no
+  longer merges the trailing run before its flushed push: the seals go as
+  they are and are swapped later (see Added), where merging them would make a
+  small, final file on every flush.
+- **The published table is rewritten by these swaps**, which replace files
+  over rows it already holds; a reader tailing Iceberg snapshots sees
+  overwrite snapshots with the same rows.
 - **Breaking: a log publishes in 512 MiB steps.** `publish` takes only files
   compaction has finished with, so the published table now trails the writer
   by up to one 512 MiB file per log — days on a stream of 100 rows a second,
   instead of hours. Recovery is unaffected (that is WAL replication's job).
-  For a fresher published table, set a smaller `target_compact_size` or call
-  `publish(flush=True)`.
+  For a fresher published table, call `publish(flush=True)` (or
+  `advance(flush=True)`) on a schedule: what it pushes early is swapped for
+  the 512 MiB file later (see Added).
 - **Breaking: a stored `target_compact_size` is now read as bytes on disk.**
   A log that set one keeps its number, which now means larger files —
   roughly the data's compression ratio larger. Re-set it to keep the old file
