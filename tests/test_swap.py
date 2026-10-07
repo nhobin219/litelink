@@ -156,6 +156,7 @@ def test_a_swap_interrupted_before_its_commit_is_retried(
 
         monkeypatch.undo()
         assert len(log._buffer.awaiting_swaps()) == 1, "still owed"
+        assert len(log._buffer.intents(log._published.uri)) == 1, "intended"
         assert len(published_files(log)) == 2, "the early copies still serve"
         assert len(read_all(log)) == 4 * PER_SEAL
 
@@ -163,7 +164,7 @@ def test_a_swap_interrupted_before_its_commit_is_retried(
 
         assert is_compacted(published_files(log)[0].path)
         assert log._buffer.awaiting_swaps() == set()
-        assert log._buffer.intents("") == [], "the intent was resolved"
+        assert log._buffer.intents(log._published.uri) == [], "intent resolved"
         assert len(read_all(log)) == 4 * PER_SEAL
 
 
