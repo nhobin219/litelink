@@ -19,6 +19,7 @@ orchestrator can run them on their own schedule or process (#118).
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import itertools
 import logging
@@ -680,14 +681,34 @@ class Maintenance:
         # filtered batch to large types — and pyarrow up to 25.0.1 aborts the
         # process casting a filtered map column (apache/arrow#51029, fixed for
         # 26.0.0).
+        #
+        # Each slice in OFFSET order before it is split, so an input larger
+        # than a row group — a seal bigger than `target_row_group_size`, or a
+        # file written before its row groups were disjoint — comes apart into
+        # pieces with disjoint offsets. Split in `sort_by` order instead, every
+        # piece would span the input's whole range, the output's row groups
+        # would overlap, and `input_slices` would read the in-progress file
+        # whole on every step after.
         slices = [s for f in run for s in input_slices(f)]
-        head = table.scan_range(*slices[0])
-        schema = head.schema
-        inputs = itertools.chain(
-            [head.to_batches()],
-            (table.scan_range(lo, hi).to_batches() for lo, hi in slices[1:]),
-        )
+
+        def read(lo: int, hi: int) -> list[pa.RecordBatch]:
+            return table.scan_range(lo, hi).sort_by("litelink_offset").to_batches()
+
+        head = read(*slices[0])
+        schema = head[0].schema if head else table.scan_range(*slices[0]).schema
+        inputs = itertools.chain([head], (read(lo, hi) for lo, hi in slices[1:]))
         del head  # held by `inputs` only until it moves past it
+
+        # Where a file may end: between inputs, and below the published
+        # watermark only at the end of a staging FILE. A file there was pushed
+        # as itself, or is owed a swap for published copies that together span
+        # exactly its range — so its end is a published file's end. A cut
+        # anywhere else below the watermark would start the next file strictly
+        # inside a published one: no swap could line up with it, and nothing
+        # re-cuts a staging straddler.
+        floor = self.published_through() + 1
+        file_ends = {f.end for f in run}
+        slice_ends = sorted(hi for _, hi in slices)
 
         outputs: list[tuple[str, int, int, int]] = []
         with contextlib.ExitStack() as stack:
@@ -724,7 +745,12 @@ class Maintenance:
                 # Per row group, not per file: a merge of a 512 MB file runs
                 # for minutes, far past the claim's TTL.
                 checkpoint(renew)
-                if ends_input and size >= target:
+                at = slice_ends[
+                    bisect.bisect_right(
+                        slice_ends, max(group["litelink_offset"].to_pylist())
+                    )
+                ]
+                if ends_input and size >= target and (at >= floor or at in file_ends):
                     stack.close()
                     write = None
                     outputs.append(_output(rel_path, piece, held))

@@ -48,14 +48,14 @@ def published_files(log: WriteHandle) -> list[DataFile]:
 def sized_log(tmp_path: Path, **overrides: Any) -> WriteHandle:
     """A log whose compaction target is three seals on disk, with a row group
     per seal so a file can be cut after any of them."""
-    config = LogConfig(
-        target_seal_size=1 << 30,
-        target_row_group_rows=PER_SEAL,
-        compact_min_files=2,
-        staging_snapshot_retention=timedelta(0),
-        published_snapshot_retention=timedelta(0),
-        **overrides,
-    )
+    settings: dict[str, Any] = {
+        "target_seal_size": 1 << 30,
+        "target_row_group_rows": PER_SEAL,
+        "compact_min_files": 2,
+        "staging_snapshot_retention": timedelta(0),
+        "published_snapshot_retention": timedelta(0),
+    }
+    config = LogConfig(**(settings | overrides))
     log = open_log(tmp_path, config)
     seal(log, 0)
     size = log._table.data_files()[0].size
@@ -196,3 +196,92 @@ def test_a_swap_interrupted_before_its_commit_is_retried(
         assert finished(log, published_files(log))
         assert log._buffer.intents(log._published.uri) == [], "intent resolved"
         assert len(read_all(log)) == (died + 1) * PER_SEAL
+
+
+def test_an_oversized_seal_keeps_the_in_progress_file_readable_in_slices(
+    tmp_path: Path,
+) -> None:
+    """A seal larger than a row group, under a `sort_by` that is not arrival
+    order, is split by offset, so the in-progress file's row groups stay
+    disjoint and each step reads it a row group at a time — not whole, which
+    at the default target is gigabytes of Arrow, every step."""
+    from litelink._maintenance import input_slices
+
+    with sized_log(tmp_path, target_row_group_rows=PER_SEAL - 1) as log:
+        for index in range(1, 30):
+            log.extend(
+                [
+                    {
+                        "event_ts": 1000 + (i * 7919) % 97,
+                        "key": f"k{i % 3}",
+                        "payload": "",
+                    }
+                    for i in range(index * PER_SEAL, (index + 1) * PER_SEAL)
+                ]
+            )
+            log.seal(flush=True)
+            log.advance()
+            for f in log._table.data_files():
+                if is_compacted(f.path) and f.rows > PER_SEAL:
+                    assert len(input_slices(f)) > 1, "read whole"
+
+
+def test_a_codec_change_never_cuts_a_file_inside_a_published_one(
+    tmp_path: Path,
+) -> None:
+    """An in-progress file uploaded as itself, then rewritten under a codec
+    that inflates it past the target: cut at an internal row group, the next
+    file would start inside the published copy, no swap could line up with it,
+    and every push would refuse it for good. Below the watermark a file ends
+    only where a staging file did."""
+    import pyarrow as pa
+
+    import litelink
+
+    per_seal = 8
+    schema = pa.schema(
+        [
+            pa.field("event_ts", pa.int64(), nullable=False),
+            pa.field("payload", pa.string()),
+        ]
+    )
+    config = LogConfig(
+        target_seal_size=1 << 30,
+        # Two seals per row group, so the uploaded file has an internal
+        # boundary inside what the published table holds as one file.
+        target_row_group_rows=2 * per_seal,
+        # Above one uncompressed seal, below two.
+        target_compact_size=30_000,
+        compact_min_files=2,
+        staging_snapshot_retention=timedelta(0),
+        published_snapshot_retention=timedelta(0),
+    )
+
+    def seal_big(log: WriteHandle, index: int) -> None:
+        log.extend(
+            [
+                {"event_ts": 1000 + i, "payload": "a" * 20_000}
+                for i in range(index * per_seal, (index + 1) * per_seal)
+            ]
+        )
+        log.seal(flush=True)
+
+    with litelink.new(
+        tmp_path, "s", schema=schema, sort_by=("event_ts",), config=config
+    ) as log:
+        for index in range(5):
+            seal_big(log, index)
+
+        log.advance()
+        log.advance(flush=True)  # the in-progress file, uploaded as itself
+        log.set_config(replace(config, compression="none"))
+        # One rewrite inflates the file past the target before its first
+        # row group ends — the cut a published copy cannot line up with.
+        seal_big(log, 5)
+        log.advance()
+        for index in range(6, 10):
+            seal_big(log, index)
+            log.advance(flush=True)
+
+        assert log.published_through() == 10 * per_seal, "publishing never wedged"
+        assert log.scan().read_all().num_rows == 10 * per_seal
