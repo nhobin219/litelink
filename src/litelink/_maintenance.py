@@ -19,6 +19,7 @@ orchestrator can run them on their own schedule or process (#118).
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import itertools
 import logging
@@ -35,7 +36,6 @@ import pyarrow.parquet as pq
 from litelink._buffer import _NO_ROW_LIMIT, PUBLISHED_THROUGH_KEY, Buffer
 from litelink._claim import new_owner
 from litelink._fs import stream_parquet
-from litelink._layout import is_compacted
 from litelink._published import Published
 from litelink._statistics import rollup
 from litelink._tiers import PublishedTier
@@ -188,15 +188,19 @@ def row_groups(
     schema: pa.Schema,
     size: int,
     rows: int | None = None,
-) -> Iterator[pa.Table]:
-    """A merge's rows, a row group at a time, broken only between inputs.
+) -> Iterator[tuple[pa.Table, bool]]:
+    """A merge's rows, a row group at a time, broken only between inputs, each
+    with whether it ends at an input's end.
 
     Whole inputs are gathered until the next would take the group past `size`
-    Arrow bytes or `rows` rows. Breaking between them is what keeps each row group's offsets
-    disjoint from its neighbours': an input is sorted by `sort_by`, so cutting
-    one in two leaves both halves spanning its whole offset range. An input
-    larger than either on its own is the exception, and is cut by `chunks` —
-    its pieces overlap each other, and nothing else.
+    Arrow bytes or `rows` rows. Breaking between them is what keeps each row
+    group's offsets disjoint from its neighbours': an input is sorted by
+    `sort_by`, so cutting one in two leaves both halves spanning its whole
+    offset range. An input larger than either on its own is the exception,
+    and is cut by `chunks` — its pieces overlap each other, and nothing else.
+
+    The flag is where a merge may also end a FILE (`_write_merge`): only at an
+    input's end, so no two files' offset ranges overlap either.
     """
     limit = rows or _NO_ROW_LIMIT
     held: list[pa.Table] = []
@@ -214,7 +218,7 @@ def row_groups(
             if held and (
                 measured + piece.nbytes > size or counted + piece.num_rows > limit
             ):
-                yield pa.concat_tables(held)
+                yield pa.concat_tables(held), True
                 held, measured, counted = [], 0, 0
 
             held.append(piece)
@@ -223,79 +227,118 @@ def row_groups(
             continue
 
         if held:
-            yield pa.concat_tables(held)
+            yield pa.concat_tables(held), True
             held, measured, counted = [], 0, 0
 
-        yield piece
-        yield following
-        yield from pieces
+        previous = piece
+        for after in itertools.chain([following], pieces):
+            yield previous, False
+            previous = after
+
+        yield previous, True
 
     if held:
-        yield pa.concat_tables(held)
+        yield pa.concat_tables(held), True
 
 
-def runs(files: Sequence[DataFile], budget: int) -> list[list[DataFile]]:
-    """Adjacent files grouped into merge candidates, each within `budget`.
+@dataclass(frozen=True)
+class Stretch:
+    """Adjacent staging files compaction treats as one unit (`stretches`)."""
 
-    The one definition of what compaction considers a run, because two
-    collaborators act on it and they must not disagree: `compact` merges these
-    groups, and `publish` refuses to push a file that appears in one, since a
-    file pushed and then merged in staging leaves the published table holding
-    rows that have been rewritten underneath it.
+    files: list[DataFile]
+    # The trailing stretch: files not yet written will join it.
+    open: bool
 
-    Sizes are each file's size ON DISK, from its manifest entry, and the budget
-    is `target_compact_size`, stated in the same units. A merge's output lands
-    under the sum of its inputs — larger row groups compress better — so the
-    budget is what a run's inputs fill, and the file comes out somewhat
-    smaller.
 
-    The budget caps the OUTPUT. Merging every adjacent small file without one
-    puts no ceiling on the result — a hundred files just under the line become
-    one file a hundred times the target, which is the same defect as an
-    undersized file with the sign flipped. A run therefore closes when the next
-    file would take it past the budget, and the pass emits several correctly
-    sized files instead of one enormous one.
+def stretches(files: Sequence[DataFile], target: int) -> list[Stretch]:
+    """The staging table, in offset order, cut into what compaction acts on.
 
-    The trailing run may still be open — see `is_open`.
+    The one definition every collaborator reads, because they must not
+    disagree: `compact` merges these, `publish` holds back what compaction may
+    still merge, and eviction keeps it local (#160).
+
+    A file is **full** once it is at `target_compact_size` on disk, whatever
+    wrote it, and full files are never merged again: each is a stretch of its
+    own. Between them, the files that are not full form maximal stretches. The
+    last of those, if nothing full follows it, is **open** — the in-progress
+    region (#162): compaction rewrites it into one file, again and again as
+    seals arrive, until that file is full. A stretch with a full file after it
+    is closed, and will never gain another file.
+
+    Sizes are each file's size ON DISK, from its manifest entry, and the target
+    is stated in the same units. A full file was measured, not estimated: the
+    in-progress file is cut on the writer's own `tell()` (`_write_merge`), so a
+    finished file lands at the target rather than under it, however much better
+    the merge compressed than its inputs did.
     """
-    grouped: list[list[DataFile]] = []
-    run: list[DataFile] = []
-    held = 0
+    grouped: list[Stretch] = []
+    current: list[DataFile] = []
     for data_file in files:
-        # A merge's output counts as full whatever its size. A merge compresses
-        # better than its inputs did — larger row groups — so its output lands
-        # under the budget its inputs filled, by about a third on compressible
-        # data (#158); counted by size, it would join the next run and be
-        # rewritten again, and the file still filling would be rewritten on
-        # every pass. Counted full, every row is compacted exactly once.
-        size = budget if is_compacted(data_file.path) else data_file.size
-        # A file already at the budget on its own closes the previous run and
-        # forms one of its own, which then closes on the next file. No special
-        # case needed: it simply never has room for a neighbour.
-        if run and held + size > budget:
-            grouped.append(run)
-            run, held = [], 0
+        if data_file.size >= target:
+            if current:
+                grouped.append(Stretch(current, open=False))
+                current = []
 
-        run.append(data_file)
-        held += size
+            grouped.append(Stretch([data_file], open=False))
+        else:
+            current.append(data_file)
 
-    if run:
-        grouped.append(run)
+    if current:
+        grouped.append(Stretch(current, open=True))
 
     return grouped
 
 
-def is_open(run: Sequence[DataFile], files: Sequence[DataFile], budget: int) -> bool:
-    """Whether `run` can still grow: it is the trailing run, and under the
-    budget, so files not yet written may join it.
+def merges(
+    stretch: Stretch,
+    target: int,
+    step: int,
+    min_files: int,
+    floor: int,
+    *,
+    flush: bool,
+) -> list[list[DataFile]]:
+    """The runs compaction merges from `stretch` now, each into files of its
+    own; `floor` is the first offset the published table does not hold.
 
-    Compaction waits for an open run, and `publish` holds it back: merged now,
-    it would be merged again — with everything sealed after it — on every pass
-    until it filled.
+    **A closed stretch** once it has `compact_min_files` files. It never grows,
+    so it is merged once; under that many, it is left as it is.
+
+    **The open stretch** grows its in-progress file — its first file — once
+    the files after it reach `step` (`target_compact_size` / 8 by default), or
+    at once with `flush`. Each growth rewrites the whole in-progress file, so
+    the step is what bounds the rewrites per finished file, however often
+    `compact` is called (#162).
+
+    **Never an unpublished seal into a file that holds published rows.** Once
+    a flushed publish has pushed rows the in-progress file holds, folding a
+    seal nobody has published into it would leave those rows only inside an
+    unfinished file — and the next flush would have to upload that file as it
+    stands, again on every flush. So the file grows from published files only,
+    and a flushed publish pushes the newest seals before compaction folds them
+    in. The seals after the floor wait for that, or — if no flush ever comes —
+    until they fill a whole target, when they are merged into files of their
+    own, so a log that flushed once and stopped is never stuck.
     """
-    held = sum(budget if is_compacted(f.path) else f.size for f in run)
+    files = stretch.files
+    if not stretch.open:
+        return [files] if len(files) >= min_files else []
 
-    return run[-1] is files[-1] and held < budget
+    if files[0].start >= floor:
+        return [files] if _grows(files, step, flush=flush) else []
+
+    published = [f for f in files if f.end <= floor]
+    after = [f for f in files if f.start >= floor]
+    due = [published] if _grows(published, step, flush=flush) else []
+    if len(after) >= 2 and sum(f.size for f in after) >= target:
+        due.append(after)
+
+    return due
+
+
+def _grows(files: Sequence[DataFile], step: int, *, flush: bool) -> bool:
+    """Whether an in-progress file absorbs the files after it now."""
+    return len(files) >= 2 and (flush or sum(f.size for f in files[1:]) >= step)
 
 
 def stable_prefix(
@@ -314,30 +357,23 @@ def stable_prefix(
     it is the rule that actually matters, since the only reason to hold a file
     back is that compaction might rewrite it.
 
-    Two things disqualify a file. It sits in a run compaction would merge right
-    now; or it sits in the trailing run, which is under budget and so still has
-    room for files that have not been written yet. Everything before the first
-    such file is settled: no run containing it can also contain anything new,
-    because the files between them already fill the budget.
+    Two things disqualify a file. It sits in a stretch compaction will merge
+    — closed, with `compact_min_files` files — or in the open stretch, which is
+    still growing. Everything before the first such file is settled.
 
     A small file in the MIDDLE is therefore pushed, not held. It is under the
-    target and always will be — its neighbours are too big to merge with, so
-    compaction will not touch it and waiting achieves nothing. Holding it was
-    the old behaviour and it meant a single explicit `seal()` blocked the
-    published table permanently: everything after it is newer, so the watermark
-    never advanced again and I4 then pinned local disk too. Not "later" — never.
+    target and always will be — its neighbours are full, so compaction will not
+    touch it and waiting achieves nothing. Holding it was the old behaviour and
+    it meant a single explicit `seal()` blocked the published table
+    permanently: everything after it is newer, so the watermark never advanced
+    again and I4 then pinned local disk too. Not "later" — never.
     """
     settled = 0
-    for run in runs(files, budget):
-        if len(run) >= min_files:
+    for stretch in stretches(files, budget):
+        if stretch.open or len(stretch.files) >= min_files:
             break
 
-        # Room under BOTH ceilings is what makes the trailing run growable. At
-        # either one it is finished, and a file that cannot grow is settled.
-        if is_open(run, files, budget):
-            break
-
-        settled += len(run)
+        settled += len(stretch.files)
 
     return settled
 
@@ -481,8 +517,8 @@ class Maintenance:
         return reached
 
     def compact(self, *, flush: bool = False) -> None:
-        """Merge runs of undersized adjacent files (§6). `flush` merges the
-        trailing run even while it can still grow (see `is_open`).
+        """Merge stretches of undersized adjacent files (§6). `flush` grows the
+        in-progress file without waiting for a step (see `merges`).
 
         Real work on the happy path. Not repair — the cut is exact and there is
         no timer to cut early, so every file a seal writes already holds what
@@ -508,10 +544,18 @@ class Maintenance:
 
         # One read, so the two limits describe the same policy.
         config = self.config
-        budget = config.compact_size
-        for run in runs(pending, budget):
-            if flush or not is_open(run, pending, budget):
-                self._merge(run)
+        target = config.compact_size
+        floor = self.published_through() + 1
+        for stretch in stretches(pending, target):
+            for run in merges(
+                stretch,
+                target,
+                config.compact_step,
+                config.compact_min_files,
+                floor,
+                flush=flush,
+            ):
+                self._rewrite_run(self._table, run)
 
     def unsettled_from(self, files: Sequence[DataFile]) -> int:
         """The index in `files` — the staging table's, in offset order — of
@@ -570,38 +614,32 @@ class Maintenance:
             for key, size in self._buffer.file_bytes().items()
         }
 
-    def _merge(self, run: list[DataFile]) -> None:
-        """Compact a run, if there is enough of it to be worth a rewrite."""
-        if len(run) >= self.config.compact_min_files:
-            self._rewrite_run(self._table, run)
+    def _rewrite_run(self, table: LogTable, run: list[DataFile]) -> None:
+        """Replace a stretch of adjacent staging files with merged ones, in one
+        commit: claimed before any file exists, re-sorted a row group at a
+        time, verified, its sources queued before the commit that supersedes
+        them.
 
-    def _rewrite_run(
-        self,
-        table: LogTable,
-        run: list[DataFile],
-    ) -> None:
-        """Replace one run of adjacent staging files with a single merged one:
-        claimed before the file exists, re-sorted, verified, its sources
-        queued before the commit that supersedes them, and their measured
-        sizes carried onto the output."""
+        One file, or several when the merge crosses `target_compact_size`:
+        the file is cut there, at an input boundary, and the rest starts the
+        next — the in-progress file of #162.
+        """
         start, end = run[0].start, run[-1].end
         # Unique per attempt. See `compaction_path`: a fixed name made a
         # rewrite of a previous compaction write over the file it was reading.
-        rel_path = self._layout.compaction_path(start, end, uuid.uuid4().hex[:8])
-        target = str(self._layout.absolute(rel_path))
-        # Claimed before the file exists, exactly as a seal claims its path
-        # (I2). One that dies between the write and the commit is then
-        # recoverable by name, instead of being a file nobody can identify
-        # without listing — which for a remote published table would be a
-        # paginated LIST over object storage, the thing this design refuses.
-        # Claimed as the TARGET, so recovery knows which tier to remove it from.
+        token = uuid.uuid4().hex[:8]
+        first = self._layout.compaction_path(start, token)
         # The range claimed before a byte is written, and the two are one
         # question: may this merge run, and is the record of it live work or a
         # dead process's leavings. A claim answers both (§4a) — and the check
         # and the insert are one transaction, so eviction cannot have decided
         # to drop this range while this decided to rewrite it.
         claim = self._buffer.claim(
-            "compact", start, end, new_owner(), self._key(target)
+            "compact",
+            start,
+            end,
+            new_owner(),
+            self._key(str(self._layout.absolute(first))),
         )
         if not claim.acquire():
             return
@@ -612,89 +650,108 @@ class Maintenance:
         # its removal and released it in between — which is a millisecond
         # unless this thread stalls, and a stall past the TTL is precisely the
         # threat the TTL exists for. The merge would then read the sources from
-        # a pre-eviction snapshot, still on disk under I6's grace, and
-        # `_commit` would retry the swap onto the fresh table and put every
+        # a pre-eviction snapshot, still on disk under I6's grace, and the
+        # commit would retry the swap onto the fresh table and put every
         # evicted row back.
         table.reload()
         current = table.data_files()
         live = {f.path for f in current}
-        if not all(f.path in live for f in run):
-            claim.release()
-
-            return
-
-        # The published premise too, not only the inputs' liveness: every
-        # input must still be a merge candidate. Since the run was grouped, a
-        # publish may have pushed part of it — which is fine now, since the
-        # swap replaces published candidates — or begun pushing it (an intent
-        # in flight), or another process may have settled it; the last two are
-        # not this merge's to touch.
-        #
-        # Read DURABLY here, not from this object's memory. A compaction pass
-        # holds no pass-level claim — only per-run ones — so what another
-        # process recorded between two runs of one pass has to be read, not
-        # remembered. Merging across a range coverage the swap cannot replace
-        # leaves a staging straddler, and nothing re-cuts one: every push
-        # refuses in `_refuse_straddle`, the watermark never advances again,
-        # and eviction pins on it.
+        # And every input must still be a merge candidate: a publish may have
+        # begun pushing part of the run (an intent in flight), or another
+        # process settled it. Read DURABLY here, not remembered from the pass:
+        # merging across coverage the swap cannot replace leaves a staging
+        # straddler, and nothing re-cuts one — every push refuses in
+        # `_refuse_straddle`, the watermark never advances again, and eviction
+        # pins on it.
         candidates = {f.path for f in self.merge_candidates(current)}
-        if not all(f.path in candidates for f in run):
+        if not all(f.path in live and f.path in candidates for f in run):
             claim.release()
 
             return
 
-        self._buffer.claim_compaction(start, end, self._key(target))
+        outputs: list[tuple[str, int, int, int]] = []
         try:
-            # The claim renews itself while the merge runs. A rewrite over a
-            # large run outlasts the TTL, and letting it lapse would invite
+            # The claim renews itself while the merge runs: a rewrite of a
+            # large stretch outlasts the TTL, and letting it lapse would invite
             # another owner onto the same range mid-write.
-            self._write_merge(table, run, rel_path, target, claim.renew)
+            outputs = self._write_merge(table, run, first, token, claim.renew)
+            self._commit_merge(table, run, outputs, claim.renew)
         finally:
             claim.release()
 
-        # Only this one. Another operation's claim — a rewrite that crashed
+        # Only these. Another operation's claim — a rewrite that crashed
         # before recovery ran — is not ours to retire.
-        self._buffer.clear_compaction(self._key(target))
+        for rel_path, _, _, _ in outputs:
+            self._buffer.clear_compaction(rel_path)
 
     def _write_merge(
         self,
         table: LogTable,
         run: list[DataFile],
-        rel_path: str,
-        target: str,
+        first: str,
+        token: str,
         renew: Callable[[], bool],
-    ) -> None:
-        """Write the run's rows to one file, streamed (§6 steps 2-3).
+    ) -> list[tuple[str, int, int, int]]:
+        """Write the run's rows, streamed (§6 steps 2-3), into one file or
+        several cut at `target_compact_size`: `(rel_path, start, end, bytes)`
+        for each, in offset order.
 
         The inputs are read one at a time, in offset order, through the table,
-        as every read of it is. Every `target_row_group_size`
-        of them is sorted by `sort_by` and written as one row group — so memory
-        is a row group's worth whatever the file's size, and an offset range
-        stays inside one or two row groups (see `DEFAULT_ROW_GROUP_SIZE`).
+        as every read of it is. Every `target_row_group_size` of them is sorted
+        by `sort_by` and written as one row group — so memory is a row group's
+        worth whatever the file's size, and an offset range stays inside one
+        or two row groups (see `DEFAULT_ROW_GROUP_SIZE`).
+
+        A file is cut when the writer's own `tell()` reaches the target, and
+        only at an input's end (`row_groups`), so the files' offset ranges are
+        disjoint and in order. Each file's path is claimed before its bytes
+        exist (I2): one that dies before the commit is recoverable by name.
         """
-        start, end = run[0].start, run[-1].end
         order = self.sort_by
         config = self.config
-        dest = self._layout.absolute(rel_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        target = config.compact_size
         tally = _Tally()
         # Read through the table, as every read of it is — so the rows come out
         # typed as a scan types them — one row group at a time: `input_slices`
-        # names each
-        # row group's offsets, and the scan's statistics skip the rest of the
-        # file. Not pyiceberg's batch reader, which casts each filtered batch to
-        # large types — and pyarrow up to 25.0.1 aborts the process casting a
-        # filtered map column (apache/arrow#51029, fixed for 26.0.0).
+        # names each row group's offsets, and the scan's statistics skip the
+        # rest of the file. Not pyiceberg's batch reader, which casts each
+        # filtered batch to large types — and pyarrow up to 25.0.1 aborts the
+        # process casting a filtered map column (apache/arrow#51029, fixed for
+        # 26.0.0).
+        #
+        # Each slice in OFFSET order before it is split, so an input larger
+        # than a row group — a seal bigger than `target_row_group_size`, or a
+        # file written before its row groups were disjoint — comes apart into
+        # pieces with disjoint offsets. Split in `sort_by` order instead, every
+        # piece would span the input's whole range, the output's row groups
+        # would overlap, and `input_slices` would read the in-progress file
+        # whole on every step after.
         slices = [s for f in run for s in input_slices(f)]
-        first = table.scan_range(*slices[0])
-        schema = first.schema
-        inputs = itertools.chain(
-            [first.to_batches()],
-            (table.scan_range(lo, hi).to_batches() for lo, hi in slices[1:]),
-        )
-        del first  # held by `inputs` only until it moves past it
-        with stream_parquet(dest, schema, config.compression) as write:
-            for group in row_groups(
+
+        def read(lo: int, hi: int) -> list[pa.RecordBatch]:
+            return table.scan_range(lo, hi).sort_by("litelink_offset").to_batches()
+
+        head = read(*slices[0])
+        schema = head[0].schema if head else table.scan_range(*slices[0]).schema
+        inputs = itertools.chain([head], (read(lo, hi) for lo, hi in slices[1:]))
+        del head  # held by `inputs` only until it moves past it
+
+        # Where a file may end: between inputs, and below the published
+        # watermark only at the end of a staging FILE. A file there was pushed
+        # as itself, or is owed a swap for published copies that together span
+        # exactly its range — so its end is a published file's end. A cut
+        # anywhere else below the watermark would start the next file strictly
+        # inside a published one: no swap could line up with it, and nothing
+        # re-cuts a staging straddler.
+        floor = self.published_through() + 1
+        file_ends = {f.end for f in run}
+        slice_ends = sorted(hi for _, hi in slices)
+
+        outputs: list[tuple[str, int, int, int]] = []
+        with contextlib.ExitStack() as stack:
+            write: Callable[[pa.Table], int] | None = None
+            rel_path, piece, held = first, _Tally(), 0
+            for group, ends_input in row_groups(
                 inputs,
                 schema,
                 config.target_row_group_size,
@@ -703,19 +760,61 @@ class Maintenance:
                 if order:
                     group = group.sort_by([(c, "ascending") for c in order])
 
+                if write is None:
+                    if outputs:
+                        low = min(group["litelink_offset"].to_pylist())
+                        rel_path = self._layout.compaction_path(low, token)
+
+                    dest = self._layout.absolute(rel_path)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    self._buffer.claim_compaction(
+                        run[0].start, run[-1].end, self._key(str(dest))
+                    )
+                    write = stack.enter_context(
+                        stream_parquet(dest, schema, config.compression)
+                    )
+                    piece, held = _Tally(), 0
+
                 tally.add(group)
-                write(group)
+                piece.add(group)
+                held += group.nbytes
+                size = write(group)
                 # Per row group, not per file: a merge of a 512 MB file runs
                 # for minutes, far past the claim's TTL.
                 checkpoint(renew)
+                at = slice_ends[
+                    bisect.bisect_right(
+                        slice_ends, max(group["litelink_offset"].to_pylist())
+                    )
+                ]
+                if ends_input and size >= target and (at >= floor or at in file_ends):
+                    stack.close()
+                    write = None
+                    outputs.append(_output(rel_path, piece, held))
 
-        tally.verify(run, start, end)
+            stack.close()
+            if write is not None:
+                outputs.append(_output(rel_path, piece, held))
 
+        tally.verify(run, run[0].start, run[-1].end)
+
+        return outputs
+
+    def _commit_merge(
+        self,
+        table: LogTable,
+        run: list[DataFile],
+        outputs: list[tuple[str, int, int, int]],
+        renew: Callable[[], bool],
+    ) -> None:
+        """Replace the run with its outputs in the staging table, and record
+        them."""
+        start, end = run[0].start, run[-1].end
         # Checked between writing and committing, because those are the two
         # halves a lapsed lease separates. A run outlasting the TTL lets
-        # another owner recover — removing the output this claimed — and the
-        # commit would then land anyway, leaving the table pointing at a file
-        # that no longer exists while the sources it superseded drain away.
+        # another owner recover — removing the outputs this claimed — and the
+        # commit would then land anyway, leaving the table pointing at files
+        # that no longer exist while the sources it superseded drain away.
         checkpoint(renew)
 
         # Queued BEFORE the commit that supersedes them, not after. A crash in
@@ -728,7 +827,9 @@ class Maintenance:
         # Superseded, not yet deletable either way: a scan that started before
         # this commit is still reading them (I6).
         self._enqueue(f.path for f in run)
-        table.replace_range(start, end, [target])
+        table.replace_range(
+            start, end, [str(self._layout.absolute(r)) for r, _, _, _ in outputs]
+        )
         # Re-dated to the commit, for the reason `restamp_deletions` gives: a
         # merge that failed between the queueing and this line and was retried
         # later would otherwise supersede these files against a stamp already
@@ -737,16 +838,17 @@ class Maintenance:
             (self._key(f.path) for f in run), int(datetime.now(UTC).timestamp())
         )
         # After the commit: until it lands the sources are still the live
-        # files, and moving their sizes onto an output that never became real
-        # would leave every one of them unmeasured.
+        # files, and recording the outputs for a merge that never became real
+        # would leave every source unmeasured.
         #
-        # Owed a swap when any input has a published copy: the merged file is
-        # under the watermark, but the published table holds its inputs, not
-        # it, until `publish` replaces them (#160).
+        # An output is owed a swap when its rows have published copies: it is
+        # under the watermark, and the published table holds its inputs, not
+        # it, until `publish` replaces them (#160) — once it is finished.
+        through = self.published_through()
         self._buffer.record_merge(
-            self._key(target),
+            outputs,
             (self._key(f.path) for f in run),
-            swap=run[0].start <= self.published_through(),
+            swap=[r for r, lo, _, _ in outputs if lo <= through],
         )
 
     def _retention_boundary(self) -> int:
@@ -1532,6 +1634,14 @@ class Maintenance:
             (self._key(p) for p in paths),
             int(datetime.now(UTC).timestamp()),
         )
+
+
+def _output(rel_path: str, tally: _Tally, held: int) -> tuple[str, int, int, int]:
+    """One merged file's `(rel_path, start, end, bytes)`, from what was written
+    to it."""
+    assert tally.low is not None and tally.high is not None
+
+    return rel_path, tally.low, tally.high + 1, held
 
 
 @dataclass

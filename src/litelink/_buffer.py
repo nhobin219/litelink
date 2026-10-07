@@ -21,7 +21,7 @@ import pyarrow as pa
 from litelink._config import LogConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import (
@@ -1943,49 +1943,43 @@ class Buffer:
             )
 
     def record_merge(
-        self, rel_path: str, sources: Iterable[str], *, swap: bool = False
+        self,
+        outputs: Sequence[tuple[str, int, int, int]],
+        sources: Iterable[str],
+        swap: Iterable[str] = (),
     ) -> None:
-        """Replace the sources' extents with one covering all of them, and with
-        `swap`, record that the output still has to replace published copies of
-        them (see `awaiting_swap`) — in the same transaction, so no crash leaves
-        the merge committed and the swap forgotten.
-
-        Addition, not re-measurement: a merge writes exactly the rows it read,
-        so the output holds what the inputs held and spans what they spanned.
-        That keeps the number in the same currency as the seal that first
-        measured it, however many rewrites later — which is the whole reason it
-        is carried rather than derived from whatever the merged file compresses
-        to.
+        """Replace the sources' extents with the outputs' — `(rel_path, start,
+        end, bytes)` each, `bytes` what the merge measured its rows holding in
+        Arrow — and record the outputs in `swap` as owed a swap (see
+        `awaiting_swap`), in one transaction, so no crash leaves the merge
+        recorded and the swap forgotten.
         """
         paths = list(sources)
-        if not paths:
-            return
-
-        placeholders = ",".join("?" * len(paths))
+        owed = list(swap)
         with self._transaction():
-            summed = self._con.execute(
-                "SELECT sum(bytes), count(*), min(start_offset), max(end_offset)"  # noqa: S608
-                f" FROM extent WHERE rel_path IN ({placeholders})",
-                paths,
-            ).fetchone()
-            # Only when every source was recorded. Summing a subset would
-            # understate the output and invite a merge of something already
-            # full; leaving it absent marks it unknown, which every caller
-            # treats as "do not touch".
-            if summed[1] == len(paths):
+            for rel_path, start, end, held in outputs:
                 self._con.execute(
                     "INSERT INTO extent"
                     " (start_offset, end_offset, bytes, rel_path, named_at)"
                     " VALUES (?, ?, ?, ?, unixepoch())"
                     " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
-                    (summed[2], summed[3], int(summed[0]), rel_path),
+                    (start, end, held, rel_path),
                 )
 
-            self._con.execute(
-                f"DELETE FROM extent WHERE rel_path IN ({placeholders})",  # noqa: S608
-                paths,
-            )
-            if swap:
+            if paths:
+                placeholders = ",".join("?" * len(paths))
+                self._con.execute(
+                    f"DELETE FROM extent WHERE rel_path IN ({placeholders})",  # noqa: S608
+                    paths,
+                )
+                # A source that was itself owed a swap is owed nothing now: the
+                # merge's output carries the debt.
+                self._con.execute(
+                    f"DELETE FROM awaiting_swap WHERE rel_path IN ({placeholders})",  # noqa: S608
+                    paths,
+                )
+
+            for rel_path in owed:
                 self._con.execute(
                     "INSERT OR IGNORE INTO awaiting_swap (rel_path) VALUES (?)",
                     (rel_path,),

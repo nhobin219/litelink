@@ -37,8 +37,8 @@ if TYPE_CHECKING:
 NAMESPACE = "litelink"
 
 
-# The directory compaction writes into, under a log's `data/`. A file there is
-# a merge's output, which `runs` never merges again (see `is_compacted`).
+# The directory compaction writes into, under a log's `data/`: a merge's
+# outputs, finished or in progress.
 COMPACTED = "compacted"
 
 
@@ -259,8 +259,12 @@ class Layout:
         """
         return f"{self.name}/data/{start}-{end}-{token}.parquet"
 
-    def compaction_path(self, start: int, end: int, token: str) -> str:
-        """Root-relative path for the merge of the offsets `[start, end)` (§6).
+    def compaction_path(self, start: int, token: str) -> str:
+        """Root-relative path for a merged file starting at offset `start` (§6).
+
+        Named by its first offset alone: a merge cuts its output at the target
+        size on disk, so a file's end is not known when its name has to be
+        recorded.
 
         `token` makes it unique per attempt, and unlike a seal's path it does
         NOT need to be derivable: `compacting` records it before the file
@@ -275,7 +279,7 @@ class Layout:
         because its source is the buffer, which is still there; a compaction's
         source is the file it is replacing.
         """
-        return f"{self.name}/data/{COMPACTED}/{start}-{end}-{token}.parquet"
+        return f"{self.name}/data/{COMPACTED}/{start}-{token}.parquet"
 
     def ingest_path(self, start: int, token: str) -> str:
         """Root-relative path for a bulk-ingested file starting at `start` (§13.4).

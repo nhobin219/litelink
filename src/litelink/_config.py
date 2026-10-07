@@ -24,9 +24,9 @@ from datetime import timedelta
 # requests to 4, and a full scan from 570-1,230 to 209-414, while every query
 # measured locally was within noise of the small files.
 #
-# Files land under it: a run is closed once its inputs fill it, and the merge
-# compresses better than they did — by about a third on sealed ticks and
-# order-book snapshots, where 512 MiB of seals merges into about 350-370 MB.
+# Files land AT it: compaction grows one in-progress file a step at a time and
+# cuts it on the writer's own `tell()` (#162), so a finished file overshoots by
+# at most one row group, however much better the merge compressed.
 #
 # What it costs is time in staging. `publish` takes only files compaction has
 # finished with, so a stream publishes in 512 MB steps: at 114 rows a second,
@@ -147,6 +147,14 @@ class LogConfig:
     # `target_row_group_size`, so nothing ties the file to what a process can
     # hold. None means `DEFAULT_COMPACT_SIZE`.
     target_compact_size: int | None = None
+    # §6. How much new sealed data, ON DISK, compaction waits for before it
+    # rewrites the in-progress file to absorb it (#162). Every rewrite reads
+    # and writes the whole in-progress file, so this bounds the rewrites per
+    # finished file — target / step of them, about 4.5 local writes per row at
+    # the default — however often `compact` runs. Smaller grows the file
+    # sooner, leaving fewer seals local, for more local writes. None means an
+    # eighth of `compact_size`.
+    target_compact_step_size: int | None = None
     # Arrow bytes compaction sorts and writes as one row group: its memory
     # bound, and the unit an offset range is localised to inside a file. See
     # `DEFAULT_ROW_GROUP_SIZE`.
@@ -162,6 +170,15 @@ class LogConfig:
     def compact_size(self) -> int:
         """The on-disk file size compaction aims for."""
         return self.target_compact_size or DEFAULT_COMPACT_SIZE
+
+    @property
+    def compact_step(self) -> int:
+        """How much new sealed data, on disk, the in-progress file absorbs per
+        rewrite: `target_compact_step_size`, or an eighth of the target."""
+        if self.target_compact_step_size is not None:
+            return self.target_compact_step_size
+
+        return max(1, self.compact_size // 8)
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
@@ -324,6 +341,7 @@ class LogConfig:
             {
                 "target_seal_size": self.target_seal_size,
                 "target_compact_size": self.target_compact_size,
+                "target_compact_step_size": self.target_compact_step_size,
                 "target_seal_rows": self.target_seal_rows,
                 "target_row_group_size": self.target_row_group_size,
                 "target_row_group_rows": self.target_row_group_rows,
@@ -385,6 +403,9 @@ class LogConfig:
             target_seal_size=raw.get("target_seal_size", defaults.target_seal_size),
             target_compact_size=raw.get(
                 "target_compact_size", defaults.target_compact_size
+            ),
+            target_compact_step_size=raw.get(
+                "target_compact_step_size", defaults.target_compact_step_size
             ),
             target_seal_rows=raw.get("target_seal_rows", defaults.target_seal_rows),
             target_row_group_size=raw.get(

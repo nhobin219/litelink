@@ -715,6 +715,24 @@ pyiceberg's `CommitFailedException`, and either way nothing landed and the next 
 what is left. `examples/adsb/maintainer.py` runs each
 role, and `just demo-maintain` starts all five.
 
+**Flush on two schedules, for two different things.**
+- **RPO and published-table freshness: `seal` and `publish`.** On your RPO interval, say every
+  15 minutes, the seal process calls `seal(flush=True)` and the publish process
+  `publish(flush=True)`; between those they run unflushed.
+  - Both are needed: a flushed publish pushes only what is sealed. Without `wal_replication`,
+    data on this machine and nowhere else is at most about one seal interval plus one publish
+    interval old. With it, seconds.
+  - Without flushing, the published table receives only finished files, up to one
+    `target_compact_size` behind the writer.
+- **Staging read performance: `compact`, and leave it unflushed.** Plain `compact()` already
+  grows the log's in-progress file a step at a time (`target_compact_step_size`), so staging
+  holds one file plus under a step of seals. `compact(flush=True)` only skips the step, which
+  rewrites the in-progress file on every call; keep it for shutdown and tests.
+
+The two schedules are independent: an in-progress file that holds published rows never absorbs
+an unpublished seal, so a flushed publish never has to upload a growing file, whichever process
+ran first.
+
 ## Published table
 
 ```python
@@ -722,12 +740,14 @@ log.publish(*, flush: bool = False) -> None
 ```
 
 `publish` uploads the staging files compaction is finished with, registers them into the
-published table in one commit, and records the watermark (§5). Compactions are never
-replicated: a file is pushed once it is settled, and compaction will not merge what the
-published table holds. `flush=True` also pushes the trailing run that
+published table in one commit, and records the watermark (§5). `flush=True` also pushes what
 `stable_prefix` holds back for compaction — everything unpublished, not a subset, because the
-push walks a prefix and the watermark it records must stay contiguous. Use it to close a bulk
-load's tail on a log that has gone quiet; the cost is undersized objects the published table keeps.
+push walks a prefix and the watermark it records must stay contiguous.
+- **What a flush pushes early stays a recompaction candidate** (#160). Compaction folds it into
+  the log's in-progress file, and once that file is finished `publish` swaps it in for the early
+  copies in one commit over the same rows.
+- **So flushing costs a second upload of those rows, not small files for good.** Use it on your
+  RPO interval (see the process split) and to close a bulk load's tail.
 
 `publish` is lazy, restartable and arbitrarily far behind, and **no read
 depends on it**. All three raise `RuntimeError` when another owner holds the claim.
@@ -919,6 +939,7 @@ stay dense across the two, and any engine reads both as one sequence.
 target_seal_size      int             = 8 MiB    uncompressed (Arrow) bytes per SEAL
 target_seal_rows      int | None      = None     the other ceiling; whichever is hit FIRST
 target_compact_size   int | None      = None     bytes ON DISK per compacted FILE (None = 512 MiB)
+target_compact_step_size int | None = None     new sealed bytes on disk per in-progress rewrite (None = target/8)
 target_row_group_size int             = 64 MiB   Arrow bytes compaction sorts and holds at once
 target_row_group_rows int | None      = None     rows per row group, beside the bytes (None = no limit)
 staging_retention     timedelta|None  = None     staging window by TIME (None keeps everything)
@@ -937,8 +958,8 @@ Frozen dataclass, with `to_json`/`from_json` and one derived property, `compact_
 `set_config` needs no rewrite.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
-construction: `compact_min_files` below 2, a `target_row_group_size` or `target_row_group_rows`
-below 1, `wal_retention` without `wal_replication`, `wal_replication` without an s3:// published
+construction: `compact_min_files` below 2, a `target_compact_step_size` outside
+`[1, target_compact_size]`, a `target_row_group_size` or `target_row_group_rows` below 1, `wal_retention` without `wal_replication`, `wal_replication` without an s3:// published
 table, a `vacuum_free_ratio` outside `[0, 1]`, and a `compression` this build cannot write are
 each refused.
 

@@ -20,7 +20,7 @@ from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import DEFAULT_COMPACT_SIZE
 from litelink._handle import LogConfig, WriteHandle, validate
 from litelink._layout import Layout
-from litelink._maintenance import _covered, runs, stable_prefix
+from litelink._maintenance import _covered, merges, stable_prefix, stretches
 from litelink._table import DataFile
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
@@ -323,7 +323,7 @@ def test_recovery_queues_a_crashed_compaction_by_name(tmp_path: Path) -> None:
     config = LogConfig(compact_min_files=99, staging_snapshot_retention=timedelta(0))
     with open_log(tmp_path, config) as log:
         seal_files(log, 1)
-        rel_path = log._layout.compaction_path(1, 4, "deadbeef")
+        rel_path = log._layout.compaction_path(1, "deadbeef")
         log._buffer.claim_compaction(1, 4, rel_path)
         half_written = tmp_path / rel_path
         half_written.parent.mkdir(parents=True, exist_ok=True)
@@ -630,35 +630,74 @@ def sized(*sizes: int) -> list[DataFile]:
     ]
 
 
-def test_a_run_closes_before_it_exceeds_the_budget() -> None:
-    """The output cap. Without it, a hundred files just under the line merge
-    into one file a hundred times the target."""
-    grouped = runs(sized(30, 30, 30, 30, 30), 100)
+def test_full_files_stand_alone_and_split_the_rest_into_stretches() -> None:
+    """A file at the target is never merged again; the files between full ones
+    form stretches, and only the last can grow."""
+    grouped = stretches(sized(10, 500, 10, 20, 300, 5), 100)
 
-    assert [len(run) for run in grouped] == [3, 2]
-    assert all(sum(f.size for f in run) <= 100 for run in grouped)
-
-
-def test_a_file_over_the_budget_forms_its_own_run() -> None:
-    """It has no room for a neighbour, so it must not drag one in."""
-    grouped = runs(sized(10, 500, 10), 100)
-
-    assert [[f.size for f in run] for run in grouped] == [[10], [500], [10]]
-
-
-def test_the_trailing_run_is_never_settled() -> None:
-    """It is under budget, so a file that has not been written yet can still
-    join it — pushing it now would publish something compaction will replace.
-
-    Two files short of `min_files`, so compaction leaves them alone today; it
-    is room in the budget, not the merge, that makes them unsettled.
-    """
-    assert stable_prefix(sized(60, 60, 20), 100, 3) == 1
+    assert [[f.size for f in st.files] for st in grouped] == [
+        [10],
+        [500],
+        [10, 20],
+        [300],
+        [5],
+    ]
+    assert [st.open for st in grouped] == [False, False, False, False, True]
 
 
-def test_a_full_trailing_run_is_settled() -> None:
-    """Nothing more fits, so nothing can change it."""
-    assert stable_prefix(sized(60, 60, 100), 100, 2) == 3
+def test_the_open_stretch_merges_every_step() -> None:
+    """The in-progress file absorbs the files after it once they add up to a
+    step (#162); a closed stretch merges at `compact_min_files`. Nothing here
+    is published: the floor is past every file."""
+    unpublished = 1
+
+    def due(*sizes: int, min_files: int = 4, flush: bool = False) -> list[int]:
+        found = []
+        for st in stretches(sized(*sizes), 100):
+            for run in merges(st, 100, 12, min_files, unpublished, flush=flush):
+                found.append(len(run))
+
+        return found
+
+    assert due(60, 5, 6) == [], "11 is under the step of 12"
+    assert due(60, 5, 6, flush=True) == [3], "unless flushed"
+    assert due(60, 5, 6, 2) == [4], "13 reaches the step"
+    assert due(5, 6, 200, min_files=3) == [], "two files, three needed"
+    assert due(5, 6, 200, min_files=2) == [2]
+
+
+def test_an_unpublished_file_never_grows_a_published_one() -> None:
+    """Once the in-progress file holds published rows, it absorbs published
+    files only: folding in a seal nobody has published would leave those rows
+    only inside an unfinished file, which the next flush would have to upload.
+    The seals after the floor wait for a flush, or merge on their own once they
+    fill a target, so a log that stops flushing is never stuck."""
+    files = sized(40, 10, 10, 10, 10)
+    floor = files[3].start  # the first three are published
+
+    (st,) = stretches(files, 100)
+    assert merges(st, 100, 12, 2, floor, flush=False) == [files[:3]]
+    assert merges(st, 100, 12, 2, floor, flush=True) == [files[:3]], (
+        "not even under flush"
+    )
+
+    stuck = sized(40, 10, 30, 30, 30, 30)
+    (st,) = stretches(stuck, 100)
+    floor = stuck[2].start
+    runs = merges(st, 100, 1000, 2, floor, flush=False)
+    assert runs == [stuck[2:]], "a whole target of unpublished seals goes alone"
+
+
+def test_the_open_stretch_is_never_settled() -> None:
+    """Files not yet written will join it — pushing it now would publish
+    something compaction will replace."""
+    assert stable_prefix(sized(60, 60, 20), 100, 3) == 0
+
+
+def test_a_full_file_settles_what_compaction_leaves_before_it() -> None:
+    """A closed stretch under `compact_min_files` will never be merged, so it is
+    settled, and so is the full file after it."""
+    assert stable_prefix(sized(60, 60, 100), 100, 3) == 3
 
 
 def test_nothing_before_a_mergeable_run_is_settled() -> None:
@@ -669,10 +708,10 @@ def test_nothing_before_a_mergeable_run_is_settled() -> None:
 
 def test_a_stranded_small_file_is_still_settled() -> None:
     """The regression that made a single explicit seal block the published table
-    forever. A small file between larger neighbours can never be merged — no
-    run containing it fits the budget — so waiting for it to grow waits
-    forever, and the watermark never advances past it again."""
-    assert stable_prefix(sized(98, 5, 98, 200), 100, 2) == 4
+    forever. A small file between full neighbours can never be merged, so
+    waiting for it to grow waits forever, and the watermark never advances past
+    it again."""
+    assert stable_prefix(sized(200, 5, 200, 150), 100, 2) == 4
 
 
 def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> None:
@@ -800,10 +839,15 @@ def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
 def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> None:
     """The job the split gives it: seal at the size a hot read wants to scan,
     compact to the size object storage wants to receive — on disk, where the
-    target is stated."""
+    target is stated, and AT it (#162): a file is cut on the writer's own
+    `tell()`, so it lands at the target rather than under it, overshooting by at
+    most the row group that crossed it."""
     config = LogConfig(
         target_seal_size=4096,
         target_compact_size=1 << 30,
+        # Small, so a file can be cut every few seals: it ends only between
+        # row groups.
+        target_row_group_size=4096,
         compact_min_files=2,
         staging_snapshot_retention=timedelta(0),
     )
@@ -814,18 +858,19 @@ def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> No
         assert len(sealed) >= 6, "several full seals to convert"
 
         # Room for about three seals per file, on disk.
-        target = 3 * max(f.size for f in sealed)
+        seal = max(f.size for f in sealed)
+        target = 3 * seal
         log.set_config(replace(config, target_compact_size=target))
         log.advance()
 
-        compacted = log._table.data_files()
-        assert len(compacted) < len(sealed), "compaction must merge"
-        assert max(f.size for f in compacted) > max(f.size for f in sealed), (
-            "a compacted file must be larger than a sealed one"
+        *finished, last = log._table.data_files()
+        assert finished, "compaction must finish a file"
+        assert all(target <= f.size < target + 2 * seal for f in finished), (
+            "a finished file is at the target, overshooting by one row group"
         )
-        assert all(f.size <= target for f in compacted), (
-            "and no larger than the compaction target"
-        )
+        # The last is the in-progress file, or finished too when the final row
+        # group happened to carry it past the target.
+        assert last.size < target + 2 * seal
         assert log.scan().read_all().num_rows == 1200
 
 
@@ -939,6 +984,13 @@ def test_an_empty_row_group_row_ceiling_is_refused() -> None:
         validate(SCHEMA, (), config, None)
 
 
+def test_a_step_outside_the_target_is_refused() -> None:
+    for step in (0, 101):
+        config = LogConfig(target_compact_size=100, target_compact_step_size=step)
+        with pytest.raises(ValueError, match="target_compact_step_size"):
+            validate(SCHEMA, (), config, None)
+
+
 def test_an_empty_row_group_size_is_refused() -> None:
     config = LogConfig(target_row_group_size=0)
     with pytest.raises(ValueError, match="target_row_group_size"):
@@ -974,7 +1026,9 @@ def test_the_passes_can_be_run_separately(tmp_path: Path) -> None:
         log.evict()
         log.reclaim()
 
-        assert log._table.data_files() == [], "eviction must run on its own"
+        # All but the in-progress file, which stays local until it is
+        # finished and swapped (#162).
+        assert len(log._table.data_files()) <= 1, "eviction must run on its own"
         # Every row still reads: the evicted ones from the published table,
         # the unsealed tail from the buffer, which eviction never touches.
         assert log.scan().read_all().num_rows == 1200
@@ -1096,20 +1150,14 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
         assert all(f.rows == 4 for f in after), "a file was split by the boundary"
 
 
-def test_compaction_will_not_merge_a_file_the_published_table_holds(
+def test_compaction_will_not_merge_across_a_push_in_flight(
     tmp_path: Path,
 ) -> None:
-    """A merge spanning the published table's extent is a duplicate that cannot be undone.
-
-    Its inputs would include files already pushed, so the merged file covers a
-    range partially overlapping one the published table holds — and `register` declines
-    only a range that is ENTIRELY covered, so the partial one is admitted and
-    the same offsets sit in two published files for ever.
-
-    Compaction therefore skips a file the published table holds, asked per file (§4a).
-    That is also what keeps the two tiers' ranges aligned: a file the published table
-    holds is never rewritten locally, so the ranges stay comparable at all.
-    """
+    """A copy that is intended but not confirmed is coverage the swap cannot
+    replace (#160): it may land with cuts of its own. Merging across it would
+    leave a staging file straddling what the published table then holds, and
+    nothing re-cuts a staging straddler. So compaction leaves everything below
+    an unconfirmed intent alone."""
     config = LogConfig(
         target_seal_size=4096,
         target_compact_size=8 * 4096,
@@ -1131,17 +1179,19 @@ def test_compaction_will_not_merge_a_file_the_published_table_holds(
 
         assert len(files) >= 4
 
-        # The published table holds the first two.
-        log._buffer.confirm_published(files[1].end - 1)
+        # A push of the first two is in flight.
+        for f in files[:2]:
+            log._buffer.intend_file(f"s3://bucket/prefix/{f.path}", f.start, f.end, 1)
 
         boundary = files[1].end - 1
-        log.compact()
+        log.compact(flush=True)
 
         merged = log._table.data_files()
 
-        assert all(f.start > boundary or (f.end - 1) <= boundary for f in merged), (
-            "no file may span the published table's extent, or the published table gets it twice"
+        assert {f.path for f in files[:2]} <= {f.path for f in merged}, (
+            "files under an unconfirmed intent are not merged"
         )
+        assert all(f.start > boundary or (f.end - 1) <= boundary for f in merged)
         assert log.scan().read_all().num_rows == 1200
     finally:
         log.close()
