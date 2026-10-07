@@ -856,8 +856,9 @@ at the target. Eviction still asks about the CONFIGURED published table, because
 where the copy is.
 
 **And `publish` applies the same exclusion, or the two deadlock.** `stable_prefix` holds a file
-back when compaction might still merge it; compaction refuses to merge anything a published table
-holds. Those are one rule, and `stretches` is shared between them precisely so they cannot
+back when compaction might still merge it; compaction merges published files only as
+recompaction candidates this table's watermark covers, never across a push in flight or another
+table's coverage (#160). Those are one rule, and `stretches` is shared between them precisely so they cannot
 disagree — giving compaction a second input `stable_prefix` could not see was enough to
 break it. After a re-point to a fresh prefix the floor is 0, so files the old published table covers
 return to `pending`, group into a mergeable run under a raised target, and are held back for
@@ -1753,8 +1754,11 @@ target_seal_size       Arrow bytes per SEAL               (size it for READ late
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
                                                           whatever compression achieved)
-staging_retention      staging window, by TIME            (> longest hot lookback, with margin; 0 = evict on publish)
+staging_retention      staging window, by TIME            (> longest hot lookback, with margin; default 1 day;
+                                                          0 = evict on publish)
 staging_rows           staging window, by ROWS            (floor: keep at least this many recent rows)
+staging_max_bytes      staging size, on DISK              (ceiling over both floors: the newest files that
+                                                          fit stay; None = no cap)
 staging_snapshot_retention    staging snapshot expiry floor    (> longest local scan; default 15 min)
 published_snapshot_retention  published snapshot expiry floor  (> longest remote scan; default 1 hour)
 compact_min_files      minimum adjacent files to compact  (default 4; below 2 is refused —
@@ -2300,9 +2304,9 @@ The consequence worth planning for is that local disk holds roughly
    files went 40 to 240 with snapshots pinned at one. §6 selects files holding *under*
    `target_compact_size`, so a file compaction has already produced at or above that size is
    never revisited — compaction bounds how many *small* files exist and cannot reduce the
-   total. Eviction is the only mechanism that removes a large file, and §8 makes
-   `staging_retention = None` the default, so a local-only capture that keeps its history still
-   degrades. Less steeply than this entry first claimed, and for a reason now named.
+   total. Eviction is the only mechanism that removes a large file, and a log that sets
+   a `staging_retention` of years to keep its history local still degrades. Less steeply than
+   this entry first claimed, and for a reason now named.
 
    Worth measuring before choosing a fix, since the options differ in shape: raising
    `target_compact_size` over time so yesterday's output is tomorrow's input, tiered compaction, or

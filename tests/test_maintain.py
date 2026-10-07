@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import threading
@@ -816,13 +817,14 @@ def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> N
 
 
 def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
-    """`staging_retention=None` used to mean "never evict", full stop. With a row
-    floor set it means "no limit from TIME", and the floor still applies."""
+    """A row floor with no window in time: `staging_retention=0` evicts on
+    publish, and `staging_rows` keeps the last few rows local regardless —
+    the policies are floors, and the one that retains more binds."""
     config = LogConfig(
         target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 30,
         compact_min_files=2,
-        staging_retention=None,
+        staging_retention=timedelta(0),
         staging_rows=4,
         staging_snapshot_retention=timedelta(0),
     )
@@ -989,6 +991,52 @@ def test_a_step_outside_the_target_is_refused() -> None:
         config = LogConfig(target_compact_size=100, target_compact_step_size=step)
         with pytest.raises(ValueError, match="target_compact_step_size"):
             validate(SCHEMA, (), config, None)
+
+
+def test_a_byte_cap_overrides_the_retention_floors(tmp_path: Path) -> None:
+    """`staging_max_bytes` is a ceiling: a day's window would keep every file
+    here, and the cap keeps only the newest that fit — the floors are about hot
+    reads, the cap about disk, and disk wins."""
+    config = LogConfig(
+        target_compact_size=1,  # every file final: eviction, not candidates
+        target_seal_size=1 << 30,
+        staging_snapshot_retention=timedelta(0),
+    )
+    with open_log(tmp_path, config) as log:
+        seal_files(log, 6)
+        log.publish(flush=True)
+        files = log._table.data_files()
+        cap = files[-1].size + files[-2].size
+        log.set_config(replace(config, staging_max_bytes=cap))
+        log._maintenance.evict()
+
+        kept = log._table.data_files()
+        assert [f.path for f in kept] == [f.path for f in files[-2:]], (
+            "the newest files that fit under the cap stay, nothing more"
+        )
+        assert len(read_all(log)) == 24, "the evicted rows read from published"
+
+
+def test_an_empty_byte_cap_is_refused() -> None:
+    with pytest.raises(ValueError, match="staging_max_bytes"):
+        validate(SCHEMA, (), LogConfig(staging_max_bytes=0), None)
+
+
+def test_a_stored_unbounded_retention_becomes_the_default(tmp_path: Path) -> None:
+    """A log written when `staging_retention=None` meant "keep everything" —
+    and was the default — opens with today's default, and says so durably."""
+    from litelink._buffer import CONFIG_KEY
+    from litelink._config import DEFAULT_STAGING_RETENTION
+
+    with open_log(tmp_path, LogConfig()) as log:
+        stored = json.loads(log._buffer.get_meta(CONFIG_KEY) or "{}")
+        stored["staging_retention"] = None
+        log._buffer.set_meta(CONFIG_KEY, json.dumps(stored))
+
+    with open_log(tmp_path) as log:
+        assert log.config.staging_retention == DEFAULT_STAGING_RETENTION
+        stored = json.loads(log._buffer.get_meta(CONFIG_KEY) or "{}")
+        assert stored["staging_retention"] == DEFAULT_STAGING_RETENTION.total_seconds()
 
 
 def test_an_empty_row_group_size_is_refused() -> None:
@@ -1299,7 +1347,12 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
     is valid throughout, commits them back.
     """
     # Every file final: this is about eviction, not recompaction candidates.
-    config = LogConfig(staging_rows=1, target_seal_size=1 << 30, target_compact_size=1)
+    config = LogConfig(
+        staging_rows=1,
+        staging_retention=timedelta(0),
+        target_seal_size=1 << 30,
+        target_compact_size=1,
+    )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.publish(flush=True)
@@ -1494,7 +1547,7 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
                             # field seen as an int by the guard and as None by
                             # the arithmetic after it is `int - None`.
                             staging_rows=None if churned % 2 else 200,
-                            staging_retention=None
+                            staging_retention=timedelta(0)
                             if churned % 3
                             else timedelta(seconds=30),
                         )
@@ -1547,7 +1600,7 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
     because the values happened to line up harmlessly.
     """
     config = LogConfig(
-        target_seal_size=1 << 30, staging_rows=200, staging_retention=None
+        target_seal_size=1 << 30, staging_rows=200, staging_retention=timedelta(0)
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
@@ -1723,7 +1776,12 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
     directly.
     """
     # Every file final: this is about eviction, not recompaction candidates.
-    config = LogConfig(staging_rows=1, target_seal_size=1 << 30, target_compact_size=1)
+    config = LogConfig(
+        staging_rows=1,
+        staging_retention=timedelta(0),
+        target_seal_size=1 << 30,
+        target_compact_size=1,
+    )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.publish(flush=True)

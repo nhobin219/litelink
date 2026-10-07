@@ -2876,6 +2876,7 @@ def test_advance_cycles_and_reloads_reuse_one_file_io(
             target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
             compact_min_files=2,
             staging_rows=100,
+            staging_retention=timedelta(0),  # rows only: the floor binds
             staging_snapshot_retention=timedelta(seconds=0),
             published_snapshot_retention=timedelta(seconds=0),
         ),

@@ -1601,6 +1601,7 @@ class WriteHandle(LocalReadHandle):
         )
         log.recover()
         log._backfill_manifest()
+        log._settle_stored_config()
 
         return log
 
@@ -2306,6 +2307,22 @@ class WriteHandle(LocalReadHandle):
 
     # -- settings ----------------------------------------------------------
 
+    def _settle_stored_config(self) -> None:
+        """Write back a stored config an earlier version left with
+        `staging_retention: null`.
+
+        That was "keep everything", and the default, before every log had a
+        published table holding every row. It reads as today's default already
+        (`LogConfig.from_json`); written back, the stored policy says what the
+        log does, with nothing for anyone to change after upgrading.
+        """
+        encoded = self._buffer.get_meta(_CONFIG_KEY)
+        if (
+            encoded is not None
+            and json.loads(encoded).get("staging_retention", 0) is None
+        ):
+            self.set_config(LogConfig.from_json(encoded))
+
     def _restore_tail(self) -> None:
         """Bring the published table's tail back into staging, so compaction
         finishes what it was doing when the old machine went (#166).
@@ -2722,14 +2739,11 @@ class WriteHandle(LocalReadHandle):
 
         if loaded is not None and publish:
             try:
-                # COMPACT first, and it is not tidiness. The push below takes
-                # the whole trailing run, so every undersized seal still sitting
-                # below the load goes to the published table with it — and
-                # compaction will not merge what the published table holds, so
-                # they stay small there for ever. Merging them in staging first
-                # collapses that to the one file a run genuinely cannot fill.
-                # Measured on five small seals: six undersized objects pushed
-                # without this, one with it.
+                # COMPACT first. The push below may take the whole in-progress
+                # region with `flush`, and whatever it pushes unmerged is an
+                # early copy, uploaded again when compaction swaps it out
+                # (#160). Merging what is due first sends fewer, larger files
+                # the first time.
                 self.compact()
                 self.publish(flush=flush)
             except Exception as exc:
@@ -3495,9 +3509,10 @@ class WriteHandle(LocalReadHandle):
         **Only the range it pushes**, `[floor, end)`: from the published
         table's frontier to the end of what this push would upload. Nothing
         else needs to wait for it. A seal lands above the staging table's end,
-        eviction below the published floor, and compaction refuses what the
-        published table holds — and a compaction over the trailing run, which
-        `flush` pushes too, overlaps this range and so is excluded by it.
+        eviction below the published floor, and compaction below it only on
+        files the published table already holds (#160) — and a compaction
+        over the in-progress region, which `flush` pushes too, overlaps this
+        range and so is excluded by it.
         The whole-log operations still exclude any publish.
 
         **Two publishes still exclude each other.** Both start at the same
@@ -4503,7 +4518,11 @@ def validate(
             msg = f"{name} must not be negative: {retention}"
             raise ValueError(msg)
 
-    if config.staging_retention is not None and config.staging_retention < timedelta(0):
+    if config.staging_max_bytes is not None and config.staging_max_bytes < 1:
+        msg = f"staging_max_bytes must be at least 1: {config.staging_max_bytes}"
+        raise ValueError(msg)
+
+    if config.staging_retention < timedelta(0):
         # The same check its twin above has always had, and the reason it
         # matters more here: eviction computes `now - staging_retention`, so a
         # negative one puts the cutoff in the FUTURE and every file in the log

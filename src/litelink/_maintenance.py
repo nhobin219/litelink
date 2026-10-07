@@ -860,6 +860,13 @@ class Maintenance:
         on what stays readable locally, so the one that retains MORE wins,
         which is the opposite of how the seal combines its two limits (§12).
 
+        `staging_max_bytes` is the exception, and a ceiling: the newest files
+        it keeps add up to it on disk, everything older goes, whatever the
+        floors would keep. It exists for disk, so it wins. Files eviction may
+        not drop — unpublished (I4), or compaction's still (#160, #162) — count
+        toward it all the same, so under pressure it takes more of the rest;
+        they are held below, after this bound.
+
         Its own method because eviction computes it twice: once to decide
         whether there is work and what range to claim, and again under that
         claim, where the answer is the one acted on.
@@ -876,13 +883,11 @@ class Maintenance:
         # Fresh per decision, coherent within it.
         config = self.config
         limits: list[int] = []
-        retention = config.staging_retention
-        if retention is not None:
-            cutoff = datetime.now(UTC) - retention
-            stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
-            # Nothing old enough is a limit of zero, not an absent one: it
-            # means this policy would keep everything.
-            limits.append(max((f.end for f in stale), default=0))
+        cutoff = datetime.now(UTC) - config.staging_retention
+        stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
+        # Nothing old enough is a limit of zero, not an absent one: it means
+        # this policy would keep everything.
+        limits.append(max((f.end for f in stale), default=0))
 
         if config.staging_rows is not None:
             # COUNTED, not subtracted from the frontier. `next_offset() - 1 -
@@ -914,7 +919,18 @@ class Maintenance:
                 # Every staging file is inside the window: keep all of them.
                 limits.append(0)
 
-        return min(limits) if limits else 0
+        boundary = min(limits) if limits else 0
+        if config.staging_max_bytes is not None:
+            held = 0
+            for data_file in sorted(
+                self._table.data_files(), key=lambda f: f.end, reverse=True
+            ):
+                held += data_file.size
+                if held > config.staging_max_bytes:
+                    boundary = max(boundary, data_file.end)
+                    break
+
+        return boundary
 
     def evict_buffer(
         self, start_offset: int | None = None, end_offset: int | None = None
@@ -978,18 +994,7 @@ class Maintenance:
         Never deletion: every log has a published table (#98), and I4 keeps a
         file until it holds it.
         """
-        # The POLICY re-read first, because it decides everything below. Read
-        # again under the claim as well: this one only decides whether there is
-        # work, and the one that decides the deletion has to be the guarded one.
-        config = self.config
-        if (
-            not everything
-            and config.staging_retention is None
-            and config.staging_rows is None
-        ):
-            return
-
-        # Same reason as `compact`: this decides what to drop from the ages a
+        # Reloaded first, for the same reason as `compact`: this decides what to drop from the ages a
         # handle reports, and a stale one reports a table that has moved.
         self._table.reload()
         self._age_cache = None

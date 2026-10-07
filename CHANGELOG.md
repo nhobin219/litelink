@@ -67,6 +67,14 @@ with `flush` and compacts without it.
 
 ### Added
 
+- **`staging_max_bytes`, a cap on the staging table's size on disk.** The
+  retention settings are floors on what stays local for hot reads; this is a
+  ceiling over them, for a stream fast enough that a day of it is more disk
+  than the machine has. The newest files that fit stay, older ones go,
+  whatever the floors would keep. It can't evict what isn't published yet
+  (I4) or the in-progress region, so staging can sit above it by about one
+  `target_compact_size`, or by a publish backlog. No cap by default.
+
 - **`restore` brings the published table's tail back into staging** (#166).
   The files after the last one at `target_compact_size` — seals a flushed
   publish pushed early, an in-progress file uploaded unfinished — return as
@@ -89,6 +97,26 @@ with `flush` and compacts without it.
   drain once no live snapshot names them.
 
 ### Changed
+
+- **Breaking: `staging_retention` is always a window, one day by default.**
+  It no longer accepts `None`, which meant "keep everything" and was the
+  default before every log had a published table holding every row (#98);
+  the staging table is a cache for hot reads now, and a window bounds it. A
+  log that wants years of history local sets years. **Nothing to do on
+  upgrade:** a stored `None` reads as the one-day default, and a writer
+  rewrites its stored config to say so on its next open. `timedelta(0)` with
+  `staging_rows` is the rows-only policy `None` with `staging_rows` used to
+  be.
+- **Upgrading re-cuts what staging holds, once.** Files compacted by an
+  earlier version were sized in Arrow bytes, so they are under the new
+  on-disk target and are recompaction candidates: compaction grows them into
+  512 MiB files and `publish` swaps those in for the published copies.
+  Nothing is lost or duplicated; the cost is local rewrites (about 4.5× the
+  staged window) and one re-upload of it, and eviction keeps those files
+  local until they are re-cut. The window is what staging held at upgrade:
+  your retention for a log that set one, the whole log for one on the old
+  default of keeping everything. Raising `target_compact_size` later does the
+  same.
 
 - **Compaction streams, and sizes files on disk: 512 MiB by default** (#158).
   `target_compact_size` is now bytes on disk, defaulting to 512 MiB (Iceberg's

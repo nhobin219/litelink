@@ -50,6 +50,10 @@ DEFAULT_COMPACT_SIZE = 512 * 1024 * 1024
 # whole compacted file was this size.
 DEFAULT_ROW_GROUP_SIZE = 64 * 1024 * 1024
 
+# How long the staging table keeps a published file for hot reads, when
+# nothing says (`LogConfig.staging_retention`).
+DEFAULT_STAGING_RETENTION = timedelta(days=1)
+
 
 @dataclass(frozen=True, slots=True)
 class LogConfig:
@@ -64,13 +68,12 @@ class LogConfig:
     # writes. §7 makes it a READ-LATENCY knob before a file-size one: the
     # buffer is the entire variable cost of a hot read.
     #
-    # There is deliberately no `max_age` beside it. A timer sealing a quiet
-    # stream emits a small file every interval for ever — the layout §6 exists
-    # to repair — and it made the knob do double duty as an RPO policy, so
-    # shrinking the window to lose less on a crash produced worse files. §3a
-    # names that trade and WAL replication is what breaks it: freshness in the
-    # cloud is replication's job, not the seal's. With the timer gone every cut
-    # lands exactly here, so no undersized file is ever written.
+    # There is deliberately no `max_age` beside it: a size is not a schedule.
+    # Bounding what a crash can lose without WAL replication is the
+    # maintainer's call, made explicitly — `seal(flush=True)` and
+    # `publish(flush=True)` on its RPO interval — and the short files a flush
+    # cuts are compaction's to fold into the in-progress file (§6, #162), so
+    # the files a log ends with do not depend on how often it flushes.
     #
     # BYTES, not rows. §13.3 is the deciding argument: a row-count bound can
     # exceed a byte-based memory limit, so it loses the race to the OOM killer
@@ -182,11 +185,23 @@ class LogConfig:
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
-    # None keeps everything in staging and grows without bound. Zero means
-    # "evict on publish" — pure archival capture, hot reads limited to the
-    # buffer. Every log has a published table (#98), local by default, so zero
-    # never deletes a file publish has not taken: eviction still waits on I4.
-    staging_retention: timedelta | None = None
+    # A day by default (`DEFAULT_STAGING_RETENTION`). Every log has a published
+    # table (#98), local by default, which already holds every row, so the
+    # staging table is a cache for hot reads rather than the log's copy, and
+    # it always has a window: a log that wants years of history local sets
+    # years. Zero means "evict on publish" — pure archival capture, hot reads
+    # limited to the buffer, or to `staging_rows` when that is set. Eviction
+    # never deletes a file publish has not taken, whatever this says (I4), nor
+    # one compaction is still working on (#160, #162).
+    staging_retention: timedelta = DEFAULT_STAGING_RETENTION
+    # §8. A CEILING on the staging table's size on disk, where the two settings
+    # either side of it are floors: the newest files that fit stay, older ones
+    # go, whatever the floors would keep — for a stream fast enough that a day
+    # of it is more disk than the machine has. None is no cap. Files eviction
+    # may not drop still count toward it and stay: unpublished ones (I4), and
+    # the in-progress region (at most about one `target_compact_size`), so the
+    # table can sit above it by that much, or by a publish backlog.
+    staging_max_bytes: int | None = None
     # §8, the other half of the same policy. A window in time and a count of
     # rows bound different things, and which one binds depends on a rate the
     # library cannot know: an hour of a quiet stream is a handful of rows, and
@@ -345,12 +360,9 @@ class LogConfig:
                 "target_seal_rows": self.target_seal_rows,
                 "target_row_group_size": self.target_row_group_size,
                 "target_row_group_rows": self.target_row_group_rows,
-                "staging_retention": (
-                    None
-                    if self.staging_retention is None
-                    else self.staging_retention.total_seconds()
-                ),
+                "staging_retention": self.staging_retention.total_seconds(),
                 "staging_rows": self.staging_rows,
+                "staging_max_bytes": self.staging_max_bytes,
                 "wal_replication": self.wal_replication,
                 "vacuum_free_ratio": self.vacuum_free_ratio,
                 "wal_retention": (
@@ -414,14 +426,20 @@ class LogConfig:
             target_row_group_rows=raw.get(
                 "target_row_group_rows", defaults.target_row_group_rows
             ),
+            # A stored None is the "keep everything" this no longer offers: it
+            # was the default before every log had a published table holding
+            # every row, so it reads as today's default (see `WriteHandle.open`).
             staging_retention=(
-                retention
-                if isinstance(retention, timedelta) or retention is None
+                defaults.staging_retention
+                if retention is None
+                else retention
+                if isinstance(retention, timedelta)
                 else timedelta(seconds=retention)
             ),
             staging_rows=raw.get(
                 "staging_rows", raw.get("local_rows", defaults.staging_rows)
             ),
+            staging_max_bytes=raw.get("staging_max_bytes", defaults.staging_max_bytes),
             wal_replication=raw.get("wal_replication", defaults.wal_replication),
             vacuum_free_ratio=raw.get("vacuum_free_ratio", defaults.vacuum_free_ratio),
             wal_retention=(
