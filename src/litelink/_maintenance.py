@@ -184,21 +184,26 @@ def input_slices(data_file: DataFile) -> list[tuple[int, int]]:
 
 
 def row_groups(
-    inputs: Iterable[Iterable[pa.RecordBatch]], schema: pa.Schema, size: int
+    inputs: Iterable[Iterable[pa.RecordBatch]],
+    schema: pa.Schema,
+    size: int,
+    rows: int | None = None,
 ) -> Iterator[pa.Table]:
     """A merge's rows, a row group at a time, broken only between inputs.
 
     Whole inputs are gathered until the next would take the group past `size`
-    Arrow bytes. Breaking between them is what keeps each row group's offsets
+    Arrow bytes or `rows` rows. Breaking between them is what keeps each row group's offsets
     disjoint from its neighbours': an input is sorted by `sort_by`, so cutting
     one in two leaves both halves spanning its whole offset range. An input
-    larger than `size` on its own is the exception, and is cut by `chunks` —
+    larger than either on its own is the exception, and is cut by `chunks` —
     its pieces overlap each other, and nothing else.
     """
+    limit = rows or _NO_ROW_LIMIT
     held: list[pa.Table] = []
     measured = 0
+    counted = 0
     for source in inputs:
-        pieces = chunks(source, schema, size)
+        pieces = chunks(source, schema, size, rows)
         piece = next(pieces, None)
         if piece is None:
             continue
@@ -206,17 +211,20 @@ def row_groups(
         following = next(pieces, None)
         if following is None:
             # The whole input fits in one row group.
-            if held and measured + piece.nbytes > size:
+            if held and (
+                measured + piece.nbytes > size or counted + piece.num_rows > limit
+            ):
                 yield pa.concat_tables(held)
-                held, measured = [], 0
+                held, measured, counted = [], 0, 0
 
             held.append(piece)
             measured += piece.nbytes
+            counted += piece.num_rows
             continue
 
         if held:
             yield pa.concat_tables(held)
-            held, measured = [], 0
+            held, measured, counted = [], 0, 0
 
         yield piece
         yield following
@@ -226,11 +234,7 @@ def row_groups(
         yield pa.concat_tables(held)
 
 
-def runs(
-    files: Sequence[DataFile],
-    budget: int,
-    rows: int | None = None,
-) -> list[list[DataFile]]:
+def runs(files: Sequence[DataFile], budget: int) -> list[list[DataFile]]:
     """Adjacent files grouped into merge candidates, each within `budget`.
 
     The one definition of what compaction considers a run, because two
@@ -252,16 +256,11 @@ def runs(
     file would take it past the budget, and the pass emits several correctly
     sized files instead of one enormous one.
 
-    `rows` is `target_compact_rows`, a ceiling a log may set as well; whichever
-    binds first closes the run.
-
     The trailing run may still be open — see `is_open`.
     """
-    limit = rows or _NO_ROW_LIMIT
     grouped: list[list[DataFile]] = []
     run: list[DataFile] = []
     held = 0
-    counted = 0
     for data_file in files:
         # A merge's output counts as full whatever its size. A merge compresses
         # better than its inputs did — larger row groups — so its output lands
@@ -270,16 +269,15 @@ def runs(
         # rewritten again, and the file still filling would be rewritten on
         # every pass. Counted full, every row is compacted exactly once.
         size = budget if is_compacted(data_file.path) else data_file.size
-        # A file already at either ceiling on its own closes the previous run
-        # and forms one of its own, which then closes on the next file. No
-        # special case needed: it simply never has room for a neighbour.
-        if run and (held + size > budget or counted + data_file.rows > limit):
+        # A file already at the budget on its own closes the previous run and
+        # forms one of its own, which then closes on the next file. No special
+        # case needed: it simply never has room for a neighbour.
+        if run and held + size > budget:
             grouped.append(run)
-            run, held, counted = [], 0, 0
+            run, held = [], 0
 
         run.append(data_file)
         held += size
-        counted += data_file.rows
 
     if run:
         grouped.append(run)
@@ -287,28 +285,23 @@ def runs(
     return grouped
 
 
-def is_open(
-    run: Sequence[DataFile], files: Sequence[DataFile], budget: int, rows: int | None
-) -> bool:
-    """Whether `run` can still grow: it is the trailing run, and under both
-    ceilings, so files not yet written may join it.
+def is_open(run: Sequence[DataFile], files: Sequence[DataFile], budget: int) -> bool:
+    """Whether `run` can still grow: it is the trailing run, and under the
+    budget, so files not yet written may join it.
 
     Compaction waits for an open run, and `publish` holds it back: merged now,
     it would be merged again — with everything sealed after it — on every pass
     until it filled.
     """
-    limit = rows or _NO_ROW_LIMIT
     held = sum(budget if is_compacted(f.path) else f.size for f in run)
-    counted = sum(f.rows for f in run)
 
-    return run[-1] is files[-1] and held < budget and counted < limit
+    return run[-1] is files[-1] and held < budget
 
 
 def stable_prefix(
     files: Sequence[DataFile],
     budget: int,
     min_files: int,
-    rows: int | None = None,
 ) -> int:
     """How many leading files compaction will never touch again.
 
@@ -335,13 +328,13 @@ def stable_prefix(
     never advanced again and I4 then pinned local disk too. Not "later" — never.
     """
     settled = 0
-    for run in runs(files, budget, rows):
+    for run in runs(files, budget):
         if len(run) >= min_files:
             break
 
         # Room under BOTH ceilings is what makes the trailing run growable. At
         # either one it is finished, and a file that cannot grow is settled.
-        if is_open(run, files, budget, rows):
+        if is_open(run, files, budget):
             break
 
         settled += len(run)
@@ -543,9 +536,9 @@ class Maintenance:
 
         # One read, so the two limits describe the same policy.
         config = self.config
-        budget, rows = config.compact_size, config.target_compact_rows
-        for run in runs(pending, budget, rows):
-            if flush or not is_open(run, pending, budget, rows):
+        budget = config.compact_size
+        for run in runs(pending, budget):
+            if flush or not is_open(run, pending, budget):
                 self._merge(run)
 
     def memory(self) -> dict[str, int]:
@@ -686,7 +679,12 @@ class Maintenance:
         )
         del first  # held by `inputs` only until it moves past it
         with stream_parquet(dest, schema, config.compression) as write:
-            for group in row_groups(inputs, schema, config.target_row_group_size):
+            for group in row_groups(
+                inputs,
+                schema,
+                config.target_row_group_size,
+                config.target_row_group_rows,
+            ):
                 if order:
                     group = group.sort_by([(c, "ascending") for c in order])
 

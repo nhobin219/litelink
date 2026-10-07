@@ -890,7 +890,6 @@ def test_only_compacted_files_are_eligible_for_the_published_table(
             sealed,
             config.compact_size,
             config.compact_min_files,
-            config.target_compact_rows,
         )
 
         assert settled == 0, (
@@ -927,10 +926,9 @@ def test_the_compaction_target_defaults_to_iceberg_s(tmp_path: Path) -> None:
         assert log.scan().read_all().num_rows == 1200
 
 
-def test_a_row_ceiling_under_the_seal_s_is_refused() -> None:
-    """Every sealed file would be a run of its own, so nothing would merge."""
-    config = LogConfig(target_seal_rows=100, target_compact_rows=50)
-    with pytest.raises(ValueError, match="target_compact_rows"):
+def test_an_empty_row_group_row_ceiling_is_refused() -> None:
+    config = LogConfig(target_row_group_rows=0)
+    with pytest.raises(ValueError, match="target_row_group_rows"):
         validate(SCHEMA, (), config, None)
 
 

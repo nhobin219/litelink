@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 import litelink
 from litelink import LogConfig, WriteHandle
@@ -517,32 +518,25 @@ def test_the_seal_cuts_on_whichever_limit_is_reached_first(tmp_path: Path) -> No
         )
 
 
-def test_a_row_capped_cut_is_not_undone_by_compaction(tmp_path: Path) -> None:
-    """The half that is easy to miss.
-
-    A file cut on the row limit holds fewer BYTES than `target_seal_size`, so
-    judged by bytes alone it looks starved — and compaction would merge exactly
-    the files the row cap just created, straight past the ceiling. Compaction
-    respects a row ceiling as the seal does; the only difference is which one,
-    since conversion aims at a larger file than a seal does.
-    """
+def test_a_row_group_closes_at_its_row_ceiling(tmp_path: Path) -> None:
+    """`target_row_group_rows` caps a compacted file's row groups, beside the
+    byte target: seals cut on rows merge into one file, in row groups of at
+    most that many rows."""
     config = quiet(
         target_seal_size=1 << 30,
         target_seal_rows=10,
-        # Equal to the seal's, so this is about the ceiling being respected
-        # rather than about the conversion. Left to default it would be eight
-        # times larger and these files would merge — correctly.
-        target_compact_rows=10,
+        target_row_group_rows=25,
         compact_min_files=2,
     )
     with open_log(tmp_path, config) as log:
         log.extend(rows(40))
         log.seal()
-        before = len(log._table.data_files())
-        assert before >= 3, "the row cap must have produced several files"
+        assert len(log._table.data_files()) >= 3
 
-        log.advance()
+        log.compact(flush=True)
 
-        after = log._table.data_files()
-        assert len(after) == before, "compaction must not merge past the ceiling"
-        assert all(f.rows <= 10 for f in after)
+        (merged,) = log._table.data_files()
+        meta = pq.ParquetFile(merged.path).metadata
+        groups = [meta.row_group(g).num_rows for g in range(meta.num_row_groups)]
+        assert max(groups) <= 25, groups
+        assert sum(groups) == merged.rows

@@ -1731,9 +1731,10 @@ target_seal_rows       max rows per SEAL                  (the other ceiling; th
                                                           no row limit)
 target_compact_size    bytes ON DISK per FILE             (what compaction converts sealed
                                                           files INTO. None = 512 MiB)
-target_compact_rows    max rows per compacted file        (None = no row limit)
 target_row_group_size  Arrow bytes per ROW GROUP          (what compaction sorts and holds at
                                                           once: its memory bound. 64 MiB)
+target_row_group_rows  max rows per ROW GROUP             (closes it at whichever it reaches
+                                                          first. None = no row limit)
 target_seal_size       Arrow bytes per SEAL               (size it for READ latency and for
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by

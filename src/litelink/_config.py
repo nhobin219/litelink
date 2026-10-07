@@ -147,12 +147,16 @@ class LogConfig:
     # `target_row_group_size`, so nothing ties the file to what a process can
     # hold. None means `DEFAULT_COMPACT_SIZE`.
     target_compact_size: int | None = None
-    # A row ceiling for the same files, for a log that wants one. None is none.
-    target_compact_rows: int | None = None
     # Arrow bytes compaction sorts and writes as one row group: its memory
     # bound, and the unit an offset range is localised to inside a file. See
     # `DEFAULT_ROW_GROUP_SIZE`.
     target_row_group_size: int = DEFAULT_ROW_GROUP_SIZE
+    # A row ceiling on the same row groups, for a log that wants one: a row
+    # group closes at whichever it reaches first. None is none. Bytes stay the
+    # primary limit, because a row count alone cannot bound rows of unbounded
+    # width — a million 10 KB payloads is 10 GB. pyarrow's own writer caps at
+    # 1,048,576 rows; Parquet's and Iceberg's guidance is in bytes.
+    target_row_group_rows: int | None = None
 
     @property
     def compact_size(self) -> int:
@@ -321,8 +325,8 @@ class LogConfig:
                 "target_seal_size": self.target_seal_size,
                 "target_compact_size": self.target_compact_size,
                 "target_seal_rows": self.target_seal_rows,
-                "target_compact_rows": self.target_compact_rows,
                 "target_row_group_size": self.target_row_group_size,
+                "target_row_group_rows": self.target_row_group_rows,
                 "staging_retention": (
                     None
                     if self.staging_retention is None
@@ -383,11 +387,11 @@ class LogConfig:
                 "target_compact_size", defaults.target_compact_size
             ),
             target_seal_rows=raw.get("target_seal_rows", defaults.target_seal_rows),
-            target_compact_rows=raw.get(
-                "target_compact_rows", defaults.target_compact_rows
-            ),
             target_row_group_size=raw.get(
                 "target_row_group_size", defaults.target_row_group_size
+            ),
+            target_row_group_rows=raw.get(
+                "target_row_group_rows", defaults.target_row_group_rows
             ),
             staging_retention=(
                 retention

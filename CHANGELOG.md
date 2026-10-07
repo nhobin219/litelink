@@ -39,11 +39,14 @@ minor version carries breaking changes.
   A log that set one keeps its number, which now means larger files —
   roughly the data's compression ratio larger. Re-set it to keep the old file
   size.
-- **Breaking: `target_compact_rows` no longer defaults to 8x
-  `target_seal_rows`**; None now means no row ceiling. `COMPACT_MULTIPLE` and
-  `LogConfig.compact_rows` are removed. A `target_compact_size` under
-  `target_seal_size` is no longer refused (the two are in different units);
-  a `target_compact_rows` under `target_seal_rows` still is.
+- **Breaking: `target_compact_rows` is replaced by `target_row_group_rows`.**
+  Files are sized by `target_compact_size` alone, as Iceberg sizes them; an
+  optional row ceiling applies to row groups instead, beside
+  `target_row_group_size`, closing one at whichever it reaches first (None, the
+  default, is no limit). A stored `target_compact_rows` is ignored.
+  `COMPACT_MULTIPLE` and `LogConfig.compact_rows` are removed, and a
+  `target_compact_size` under `target_seal_size` is no longer refused (the two
+  are in different units).
 - **Bulk-ingested files are named by their first offset alone**
   (`ingested/{start}-{token}.parquet`), since a streamed file's end is not
   known when its name is recorded.

@@ -2738,12 +2738,14 @@ class WriteHandle(LocalReadHandle):
         config = self.config
         order = self._buffer.sort_by()
         offset_field = shape.table.field(0)
-        cap = config.target_compact_rows
 
         def prepared() -> Iterator[tuple[pa.Table, int, int]]:
             """Each row group's worth: shaped, reserved, numbered, sorted."""
             for chunk in chunks(
-                reader, reader.schema, config.target_row_group_size, cap
+                reader,
+                reader.schema,
+                config.target_row_group_size,
+                config.target_row_group_rows,
             ):
                 rows = chunk.select(shape.columns).cast(shape.schema)
                 # Before this row group's reservation, so a refusal costs no
@@ -2780,25 +2782,18 @@ class WriteHandle(LocalReadHandle):
                 dest = self._layout.absolute(rel_path)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 held = 0
-                counted = 0
                 with stream_parquet(dest, rows.schema, config.compression) as write:
                     while group is not None:
                         rows, _, end = group
                         size = write(rows)
                         held += rows.nbytes
-                        counted += rows.num_rows
                         # `DEFAULT_TTL_MS` is 30 s and this path is sized in
                         # hours, so without a renew per row group the exclusion
                         # evaporates while the first file is still being written.
                         checkpoint(lease.renew)
                         group = next(groups, None)
-                        # The file closes at the target on disk, or before the
-                        # next row group would carry it past the row ceiling.
-                        if size >= config.compact_size or (
-                            cap is not None
-                            and group is not None
-                            and counted + group[0].num_rows > cap
-                        ):
+                        # The file closes at the target on disk.
+                        if size >= config.compact_size:
                             break
 
                 staged.append((rel_path, start, end, held))
@@ -3482,7 +3477,6 @@ class WriteHandle(LocalReadHandle):
             head,
             config.compact_size,
             config.compact_min_files,
-            config.target_compact_rows,
         )
 
     def _push(
@@ -4375,16 +4369,9 @@ def validate(
         )
         raise ValueError(msg)
 
-    if (
-        config.target_compact_rows is not None
-        and config.target_seal_rows is not None
-        and config.target_compact_rows < config.target_seal_rows
-    ):
+    if config.target_row_group_rows is not None and config.target_row_group_rows < 1:
         msg = (
-            f"target_compact_rows ({config.target_compact_rows}) must be at "
-            f"least target_seal_rows ({config.target_seal_rows}): compaction "
-            "converts sealed files into larger ones, and under a lower ceiling "
-            "every sealed file is a run of its own, so nothing would ever merge"
+            f"target_row_group_rows must be at least 1: {config.target_row_group_rows}"
         )
         raise ValueError(msg)
 
