@@ -486,12 +486,11 @@ class Maintenance:
 
         Real work on the happy path. Not repair — the cut is exact and there is
         no timer to cut early, so every file a seal writes already holds what
-        it should — but conversion: `target_compact_size` defaults to eight
-        times `target_seal_size`, so eight sealed files become one, before they
-        are published. It also picks up the deliberate exceptions: an explicit
-        `seal()`, which cuts short by definition, and a change to
-        `target_compact_size`, which leaves existing files sized for the old
-        value. A no-op only where the two targets are set equal.
+        it should — but conversion: seals are sized for a hot read, and
+        `target_compact_size` for object storage, so hundreds of sealed files
+        become one. It also picks up the deliberate exceptions: an explicit
+        `seal()`, which cuts short by definition, a flushed publish's early
+        copies (`merge_candidates`), and a change to `target_compact_size`.
 
         The table is unpartitioned, so the compaction unit is a contiguous
         offset range — safe precisely because sealed files already cover
@@ -505,34 +504,7 @@ class Maintenance:
         # against the moved branch, then it reloads and retries the swap on the
         # FRESH table, committing evicted data back into the log.
         self._table.reload()
-
-        # Published files are never inputs. A merge spanning the published
-        # table's span either duplicates the rows already pushed or strands the
-        # ones above them, and skipping them makes that unreachable. They are a
-        # prefix, so dropping them cannot break adjacency.
-        #
-        # Asked per file (§4a). It also keeps the two tiers' ranges aligned:
-        # a file the published table holds is never rewritten in staging, so
-        # the staging range and the published range stay the same range, which
-        # is what lets `published_prefix` match them at all.
-        local = self._table.data_files()
-        # Asked of ANY published table, not only the one the log points at
-        # now. A merge across a range some published table holds makes a
-        # staging file whose boundaries line up with nothing there — and
-        # nothing re-cuts a STAGING straddler, so pointing back at that
-        # published table stalls the log for good: eviction pins below the
-        # straddler and every push is refused. Four legitimate operations reach
-        # it — point away, raise the target, maintain, point back — with no
-        # warning at any step.
-        #
-        # Skipping them is not free: a file with a published copy is NOT
-        # necessarily at the target, once the target is RAISED after the copy
-        # was made. What it costs is that such a file stays at the size it was
-        # published at, as the published copy does. What it buys is that no merge can ever straddle a range a
-        # published table holds. `_push` applies the same exclusion, or the two
-        # deadlock.
-        published = self.published_prefix(local, include_intents=True)
-        pending = [f for f in local if f.end > published]
+        pending = self.merge_candidates(self._table.data_files())
 
         # One read, so the two limits describe the same policy.
         config = self.config
@@ -540,6 +512,49 @@ class Maintenance:
         for run in runs(pending, budget):
             if flush or not is_open(run, pending, budget):
                 self._merge(run)
+
+    def unsettled_from(self, files: Sequence[DataFile]) -> int:
+        """The index in `files` — the staging table's, in offset order — of
+        the first file compaction may still merge; `len(files)` if none.
+
+        `stable_prefix` over the whole staging table, published copies
+        included, because that is the one partition into runs that compaction,
+        `publish` and eviction can all agree on. Before it, every file is
+        final: `publish` may push it and eviction may drop it once published.
+        From it on, a file may yet be merged, whether or not it has a published
+        copy.
+        """
+        config = self.config
+
+        return stable_prefix(files, config.compact_size, config.compact_min_files)
+
+    def merge_candidates(self, files: Sequence[DataFile]) -> list[DataFile]:
+        """The staging files compaction may merge: those past the settled
+        prefix (`unsettled_from`), published or not.
+
+        **A published copy no longer excludes a file** (#160). A flushed
+        publish pushes files compaction is not finished with, and they are
+        merged like any other; `publish` then swaps the merged file in for
+        their published copies, in one commit over the same rows. Such a file
+        is a *recompaction candidate* — derived, not recorded: it is under the
+        watermark and not settled.
+
+        **Coverage from anywhere else still excludes.** A push in flight (an
+        unconfirmed intent) or a range another published table holds (a legacy
+        per-file row) is not something this log's swap can replace: the swap
+        replaces files of the table the watermark describes, matched by path.
+        Merging across either would leave a staging file whose boundaries line
+        up with nothing the published table holds, and nothing re-cuts a
+        staging straddler. So when coverage reaches past the landed watermark,
+        only the files above all of it are candidates.
+        """
+        rest = list(files[self.unsettled_from(files) :])
+        landed = self.published_prefix(files, include_intents=False)
+        claimed = self.published_prefix(files, include_intents=True)
+        if claimed > landed:
+            rest = [f for f in rest if f.start >= claimed]
+
+        return rest
 
     def memory(self) -> dict[str, int]:
         """What each data file holds uncompressed, keyed by the path a
@@ -608,23 +623,22 @@ class Maintenance:
 
             return
 
-        # The published premise too, not only the inputs' liveness. The run was
-        # grouped at pass start against the watermark as it was then, and a
-        # publish pass that ran since — under a policy whose grouping settles a
-        # partial prefix of this run — can have pushed part of it. Merging what
-        # is left commits a STAGING file straddling the published table's span,
-        # and nothing re-cuts a straddler.
+        # The published premise too, not only the inputs' liveness: every
+        # input must still be a merge candidate. Since the run was grouped, a
+        # publish may have pushed part of it — which is fine now, since the
+        # swap replaces published candidates — or begun pushing it (an intent
+        # in flight), or another process may have settled it; the last two are
+        # not this merge's to touch.
         #
-        # The published ranges read DURABLY here, not from this object's
-        # memory. A compaction pass holds no pass-level claim — only per-run
-        # ones — so what another process recorded between two runs of one pass
-        # has to be read, not remembered. A guard answering from pass-start
-        # memory can miss coverage recorded since, and a merge that straddles
-        # what the published table holds makes every push refuse in
-        # `_refuse_straddle`: the watermark never advances again, and eviction
-        # pins on it.
-        published = self.published_prefix(current, include_intents=True)
-        if any(f.start < published for f in run):
+        # Read DURABLY here, not from this object's memory. A compaction pass
+        # holds no pass-level claim — only per-run ones — so what another
+        # process recorded between two runs of one pass has to be read, not
+        # remembered. Merging across a range coverage the swap cannot replace
+        # leaves a staging straddler, and nothing re-cuts one: every push
+        # refuses in `_refuse_straddle`, the watermark never advances again,
+        # and eviction pins on it.
+        candidates = {f.path for f in self.merge_candidates(current)}
+        if not all(f.path in candidates for f in run):
             claim.release()
 
             return
@@ -652,8 +666,8 @@ class Maintenance:
     ) -> None:
         """Write the run's rows to one file, streamed (§6 steps 2-3).
 
-        The inputs are read one at a time, in offset order, through the table
-        so each comes out in the current schema. Every `target_row_group_size`
+        The inputs are read one at a time, in offset order, through the table,
+        as every read of it is. Every `target_row_group_size`
         of them is sorted by `sort_by` and written as one row group — so memory
         is a row group's worth whatever the file's size, and an offset range
         stays inside one or two row groups (see `DEFAULT_ROW_GROUP_SIZE`).
@@ -664,8 +678,9 @@ class Maintenance:
         dest = self._layout.absolute(rel_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tally = _Tally()
-        # Read through the table, so every input comes out in the current
-        # schema, one of its row groups at a time: `input_slices` names each
+        # Read through the table, as every read of it is — so the rows come out
+        # typed as a scan types them — one row group at a time: `input_slices`
+        # names each
         # row group's offsets, and the scan's statistics skip the rest of the
         # file. Not pyiceberg's batch reader, which casts each filtered batch to
         # large types — and pyarrow up to 25.0.1 aborts the process casting a
@@ -724,7 +739,15 @@ class Maintenance:
         # After the commit: until it lands the sources are still the live
         # files, and moving their sizes onto an output that never became real
         # would leave every one of them unmeasured.
-        self._buffer.record_merge(self._key(target), (self._key(f.path) for f in run))
+        #
+        # Owed a swap when any input has a published copy: the merged file is
+        # under the watermark, but the published table holds its inputs, not
+        # it, until `publish` replaces them (#160).
+        self._buffer.record_merge(
+            self._key(target),
+            (self._key(f.path) for f in run),
+            swap=run[0].start <= self.published_through(),
+        )
 
     def _retention_boundary(self) -> int:
         """The `end` below which the retention policies would drop, before I4.
@@ -928,6 +951,21 @@ class Maintenance:
             # intended one is the loss this whole record exists to prevent.
             self.published_prefix(files, include_intents=False),
         )
+        if not everything:
+            # Nor a file the published table holds only for now (#160): a
+            # recompaction candidate, which compaction will still merge, or a
+            # merged file still owed its swap. Dropped first, its rows would
+            # stay in the published table at the size they were pushed early
+            # at, for good. `retire` drops them anyway — a retired log never
+            # compacts again.
+            unsettled = self.unsettled_from(files)
+            if unsettled < len(files):
+                boundary = min(boundary, files[unsettled].start)
+
+            owed = self._buffer.awaiting_swaps()
+            boundary = min(
+                [boundary] + [f.start for f in files if self._key(f.path) in owed]
+            )
 
         # Snapped DOWN to a file boundary, against the list as it is now. The
         # age limit is already one — some file's `end` — and so is the published

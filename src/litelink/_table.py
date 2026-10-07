@@ -1777,8 +1777,15 @@ class LogTable:
 
         return span is not None and span[1] >= end
 
-    def replace_range(self, start: int, end: int, paths: Sequence[str]) -> None:
-        """Swap `[start, end)` for already-written files, in one snapshot (§6).
+    def replace_range(
+        self,
+        start: int,
+        end: int,
+        paths: Sequence[str],
+        properties: Mapping[str, str] | None = None,
+    ) -> None:
+        """Swap `[start, end)` for already-written files, in one snapshot (§6),
+        setting `properties` in the same commit.
 
         `overwrite()` would do this in a single call, but it writes the output
         itself — putting a path on disk this process only learns about
@@ -1793,6 +1800,8 @@ class LogTable:
             with self._table.transaction() as transaction:
                 transaction.delete(delete_filter=offset_in(start, end))
                 transaction.add_files(list(paths))
+                if properties:
+                    transaction.set_properties(dict(properties))
 
         self._commit(swap)
 

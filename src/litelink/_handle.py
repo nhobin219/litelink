@@ -53,7 +53,6 @@ from litelink._maintenance import (
     Maintenance,
     checkpoint,
     chunks,
-    stable_prefix,
 )
 from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import Reader, duckdb_connection
@@ -2634,9 +2633,8 @@ class WriteHandle(LocalReadHandle):
                 # they stay small there for ever. Merging them in staging first
                 # collapses that to the one file a run genuinely cannot fill.
                 # Measured on five small seals: six undersized objects pushed
-                # without this, one with it. Flushed with the push, so a tail
-                # still filling is merged before it goes too.
-                self.compact(flush=flush)
+                # without this, one with it.
+                self.compact()
                 self.publish(flush=flush)
             except Exception as exc:
                 # The LOAD succeeded and its rows are durable in Parquet; only
@@ -3354,39 +3352,25 @@ class WriteHandle(LocalReadHandle):
         there is no way to push the top of the list without the rest.
 
         `ingest` passes it, because a load's rows never enter the buffer and so
-        have no second copy to wait behind. An operator passes it to close a
-        load's tail on a log that has gone quiet, where the run never settles.
-        The cost is undersized objects in the published table that compaction
-        will not merge afterwards; `ingest` runs a compaction first to keep that
-        to what a run genuinely cannot fill.
+        have no second copy to wait behind. A maintainer passes it every N
+        seconds to bound how far the published table trails the writer.
 
         Published-facing work only. Lazy, restartable, and arbitrarily far
         behind — no read depends on it. Every log has a published table (#98),
         local by default, so there is always somewhere to push.
 
-        **Only files at or above the compaction threshold are pushed**, and that
-        one rule does three jobs. The published table never receives an
-        undersized file, so nothing ever has to merge one back out of object
-        storage — which would mean paying egress to fix a sizing decision made
-        locally. Such a file is also never a compaction input (`compact` only
-        builds runs from files BELOW the threshold), so nothing merges across
-        what the published table already holds, and no push can duplicate or
-        strand a range. And the undersized frontier stays in staging, bounded by
-        roughly `compact_min_files` files, until compaction grows it past the
-        line.
-
-        There is therefore at most one undersized region in the system and it is
-        always the staging one — **as long as nobody passes `flush`**.
-        That flag exists because a bulk load's rows never enter the buffer, so
-        the trailing run holding its short last file has no second copy to wait
-        behind, and the rule above would strand it on local disk for as long as
-        the stream stayed quiet. A load therefore can leave undersized objects
-        in the published table — up to `compact_min_files - 1` seals forming a
-        run `_merge` will not rewrite, plus the load's own tail — and compaction
-        will not merge them afterwards, because it refuses to touch anything the
-        published table holds; they stay as written. `ingest` compacts before
-        pushing to keep the count to what a run genuinely cannot
-        fill.
+        **Without `flush`, only files compaction has finished with are pushed**:
+        the settled prefix, where compaction will never merge again. What a
+        flush pushes before then stays a *recompaction candidate* (#160):
+        compaction merges it like any other file, and this swaps the merged
+        file in for its published copies in one commit over the same rows,
+        extending the published table when the merged file reaches past it
+        (`_swap_merged`). The published table therefore ends up at the
+        compaction target either way; a flush costs a second upload of the rows
+        it pushed early, not a small file for good. What stays small is only
+        what compaction itself will never merge — a file stranded between full
+        neighbours, a retired log's last candidates, or files pushed by an
+        earlier version that a restore did not bring back.
 
         **Publishing only**, a building block. Expiring the published table and
         sweeping it are routines of their own (`expire_published`, `sweep`),
@@ -3458,25 +3442,31 @@ class WriteHandle(LocalReadHandle):
         pending = [f for f in self._table.data_files() if f.end > floor]
         settled = self._settled(pending, flush=flush)
         end = pending[settled - 1].end if settled else floor + 1
+        # A merged file straddling the floor is swapped in and extends the
+        # published table to its end (#160), so the claim reaches that far too.
+        end = max([end] + [f.end for f in pending if f.start < floor])
 
         return self._lease(MAINTAIN_ROLE, floor, max(end, floor + 1)), end
 
     def _settled(self, pending: list[DataFile], *, flush: bool) -> int:
         """How many of `pending` — staging files above the published floor, in
         offset order — a push takes: everything compaction is finished with
-        (`stable_prefix`), past whatever is already intended or held, or all of
-        them with `flush`."""
+        (`Maintenance.unsettled_from`), past whatever is already intended or
+        held, or all of them with `flush`."""
         if flush:
             return len(pending)
 
-        config = self.config
+        files = self._table.data_files()
+        unsettled = self._maintenance.unsettled_from(files)
+        limit = files[unsettled].start if unsettled < len(files) else None
         frozen = self._maintenance.published_prefix(pending, include_intents=True)
-        head = [f for f in pending if f.start >= frozen]
 
-        return (len(pending) - len(head)) + stable_prefix(
-            head,
-            config.compact_size,
-            config.compact_min_files,
+        return sum(
+            1
+            for _ in itertools.takewhile(
+                lambda f: f.end <= frozen or limit is None or f.end <= limit,
+                pending,
+            )
         )
 
     def _push(
@@ -3500,12 +3490,12 @@ class WriteHandle(LocalReadHandle):
         `coverage()` reporting no gap. On a stream that then went quiet the run
         never settled, and 113,399 rows sat on one disk.
 
-        Safe in the direction it moves. Compaction refuses to merge anything a
-        published table already holds, so a file pushed early is simply never
-        merged — the cost is a small object the published table keeps, not a
-        duplicate range. The deadlock the
-        shared `runs` exclusion guards against is the opposite direction:
-        holding back a file compaction will never touch.
+        Safe in the direction it moves. A file pushed early stays a
+        recompaction candidate: compaction merges it, and `_swap_merged`
+        replaces its published copy with the merged file, over the same rows —
+        a second upload, not a duplicate range. The deadlock the shared
+        settled prefix guards against is the opposite direction: holding back
+        a file compaction will never touch.
 
         Everything compaction has finished with, which `stable_prefix` decides
         from compaction's own rule rather than from a size of its own. A file
@@ -3630,44 +3620,27 @@ class WriteHandle(LocalReadHandle):
                 self._buffer.forget_intent(path)
 
         memory = self._maintenance.memory()
+        # Swaps first: each can raise the floor, and what is pushed after them
+        # starts there.
+        floor = self._swap_merged(published, lease, floor, memory)
         pending = [f for f in self._table.data_files() if f.end > floor]
-        # `stable_prefix` holds a file back when compaction might still merge
-        # it, and compaction refuses to merge anything some published table
-        # already holds — so the two need the SAME exclusion or they deadlock.
-        # They share `runs` for exactly this reason, and giving compaction a
-        # second input this could not see was enough to break it: after a
-        # re-point to a fresh prefix the floor is 0, so files an old published
-        # table covers are back in `pending`, group into a mergeable run under a
-        # raised target, and are held back for ever against a merge that will
-        # never happen. Nothing is pushed, the watermark never moves, eviction
-        # pins on it, and no error surfaces anywhere.
+        # `_settled` holds a file back while compaction may still merge it, and
+        # compaction's candidates are exactly the files past the same settled
+        # prefix (`Maintenance.unsettled_from`) — so the two cannot disagree
+        # about what is in play. A second input one of them could not see is
+        # what deadlocked them once: files held back for ever against a merge
+        # that never came, the watermark stopped, and eviction pinned on it.
         #
-        # A file no merge can touch is settled by definition. Only the part
-        # above that line is still compaction's business.
-        # Intents included, so this exclusion is literally compaction's. The
-        # two share `runs` so they cannot disagree about what is in play, and
-        # a second input one of them could not see is what deadlocked them once
-        # already.
-        #
-        # `_settled` is the rule, shared with `_publish_lease` so the range a
+        # `_settled` is shared with `_publish_lease` too, so the range a
         # publish claims and the files it pushes are decided the same way.
         #
-        # With `flush`, EVERYTHING unpublished, and that is forced rather than chosen.
-        # `pending[:settled]` is a PREFIX because the watermark recorded
-        # below has to stay contiguous — eviction trusts it for I4 — so
-        # there is no way to push a load's tail while leaving an undersized
-        # SEAL beneath it unpushed. Attempted and measured: extending only
-        # through bulk-loaded files never advances past a seal sitting at
-        # index 0, and `published_through()` stays 0 with the load
-        # unpublished. Hence the blunt name.
-        #
-        # So this ships those files. Acceptable because of WHEN a load
-        # happens: `ingest` claims the whole log and is a backfill-time
-        # operation, so live capture is typically stopped and the trailing
-        # run is the load's own. And the alternative is worse by a wide
-        # margin — a load's rows never enter the buffer, so not pushing them
-        # leaves them on one disk. Compaction will not merge what the
-        # published table holds, so any small objects stay as they are.
+        # With `flush`, EVERYTHING unpublished, and that is forced rather than
+        # chosen. `pending[:settled]` is a PREFIX because the watermark recorded
+        # below has to stay contiguous — eviction trusts it for I4 — so there is
+        # no way to push a load's tail while leaving an undersized seal beneath
+        # it unpushed. What a flush pushes early stays a recompaction candidate:
+        # compaction still merges it, and `_swap_merged` replaces the published
+        # copies with the merged file (#160).
         settled = self._settled(pending, flush=flush)
         if bound is not None:
             # Inside the range claimed, and nothing past it: a seal or another
@@ -3740,6 +3713,93 @@ class WriteHandle(LocalReadHandle):
         self._buffer.confirm_published(
             last.end - 1, [published.uri(rel_path) for _, rel_path in uploaded]
         )
+
+    def _swap_merged(
+        self, published: LogTable, lease: Claim, floor: int, memory: dict[str, int]
+    ) -> int:
+        """Swap merged staging files in for the published copies of their
+        inputs (#160), returning the published floor after them.
+
+        A file is swapped when the merge that wrote it consumed inputs a
+        flushed publish had already pushed (`awaiting_swap`), or when it
+        straddles the floor — merged from published candidates and files not
+        yet pushed, which one commit both replaces and extends.
+
+        **Only what lines up.** The published files the swap replaces are the
+        ones overlapping the merged file's range, and every one of them must
+        lie inside it, from its start, without a gap: the merged file holds
+        exactly their rows plus, for a straddler, the ones above the floor. A
+        file that does not line up — cut by some other writer — is never
+        swapped; it is owed nothing, and its rows are published already.
+
+        **Ordered like a push** (I2, §6): the intent before the upload, the
+        replaced copies queued for deletion before the commit and restamped
+        after it, the watermark raised only after the commit. A crash at any
+        point is healed by the next pass: an intent whose commit landed is
+        confirmed by reconciliation, by path, and one that did not is forgotten
+        and retried, since the merged file is still owed. The replaced copies
+        are deleted by `drain` once no live snapshot names them.
+        """
+        owed = self._buffer.awaiting_swaps()
+        candidates = [
+            f
+            for f in self._table.data_files()
+            if self._layout.relative(f.path) in owed or f.start < floor < f.end
+        ]
+        if not candidates:
+            return floor
+
+        held = sorted(published.data_files(), key=lambda f: f.start)
+        for merged in candidates:
+            rel_path = self._layout.relative(merged.path)
+            uri = published.uri(rel_path)
+            replaced = [
+                f for f in held if f.end > merged.start and f.start < merged.end
+            ]
+            if any(f.path == uri for f in replaced):
+                # Swapped already, by a pass whose own record of it was lost.
+                self._buffer.clear_swap(rel_path)
+                continue
+
+            aligned = bool(replaced) and replaced[0].start == merged.start
+            for before, after in itertools.pairwise(replaced):
+                aligned = aligned and before.end == after.start
+
+            if not aligned or replaced[-1].end > merged.end:
+                _log.warning(
+                    "litelink: %s is not swapped into the published table: "
+                    "the published files over [%d, %d) do not line up with it",
+                    rel_path,
+                    merged.start,
+                    merged.end,
+                )
+                self._buffer.clear_swap(rel_path)
+                continue
+
+            checkpoint(lease.renew)
+            self._buffer.intend_file(
+                uri, merged.start, merged.end, memory.get(merged.path, merged.size)
+            )
+            published.put(self._layout.absolute(rel_path), rel_path)
+            superseded = [f.path for f in replaced]
+            self._buffer.enqueue_deletions(
+                superseded, int(datetime.now(UTC).timestamp())
+            )
+            checkpoint(lease.renew)
+            published.replace_range(
+                merged.start,
+                merged.end,
+                [uri],
+                properties={ISSUED_PROPERTY: str(self._buffer.next_offset() - 1)},
+            )
+            self._buffer.restamp_deletions(
+                superseded, int(datetime.now(UTC).timestamp())
+            )
+            self._buffer.confirm_published(merged.end - 1, [uri])
+            self._buffer.clear_swap(rel_path)
+            floor = max(floor, merged.end)
+
+        return floor
 
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.
@@ -3818,11 +3878,13 @@ class WriteHandle(LocalReadHandle):
         §6, §8, §12).
 
         `flush=True` pushes everything through, regardless of thresholds: it
-        passes `flush` to `seal`, `compact` and `publish`, so every buffered row
-        is sealed, the trailing run merged, and every staging file published in
-        this pass — at shutdown, say, to
-        get everything off this machine. The cost is undersized files, in
-        staging and in the published table, where they stay.
+        passes `flush` to `seal` and `publish`, so every buffered row is sealed
+        and every staging file published in this pass — at shutdown, say, to
+        get everything off this machine, or every N seconds to bound how far
+        the published table trails the writer. What it pushes early stays a
+        recompaction candidate: compaction merges it once its run fills, and
+        `publish` swaps the merged file in for the early copies (#160). The
+        cost is every such row uploaded twice.
 
         Data moves first, then cleanup follows behind it:
 
@@ -3864,7 +3926,10 @@ class WriteHandle(LocalReadHandle):
         # ready and `publish` only takes what compaction is finished with, so
         # a file sealed a moment ago is never touched before its time.
         self.seal(flush=flush)
-        self.compact(flush=flush)
+        # Not flushed: a flushed publish sends the trailing run's seals as
+        # they are, and they stay recompaction candidates (#160). Merging that
+        # run now would make one small, final file of it on every flush.
+        self.compact()
 
         # Held, not raised, so the local steps still run on a machine that
         # cannot reach a remote published table (§11).
@@ -3907,12 +3972,10 @@ class WriteHandle(LocalReadHandle):
         merges (§4a) and renews that claim as it works, so it excludes another
         maintainer only where their work overlaps.
 
-        Staging only. The published table is never rewritten: it is the log's
-        immutable record, and `publish` pushes only files compaction has
-        finished with, so it is well-sized by construction. The exceptions —
-        a flushed seal or publish, a bulk load's tail, a raised
-        `target_compact_size` — leave a few smaller files, which stay as they
-        were written.
+        Staging only. Files a flushed publish pushed early are merged like any
+        other; `publish` then swaps the merged file in for their published
+        copies (#160), so the published table is rewritten only by a swap over
+        rows it already holds.
         """
         self._maintenance.compact(flush=flush)
 

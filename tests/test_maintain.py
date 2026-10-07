@@ -122,7 +122,9 @@ def test_eviction_drops_files_past_staging_retention(tmp_path: Path) -> None:
     """§8. Eviction drops what the published table holds, and the rows stay
     readable from there — a local-only log publishes to a local directory (#98)."""
     config = LogConfig(
-        compact_min_files=99,  # isolate eviction from compaction
+        # Every file final — at the target on its own — so this is about
+        # retention, not about recompaction candidates, which eviction holds.
+        target_compact_size=1,
         staging_retention=timedelta(microseconds=1),
     )
     with open_log(tmp_path, config) as log:
@@ -192,7 +194,8 @@ def test_eviction_waits_for_the_published_table_to_hold_the_file(
     the bucket it went to (§4a). Not a watermark: one summarised the same facts
     and was the only boundary in the log that could move backwards.
     """
-    config = LogConfig(staging_retention=timedelta(0))
+    # Every file final: this is about eviction, not recompaction candidates.
+    config = LogConfig(staging_retention=timedelta(0), target_compact_size=1)
     log = litelink.new(
         tmp_path,
         "s",
@@ -247,6 +250,7 @@ def test_eviction_alone_does_not_free_disk(tmp_path: Path) -> None:
     short.
     """
     config = LogConfig(
+        target_compact_size=1,  # every file final: eviction, not candidates
         compact_min_files=99,
         staging_retention=timedelta(microseconds=1),
         staging_snapshot_retention=timedelta(days=365),  # nothing may expire
@@ -556,6 +560,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
     be counted.
     """
     config = LogConfig(
+        target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 40,
         compact_min_files=2,
         staging_retention=timedelta(microseconds=1),
@@ -684,6 +689,7 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
     was old enough to evict. Retention silently did nothing.
     """
     config = LogConfig(
+        target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 30,
         compact_min_files=2,
         staging_retention=timedelta(microseconds=1),
@@ -774,6 +780,7 @@ def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
     """`staging_retention=None` used to mean "never evict", full stop. With a row
     floor set it means "no limit from TIME", and the floor still applies."""
     config = LogConfig(
+        target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 30,
         compact_min_files=2,
         staging_retention=None,
@@ -1241,7 +1248,8 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
     still live — and then this commit removes them while the merge, whose claim
     is valid throughout, commits them back.
     """
-    config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
+    # Every file final: this is about eviction, not recompaction candidates.
+    config = LogConfig(staging_rows=1, target_seal_size=1 << 30, target_compact_size=1)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.publish(flush=True)
@@ -1664,7 +1672,8 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
     it. The stamp is what the reader's grace rests on, so it is asserted
     directly.
     """
-    config = LogConfig(staging_rows=1, target_seal_size=1 << 30)
+    # Every file final: this is about eviction, not recompaction candidates.
+    config = LogConfig(staging_rows=1, target_seal_size=1 << 30, target_compact_size=1)
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         log.publish(flush=True)

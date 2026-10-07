@@ -63,8 +63,9 @@ START_OFFSET_KEY = "start_offset"
 # The last offset the published table holds — written by `publish` only after
 # a register lands, reconciled against the published table's own span, and
 # never lowered (`raise_meta`). The published table is fixed when the log is
-# created and nothing rewrites it, so this only ever rises: it is the published
-# coverage eviction and compaction read (§4a). `Maintenance.PUBLISHED_THROUGH_KEY`.
+# created, and the only rewrite it takes is a swap over rows it already holds
+# (#160), so this only ever rises: it is the published coverage eviction and
+# compaction read (§4a). `Maintenance.PUBLISHED_THROUGH_KEY`.
 PUBLISHED_THROUGH_KEY = "published_through"
 
 # Where the published table's coverage begins, recorded only for a log
@@ -786,6 +787,20 @@ class Buffer:
               bytes        INTEGER NOT NULL
             )
         """)
+        # Merged staging files that still have to replace published copies of
+        # their inputs (#160). A merge whose inputs were published early — by
+        # a flushed publish, before compaction was done with them — writes a
+        # file the published table does not hold yet, under a watermark that
+        # already covers it: `publish` swaps it in for those copies. Nothing
+        # local could tell that file from one already swapped, so it is
+        # recorded, from the merge's commit until the swap's.
+        #
+        # A table of its own, not a column on `extent`, for `extent_intent`'s
+        # reason: a build that predates it ignores it, and evicts such a file
+        # as published, which costs only the swap.
+        self._con.execute(
+            "CREATE TABLE IF NOT EXISTS awaiting_swap (rel_path TEXT PRIMARY KEY)"
+        )
         self._con.execute(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
         )
@@ -1927,8 +1942,13 @@ class Buffer:
                 "DELETE FROM extent_intent WHERE rel_path = ?", (rel_path,)
             )
 
-    def record_merge(self, rel_path: str, sources: Iterable[str]) -> None:
-        """Replace the sources' extents with one covering all of them.
+    def record_merge(
+        self, rel_path: str, sources: Iterable[str], *, swap: bool = False
+    ) -> None:
+        """Replace the sources' extents with one covering all of them, and with
+        `swap`, record that the output still has to replace published copies of
+        them (see `awaiting_swap`) — in the same transaction, so no crash leaves
+        the merge committed and the swap forgotten.
 
         Addition, not re-measurement: a merge writes exactly the rows it read,
         so the output holds what the inputs held and spans what they spanned.
@@ -1964,6 +1984,26 @@ class Buffer:
             self._con.execute(
                 f"DELETE FROM extent WHERE rel_path IN ({placeholders})",  # noqa: S608
                 paths,
+            )
+            if swap:
+                self._con.execute(
+                    "INSERT OR IGNORE INTO awaiting_swap (rel_path) VALUES (?)",
+                    (rel_path,),
+                )
+
+    def awaiting_swaps(self) -> set[str]:
+        """The merged staging files still to be swapped into the published
+        table, root-relative."""
+        with self._lock:
+            rows = self._con.execute("SELECT rel_path FROM awaiting_swap").fetchall()
+
+        return {str(row[0]) for row in rows}
+
+    def clear_swap(self, rel_path: str) -> None:
+        """The swap landed, or never can: the file is no longer owed."""
+        with self._lock:
+            self._con.execute(
+                "DELETE FROM awaiting_swap WHERE rel_path = ?", (rel_path,)
             )
 
     # -- meta ---------------------------------------------------------------
@@ -2009,8 +2049,8 @@ class Buffer:
         **What the published table holds is one range**, `[published_from,
         published_through]` (§4a). `publish` raises the watermark only after a
         register lands and reconciles it against the published table's span, a
-        log's published table is fixed when it is created, and nothing rewrites
-        it — so the range only grows, and a gap below it is a gap in the log's
+        log's published table is fixed when it is created, and a swap replaces
+        files only over rows it already holds (#160) — so the range only grows, and a gap below it is a gap in the log's
         offsets, holding no rows anywhere.
 
         With intents, compaction's question also covers a register in flight
@@ -2760,11 +2800,16 @@ class Buffer:
 
         - **`compacting` stays.** It only queues deletions, and its outputs
           are published objects this machine never wrote.
+        - **`awaiting_swap` goes.** It names merged staging files, and the
+          staging table is rebuilt empty; early copies the published table
+          already holds stay as they are.
 
         Finally the offset sequence is raised by `reserve`. See `litelink.restore`.
         """
         with self._transaction():
             self._con.execute("DELETE FROM extent")
+            # The staging files they name are not restored, so no swap is owed.
+            self._con.execute("DELETE FROM awaiting_swap")
             self._con.execute(
                 "DELETE FROM pending_delete WHERE rel_path NOT LIKE '%://%'"
             )
