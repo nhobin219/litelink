@@ -20,6 +20,7 @@ from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._layout import Layout
 from litelink._read import Reader
 from litelink._table import VERSION_HINT
+from tests.conftest import keep_newest_rows
 from tests.test_publish import ROWS, SCHEMA, rows
 
 
@@ -42,16 +43,12 @@ def local_log(root: Path, *, at: str | None = None, **overrides: object) -> Writ
 
 def published(root: Path, *, at: str | None = None, **overrides: object) -> WriteHandle:
     """Every row published, most evicted from the staging table, a tail buffered."""
-    settings: dict[str, object] = {
-        "staging_retention": timedelta(0),
-        "staging_rows": 1000,
-        **overrides,
-    }
-    log = local_log(root, at=at, **settings)
+    log = local_log(root, at=at, **overrides)
     log.extend(rows(ROWS))
     log.seal(flush=True)
     log.publish(flush=True)
     log.advance()
+    keep_newest_rows(log, 1000)
     log.extend({"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(7))
 
     return log
@@ -436,7 +433,7 @@ def test_maintain_seals_publishes_and_evicts_in_one_pass(tmp_path: Path) -> None
     Falsify by moving `publish` after `evict` in `advance`: the staging table
     still holds the files after one pass.
     """
-    with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
+    with local_log(tmp_path, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
 
         log.advance()
@@ -610,7 +607,7 @@ def test_a_local_log_never_loads_the_read_cache(
     Falsify by installing the cache before the reader's `remote()` check: the
     extension loads and the default directory appears.
     """
-    with local_log(tmp_path, staging_retention=timedelta(0), staging_rows=0) as log:
+    with local_log(tmp_path, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.advance(flush=True)
         assert log.staging_files() == 0, "the read must reach the published table"

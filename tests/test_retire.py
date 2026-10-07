@@ -24,6 +24,7 @@ from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._replication import control_socket, litestream_binary
 from litelink._table import RETIRED_PROPERTY
+from tests.conftest import keep_newest_rows
 from tests.test_publish import ROWS, published_log, rows
 
 if TYPE_CHECKING:
@@ -42,14 +43,13 @@ def written(
         tmp_path,
         bucket,
         s3,
-        staging_retention=timedelta(0),
-        staging_rows=1000,
         **overrides,
     )
     log.extend(rows(ROWS))
     log.seal(flush=True)
     log.publish(flush=True)
     log.advance()
+    keep_newest_rows(log, 1000)
     log.extend({"event_ts": ROWS + i, "key": "t", "payload": "y"} for i in range(7))
 
     return log

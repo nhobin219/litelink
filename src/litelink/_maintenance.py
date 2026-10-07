@@ -852,79 +852,37 @@ class Maintenance:
         )
 
     def _retention_boundary(self) -> int:
-        """The `end` below which the retention policies would drop, before I4.
+        """The `end` below which the retention limits would drop, before I4.
 
         Files cover contiguous non-overlapping ranges, so evicting a prefix is
-        a single upper bound. Anything newer is untouched — and each policy is
-        one such bound, so honouring both is taking the lower. They are floors
-        on what stays readable locally, so the one that retains MORE wins,
-        which is the opposite of how the seal combines its two limits (§12).
-
-        `staging_max_bytes` is the exception, and a ceiling: the newest files
-        it keeps add up to it on disk, everything older goes, whatever the
-        floors would keep. It exists for disk, so it wins. Files eviction may
-        not drop — unpublished (I4), or compaction's still (#160, #162) — count
-        toward it all the same, so under pressure it takes more of the rest;
-        they are held below, after this bound.
+        a single upper bound, and each limit is one such bound. Both are
+        ceilings — a file goes once either says so — so the tighter one wins:
+        the higher bound. `staging_retention` drops what is older than its
+        window; `staging_max_bytes` keeps the newest files that fit on disk.
+        Files eviction may not drop — unpublished (I4), or compaction's still
+        (#160, #162) — count toward the size limit all the same, so under
+        pressure it takes more of the rest; they are held below, after this.
 
         Its own method because eviction computes it twice: once to decide
         whether there is work and what range to claim, and again under that
         claim, where the answer is the one acted on.
         """
         # ONE read, held for the whole decision. Each `self.config` is an
-        # independent read of the durable row now, so two of them inside one
-        # decision can disagree — and here they did arithmetic on each other:
-        # `staging_rows` seen as an int by the test and as None by the
-        # subtraction is `int - None`, a TypeError out of `advance()`. The
-        # shipped maintainer catches RuntimeError and CommitFailedException, so
-        # that killed the process and stopped maintenance entirely.
-        #
-        # The fix is not a lock: it is that a decision reads the policy once.
-        # Fresh per decision, coherent within it.
+        # independent read of the durable row, so two of them inside one
+        # decision can disagree — and did, once, with arithmetic on each other
+        # raising out of `advance()`. A decision reads the policy once: fresh
+        # per decision, coherent within it.
         config = self.config
-        limits: list[int] = []
-        cutoff = datetime.now(UTC) - config.staging_retention
-        stale = [f for f in self._table.data_files() if self._written(f) < cutoff]
-        # Nothing old enough is a limit of zero, not an absent one: it means
-        # this policy would keep everything.
-        limits.append(max((f.end for f in stale), default=0))
+        files = self._table.data_files()
+        boundary = 0
+        if config.staging_retention is not None:
+            cutoff = datetime.now(UTC) - config.staging_retention
+            stale = [f for f in files if self._written(f) < cutoff]
+            boundary = max([boundary] + [f.end for f in stale])
 
-        if config.staging_rows is not None:
-            # COUNTED, not subtracted from the frontier. `next_offset() - 1 -
-            # staging_rows` reads naturally and assumes the offset space is
-            # dense — true of a rollback's occasional gap, and false the moment
-            # anything reserves a range. A restore skips 2**20 offsets to keep
-            # I9 (§3a), so the subtraction would put the boundary 2**20 above
-            # every staging file, and the first `advance()` after a failover
-            # would evict the whole staging window, clamped only by I4. The
-            # comment here used to say the arithmetic errs toward retaining
-            # MORE, which is the safe direction for a floor; across a large
-            # hole it errs the other way.
-            #
-            # Iceberg records a row count per file, so counting back from the
-            # newest costs nothing beyond the manifest read `data_files`
-            # already did.
-            kept = 0
-            for data_file in sorted(
-                self._table.data_files(), key=lambda f: f.end, reverse=True
-            ):
-                if kept >= config.staging_rows:
-                    # This file lies entirely outside the window, so everything
-                    # up to its end may go.
-                    limits.append(data_file.end)
-                    break
-
-                kept += data_file.rows
-            else:
-                # Every staging file is inside the window: keep all of them.
-                limits.append(0)
-
-        boundary = min(limits) if limits else 0
         if config.staging_max_bytes is not None:
             held = 0
-            for data_file in sorted(
-                self._table.data_files(), key=lambda f: f.end, reverse=True
-            ):
+            for data_file in sorted(files, key=lambda f: f.end, reverse=True):
                 held += data_file.size
                 if held > config.staging_max_bytes:
                     boundary = max(boundary, data_file.end)

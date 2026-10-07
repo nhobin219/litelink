@@ -334,18 +334,17 @@ a run worth merging. It is a no-op the rest of the time — measured at 19.3 ms 
 files, which is the cost of *asking* (`data_files()` opens every manifest) rather than of
 doing.
 
-**Retention has two floors, and the looser one binds.** `staging_retention` is a window in
-time, `staging_rows` a count of recent rows, and which of them actually bounds local disk
-depends on a rate the library cannot know — an hour of a quiet stream is a handful of rows,
-an hour of a busy one is more disk than the machine has. Both say what must stay readable
-without a network round trip, so eviction keeps whichever retains MORE. That is the mirror
-of how the seal combines its limits, where they are ceilings and the tighter wins.
+**Staging has two limits, both ceilings, and the tighter one binds.** `staging_retention`
+evicts by age — files written longer ago than the window — and `staging_max_bytes` by size on
+disk, keeping the newest files that fit. A file goes once either says so, so the window is
+honoured up to the size limit, which is the hard one: the bound that holds whatever the rate.
+Every log has a published table holding every row (#98), so staging is a cache for hot reads,
+and at least one limit must be set. By default it is the size limit alone, 4 GiB per log.
 
-**`staging_max_bytes` is the ceiling over both**, for disk rather than reads: the newest files
-that fit under it on disk stay, and older ones go whatever the floors would keep. Files eviction
-may not drop count toward it and stay anyway — unpublished ones (I4), and the in-progress region,
-about one `target_compact_size` — so staging can sit above the cap by that much, or by a publish
-backlog. A publish backlog past the cap is a stalled publish, not a retention problem.
+Neither evicts what eviction must keep: unpublished files (I4), and the in-progress region,
+about one `target_compact_size` (#162). Those count toward the size limit and stay anyway, so
+staging can sit above it by that much, or by a publish backlog — which is a stalled publish,
+not a retention problem.
 
 A file's age for this purpose is when it was WRITTEN, recorded by the log itself in
 `extent`. It is deliberately not the Iceberg snapshot that added it: expiry deletes that
@@ -553,9 +552,7 @@ rows reaches a byte target only after far more rows than the read-latency ceilin
 for, while every byte-based check reports the buffer is fine. Compaction respects both, or
 it would merge exactly the files a row cap just created straight back past it.
 
-Note the direction, which is the opposite of retention's. These are ceilings on one file
-and the tighter wins; `staging_retention` and `staging_rows` are floors on what stays readable
-and the looser wins.
+These are ceilings on one file and the tighter wins, as the staging table's two limits are.
 
 **One process per role is the deployable shape.** A seal is CPU-bound pure Python — most
 of its commit is pyiceberg copying table metadata — so it starves anything sharing its

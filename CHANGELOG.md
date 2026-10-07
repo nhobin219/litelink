@@ -51,9 +51,10 @@ ends up with. Each has its own lever, and in the dedicated-process split
   for files at the target.
 - **Compaction memory and row-group pruning: `target_row_group_size`**
   (Arrow bytes, 64 MiB), **and optionally `target_row_group_rows`.**
-- **Local copies kept for hot reads: `staging_retention`.** The in-progress
-  region always stays local until it is finished and published or swapped,
-  whatever this is set to.
+- **Local disk for hot reads: `staging_max_bytes`** (4 GiB per log by
+  default), **and optionally `staging_retention`** to evict by age as well.
+  The in-progress region always stays local until it is finished and
+  published or swapped, whatever these say.
 
 A typical deployment:
 - the seal and publish processes flush on your RPO interval, say every 15
@@ -66,14 +67,6 @@ on the RPO interval do the same: a flushed `advance` seals and publishes
 with `flush` and compacts without it.
 
 ### Added
-
-- **`staging_max_bytes`, a cap on the staging table's size on disk.** The
-  retention settings are floors on what stays local for hot reads; this is a
-  ceiling over them, for a stream fast enough that a day of it is more disk
-  than the machine has. The newest files that fit stay, older ones go,
-  whatever the floors would keep. It can't evict what isn't published yet
-  (I4) or the in-progress region, so staging can sit above it by about one
-  `target_compact_size`, or by a publish backlog. No cap by default.
 
 - **`restore` brings the published table's tail back into staging** (#166).
   The files after the last one at `target_compact_size` — seals a flushed
@@ -98,15 +91,26 @@ with `flush` and compacts without it.
 
 ### Changed
 
-- **Breaking: `staging_retention` is always a window, one day by default.**
-  It no longer accepts `None`, which meant "keep everything" and was the
-  default before every log had a published table holding every row (#98);
-  the staging table is a cache for hot reads now, and a window bounds it. A
-  log that wants years of history local sets years. **Nothing to do on
-  upgrade:** a stored `None` reads as the one-day default, and a writer
-  rewrites its stored config to say so on its next open. `timedelta(0)` with
-  `staging_rows` is the rows-only policy `None` with `staging_rows` used to
-  be.
+- **Breaking: the staging table is bounded by size by default, and
+  `staging_rows` is gone.** Its two limits are now both ceilings, and a file
+  is evicted once either says so:
+  - `staging_retention` (age): files written longer ago than this go. `None`,
+    still the default, is no age limit.
+  - `staging_max_bytes` (new; size on disk, **4 GiB per log by default**):
+    the newest files that fit stay, older ones go.
+
+  With both set, the window is honoured up to the size limit, which is the
+  hard one. At least one must be set. Neither evicts unpublished files (I4)
+  or the in-progress region, so staging can sit above the size limit by
+  about one `target_compact_size`, or by a publish backlog.
+
+  `staging_rows`, a floor that kept whichever of it and the window held more,
+  is removed; a stored value is ignored.
+
+  **On upgrade, every log gets the 4 GiB limit**, including one that kept
+  everything under the old `None`. A log whose window holds more than 4 GiB
+  evicts more than before: set `staging_max_bytes` explicitly, or `None` to
+  keep the window as the only limit.
 - **Upgrading re-cuts what staging holds, once.** Files compacted by an
   earlier version were sized in Arrow bytes, so they are under the new
   on-disk target and are recompaction candidates: compaction grows them into

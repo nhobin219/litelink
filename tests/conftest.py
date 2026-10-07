@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import uuid
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,6 +23,8 @@ _BUCKET = "LITELINK_TEST_BUCKET"
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
+
+    from litelink import WriteHandle
 
 
 def options() -> S3Options:
@@ -145,3 +148,21 @@ def isolated_read_cache(
     monkeypatch.setenv("XDG_CACHE_HOME", str(home))
 
     return home
+
+
+def keep_newest_rows(log: WriteHandle, rows: int) -> None:
+    """Bound `log`'s staging table to its newest files holding about `rows`
+    rows, by size on disk, and evict the rest: the split between local and
+    published a fixture wants, from `staging_max_bytes`."""
+    kept = held = 0
+    for data_file in sorted(log._table.data_files(), key=lambda f: f.end, reverse=True):
+        if kept >= rows:
+            break
+
+        kept += data_file.rows
+        held += data_file.size
+
+    log.set_config(
+        replace(log.config, staging_retention=None, staging_max_bytes=max(1, held))
+    )
+    log.evict("staging")

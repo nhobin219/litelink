@@ -1030,7 +1030,7 @@ and one of drift between blocks. Interleaving the runs is what settled it.
 
 **A decision reads the policy ONCE.** That is the hazard this trades for, and it is a real
 one: each read is now independent, so two of them inside a single decision can disagree. It
-bit immediately — `staging_rows` seen as an int by the guard and as None by the subtraction
+bit immediately — an optional limit seen as an int by the guard and as None by the arithmetic
 after it is `int - None`, a TypeError out of `advance()`, which the shipped maintainer does
 not catch, so maintenance stopped entirely. The rule is not a lock; it is that every
 decision binds the policy to a local first: fresh per decision, coherent within it.
@@ -1754,11 +1754,11 @@ target_seal_size       Arrow bytes per SEAL               (size it for READ late
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by
                                                           whatever compression achieved)
-staging_retention      staging window, by TIME            (> longest hot lookback, with margin; default 1 day;
-                                                          0 = evict on publish)
-staging_rows           staging window, by ROWS            (floor: keep at least this many recent rows)
-staging_max_bytes      staging size, on DISK              (ceiling over both floors: the newest files that
-                                                          fit stay; None = no cap)
+staging_retention      staging limit, by AGE              (> longest hot lookback, with margin; 0 = evict
+                                                          on publish; None = no age limit, the default)
+staging_max_bytes      staging limit, by SIZE on DISK     (the newest files that fit stay; default 4 GiB;
+                                                          None = no size limit. At least one of the two
+                                                          must be set; a file goes once EITHER says so)
 staging_snapshot_retention    staging snapshot expiry floor    (> longest local scan; default 15 min)
 published_snapshot_retention  published snapshot expiry floor  (> longest remote scan; default 1 hour)
 compact_min_files      minimum adjacent files to compact  (default 4; below 2 is refused —

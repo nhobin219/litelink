@@ -153,7 +153,6 @@ def open(  # noqa: A001
 
     handle.recover()
     handle._backfill_manifest()  # noqa: SLF001
-    handle._settle_stored_config()  # noqa: SLF001
 
     return handle
 

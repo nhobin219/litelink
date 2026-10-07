@@ -763,81 +763,6 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         )
 
 
-def test_staging_rows_keeps_recent_data_a_time_window_would_drop(
-    tmp_path: Path,
-) -> None:
-    """The case a window alone cannot express.
-
-    An hour of a quiet stream is a handful of rows. A retention window sized
-    for a busy stream then evicts almost everything the moment it goes quiet,
-    and the next hot read — the thing `staging_retention` exists to serve — goes
-    to the network for data written minutes ago.
-    """
-    config = LogConfig(
-        target_seal_size=1 << 30,
-        compact_min_files=2,
-        staging_retention=timedelta(microseconds=1),
-        staging_rows=8,
-        staging_snapshot_retention=timedelta(0),
-    )
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 4)  # 4 rows each, all older than the window
-        log._maintenance.evict()
-
-        kept = log._table.data_files()
-        assert sum(f.rows for f in kept) >= 8, (
-            "the row floor must hold data the window would have dropped"
-        )
-        assert (kept[-1].end - 1) == 16, "the newest rows are the ones kept"
-
-
-def test_the_two_retention_limits_keep_whichever_holds_more(tmp_path: Path) -> None:
-    """Floors, not ceilings.
-
-    Both say what must stay readable without a network round trip, so the
-    binding one is whichever retains more — the opposite of how the seal
-    combines its limits, where they are ceilings and the tighter wins.
-    """
-    config = LogConfig(
-        target_seal_size=1 << 30,
-        compact_min_files=2,
-        # Retains everything: nothing is an hour old.
-        staging_retention=timedelta(hours=1),
-        # Retains almost nothing on its own.
-        staging_rows=1,
-        staging_snapshot_retention=timedelta(0),
-    )
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 4)
-        log._maintenance.evict()
-
-        assert len(log._table.data_files()) == 4, (
-            "the window retains everything, so the row floor must not evict"
-        )
-
-
-def test_a_row_floor_alone_is_a_retention_policy(tmp_path: Path) -> None:
-    """A row floor with no window in time: `staging_retention=0` evicts on
-    publish, and `staging_rows` keeps the last few rows local regardless —
-    the policies are floors, and the one that retains more binds."""
-    config = LogConfig(
-        target_compact_size=1,  # every file final: eviction, not candidates
-        target_seal_size=1 << 30,
-        compact_min_files=2,
-        staging_retention=timedelta(0),
-        staging_rows=4,
-        staging_snapshot_retention=timedelta(0),
-    )
-    with open_log(tmp_path, config) as log:
-        seal_files(log, 4)
-        log.publish(flush=True)
-        log._maintenance.evict()
-
-        kept = log._table.data_files()
-        assert sum(f.rows for f in kept) == 4
-        assert (kept[-1].end - 1) == 16
-
-
 def test_compaction_converts_sealed_files_into_larger_ones(tmp_path: Path) -> None:
     """The job the split gives it: seal at the size a hot read wants to scan,
     compact to the size object storage wants to receive — on disk, where the
@@ -993,13 +918,13 @@ def test_a_step_outside_the_target_is_refused() -> None:
             validate(SCHEMA, (), config, None)
 
 
-def test_a_byte_cap_overrides_the_retention_floors(tmp_path: Path) -> None:
-    """`staging_max_bytes` is a ceiling: a day's window would keep every file
-    here, and the cap keeps only the newest that fit — the floors are about hot
-    reads, the cap about disk, and disk wins."""
+def test_the_tighter_staging_limit_wins(tmp_path: Path) -> None:
+    """Both limits are ceilings: a day's window would keep every file here,
+    and the cap keeps only the newest that fit."""
     config = LogConfig(
         target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 30,
+        staging_retention=timedelta(days=1),
         staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
@@ -1022,21 +947,31 @@ def test_an_empty_byte_cap_is_refused() -> None:
         validate(SCHEMA, (), LogConfig(staging_max_bytes=0), None)
 
 
-def test_a_stored_unbounded_retention_becomes_the_default(tmp_path: Path) -> None:
-    """A log written when `staging_retention=None` meant "keep everything" —
-    and was the default — opens with today's default, and says so durably."""
+def test_a_log_that_kept_everything_is_bounded_by_the_default_cap(
+    tmp_path: Path,
+) -> None:
+    """`staging_retention=None` was "keep everything", and the default, before
+    the cap existed. A config stored then has no `staging_max_bytes`, which
+    reads as the default — so such a log is bounded with nothing to change."""
     from litelink._buffer import CONFIG_KEY
-    from litelink._config import DEFAULT_STAGING_RETENTION
+    from litelink._config import DEFAULT_STAGING_MAX_BYTES
 
     with open_log(tmp_path, LogConfig()) as log:
         stored = json.loads(log._buffer.get_meta(CONFIG_KEY) or "{}")
         stored["staging_retention"] = None
+        del stored["staging_max_bytes"]
+        stored["staging_rows"] = 1000  # retired; ignored
         log._buffer.set_meta(CONFIG_KEY, json.dumps(stored))
 
     with open_log(tmp_path) as log:
-        assert log.config.staging_retention == DEFAULT_STAGING_RETENTION
-        stored = json.loads(log._buffer.get_meta(CONFIG_KEY) or "{}")
-        assert stored["staging_retention"] == DEFAULT_STAGING_RETENTION.total_seconds()
+        assert log.config.staging_retention is None
+        assert log.config.staging_max_bytes == DEFAULT_STAGING_MAX_BYTES
+
+
+def test_unbounded_staging_is_refused() -> None:
+    config = LogConfig(staging_retention=None, staging_max_bytes=None)
+    with pytest.raises(ValueError, match="staging_max_bytes"):
+        validate(SCHEMA, (), config, None)
 
 
 def test_an_empty_row_group_size_is_refused() -> None:
@@ -1166,25 +1101,30 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
     naming it, nothing can name it again. `drain` is a keyed read and this
     design refuses directory scans, so it is unreclaimable for good.
 
-    The age limit is already file-aligned — it is some file's `hi` — and so is
-    the published table clamp. Only the row floor is arbitrary, which is why it arrived
-    with `staging_rows`.
+    The age limit is file-aligned — it is some file's `end` — and so are the
+    size limit and the published table clamp; the snap to a file edge is the
+    guard that keeps it so for whatever bound comes next.
     """
     config = LogConfig(
         target_seal_size=1 << 30,
         target_compact_size=1 << 30,
         compact_min_files=2,
-        staging_retention=timedelta(microseconds=1),
-        # Deliberately not a multiple of the 4 rows each sealed file holds, so
-        # the raw boundary falls inside one.
-        staging_rows=6,
         staging_snapshot_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 5)
-        before = {f.path for f in log._table.data_files()}
+        files = log._table.data_files()
+        before = {f.path for f in files}
         assert len(before) == 5
 
+        # A cap of a file and a half: the raw bound falls inside a file.
+        log.set_config(
+            replace(
+                config,
+                staging_retention=None,
+                staging_max_bytes=files[-1].size * 3 // 2,
+            )
+        )
         log._maintenance.evict()
 
         after = log._table.data_files()
@@ -1193,8 +1133,8 @@ def test_eviction_only_ever_removes_whole_files(tmp_path: Path) -> None:
             "rewrite of a straddling file would do"
         )
         # Whole files only: every survivor keeps the exact range it was sealed
-        # with, and the row floor is honoured by keeping MORE than asked.
-        assert sum(f.rows for f in after) >= 6
+        # with.
+        assert after, "the newest file fits under the cap"
         assert all(f.rows == 4 for f in after), "a file was split by the boundary"
 
 
@@ -1348,7 +1288,6 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
     """
     # Every file final: this is about eviction, not recompaction candidates.
     config = LogConfig(
-        staging_rows=1,
         staging_retention=timedelta(0),
         target_seal_size=1 << 30,
         target_compact_size=1,
@@ -1457,18 +1396,20 @@ def test_eviction_reads_the_policy_the_log_records(tmp_path: Path) -> None:
 
     The same reasoning the published location already earned, applied to the
     settings beside it. Eviction is where it shows: it decides deletions from
-    `staging_retention` and `staging_rows`, so a process holding the copy it read
+    `staging_retention` and `staging_max_bytes`, so a process holding the copy it read
     at open goes on deleting the only copy of rows the durable policy now says
     to keep — and §8 reads as an obligation, not a hint.
     """
-    with open_log(tmp_path, LogConfig(staging_rows=1, target_seal_size=1 << 30)) as log:
+    config = LogConfig(staging_retention=timedelta(0), target_seal_size=1 << 30)
+    with open_log(tmp_path, config) as log:
         seal_files(log, 3)
         before = log.staging_files()
 
         assert before == 3
 
-        # Another process raises the floor to cover everything.
-        log._buffer.set_meta("config", LogConfig(staging_rows=10_000).to_json())
+        # Another process lifts the window to keep everything.
+        keep = LogConfig(staging_retention=None, staging_max_bytes=1 << 40)
+        log._buffer.set_meta("config", keep.to_json())
         log.evict()
 
         assert log.staging_files() == before, (
@@ -1489,10 +1430,14 @@ def test_a_refreshed_policy_reaches_compaction_publish_and_the_buffer(
     published table holding rows rewritten underneath it. The buffer's seal target is
     the third copy, and a stale one sizes every file the log writes.
     """
-    with open_log(tmp_path, LogConfig(staging_rows=1, target_seal_size=4096)) as log:
+    config = LogConfig(staging_retention=timedelta(0), target_seal_size=4096)
+    with open_log(tmp_path, config) as log:
         seal_files(log, 2)
         raised = LogConfig(
-            staging_rows=10_000, target_seal_size=1 << 20, target_compact_size=1 << 23
+            staging_retention=None,
+            staging_max_bytes=1 << 40,
+            target_seal_size=1 << 20,
+            target_compact_size=1 << 23,
         )
         log._buffer.set_meta("config", raised.to_json())
 
@@ -1501,7 +1446,7 @@ def test_a_refreshed_policy_reaches_compaction_publish_and_the_buffer(
         assert log.config.target_compact_size == raised.target_compact_size, (
             "publish reads the policy through WriteHandle; it must be the refreshed one"
         )
-        assert log._maintenance.config.staging_rows == raised.staging_rows
+        assert log._maintenance.config.staging_max_bytes == raised.staging_max_bytes
         assert log._buffer.config().target_seal_size == raised.target_seal_size, (
             "the buffer sizes every file the log writes; it reads the same row"
         )
@@ -1524,7 +1469,9 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
     a disagreement costs an undersized published file, which `_push` already
     documents as tolerated.
     """
-    config = LogConfig(target_seal_size=4096, compact_min_files=2, staging_rows=200)
+    config = LogConfig(
+        target_seal_size=4096, compact_min_files=2, staging_max_bytes=1 << 30
+    )
     with open_log(tmp_path, config) as log:
         stop = threading.Event()
         churned = 0
@@ -1546,7 +1493,7 @@ def test_maintenance_survives_the_policy_changing_underneath_it(
                             # torn read of two ints is merely an odd size. A
                             # field seen as an int by the guard and as None by
                             # the arithmetic after it is `int - None`.
-                            staging_rows=None if churned % 2 else 200,
+                            staging_max_bytes=None if churned % 2 else 1 << 30,
                             staging_retention=timedelta(0)
                             if churned % 3
                             else timedelta(seconds=30),
@@ -1589,8 +1536,8 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
 
     Each `self.config` is now an independent read of the durable row, so two
     of them inside one decision can disagree — and here they did arithmetic on
-    each other: `staging_rows` seen as an int by the guard and as None by the
-    subtraction after it is `int - None`, a TypeError out of `advance()`. The
+    each other: an optional limit seen as an int by the guard and as None by
+    the arithmetic after it is `int - None`, a TypeError out of `advance()`. The
     shipped maintainer catches RuntimeError and CommitFailedException, so that
     stopped maintenance entirely.
 
@@ -1600,7 +1547,9 @@ def test_a_decision_reads_the_policy_once(tmp_path: Path) -> None:
     because the values happened to line up harmlessly.
     """
     config = LogConfig(
-        target_seal_size=1 << 30, staging_rows=200, staging_retention=timedelta(0)
+        target_seal_size=1 << 30,
+        staging_max_bytes=1 << 30,
+        staging_retention=timedelta(0),
     )
     with open_log(tmp_path, config) as log:
         seal_files(log, 3)
@@ -1777,7 +1726,6 @@ def test_eviction_restamps_what_it_drops(tmp_path: Path) -> None:
     """
     # Every file final: this is about eviction, not recompaction candidates.
     config = LogConfig(
-        staging_rows=1,
         staging_retention=timedelta(0),
         target_seal_size=1 << 30,
         target_compact_size=1,
@@ -1847,47 +1795,6 @@ def test_expiry_restamps_the_metadata_it_supersedes(tmp_path: Path) -> None:
             "the restamp matched nothing: it must key paths the way the "
             "enqueue beside it does"
         )
-
-
-def test_staging_rows_counts_rows_rather_than_differencing_offsets(
-    tmp_path: Path,
-) -> None:
-    """§8's floor has to survive a hole in the offset space.
-
-    It used to be `next_offset() - 1 - staging_rows`, which reads naturally and
-    assumes offsets are dense. A rollback's occasional gap makes that retain
-    slightly MORE than asked — the safe direction. A reservation does the
-    opposite: a restore skips 2**20 offsets to keep I9, so the subtraction puts
-    the boundary far above every local file and the first `advance()` evicts
-    the entire staging window.
-
-    Simulated here by seeding the sequence forward, which is what a restore
-    does. The rows already sealed must stay.
-    """
-    config = replace(
-        LogConfig(), target_seal_size=2048, compact_min_files=2, staging_rows=1_000_000
-    )
-    with open_log(tmp_path, config=config) as log:
-        log.extend(rows(400))
-        log.seal()
-        before = log.staging_rows()
-
-        assert before > 0, "nothing sealed, so there is nothing to evict"
-
-        # ROWS, not files: `advance` also compacts, so a file count falls for
-        # a reason that has nothing to do with this.
-        #
-        # The hole. `Buffer.seed_offsets` is what a restore uses; here it
-        # stands in for one, moving `next_offset` far above every sealed row.
-        log._buffer.seed_offsets(log._buffer.next_offset() + (1 << 20))  # noqa: SLF001
-        log.advance()
-
-        assert log.staging_rows() == before, (
-            "the reserved hole was read as a million rows and evicted the window"
-        )
-
-
-# -- the stranded-metadata sweep (#113) -------------------------------------
 
 
 def metadata_dir(log: WriteHandle) -> Path:

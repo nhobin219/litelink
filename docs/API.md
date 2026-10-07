@@ -948,9 +948,8 @@ target_compact_size   int | None      = None     bytes ON DISK per compacted FIL
 target_compact_step_size int | None = None     new sealed bytes on disk per in-progress rewrite (None = target/8)
 target_row_group_size int             = 64 MiB   Arrow bytes compaction sorts and holds at once
 target_row_group_rows int | None      = None     rows per row group, beside the bytes (None = no limit)
-staging_retention     timedelta       = 1 day    staging window by TIME (0 evicts on publish)
-staging_rows          int | None      = None     staging window by ROWS — a floor, not a ceiling
-staging_max_bytes     int | None      = None     staging size ON DISK — a ceiling over both floors
+staging_retention     timedelta|None  = None     staging limit by AGE (0 evicts on publish, None = no age limit)
+staging_max_bytes     int | None      = 4 GiB    staging limit by SIZE ON DISK (None = no size limit)
 staging_snapshot_retention    timedelta = 15 min   how long the staging table's expired snapshots survive
 published_snapshot_retention  timedelta = 1 hour   how long the published table's expired snapshots survive
 compact_min_files     int             = 4        minimum adjacent files to merge
@@ -965,7 +964,7 @@ Frozen dataclass, with `to_json`/`from_json` and one derived property, `compact_
 `set_config` needs no rewrite.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
-construction: `compact_min_files` below 2, a `target_compact_step_size` outside
+construction: `compact_min_files` below 2, neither `staging_retention` nor `staging_max_bytes` set (staging must be bounded), a `target_compact_step_size` outside
 `[1, target_compact_size]`, a `target_row_group_size` or `target_row_group_rows` below 1, `wal_retention` without `wal_replication`, `wal_replication` without an s3:// published
 table, a `vacuum_free_ratio` outside `[0, 1]`, and a `compression` this build cannot write are
 each refused.

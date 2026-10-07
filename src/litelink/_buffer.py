@@ -1084,8 +1084,7 @@ class Buffer:
                 group.bytes += measure(values) + extra
                 # Whichever is reached FIRST. Both are ceilings on one file —
                 # bytes bound memory, rows bound the read latency §7 sizes for
-                # — so the tighter one wins, which is the opposite of how
-                # `staging_retention` and `staging_rows` combine.
+                # — so the tighter one wins.
                 if (
                     group.bytes >= target
                     or offset - (group.start_offset or offset) + 1 >= target_rows

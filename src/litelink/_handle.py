@@ -1601,7 +1601,6 @@ class WriteHandle(LocalReadHandle):
         )
         log.recover()
         log._backfill_manifest()
-        log._settle_stored_config()
 
         return log
 
@@ -2306,22 +2305,6 @@ class WriteHandle(LocalReadHandle):
         return log
 
     # -- settings ----------------------------------------------------------
-
-    def _settle_stored_config(self) -> None:
-        """Write back a stored config an earlier version left with
-        `staging_retention: null`.
-
-        That was "keep everything", and the default, before every log had a
-        published table holding every row. It reads as today's default already
-        (`LogConfig.from_json`); written back, the stored policy says what the
-        log does, with nothing for anyone to change after upgrading.
-        """
-        encoded = self._buffer.get_meta(_CONFIG_KEY)
-        if (
-            encoded is not None
-            and json.loads(encoded).get("staging_retention", 0) is None
-        ):
-            self.set_config(LogConfig.from_json(encoded))
 
     def _restore_tail(self) -> None:
         """Bring the published table's tail back into staging, so compaction
@@ -4139,7 +4122,7 @@ class WriteHandle(LocalReadHandle):
         - **`"buffer"`**: rows staging holds — or, with `wal_replication`, rows
           the published table holds, since until then the buffer is their
           off-box copy (§3a). A seal never deletes its own rows; this does.
-        - **`"staging"`**: files past `staging_retention` / `staging_rows` that
+        - **`"staging"`**: files past `staging_retention` / `staging_max_bytes` that
           the published table holds (I4). Never past what it holds, so a
           publish that is behind delays this rather than losing data.
 
@@ -4522,7 +4505,15 @@ def validate(
         msg = f"staging_max_bytes must be at least 1: {config.staging_max_bytes}"
         raise ValueError(msg)
 
-    if config.staging_retention < timedelta(0):
+    if config.staging_retention is None and config.staging_max_bytes is None:
+        msg = (
+            "set staging_retention, staging_max_bytes or both: with neither, the "
+            "staging table would grow for good. Every row is in the published "
+            "table, so staging is a cache for hot reads, and needs a bound"
+        )
+        raise ValueError(msg)
+
+    if config.staging_retention is not None and config.staging_retention < timedelta(0):
         # The same check its twin above has always had, and the reason it
         # matters more here: eviction computes `now - staging_retention`, so a
         # negative one puts the cutoff in the FUTURE and every file in the log
@@ -4610,10 +4601,6 @@ def validate(
         msg = (
             f"target_row_group_rows must be at least 1: {config.target_row_group_rows}"
         )
-        raise ValueError(msg)
-
-    if config.staging_rows is not None and config.staging_rows < 0:
-        msg = f"staging_rows must not be negative: {config.staging_rows}"
         raise ValueError(msg)
 
     if config.compression not in _CODECS:

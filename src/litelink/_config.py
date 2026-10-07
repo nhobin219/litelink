@@ -50,9 +50,11 @@ DEFAULT_COMPACT_SIZE = 512 * 1024 * 1024
 # whole compacted file was this size.
 DEFAULT_ROW_GROUP_SIZE = 64 * 1024 * 1024
 
-# How long the staging table keeps a published file for hot reads, when
-# nothing says (`LogConfig.staging_retention`).
-DEFAULT_STAGING_RETENTION = timedelta(days=1)
+# How much of a log's history the staging table keeps on disk, when nothing
+# says (`LogConfig.staging_max_bytes`): about seven finished files at the
+# default `target_compact_size`, besides the in-progress one. Per log, so a
+# machine running many multiplies it.
+DEFAULT_STAGING_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,9 +118,7 @@ class LogConfig:
     # tenfold, while every byte-based check reports the buffer is fine.
     #
     # Bytes bound memory; rows bound read latency. Both are CEILINGS on one
-    # file, so the seal cuts at whichever is reached FIRST — the mirror of
-    # `staging_retention` and `staging_rows`, which are floors and take whichever
-    # retains more.
+    # file, so the seal cuts at whichever is reached FIRST.
     #
     # None means no row limit, which is the right default: a narrow-row stream
     # is the case that needs this and a library cannot guess the row width.
@@ -183,58 +183,28 @@ class LogConfig:
 
         return max(1, self.compact_size // 8)
 
-    # §8. Must exceed the longest hot-path lookback WITH margin.
+    # §8. The staging table's two limits, both CEILINGS: a file is evicted
+    # once either says so, so the tighter one wins. Every log has a published
+    # table (#98), local by default, that already holds every row, so the
+    # staging table is a cache for hot reads, and it must be bounded by at
+    # least one of these (`validate`).
     #
-    # A day by default (`DEFAULT_STAGING_RETENTION`). Every log has a published
-    # table (#98), local by default, which already holds every row, so the
-    # staging table is a cache for hot reads rather than the log's copy, and
-    # it always has a window: a log that wants years of history local sets
-    # years. Zero means "evict on publish" — pure archival capture, hot reads
-    # limited to the buffer, or to `staging_rows` when that is set. Eviction
-    # never deletes a file publish has not taken, whatever this says (I4), nor
-    # one compaction is still working on (#160, #162).
-    staging_retention: timedelta = DEFAULT_STAGING_RETENTION
-    # §8. A CEILING on the staging table's size on disk, where the two settings
-    # either side of it are floors: the newest files that fit stay, older ones
-    # go, whatever the floors would keep — for a stream fast enough that a day
-    # of it is more disk than the machine has. None is no cap. Files eviction
-    # may not drop still count toward it and stay: unpublished ones (I4), and
-    # the in-progress region (at most about one `target_compact_size`), so the
-    # table can sit above it by that much, or by a publish backlog.
-    staging_max_bytes: int | None = None
-    # §8, the other half of the same policy. A window in time and a count of
-    # rows bound different things, and which one binds depends on a rate the
-    # library cannot know: an hour of a quiet stream is a handful of rows, and
-    # an hour of a busy one is more local disk than the machine has. Set both
-    # and eviction keeps whichever retains MORE — they are floors on what must
-    # stay readable without touching the network, so the binding one is the one
-    # that keeps more.
+    # Neither evicts a file publish has not taken (I4), nor one compaction is
+    # still working on (#160, #162): those stay whatever the limits say, so
+    # staging can sit above them by about one `target_compact_size`, or by a
+    # publish backlog — which is a stalled publish, not a retention problem.
     #
-    # The mirror image of the seal's `min(target_seal_size, target_seal_rows)`
-    # in §12, deliberately: there the two are ceilings and the tighter wins,
-    # here they are floors and the looser does.
-    #
-    # Rows, not files, because it is a statement about the data — "the last
-    # million entries stay local" survives a change to either size target, and
-    # "the last ten files" does not.
-    #
-    # FOLLOW-UP: no third floor in BYTES, and deliberately. These two answer
-    # "what can I query without touching the network", which is how queries are
-    # written — the last hour, the last million rows. "The last 10 GB" is not a
-    # statement any query makes, and rows already stand in for bytes since
-    # bytes are roughly rows times width.
-    #
-    # What is genuinely missing is the opposite: nothing bounds local disk from
-    # ABOVE, so with both of these unset it grows without limit. That wants a
-    # CAP rather than a floor, and it composes the other way — `max` after the
-    # `min` below, because a cap evicts MORE and can therefore violate both
-    # floors. It would measure on-disk size (`DataFile.size`), one of the few
-    # places where that is the right unit. And it could not be honoured at all
-    # while publish is behind, since I4 forbids evicting what the published
-    # table lacks — a log breaching its floors to stay under a cap is
-    # misconfigured and should say so rather than quietly serving every read
-    # from object storage.
-    staging_rows: int | None = None
+    # By AGE: files written longer ago than this go. It should exceed the
+    # longest hot-path lookback, with margin. None is no age limit. Zero means
+    # "evict on publish" — pure archival capture, hot reads limited to the
+    # buffer.
+    staging_retention: timedelta | None = None
+    # By SIZE ON DISK: the newest files that fit stay, older ones go — for a
+    # stream fast enough that its window is more disk than the machine has, and
+    # the bound every log gets by default (`DEFAULT_STAGING_MAX_BYTES`). With
+    # `staging_retention` set too, the window is honoured up to this. None is
+    # no size limit, which needs an age limit instead.
+    staging_max_bytes: int | None = DEFAULT_STAGING_MAX_BYTES
 
     # §3a. Continuous WAL shipping, which is the ONLY thing bounding RPO now
     # that the seal has no timer: a stream that goes quiet holds its last
@@ -360,8 +330,11 @@ class LogConfig:
                 "target_seal_rows": self.target_seal_rows,
                 "target_row_group_size": self.target_row_group_size,
                 "target_row_group_rows": self.target_row_group_rows,
-                "staging_retention": self.staging_retention.total_seconds(),
-                "staging_rows": self.staging_rows,
+                "staging_retention": (
+                    None
+                    if self.staging_retention is None
+                    else self.staging_retention.total_seconds()
+                ),
                 "staging_max_bytes": self.staging_max_bytes,
                 "wal_replication": self.wal_replication,
                 "vacuum_free_ratio": self.vacuum_free_ratio,
@@ -399,7 +372,7 @@ class LogConfig:
         raw = json.loads(encoded)
         defaults = cls()
         # Written under the #98 names; a config written before them used
-        # `local_retention` and `local_rows`, read when the new key is absent.
+        # `local_retention`, read when the new key is absent.
         retention = raw.get(
             "staging_retention", raw.get("local_retention", defaults.staging_retention)
         )
@@ -426,19 +399,15 @@ class LogConfig:
             target_row_group_rows=raw.get(
                 "target_row_group_rows", defaults.target_row_group_rows
             ),
-            # A stored None is the "keep everything" this no longer offers: it
-            # was the default before every log had a published table holding
-            # every row, so it reads as today's default (see `WriteHandle.open`).
             staging_retention=(
-                defaults.staging_retention
-                if retention is None
-                else retention
-                if isinstance(retention, timedelta)
+                retention
+                if isinstance(retention, timedelta) or retention is None
                 else timedelta(seconds=retention)
             ),
-            staging_rows=raw.get(
-                "staging_rows", raw.get("local_rows", defaults.staging_rows)
-            ),
+            # Absent from a config written before the cap existed, which reads
+            # as the default: a log that kept everything, the old default, is
+            # bounded from its next pass. A stored `staging_rows`, retired with
+            # it, is ignored like any key this version does not know.
             staging_max_bytes=raw.get("staging_max_bytes", defaults.staging_max_bytes),
             wal_replication=raw.get("wal_replication", defaults.wal_replication),
             vacuum_free_ratio=raw.get("vacuum_free_ratio", defaults.vacuum_free_ratio),
