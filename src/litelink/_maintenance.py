@@ -289,27 +289,56 @@ def stretches(files: Sequence[DataFile], target: int) -> list[Stretch]:
     return grouped
 
 
-def merge_due(stretch: Stretch, target: int, min_files: int, *, flush: bool) -> bool:
-    """Whether compaction merges `stretch` now.
+def merges(
+    stretch: Stretch,
+    target: int,
+    step: int,
+    min_files: int,
+    floor: int,
+    *,
+    flush: bool,
+) -> list[list[DataFile]]:
+    """The runs compaction merges from `stretch` now, each into files of its
+    own; `floor` is the first offset the published table does not hold.
 
     **A closed stretch** once it has `compact_min_files` files. It never grows,
-    so it is merged once, into one file; under that many, it is left as it is.
+    so it is merged once; under that many, it is left as it is.
 
-    **The open stretch** once the files after its first have reached a step,
-    an eighth of the target — or at once with `flush`. Its first file is
-    usually the in-progress file, so the step is the new seals it absorbs per
-    rewrite: eight rewrites of a growing file per finished one, about 4.5
-    writes per row locally, and nothing extra to object storage (#162).
+    **The open stretch** grows its in-progress file — its first file — once
+    the files after it reach `step` (`target_compact_size` / 8 by default), or
+    at once with `flush`. Each growth rewrites the whole in-progress file, so
+    the step is what bounds the rewrites per finished file, however often
+    `compact` is called (#162).
+
+    **Never an unpublished seal into a file that holds published rows.** Once
+    a flushed publish has pushed rows the in-progress file holds, folding a
+    seal nobody has published into it would leave those rows only inside an
+    unfinished file — and the next flush would have to upload that file as it
+    stands, again on every flush. So the file grows from published files only,
+    and a flushed publish pushes the newest seals before compaction folds them
+    in. The seals after the floor wait for that, or — if no flush ever comes —
+    until they fill a whole target, when they are merged into files of their
+    own, so a log that flushed once and stopped is never stuck.
     """
-    if len(stretch.files) < 2:
-        return False
-
+    files = stretch.files
     if not stretch.open:
-        return len(stretch.files) >= min_files
+        return [files] if len(files) >= min_files else []
 
-    step = max(1, target // 8)
+    if files[0].start >= floor:
+        return [files] if _grows(files, step, flush=flush) else []
 
-    return flush or sum(f.size for f in stretch.files[1:]) >= step
+    published = [f for f in files if f.end <= floor]
+    after = [f for f in files if f.start >= floor]
+    due = [published] if _grows(published, step, flush=flush) else []
+    if len(after) >= 2 and sum(f.size for f in after) >= target:
+        due.append(after)
+
+    return due
+
+
+def _grows(files: Sequence[DataFile], step: int, *, flush: bool) -> bool:
+    """Whether an in-progress file absorbs the files after it now."""
+    return len(files) >= 2 and (flush or sum(f.size for f in files[1:]) >= step)
 
 
 def stable_prefix(
@@ -488,8 +517,8 @@ class Maintenance:
         return reached
 
     def compact(self, *, flush: bool = False) -> None:
-        """Merge stretches of undersized adjacent files (§6). `flush` merges the
-        in-progress region whatever its size (see `merge_due`).
+        """Merge stretches of undersized adjacent files (§6). `flush` grows the
+        in-progress file without waiting for a step (see `merges`).
 
         Real work on the happy path. Not repair — the cut is exact and there is
         no timer to cut early, so every file a seal writes already holds what
@@ -516,9 +545,17 @@ class Maintenance:
         # One read, so the two limits describe the same policy.
         config = self.config
         target = config.compact_size
+        floor = self.published_through() + 1
         for stretch in stretches(pending, target):
-            if merge_due(stretch, target, config.compact_min_files, flush=flush):
-                self._rewrite_run(self._table, stretch.files)
+            for run in merges(
+                stretch,
+                target,
+                config.compact_step,
+                config.compact_min_files,
+                floor,
+                flush=flush,
+            ):
+                self._rewrite_run(self._table, run)
 
     def unsettled_from(self, files: Sequence[DataFile]) -> int:
         """The index in `files` — the staging table's, in offset order — of

@@ -285,3 +285,48 @@ def test_a_codec_change_never_cuts_a_file_inside_a_published_one(
 
         assert log.published_through() == 10 * per_seal, "publishing never wedged"
         assert log.scan().read_all().num_rows == 10 * per_seal
+
+
+def test_an_alternating_maintainer_never_uploads_a_growing_file(
+    tmp_path: Path,
+) -> None:
+    """Plain passes between flushes: the newest seals stay as they are until a
+    flush publishes them, and only then join the in-progress file — so no
+    flush ever has rows that exist only inside an unfinished file."""
+    with sized_log(tmp_path) as log:
+        log.advance(flush=True)
+        for index in range(1, PASSES):
+            seal(log, index)
+            # Flushing more often than a target fills, as a deployment does: a
+            # whole target of unpublished seals is the escape for a log that
+            # has stopped flushing, and merges on its own.
+            if index % 2 == 0:
+                log.advance(flush=True)
+                assert log.published_through() == (index + 1) * PER_SEAL
+            else:
+                log.advance()
+
+            assert not [
+                f
+                for f in published_files(log)
+                if is_compacted(f.path) and f.size < log.config.compact_size
+            ], "an in-progress file is never uploaded"
+
+        assert finished(log, published_files(log)), "finished files swapped in"
+        assert len(read_all(log)) == PASSES * PER_SEAL
+
+
+def test_a_log_that_stops_flushing_still_publishes(tmp_path: Path) -> None:
+    """Flushed once, then never again: the in-progress file holds published
+    rows and takes no unpublished seal, so the seals after it merge on their
+    own once they fill a target — and are published, finished."""
+    with sized_log(tmp_path) as log:
+        seal(log, 1)
+        log.advance(flush=True)
+        flushed = log.published_through()
+        for index in range(2, PASSES):
+            seal(log, index)
+            log.advance()
+
+        assert log.published_through() > flushed, "publishing was never stuck"
+        assert len(read_all(log)) == PASSES * PER_SEAL

@@ -9,6 +9,45 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+### Levers, and how they relate to RPO
+
+This release separates three things a log used to decide together: how much
+data you can lose (RPO), how fresh the published table is, and what files it
+ends up with. Each has its own lever.
+
+- **RPO, with `wal_replication`:** seconds. Litestream ships the buffer's WAL
+  continuously, independent of everything below.
+- **RPO without it, and published-table freshness: how often you call
+  `advance(flush=True)`** (or `seal(flush=True)` + `publish(flush=True)`).
+  - A flushed pass seals whatever is buffered and publishes it, so data on
+    this machine and nowhere else is at most one interval old.
+  - Without flushing, the published table only receives finished files:
+    up to one `target_compact_size` behind the writer, days on a stream of
+    about 100 rows a second.
+  - Flush more often than a target fills, which at 512 MiB is any realistic
+    interval.
+  - A flushed pass costs a second upload of what it pushes early (seals,
+    later swapped for the finished file) and one published commit.
+- **Published file size: `target_compact_size`** (on disk, 512 MiB). Fewer,
+  larger files make wide reads over object storage cheaper: 2.5–100× fewer
+  requests, measured. Flushing doesn't change it: early copies are swapped
+  for files at the target.
+- **Local compaction cost: `target_compact_step_size`** (on disk, an eighth
+  of the target).
+  - The in-progress file absorbs new seals a step at a time. Each step
+    rewrites it, so a smaller step leaves fewer seals local, for more local
+    writes: about 4.5 per row at the default.
+  - It never affects RPO or uploads.
+- **Compaction memory and row-group pruning: `target_row_group_size`**
+  (Arrow bytes, 64 MiB), **and optionally `target_row_group_rows`.**
+- **Local copies kept for hot reads: `staging_retention`.** The in-progress
+  region always stays local until it is finished and published or swapped,
+  whatever this is set to.
+
+A typical split: a writer appends; a maintainer runs `advance()` every few
+seconds and `advance(flush=True)` on your RPO interval, say every 15
+minutes. Turn on `wal_replication` if you need seconds rather than minutes.
+
 ### Added
 
 - **A flushed publish no longer leaves small files in the published table
@@ -44,8 +83,13 @@ minor version carries breaking changes.
   own `tell()` once it is full. A log's staging table holds one in-progress
   file and under a step of seals, instead of hundreds of seals, and finished
   files land at the target rather than a third under it. The cost is local:
-  about 4.5 writes per row. Only a finished file is published or swapped.
-  `compact(flush=True)` merges the in-progress region at once.
+  about 4.5 writes per row, set by the new `target_compact_step_size` (on
+  disk; an eighth of the target by default). Only a finished file is
+  published or swapped, and an in-progress file holding published rows only
+  absorbs published seals, so a maintainer that runs `advance()` often and
+  `advance(flush=True)` on an interval never uploads a growing file.
+  `compact(flush=True)` grows the in-progress file without waiting for a
+  step.
 - **`advance(flush=True)` no longer flushes compaction**, and `ingest` no
   longer merges the trailing run before its flushed push: the seals go as
   they are and are swapped later (see Added), where merging them would make a

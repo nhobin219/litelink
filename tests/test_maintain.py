@@ -20,7 +20,7 @@ from litelink._claim import EVERYTHING, Claim, new_owner
 from litelink._config import DEFAULT_COMPACT_SIZE
 from litelink._handle import LogConfig, WriteHandle, validate
 from litelink._layout import Layout
-from litelink._maintenance import _covered, merge_due, stable_prefix, stretches
+from litelink._maintenance import _covered, merges, stable_prefix, stretches
 from litelink._table import DataFile
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
@@ -646,18 +646,46 @@ def test_full_files_stand_alone_and_split_the_rest_into_stretches() -> None:
 
 
 def test_the_open_stretch_merges_every_step() -> None:
-    """The in-progress file absorbs new files once they add up to an eighth of
-    the target (#162); a closed stretch at `compact_min_files`."""
-    (open_,) = stretches(sized(60, 5, 6), 100)
-    assert not merge_due(open_, 100, 4, flush=False), "11 is under the step"
-    assert merge_due(open_, 100, 4, flush=True), "unless flushed"
+    """The in-progress file absorbs the files after it once they add up to a
+    step (#162); a closed stretch merges at `compact_min_files`. Nothing here
+    is published: the floor is past every file."""
+    unpublished = 1
 
-    (grown,) = stretches(sized(60, 5, 6, 2), 100)
-    assert merge_due(grown, 100, 4, flush=False), "13 reaches the step of 12"
+    def due(*sizes: int, min_files: int = 4, flush: bool = False) -> list[int]:
+        found = []
+        for st in stretches(sized(*sizes), 100):
+            for run in merges(st, 100, 12, min_files, unpublished, flush=flush):
+                found.append(len(run))
 
-    closed = stretches(sized(5, 6, 200), 100)[0]
-    assert not merge_due(closed, 100, 3, flush=False), "two files, three needed"
-    assert merge_due(closed, 100, 2, flush=False)
+        return found
+
+    assert due(60, 5, 6) == [], "11 is under the step of 12"
+    assert due(60, 5, 6, flush=True) == [3], "unless flushed"
+    assert due(60, 5, 6, 2) == [4], "13 reaches the step"
+    assert due(5, 6, 200, min_files=3) == [], "two files, three needed"
+    assert due(5, 6, 200, min_files=2) == [2]
+
+
+def test_an_unpublished_file_never_grows_a_published_one() -> None:
+    """Once the in-progress file holds published rows, it absorbs published
+    files only: folding in a seal nobody has published would leave those rows
+    only inside an unfinished file, which the next flush would have to upload.
+    The seals after the floor wait for a flush, or merge on their own once they
+    fill a target, so a log that stops flushing is never stuck."""
+    files = sized(40, 10, 10, 10, 10)
+    floor = files[3].start  # the first three are published
+
+    (st,) = stretches(files, 100)
+    assert merges(st, 100, 12, 2, floor, flush=False) == [files[:3]]
+    assert merges(st, 100, 12, 2, floor, flush=True) == [files[:3]], (
+        "not even under flush"
+    )
+
+    stuck = sized(40, 10, 30, 30, 30, 30)
+    (st,) = stretches(stuck, 100)
+    floor = stuck[2].start
+    runs = merges(st, 100, 1000, 2, floor, flush=False)
+    assert runs == [stuck[2:]], "a whole target of unpublished seals goes alone"
 
 
 def test_the_open_stretch_is_never_settled() -> None:
@@ -953,6 +981,12 @@ def test_the_compaction_target_defaults_to_iceberg_s(tmp_path: Path) -> None:
 def test_an_empty_row_group_row_ceiling_is_refused() -> None:
     config = LogConfig(target_row_group_rows=0)
     with pytest.raises(ValueError, match="target_row_group_rows"):
+        validate(SCHEMA, (), config, None)
+
+
+def test_a_step_larger_than_the_target_is_refused() -> None:
+    config = LogConfig(target_compact_size=100, target_compact_step_size=101)
+    with pytest.raises(ValueError, match="target_compact_step_size"):
         validate(SCHEMA, (), config, None)
 
 

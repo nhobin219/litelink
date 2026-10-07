@@ -4455,6 +4455,13 @@ def validate(
         msg = f"target_compact_size must be at least 1: {config.compact_size}"
         raise ValueError(msg)
 
+    if not 1 <= config.compact_step <= config.compact_size:
+        msg = (
+            f"target_compact_step_size must be between 1 and "
+            f"target_compact_size ({config.compact_size}): {config.compact_step}"
+        )
+        raise ValueError(msg)
+
     if config.target_row_group_size < 1:
         msg = (
             f"target_row_group_size must be at least 1: {config.target_row_group_size}"

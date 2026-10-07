@@ -919,6 +919,7 @@ stay dense across the two, and any engine reads both as one sequence.
 target_seal_size      int             = 8 MiB    uncompressed (Arrow) bytes per SEAL
 target_seal_rows      int | None      = None     the other ceiling; whichever is hit FIRST
 target_compact_size   int | None      = None     bytes ON DISK per compacted FILE (None = 512 MiB)
+target_compact_step_size int | None = None     new sealed bytes on disk per in-progress rewrite (None = target/8)
 target_row_group_size int             = 64 MiB   Arrow bytes compaction sorts and holds at once
 target_row_group_rows int | None      = None     rows per row group, beside the bytes (None = no limit)
 staging_retention     timedelta|None  = None     staging window by TIME (None keeps everything)
@@ -937,8 +938,8 @@ Frozen dataclass, with `to_json`/`from_json` and one derived property, `compact_
 `set_config` needs no rewrite.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
-construction: `compact_min_files` below 2, a `target_row_group_size` or `target_row_group_rows`
-below 1, `wal_retention` without `wal_replication`, `wal_replication` without an s3:// published
+construction: `compact_min_files` below 2, a `target_compact_step_size` outside
+`[1, target_compact_size]`, a `target_row_group_size` or `target_row_group_rows` below 1, `wal_retention` without `wal_replication`, `wal_replication` without an s3:// published
 table, a `vacuum_free_ratio` outside `[0, 1]`, and a `compression` this build cannot write are
 each refused.
 

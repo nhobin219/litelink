@@ -1141,9 +1141,14 @@ remains starts the next in-progress file, in the same commit. A finished file th
 the target, overshooting by at most one row group, however much better the merge compressed than
 its inputs did (by about a third on sealed ticks and order-book snapshots, #158). A closed stretch
 — one a full file follows — never grows, and is merged once when it has `compact_min_files`
-files. The cost is local: eight rewrites of a growing file per finished one, about 4.5 writes per
-row, and nothing extra to object storage, because only a finished file is pushed or swapped
-(§5). The merge streams: it reads its
+files. The cost is local: eight rewrites of a growing file per finished one at the default
+`target_compact_step_size`, about 4.5 writes per row, and nothing extra to object storage, because
+only a finished file is pushed or swapped (§5). **An in-progress file that holds published rows
+absorbs only published files**: a seal nobody has published would otherwise leave those rows
+only inside an unfinished file, which the next flushed publish would have to upload as it stands.
+So under a flushing maintainer the newest seals stay as they are until a flush publishes them —
+`advance(flush=True)` publishes before it compacts — and a log that stops flushing merges the
+seals after the floor on their own once they fill a target, so it is never stuck. The merge streams: it reads its
 inputs one at a time in offset order, gathers whole inputs up to `target_row_group_size`
 (default 64 MiB of Arrow), sorts that by `sort_by` and writes it as one row group. Peak memory
 is about 2.5× the row group, whatever the file's size — measured at 285 MB writing a 512 MB file
@@ -1738,6 +1743,8 @@ target_seal_rows       max rows per SEAL                  (the other ceiling; th
                                                           no row limit)
 target_compact_size    bytes ON DISK per FILE             (what compaction converts sealed
                                                           files INTO. None = 512 MiB)
+target_compact_step_size  bytes ON DISK per growth     (new sealed data the in-progress file
+                                                          absorbs per rewrite. None = 1/8 target)
 target_row_group_size  Arrow bytes per ROW GROUP          (what compaction sorts and holds at
                                                           once: its memory bound. 64 MiB)
 target_row_group_rows  max rows per ROW GROUP             (closes it at whichever it reaches
