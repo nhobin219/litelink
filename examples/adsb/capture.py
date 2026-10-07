@@ -119,12 +119,7 @@ def main() -> None:
         target_compact_size=8 * 1024 * 1024,
         compact_min_files=3,
         staging_snapshot_retention=timedelta(seconds=30),
-        # None without a published table, because with nowhere to push to a retention
-        # is a policy for deleting the only copy — which `WriteHandle.new` refuses to
-        # be told by accident.
-        staging_retention=(
-            timedelta(seconds=args.staging_retention) if args.published else None
-        ),
+        staging_retention=timedelta(seconds=args.staging_retention),
         wal_replication=args.replicate,
     )
 
@@ -209,8 +204,6 @@ def main() -> None:
     print(f"{args.root}/ holds {on_disk / 1e6:.1f} MB — `just demo-clean` to remove it")
     # Nothing deletes this on exit, deliberately: tail.py reads it after the
     # writer stops, and a demo you cannot inspect afterwards is not much of one.
-    # Note the demo leaves staging_retention unset, so the window grows without
-    # bound; a real deployment sets it and lets advance() hold the size.
     # Rows still queued or buffered here are not lost — they are durable, and
     # the next process to open the log finds the cuts already recorded.
 

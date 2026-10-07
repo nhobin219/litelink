@@ -46,7 +46,7 @@ from litelink._table import (
     _recorded_location,
     forget_published_entry,
 )
-from tests.conftest import filesystem
+from tests.conftest import filesystem, keep_newest_rows
 
 pytestmark = pytest.mark.s3
 
@@ -182,13 +182,12 @@ def test_a_hot_read_never_touches_the_published_table(
     Falsify by returning `(True, True)` from `Reader._tiers`: the bounded read
     raises. Or `(True, False)`: the unbounded one returns the local rows alone.
     """
-    with published_log(
-        tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
-    ) as log:
+    with published_log(tmp_path, bucket, s3) as log:
         log.extend(rows(ROWS))
         log.seal(flush=True)
         log.publish(flush=True)
         log.advance()
+        keep_newest_rows(log, 1000)
         extent = log.staging_extent()
         assert extent is not None
         assert 1 < extent[0], "the fixture must evict part of the log"
@@ -748,7 +747,6 @@ def test_the_published_table_reads_as_a_directory_with_no_catalog_at_all(
         target_seal_size=8 * 1024,
         target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
         compact_min_files=2,
-        staging_rows=200,
     )
     with litelink.new(
         tmp_path, "s", schema=SCHEMA, config=config, published=where, s3_options=s3
@@ -884,7 +882,9 @@ def test_eviction_never_acts_on_an_intended_copy(
     coverage is the loss this whole record exists to prevent — and it is the
     direction a `confirmed` column would have handed an older build for free.
     """
-    config = replace(LogConfig(), staging_rows=50, target_seal_size=1 << 30)
+    config = replace(
+        LogConfig(), staging_retention=timedelta(0), target_seal_size=1 << 30
+    )
     log = litelink.new(
         tmp_path,
         "s",
@@ -2605,14 +2605,13 @@ def test_the_statistics_tiers_partition_the_log(
         tmp_path,
         bucket,
         s3,
-        staging_retention=timedelta(0),
-        staging_rows=1000,
         wal_replication=True,
     ) as log:
         log.extend(rows(ROWS))
         log.seal(flush=True)
         log.publish(flush=True)
         log.advance()
+        keep_newest_rows(log, 1000)
         log.extend(
             {"event_ts": ROWS + i, "key": "h", "payload": "y"} for i in range(held)
         )
@@ -2758,9 +2757,7 @@ def test_a_disk_cached_connection_shares_published_reads_by_key(
     second reader fetches every data file again.
     """
     root = tmp_path / "log"
-    with published_log(
-        root, bucket, s3, staging_retention=timedelta(0), staging_rows=0
-    ) as log:
+    with published_log(root, bucket, s3, staging_retention=timedelta(0)) as log:
         log.extend(rows(ROWS))
         log.advance(flush=True)
         metadata = log._published.require().metadata_location  # noqa: SLF001
@@ -2875,7 +2872,7 @@ def test_advance_cycles_and_reloads_reuse_one_file_io(
             target_seal_size=4096,
             target_compact_size=4 * 1024,  # small, so a merge finishes a file at once
             compact_min_files=2,
-            staging_rows=100,
+            staging_retention=timedelta(0),
             staging_snapshot_retention=timedelta(seconds=0),
             published_snapshot_retention=timedelta(seconds=0),
         ),
@@ -2934,7 +2931,6 @@ def _restore_settings() -> LogConfig:
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
         staging_retention=timedelta(0),
-        staging_rows=0,
     )
 
 
@@ -3243,7 +3239,6 @@ def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
         s3,
         wal_replication=True,
         staging_retention=timedelta(0),
-        staging_rows=0,
     ) as log:
         log.extend(rows(ROWS))
         log.seal(flush=True)

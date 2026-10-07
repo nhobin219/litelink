@@ -365,7 +365,7 @@ def test_a_config_written_without_a_setting_still_opens() -> None:
 
     assert recovered.target_seal_size == 4096
     assert recovered.compact_min_files == 2
-    assert recovered.staging_rows == LogConfig().staging_rows
+    assert recovered.staging_max_bytes == LogConfig().staging_max_bytes
     assert recovered.staging_snapshot_retention == timedelta(minutes=15)
     assert recovered.published_snapshot_retention == timedelta(hours=1)
 
@@ -725,29 +725,6 @@ def test_negative_staging_retention_is_refused(tmp_path: Path) -> None:
         )
 
 
-def test_a_generous_floor_beside_an_evicting_one_is_allowed(tmp_path: Path) -> None:
-    """Eviction takes the LOWER boundary, so the policy retaining more wins.
-
-    A config is only "evict on upload" when every floor it states is one.
-    Refusing `staging_retention=0` beside `staging_rows=1_000_000` would refuse a
-    config that keeps a million rows regardless of age, with a message that is
-    false for it.
-    """
-    log = litelink.new(
-        tmp_path,
-        "s",
-        schema=SCHEMA,
-        sort_by=("event_ts",),
-        config=LogConfig(staging_retention=timedelta(0), staging_rows=1_000_000),
-    )
-    with log:
-        log.extend([{"event_ts": i, "key": "k"} for i in range(8)])
-        log.seal(flush=True)
-        log.advance()
-
-        assert log.scan().read_all().num_rows == 8, "evicted under a generous floor"
-
-
 @pytest.mark.parametrize(
     "name", ["staging_snapshot_retention", "published_snapshot_retention"]
 )
@@ -794,14 +771,14 @@ def test_a_second_handle_sees_settings_changes_with_no_refresh(tmp_path: Path) -
         tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",), config=LogConfig()
     )
     with first, litelink.open(tmp_path, "s") as second:
-        assert second.config.staging_rows is None
+        assert second.config.staging_max_bytes == LogConfig().staging_max_bytes
 
-        first.set_config(LogConfig(staging_rows=4242))
+        first.set_config(LogConfig(staging_max_bytes=4242))
 
         # `second` was never told, and never asked.
-        assert second.config.staging_rows == 4242
-        assert second._maintenance.config.staging_rows == 4242
-        assert second._buffer.config().staging_rows == 4242
+        assert second.config.staging_max_bytes == 4242
+        assert second._maintenance.config.staging_max_bytes == 4242
+        assert second._buffer.config().staging_max_bytes == 4242
 
 
 def test_the_sort_order_is_recovered_from_meta_not_from_the_catalog(
@@ -1237,24 +1214,21 @@ def test_a_pre_02_log_names_the_release_that_can_migrate_it(tmp_path: Path) -> N
 
 
 def test_the_config_is_written_under_the_staging_names_and_reads_the_old_ones() -> None:
-    """New logs store `staging_retention` and `staging_rows` (#98); one written
-    before the rename stored `local_retention` and `local_rows`, and still opens
-    with its policy.
+    """New logs store `staging_retention` (#98); one written before the
+    rename stored `local_retention`, and still opens with its policy. Its
+    `local_rows`, retired with `staging_rows`, is ignored.
 
-    Falsify by dropping the fallback to `local_rows` in `from_json`: the old
-    record reads back with no row floor.
+    Falsify by dropping the fallback to `local_retention` in `from_json`: the
+    old record reads back with no age limit.
     """
-    config = LogConfig(staging_retention=timedelta(hours=2), staging_rows=500)
+    config = LogConfig(staging_retention=timedelta(hours=2))
     written = json.loads(config.to_json())
     assert written["staging_retention"] == 7200
-    assert written["staging_rows"] == 500
     assert "local_retention" not in written
-    assert "local_rows" not in written
 
     old = json.dumps({"local_retention": 7200, "local_rows": 500})
     recovered = LogConfig.from_json(old)
     assert recovered.staging_retention == timedelta(hours=2)
-    assert recovered.staging_rows == 500
 
 
 def test_set_config_takes_no_claim(tmp_path: Path) -> None:
@@ -1269,8 +1243,8 @@ def test_set_config_takes_no_claim(tmp_path: Path) -> None:
         held = log._lease("maintain")
         assert held.acquire()
         try:
-            log.set_config(LogConfig(staging_rows=7))
+            log.set_config(LogConfig(staging_max_bytes=7))
         finally:
             held.release()
 
-        assert log.config.staging_rows == 7
+        assert log.config.staging_max_bytes == 7

@@ -10,7 +10,6 @@ back either way.
 from __future__ import annotations
 
 import sqlite3
-from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -25,6 +24,7 @@ from litelink._prune import terms
 from litelink._read import Reader
 from litelink._tiers import PublishedTier, Stored
 from litelink.manifest import build, prune
+from tests.conftest import keep_newest_rows
 from tests.test_manifest import row
 from tests.test_publish import ROWS, published_log, rows
 
@@ -339,13 +339,12 @@ def evicted(tmp_path: Path, bucket: str, s3: S3Options) -> WriteHandle:
     `event_ts` is the row's position, so `event_ts = offset - 1` and a
     predicate on either lands in a known tier.
     """
-    log = published_log(
-        tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
-    )
+    log = published_log(tmp_path, bucket, s3)
     log.extend(rows(ROWS))
     log.seal(flush=True)
     log.publish(flush=True)
     log.advance()
+    keep_newest_rows(log, 1000)
     extent = log.staging_extent()
     assert extent is not None, "the fixture must keep part of the log local"
     assert 1 < extent[0] < ROWS, "the fixture must evict part of the log"
@@ -594,15 +593,13 @@ def test_eviction_widens_the_published_row_before_it_commits(
         seen.append((boundary, None if stored is None else stored.offsets[1]))
         original(table, boundary)
 
-    log = published_log(
-        tmp_path, bucket, s3, staging_retention=timedelta(0), staging_rows=1000
-    )
+    log = published_log(tmp_path, bucket, s3)
     with log:
         log.extend(rows(ROWS))
         log.seal(flush=True)
         log.publish(flush=True)
         monkeypatch.setattr(LogTable, "evict_below", checked)
-        log.advance()
+        keep_newest_rows(log, 1000)
 
     assert seen, "the fixture must evict"
     for boundary, covered_until in seen:

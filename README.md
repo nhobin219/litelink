@@ -351,8 +351,8 @@ Upgrading a log written by 0.1.0 takes litelink 0.5.1 first: see
 
 - **Not an unbounded staging table.** A seal's cost tracks what the table's metadata holds, so
   a log that never runs `advance()` and never evicts gets slower on the write path over time.
-  `advance()` arrests the larger factor; a retention, with `publish()` running, bounds the
-  rest. Numbers and the reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
+  `advance()` arrests the larger factor; `staging_retention` (a day by default), with
+  `publish()` running, bounds the rest. Numbers and the reasoning are in [`docs/SPEC.md`](docs/SPEC.md) §13.7.
 
 ## Not implemented yet
 

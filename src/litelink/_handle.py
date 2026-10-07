@@ -2722,14 +2722,11 @@ class WriteHandle(LocalReadHandle):
 
         if loaded is not None and publish:
             try:
-                # COMPACT first, and it is not tidiness. The push below takes
-                # the whole trailing run, so every undersized seal still sitting
-                # below the load goes to the published table with it — and
-                # compaction will not merge what the published table holds, so
-                # they stay small there for ever. Merging them in staging first
-                # collapses that to the one file a run genuinely cannot fill.
-                # Measured on five small seals: six undersized objects pushed
-                # without this, one with it.
+                # COMPACT first. The push below may take the whole in-progress
+                # region with `flush`, and whatever it pushes unmerged is an
+                # early copy, uploaded again when compaction swaps it out
+                # (#160). Merging what is due first sends fewer, larger files
+                # the first time.
                 self.compact()
                 self.publish(flush=flush)
             except Exception as exc:
@@ -3495,9 +3492,10 @@ class WriteHandle(LocalReadHandle):
         **Only the range it pushes**, `[floor, end)`: from the published
         table's frontier to the end of what this push would upload. Nothing
         else needs to wait for it. A seal lands above the staging table's end,
-        eviction below the published floor, and compaction refuses what the
-        published table holds — and a compaction over the trailing run, which
-        `flush` pushes too, overlaps this range and so is excluded by it.
+        eviction below the published floor, and compaction below it only on
+        files the published table already holds (#160) — and a compaction
+        over the in-progress region, which `flush` pushes too, overlaps this
+        range and so is excluded by it.
         The whole-log operations still exclude any publish.
 
         **Two publishes still exclude each other.** Both start at the same
@@ -4124,7 +4122,7 @@ class WriteHandle(LocalReadHandle):
         - **`"buffer"`**: rows staging holds — or, with `wal_replication`, rows
           the published table holds, since until then the buffer is their
           off-box copy (§3a). A seal never deletes its own rows; this does.
-        - **`"staging"`**: files past `staging_retention` / `staging_rows` that
+        - **`"staging"`**: files past `staging_retention` / `staging_max_bytes` that
           the published table holds (I4). Never past what it holds, so a
           publish that is behind delays this rather than losing data.
 
@@ -4503,6 +4501,18 @@ def validate(
             msg = f"{name} must not be negative: {retention}"
             raise ValueError(msg)
 
+    if config.staging_max_bytes is not None and config.staging_max_bytes < 1:
+        msg = f"staging_max_bytes must be at least 1: {config.staging_max_bytes}"
+        raise ValueError(msg)
+
+    if config.staging_retention is None and config.staging_max_bytes is None:
+        msg = (
+            "set staging_retention, staging_max_bytes or both: with neither, the "
+            "staging table would grow for good. Every row is in the published "
+            "table, so staging is a cache for hot reads, and needs a bound"
+        )
+        raise ValueError(msg)
+
     if config.staging_retention is not None and config.staging_retention < timedelta(0):
         # The same check its twin above has always had, and the reason it
         # matters more here: eviction computes `now - staging_retention`, so a
@@ -4591,10 +4601,6 @@ def validate(
         msg = (
             f"target_row_group_rows must be at least 1: {config.target_row_group_rows}"
         )
-        raise ValueError(msg)
-
-    if config.staging_rows is not None and config.staging_rows < 0:
-        msg = f"staging_rows must not be negative: {config.staging_rows}"
         raise ValueError(msg)
 
     if config.compression not in _CODECS:

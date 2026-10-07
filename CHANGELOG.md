@@ -51,9 +51,10 @@ ends up with. Each has its own lever, and in the dedicated-process split
   for files at the target.
 - **Compaction memory and row-group pruning: `target_row_group_size`**
   (Arrow bytes, 64 MiB), **and optionally `target_row_group_rows`.**
-- **Local copies kept for hot reads: `staging_retention`.** The in-progress
-  region always stays local until it is finished and published or swapped,
-  whatever this is set to.
+- **Local disk for hot reads: `staging_max_bytes`** (4 GiB per log by
+  default), **and optionally `staging_retention`** to evict by age as well.
+  The in-progress region always stays local until it is finished and
+  published or swapped, whatever these say.
 
 A typical deployment:
 - the seal and publish processes flush on your RPO interval, say every 15
@@ -89,6 +90,37 @@ with `flush` and compacts without it.
   drain once no live snapshot names them.
 
 ### Changed
+
+- **Breaking: the staging table is bounded by size by default, and
+  `staging_rows` is gone.** Its two limits are now both ceilings, and a file
+  is evicted once either says so:
+  - `staging_retention` (age): files written longer ago than this go. `None`,
+    still the default, is no age limit.
+  - `staging_max_bytes` (new; size on disk, **4 GiB per log by default**):
+    the newest files that fit stay, older ones go.
+
+  With both set, the window is honoured up to the size limit, which is the
+  hard one. At least one must be set. Neither evicts unpublished files (I4)
+  or the in-progress region, so staging can sit above the size limit by
+  about one `target_compact_size`, or by a publish backlog.
+
+  `staging_rows`, a floor that kept whichever of it and the window held more,
+  is removed; a stored value is ignored.
+
+  **On upgrade, every log gets the 4 GiB limit**, including one that kept
+  everything under the old `None`. A log whose window holds more than 4 GiB
+  evicts more than before: set `staging_max_bytes` explicitly, or `None` to
+  keep the window as the only limit.
+- **Upgrading re-cuts what staging holds, once.** Files compacted by an
+  earlier version were sized in Arrow bytes, so they are under the new
+  on-disk target and are recompaction candidates: compaction grows them into
+  512 MiB files and `publish` swaps those in for the published copies.
+  Nothing is lost or duplicated; the cost is local rewrites (about 4.5× the
+  staged window) and one re-upload of it, and eviction keeps those files
+  local until they are re-cut. Only what staging held at upgrade is re-cut:
+  your retention window for a log that set one, the whole log for one on the
+  old default of keeping everything. Published files no longer in staging are
+  left as they are. Raising `target_compact_size` later does the same.
 
 - **Compaction streams, and sizes files on disk: 512 MiB by default** (#158).
   `target_compact_size` is now bytes on disk, defaulting to 512 MiB (Iceberg's
