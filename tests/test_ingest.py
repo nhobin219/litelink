@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -12,12 +13,14 @@ import pytest
 
 import litelink
 import litelink._handle
+import litelink._table
 from litelink import OFFSET, LogConfig, WriteHandle
 from litelink._claim import EVERYTHING, new_owner
 from litelink._layout import Layout
 from litelink._s3 import S3Options
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 SCHEMA = pa.schema(
@@ -181,7 +184,11 @@ def test_an_ingested_file_is_sorted_within_itself(tmp_path: Path) -> None:
 
 
 def test_a_large_source_is_split_at_the_compaction_target(tmp_path: Path) -> None:
-    config = LogConfig(target_seal_size=4096, target_compact_size=8192)
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8192,
+        target_row_group_size=4096,
+    )
     with open_log(tmp_path, config) as log:
         log.ingest(table(4000))
         files = sorted(log._table.data_files(), key=lambda f: f.start)
@@ -201,7 +208,11 @@ def test_a_large_source_is_split_at_the_compaction_target(tmp_path: Path) -> Non
 
 
 def test_ingested_files_are_born_past_compaction(tmp_path: Path) -> None:
-    config = LogConfig(target_seal_size=4096, target_compact_size=8192)
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8192,
+        target_row_group_size=4096,
+    )
     with open_log(tmp_path, config) as log:
         log.ingest(table(4000))
         before = {f.path for f in log._table.data_files()}
@@ -284,6 +295,7 @@ def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     config = LogConfig(
         target_seal_size=4096,
         target_compact_size=8192,
+        target_row_group_size=4096,
         staging_snapshot_retention=timedelta(seconds=0),
         published_snapshot_retention=timedelta(seconds=0),
         wal_replication=True,
@@ -404,6 +416,48 @@ def test_a_value_the_schema_cannot_hold_costs_no_offsets(tmp_path: Path) -> None
         assert log._table.span() is None
 
 
+def test_merging_a_loads_tail_reads_it_a_row_group_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load's tail is an input like a seal, and up to `target_compact_size`
+    on disk. Read whole it is that times the compression ratio in Arrow, in one
+    allocation; read a row group at a time, it is bounded like every other
+    input."""
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=64 * 1024,
+        target_row_group_size=8192,
+        compact_min_files=2,
+    )
+    with open_log(tmp_path, config) as log:
+        log.ingest(table(6000), publish=False)
+        tail = log._table.data_files()[-1]
+        assert tail.size < config.compact_size, "the load must leave a tail"
+        assert pq.ParquetFile(tail.path).metadata.num_row_groups > 2
+
+        log.extend(rows(200, start=6000))
+        log.seal(flush=True)
+
+        read: list[int] = []
+        scan_range = litelink._table.LogTable.scan_range
+
+        def spy(self: Any, start: int, end: int) -> pa.Table:
+            got = scan_range(self, start, end)
+            read.append(got.nbytes)
+
+            return got
+
+        monkeypatch.setattr(litelink._table.LogTable, "scan_range", spy)
+        log.compact(flush=True)
+        monkeypatch.undo()
+
+        assert read, "the tail must have been merged"
+        assert max(read) <= 2 * config.target_row_group_size, (
+            f"an input was read whole: {max(read)} bytes"
+        )
+        assert log.scan().read_all().num_rows == 6200
+
+
 # -- ingest: what a failure leaves behind (I2) ---------------------------------
 
 
@@ -412,22 +466,29 @@ def test_a_load_that_dies_mid_write_leaves_nothing_unnameable(
 ) -> None:
     """Every path is in SQLite before its bytes are, so a crash leaves files
     this database can still name — the one category §12 refuses to have."""
-    config = LogConfig(target_seal_size=4096, target_compact_size=8192)
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8192,
+        target_row_group_size=4096,
+    )
     written: list[object] = []
-    real = litelink._handle.write_parquet
+    real = litelink._handle.stream_parquet
 
-    def failing(rows: Any, path: Any, compression: Any) -> None:
+    @contextmanager
+    def failing(path: Any, schema: Any, compression: Any) -> Iterator[Any]:
         written.append(path)
         # The bytes land and the durable write then fails, so the third file is
         # on disk under a name only `compacting` holds. That is the state I2
         # exists for, and a raise BEFORE the write would not produce it.
-        real(rows, path, compression)
+        with real(path, schema, compression) as write:
+            yield write
+
         if len(written) == 3:
             msg = "the disk went away"
             raise OSError(msg)
 
     with open_log(tmp_path, config) as log:
-        monkeypatch.setattr(litelink._handle, "write_parquet", failing)
+        monkeypatch.setattr(litelink._handle, "stream_parquet", failing)
 
         with pytest.raises(OSError, match="the disk went away"):
             log.ingest(table(4000))
@@ -494,7 +555,11 @@ def test_files_are_registered_several_per_commit(
 ) -> None:
     """A commit costs far more than the write it publishes — 4.1 s against
     648 ms against S3 — so writes and commits decouple."""
-    config = LogConfig(target_seal_size=4096, target_compact_size=8192)
+    config = LogConfig(
+        target_seal_size=4096,
+        target_compact_size=8192,
+        target_row_group_size=4096,
+    )
     monkeypatch.setattr(litelink._handle, "_INGEST_BATCH", 3)
     commits: list[int] = []
 
@@ -531,6 +596,7 @@ def test_an_ingested_range_survives_the_whole_published_table_cycle(
         config=LogConfig(
             target_seal_size=4096,
             target_compact_size=8192,
+            target_row_group_size=4096,
             compact_min_files=2,
             staging_retention=timedelta(seconds=0),
             staging_snapshot_retention=timedelta(seconds=0),
@@ -580,6 +646,7 @@ def test_a_load_flushes_its_tail_by_default_only_when_the_wal_is_replicated(
         config=LogConfig(
             target_seal_size=4096,
             target_compact_size=8192,
+            target_row_group_size=4096,
             compact_min_files=2,
             staging_snapshot_retention=timedelta(seconds=0),
             published_snapshot_retention=timedelta(seconds=0),
@@ -631,6 +698,7 @@ def test_every_write_path_uses_the_configured_codec(
     config = LogConfig(
         target_seal_size=4096,
         target_compact_size=8192,
+        target_row_group_size=4096,
         compact_min_files=2,
         compression=setting,
     )

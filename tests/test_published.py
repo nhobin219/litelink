@@ -27,7 +27,7 @@ def local_log(root: Path, *, at: str | None = None, **overrides: object) -> Writ
     """A log given no published table, sized like `published_log` so it seals many files."""
     settings: dict[str, object] = {
         "target_seal_size": 64 * 1024,
-        "target_compact_size": 64 * 1024,
+        "target_compact_size": 1,  # conversion off, as in `published_log`
         "compact_min_files": 2,
         "staging_snapshot_retention": timedelta(seconds=0),
         "published_snapshot_retention": timedelta(seconds=0),

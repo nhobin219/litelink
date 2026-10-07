@@ -37,6 +37,16 @@ if TYPE_CHECKING:
 NAMESPACE = "litelink"
 
 
+# The directory compaction writes into, under a log's `data/`. A file there is
+# a merge's output, which `runs` never merges again (see `is_compacted`).
+COMPACTED = "compacted"
+
+
+def is_compacted(path: str) -> bool:
+    """Whether `path` — relative, absolute or a URI — is a merge's output."""
+    return f"/data/{COMPACTED}/" in path
+
+
 @dataclass(frozen=True, slots=True)
 class Layout:
     """The file and catalog layout of one log under one root."""
@@ -265,10 +275,14 @@ class Layout:
         because its source is the buffer, which is still there; a compaction's
         source is the file it is replacing.
         """
-        return f"{self.name}/data/compacted/{start}-{end}-{token}.parquet"
+        return f"{self.name}/data/{COMPACTED}/{start}-{end}-{token}.parquet"
 
-    def ingest_path(self, start: int, end: int, token: str) -> str:
-        """Root-relative path for a bulk-ingested file covering `[start, end)` (§13.4).
+    def ingest_path(self, start: int, token: str) -> str:
+        """Root-relative path for a bulk-ingested file starting at `start` (§13.4).
+
+        Named by its first offset alone: the file is written a row group at a
+        time and closes at a size on disk, so its end is not known when the
+        name has to be recorded.
 
         Its own directory, beside `compacted/`, because the file is neither: it
         was never buffered and never merged. That is worth being able to see
@@ -281,7 +295,7 @@ class Layout:
         exist and read back from there, so it never has to be derivable, and
         two owners racing the range must not write one file.
         """
-        return f"{self.name}/data/ingested/{start}-{end}-{token}.parquet"
+        return f"{self.name}/data/ingested/{start}-{token}.parquet"
 
     def absolute(self, rel_path: str) -> Path:
         return self.root / rel_path

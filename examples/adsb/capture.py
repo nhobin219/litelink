@@ -111,8 +111,9 @@ def main() -> None:
     # Measured against S3: 648 ms to upload a 9 kB file. Almost all of that is
     # the round trip, not the bytes, so halving file size doubles the cost of
     # publishing the same stream. Compaction is what bridges it: seal at 1 MiB
-    # so the buffer stays shallow, convert to 8 MiB so the published table receives
-    # eight times fewer objects for the same data.
+    # of Arrow so the buffer stays shallow, convert to 8 MiB on disk so the
+    # published table receives far fewer objects for the same data. Small for a
+    # demo, so it publishes within minutes; the default is 512 MiB.
     config = LogConfig(
         target_seal_size=1024 * 1024,
         target_compact_size=8 * 1024 * 1024,

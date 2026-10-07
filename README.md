@@ -81,7 +81,7 @@ later `reclaim` deletes it.
   cut off from S3 keeps reclaiming local storage; then the error is raised.
 
 `ingest()` loads data that is already durable, a Parquet corpus say: it skips the buffer and
-writes straight into staging at `target_compact_size`, then publishes, flushing its short last
+streams straight into staging at `target_compact_size`, then publishes, flushing its short last
 file by default only when the log replicates its WAL. Eviction, reclaiming and
 the sweeps are left to the next `advance()`, which a log that only ever ingests still needs.
 [SPEC §1](docs/SPEC.md#the-pipeline) diagrams both paths.

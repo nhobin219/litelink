@@ -1101,17 +1101,23 @@ it** — the one ordering in publishing that is correctness, not optimisation.
 Runs on the happy path, and has real work to do there. Not because seals come out
 undersized — every file a seal writes is already the size it was asked to be, since the cut
 is exact and there is no timer to cut early — but because the seal size and the file size
-are two different targets (§12). `target_compact_size` defaults to eight times
-`target_seal_size`, so eight sealed files become one, and that conversion is on **whether
-or not the published table is remote**: file count is a read cost locally too. Every file a query
+are two different targets (§12). `target_compact_size` defaults to 512 MiB **on disk** —
+Iceberg's own `write.target-file-size-bytes` — so hundreds of sealed files become one, and that
+conversion is on **whether or not the published table is remote**: file count is a read cost locally too. Every file a query
 cannot prune is opened — a footer read, and on object storage a request — which a wide scan or a
 filter on a column outside `sort_by` pays for every file. Planning is cheap either way: the offset
 boundary is read from one manifest, measured at 1.6 ms over one file and 3.0 ms over 64 (#158).
 
 It picks up the deliberate exceptions on the way — an explicit `seal()`, which cuts short by
 definition, and a change to `target_seal_size`, which leaves history sized for the old value.
-It is a no-op only where `target_compact_size` is set equal to the seal size, which is how
-the conversion is turned off.
+It is a no-op only where `target_compact_size` is at or under a sealed file's size on disk,
+which is how the conversion is turned off.
+
+**What a larger target costs is time in staging.** `publish` takes only files compaction has
+finished with (§5), so a stream publishes in `target_compact_size` steps: at 114 rows a second,
+512 MiB is 6 to 16 days. That is the published table's freshness, not durability — recovery is
+WAL replication's job (§3a) — and a log that wants a fresher published table sets a smaller
+target or calls `publish(flush=True)`.
 
 Hand-written, because `rewrite_data_files` is a Spark procedure with no pyiceberg
 equivalent.
@@ -1121,24 +1127,33 @@ works because sealed files already cover contiguous, non-overlapping ranges: pic
 files that together hold less than `target_compact_size`, and their combined range is itself
 contiguous.
 
-**Sizing is in uncompressed bytes, never in file size on disk.** The unit is the Arrow table's
-`nbytes` — what a reader pays to hold the rows in memory, since every read hands them back as
-Arrow. `target_compact_size` bounds what a file HOLDS in that unit: the appender's estimate
-for the rows that went into it, which models the Arrow layout and stays at or a little above
-`nbytes` (#84), or `nbytes` itself for a file `ingest` wrote. That number is carried per file
-from the seal that measured it, added up across a merge, and dropped when the file is
-unlinked. It cannot be recovered from the file afterwards: on data compressing
-8:1 a file holding a full target is an eighth of it on disk, so a rule reading sizes off disk
-merges eight already-full files into one holding eight times the memory the target allows —
-and, since `publish` refuses anything compaction may still rewrite, publishes nothing at all in the
-meantime. A file whose size was never recorded counts as full, so an unmeasured file is never
-rewritten on a guess.
+**Files are sized on disk; memory is bounded by the row group.** A run is chosen by adding up
+its files' sizes on disk, from their manifest entries, until the next would pass
+`target_compact_size`. It is merged once it is **closed** — the next file would not fit, or it has
+reached the target — so the trailing run waits for the files still to come, and
+`compact(flush=True)` is what merges it early. **A merge's output is never an input again**: it
+counts as full whatever its size. Without that, every output would be merged again, because a merge
+compresses better than its inputs did — larger row groups — and lands under the target they filled:
+by about a third, measured on sealed files of synthetic ticks and order-book snapshots (#158). So
+each row is compacted exactly once, and a 512 MiB target gives files of about 350-370 MB on
+those streams; data that gains less from larger row groups lands closer to the target. The merge streams: it reads its
+inputs one at a time in offset order, gathers whole inputs up to `target_row_group_size`
+(default 64 MiB of Arrow), sorts that by `sort_by` and writes it as one row group. Peak memory
+is about 2.5× the row group, whatever the file's size — measured at 285 MB writing a 512 MB file
+that held 6.6 GiB of Arrow, where the same file sorted whole in memory would need about 17 GB.
+
+**Sorted a row group at a time, not end to end.** A file sorted end to end by a `sort_by` that is
+not arrival order spreads every offset range across one stretch per sort key, so a range read
+touches a row group per key: measured, a 100k-offset read went from 4 requests to 27. Sorting
+each row group keeps an offset or time range inside one or two row groups. Row groups break
+between inputs, never inside one that fits, so their offset ranges stay disjoint.
 
 ```
-1. Select adjacent files holding < target_compact_size in total, spanning [start, end);
-   require compact_min_files.
-2. Scan them into one Arrow table; re-sort by `sort_by`.
-3. Verify row count and per-column min/max against the sources.
+1. Select adjacent files under target_compact_size on disk in total, spanning [start, end),
+   counting a previous merge's output as full; require compact_min_files and a closed run.
+2. Stream them in offset order, target_row_group_size at a time; sort each by `sort_by` and
+   write it as one row group.
+3. Verify the row count and the offset extent against the sources.
 4. staging.overwrite(table, overwrite_filter=(offset >= start) & (offset < end))  -- one snapshot
 ```
 
@@ -1714,9 +1729,12 @@ of them is chosen.
 target_seal_rows       max rows per SEAL                  (the other ceiling; the seal cuts at
                                                           whichever is reached FIRST. None =
                                                           no row limit)
-target_compact_size    Arrow bytes per FILE               (what compaction converts sealed
-                                                          files INTO. None = 8x the seal)
-target_compact_rows    max rows per compacted file        (None = 8x target_seal_rows)
+target_compact_size    bytes ON DISK per FILE             (what compaction converts sealed
+                                                          files INTO. None = 512 MiB)
+target_row_group_size  Arrow bytes per ROW GROUP          (what compaction sorts and holds at
+                                                          once: its memory bound. 64 MiB)
+target_row_group_rows  max rows per ROW GROUP             (closes it at whichever it reaches
+                                                          first. None = no row limit)
 target_seal_size       Arrow bytes per SEAL               (size it for READ latency and for
                                                           memory -- keep buffer <20k rows;
                                                           files land SMALLER on disk, by

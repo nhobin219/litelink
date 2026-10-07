@@ -7,6 +7,50 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Changed
+
+- **Compaction streams, and sizes files on disk: 512 MiB by default** (#158).
+  `target_compact_size` is now bytes on disk, defaulting to 512 MiB (Iceberg's
+  own default), instead of Arrow bytes defaulting to 8x the seal (64 MiB, often
+  10 MB or less on disk). Compaction reads its inputs one at a time and writes
+  `target_row_group_size` (new, 64 MiB of Arrow) at a time, each row group
+  sorted by `sort_by`, so its memory stays about 2.5x one row group whatever
+  the file's size. Measured on synthetic ticks and order-book snapshots: a
+  `count(*)` over S3 went from 190-410 requests to 4, full scans from 570-1,230
+  to 209-414, with local query times unchanged. `ingest` writes its files the
+  same way.
+- **Compaction merges a run once it is closed, and never merges its own output
+  again.** A run whose inputs fill the target (or that the next file would
+  overflow) is merged once. The trailing run waits for more, and its merged
+  file counts as full whatever its size, so every row is compacted exactly
+  once. Merged files therefore land under the target, by about a third on
+  compressible data. `compact(flush=True)` merges the trailing run early;
+  `advance(flush=True)` passes it, and so does `ingest` before a flushed
+  push.
+- **Breaking: a log publishes in 512 MiB steps.** `publish` takes only files
+  compaction has finished with, so the published table now trails the writer
+  by up to one 512 MiB file per log — days on a stream of 100 rows a second,
+  instead of hours. Recovery is unaffected (that is WAL replication's job).
+  For a fresher published table, set a smaller `target_compact_size` or call
+  `publish(flush=True)`.
+- **Breaking: a stored `target_compact_size` is now read as bytes on disk.**
+  A log that set one keeps its number, which now means larger files —
+  roughly the data's compression ratio larger. Re-set it to keep the old file
+  size.
+- **Breaking: `target_compact_rows` is replaced by `target_row_group_rows`.**
+  Files are sized by `target_compact_size` alone, as Iceberg sizes them; an
+  optional row ceiling applies to row groups instead, beside
+  `target_row_group_size`, closing one at whichever it reaches first (None, the
+  default, is no limit). A stored `target_compact_rows` is ignored.
+  `COMPACT_MULTIPLE` and `LogConfig.compact_rows` are removed, and a
+  `target_compact_size` under `target_seal_size` is no longer refused (the two
+  are in different units).
+- **Bulk-ingested files are named by their first offset alone**
+  (`ingested/{start}-{token}.parquet`), since a streamed file's end is not
+  known when its name is recorded.
+
 ## 0.10.2 — 2026-10-04
 
 ### Fixed

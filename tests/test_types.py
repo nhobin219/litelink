@@ -383,7 +383,8 @@ def test_an_otel_log_round_trips_through_every_local_path(tmp_path: Path) -> Non
         assert by_id.read_all().to_pylist() == [{"ts": 3}]
 
         log.seal(flush=True)
-        log.advance()
+        # Flushed: the trailing run is still open, so only a flush merges it.
+        log.compact(flush=True)
         assert log.staging_files() == 1, "compaction merged nested files"
         assert _read_back(log) == _expected(rows), "after compaction"
 

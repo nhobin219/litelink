@@ -201,7 +201,8 @@ def test_maintain_does_nothing_while_another_owner_holds_the_range(
         )
 
         other.release()
-        log.advance()
+        # Flushed: the trailing run is still open, so only a flush merges it.
+        log.advance(flush=True)
 
         assert len(log._table.data_files()) < before
 
