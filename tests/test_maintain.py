@@ -984,10 +984,11 @@ def test_an_empty_row_group_row_ceiling_is_refused() -> None:
         validate(SCHEMA, (), config, None)
 
 
-def test_a_step_larger_than_the_target_is_refused() -> None:
-    config = LogConfig(target_compact_size=100, target_compact_step_size=101)
-    with pytest.raises(ValueError, match="target_compact_step_size"):
-        validate(SCHEMA, (), config, None)
+def test_a_step_outside_the_target_is_refused() -> None:
+    for step in (0, 101):
+        config = LogConfig(target_compact_size=100, target_compact_step_size=step)
+        with pytest.raises(ValueError, match="target_compact_step_size"):
+            validate(SCHEMA, (), config, None)
 
 
 def test_an_empty_row_group_size_is_refused() -> None:

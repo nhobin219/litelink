@@ -13,40 +13,57 @@ minor version carries breaking changes.
 
 This release separates three things a log used to decide together: how much
 data you can lose (RPO), how fresh the published table is, and what files it
-ends up with. Each has its own lever.
+ends up with. Each has its own lever, and in the dedicated-process split
+(one maintainer per step) each step can run on its own schedule.
 
 - **RPO, with `wal_replication`:** seconds. Litestream ships the buffer's WAL
   continuously, independent of everything below.
-- **RPO without it, and published-table freshness: how often you call
-  `advance(flush=True)`** (or `seal(flush=True)` + `publish(flush=True)`).
-  - A flushed pass seals whatever is buffered and publishes it, so data on
-    this machine and nowhere else is at most one interval old.
-  - Without flushing, the published table only receives finished files:
-    up to one `target_compact_size` behind the writer, days on a stream of
+- **RPO without it, and published-table freshness: the seal and publish
+  processes' flush interval.**
+  - `seal(flush=True)` cuts whatever is buffered into a file;
+    `publish(flush=True)` pushes every sealed file. Both are needed: a
+    flushed publish pushes only what is sealed. Data on this machine and
+    nowhere else is at most about one seal interval plus one publish
+    interval old.
+  - Without flushing, the published table only receives finished files: up
+    to one `target_compact_size` behind the writer, days on a stream of
     about 100 rows a second.
   - Flush more often than a target fills, which at 512 MiB is any realistic
-    interval.
-  - A flushed pass costs a second upload of what it pushes early (seals,
+    interval. Slower than that, the seals between flushes merge on their own
+    and some finished files land under the target.
+  - A flushed publish costs a second upload of what it pushes early (seals,
     later swapped for the finished file) and one published commit.
+- **Staging read performance and local compaction cost: the compaction
+  process. Leave it unflushed.**
+  - Plain `compact()` grows the log's in-progress file a step at a time, so
+    staging holds one file plus under a step of seals.
+  - `target_compact_step_size` (on disk, an eighth of the target) is the
+    knob. A smaller step leaves fewer seals local, for more local writes:
+    about 4.5 per row at the default. It never affects RPO or uploads.
+  - `compact(flush=True)` only skips the step. On a schedule it rewrites the
+    in-progress file every call, so keep it for shutdown and tests.
+  - Compaction and publish schedules are independent. An in-progress file
+    holding published rows never absorbs an unpublished seal, so no publish
+    ever uploads a growing file, whichever ran first.
 - **Published file size: `target_compact_size`** (on disk, 512 MiB). Fewer,
   larger files make wide reads over object storage cheaper: 2.5–100× fewer
   requests, measured. Flushing doesn't change it: early copies are swapped
   for files at the target.
-- **Local compaction cost: `target_compact_step_size`** (on disk, an eighth
-  of the target).
-  - The in-progress file absorbs new seals a step at a time. Each step
-    rewrites it, so a smaller step leaves fewer seals local, for more local
-    writes: about 4.5 per row at the default.
-  - It never affects RPO or uploads.
 - **Compaction memory and row-group pruning: `target_row_group_size`**
   (Arrow bytes, 64 MiB), **and optionally `target_row_group_rows`.**
 - **Local copies kept for hot reads: `staging_retention`.** The in-progress
   region always stays local until it is finished and published or swapped,
   whatever this is set to.
 
-A typical split: a writer appends; a maintainer runs `advance()` every few
-seconds and `advance(flush=True)` on your RPO interval, say every 15
-minutes. Turn on `wal_replication` if you need seconds rather than minutes.
+A typical deployment:
+- the seal and publish processes flush on your RPO interval, say every 15
+  minutes, and otherwise run unflushed every few seconds;
+- compaction runs unflushed;
+- `wal_replication` is on if you need seconds rather than minutes.
+
+In a single process, `advance()` every few seconds and `advance(flush=True)`
+on the RPO interval do the same: a flushed `advance` seals and publishes
+with `flush` and compacts without it.
 
 ### Added
 

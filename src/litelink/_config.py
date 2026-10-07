@@ -175,7 +175,10 @@ class LogConfig:
     def compact_step(self) -> int:
         """How much new sealed data, on disk, the in-progress file absorbs per
         rewrite: `target_compact_step_size`, or an eighth of the target."""
-        return self.target_compact_step_size or max(1, self.compact_size // 8)
+        if self.target_compact_step_size is not None:
+            return self.target_compact_step_size
+
+        return max(1, self.compact_size // 8)
 
     # §8. Must exceed the longest hot-path lookback WITH margin.
     #
