@@ -1173,9 +1173,20 @@ class Maintenance:
         )
         self.drain()
 
-    def expire_published(self) -> None:
+    def expire_published(self, *, batch: bool = True) -> None:
         """Expire the published table's snapshots past
         `published_snapshot_retention`, then delete what has come due (§6, #113).
+
+        **Batched:** it commits only once the oldest expirable snapshot
+        is a quarter of the retention past due, and then expires everything
+        due in that one commit. A log that publishes every pass has a snapshot
+        come due every pass, and expiring each as it came was a published
+        commit per pass — a `metadata.json` and a version hint on object
+        storage, to free one snapshot. Batched, it is one commit per quarter
+        retention, about one every 15 minutes at the default hour. Snapshots
+        live up to a quarter longer, never less: retention is a minimum for
+        readers still holding one, so the wait only lengthens their grace.
+        `batch=False` expires whatever is due now, for `retire`.
 
         The published half of `expire`, and a routine of its own rather than a
         step inside `publish`, so an orchestrator can run it on its own
@@ -1198,10 +1209,21 @@ class Maintenance:
         if published is None:
             return
 
-        cutoff = datetime.now(UTC) - self.config.published_snapshot_retention
-        retiring = list(
-            published.expiring_paths(published.snapshots_older_than(cutoff))
-        )
+        retention = self.config.published_snapshot_retention
+        cutoff = datetime.now(UTC) - retention
+        due = published.snapshots_older_than(cutoff)
+        if batch and due:
+            oldest = min(s.timestamp_ms for s in due) / 1000
+            if oldest >= (cutoff - retention / 4).timestamp():
+                # Not a quarter past due yet: wait, and take the rest with it.
+                due = []
+
+        if not due:
+            self.drain_published()
+
+            return
+
+        retiring = list(published.expiring_paths(due))
         self._enqueue(retiring)
         published.expire_snapshots_older_than(cutoff)
         self._buffer.restamp_deletions(retiring, int(datetime.now(UTC).timestamp()))
