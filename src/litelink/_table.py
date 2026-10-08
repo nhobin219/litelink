@@ -165,7 +165,8 @@ class _SinglePutFileIO(PyArrowFileIO):
     publish pushes is under a part, so this is most of a log's writes.
 
     pyiceberg offers no property for it, so the filesystem it builds is rebuilt
-    from its own options with the one changed.
+    from its own options with the one changed. The option is pyarrow 21's,
+    hence litelink's floor there.
     """
 
     def _initialize_s3_fs(self, netloc: str | None) -> FileSystem:

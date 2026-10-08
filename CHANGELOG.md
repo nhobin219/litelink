@@ -11,6 +11,9 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: pyarrow 21 or later is required** (was 17). The
+  single-request upload for small S3 objects (#171) needs `S3FileSystem`'s
+  `allow_delayed_open`, which pyarrow 21 introduced.
 - **Published snapshot expiry is batched.** It commits only once the oldest
   due snapshot is a quarter of `published_snapshot_retention` past due, then
   expires everything due in one commit. A log that publishes every pass used
