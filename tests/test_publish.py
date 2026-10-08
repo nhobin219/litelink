@@ -3393,3 +3393,27 @@ def test_publish_reapplies_the_published_tables_metadata_properties(
         published.reload()
 
         assert published.properties.get(key) == METADATA_PROPERTIES[key]
+
+
+def test_a_small_object_goes_to_s3_in_one_request(s3: S3Options) -> None:
+    """pyarrow's S3 stream opens a multipart upload as soon as it opens, which
+    is three billed writes for a `version-hint.text` (#171). The shared FileIO
+    delays the open, so an object under a part is one `PutObject`.
+
+    Falsify by returning `load_file_io`'s FileIO from `shared_file_io` as is:
+    `allow_delayed_open` reads False.
+    """
+    from litelink._table import shared_file_io
+
+    io = shared_file_io(
+        {
+            "s3.endpoint": s3.endpoint or "",
+            "s3.access-key-id": s3.access_key or "",
+            "s3.secret-access-key": s3.secret_key or "",
+            "s3.region": s3.region or "us-east-1",
+        },
+        "s3://bucket/prefix",
+    )
+    filesystem = io.fs_by_scheme("s3", "bucket")  # ty: ignore[unresolved-attribute]
+    _, (options,) = filesystem.__reduce__()
+    assert options["allow_delayed_open"] is True

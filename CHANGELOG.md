@@ -7,6 +7,21 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Fixed
+
+- **A small object goes to S3 in one request, not three** (#171). pyarrow's
+  S3 stream opens a multipart upload as soon as it opens, so every
+  `metadata.json`, manifest list, manifest, `version-hint.text` and small
+  data file was `CreateMultipartUpload` + `UploadPart` +
+  `CompleteMultipartUpload`: three billed write requests, even for a 5-byte
+  hint. The FileIO litelink shares now delays the open, so an object under a
+  part is one `PutObject`; a larger one is the multipart upload it was. A
+  log whose published writes are mostly small, such as one publishing every
+  tick, makes about a third as many write requests. The only exception is a published table's very first
+  `metadata.json`, which pyiceberg writes through a FileIO of its own.
+
 ## 0.11.0 — 2026-10-07
 
 ### Levers, and how they relate to RPO
