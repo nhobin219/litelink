@@ -30,8 +30,10 @@ minor version carries breaking changes.
   hint. The FileIO litelink shares now delays the open, so an object under a
   part is one `PutObject`; a larger one is the multipart upload it was. A
   log whose published writes are mostly small, such as one publishing every
-  tick, makes about a third as many write requests. The only exception is a published table's very first
-  `metadata.json`, which pyiceberg writes through a FileIO of its own.
+  tick, makes about a third as many write requests. The only exception is a
+  published table's very first `metadata.json`, which pyiceberg writes
+  through a FileIO of its own. It needs pyarrow 21 or later; an older pyarrow
+  uploads as before.
 
 ## 0.11.0 — 2026-10-07
 

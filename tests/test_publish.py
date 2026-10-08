@@ -3419,6 +3419,33 @@ def test_a_small_object_goes_to_s3_in_one_request(s3: S3Options) -> None:
     assert options["allow_delayed_open"] is True
 
 
+def test_a_pyarrow_without_delayed_open_keeps_its_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`allow_delayed_open` arrived in pyarrow 21, and pyiceberg accepts 18.
+    An older pyarrow's options lack it, and passing it fails the filesystem's
+    construction, so the filesystem is kept as built.
+
+    Falsify by rebuilding whenever the option is not set: the rebuild raises.
+    """
+    from pyiceberg.io.pyarrow import PyArrowFileIO
+
+    from litelink._table import shared_file_io
+
+    def refuse(options: dict[str, object]) -> None:
+        raise TypeError("unexpected keyword argument 'allow_delayed_open'")
+
+    class OldS3FileSystem:
+        def __reduce__(self) -> tuple[object, tuple[dict[str, object]]]:
+            return refuse, ({"region": "us-east-1"},)
+
+    built = OldS3FileSystem()
+    monkeypatch.setattr(PyArrowFileIO, "_initialize_s3_fs", lambda self, netloc: built)
+    io = shared_file_io({}, "s3://bucket/prefix")
+    filesystem = io.fs_by_scheme("s3", "bucket")  # ty: ignore[unresolved-attribute]
+    assert filesystem is built
+
+
 def test_published_expiry_waits_for_a_quarter_retention_then_takes_all_due(
     tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
 ) -> None:
