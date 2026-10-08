@@ -19,7 +19,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
-from pyarrow.fs import FileSelector, FileType
+from pyarrow.fs import FileSelector, FileSystem, FileType
 from pyiceberg.catalog import METADATA_LOCATION, Catalog
 from pyiceberg.catalog.sql import IcebergTables, SqlCatalog
 from pyiceberg.conversions import from_bytes
@@ -140,11 +140,41 @@ def shared_file_io(properties: Mapping[str, str], location: str | None) -> FileI
             return io
 
         io = load_file_io(dict(properties), location)
+        if type(io) is PyArrowFileIO:
+            io = _SinglePutFileIO(dict(properties))
+
         _FILE_IOS[key] = io
         while len(_FILE_IOS) > _FILE_IOS_LIMIT:
             _FILE_IOS.popitem(last=False)
 
         return io
+
+
+class _SinglePutFileIO(PyArrowFileIO):
+    """`PyArrowFileIO`, writing an object smaller than a part to S3 in one
+    request rather than three (#171).
+
+    pyarrow's S3 output stream opens a multipart upload as soon as it opens —
+    `CreateMultipartUpload`, then `UploadPart`, then `CompleteMultipartUpload`,
+    each a billed write — even for `version-hint.text`, whose whole content is
+    a version number. Measured against rustfs: a 5-byte write was those three
+    requests. With `allow_delayed_open` the stream buffers until it holds a
+    part's worth: a smaller object goes up as one `PutObject`, a larger one as
+    the multipart upload it was. Every object a commit writes — `metadata.json`,
+    the manifest list, its manifests, the hint — and every seal a flushed
+    publish pushes is under a part, so this is most of a log's writes.
+
+    pyiceberg offers no property for it, so the filesystem it builds is rebuilt
+    from its own options with the one changed.
+    """
+
+    def _initialize_s3_fs(self, netloc: str | None) -> FileSystem:
+        built = super()._initialize_s3_fs(netloc)
+        rebuild, (options,) = built.__reduce__()
+        if options.get("allow_delayed_open"):
+            return built
+
+        return rebuild({**options, "allow_delayed_open": True})
 
 
 class _Catalog(SqlCatalog):
