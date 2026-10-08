@@ -9,6 +9,17 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+### Changed
+
+- **Published snapshot expiry is batched.** It commits only once the oldest
+  due snapshot is a quarter of `published_snapshot_retention` past due, then
+  expires everything due in one commit. A log that publishes every pass used
+  to make an expiry commit nearly every pass (a `metadata.json` and a version
+  hint on object storage); now it makes about one per quarter retention, every
+  15 minutes at the default hour. Published snapshots, and the files only they
+  hold, live up to a quarter longer than the retention: about an eighth more
+  retained snapshots on average. `retire` still expires everything due at once.
+
 ### Fixed
 
 - **A small object goes to S3 in one request, not three** (#171). pyarrow's

@@ -19,7 +19,7 @@ import subprocess
 import uuid
 from collections.abc import Iterable
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 import duckdb
@@ -3417,3 +3417,60 @@ def test_a_small_object_goes_to_s3_in_one_request(s3: S3Options) -> None:
     filesystem = io.fs_by_scheme("s3", "bucket")  # ty: ignore[unresolved-attribute]
     _, (options,) = filesystem.__reduce__()
     assert options["allow_delayed_open"] is True
+
+
+def test_published_expiry_waits_for_a_quarter_retention_then_takes_all_due(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A log publishing every pass has a snapshot come due every pass, and
+    expiring each as it came was a published commit per pass. Batched, expiry
+    waits until the oldest due snapshot is a quarter of the retention past due,
+    then expires everything due in one commit. Never earlier than retention:
+    that is the readers' grace. `retire` expires at once (`batch=False`).
+
+    Falsify by dropping the wait: the first check expires the three.
+    """
+    import litelink._maintenance as maintenance
+
+    retention = timedelta(hours=1)
+    later = timedelta(0)
+
+    class Shifted(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return datetime.now(tz) + later
+
+    with published_log(
+        tmp_path, bucket, s3, published_snapshot_retention=retention
+    ) as log:
+        for _ in range(4):
+            log.extend(rows(ROWS))
+            log.seal()
+            log.publish()
+
+        published = log._published.require()
+
+        def snapshots() -> int:
+            published.reload()
+            return len(list(published._table.snapshots()))
+
+        assert snapshots() == 4
+        monkeypatch.setattr(maintenance, "datetime", Shifted)
+
+        later = retention + timedelta(minutes=5)
+        log._maintenance.expire_published()
+        assert snapshots() == 4, "three are due, but not a quarter past it"
+
+        later = retention + timedelta(minutes=16)
+        log._maintenance.expire_published()
+        assert snapshots() == 1, "all three due go, in one commit"
+
+        log.extend(rows(ROWS))
+        log.seal()
+        log.publish()
+        later = retention + timedelta(minutes=1)
+        assert snapshots() == 2
+        log._maintenance.expire_published()
+        assert snapshots() == 2, "one due, a minute past: batched, it waits"
+        log._maintenance.expire_published(batch=False)
+        assert snapshots() == 1, "unbatched, as `retire` runs it, it goes now"

@@ -4345,7 +4345,9 @@ class WriteHandle(LocalReadHandle):
         # them grows with that; expiry takes the table down to the snapshots
         # its retention keeps. Each drains what has come due after.
         self.reclaim("staging")
-        self.reclaim("published")
+        # Not batched: a retired log takes no more passes, so whatever is due
+        # expires now.
+        self._maintenance.expire_published(batch=False)
         # And what that expiry queued, now rather than after the grace (#153).
         # The grace lets a scan already reading an expired snapshot finish; a
         # retired log takes no more passes, so whatever it leaves queued is

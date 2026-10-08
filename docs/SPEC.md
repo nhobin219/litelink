@@ -1187,6 +1187,13 @@ long-running scan may still hold open. Each table retains snapshots for its own 
 metadata pointer this process cannot see. Both are bounded. A log's offsets are its
 point-in-time reads, so no snapshot is kept for time travel.
 
+Published expiry is batched: it commits only once the oldest due snapshot is a quarter of
+`published_snapshot_retention` past due, then expires everything due in that one commit. A
+log that publishes every pass has a snapshot come due every pass, and each expiry commit is a
+`metadata.json` and a version hint on object storage. Batched, it is one commit per quarter
+retention, and a snapshot lives up to a quarter longer than the setting, never less.
+`retire` expires whatever is due without waiting.
+
 **Expiry does not delete the files, and the library must.** Verified against pyiceberg
 0.11.1: `maintenance.expire_snapshots()` drops the snapshot metadata and nothing else — after
 expiring three snapshots, `inspect.all_files()` is empty and all three Parquet files are still
