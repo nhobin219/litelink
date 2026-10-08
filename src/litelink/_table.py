@@ -165,15 +165,14 @@ class _SinglePutFileIO(PyArrowFileIO):
     publish pushes is under a part, so this is most of a log's writes.
 
     pyiceberg offers no property for it, so the filesystem it builds is rebuilt
-    from its own options with the one changed. The option arrived in pyarrow
-    21, and pyiceberg accepts 18: an older pyarrow's options lack it, and its
-    filesystem is kept as built, three requests and all.
+    from its own options with the one changed. The option is pyarrow 21's,
+    hence litelink's floor there.
     """
 
     def _initialize_s3_fs(self, netloc: str | None) -> FileSystem:
         built = super()._initialize_s3_fs(netloc)
         rebuild, (options,) = built.__reduce__()
-        if options.get("allow_delayed_open", True):
+        if options.get("allow_delayed_open"):
             return built
 
         return rebuild({**options, "allow_delayed_open": True})

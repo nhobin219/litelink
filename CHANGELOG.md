@@ -11,6 +11,9 @@ minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking: pyarrow 21 or later is required** (was 17). The
+  single-request upload for small S3 objects (#171) needs `S3FileSystem`'s
+  `allow_delayed_open`, which pyarrow 21 introduced.
 - **Published snapshot expiry is batched.** It commits only once the oldest
   due snapshot is a quarter of `published_snapshot_retention` past due, then
   expires everything due in one commit. A log that publishes every pass used
@@ -30,10 +33,8 @@ minor version carries breaking changes.
   hint. The FileIO litelink shares now delays the open, so an object under a
   part is one `PutObject`; a larger one is the multipart upload it was. A
   log whose published writes are mostly small, such as one publishing every
-  tick, makes about a third as many write requests. The only exception is a
-  published table's very first `metadata.json`, which pyiceberg writes
-  through a FileIO of its own. It needs pyarrow 21 or later; an older pyarrow
-  uploads as before.
+  tick, makes about a third as many write requests. The only exception is a published table's very first
+  `metadata.json`, which pyiceberg writes through a FileIO of its own.
 
 ## 0.11.0 — 2026-10-07
 

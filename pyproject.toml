@@ -36,7 +36,10 @@ dependencies = [
     # at all; online, `LOAD iceberg` silently autoinstalls over the network and
     # the package regains the dependency the bundling exists to remove.
     "duckdb>=1.5.5,<1.5.6",
-    "pyarrow>=17.0.0",
+    # 21 for S3FileSystem's allow_delayed_open, which writes an object under
+    # a part in one request rather than three (#171); pyiceberg alone would
+    # accept 18.
+    "pyarrow>=21.0.0",
     # Capped at the newest minor the suite has run on. litelink overrides two
     # of `SqlCatalog`'s private methods (`_table._Catalog`, #137), whose
     # signatures pyiceberg changes between minors, so an unbounded range lets a
