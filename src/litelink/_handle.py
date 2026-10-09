@@ -92,7 +92,7 @@ from litelink._tiers import encode as encode_tier
 from litelink._types import NON_FINITE, column_type, validate_schema
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from os import PathLike
     from typing import Self
 
@@ -3678,7 +3678,7 @@ class WriteHandle(LocalReadHandle):
                 )
                 return
 
-            self._record_published_row(published)
+            self._record_published_row(published, lease.renew)
 
         # The published span's end: everything below it is in the bucket.
         covered = published.span()
@@ -3936,7 +3936,9 @@ class WriteHandle(LocalReadHandle):
             location, offsets, encode_tier(self._buffer.shape().table, statistics)
         )
 
-    def _record_published_row(self, published: LogTable) -> None:
+    def _record_published_row(
+        self, published: LogTable, renew: Callable[[], bool]
+    ) -> None:
         """The published table's tier row, exactly, from its manifests.
 
         Its files reaching below the staging table — the range the published leg
@@ -3945,10 +3947,15 @@ class WriteHandle(LocalReadHandle):
 
         Narrows, so only under the whole-log maintenance claim: eviction, the
         one thing that widens this row, cannot run beside it, and nothing
-        else moves the staging table's floor down.
+        else moves the staging table's floor down. `renew` is that claim,
+        checked after the manifest walk, which on object storage can outlast
+        its TTL. Lapsed, an eviction may widen the row between the staging
+        span read and the write, and this would overwrite the widening: the
+        rows it moved would be in no tier a read consults.
         """
         published.reload()
         schema, files = published.live_files()
+        checkpoint(renew)
         self._table.reload()
         span = self._table.span()
         below = [f for f in files if span is None or file_span(schema, f)[0] < span[0]]
@@ -3979,7 +3986,7 @@ class WriteHandle(LocalReadHandle):
         try:
             published = self._published.table()
             if published is not None:
-                self._record_published_row(published)
+                self._record_published_row(published, lease.renew)
         except Exception:  # noqa: BLE001
             # Unreachable is the ordinary case this tolerates — a box whose
             # credentials arrive after the log is opened. A row not written is
@@ -4159,6 +4166,70 @@ class WriteHandle(LocalReadHandle):
                     raise ValueError(msg)
 
             self._maintenance.evict(end_offset=end_offset)
+
+    def truncate(self, *, below: int) -> int:
+        """Drop the log's history below offset `below`, from every tier, for
+        good. Returns the floor reached: no row below it remains, and none at or
+        above it was touched (#80).
+
+        **Not reversible.** The published table loses the rows too, and it is
+        the copy of last resort.
+
+        - **Whole files only.** A file in either table that straddles `below`
+          stays, so the floor is that file's start, which can be below what was
+          asked. `coverage()` reports where the log now starts.
+        - **Never past what the published table holds.** Rows not published
+          yet are not history; `publish(flush=True)` first to include them.
+        - **The offset counter never moves.** Appends continue where they
+          were, and a read below the floor finds nothing rather than other rows.
+
+        Truncation follows the same cycle as every other delete. Each table drops
+        the files in a commit, which queues them for deletion; expiry then
+        retires the snapshots still naming them, and `reclaim` deletes each
+        once its grace — the table's snapshot retention — has passed and no
+        live snapshot references it. A scan already reading one finishes. So
+        the space comes back over the next retention of `advance` passes, not
+        from this call.
+
+        Takes the whole-log claim, so it waits on no pass and none runs beside
+        it: a held claim raises `RuntimeError`, and calling again later is
+        safe. A crash part way leaves the rows below the floor partly dropped
+        and still correctly read; calling again finishes it.
+        """
+        if below < 0:
+            msg = f"below must be an offset, not {below}"
+            raise ValueError(msg)
+
+        # The whole log. A claim on the range it drops is not enough:
+        # - publish's swap replaces the published copies of a merged file
+        #   owed its swap, which lies below the range publish claims (from
+        #   the published table's end). Truncate drops that file and its
+        #   copies too, so the two commits fight over the same published
+        #   files: the swap's commit fails after uploading the merged file,
+        #   and the upload is orphaned, named by nothing. A narrower claim
+        #   would have to overlap every publish, which is most of the log.
+        # - `below=0` would claim `[0, 0)`, which excludes nothing, and the
+        #   tier row's narrowing at the end would overwrite an eviction's
+        #   widening: the rows it moved would be in no tier a read consults.
+        # Appends never wait on it; seals, compactions and publishes do, for
+        # the few commits a truncate takes.
+        lease = self._lease(MAINTAIN_ROLE)
+        if not lease.acquire():
+            msg = "another owner holds a claim over this log; retry the truncate"
+            raise RuntimeError(msg)
+
+        try:
+            floor = self._maintenance.truncate(below, lease.renew)
+            self._store_staging_statistics()
+            published = self._published.table()
+            if published is not None:
+                # Narrowed, exactly: what the published table now holds below
+                # the staging table. The whole-log claim is what allows it.
+                self._record_published_row(published, lease.renew)
+        finally:
+            lease.release()
+
+        return floor
 
     def reclaim(
         self,

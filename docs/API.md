@@ -105,7 +105,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
-| **`+ WriteHandle`** — published table | `publish` · `retire` |
+| **`+ WriteHandle`** — published table | `publish` · `truncate` · `retire` |
 | **`+ WriteHandle`** — configure | `set_config` |
 | **`+ WriteHandle`** — recover | `recover` · `recovery` |
 
@@ -687,7 +687,7 @@ A claim excludes only an overlapping claim, whatever its kind:
 | `reclaim()` | nothing for the expiry or the delete | nothing |
 | `sweep()` | nothing | nothing |
 | `set_config` | nothing: one `meta` row, read wherever a decision is made | nothing |
-| `retire`, `ingest` | the whole log | everything above |
+| `retire`, `ingest`, `truncate` | the whole log | everything above |
 
 The sweep lists a table's `metadata/` at its first pass in a process, then every four hours,
 and deletes what a lost or crashed commit left behind, at most 500 files a pass (SPEC §6). It
@@ -762,8 +762,8 @@ depends on it**. All three raise `RuntimeError` when another owner holds the cla
 `published="file:///directory"` it is that directory; given none, it is
 `<root>/<name>/published`. The pipeline is the same either way — a local-only log publishes,
 evicts and retires exactly like one on S3, and any Iceberg engine reads its table through
-`version-hint.text`. Its cost is disk: the local published table keeps everything, until truncation
-lands (a follow-up). `wal_replication` and `replication_config()` need a remote one: the WAL
+`version-hint.text`. Its cost is disk: the local published table keeps everything until
+`truncate()` drops its history. `wal_replication` and `replication_config()` need a remote one: the WAL
 replica exists to get rows off the machine, and a local published table is on this disk
 already. `restore` rebuilds from a local one, from the published table alone.
 
@@ -869,6 +869,40 @@ A consumer prunes on this, so missing information is `None`, never a narrower bo
   to 16 bytes, so they are not values. Nested columns keep no statistics of their own.
 - **Counts are sums, and None when any file lacks the count.** `value_count` includes NULLs,
   as Iceberg defines it.
+
+## Truncating a log: `truncate()`
+
+```python
+log.truncate(*, below: int) -> int
+```
+
+Drops the log's history below offset `below` from every tier, the published table included, and
+returns the floor it reached: no row below it remains, and none at or above it was touched.
+**It cannot be undone.** Nothing else drops published rows; there is no setting that ages them
+out (SPEC §8).
+
+- **Whole files only.** A file in either table that straddles `below` stays whole, so the floor
+  is its start, which can be below what was asked. `coverage()` reports where the log now
+  starts.
+- **Never past what the published table holds.** Rows not published yet are not history.
+  Call `publish(flush=True)` first to include them.
+- **The offset counter never moves.** Appends continue where they were. A read below the floor
+  finds nothing rather than other rows, so a consumer cursor below it should be refused by the
+  consumer, using `coverage()`.
+
+**It deletes nothing itself.** Each table drops the files in a commit and queues them, and they
+go the way every evicted or compacted file goes: expiry retires the snapshots still naming them,
+and `reclaim` deletes each once its table's snapshot retention has passed and no live snapshot
+references it, so a scan already reading one finishes. The space comes back over the next
+retention of `advance` passes, not from this call.
+
+A policy by age belongs above litelink: find the **smallest offset newer than the cutoff**, and
+truncate below it. The largest offset at or before the cutoff drops newer rows when timestamps
+are not monotonic in offset order.
+
+It takes the whole-log claim and raises `RuntimeError` if another owner holds any claim;
+calling it again later is safe. A crash part way leaves rows below the floor partly dropped but
+correctly read, and calling it again finishes.
 
 ## Retiring a log: `retire()`
 
