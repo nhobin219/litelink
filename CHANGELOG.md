@@ -7,6 +7,26 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **A retired log can be truncated and deleted** (#181), from its published
+  table alone, with no local directory needed.
+  - `litelink.truncate(published, name, *, below)` follows
+    `WriteHandle.truncate`'s rules. No maintainer runs on a retired log, so
+    each call first deletes what earlier calls left due, once
+    `published_snapshot_retention` has passed.
+  - `litelink.delete(published, name, *, root=None)` deletes the log
+    entirely: everything under `<published>/<name>/` (the published table and
+    the WAL replica), and its local directory when `root` is given. It is
+    immediate, and resumable after a crash.
+
+  Both refuse a log that isn't retired, and truncation never deletes a log.
+  A read-only handle on a retired log now follows its published table's
+  version hint, so it sees a truncate made from anywhere, and its
+  `coverage()` reads the published table.
+
 ## 0.12.2 — 2026-10-09
 
 ### Changed

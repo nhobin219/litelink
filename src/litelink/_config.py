@@ -56,6 +56,10 @@ DEFAULT_ROW_GROUP_SIZE = 64 * 1024 * 1024
 # machine running many multiplies it.
 DEFAULT_STAGING_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
+# Also the default for a retired log's `litelink.truncate`, which has no
+# config to read it from (#181).
+DEFAULT_PUBLISHED_SNAPSHOT_RETENTION = timedelta(hours=1)
+
 
 @dataclass(frozen=True, slots=True)
 class LogConfig:
@@ -283,7 +287,7 @@ class LogConfig:
     # and other engines, holding a metadata pointer this process cannot see.
     # The staging table's readers are this log's own scans.
     staging_snapshot_retention: timedelta = timedelta(minutes=15)
-    published_snapshot_retention: timedelta = timedelta(hours=1)
+    published_snapshot_retention: timedelta = DEFAULT_PUBLISHED_SNAPSHOT_RETENTION
 
     # §6. What counts as "big enough to leave alone" is `settled_size` of the
     # target, not its own setting — see `_maintenance.settled_size`.

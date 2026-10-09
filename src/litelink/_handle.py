@@ -911,6 +911,9 @@ class LogHandle:
         and not yet backfilled, or one just re-pointed. That is the one case
         this touches the network, and it is never answered wrongly instead.
 
+        A retired log's published range is read from the published table
+        itself, network included: it can be truncated from another machine.
+
         `published=False` is for a caller that will not read the published
         table — a replay held to the staging floor, `min(staging[0],
         buffer[0])`. Its `published` is None, meaning "not asked" rather than
@@ -932,7 +935,12 @@ class LogHandle:
             local = extent
 
         published_row = stored.get(PUBLISHED_TIER)
-        if published_row is not None:
+        marker = self._buffer.retired()
+        # A retired log's published table can be truncated from anywhere
+        # (`litelink.truncate`, #181), which no row here hears of — so it is
+        # asked, not the row.
+        retired = marker is not None and marker.get("state") == "retired"
+        if published_row is not None and not retired:
             below = _span(*published_row.offsets)
         elif published:
             below = self._published_below(local)
