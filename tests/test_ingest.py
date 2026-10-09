@@ -266,7 +266,7 @@ def test_ingest_is_refused_while_the_seal_queue_holds_a_group(tmp_path: Path) ->
 
 def test_ingest_is_refused_while_a_seal_is_in_flight(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
-        log._buffer.claim_seal(1, 41, "s/data/1-41-abcdef01.parquet")
+        log._buffer.claim_seal(1, 41, "s/data/sealed/1-41-abcdef01.parquet")
 
         with pytest.raises(RuntimeError, match="in flight"):
             log.ingest(table(100))
