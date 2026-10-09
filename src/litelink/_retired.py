@@ -18,7 +18,6 @@ import contextlib
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,7 +26,6 @@ from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import StaticTable
 
 from litelink._buffer import Buffer
-from litelink._config import DEFAULT_PUBLISHED_SNAPSHOT_RETENTION
 from litelink._layout import Layout
 from litelink._s3 import S3Options
 from litelink._table import (
@@ -57,7 +55,6 @@ def truncate(
     *,
     below: int,
     s3_options: S3Options | None = None,
-    published_snapshot_retention: timedelta = DEFAULT_PUBLISHED_SNAPSHOT_RETENTION,
 ) -> int:
     """Drop a RETIRED log's history below offset `below`, from its published
     table alone, and return the floor reached (#181).
@@ -70,31 +67,26 @@ def truncate(
     offset counter is untouched. **Not reversible.** A log that is not
     retired is refused: its truncation needs its local claims and tier rows.
 
-    **Each call first deletes what earlier calls left due**, since no
-    maintainer runs on a retired log. The live log's deletion queue is in its
-    local SQLite, which this cannot rely on, so what is due is derived from
-    the table's snapshot history instead:
+    **Deleted at once, with no grace**, as `retire` deletes: a retired log
+    takes no maintenance passes, so nothing would delete later what this left
+    for later. After the truncating commit, every snapshot but the current one
+    expires, and every data and metadata file nothing then references is
+    deleted. A reader that resolved the table before the commit and is still
+    scanning rows below the floor can lose files under it — its query fails,
+    it is never served wrong rows. Giving readers a grace is the caller's,
+    which knows them: stop pointing readers at those rows a grace period
+    before truncating.
 
-    1. kept: every snapshot younger than `published_snapshot_retention`, and
-       the one that was current at the cutoff;
-    2. a data file only older snapshots reference stopped being referenced
-       before the cutoff — timed from the commit that removed it, not from the
-       snapshot that last held it — so its grace has passed, and it is
-       deleted;
-    3. then those snapshots expire, and the metadata nothing references any
-       more is swept.
-
-    Deleted BEFORE the expiry, so a crash between the two leaves the files
-    still named and the next call finds them again; the other order orphans
-    them. The files this call truncates go on a later call, once a retention
-    has passed — the grace a reader already scanning them needs.
+    Data files go BEFORE the snapshots naming them expire, so a crash between
+    the two leaves them named, and the next call — which cleans up whatever is
+    unreferenced whether or not it truncates anything — finds them again.
 
     **One caller at a time per log.** It commits through a throwaway catalog
     adopted from the published table's `version-hint.text`, so two callers
     would each commit onto what the hint said when they started. Each commit
-    first checks the hint still names the metadata it started from, and
-    raises `RuntimeError` if not; calling again then starts from the current
-    one.
+    and delete first checks the hint still names the metadata this one is
+    on, and raises `RuntimeError` if not; calling again then starts from the
+    current one.
     """
     if below < 0:
         msg = f"below must be an offset, not {below}"
@@ -151,9 +143,6 @@ def truncate(
                 )
                 raise RuntimeError(msg)
 
-        boundary = f"{layout.published_table_location(published).rstrip('/')}/"
-        _reclaim(table, published_snapshot_retention, boundary, unmoved)
-
         table.reload()
         files = table.data_files()
         floor = below
@@ -169,6 +158,9 @@ def truncate(
         if any(f.end <= floor for f in files):
             unmoved()
             table.evict_below(floor)
+
+        boundary = f"{layout.published_table_location(published).rstrip('/')}/"
+        _clean(table, boundary, unmoved)
 
         return floor
 
@@ -288,46 +280,30 @@ def delete(
         shutil.rmtree(local.directory)
 
 
-def _reclaim(
-    table: LogTable,
-    retention: timedelta,
-    boundary: str,
-    unmoved: Callable[[], None],
-) -> None:
-    """Delete what earlier truncations left due, then expire the snapshots
-    that named it and sweep their metadata (see `truncate`)."""
+def _clean(table: LogTable, boundary: str, unmoved: Callable[[], None]) -> None:
+    """Expire every snapshot but the current one, and delete every file
+    nothing then references — data first, then metadata (see `truncate`)."""
     table.reload()
-    cutoff = datetime.now(UTC) - retention
-    # The snapshot current at the cutoff stays: a file it references may have
-    # stopped being referenced only since, inside the grace. Found along the
-    # lineage, from the current snapshot back to the first older than the
-    # cutoff — the current one itself when nothing has committed since — and
-    # not by sorting timestamps, which two writers' skewed clocks can misorder.
-    cutoff_ms = cutoff.timestamp() * 1000
-    current_then = next(
-        (s.snapshot_id for s in table.lineage() if s.timestamp_ms < cutoff_ms), None
-    )
-    expiring = [
-        s for s in table.snapshots_older_than(cutoff) if s.snapshot_id != current_then
-    ]
-
-    if expiring:
-        ids = {s.snapshot_id for s in expiring}
-        kept = [s for s in table.snapshots() if s.snapshot_id not in ids]
-        due = [
-            path
-            for path in table.data_paths(expiring) - table.data_paths(kept)
-            if path.startswith(boundary)
+    current = table.current_snapshot()
+    if current is not None:
+        expiring = [
+            s for s in table.snapshots() if s.snapshot_id != current.snapshot_id
         ]
-        unmoved()
-        _remove_all(table, due)
-        unmoved()
-        table.expire_snapshots(sorted(ids))
+        if expiring:
+            # Before the expiry, while the snapshots still name them.
+            due = [
+                path
+                for path in table.data_paths(expiring) - table.data_paths([current])
+                if path.startswith(boundary)
+            ]
+            unmoved()
+            _remove_all(table, due)
+            unmoved()
+            table.expire_snapshots([s.snapshot_id for s in expiring])
 
-    # What no snapshot or `metadata.json` still names, older than the
-    # retention — the expired snapshots' manifests and lists among it.
-    # Listed first and read after, so a commit landing between counts as
-    # live (`Maintenance._stranded`).
+    # What no snapshot or `metadata.json` still names — the expired snapshots'
+    # manifests and lists among it. Listed first and read after, so a commit
+    # landing between counts as live (`Maintenance._stranded`).
     table.reload()
     anchors = table.anchors()
     listed = table.metadata_files()
@@ -339,11 +315,7 @@ def _reclaim(
     unmoved()
     _remove_all(
         table,
-        [
-            path
-            for path, written in listed
-            if written < cutoff and path not in live and path.startswith(boundary)
-        ],
+        [path for path, _ in listed if path not in live and path.startswith(boundary)],
     )
 
 

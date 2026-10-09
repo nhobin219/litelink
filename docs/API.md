@@ -142,8 +142,7 @@ litelink.restore(root, name, *, published, s3_options=None, binary=None,
                  replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
 
 # A retired log, from its published table alone (see "Retiring a log")
-litelink.truncate(published, name, *, below, s3_options=None,
-                  published_snapshot_retention=timedelta(hours=1)) -> int
+litelink.truncate(published, name, *, below, s3_options=None) -> int
 litelink.delete(published, name, *, s3_options=None, root=None) -> None
 ```
 
@@ -960,13 +959,16 @@ handle, and work with no local directory, as after a failover.
 - `below` is exclusive;
 - the offset counter never moves.
 
-It refuses a log that isn't retired. No maintainer runs on a retired log, so **each call first
-deletes what earlier calls left due**. That means data files that only snapshots older than
-`published_snapshot_retention` reference, timed from the commit that removed them. Then it
-expires those snapshots and sweeps their metadata. The files a call truncates go on a later call,
-once the retention has passed. Call it from one place at a time per log: it commits through the
-table's `version-hint.text`, and a call that finds the hint moved since it started raises
-`RuntimeError`, which is safe to retry.
+It refuses a log that isn't retired. **It deletes at once, with no grace**, as `retire` does: a
+retired log takes no maintenance passes, so nothing would delete the files later. After the
+truncating commit, every snapshot but the current one expires, and every data and metadata file
+nothing then references is deleted. A reader still scanning rows below the floor from before the
+commit can lose files under it; its query fails, it never gets wrong rows. **Readers' grace is the
+caller's to give**: stop pointing readers at those rows a grace period before truncating (for
+streamcast, by moving the stream's floor in its own metadata first). Each call also cleans up
+whatever an earlier call left unreferenced, for example after a crash. Call it from one place at a
+time per log: it commits through the table's `version-hint.text`, and a call that finds the hint
+moved since it started raises `RuntimeError`, which is safe to retry.
 
 **`litelink.delete(published, name, *, root=None)`** deletes a retired log entirely:
 - everything under `<published>/<name>/`: the published table's data and metadata, and the WAL

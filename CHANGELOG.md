@@ -14,9 +14,10 @@ minor version carries breaking changes.
 - **A retired log can be truncated and deleted** (#181), from its published
   table alone, with no local directory needed.
   - `litelink.truncate(published, name, *, below)` follows
-    `WriteHandle.truncate`'s rules. No maintainer runs on a retired log, so
-    each call first deletes what earlier calls left due, once
-    `published_snapshot_retention` has passed.
+    `WriteHandle.truncate`'s rules, and deletes at once, as `retire` does: a
+    retired log takes no maintenance passes, so nothing would delete later.
+    Readers' grace is the caller's to give, by no longer pointing them at
+    those rows a grace period before truncating.
   - `litelink.delete(published, name, *, root=None)` deletes the log
     entirely: everything under `<published>/<name>/` (the published table and
     the WAL replica), and its local directory when `root` is given. It is

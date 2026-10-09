@@ -1635,13 +1635,13 @@ buffer, staging, published, so a crash leaves nothing below the floor that could
 into the published table, and calling it again finishes.
 
 **A retired log is truncated from its published table alone** (`litelink.truncate`, #181):
-`retire` leaves nothing local, and after a failover there may be no local directory. Its
-deletion queue is in a `buffer.db` the call cannot rely on, so what is due is derived from the
-table's snapshot history instead. The snapshots kept are those younger than the retention plus
-the one current at the cutoff. A data file referenced only by older ones stopped being referenced
-before the cutoff, so its grace has passed. Those files are deleted BEFORE the snapshots expire,
-so a crash leaves them named for the next call. Each call does that first, then truncates, so the
-files a call drops go on a later one. Commits go through a throwaway catalog adopted from the
+`retire` leaves nothing local, and after a failover there may be no local directory. It deletes
+at once, as `retire` does: a retired log takes no maintenance passes, so nothing would delete
+later. After the truncating commit every snapshot but the current one expires, and every file
+nothing then references is deleted, data files BEFORE the snapshots naming them expire, so a
+crash leaves them named and the next call finds them. Readers' grace belongs to the caller, the
+layer that knows its readers: it stops pointing them at the rows a grace period before it
+truncates. Commits go through a throwaway catalog adopted from the
 version hint, re-checked before each commit, and a read-only handle on a retired log follows the
 hint rather than its directory's catalog row. Deleting a retired log (`litelink.delete`) is a
 separate, immediate operation, and truncation never calls it. It deletes the files that say the

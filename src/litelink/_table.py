@@ -1480,17 +1480,9 @@ class LogTable:
         """Every snapshot the table keeps, oldest first."""
         return sorted(self._table.snapshots(), key=lambda s: s.timestamp_ms)
 
-    def lineage(self) -> list[Snapshot]:
-        """The current snapshot and its ancestors, newest first."""
-        by_id = {s.snapshot_id: s for s in self._table.snapshots()}
-        chain: list[Snapshot] = []
-        snapshot = self._table.current_snapshot()
-        while snapshot is not None:
-            chain.append(snapshot)
-            parent = snapshot.parent_snapshot_id
-            snapshot = None if parent is None else by_id.get(parent)
-
-        return chain
+    def current_snapshot(self) -> Snapshot | None:
+        """The snapshot the table is at, or None before its first commit."""
+        return self._table.current_snapshot()
 
     def data_paths(self, snapshots: Iterable[Snapshot]) -> set[str]:
         """The data files `snapshots` reference, named as `_name` names them.

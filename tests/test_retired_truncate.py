@@ -9,7 +9,6 @@ apart from the log's, so "no local directory" is one `rmtree` away.
 from __future__ import annotations
 
 import shutil
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -23,7 +22,6 @@ from tests.test_log import SCHEMA, rows
 
 PER_SEAL = 4
 SEALS = 5
-NONE = timedelta(0)
 
 
 def retired_log(
@@ -141,29 +139,51 @@ def test_a_retired_log_read_locally_follows_the_truncate(
         assert log.coverage().published == (9, 21)
 
 
-def test_truncated_files_go_on_a_later_call_once_due(
-    where: tuple[Path, str, Path],
-) -> None:
-    """No maintainer runs on a retired log, so each call deletes what earlier
-    ones left due — and only once the retention has passed.
+def test_truncated_files_are_deleted_at_once(where: tuple[Path, str, Path]) -> None:
+    """No maintainer runs on a retired log, so nothing would delete later what
+    a truncate left for later: the files go in the call, with the snapshots
+    and metadata that named them.
 
-    Falsify by deleting in the truncating call itself: the first assertion
-    finds the files gone. Or by expiring before deleting: the expired
-    snapshots stop naming the files, and nothing ever deletes them.
+    Falsify by leaving the clean-up out: the two files stay.
     """
     root, published, directory = where
     retired_log(root, published)
     shutil.rmtree(root)
     before = parquet(directory)
 
-    litelink.truncate(published, "s", below=9)
-    assert parquet(directory) == before, "deleted inside the grace"
+    assert litelink.truncate(published, "s", below=9) == 9
 
-    # Within the default hour's retention, a later call deletes nothing.
-    litelink.truncate(published, "s", below=9)
+    assert len(before - parquet(directory)) == 2
+    assert published_offsets(published) == list(range(9, 21))
+
+
+def test_a_clean_up_a_crash_skipped_is_done_by_the_next_call(
+    where: tuple[Path, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after the truncating commit leaves the dropped files named by
+    older snapshots; the next call cleans up whatever is unreferenced, even
+    with nothing new to truncate.
+
+    Falsify by cleaning up only what the call itself truncated: the files
+    stay.
+    """
+    import litelink._retired as retired
+
+    root, published, directory = where
+    retired_log(root, published)
+    before = parquet(directory)
+
+    def crash(*_: object) -> None:
+        raise RuntimeError("crashed")
+
+    monkeypatch.setattr(retired, "_clean", crash)
+    with pytest.raises(RuntimeError, match="crashed"):
+        litelink.truncate(published, "s", below=9)
+
     assert parquet(directory) == before
+    monkeypatch.undo()
 
-    litelink.truncate(published, "s", below=9, published_snapshot_retention=NONE)
+    assert litelink.truncate(published, "s", below=9) == 9
     assert len(before - parquet(directory)) == 2
     assert published_offsets(published) == list(range(9, 21))
 
