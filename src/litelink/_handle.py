@@ -4200,6 +4200,24 @@ class WriteHandle(LocalReadHandle):
             msg = f"below must be an offset, not {below}"
             raise ValueError(msg)
 
+        # The whole log, because then nothing runs beside it and its safety
+        # needs no argument about any other pass. `[0, below)` would also be
+        # safe, and would let seals, publishes and compactions above `below`
+        # carry on (appends never wait either way):
+        # - eviction, the one widener of the tier row this narrows, always
+        #   claims from 0, so it is excluded;
+        # - so is any compaction of a run below `below`;
+        # - seals claim above the staging table's end, which is at or above
+        #   the watermark this never passes;
+        # - publish claims from the published table's end. Its swap replaces
+        #   copies below that end, but only inside the merged file's range,
+        #   and a merged file straddling the floor snaps it to its start, so
+        #   the two drop disjoint rows. Concurrent commits to the published
+        #   table are ordered by the catalog's compare-and-swap, and the
+        #   retried delete filter cannot reach the merged file.
+        # Worth switching if truncation ever runs often, say every pass; the
+        # narrowing's docstring would then need "a claim from 0" in place of
+        # "the whole-log claim".
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
             msg = "another owner holds a claim over this log; retry the truncate"
