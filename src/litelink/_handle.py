@@ -4200,24 +4200,19 @@ class WriteHandle(LocalReadHandle):
             msg = f"below must be an offset, not {below}"
             raise ValueError(msg)
 
-        # The whole log, because then nothing runs beside it and its safety
-        # needs no argument about any other pass. `[0, below)` would also be
-        # safe, and would let seals, publishes and compactions above `below`
-        # carry on (appends never wait either way):
-        # - eviction, the one widener of the tier row this narrows, always
-        #   claims from 0, so it is excluded;
-        # - so is any compaction of a run below `below`;
-        # - seals claim above the staging table's end, which is at or above
-        #   the watermark this never passes;
-        # - publish claims from the published table's end. Its swap replaces
-        #   copies below that end, but only inside the merged file's range,
-        #   and a merged file straddling the floor snaps it to its start, so
-        #   the two drop disjoint rows. Concurrent commits to the published
-        #   table are ordered by the catalog's compare-and-swap, and the
-        #   retried delete filter cannot reach the merged file.
-        # Worth switching if truncation ever runs often, say every pass; the
-        # narrowing's docstring would then need "a claim from 0" in place of
-        # "the whole-log claim".
+        # The whole log. A claim on the range it drops is not enough:
+        # - publish's swap replaces the published copies of a merged file
+        #   owed its swap, which lies below the range publish claims (from
+        #   the published table's end). Truncate drops that file and its
+        #   copies too, so the two commits fight over the same published
+        #   files: the swap's commit fails after uploading the merged file,
+        #   and the upload is orphaned, named by nothing. A narrower claim
+        #   would have to overlap every publish, which is most of the log.
+        # - `below=0` would claim `[0, 0)`, which excludes nothing, and the
+        #   tier row's narrowing at the end would overwrite an eviction's
+        #   widening: the rows it moved would be in no tier a read consults.
+        # Appends never wait on it; seals, compactions and publishes do, for
+        # the few commits a truncate takes.
         lease = self._lease(MAINTAIN_ROLE)
         if not lease.acquire():
             msg = "another owner holds a claim over this log; retry the truncate"
