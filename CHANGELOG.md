@@ -7,6 +7,18 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Changed
+
+- **Seals are written to `data/sealed/`**, beside `data/compacted/` and
+  `data/ingested/`, so a listing of a log's `data/` says how each file was
+  made. Files sealed by an earlier version stay directly under `data/`:
+  Iceberg finds files by the paths in its manifests, so nothing moves them,
+  and they leave as compaction and eviction replace them. Nothing reads the
+  layout, so this changes no behaviour; tooling that matches paths (an S3
+  lifecycle rule on a prefix, say) should expect both places.
+
 ## 0.12.1 — 2026-10-09
 
 ### Added

@@ -601,7 +601,7 @@ that seal holds, and does not affect the tier boundaries in §7, which use min/m
 `litelink_offset` and are order-independent.
 
 **Step 1 fixes the range before the file exists**, making the path NAMEABLE:
-`{name}/data/{start}-{end}-{token}.parquet`. Chosen after the write instead, a crash
+`{name}/data/sealed/{start}-{end}-{token}.parquet`. Chosen after the write instead, a crash
 between write and commit lets new rows arrive, and the retry seals a wider range while the
 first file is stranded.
 

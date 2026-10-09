@@ -37,9 +37,12 @@ if TYPE_CHECKING:
 NAMESPACE = "litelink"
 
 
-# The directory compaction writes into, under a log's `data/`: a merge's
-# outputs, finished or in progress.
+# The directories a log's data files go in, under its `data/`, one per way a
+# file is made: a seal's output, a merge's (finished or in progress), and a
+# bulk load's.
+SEALED = "sealed"
 COMPACTED = "compacted"
+INGESTED = "ingested"
 
 
 def is_compacted(path: str) -> bool:
@@ -256,8 +259,13 @@ class Layout:
         What the grouping did produce was a way to strand a file, by
         recomputing a path across midnight and landing somewhere else.
         Compaction outputs were never dated, which is the tell.
+
+        In `sealed/`, beside `compacted/` and `ingested/`, so a listing of
+        `data/` says how each file was made. Files sealed by earlier versions are
+        directly under `data/`, and stay there: Iceberg finds a file by the
+        path in its manifests, so nothing moves them or needs to.
         """
-        return f"{self.name}/data/{start}-{end}-{token}.parquet"
+        return f"{self.name}/data/{SEALED}/{start}-{end}-{token}.parquet"
 
     def compaction_path(self, start: int, token: str) -> str:
         """Root-relative path for a merged file starting at offset `start` (§6).
@@ -299,7 +307,7 @@ class Layout:
         exist and read back from there, so it never has to be derivable, and
         two owners racing the range must not write one file.
         """
-        return f"{self.name}/data/ingested/{start}-{token}.parquet"
+        return f"{self.name}/data/{INGESTED}/{start}-{token}.parquet"
 
     def absolute(self, rel_path: str) -> Path:
         return self.root / rel_path
