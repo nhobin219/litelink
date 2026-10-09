@@ -7,6 +7,22 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`truncate(below=offset)` drops a log's history** (#80). It removes every
+  file whose rows are all below `offset`, from the buffer, the staging table
+  and the published table, and returns the floor it reached. A file
+  straddling the offset in either table stays whole, so the floor can be
+  below what was asked, and it never passes what the published table holds.
+  The offset counter does not move. Nothing is deleted directly: the files are
+  committed out and queued, and `reclaim` deletes them once the snapshot
+  retention has passed and no snapshot references them, as with every other
+  delete. It is the only way rows leave the published table. Before this, a
+  log's published table grew for ever, and an S3 lifecycle rule (the obvious
+  workaround) deletes files the table still references, breaking it.
+
 ## 0.12.0 — 2026-10-08
 
 ### Changed

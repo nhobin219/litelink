@@ -1100,6 +1100,100 @@ class Maintenance:
         finally:
             removal.release()
 
+    def truncate(self, below: int, renew: Callable[[], bool]) -> int:
+        """Drop the log's history below `below`, from every tier, and return
+        the floor reached (#80). Under the caller's whole-log claim, which
+        `renew` checks.
+
+        **Whole files only.** The floor is `below` snapped down to a file
+        boundary in BOTH tables: a file straddling it in either stays, and the
+        floor drops to its start, so the tables agree on where the log begins.
+        Agreeing is what keeps the rows from coming back. A staging file below
+        a published one's start would otherwise stay local while its copy went,
+        and a swap or a later push could hand those rows back to the published
+        table.
+
+        **Never past what the published table holds** (the watermark, as
+        eviction's I4 uses). Truncation is for history; rows only this machine
+        has are not history yet, and dropping them would leave a gap the next
+        publish has to cross. A caller who wants them gone too publishes first.
+
+        **No file is deleted here.** Each table's removal is a commit, like
+        eviction's, with its files queued in `pending_delete` beforehand and
+        re-dated to the commit after. From there they take the path every
+        superseded file takes: expiry retires the snapshots still naming them,
+        and the drain deletes each once its grace has passed and no live
+        snapshot references it — so a scan already reading one finishes (I6).
+
+        Top down, buffer then staging then published, so each step leaves
+        nothing above it that could flow back down: a crash between steps
+        leaves rows still readable and the next call finishes the job. The
+        published tier row is widened before staging gives rows up, as
+        eviction does; the caller narrows it exactly afterwards.
+        """
+        self._table.reload()
+        staging = self._table.data_files()
+        published = self._published.table()
+        remote: list[DataFile] = []
+        if published is not None:
+            published.reload()
+            remote = published.data_files()
+
+        floor = min(below, self.published_through() + 1)
+        # Down to a boundary of every file in both tables. Each move only
+        # lowers it, and each lands on some file's start, so this ends.
+        moved = True
+        while moved:
+            moved = False
+            for data_file in (*staging, *remote):
+                if data_file.start < floor < data_file.end:
+                    floor = data_file.start
+                    moved = True
+
+        checkpoint(renew)
+        self._buffer.evict_rows(0, floor)
+
+        leaving = [f.path for f in staging if f.end <= floor]
+        if leaving:
+            checkpoint(renew)
+            # Rows the published table holds below the staging table, until the
+            # published step below removes them there too.
+            schema, live = self._table.live_files()
+            gone = set(leaving)
+            self._tiers.widen(
+                self._buffer.shape().table,
+                rollup(
+                    None,
+                    schema,
+                    [
+                        f
+                        for f in live
+                        if str(f.file_path).removeprefix("file://") in gone
+                    ],
+                ),
+            )
+            self._enqueue(leaving)
+            self._table.evict_below(floor)
+            keys = [self._key(p) for p in leaving]
+            self._buffer.restamp_deletions(keys, int(datetime.now(UTC).timestamp()))
+            # A merged file owed its swap is gone with the rest; the swap would
+            # put its rows back.
+            owed = self._buffer.awaiting_swaps()
+            for key in keys:
+                if key in owed:
+                    self._buffer.clear_swap(key)
+
+        doomed = [f.path for f in remote if f.end <= floor]
+        if published is not None and doomed:
+            checkpoint(renew)
+            self._enqueue(doomed)
+            published.evict_below(floor)
+            self._buffer.restamp_deletions(
+                (self._key(p) for p in doomed), int(datetime.now(UTC).timestamp())
+            )
+
+        return floor
+
     def _written(self, data_file: DataFile) -> datetime:
         """When a file was written, for `staging_retention` to measure against.
 

@@ -1607,8 +1607,32 @@ shape.
 
 Now every log has a published table: on S3 when one is given, otherwise a local directory under the
 log's own, fixed when the log is created. Eviction drops only what it holds, and
-`staging_retention = 0` means "evict on publish" on every log. The cost moves to the published table: a local one keeps everything until truncation by offset
-or age lands, which is a follow-up.
+`staging_retention = 0` means "evict on publish" on every log. The cost moves to the published table,
+which keeps everything until it is truncated.
+
+**Nothing ages out of the published table except through `truncate(below=offset)`** (#80). No
+setting drops published rows on a schedule, so a consumer catching up from the published table
+can rely on everything above the log's floor still being there, and on the floor moving only
+when someone truncates. Truncation is defined by offset alone; a policy by age lives above it
+(streamcast resolves a timestamp to the smallest offset newer than it, then truncates below
+that).
+
+It drops whole files below the offset from every tier: the buffer's rows, the staging table's
+files and the published table's. The floor snaps down to a file boundary in both tables, so a
+straddling file stays whole and the tables agree on where the log starts. Without that, a
+staging file left below a published one's start could be swapped or pushed back. It never
+passes the published watermark: rows only this machine holds are not history yet. The offset
+counter does not move, so the log continues with a gap below, and a read below the floor finds
+nothing rather than other rows.
+
+It deletes nothing itself. Each table drops its files in a commit, as eviction does, with the
+files queued in `pending_delete` first and re-dated to the commit after. Then they go the way
+every superseded file goes: expiry retires the snapshots still naming them, and the drain
+deletes each once its table's snapshot retention has passed and no live snapshot references
+it (I6). An S3 lifecycle rule, the workaround this replaces, deletes files the manifests still
+reference and breaks the table. Truncation takes the whole-log claim and is resumable: steps run
+buffer, staging, published, so a crash leaves nothing below the floor that could flow back up
+into the published table, and calling it again finishes.
 
 Raising it applies to data captured afterwards. Reading older data often is the reader's
 disk cache's job (#118), not the staging table's: it keeps what is read from the published
