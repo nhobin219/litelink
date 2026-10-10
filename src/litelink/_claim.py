@@ -36,15 +36,13 @@ claim's `rel_path` is what says which file that work was writing.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import sqlite3
 
 # Long enough that a slow seal does not lose its own lease mid-operation — a
 # compaction over a large table is seconds — and short enough that a killed
@@ -153,7 +151,27 @@ class Claim:
                 self.row_id = cursor.lastrowid
                 self.connection.execute("COMMIT")
             except BaseException:
-                self.connection.execute("ROLLBACK")
+                # Best-effort, and never over the original error (#187). One
+                # landing inside COMMIT leaves no transaction to roll back, and
+                # the bare ROLLBACK raised "cannot rollback - no transaction is
+                # active" in its place, turning a KeyboardInterrupt into an
+                # OperationalError that a per-pass `except Exception` swallowed.
+                with contextlib.suppress(sqlite3.Error):
+                    self.connection.execute("ROLLBACK")
+
+                # And that COMMIT may have landed: the row is in the table while
+                # this raises, so nobody would release it, and every overlapping
+                # pass would be refused until the TTL lapsed. The owner is this
+                # attempt's alone, so the delete matches that row or nothing — a
+                # rollback that worked already took it.
+                with contextlib.suppress(sqlite3.Error):
+                    self.connection.execute(
+                        "DELETE FROM claim"
+                        " WHERE owner = ? AND start_offset = ? AND end_offset = ?",
+                        (self.owner, self.start, self.end),
+                    )
+
+                self.row_id = None
                 raise
 
             return True

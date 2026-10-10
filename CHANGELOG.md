@@ -7,6 +7,20 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Fixed
+
+- **A failure inside a claim's commit raises itself and orphans no claim**
+  (#187). `Claim.acquire` rolled back with a bare `ROLLBACK`, which, after
+  an error landing inside `COMMIT`, raised "cannot rollback - no transaction
+  is active" in place of the real error. A `KeyboardInterrupt` became an
+  `OperationalError`, which a per-pass `except Exception` then swallowed, so
+  a stop signal could be lost. And since that `COMMIT` may have landed, the
+  claim row stayed with nobody to release it, refusing every overlapping pass
+  until its 30 s TTL lapsed. The rollback is now best-effort, the original
+  error propagates, and the attempt's own row is deleted on the way out.
+
 ## 0.12.3 — 2026-10-10
 
 ### Added
