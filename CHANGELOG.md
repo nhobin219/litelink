@@ -34,7 +34,9 @@ minor version carries breaking changes.
   Every manifest, manifest list and `metadata.json` is written once under a
   name no write reuses, so the FileIO litelink shares now keeps the bytes of
   each one it reads from object storage, in a cache bounded at 64 MiB per
-  process (least recently used out first; nothing above 16 MiB held). A
+  process (least recently used out first; nothing above 16 MiB held). Each
+  entry belongs to the credentials that read it, so one set is never served
+  bytes another fetched. A
   maintainer used to re-read them tick after tick: span, file lists and
   statistics each walk the manifests, and pyiceberg's merging commit reads
   the one the last commit wrote. Measured against rustfs, per tick: an idle

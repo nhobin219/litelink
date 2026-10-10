@@ -160,8 +160,15 @@ IMMUTABLE_CACHE_BYTES = 64 * 1024 * 1024
 
 
 class _ImmutableObjects:
-    """Bytes of immutable metadata objects read from object storage, by
-    location, least recently used evicted first.
+    """Bytes of immutable metadata objects read from object storage, by the
+    credentials that read them and the location, least recently used evicted
+    first.
+
+    **Scoped by credentials.** Keyed by location alone, a FileIO whose
+    credentials cannot read an object would be served the bytes another one
+    fetched — an open with a revoked or wrong key succeeding, which the
+    published table's open relies on failing. So each entry belongs to the
+    FileIO properties that fetched it, and one budget bounds them all.
 
     Never stale, so there is nothing to invalidate. Every manifest, manifest
     list and `metadata.json` is written once under a name no write reuses —
@@ -172,27 +179,29 @@ class _ImmutableObjects:
 
     def __init__(self, budget: int) -> None:
         self._budget = budget
-        self._held: OrderedDict[str, bytes] = OrderedDict()
+        self._held: OrderedDict[tuple[object, str], bytes] = OrderedDict()
         self._size = 0
         self._lock = threading.Lock()
 
-    def get(self, location: str) -> bytes | None:
+    def get(self, scope: object, location: str) -> bytes | None:
+        key = (scope, location)
         with self._lock:
-            data = self._held.get(location)
+            data = self._held.get(key)
             if data is not None:
-                self._held.move_to_end(location)
+                self._held.move_to_end(key)
 
             return data
 
-    def put(self, location: str, data: bytes) -> None:
+    def put(self, scope: object, location: str, data: bytes) -> None:
         if len(data) > self._budget // 4:
             return
 
+        key = (scope, location)
         with self._lock:
-            if location in self._held:
+            if key in self._held:
                 return
 
-            self._held[location] = data
+            self._held[key] = data
             self._size += len(data)
             while self._size > self._budget:
                 _, evicted = self._held.popitem(last=False)
@@ -221,16 +230,22 @@ def _immutable(location: str) -> bool:
 
 
 class _CachedFile(PyArrowFile):
-    """A `PyArrowFile` read through `_IMMUTABLE`: fetched once per process
-    while it stays in the cache, then served from memory."""
+    """A `PyArrowFile` read through `_IMMUTABLE`: fetched once per process and
+    set of credentials while it stays in the cache, then served from memory."""
+
+    def __init__(
+        self, location: str, path: str, fs: FileSystem, buffer_size: int, scope: object
+    ) -> None:
+        super().__init__(location, path, fs, buffer_size)
+        self._scope = scope
 
     def _data(self) -> bytes:
-        data = _IMMUTABLE.get(self.location)
+        data = _IMMUTABLE.get(self._scope, self.location)
         if data is None:
             with super().open() as stream:
                 data = stream.read()
 
-            _IMMUTABLE.put(self.location, data)
+            _IMMUTABLE.put(self._scope, self.location, data)
 
         return data
 
@@ -238,7 +253,8 @@ class _CachedFile(PyArrowFile):
         return len(self._data())
 
     def exists(self) -> bool:
-        return _IMMUTABLE.get(self.location) is not None or super().exists()
+        cached = _IMMUTABLE.get(self._scope, self.location) is not None
+        return cached or super().exists()
 
     def open(self, seekable: bool = True) -> InputStream:  # noqa: ARG002
         # A BytesIO is an InputStream in all but the name of one `__exit__`
@@ -288,7 +304,13 @@ class _SinglePutFileIO(PyArrowFileIO):
             return source
 
         return _CachedFile(
-            location, source._path, source._filesystem, source._buffer_size
+            location,
+            source._path,
+            source._filesystem,
+            source._buffer_size,
+            # The credentials and endpoint this FileIO reads with: what
+            # `shared_file_io` keys it by, and what scopes its entries.
+            tuple(sorted(self.properties.items())),
         )
 
 
