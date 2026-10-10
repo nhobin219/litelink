@@ -23,9 +23,9 @@ permissions:
 jobs:
   packaging:
     name: The wheel works on a cold box
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # **No cache on this job, deliberately.** It is the only one that
       # resolves from the INDEX rather than from the lockfile, and uv's cache
       # includes index metadata — so a restored cache predating a release
@@ -39,7 +39,7 @@ jobs:
       # wheel into one throwaway venv, so the cache saves little and costs the
       # answer to the question the job exists to ask: does a COLD box resolve
       # and run this.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.3.0
 
       # A PLATFORM wheel, which is what a user on this OS installs. The pure
       # wheel is the fallback for platforms with no build, and it cannot carry
@@ -96,10 +96,10 @@ jobs:
 
   lint:
     name: Lint + format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync
@@ -109,10 +109,10 @@ jobs:
 
   typecheck:
     name: Type check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync
@@ -120,7 +120,7 @@ jobs:
 
   test:
     name: Tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     # An S3-compatible endpoint, because without one the ENTIRE archive tier
     # skips — and it did, silently, for the whole life of this workflow. The
@@ -152,8 +152,8 @@ jobs:
         # is the one CI catches that a dev machine does not.
         python-version: ["3.11", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -209,7 +209,7 @@ jobs:
     name: CI success
     if: always()
     needs: [lint, typecheck, test, packaging]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # One required check for branch protection / the merge queue.
       #

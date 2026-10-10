@@ -14,10 +14,10 @@ permissions:
 jobs:
   build:
     name: Build and check the tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
 
@@ -70,7 +70,7 @@ jobs:
               print(f"{wheel.name}: litestream + avro + iceberg + httpfs + cache_httpfs")
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -78,11 +78,11 @@ jobs:
   smoke:
     name: Install the wheel and capture a row
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -137,7 +137,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Trusted publishing: PyPI verifies this workflow's OIDC identity, so there
     # is no API token in the repository to leak or rotate. It requires a
     # publisher configured on the PyPI project side — owner, repo, workflow
@@ -149,7 +149,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -158,16 +158,16 @@ jobs:
   github-release:
     name: GitHub release
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       # Full history and tags: the notes are generated from the commits since
       # the previous tag, and the default shallow checkout has neither.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
