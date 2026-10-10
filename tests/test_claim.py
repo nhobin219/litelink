@@ -8,6 +8,7 @@ about a process that is no longer running.
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -496,3 +497,59 @@ def test_a_buffer_with_the_inclusive_column_names_is_renamed_on_open(
         assert adjacent.acquire(), "[10, 20) and [20, 30) do not overlap"
         held.release()
         adjacent.release()
+
+
+class _CommitThenRaise:
+    """A connection whose COMMIT lands and then raises — an error, or a
+    signal, arriving inside it (#187)."""
+
+    def __init__(self, connection: sqlite3.Connection, error: BaseException) -> None:
+        self._connection = connection
+        self._error = error
+
+    def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+        result = self._connection.execute(sql, parameters)
+        if sql == "COMMIT":
+            raise self._error
+
+        return result
+
+
+@pytest.mark.parametrize(
+    "error",
+    [sqlite3.OperationalError("disk I/O error"), KeyboardInterrupt()],
+    ids=["operational error", "keyboard interrupt"],
+)
+def test_a_failure_inside_commit_raises_itself_and_orphans_no_claim(
+    tmp_path: Path, error: BaseException
+) -> None:
+    """The original error propagates — a KeyboardInterrupt stays one, so a
+    stop signal is not swallowed by a per-pass `except Exception` — and the
+    row the COMMIT already wrote is gone, so the next pass over the range is
+    not refused for the TTL.
+
+    Falsify with the bare ROLLBACK: `acquire` raises "cannot rollback - no
+    transaction is active", and the second claim is refused.
+    """
+    open_log(tmp_path).close()
+    connection = sqlite3.connect(Layout(tmp_path, "s").buffer_db, isolation_level=None)
+    try:
+        claim = Claim(
+            _CommitThenRaise(connection, error),  # ty: ignore[invalid-argument-type]
+            threading.RLock(),
+            "publish",
+            1,
+            10,
+            new_owner(),
+        )
+        with pytest.raises(type(error)) as raised:
+            claim.acquire()
+
+        assert raised.value is error
+        assert connection.execute("SELECT COUNT(*) FROM claim").fetchone() == (0,)
+        assert claim.row_id is None
+
+        other = Claim(connection, threading.RLock(), "publish", 1, 10, new_owner())
+        assert other.acquire()
+    finally:
+        connection.close()
