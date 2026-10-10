@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 
 from litelink._layout import is_remote
 from litelink._s3 import S3Options
-from litelink._table import LogTable, PublishedAbsent
+from litelink._table import HintedTable, LogTable, PublishedAbsent
 
 if TYPE_CHECKING:
     from litelink._buffer import Buffer
@@ -80,6 +80,9 @@ class Published:
         # local disk grows without bound. The clustering goes the same way,
         # which `main` arrived at independently for `sort_by`.
         self._handle: LogTable | None = None
+        # Whether the cached handle follows the version hint — a retired log's
+        # does (`HintedTable`) — so retiring in this process swaps it.
+        self._handle_hinted = False
         # What the cached handle was opened FOR. Keying the cache on the
         # durable value is what keeps it from becoming the stale copy this
         # class was rewritten to remove: when the log is re-pointed, the key
@@ -131,20 +134,34 @@ class Published:
         """
         with self._lock:
             uri = self.location()
-            if self._handle is None or self._handle_uri != uri:
+            # A retired log's published table is followed through its version
+            # hint, not this directory's catalog row: `litelink.truncate` moves
+            # it on from anywhere, through no catalog this directory knows of
+            # (#181). Nothing writes it through this handle any more.
+            marker = self._buffer.retired()
+            hinted = marker is not None and marker.get("state") == "retired"
+            if (
+                self._handle is None
+                or self._handle_uri != uri
+                or self._handle_hinted != hinted
+            ):
                 try:
-                    self._handle = LogTable.open_published(
-                        self._layout,
-                        uri,
-                        self._s3,
-                        self._buffer.shape().table,
-                        self._buffer.sort_by(),
-                        repair=repair,
-                    )
+                    if hinted:
+                        self._handle = HintedTable(self._layout, uri, self._s3)
+                    else:
+                        self._handle = LogTable.open_published(
+                            self._layout,
+                            uri,
+                            self._s3,
+                            self._buffer.shape().table,
+                            self._buffer.sort_by(),
+                            repair=repair,
+                        )
                 except PublishedAbsent:
                     return None
 
                 self._handle_uri = uri
+                self._handle_hinted = hinted
 
             return self._handle
 

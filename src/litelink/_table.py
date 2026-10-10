@@ -1476,6 +1476,45 @@ class LogTable:
 
         return names
 
+    def snapshots(self) -> list[Snapshot]:
+        """Every snapshot the table keeps, oldest first."""
+        return sorted(self._table.snapshots(), key=lambda s: s.timestamp_ms)
+
+    def current_snapshot(self) -> Snapshot | None:
+        """The snapshot the table is at, or None before its first commit."""
+        return self._table.current_snapshot()
+
+    def data_paths(self, snapshots: Iterable[Snapshot]) -> set[str]:
+        """The data files `snapshots` reference, named as `_name` names them.
+
+        One manifest walk per snapshot, so for the few a retired log's
+        published table keeps, not for a live table's whole history.
+        """
+        paths: set[str] = set()
+        for snapshot in snapshots:
+            for manifest in snapshot.manifests(self._table.io):
+                paths.update(
+                    self._name(entry.data_file.file_path)
+                    for entry in manifest.fetch_manifest_entry(
+                        self._table.io, discard_deleted=True
+                    )
+                )
+
+        return paths
+
+    def expire_snapshots(self, snapshot_ids: Sequence[int]) -> None:
+        """Expire these snapshots' metadata, by id. Deletes no file — see §6."""
+        if not snapshot_ids:
+            return
+
+        self._commit(
+            lambda: (
+                self._table.maintenance.expire_snapshots()
+                .by_ids(list(snapshot_ids))
+                .commit()
+            )
+        )
+
     def snapshots_older_than(self, cutoff: datetime) -> list[Snapshot]:
         """Snapshots eligible for expiry, excluding the current one."""
         current = self._table.current_snapshot()
@@ -1894,6 +1933,43 @@ class LogTable:
     def _set_properties(self, properties: dict[str, str]) -> None:
         with self._table.transaction() as transaction:
             transaction.set_properties(properties)
+
+
+class HintedTable(LogTable):
+    """A published table followed through its `version-hint.text` rather than
+    a catalog row: a retired log's (#181).
+
+    A retired log's published table used to be frozen at retirement, so the
+    catalog row its local directory kept named its current metadata for good.
+    `litelink.truncate` now moves it on, from any machine and through no
+    catalog this directory knows of, and the hint is the one record every
+    commit updates (`publish_pointer`). So a reader follows the hint.
+
+    Read-only: no catalog, so `_commit` has nothing to commit through.
+    """
+
+    def __init__(self, layout: Layout, prefix: str, options: S3Options) -> None:
+        self._properties = options.resolved().catalog_properties()
+        self._io = shared_file_io(self._properties, prefix)
+        self._prefix = prefix
+        super().__init__(None, layout, self._load(layout), prefix)  # ty: ignore
+
+    def _load(self, layout: Layout) -> IcebergTable:
+        location = _published_location(self._io, layout, self._prefix)
+        if location is None:
+            msg = f"no published table at {self._prefix!r}"
+            raise PublishedAbsent(msg)
+
+        return StaticTable.from_metadata(location, self._properties)
+
+    def reload(self) -> None:
+        """Re-read the hint, and the metadata only when the hint has moved."""
+        with self._lock:
+            location = _published_location(self._io, self._layout, self._prefix)
+            if location is None or location == self._table.metadata_location:
+                return
+
+            self._table = StaticTable.from_metadata(location, self._properties)
 
 
 def _commit_uuid(manifest_list: str) -> str | None:

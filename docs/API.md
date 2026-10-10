@@ -140,6 +140,10 @@ litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, binary=None,
                  schema=None, sort_by=None, config=None,
                  replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
+
+# A retired log, from its published table alone (see "Retiring a log")
+litelink.truncate(published, name, *, below, s3_options=None) -> int
+litelink.delete(published, name, *, s3_options=None, root=None) -> None
 ```
 
 **`new` takes the shape; `open` takes none of it.** Schema, sort order, config and published table
@@ -924,6 +928,8 @@ Afterwards:
 | `open(root, name, read_only=True)` | allowed; reads come from the published table |
 | `restore(...)` | `RetiredError`, from the published table's `litelink.retired` or the replica's closed buffer |
 | `column_statistics(tier="published")` | the whole log |
+| `litelink.truncate(published, name, below=...)` | allowed: drops history below an offset |
+| `litelink.delete(published, name)` | allowed: deletes its published side entirely |
 
 **Appends are refused by SQLite**: a trigger on the buffer refuses every insert once the
 buffer has an end, so a writer that opened before `retire()` ran is refused too, at no cost
@@ -941,6 +947,43 @@ and lets every read skip the buffer without reading it.
 replica sees the retirement. It never starts a litestream of its own — two processes
 replicating one database is corruption — so if the sidecar does not answer, it raises and
 says to regenerate the config (see RUNTIME.md).
+
+### Truncating and deleting a retired log
+
+A retired log is only its published table: `retire` leaves nothing local. So the two
+operations that still apply to it take the published location and the log's name, not a
+handle, and work with no local directory, as after a failover.
+
+**`litelink.truncate(published, name, *, below)`** follows `WriteHandle.truncate`'s rules:
+- whole files only, so the floor it returns can be below `below`;
+- `below` is exclusive;
+- the offset counter never moves.
+
+It refuses a log that isn't retired. **It deletes at once, with no grace**, as `retire` does: a
+retired log takes no maintenance passes, so nothing would delete the files later. After the
+truncating commit, every snapshot but the current one expires, and every data and metadata file
+nothing then references is deleted. A reader still scanning rows below the floor from before the
+commit can lose files under it; its query fails, it never gets wrong rows. **Readers' grace is the
+caller's to give**: stop pointing readers at those rows a grace period before truncating (for
+streamcast, by moving the stream's floor in its own metadata first). Each call also cleans up
+whatever an earlier call left unreferenced, for example after a crash. Call it from one place at a
+time per log: it commits through the table's `version-hint.text`, and a call that finds the hint
+moved since it started raises `RuntimeError`, which is safe to retry.
+
+**`litelink.delete(published, name, *, root=None)`** deletes a retired log entirely:
+- everything under `<published>/<name>/`: the published table's data and metadata, and the WAL
+  replica;
+- given `root`, its local directory there, after checking that `buffer.db` says it is retired.
+
+Without `root` nothing local is touched, which is the failover case. It refuses a log that
+isn't retired, and it is resumable: what says the log is retired goes last, so calling it again
+after a crash finishes. **It is immediate**, with no grace: remove the log from whatever names it
+first (for streamcast, the stream's `metadata.json`), and wait out its readers. Stop a litestream
+sidecar still running for the log first. Truncation never deletes a log, even one it has emptied:
+that is the caller's call.
+
+A read-only handle on a retired log follows its published table's `version-hint.text`, so it
+sees a truncate made from anywhere, and its `coverage()` reads the published table.
 
 ## Configuration
 

@@ -55,6 +55,7 @@ from litelink._read import (
     duckdb_connection,
     install_s3_secret,
 )
+from litelink._retired import delete, truncate
 from litelink._s3 import S3Options
 from litelink._statistics import ColumnStatistics, Tier, TierStatistics
 
@@ -81,6 +82,7 @@ __all__ = [
     "WriteHandle",
     "__version__",
     "current_metadata",
+    "delete",
     "duckdb_connection",
     "install_s3_secret",
     "manifest",
@@ -88,5 +90,6 @@ __all__ = [
     "open",
     "preflight",
     "restore",
+    "truncate",
     "validate_row",
 ]

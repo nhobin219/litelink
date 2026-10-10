@@ -1634,6 +1634,20 @@ reference and breaks the table. Truncation takes the whole-log claim and is resu
 buffer, staging, published, so a crash leaves nothing below the floor that could flow back up
 into the published table, and calling it again finishes.
 
+**A retired log is truncated from its published table alone** (`litelink.truncate`, #181):
+`retire` leaves nothing local, and after a failover there may be no local directory. It deletes
+at once, as `retire` does: a retired log takes no maintenance passes, so nothing would delete
+later. After the truncating commit every snapshot but the current one expires, and every file
+nothing then references is deleted, data files BEFORE the snapshots naming them expire, so a
+crash leaves them named and the next call finds them. Readers' grace belongs to the caller, the
+layer that knows its readers: it stops pointing them at the rows a grace period before it
+truncates. Commits go through a throwaway catalog adopted from the
+version hint, re-checked before each commit, and a read-only handle on a retired log follows the
+hint rather than its directory's catalog row. Deleting a retired log (`litelink.delete`) is a
+separate, immediate operation, and truncation never calls it. It deletes the files that say the
+log is retired last (the hint, then the `metadata.json` it named, then the local directory), so it
+is resumable.
+
 Raising it applies to data captured afterwards. Reading older data often is the reader's
 disk cache's job (#118), not the staging table's: it keeps what is read from the published
 table, across restarts, without writing to either table.
