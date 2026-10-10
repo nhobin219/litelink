@@ -28,6 +28,22 @@ minor version carries breaking changes.
   version hint, so it sees a truncate made from anywhere, and its
   `coverage()` reads the published table.
 
+### Fixed
+
+- **Metadata already read is not fetched from object storage again** (#184).
+  Every manifest, manifest list and `metadata.json` is written once under a
+  name no write reuses, so the FileIO litelink shares now keeps the bytes of
+  each one it reads from object storage, in a cache bounded at 64 MiB per
+  process (least recently used out first; nothing above 16 MiB held). A
+  maintainer used to re-read them tick after tick: span, file lists and
+  statistics each walk the manifests, and pyiceberg's merging commit reads
+  the one the last commit wrote. Measured against rustfs, per tick: an idle
+  one went from two `metadata.json` GETs to none (22 KiB to 1 KiB of
+  metadata), and one that publishes from 13 metadata GETs to 4 (91 KiB to
+  26 KiB), which are the four objects its commit wrote, each read once.
+  `version-hint.text`, rewritten in place, is still read every time, and
+  local files are not cached.
+
 ## 0.12.2 — 2026-10-09
 
 ### Changed

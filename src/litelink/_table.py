@@ -17,6 +17,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from io import BytesIO
 from typing import TYPE_CHECKING, NamedTuple
 
 from pyarrow.fs import FileSelector, FileSystem, FileType
@@ -28,7 +29,7 @@ from pyiceberg.exceptions import (
     NoSuchTableError,
 )
 from pyiceberg.io import load_file_io
-from pyiceberg.io.pyarrow import PyArrowFileIO, schema_to_pyarrow
+from pyiceberg.io.pyarrow import PyArrowFile, PyArrowFileIO, schema_to_pyarrow
 from pyiceberg.serializers import FromInputFile
 from pyiceberg.table import StaticTable
 from pyiceberg.table import Table as IcebergTable
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import pyarrow as pa
-    from pyiceberg.io import FileIO
+    from pyiceberg.io import FileIO, InputStream
     from pyiceberg.manifest import DataFile as IcebergDataFile
     from pyiceberg.schema import Schema
     from pyiceberg.table import Table
@@ -150,6 +151,101 @@ def shared_file_io(properties: Mapping[str, str], location: str | None) -> FileI
         return io
 
 
+# What the immutable-object cache may hold, per process (#184): about two
+# hundred manifests of the several hundred KB a busy log's run to. Bounded by
+# bytes, so a log whose manifests grow costs the same memory, not more; an
+# object above a quarter of it is not cached, so one large manifest cannot
+# evict everything else.
+IMMUTABLE_CACHE_BYTES = 64 * 1024 * 1024
+
+
+class _ImmutableObjects:
+    """Bytes of immutable metadata objects read from object storage, by
+    location, least recently used evicted first.
+
+    Never stale, so there is nothing to invalidate. Every manifest, manifest
+    list and `metadata.json` is written once under a name no write reuses —
+    pyiceberg names them by UUID — so a location means the same bytes for as
+    long as it exists. `version-hint.text`, the one metadata object rewritten
+    in place, is not among them.
+    """
+
+    def __init__(self, budget: int) -> None:
+        self._budget = budget
+        self._held: OrderedDict[str, bytes] = OrderedDict()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def get(self, location: str) -> bytes | None:
+        with self._lock:
+            data = self._held.get(location)
+            if data is not None:
+                self._held.move_to_end(location)
+
+            return data
+
+    def put(self, location: str, data: bytes) -> None:
+        if len(data) > self._budget // 4:
+            return
+
+        with self._lock:
+            if location in self._held:
+                return
+
+            self._held[location] = data
+            self._size += len(data)
+            while self._size > self._budget:
+                _, evicted = self._held.popitem(last=False)
+                self._size -= len(evicted)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._held.clear()
+            self._size = 0
+
+
+_IMMUTABLE = _ImmutableObjects(IMMUTABLE_CACHE_BYTES)
+
+
+def _immutable(location: str) -> bool:
+    """Whether `location` is a metadata object no write ever replaces, on
+    object storage. Local files are not cached: reading one again costs no
+    request, and the page cache already holds it."""
+    scheme = location.partition("://")[0] if "://" in location else ""
+    if scheme in ("", "file"):
+        return False
+
+    name = location.rpartition("/")[2]
+
+    return name.endswith(".avro") or name.endswith(".metadata.json")
+
+
+class _CachedFile(PyArrowFile):
+    """A `PyArrowFile` read through `_IMMUTABLE`: fetched once per process
+    while it stays in the cache, then served from memory."""
+
+    def _data(self) -> bytes:
+        data = _IMMUTABLE.get(self.location)
+        if data is None:
+            with super().open() as stream:
+                data = stream.read()
+
+            _IMMUTABLE.put(self.location, data)
+
+        return data
+
+    def __len__(self) -> int:
+        return len(self._data())
+
+    def exists(self) -> bool:
+        return _IMMUTABLE.get(self.location) is not None or super().exists()
+
+    def open(self, seekable: bool = True) -> InputStream:  # noqa: ARG002
+        # A BytesIO is an InputStream in all but the name of one `__exit__`
+        # parameter, which only a keyword call could tell apart.
+        return BytesIO(self._data())  # ty: ignore[invalid-return-type]
+
+
 class _SinglePutFileIO(PyArrowFileIO):
     """`PyArrowFileIO`, writing an object smaller than a part to S3 in one
     request rather than three (#171).
@@ -176,6 +272,24 @@ class _SinglePutFileIO(PyArrowFileIO):
             return built
 
         return rebuild({**options, "allow_delayed_open": True})
+
+    def new_input(self, location: str) -> PyArrowFile:
+        """Read immutable metadata on object storage through the process's
+        cache (#184).
+
+        A maintainer re-reads the same manifests tick after tick — span, file
+        lists and statistics each walk them, and pyiceberg's merging commit
+        reads the manifest the last commit wrote — and on S3 each read is a
+        GET of several hundred KB. Measured on a log publishing every tick:
+        five manifest reads a tick for two new manifests.
+        """
+        source = super().new_input(location)
+        if not _immutable(location):
+            return source
+
+        return _CachedFile(
+            location, source._path, source._filesystem, source._buffer_size
+        )
 
 
 class _Catalog(SqlCatalog):
