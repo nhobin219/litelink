@@ -4450,7 +4450,7 @@ class WriteHandle(LocalReadHandle):
     def _flush_replica(self) -> None:
         """Ship `buffer.db` to its WAL replica now, when one is being kept."""
         if self.config.wal_replication:
-            flush(self._layout)
+            flush(self._layout, self._layout.buffer_db)
 
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
