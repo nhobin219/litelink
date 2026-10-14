@@ -735,13 +735,22 @@ class Store:
         destination.write_text(self.replication_config())
         return destination
 
-    def flush(self, binary: str | None = None, timeout: int = 60) -> None:
+    def flush(
+        self,
+        binary: str | None = None,
+        timeout: int = 60,
+        socket: Path | None = None,
+    ) -> None:
         """Ship the database to its replica now; return once the replica has it.
 
         The log's flush: `litestream sync -wait` through the running sidecar's
         control socket. It raises when no sidecar answers and starts nothing,
         since it cannot tell "no sidecar" from "a sidecar started from a config
         without the socket", and guessing wrong is two replicators.
+
+        `socket` is the running sidecar's control socket when it is not the one
+        this store's config names: a sidecar that merges several configs
+        listens on its own.
 
         Ships what is committed. Inside a transaction, that excludes the
         transaction itself, so it is refused there.
@@ -751,7 +760,7 @@ class Store:
             msg = f"store {self.name!r} has no published location to flush to"
             raise ValueError(msg)
 
-        flush(self._layout, self._layout.database, binary, timeout)
+        flush(self._layout, self._layout.database, binary, timeout, socket)
 
     # -- reads -------------------------------------------------------------
 

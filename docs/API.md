@@ -1210,7 +1210,7 @@ store.offset(subscription) -> int | None
 store.query(sql, parameters=()) -> list[tuple]      # read-only
 store.replication_config() -> str
 store.write_replication_config() -> Path
-store.flush(binary=None, timeout=60)
+store.flush(binary=None, timeout=60, socket=None)
 store.root · name · path · tables · published · retention · databases
 store.close() · context manager
 
@@ -1251,8 +1251,10 @@ replay. Inside the transaction, statements that could end it — `COMMIT`, savep
 `retention` writes the snapshot window that prunes the replica; the sidecar's credentials need
 delete permission under the prefix for it to work. `flush()` asks the running sidecar to ship
 now and returns once the replica has it; with no sidecar answering it raises and starts
-nothing. `restore()` pulls the database onto a machine that has none and refuses one that does.
-`published` must be `s3://`, is recorded on first use, and cannot change.
+nothing. It asks the socket the store's config names; a sidecar that merges several configs
+listens on its own socket, so pass it as `socket=`. `restore()` pulls the database onto a
+machine that has none and refuses one that does. `published` must be `s3://`, is recorded on
+first use, and cannot change.
 
 ## Rules that cut across
 

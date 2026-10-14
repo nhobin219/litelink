@@ -3015,7 +3015,9 @@ same name.
   returns once the replica's transaction is at the database's, and raises — starting nothing —
   when no sidecar answers. It is what makes a long sync interval safe for a store that
   changes slowly. It is refused inside a transaction on the same thread, since it ships what
-  is committed.
+  is committed. It asks the socket the store's config names, derived from its directory; a
+  sidecar that merges several configs into one process listens on its own socket, which no
+  one directory derives, so `flush(socket=)` takes that path instead.
 - **`restore()`** writes `replication_config_for`'s config and calls `restore_buffer` into the
   database's own path, then opens the store with the caller's declaration. It refuses a
   machine where the database or a stray `-wal` exists, and with no replica it raises naming
@@ -3039,5 +3041,7 @@ same name.
 - With a sidecar running at an hour's sync interval: `flush()`, then restore onto a root with
   no database, brings back the tables and the offset.
 - With no sidecar, `flush()` raises and every process it started was a `sync` client.
+- `flush(socket=X)` asks `X` and names it when nothing answers; against a sidecar listening
+  only on `X`, it ships the writes a restore then brings back, and without `socket=` it raises.
 - A process killed with SIGKILL inside a transaction that has written a row and advanced its
   offset comes back with neither, and with every committed message and its offset.

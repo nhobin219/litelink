@@ -13,8 +13,10 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -238,6 +240,43 @@ def test_flush_without_a_sidecar_raises_and_starts_nothing(
     assert all("-socket" in command for command in ran), ran
 
 
+def test_flush_asks_the_socket_it_is_given_and_names_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`flush(socket=X)` asks `X`, not the socket the config derives, and the
+    error names `X` when nothing answers there.
+
+    A sidecar that merges several configs listens on one socket of its own,
+    so a flush that kept asking the derived one would never reach it.
+
+    Falsify by ignoring `socket` in `_replication.flush`: the command carries
+    the derived path, and the error names it.
+    """
+    binary = sidecar_binary()
+    ran: list[list[str]] = []
+    popen = subprocess.Popen
+
+    def recorded(command: list[str], *args: object, **kwargs: object) -> object:
+        ran.append(list(command))
+        return popen(command, *args, **kwargs)  # noqa: S603  # ty: ignore[no-matching-overload]
+
+    monkeypatch.setattr(replication.subprocess, "Popen", recorded)
+    given = tmp_path / "merged.sock"
+    with opened(tmp_path, published=NOWHERE) as store:
+        derived = control_socket(store._layout)  # noqa: SLF001
+        assert given != derived
+        work(store, 1)
+        with pytest.raises(RuntimeError, match="control socket") as raised:
+            store.flush(binary, timeout=2, socket=given)
+
+    assert str(given) in str(raised.value)
+    assert str(derived) not in str(raised.value)
+    assert len(ran) == 1, ran
+    command = ran[0]
+    assert command[command.index("-socket") + 1] == str(given)
+    assert str(derived) not in command
+
+
 def test_flush_inside_a_transaction_is_refused(tmp_path: Path) -> None:
     """It ships what is committed, which would not include the transaction."""
     with opened(tmp_path, published=NOWHERE) as store, store.transaction():
@@ -311,6 +350,79 @@ def test_flush_then_restore_brings_back_the_tables_and_the_offset(
     finally:
         sidecar.terminate()
         sidecar.wait(timeout=10)
+
+
+@pytest.mark.s3
+def test_flush_through_a_sidecar_on_its_own_socket(
+    tmp_path: Path, bucket: str, s3: S3Options
+) -> None:
+    """A sidecar listening only on a socket no config of the store derives, as
+    a merged process does: `flush(socket=)` ships through it and a restore
+    brings the rows back; without `socket=` the flush raises.
+
+    The sidecar's own sync is an hour away, so only the flush can have
+    shipped the writes, and it still runs during the restore, as in the
+    test above.
+
+    Falsify by ignoring `socket` in `_replication.flush`: the flush given the
+    socket raises like the one without it.
+    """
+    binary = sidecar_binary()
+    published = f"s3://{bucket}/stores"
+    store = opened(tmp_path / "primary", published=published, s3_options=s3)
+    derived = control_socket(store._layout)  # noqa: SLF001
+    # In the temp directory, not under `tmp_path`, for the ~104-byte limit on
+    # a Unix socket path.
+    merged = (
+        Path(tempfile.gettempdir()) / f"litelink-merged-{uuid.uuid4().hex[:12]}.sock"
+    )
+    config = store.write_replication_config()
+    text = config.read_text()
+    assert f"  path: {derived}\n" in text
+    config.write_text(
+        text.replace(f"  path: {derived}\n", f"  path: {merged}\n").replace(
+            "      force-path-style: true\n",
+            "      force-path-style: true\n      sync-interval: 1h\n",
+        )
+    )
+    environment = dict(os.environ)
+    resolved = s3.resolved()
+    environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key or ""
+    environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key or ""
+    sidecar = subprocess.Popen(  # noqa: S603
+        [binary, "replicate", "-config", str(config)],
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while not merged.exists():
+            assert time.monotonic() < deadline, "the sidecar never listened"
+            time.sleep(0.1)
+
+        assert not derived.exists()
+        work(store, 50)
+        with pytest.raises(RuntimeError, match="control socket"):
+            store.flush(binary, timeout=2)
+
+        store.flush(binary, socket=merged)
+        store.close()
+
+        with Store.restore(
+            tmp_path / "replacement",
+            "state",
+            published=published,
+            tables=TABLES,
+            s3_options=s3,
+            binary=binary,
+        ) as restored:
+            assert restored.offset("sub") == 50
+            assert restored.query("SELECT count(*), max(id) FROM items") == [(50, 50)]
+    finally:
+        sidecar.terminate()
+        sidecar.wait(timeout=10)
+        merged.unlink(missing_ok=True)
 
 
 @pytest.mark.s3

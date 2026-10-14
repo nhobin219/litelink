@@ -227,6 +227,7 @@ def flush(
     database: Path,
     binary: str | None = None,
     timeout: int = 60,
+    socket: Path | None = None,
 ) -> None:
     """Ship `database` to its replica now, and return once the replica has it.
 
@@ -243,8 +244,13 @@ def flush(
     of its own: this cannot tell "no sidecar" from "a sidecar started from a
     config without the socket", and guessing wrong in the second case is two
     processes replicating one database.
+
+    `socket` is the sidecar's control socket, `control_socket(layout)` when not
+    given. That default is right for a sidecar run on this config. A sidecar
+    that merges several configs into one process listens on one socket of its
+    own, which no single layout derives, so its caller passes that socket.
     """
-    socket = control_socket(layout)
+    socket = socket or control_socket(layout)
     command = [
         litestream_binary(binary),
         "sync",

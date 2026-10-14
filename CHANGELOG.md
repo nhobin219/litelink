@@ -19,6 +19,9 @@ minor version carries breaking changes.
   and `write_replication_config()` emit the log's config for its one database, `flush()` is
   `litestream sync -wait` through the running sidecar's control socket and raises when none
   answers, and `restore()` uses the log's restore path onto a machine with no database.
+- **`Store.flush(socket=)`** (#192). `flush()` asks the control socket the store's config
+  derives from its directory; a sidecar that merges several configs into one process listens
+  on a socket of its own, and `socket=` names it. The default is unchanged.
 
 ## 0.12.4 — 2026-10-10
 
