@@ -7,6 +7,19 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`Store`, a table store beside the log** (#192). A local SQLite database of declared
+  tables, the source of truth, with additive-only schema changes and the log's column type
+  checks. `transaction()` commits the consumer's writes with a reserved `litelink_offset` per
+  subscription (`tx.advance`), so a write and its offset survive `kill -9` together or not at
+  all. It replicates exactly as a log does and never runs litestream: `replication_config()`
+  and `write_replication_config()` emit the log's config for its one database, `flush()` is
+  `litestream sync -wait` through the running sidecar's control socket and raises when none
+  answers, and `restore()` uses the log's restore path onto a machine with no database.
+
 ## 0.12.4 — 2026-10-10
 
 ### Fixed

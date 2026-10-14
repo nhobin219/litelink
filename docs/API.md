@@ -1194,6 +1194,66 @@ Offsets stay dense across the two, so any engine reads `<prefix>/trades` and
 `<prefix>/trades-v2` as one sequence. A log a 0.5 release widened with `add_column` stays
 readable; one it left mid-change is refused with the release that can finish it (0.5.1).
 
+## A table store beside the log: `Store`
+
+```python
+Store.open(root, name, *, tables, published=None, s3_options=None, retention=None) -> Store
+Store.restore(root, name, *, published, tables, s3_options=None, retention=None,
+              binary=None) -> Store
+Store.replication_config_for(root, name, published, s3_options=None, retention=None) -> str
+
+store.transaction() -> ContextManager[StoreTransaction]
+    tx.execute(sql, parameters=()) -> sqlite3.Cursor
+    tx.advance(subscription, offset)
+    tx.offset(subscription) -> int | None
+store.offset(subscription) -> int | None
+store.query(sql, parameters=()) -> list[tuple]      # read-only
+store.replication_config() -> str
+store.write_replication_config() -> Path
+store.flush(binary=None, timeout=60)
+store.root · name · path · tables · published · retention · databases
+store.close() · context manager
+
+StoreTable(schema, key=(), single_row=False)
+```
+
+A local SQLite database of declared tables (SPEC §16), for the state a consumer keeps beside
+a log. It is the source of truth; reads and writes never touch the network. `open` creates it
+or opens it, and applies additive declaration changes (a new table, a new nullable column);
+anything else is refused with the differences named. Column types are enforced by the same DDL
+as a log's buffer, so `tx.execute` cannot store a value of the wrong type.
+
+**Committing work with its offset** is the pattern the store exists for:
+
+```python
+store = litelink.Store.open(root, "state", tables={
+    "seen": StoreTable(pa.schema([pa.field("id", pa.string(), nullable=False),
+                                  pa.field("count", pa.int64(), nullable=False)]),
+                       key=("id",)),
+})
+start = (store.offset("events") or 0) + 1
+for batch in log.scan(start_offset=start):
+    for row in batch.to_pylist():
+        with store.transaction() as tx:            # durable when the block returns
+            tx.execute("INSERT INTO seen VALUES (?, 1) "
+                       "ON CONFLICT (id) DO UPDATE SET count = count + 1", (row["key"],))
+            tx.advance("events", row[litelink.OFFSET])
+```
+
+A crash at any point leaves both the row's effect and its offset, or neither, so the loop
+resumes exactly after the last message it applied. `advance` only moves forward and refuses a
+replay. Inside the transaction, statements that could end it — `COMMIT`, savepoints, DDL,
+`PRAGMA`, `ATTACH` — and writes to the store's own `_litelink_` tables are refused.
+
+**Replication is the log's** (see Replication above). The store never runs litestream:
+`write_replication_config()` writes `<root>/<name>/litestream.yml`, the deployment runs
+`litestream replicate -config` on it, and the database ships to `<published>/<name>/_wal`.
+`retention` writes the snapshot window that prunes the replica; the sidecar's credentials need
+delete permission under the prefix for it to work. `flush()` asks the running sidecar to ship
+now and returns once the replica has it; with no sidecar answering it raises and starts
+nothing. `restore()` pulls the database onto a machine that has none and refuses one that does.
+`published` must be `s3://`, is recorded on first use, and cannot change.
+
 ## Rules that cut across
 
 **A reader has nothing that writes**, rather than write methods that refuse. `extend`,

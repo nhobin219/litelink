@@ -2950,3 +2950,92 @@ behaviour that changes under the caller without warning.
 
 **Ranged reads.** Page-index-driven fetches below row group granularity would cut the fetch
 amplification substantially. Blocked on reader support, not on anything here.
+
+---
+
+# 16. Table store
+
+A consumer of a log keeps state beside it: what it did with the rows it read, and how far it
+read. `Store` is that state as an embedded SQLite database of declared tables, replicated the
+way a log is (§3a). It is the source of truth, every read and write is local, and the network
+is reached only by the sidecar the deployment runs and by an explicit `flush` or `restore`.
+
+## 16.1 Layout and declaration
+
+A store is `<root>/<name>/store.db`, with its litestream config beside it in
+`<root>/<name>/litestream.yml`. `StoreLayout` derives both and does no I/O. A store refuses a
+directory holding a log's `buffer.db`: the config and the sidecar's control socket are both
+derived from the directory, so the two would share one sidecar's config and the second to
+write it would silently stop the first replicating.
+
+Tables are declared with an Arrow schema, an optional primary key, or `single_row` (a rowid
+alias pinned to 0, so a second row is refused by SQLite). Every column carries the log's I17
+DDL — `ANY` with a `typeof` and range CHECK inside a STRICT table — so the consumer's own SQL
+cannot store a value of the wrong type. Nested types are refused: JSON text is something no
+CHECK can see into, and a transaction hands the consumer raw SQL. Names beginning `litelink_`
+or `_litelink` are reserved.
+
+**Schema changes are additive, which a log's are not (§9).** A log spanned three systems
+with no common commit, which is why widening it was removed. A store is one SQLite database,
+so a new table or a new nullable column is one transaction at `open`, and no file anywhere
+predates it. Everything else — a dropped or renamed column or table, a type change, a
+tightened nullability, a key change, a new non-nullable column — changes what an existing row
+means, and is refused with every difference named. The declaration is recorded in the store's
+`_litelink_meta` table, which is the one copy of what the tables are.
+
+## 16.2 The reserved offset
+
+A consumer commits its work and its position in what it consumes in one transaction.
+`transaction()` is `BEGIN IMMEDIATE` … `COMMIT` at `synchronous=FULL`, so it is durable when
+the `with` returns, and `tx.advance(subscription, offset)` writes the reserved
+`litelink_offset` in `_litelink_offsets`, one row per subscription, inside it. The offset is
+not a column of the consumer's tables: a per-table column would lose its position when the
+rows carrying it are deleted.
+
+That is the whole pattern. Nothing here knows what is being consumed; a consume loop reads a
+row, applies it through `tx.execute`, advances to its offset, and on restart resumes after
+`store.offset(subscription)`.
+
+## 16.3 Replication
+
+The store adds nothing to §3a. `replication_config`, `write_replication_config`,
+`replication_config_for`, `flush` and `restore` are the log's, through `_replication`'s
+`Replicated` protocol (a name, a directory, the databases): the same socket, the same
+destination `<published>/<name>/_wal`, the same per-database snapshot window that prunes the
+replica (§3a, `snapshot_block`). The store's replica key is `<prefix>/<name>/_wal/store.db`,
+so it does not collide with a log's `buffer.db`, `catalog.db` or `published.db` under the
+same name.
+
+- **The store never runs litestream.** Running the sidecar, and deciding whether several
+  databases share one, is the deployment's job, as for logs; the library supervising one
+  could become a second replicator of one database.
+- **`flush()`** is `litestream sync -wait` through the running sidecar's control socket. It
+  returns once the replica's transaction is at the database's, and raises — starting nothing —
+  when no sidecar answers. It is what makes a long sync interval safe for a store that
+  changes slowly. It is refused inside a transaction on the same thread, since it ships what
+  is committed.
+- **`restore()`** writes `replication_config_for`'s config and calls `restore_buffer` into the
+  database's own path, then opens the store with the caller's declaration. It refuses a
+  machine where the database or a stray `-wal` exists, and with no replica it raises naming
+  where it looked rather than creating an empty store.
+- **Retention needs delete permission.** The snapshot window prunes the replica only if the
+  sidecar's credentials may delete under the prefix (`s3:DeleteObject`). Without it retention
+  fails and old LTX files accumulate.
+
+## 16.4 Invariants
+
+| | Invariant | Why |
+|---|---|---|
+| **S1** | A consumer's writes and its offset advance commit together or not at all. | It is exactly-once processing with no broker state. Enforced by one SQLite transaction; an authorizer refuses the consumer statements that could end it (transaction control, savepoints, DDL, PRAGMA, ATTACH, writes to `_litelink_` tables), and a transaction SQLite ended by itself (a caught `OR ROLLBACK`) refuses every later call and commits nothing. |
+| **S2** | An offset only moves forward. | A replayed message is refused rather than applied twice. |
+| **S3** | The library never starts a replicator. | Two litestream processes on one database corrupt its replica. `flush` is a client of the running sidecar. |
+| **S4** | A local database is never restored over. | It is the source of truth; a restore over it would discard commits the replica never received. |
+
+## 16.5 Tests
+
+- The store's config equals the log's for the same inputs, block for block.
+- With a sidecar running at an hour's sync interval: `flush()`, then restore onto a root with
+  no database, brings back the tables and the offset.
+- With no sidecar, `flush()` raises and every process it started was a `sync` client.
+- A process killed with SIGKILL inside a transaction that has written a row and advanced its
+  offset comes back with neither, and with every committed message and its offset.

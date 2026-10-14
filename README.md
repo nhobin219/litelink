@@ -285,6 +285,15 @@ the primary.
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
 asks for what came after — which is how you poll the published table as it grows.
 
+## State beside a log
+
+`litelink.Store` is a local SQLite database of declared tables for what a consumer keeps
+beside a log, with a reserved `litelink_offset` committed in the same transaction as the
+consumer's writes, so the work and the position in the log land together or not at all.
+Schema changes are additive. It replicates exactly as a log does: it writes a litestream
+config for the sidecar the deployment runs, `flush()` ships through that sidecar, and
+`restore()` brings the database back on another machine. See [`docs/API.md`](docs/API.md).
+
 ## Demos and recovery
 
 ```bash
