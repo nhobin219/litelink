@@ -1374,6 +1374,8 @@ class WriteHandle(LocalReadHandle):
             msg = f"a log already exists at {layout.root}/{name} — use open()"
             raise FileExistsError(msg)
 
+        refuse_a_store(layout)
+
         # BEFORE anything is created, so a refusal leaves no half-built log —
         # which would then block the retry, since `new` refuses an existing
         # buffer and `restore` does too.
@@ -1778,6 +1780,8 @@ class WriteHandle(LocalReadHandle):
         # with eight Parquet files stranded and referenced by nothing.
         if layout.is_legacy():
             raise FileExistsError(legacy_layout(layout, "restore refuses to touch it"))
+
+        refuse_a_store(layout)
 
         try:
             has_table = LogTable.exists_for(layout)
@@ -4451,6 +4455,21 @@ class WriteHandle(LocalReadHandle):
         """Ship `buffer.db` to its WAL replica now, when one is being kept."""
         if self.config.wal_replication:
             flush(self._layout, self._layout.buffer_db)
+
+
+def refuse_a_store(layout: Layout) -> None:
+    """Refuse a directory holding a table store (§16), before writing anything.
+
+    A log there would write its `litestream.yml` over the store's, and the
+    store's database would stop being replicated with no error.
+    """
+    if layout.store_db.exists():
+        msg = (
+            f"{layout.directory} holds a table store; a log needs a directory of "
+            f"its own, because the replication config and the sidecar's control "
+            f"socket are both derived from the directory"
+        )
+        raise FileExistsError(msg)
 
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:

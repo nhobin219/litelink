@@ -90,6 +90,18 @@ class Layout:
         return self.directory / "buffer.db"
 
     @property
+    def store_db(self) -> Path:
+        """A table store's database (§16), whose presence says this directory
+        belongs to a store and not to a log.
+
+        Named here, beside `buffer_db`, because each of the two refuses the
+        other's directory: the replication config and the sidecar's control
+        socket are both derived from the directory, so whichever wrote its
+        config second would silently stop the other replicating.
+        """
+        return self.directory / "store.db"
+
+    @property
     def catalog_db(self) -> Path:
         """The catalog is a file, not a service. One per stream (§2)."""
         return self.directory / "catalog.db"

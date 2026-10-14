@@ -2963,10 +2963,12 @@ is reached only by the sidecar the deployment runs and by an explicit `flush` or
 ## 16.1 Layout and declaration
 
 A store is `<root>/<name>/store.db`, with its litestream config beside it in
-`<root>/<name>/litestream.yml`. `StoreLayout` derives both and does no I/O. A store refuses a
-directory holding a log's `buffer.db`: the config and the sidecar's control socket are both
-derived from the directory, so the two would share one sidecar's config and the second to
-write it would silently stop the first replicating.
+`<root>/<name>/litestream.yml`. `StoreLayout` derives both and does no I/O. A store and a log
+refuse each other's directory — `Store.open` and `Store.restore` a log's `buffer.db`, a log's
+`new` and `restore` a store's `store.db` — because the config and the sidecar's control socket
+are both derived from the directory, so whichever wrote its config second would silently stop
+the other replicating. Each refusal comes before anything is written: a store's `restore`
+writes `litestream.yml`, and removes it again when there is no replica.
 
 Tables are declared with an Arrow schema, an optional primary key, or `single_row` (a rowid
 alias pinned to 0, so a second row is refused by SQLite). Every column carries the log's I17

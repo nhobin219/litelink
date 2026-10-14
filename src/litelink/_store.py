@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Self
 import pyarrow as pa
 
 from litelink._buffer import _column_ddl
-from litelink._layout import is_remote, validate_published
+from litelink._layout import Layout, is_remote, validate_published
 from litelink._replication import (
     destination,
     flush,
@@ -139,7 +139,7 @@ class StoreLayout:
 
     @property
     def database(self) -> Path:
-        return self.directory / "store.db"
+        return Layout(self.root, self.name).store_db
 
     @property
     def wal(self) -> Path:
@@ -162,7 +162,17 @@ class StoreLayout:
         control socket, both derived from the directory, so the second one to
         write its config would silently stop the first replicating.
         """
-        return self.directory / "buffer.db"
+        return Layout(self.root, self.name).buffer_db
+
+    def refuse_a_log(self) -> None:
+        """Refuse a log's directory, before anything is written to it."""
+        if self.log_buffer.exists():
+            msg = (
+                f"{self.directory} holds a log; a store needs a directory of "
+                f"its own, because the replication config and the sidecar's "
+                f"control socket are both derived from the directory"
+            )
+            raise FileExistsError(msg)
 
 
 # -- declarations -------------------------------------------------------------
@@ -531,14 +541,7 @@ class Store:
             msg = f"retention must be positive, not {retention}"
             raise ValueError(msg)
 
-        if layout.log_buffer.exists():
-            msg = (
-                f"{layout.directory} holds a log; a store needs a directory of "
-                f"its own, because the replication config and the sidecar's "
-                f"control socket are both derived from the directory"
-            )
-            raise FileExistsError(msg)
-
+        layout.refuse_a_log()
         layout.directory.mkdir(parents=True, exist_ok=True)
         con = _connect(layout.database)
         try:
@@ -620,6 +623,9 @@ class Store:
         """
         layout = StoreLayout(Path(root), name)
         _check_published(published)
+        # First: a restore writes and may remove `litestream.yml`, and in a
+        # log's directory that file is the log's.
+        layout.refuse_a_log()
         for path in (layout.database, layout.wal):
             if path.exists():
                 msg = (
@@ -799,6 +805,9 @@ class Store:
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
+        # The lock is held for the whole transaction, so closing from inside
+        # one on its own thread would wait for itself for ever.
+        self._refuse_inside_transaction("close")
         with self._lock:
             if self._con is not None:
                 self._con.close()

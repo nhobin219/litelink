@@ -161,6 +161,48 @@ def test_a_store_refuses_a_logs_directory(tmp_path: Path) -> None:
         opened(tmp_path)
 
 
+def test_a_store_restore_leaves_a_logs_directory_untouched(tmp_path: Path) -> None:
+    """The refusal comes before `restore` writes anything: its config would
+    replace the log's `litestream.yml`, or be removed with it when there is no
+    replica, and the log's sidecar would stop replicating its buffer.
+
+    Falsify by moving `refuse_a_log()` in `restore` after the config is
+    written: the log's config is gone or replaced.
+    """
+    schema = pa.schema([pa.field("event_ts", pa.int64(), nullable=False)])
+    with WriteHandle.new(tmp_path, "state", schema=schema, published=NOWHERE) as log:
+        config = log.write_replication_config()
+        before = config.read_text()
+
+    with pytest.raises(FileExistsError, match="holds a log"):
+        Store.restore(tmp_path, "state", published=NOWHERE, tables=TABLES)
+
+    assert config.read_text() == before
+    assert not (tmp_path / "state" / "store.db").exists()
+
+
+def test_a_log_refuses_a_stores_directory(tmp_path: Path) -> None:
+    """The converse: a log created or restored where a store is would write
+    its config over the store's, and the store would stop being replicated.
+
+    Falsify by removing `refuse_a_store` from `WriteHandle.new` (or
+    `restore`): the log is created and the store's config replaced.
+    """
+    with opened(tmp_path, published=NOWHERE) as store:
+        config = store.write_replication_config()
+        before = config.read_text()
+
+    schema = pa.schema([pa.field("event_ts", pa.int64(), nullable=False)])
+    with pytest.raises(FileExistsError, match="holds a table store"):
+        WriteHandle.new(tmp_path, "state", schema=schema, published=NOWHERE)
+
+    with pytest.raises(FileExistsError, match="holds a table store"):
+        WriteHandle.restore(tmp_path, "state", published=NOWHERE)
+
+    assert config.read_text() == before
+    assert not (tmp_path / "state" / "buffer.db").exists()
+
+
 # -- flush --------------------------------------------------------------------
 
 
@@ -449,6 +491,11 @@ def test_nothing_ends_a_transaction_from_inside_it(tmp_path: Path) -> None:
 
         with pytest.raises(RuntimeError, match="inside a store transaction"):
             store.offset("sub")
+
+        # `close` too: the lock is held for the transaction, so it would wait
+        # for itself.
+        with pytest.raises(RuntimeError, match="inside a store transaction"):
+            store.close()
 
         tx.advance("sub", 1)
 
