@@ -7,6 +7,32 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`litelink.replication`: the WAL replication primitives, public** (#193). A public module
+  beside `litelink.manifest`: `Replicated` (a name, a directory, the databases under it),
+  `litestream_config`, `control_socket`, `destination`, `flush`, `restore_database` and
+  `litestream_binary`. They are the functions a log's own replication calls, re-exported
+  rather than copied, and they take any `Replicated`, of which a log's layout is one.
+  litelink still never runs the continuous sidecar.
+- **`flush(..., socket=)`.** A sidecar that merges several configs into one process listens on
+  one control socket of its own, which no single directory derives; `socket=` names it. The
+  default is the derived socket, unchanged.
+- **`litelink.column_ddl(field)`**: one column of the buffer's DDL, the rule `validate_row`
+  enforces as a SQLite column definition, for a `STRICT` table.
+
+### Changed
+
+- **`restore_database` refuses an existing database or a stray `-wal`**, before running
+  litestream, and returns whether a replica existed. A log's `restore` already refused an
+  existing buffer, so only a stray `buffer.db-wal` with no buffer is newly refused, which
+  would otherwise have been replayed into the restored file.
+- **The replication config validates `published`** before splitting it, so
+  `WriteHandle.replication_config_for` with a malformed prefix raises `ValueError` instead of
+  writing a config naming another bucket.
+
 ## 0.12.4 — 2026-10-10
 
 ### Fixed
