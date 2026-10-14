@@ -57,7 +57,7 @@ from litelink._maintenance import (
 )
 from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import Reader, duckdb_connection
-from litelink._replication import flush, litestream_config, restore_buffer
+from litelink._replication import flush, litestream_config, restore_database
 from litelink._s3 import S3Options
 from litelink._statistics import (
     Tier,
@@ -1837,16 +1837,18 @@ class WriteHandle(LocalReadHandle):
         layout.create()
         config_path.write_text(litestream_config(layout, published, options))
 
-        # ONLY the buffer. `restore_buffer` passes `-if-replica-exists`, so an
+        # ONLY the buffer. `restore_database` passes `-if-replica-exists`, so an
         # absent replica returns quietly and the check below is what reports
         # it — which is the point, since this is the caller that knows what
-        # "no replica" means here. See `restore_buffer` for why that flag does
+        # "no replica" means here. See `restore_database` for why that flag does
         # not hide a real failure.
         #
         # Skipped when resuming — the buffer is already here, and litestream
         # would refuse to write over it anyway.
         if not resuming:
-            restore_buffer(config_path, layout.buffer_db, options, binary)
+            restore_database(
+                config_path, layout.buffer_db, s3_options=options, binary=binary
+            )
 
         if not layout.buffer_db.exists():
             # No replica: litestream found none, and said so by exiting cleanly
@@ -1874,7 +1876,7 @@ class WriteHandle(LocalReadHandle):
         # this went unnoticed. They diverge only when the buffer arrives some
         # other way, and that is not an exotic case: hand-placing one is the
         # documented recovery for a log whose WAL was never replicated, since
-        # `wal_replication=False` leaves no replica for `restore_buffer` to
+        # `wal_replication=False` leaves no replica for `restore_database` to
         # find.
         #
         # Left alone the divergence is SILENT and the handle comes back bound to
@@ -4450,7 +4452,7 @@ class WriteHandle(LocalReadHandle):
     def _flush_replica(self) -> None:
         """Ship `buffer.db` to its WAL replica now, when one is being kept."""
         if self.config.wal_replication:
-            flush(self._layout)
+            flush(self._layout, self._layout.buffer_db)
 
 
 def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:

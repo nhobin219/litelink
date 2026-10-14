@@ -35,9 +35,9 @@ where the reasoning lives.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from litelink import manifest
+from litelink import manifest, replication
 from litelink._assembly import new, open, restore  # noqa: A004
-from litelink._buffer import RetiredError
+from litelink._buffer import RetiredError, column_ddl
 from litelink._handle import (
     OFFSET,
     Coverage,
@@ -81,6 +81,7 @@ __all__ = [
     "TierStatistics",
     "WriteHandle",
     "__version__",
+    "column_ddl",
     "current_metadata",
     "delete",
     "duckdb_connection",
@@ -89,6 +90,7 @@ __all__ = [
     "new",
     "open",
     "preflight",
+    "replication",
     "restore",
     "truncate",
     "validate_row",

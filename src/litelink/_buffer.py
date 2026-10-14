@@ -222,8 +222,14 @@ class _Group:
     bytes: int
 
 
-def _column_ddl(name: str, field: pa.Field) -> str:
+def column_ddl(field: pa.Field) -> str:
     """One column's DDL, carrying every part of I17 that SQLite can enforce.
+
+    Public as `litelink.column_ddl`: the rule `validate_row` enforces, as the
+    column definition that enforces it. It is only right inside a `STRICT`
+    table (below), and an unsupported type raises `TypeError`. A nested
+    column is checked as text and no more: its JSON is checked against the
+    declared type by `Nested` before the insert, which is not part of the DDL.
 
     **Every column is `ANY`, and that is the whole design.** A STRICT column
     of a declared type does not refuse a wrong value, it CONVERTS one: an
@@ -245,7 +251,7 @@ def _column_ddl(name: str, field: pa.Field) -> str:
     constraint can distinguish it from a plain int. It is lossless.
     """
     kind = column_type(field.type)
-    q = f'"{name}"'
+    q = f'"{field.name}"'
 
     if pa.types.is_boolean(field.type):
         # A bool column is an integer holding 0 or 1; anything else is a value
@@ -323,7 +329,7 @@ def _buffer_ddl(shape: Shape) -> str:
     both tables come from here.
     """
     columns = ",\n  ".join(
-        _column_ddl(name, shape.schema.field(name)) for name in shape.columns
+        column_ddl(shape.schema.field(name)) for name in shape.columns
     )
     # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
     # at every seal, and a rowid alias would reissue offsets already
@@ -333,7 +339,7 @@ def _buffer_ddl(shape: Shape) -> str:
     # given" rather than "no declared affinity". It is not itself the
     # gate — a STRICT column of a declared type CONVERTS a wrong value
     # rather than refusing it — so every column is `ANY` and carries its
-    # own CHECK. See `_column_ddl`, which is where I17 actually lives.
+    # own CHECK. See `column_ddl`, which is where I17 actually lives.
     return f"""
         CREATE TABLE IF NOT EXISTS buffer (
           "litelink_offset" INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -1989,7 +1989,24 @@ def test_a_refused_restore_does_not_drop_a_live_logs_catalog_row(
     # The buffer removed by hand; the table and its files stay. That is a
     # plausible answer to the guard's own "Remove it, or restore into another
     # root", and it walks straight past the guard, which keys on the buffer.
-    Layout(tmp_path, "s").buffer_db.unlink()
+    buffer = Layout(tmp_path, "s").buffer_db
+    buffer.unlink()
+
+    # Its `-wal` left behind is refused before anything is pulled: SQLite
+    # would replay it into the restored buffer, mixing two histories.
+    stray = buffer.with_name(f"{buffer.name}-wal")
+    assert stray.exists()
+    with pytest.raises(FileExistsError, match="never restored over"):
+        litelink.restore(
+            tmp_path, "s", published=where, s3_options=s3, binary=str(binary)
+        )
+
+    assert LogTable.exists_for(Layout(tmp_path, "s"))
+
+    # Removed with its WAL, as removing a database means, the restore reaches
+    # the create this test is about.
+    for leftover in (stray, buffer.with_name(f"{buffer.name}-shm")):
+        leftover.unlink(missing_ok=True)
 
     with pytest.raises(Exception, match="already exists"):
         litelink.restore(
