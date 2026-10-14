@@ -35,12 +35,11 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from datetime import timedelta
 
-    from litelink._layout import Layout
     from litelink._s3 import S3Options
 
 # Where the WAL goes inside the published prefix. INSIDE the log's own directory,
@@ -58,6 +57,25 @@ if TYPE_CHECKING:
 # litestream forbids. Per-stream catalogs removed that, and the replica
 # followed them into the stream's own prefix.
 WAL_PREFIX = "_wal"
+
+
+class Replicated(Protocol):
+    """What the config and `flush` need from the thing they replicate.
+
+    A log's `Layout` and a store's layout both satisfy it. Typed by the three
+    members read rather than by `Layout`, so a store gets the same config, the
+    same socket and the same flush from this module instead of a copy of them:
+    a second copy of these nine lines is how the two would drift apart.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def directory(self) -> Path: ...
+
+    @property
+    def databases(self) -> tuple[Path, ...]: ...
 
 
 def destination(published: str, name: str) -> str:
@@ -105,7 +123,7 @@ def snapshot_block(retention: timedelta) -> list[str]:
 
 
 def litestream_config(
-    layout: Layout,
+    layout: Replicated,
     published: str,
     s3: S3Options,
     retention: timedelta | None = None,
@@ -191,7 +209,7 @@ def litestream_config(
     return "\n".join(lines) + "\n"
 
 
-def control_socket(layout: Layout) -> Path:
+def control_socket(layout: Replicated) -> Path:
     """Where a log's sidecar listens for control commands.
 
     In the temp directory, keyed by a hash of the log's directory, rather than
@@ -204,8 +222,16 @@ def control_socket(layout: Layout) -> Path:
     return Path(tempfile.gettempdir()) / f"litelink-{digest}.sock"
 
 
-def flush(layout: Layout, binary: str | None = None, timeout: int = 60) -> None:
-    """Ship `buffer.db` to its replica now, and return once the replica has it.
+def flush(
+    layout: Replicated,
+    database: Path,
+    binary: str | None = None,
+    timeout: int = 60,
+) -> None:
+    """Ship `database` to its replica now, and return once the replica has it.
+
+    `database` is one of `layout.databases`: a log flushes its `buffer.db`,
+    the one carrying rows nothing else holds, and a store its one database.
 
     `litestream sync -wait` through the running sidecar's control socket:
     measured on 0.5.16 against rustfs with litestream's periodic sync at 1 h,
@@ -228,7 +254,7 @@ def flush(layout: Layout, binary: str | None = None, timeout: int = 60) -> None:
         str(timeout),
         "-socket",
         str(socket),
-        str(layout.buffer_db),
+        str(database),
     ]
     try:
         done = subprocess.run(  # noqa: S603
@@ -240,7 +266,7 @@ def flush(layout: Layout, binary: str | None = None, timeout: int = 60) -> None:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         detail = getattr(exc, "stderr", b"") or b""
         msg = (
-            f"could not flush {layout.buffer_db.name} to its WAL replica through "
+            f"could not flush {database.name} to its WAL replica through "
             f"the sidecar's control socket at {socket}: "
             f"{detail.decode(errors='replace').strip() or exc}. Regenerate the "
             "litestream config with write_replication_config() and restart the "
@@ -262,7 +288,7 @@ def flush(layout: Layout, binary: str | None = None, timeout: int = 60) -> None:
         or shipped < current
     ):
         msg = (
-            f"the WAL replica of {layout.buffer_db.name} is at transaction "
+            f"the WAL replica of {database.name} is at transaction "
             f"{shipped} after a flush, behind the database's {current}"
         )
         raise RuntimeError(msg)
