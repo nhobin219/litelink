@@ -31,7 +31,7 @@ if you genuinely need it:
 
 types   feat fix refactor perf test docs build chore
 scopes  benchmarks blob buffer catalog ci compaction config deps examples layout
-        read replication retention schema seal spec sync write
+        read replication retention schema seal spec store sync write
 ```
 
 Write the body for someone reading `git log` in a year: what was wrong, why this fix and not

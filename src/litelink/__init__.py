@@ -58,6 +58,7 @@ from litelink._read import (
 from litelink._retired import delete, truncate
 from litelink._s3 import S3Options
 from litelink._statistics import ColumnStatistics, Tier, TierStatistics
+from litelink._store import Store, StoreTable, StoreTransaction
 
 try:
     __version__ = version("litelink")
@@ -77,6 +78,9 @@ __all__ = [
     "RetiredError",
     "Row",
     "S3Options",
+    "Store",
+    "StoreTable",
+    "StoreTransaction",
     "Tier",
     "TierStatistics",
     "WriteHandle",

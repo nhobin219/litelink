@@ -34,6 +34,7 @@ SCOPES = {
     "schema",  # §9  schema evolution
     "config",  # §12
     "blob",  # §15 blob fields
+    "store",  # §16 the table store
     "catalog",  # the SqlCatalog pair
     "layout",  # §2  where a log's files live, in either tier
     "spec",  # docs/SPEC.md itself
