@@ -164,7 +164,7 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
     )
 
 
-def test_only_the_root_and_the_manifest_are_public_modules() -> None:
+def test_only_the_root_manifest_and_replication_are_public_modules() -> None:
     """Everything else is private, and the root exports what callers need.
 
     `litelink.log` was importable for no reason but its name, and streamcast
@@ -182,6 +182,6 @@ def test_only_the_root_and_the_manifest_are_public_modules() -> None:
         for _, name, _ in pkgutil.iter_modules(litelink.__path__)
         if not name.startswith("_")
     }
-    assert public == {"manifest"}
+    assert public == {"manifest", "replication"}
     assert litelink.OFFSET == "litelink_offset"
     assert "OFFSET" in litelink.__all__

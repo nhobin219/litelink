@@ -37,10 +37,11 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from litelink._layout import is_remote, validate_published
+from litelink._s3 import S3Options
+
 if TYPE_CHECKING:
     from datetime import timedelta
-
-    from litelink._s3 import S3Options
 
 # Where the WAL goes inside the published prefix. INSIDE the log's own directory,
 # beside `data/` and `metadata/`, so a stream is one self-contained prefix that
@@ -62,10 +63,15 @@ WAL_PREFIX = "_wal"
 class Replicated(Protocol):
     """What the config and `flush` need from the thing they replicate.
 
-    A log's `Layout` and a store's layout both satisfy it. Typed by the three
-    members read rather than by `Layout`, so a store gets the same config, the
-    same socket and the same flush from this module instead of a copy of them:
-    a second copy of these nine lines is how the two would drift apart.
+    A log's `Layout` satisfies it, and so does any object with these three
+    members; the protocol is public as `litelink.replication.Replicated`.
+    Typed by the three members read rather than by `Layout`, so the config,
+    the socket and the flush have one implementation whatever they are given.
+
+    `databases` live under `directory`, which is the sidecar's identity: the
+    config names each database by its path relative to it, and the control
+    socket is derived from it. So one directory is one sidecar, and two
+    layouts with one directory would share both.
     """
 
     @property
@@ -125,7 +131,7 @@ def snapshot_block(retention: timedelta) -> list[str]:
 def litestream_config(
     layout: Replicated,
     published: str,
-    s3: S3Options,
+    s3_options: S3Options | None = None,
     retention: timedelta | None = None,
 ) -> str:
     """A litestream config replicating every database the log needs.
@@ -144,16 +150,27 @@ def litestream_config(
     the generated config is safe to commit, copy and hand around — the same
     reason `S3Options` is not part of `LogConfig`.
     """
-    if not published.startswith("s3://"):
+    # Shaped before it is parsed: `published` is split positionally below, so
+    # a malformed one would not fail here, it would name another bucket.
+    validate_published(published)
+    if not is_remote(published):
         msg = (
             f"replication needs a remote published table (s3://), not {published!r}: the "
             f"WAL replica exists to get unsealed rows off this machine"
         )
         raise ValueError(msg)
 
+    outside = [d for d in layout.databases if not d.is_relative_to(layout.directory)]
+    if outside:
+        # The replica key is the path relative to the directory, so a database
+        # outside it has no key, and the socket derived from the directory
+        # would not be this database's sidecar's.
+        msg = f"databases outside {layout.directory} cannot be replicated with it: {outside}"
+        raise ValueError(msg)
+
     target = destination(published, layout.name)
     bucket, _, prefix = target.removeprefix("s3://").rstrip("/").partition("/")
-    resolved = s3.resolved()
+    resolved = (s3_options or S3Options()).resolved()
 
     # The sidecar's control socket, which is how `retire()` asks it to ship
     # NOW and waits until it has (`flush`). Asking the running sidecar is the
@@ -225,13 +242,15 @@ def control_socket(layout: Replicated) -> Path:
 def flush(
     layout: Replicated,
     database: Path,
+    *,
     binary: str | None = None,
     timeout: int = 60,
+    socket: Path | None = None,
 ) -> None:
     """Ship `database` to its replica now, and return once the replica has it.
 
     `database` is one of `layout.databases`: a log flushes its `buffer.db`,
-    the one carrying rows nothing else holds, and a store its one database.
+    the one carrying rows nothing else holds.
 
     `litestream sync -wait` through the running sidecar's control socket:
     measured on 0.5.16 against rustfs with litestream's periodic sync at 1 h,
@@ -243,8 +262,18 @@ def flush(
     of its own: this cannot tell "no sidecar" from "a sidecar started from a
     config without the socket", and guessing wrong in the second case is two
     processes replicating one database.
+
+    `socket` is the sidecar's control socket, `control_socket(layout)` when not
+    given. That default is right for a sidecar run on this layout's config. A
+    sidecar that merges several configs into one process listens on one
+    socket of its own, which no single layout derives, so its caller passes
+    that socket.
     """
-    socket = control_socket(layout)
+    if database not in layout.databases:
+        msg = f"{database} is not one of the databases replicated: {layout.databases}"
+        raise ValueError(msg)
+
+    socket = socket or control_socket(layout)
     command = [
         litestream_binary(binary),
         "sync",
@@ -328,16 +357,25 @@ def litestream_binary(override: str | None = None) -> str:
     return "litestream"
 
 
-def restore_buffer(
-    config: Path, destination: Path, options: S3Options, binary: str | None = None
-) -> None:
-    """Restore one database from its replica, into `destination`.
+def restore_database(
+    config: Path,
+    database: Path,
+    *,
+    s3_options: S3Options | None = None,
+    binary: str | None = None,
+) -> bool:
+    """Restore one database from its replica, into `database`; False if none.
+
+    `config` is the litestream config naming `database`, as
+    `litestream_config` writes it. **A local database is never restored
+    over**: it is the source of truth, and a restore over it would discard
+    commits the replica never received. A stray `-wal` is refused too, since
+    SQLite would replay it into the restored file and mix two histories.
 
     **`-if-replica-exists`, so an ABSENT replica is not an error.** It exits 0
-    and writes nothing, which leaves the caller's `destination.exists()` check
-    to say what happened — and that check is the whole point, because "there is
-    no replica here" is the answer a restore needs to explain in its own
-    words. Without the flag litestream exits 1 on absence
+    and writes nothing, and the return value says what happened — the caller
+    is the one that knows what "there is no replica here" means, and
+    explains it in its own words. Without the flag litestream exits 1 on absence
     and the RuntimeError below fires first, so both callers' explanatory
     messages were unreachable and a mistyped log name surfaced as
 
@@ -357,13 +395,21 @@ def restore_buffer(
     file, which is why that file is safe to commit and hand around. litestream
     reads its own names first and falls back to the AWS ones.
     """
+    for path in (database, database.with_name(f"{database.name}-wal")):
+        if path.exists():
+            msg = (
+                f"{path} exists; a local database is the source of truth and is "
+                f"never restored over"
+            )
+            raise FileExistsError(msg)
+
     environment = dict(os.environ)
-    resolved = options.resolved()
+    resolved = (s3_options or S3Options()).resolved()
     if resolved.access_key and resolved.secret_key:
         environment["LITESTREAM_ACCESS_KEY_ID"] = resolved.access_key
         environment["LITESTREAM_SECRET_ACCESS_KEY"] = resolved.secret_key
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    database.parent.mkdir(parents=True, exist_ok=True)
     command = [
         litestream_binary(binary),
         "restore",
@@ -371,14 +417,14 @@ def restore_buffer(
         "-config",
         str(config),
         "-o",
-        str(destination),
-        str(destination),
+        str(database),
+        str(database),
     ]
     try:
         subprocess.run(command, check=True, env=environment, capture_output=True)  # noqa: S603
     except FileNotFoundError:
         msg = (
-            "litestream was not found, and this log needs it to restore.\n"
+            "litestream was not found, and a restore needs it.\n"
             "\n"
             "litelink's platform wheels ship it, so this is either a "
             "pure-Python wheel — the fallback for a platform with no build — "
@@ -395,3 +441,5 @@ def restore_buffer(
         detail = exc.stderr.decode(errors="replace").strip()
         msg = f"litestream restore failed: {detail or exc}"
         raise RuntimeError(msg) from exc
+
+    return database.exists()
