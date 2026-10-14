@@ -285,14 +285,51 @@ the primary.
 `litelink_offset` is monotonic and never reused, so a reader keeps the highest it has seen and
 asks for what came after — which is how you poll the published table as it grows.
 
-## State beside a log
+## A consumer's state: `Store`
 
-`litelink.Store` is a local SQLite database of declared tables for what a consumer keeps
-beside a log, with a reserved `litelink_offset` committed in the same transaction as the
-consumer's writes, so the work and the position in the log land together or not at all.
-Schema changes are additive. It replicates exactly as a log does: it writes a litestream
-config for the sidecar the deployment runs, `flush()` ships through that sidecar, and
-`restore()` brings the database back on another machine. See [`docs/API.md`](docs/API.md).
+A consumer that reads a log and applies each message to tables of its own needs two things to
+land together: the message's effect, and the record that the message is done. `litelink.Store`
+is that state, a local SQLite database of declared tables in which a consumer's writes and its
+offset in the log commit in one transaction. After any crash it resumes from
+`store.offset(subscription)`, so no message is skipped and none is applied twice:
+exactly-once processing, with no broker keeping track for it.
+
+```python
+import litelink
+import pyarrow as pa
+
+log = litelink.open("data", "orders", read_only=True)
+store = litelink.Store.open("data", "totals", tables={
+    "totals": litelink.StoreTable(
+        pa.schema([pa.field("account", pa.string(), nullable=False),
+                   pa.field("amount", pa.int64(), nullable=False)]),
+        key=("account",)),
+})
+
+def consume() -> None:
+    done = store.offset("orders")               # None on first start
+    start = 0 if done is None else done + 1     # resume after the last message applied
+    for batch in log.scan(start_offset=start):
+        for row in batch.to_pylist():
+            with store.transaction() as tx:     # one transaction, durable on return
+                tx.execute(
+                    "INSERT INTO totals VALUES (?, ?) ON CONFLICT (account) "
+                    "DO UPDATE SET amount = amount + excluded.amount",
+                    (row["account"], row["amount"]))
+                tx.advance("orders", row[litelink.OFFSET])
+
+consume()   # killed part-way, then restarted: picks up after the last committed message
+```
+
+A crash leaves both the effect and the offset, or neither. `advance` only moves forward, so a
+replayed message is refused rather than applied twice. The guarantee covers what the
+transaction writes; an effect outside the store, such as a request to another service, is
+not part of it. Schema changes are additive.
+
+So that this state also survives losing the machine, the store replicates exactly as a log
+does: it writes a litestream config for the sidecar the deployment runs, `flush()` ships
+through that sidecar, and `restore()` brings the database back on another machine. See
+[`docs/API.md`](docs/API.md).
 
 ## Demos and recovery
 

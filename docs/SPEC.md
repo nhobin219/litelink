@@ -2953,12 +2953,19 @@ amplification substantially. Blocked on reader support, not on anything here.
 
 ---
 
-# 16. Table store
+# 16. A log consumer's state: `Store`
 
-A consumer of a log keeps state beside it: what it did with the rows it read, and how far it
-read. `Store` is that state as an embedded SQLite database of declared tables, replicated the
-way a log is (§3a). It is the source of truth, every read and write is local, and the network
-is reached only by the sidecar the deployment runs and by an explicit `flush` or `restore`.
+A consumer of a log applies each message to tables of its own and must know, after any
+crash, which messages it has applied. `Store` is that state: an embedded SQLite database of
+declared tables in which the consumer's writes and its offset in the log commit in one
+transaction (§16.2, S1). A crash leaves a message's effect and its offset together or neither,
+so the consumer resumes from `offset(subscription)` and processes every message exactly once:
+none skipped, none applied twice (S2), with no broker holding its position.
+
+The database is the source of truth, every read and write is local, and the network is reached
+only by the sidecar the deployment runs and by an explicit `flush` or `restore`. Replication is
+secondary to the pattern: it is how the same state survives losing the machine, and it is the
+log's own (§3a, §16.3).
 
 ## 16.1 Layout and declaration
 

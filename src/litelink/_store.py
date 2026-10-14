@@ -1,22 +1,26 @@
-"""A local table store beside the log, replicated the way a log is (§16).
+"""A log consumer's state, committed with its offset (§16).
 
-A store is one SQLite database of declared tables. It is the source of truth:
-every read and write is local, and nothing in this module touches the network.
-Getting it off the machine is the WAL replication a log already has (§3a): the
-store writes a litestream config for its database, the deployment runs the
-sidecar on it, `flush` asks that sidecar to ship now through its control
-socket, and `restore` pulls the database back on a machine that has none. The
-config, the socket, the flush and the restore are `_replication`'s, shared with
-the log rather than copied, so the two cannot drift apart.
+A consumer reads a log and applies each message to tables of its own. A store
+is those tables, one SQLite database, plus the consumer's position in each log
+it reads: `transaction()` is one SQLite transaction, and `advance` writes the
+reserved `litelink_offset` inside it, so a message's effect and the record that
+it is done commit together or not at all (S1). After a crash the consumer
+resumes from `offset`, skipping no message, and `advance` only moves forward,
+so none is applied twice (S2). That is the whole of the pattern; nothing here
+knows what is being consumed.
+
+The database is the source of truth: every read and write is local, and
+nothing in this module touches the network. So that the state survives losing
+the machine, it replicates the way a log does (§3a): the store writes a
+litestream config for its database, the deployment runs the sidecar on it,
+`flush` asks that sidecar to ship now through its control socket, and `restore`
+pulls the database back on a machine that has none. The config, the socket,
+the flush and the restore are `_replication`'s, shared with the log rather than
+copied, so the two cannot drift apart.
 
 The store never starts litestream. A library that supervised the sidecar would
 own its lifecycle and could become a second replicator of one database, which
 is the corruption litestream warns about; see `_replication`.
-
-The consumer's writes and its position in what it consumes commit together:
-`transaction()` is one SQLite transaction, and `advance` writes the reserved
-`litelink_offset` inside it (S1). That is the whole of the pattern; nothing
-here knows what is being consumed.
 """
 
 from __future__ import annotations

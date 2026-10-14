@@ -1194,7 +1194,7 @@ Offsets stay dense across the two, so any engine reads `<prefix>/trades` and
 `<prefix>/trades-v2` as one sequence. A log a 0.5 release widened with `add_column` stays
 readable; one it left mid-change is refused with the release that can finish it (0.5.1).
 
-## A table store beside the log: `Store`
+## A log consumer's state: `Store`
 
 ```python
 Store.open(root, name, *, tables, published=None, s3_options=None, retention=None) -> Store
@@ -1217,13 +1217,19 @@ store.close() · context manager
 StoreTable(schema, key=(), single_row=False)
 ```
 
-A local SQLite database of declared tables (SPEC §16), for the state a consumer keeps beside
-a log. It is the source of truth; reads and writes never touch the network. `open` creates it
-or opens it, and applies additive declaration changes (a new table, a new nullable column);
-anything else is refused with the differences named. Column types are enforced by the same DDL
-as a log's buffer, so `tx.execute` cannot store a value of the wrong type.
+The state of a consumer of a log, for exactly-once processing (SPEC §16). A consumer applies
+each message to tables of its own and advances its offset in that log in one transaction, so
+after any crash it resumes from `store.offset(subscription)`, never skipping a message and
+never applying one twice. A `subscription` is the consumer's own name for its position in one
+log; a store keeps one offset per subscription.
 
-**Committing work with its offset** is the pattern the store exists for:
+The store is a local SQLite database of declared tables. It is the source of truth; reads and
+writes never touch the network. `open` creates it or opens it, and applies additive
+declaration changes (a new table, a new nullable column); anything else is refused with the
+differences named. Column types are enforced by the same DDL as a log's buffer, so
+`tx.execute` cannot store a value of the wrong type.
+
+**Committing work with its offset** is what the store exists for:
 
 ```python
 store = litelink.Store.open(root, "state", tables={
@@ -1242,10 +1248,12 @@ for batch in log.scan(start_offset=start):
 
 A crash at any point leaves both the row's effect and its offset, or neither, so the loop
 resumes exactly after the last message it applied. `advance` only moves forward and refuses a
-replay. Inside the transaction, statements that could end it — `COMMIT`, savepoints, DDL,
+replay. The guarantee covers what the transaction writes: an effect outside the store, such as
+a request to another service, can still happen twice. Inside the transaction, statements that could end it — `COMMIT`, savepoints, DDL,
 `PRAGMA`, `ATTACH` — and writes to the store's own `_litelink_` tables are refused.
 
-**Replication is the log's** (see Replication above). The store never runs litestream:
+**Replication is the log's** (see Replication above), and it is what lets the consumer's state
+survive losing the machine. The store never runs litestream:
 `write_replication_config()` writes `<root>/<name>/litestream.yml`, the deployment runs
 `litestream replicate -config` on it, and the database ships to `<published>/<name>/_wal`.
 `retention` writes the snapshot window that prunes the replica; the sidecar's credentials need

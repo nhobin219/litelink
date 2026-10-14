@@ -11,12 +11,16 @@ minor version carries breaking changes.
 
 ### Added
 
-- **`Store`, a table store beside the log** (#192). A local SQLite database of declared
-  tables, the source of truth, with additive-only schema changes and the log's column type
-  checks. `transaction()` commits the consumer's writes with a reserved `litelink_offset` per
-  subscription (`tx.advance`), so a write and its offset survive `kill -9` together or not at
-  all. It replicates exactly as a log does and never runs litestream: `replication_config()`
-  and `write_replication_config()` emit the log's config for its one database, `flush()` is
+- **`Store`, a log consumer's state, committed with its offset** (#192). Exactly-once
+  processing for a consumer of a log: in one `transaction()` it applies a message to its own
+  tables and advances its offset in that log (`tx.advance(subscription, offset)`, a reserved
+  `litelink_offset` per subscription), so a write and its offset survive `kill -9` together or
+  not at all. After any crash it resumes from `store.offset(subscription)`, skipping no
+  message, and `advance` only moves forward, so none is applied twice. The state is a local
+  SQLite database of declared tables, the source of truth, with additive-only schema changes
+  and the log's column type checks. So that it survives losing the machine, it replicates
+  exactly as a log does and never runs litestream: `replication_config()` and
+  `write_replication_config()` emit the log's config for its one database, `flush()` is
   `litestream sync -wait` through the running sidecar's control socket and raises when none
   answers, and `restore()` uses the log's restore path onto a machine with no database.
 - **`Store.flush(socket=)`** (#192). `flush()` asks the control socket the store's config
