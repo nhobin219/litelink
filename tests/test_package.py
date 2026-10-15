@@ -164,7 +164,7 @@ def test_every_type_a_caller_must_name_is_exported() -> None:
     )
 
 
-def test_only_the_root_manifest_and_replication_are_public_modules() -> None:
+def test_only_the_root_and_the_manifest_are_public_modules() -> None:
     """Everything else is private, and the root exports what callers need.
 
     `litelink.log` was importable for no reason but its name, and streamcast
@@ -172,6 +172,8 @@ def test_only_the_root_manifest_and_replication_are_public_modules() -> None:
     first. Pinned so a new module cannot quietly become API.
 
     Falsify by renaming `_handle.py` back to `log.py`: a public module appears.
+    `replication` and `column_ddl` were public in 0.12.5 for one consumer that
+    no longer uses them, and are private again; re-exporting either fails.
     """
     import pkgutil
 
@@ -182,6 +184,8 @@ def test_only_the_root_manifest_and_replication_are_public_modules() -> None:
         for _, name, _ in pkgutil.iter_modules(litelink.__path__)
         if not name.startswith("_")
     }
-    assert public == {"manifest", "replication"}
+    assert public == {"manifest"}
+    assert not {"replication", "column_ddl"} & set(litelink.__all__)
+    assert not hasattr(litelink, "column_ddl")
     assert litelink.OFFSET == "litelink_offset"
     assert "OFFSET" in litelink.__all__

@@ -1,5 +1,5 @@
-"""`litelink.replication` and `litelink.column_ddl`: a log's replication and
-column checks, as public primitives over any `Replicated`.
+"""`litelink._replication` and `column_ddl`: a log's replication and
+column checks, as primitives over any `Replicated`.
 
 The replica tests run the real sidecar against a local endpoint (`just
 rustfs`), as the log's flush test does; everything else is local files.
@@ -21,10 +21,10 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-import litelink
 from litelink import S3Options, WriteHandle
 from litelink import _replication as internals
-from litelink.replication import (
+from litelink._buffer import column_ddl
+from litelink._replication import (
     control_socket,
     flush,
     litestream_binary,
@@ -357,7 +357,7 @@ def test_column_ddl_refuses_what_an_append_refuses(tmp_path: Path) -> None:
             pa.field("ok", pa.bool_()),
         ]
     )
-    columns = ", ".join(litelink.column_ddl(field) for field in schema)
+    columns = ", ".join(column_ddl(field) for field in schema)
     con = sqlite3.connect(tmp_path / "t.db")
     con.execute(f"CREATE TABLE t ({columns}) STRICT")
     con.execute("INSERT INTO t VALUES (1, 2.5, 1)")
@@ -370,4 +370,4 @@ def test_column_ddl_refuses_what_an_append_refuses(tmp_path: Path) -> None:
 
 def test_column_ddl_refuses_an_unsupported_type() -> None:
     with pytest.raises(TypeError):
-        litelink.column_ddl(pa.field("d", pa.decimal128(10, 2)))
+        column_ddl(pa.field("d", pa.decimal128(10, 2)))

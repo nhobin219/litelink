@@ -64,7 +64,7 @@ class Replicated(Protocol):
     """What the config and `flush` need from the thing they replicate.
 
     A log's `Layout` satisfies it, and so does any object with these three
-    members; the protocol is public as `litelink.replication.Replicated`.
+    members.
     Typed by the three members read rather than by `Layout`, so the config,
     the socket and the flush have one implementation whatever they are given.
 

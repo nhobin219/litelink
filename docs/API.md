@@ -9,10 +9,10 @@ from litelink import LogConfig, LogHandle, Row, S3Options, WriteHandle, __versio
 ```
 
 Those are the names most code takes; `litelink` also exports `new`, `open`, `restore`,
-`validate_row`, `column_ddl`, `preflight`, `duckdb_connection`, `current_metadata`, `install_s3_secret`,
+`validate_row`, `preflight`, `duckdb_connection`, `current_metadata`, `install_s3_secret`,
 `LocalReadHandle`, `Coverage`, `RetiredError`, `ExtensionMissing`, `OFFSET`, the statistics types
 (`ColumnStatistics`, `TierStatistics`, `Tier`), the preflight report types (`Check`, `Report`)
-and the `manifest` and `replication` modules. The handles are the whole object model — there
+and the `manifest` module. The handles are the whole object model — there
 is no session, no client, no catalog handle to hold. A log is a directory under a root, named
 at `litelink.new` and opened by that name for ever after.
 
@@ -114,8 +114,8 @@ rather than only watching, and a reader could only watch.
 
 Most deployments use six: `new`/`open`, `extend`, `scan`, `seal`, `advance`, `publish`.
 
-**Import everything from `litelink`.** The package root, `litelink.manifest` and
-`litelink.replication` are the public modules; every other module is private (`_handle`, `_buffer`, …). `litelink.OFFSET` is
+**Import everything from `litelink`.** The package root and `litelink.manifest` are the
+public modules; every other module is private (`_handle`, `_buffer`, …). `litelink.OFFSET` is
 the name of the one column litelink owns, `"litelink_offset"`, for code that bounds or reads it
 without spelling the string.
 
@@ -275,28 +275,6 @@ the same rule either way. Pass the schema `new` took, or `log.schema` for an exi
 The rules are the buffer's own: the check inserts into a private in-memory copy of the
 buffer table and rolls back. Building that copy costs ~260 µs once per schema, after which a
 row costs ~4 µs.
-
-### The same rule as SQLite DDL: `column_ddl`
-
-```python
-litelink.column_ddl(field: pa.Field) -> str
-```
-
-One column of the buffer's DDL (SPEC I17): the rule `validate_row` enforces, expressed as the
-SQLite column definition that enforces it. `"<name>" ANY`, `NOT NULL` when the field is
-non-nullable, and a `CHECK` on `typeof` and range, so `'77'` is not converted into an integer,
-±inf is not a float and `7` is not a bool.
-
-```python
-columns = ", ".join(litelink.column_ddl(f) for f in schema)
-con.execute(f"CREATE TABLE t ({columns}) STRICT")
-```
-
-**`STRICT` is required.** `ANY` stores a value exactly as given only in a `STRICT` table; in an
-ordinary one it is an affinity, and the conversion happens before the `CHECK` sees the value.
-An unsupported type raises `TypeError`. A nested column (`struct`, `map`, `list`) is checked as
-text and no more: the rest of its check is Python's, applied by `append` and `validate_row`
-before SQLite sees the value, and is not part of the DDL.
 
 ### Column types
 
@@ -1131,48 +1109,6 @@ each config is complete on its own rather than needing to be merged by hand.
 Before 0.2 it was one sidecar per *root*: `catalog.db` and `archive.db` were shared, so a
 sidecar per log would have run two litestream instances against one database, and a
 multi-stream root needed a config written by hand.
-
-### The primitives: `litelink.replication`
-
-```python
-from litelink.replication import (Replicated, control_socket, destination, flush,
-                                  litestream_binary, litestream_config, restore_database)
-
-Replicated                       # Protocol: name: str · directory: Path · databases: tuple[Path, ...]
-litestream_config(layout, published, s3_options=None, retention=None) -> str
-control_socket(layout) -> Path
-destination(published, name) -> str                    # <published>/<name>/_wal
-flush(layout, database, *, binary=None, timeout=60, socket=None) -> None
-restore_database(config, database, *, s3_options=None, binary=None) -> bool
-litestream_binary(override=None) -> str
-```
-
-The functions the replication above is built from. `layout` is a `Replicated`: a name, a
-directory, and the SQLite databases under it. A log's own layout is one, and any object with
-those three members is another.
-
-- **`litestream_config`** is the text `write_replication_config` writes: the control socket,
-  one block per database keyed by its path under `directory`, the replica under
-  `destination(published, name)`, the snapshot window `retention` derives, the endpoint for a
-  non-AWS object store, and no credentials. litelink never runs the continuous sidecar; the
-  deployment runs `litestream replicate -config` on the file. It refuses a local or malformed
-  `published` and a database outside `directory`.
-- **`flush`** ships `database`, one of `layout.databases`, through the running sidecar's
-  control socket and returns once the replica has it (`litestream sync -wait`). With no sidecar
-  answering it raises and starts nothing. It asks `control_socket(layout)`, the socket the
-  config names; a sidecar that merges several configs into one process listens on one socket
-  of its own, so pass that as `socket=`.
-- **`restore_database`** pulls `database` from the replica `config` names, onto a machine that
-  has none, and returns whether there was a replica to pull. It refuses an existing database or
-  a stray `-wal` before running anything: a local database is the source of truth.
-- **`litestream_binary`** is the binary these run: `override`, else a checkout's pinned build
-  (`just litestream`), else the one bundled with the wheel, else `litestream` on `PATH`.
-
-**One directory is one sidecar.** The socket is derived from `directory` and the config is
-keyed under it, so two layouts with one directory would overwrite each other's config and
-share a socket, and the second would silently stop the first replicating. A log's directory is
-the log's. Retention needs the sidecar's credentials to allow delete under the prefix
-(`s3:DeleteObject`).
 
 ### The sidecar needs a monotonic clock
 

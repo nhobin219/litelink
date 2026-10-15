@@ -7,6 +7,17 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Removed
+
+- **Breaking: `litelink.replication` and `litelink.column_ddl` are private again** (#195).
+  0.12.5 made them public for one consumer, which no longer uses them, and replicating
+  arbitrary databases is not litelink's job. The module is `litelink._replication` and the
+  function `litelink._buffer.column_ddl`, with no compatibility path; a log's own replication
+  is unchanged. `restore_database`'s refusals and the config's validation of `published` from
+  0.12.5 stay, since a log's replication runs them.
+
 ## 0.12.5 — 2026-10-14
 
 ### Added
