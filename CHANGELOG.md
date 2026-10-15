@@ -7,7 +7,7 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
-## Unreleased
+## 0.13.0 — 2026-10-15
 
 ### Removed
 
