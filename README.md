@@ -141,7 +141,6 @@ litelink.open(root, name, *, s3_options=None)                      -> WriteHandl
 litelink.open(root, name, *, read_only=True, ...)                  -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, ...)   -> WriteHandle
 litelink.validate_row(schema, row)                                 # raises as append would
-litelink.column_ddl(field)                                         # that rule as a column's DDL
 litelink.preflight(...)                                            # what python -m litelink runs
 
 # Every handle reads:

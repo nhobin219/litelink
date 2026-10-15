@@ -225,11 +225,10 @@ class _Group:
 def column_ddl(field: pa.Field) -> str:
     """One column's DDL, carrying every part of I17 that SQLite can enforce.
 
-    Public as `litelink.column_ddl`: the rule `validate_row` enforces, as the
-    column definition that enforces it. It is only right inside a `STRICT`
-    table (below), and an unsupported type raises `TypeError`. A nested
-    column is checked as text and no more: its JSON is checked against the
-    declared type by `Nested` before the insert, which is not part of the DDL.
+    It is only right inside a `STRICT` table (below), and an unsupported
+    type raises `TypeError`. A nested column is checked as text and no more:
+    its JSON is checked against the declared type by `Nested` before the
+    insert, which is not part of the DDL.
 
     **Every column is `ANY`, and that is the whole design.** A STRICT column
     of a declared type does not refuse a wrong value, it CONVERTS one: an
