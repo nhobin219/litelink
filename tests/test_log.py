@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import litelink
-from litelink import OFFSET, LogConfig, WriteHandle
+from litelink import OFFSET, LogConfig, WriteHandle, _table
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 
@@ -1250,18 +1250,16 @@ def test_a_commit_fsyncs_the_metadata_json_before_the_catalog_names_it(
     PREVIOUS version, which is what each entry records: the pointer as it was
     at the moment that file was fsynced.
     """
-    import litelink._table as table_module
-
     catalog_db = Layout(tmp_path, "s").catalog_db
     synced: list[tuple[str, str | None]] = []
-    real_fsync = table_module.fsync
+    real_fsync = _table.fsync
 
     def recording(path: Path) -> None:
         real_fsync(path)
         if path.name.endswith(".metadata.json"):
             synced.append((path.name, _current_metadata(catalog_db)))
 
-    monkeypatch.setattr(table_module, "fsync", recording)
+    monkeypatch.setattr(_table, "fsync", recording)
 
     with open_log(tmp_path) as log:
         for i in range(3):
