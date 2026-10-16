@@ -7,6 +7,19 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## 0.13.1 — 2026-10-16
+
+### Fixed
+
+- **A table's metadata JSON is fsynced before the catalog names it** (#198, #199).
+  `SqlCatalog.commit_table` wrote the JSON through the FileIO and committed the SQLite
+  pointer straight after; SQLite fsyncs the row, nothing fsynced the JSON, so a power loss
+  or hard reset inside the filesystem's commit window kept the pointer and lost the file —
+  a catalog naming a zero-byte metadata file, and a log that could not be opened.
+  `_Catalog._write_metadata` now fsyncs a local metadata file and its directory before
+  returning, the order I1 already gives data files and manifests. A remote location is
+  left to its store's own durability.
+
 ## 0.13.0 — 2026-10-15
 
 ### Removed
