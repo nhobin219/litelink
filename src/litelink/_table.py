@@ -18,6 +18,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from pyarrow.fs import FileSelector, FileSystem, FileType
@@ -36,6 +37,7 @@ from pyiceberg.table import Table as IcebergTable
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.typedef import EMPTY_DICT
 
+from litelink._fs import fsync
 from litelink._predicates import offset_below, offset_in
 from litelink._s3 import S3Options
 from litelink._statistics import TierStatistics, rollup
@@ -43,13 +45,13 @@ from litelink._statistics import TierStatistics, rollup
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
     from datetime import datetime
-    from pathlib import Path
 
     import pyarrow as pa
     from pyiceberg.io import FileIO, InputStream
     from pyiceberg.manifest import DataFile as IcebergDataFile
     from pyiceberg.schema import Schema
     from pyiceberg.table import Table
+    from pyiceberg.table.metadata import TableMetadata
     from pyiceberg.table.snapshots import Snapshot
     from pyiceberg.typedef import Properties
 
@@ -322,6 +324,9 @@ class _Catalog(SqlCatalog):
     own, from `_load_file_io`. `_convert_orm_to_iceberg` is pyiceberg 0.12's
     body with only that first call changed; the FileIO-count test in
     `test_publish` fails if an upgrade routes around either.
+
+    A third, `_write_metadata`, makes a local metadata file durable before the
+    catalog names it (#198).
     """
 
     def _load_file_io(
@@ -357,6 +362,39 @@ class _Catalog(SqlCatalog):
             io=self._load_file_io(metadata.properties, metadata_location),
             catalog=self,
         )
+
+    @staticmethod
+    def _write_metadata(
+        metadata: TableMetadata, io: FileIO, metadata_path: str
+    ) -> None:
+        """Write the table's metadata JSON and, on a local filesystem, make it
+        durable BEFORE the catalog is pointed at it.
+
+        pyiceberg writes the JSON through the FileIO and commits the SQL row
+        straight after. On an object store a finished PUT is durable, so that
+        order is safe there, and it is all Iceberg was built for. On the local
+        filesystem the staging table lives on, the file's bytes sit in the
+        page cache while SQLite fsyncs the pointer -- so a power loss or a
+        hard reset inside the filesystem's commit window keeps the pointer and
+        drops the contents: a catalog naming an EMPTY metadata file, and a log
+        that cannot be opened (#198; found on a broker whose VM was reset
+        mid-commit). I1 already orders data files and manifests this way
+        (`_fs.fsync`, file and directory); the metadata JSON is the one commit
+        artefact pyiceberg writes rather than litelink, and the one it missed.
+        """
+        SqlCatalog._write_metadata(metadata, io, metadata_path)
+        if (local := _local_path(metadata_path)) is not None:
+            fsync(local)
+
+
+def _local_path(location: str) -> Path | None:
+    """The path a `file://` or bare location names on this machine; None for a
+    remote one, whose store makes its own durability promise."""
+    scheme, separator, rest = location.partition("://")
+    if not separator:
+        return Path(location)
+
+    return Path(rest) if scheme == "file" else None
 
 
 # The catalog names each `SqlCatalog` is built with, and the key its rows are

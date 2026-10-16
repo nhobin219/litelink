@@ -1236,3 +1236,61 @@ def test_a_writer_reports_where_its_next_append_lands(tmp_path: Path) -> None:
         # nothing here can reach the network.
         assert log.published.startswith("file://")
         assert log.end_offset() == 7
+
+
+def test_a_commit_fsyncs_the_metadata_json_before_the_catalog_names_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A table's metadata JSON is durable before the catalog's pointer is (#198).
+
+    pyiceberg writes the JSON and then commits the SQLite row. SQLite fsyncs
+    the row; nobody fsynced the JSON -- so a hard reset inside the filesystem's
+    commit window left a catalog naming a zero-byte file, and a log that could
+    not be opened. The fsync must land while the catalog still names the
+    PREVIOUS version, which is what each entry records: the pointer as it was
+    at the moment that file was fsynced.
+    """
+    import litelink._table as table_module
+
+    catalog_db = Layout(tmp_path, "s").catalog_db
+    synced: list[tuple[str, str | None]] = []
+    real_fsync = table_module.fsync
+
+    def recording(path: Path) -> None:
+        real_fsync(path)
+        if path.name.endswith(".metadata.json"):
+            synced.append((path.name, _current_metadata(catalog_db)))
+
+    monkeypatch.setattr(table_module, "fsync", recording)
+
+    with open_log(tmp_path) as log:
+        for i in range(3):
+            log.append({"event_ts": i, "key": "k", "payload": ""})
+
+        log.seal(flush=True)
+
+    # The create and the seal each commit one metadata version.
+    assert len(synced) >= 2, synced
+    for name, pointer_at_fsync in synced:
+        assert pointer_at_fsync is None or not pointer_at_fsync.endswith(name), (
+            f"the catalog named {name} before it was durable"
+        )
+
+    current = _current_metadata(catalog_db)
+    assert current is not None and current.endswith(synced[-1][0])
+
+
+def _current_metadata(catalog_db: Path) -> str | None:
+    """What the catalog names as the table's metadata right now, or None."""
+    if not catalog_db.exists():
+        return None
+
+    connection = sqlite3.connect(f"file:{catalog_db}?mode=ro", uri=True, timeout=5)
+    try:
+        row = connection.execute(
+            "SELECT metadata_location FROM iceberg_tables"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    return None if row is None else str(row[0])
