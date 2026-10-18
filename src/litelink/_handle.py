@@ -59,6 +59,8 @@ from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import flush, litestream_config, restore_database
 from litelink._s3 import S3Options
+from litelink._state import STATE_PROPERTY
+from litelink._state import encode as encode_state
 from litelink._statistics import (
     Tier,
     TierStatistics,
@@ -83,6 +85,7 @@ from litelink._table import (
     published_retired,
     published_shape,
     published_span,
+    published_state,
 )
 from litelink._tiers import PUBLISHED as PUBLISHED_TIER
 from litelink._tiers import STAGING as STAGING_TIER
@@ -699,6 +702,16 @@ class LogHandle:
         buffered = self._buffer.span()
 
         return max(self._checked_span()[1], 0 if buffered is None else buffered[1])
+
+    def state(self, key: str) -> bytes | None:
+        """The newest value `extend(..., state=)` committed for `key`, or None
+        if none ever was (#202). One keyed read of the buffer."""
+        return self._buffer.state(key)
+
+    def states(self, prefix: str = "") -> dict[str, bytes]:
+        """The newest value of every state key starting with `prefix` (#202):
+        every key, by default. For copying a log's state into another."""
+        return self._buffer.states(prefix)
 
     def buffered_rows(self) -> int:
         """Rows durable in the buffer but not yet sealed.
@@ -1436,10 +1449,12 @@ class WriteHandle(LocalReadHandle):
         s3_options: S3Options | None,
         first_offset: int,
         meta: Mapping[str, str],
+        state: tuple[int, Mapping[str, bytes]] | None = None,
     ) -> Self:
         """Create the log's files, its first appended row taking `first_offset`,
-        with `meta` written beside its shape. `new`, and `restore` rebuilding a
-        log from its published table, once each has decided what to create."""
+        with `meta` written beside its shape and `state`, `(through, values)`,
+        adopted. `new`, and `restore` rebuilding a log from its published
+        table, once each has decided what to create."""
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
         buffer = Buffer.open(
@@ -1459,6 +1474,12 @@ class WriteHandle(LocalReadHandle):
         # the buffer exists. The reserve would be lost with no error anywhere.
         if first_offset > 1:
             buffer.seed_offsets(first_offset)
+
+        # Before the `meta` writes too, for the same reason (#202): a crash
+        # after them would leave a log that opens with its state missing, and
+        # a restore that refuses to run again over it.
+        if state is not None:
+            buffer.adopt_state(state[1], state[0])
 
         buffer.set_meta(_SCHEMA_KEY, schema.serialize().to_pybytes().hex())
         # One transaction. `validate` has just accepted the policy and the
@@ -2105,6 +2126,14 @@ class WriteHandle(LocalReadHandle):
 
             if wanted > resumed:
                 resumed = buffer.reserve(wanted - resumed)[1]
+
+            # The replica's state describes the replica's rows. A push inside
+            # the replication lag leaves the published table ahead of them, and
+            # its record ahead of that state: per key, the newer wins (#202).
+            # Before `LogTable.create`, with everything else repeatable here.
+            recorded_state = published_state(layout, published, options)
+            if recorded_state is not None:
+                buffer.adopt_state(recorded_state[1], recorded_state[0])
         finally:
             buffer.close()
 
@@ -2277,6 +2306,9 @@ class WriteHandle(LocalReadHandle):
         issued = published_issued_through(layout, published, options)
         known = frontier if issued is None else issued + 1
         first = known + reserve
+        # The state the last published commit recorded, as of its last offset
+        # (#202): the state that describes exactly the rows coming back.
+        recorded_state = published_state(layout, published, options)
         _log.warning(
             "litelink: no WAL replica of %s under %s; rebuilding the log from its "
             "published table, which holds offsets below %d. Rows the old machine "
@@ -2294,6 +2326,7 @@ class WriteHandle(LocalReadHandle):
             s3_options=options,
             first_offset=first,
             meta={PUBLISHED_THROUGH_KEY: str(frontier - 1)},
+            state=recorded_state,
         )
         # Adopted now, as a WAL restore does, so reads reach the published rows
         # from the first query rather than after the first maintenance pass.
@@ -2539,7 +2572,9 @@ class WriteHandle(LocalReadHandle):
         """
         return self.extend([row])[0]
 
-    def extend(self, rows: Iterable[Row]) -> list[int]:
+    def extend(
+        self, rows: Iterable[Row], *, state: Mapping[str, bytes] | None = None
+    ) -> list[int]:
         """Append many rows in ONE transaction. Returns the assigned offsets.
 
         The batch is the durability unit: one fsync amortised across the batch,
@@ -2551,6 +2586,15 @@ class WriteHandle(LocalReadHandle):
         anything commits, and no offset is consumed. Partial acceptance would
         be worse than refusal — it would hand back offsets for some rows while
         the caller learns nothing about the rest.
+
+        **`state` commits in the same transaction** (#202, §3): keyed values,
+        opaque to the log, that describe the rows — a producer's last sequence
+        number, say. Both commit or neither does. With no rows it writes the
+        state alone. `state(key)` reads the newest value back, and each
+        published snapshot records the state as of its last offset, which is
+        what a restore from the published table alone brings back. A batch
+        carrying state is never split by a seal: its file may run past
+        `target_seal_size` by up to the batch.
         """
 
         # No lock. `Buffer` serialises its own connection, which is the only
@@ -2559,7 +2603,7 @@ class WriteHandle(LocalReadHandle):
         # compare, signal, or start anything: a maintainer calls `seal` and
         # finds the work waiting, exactly as it calls `advance` and finds
         # files to compact.
-        return self._buffer.append(rows)
+        return self._buffer.append(rows, state)
 
     # -- bulk ingest ---------------------------------------------------------
 
@@ -3798,8 +3842,14 @@ class WriteHandle(LocalReadHandle):
         # waited, and the buffer grew for the whole of it.
         checkpoint(lease.renew)
         last = uploaded[-1][0]
+        previous = published.state_location
+        # The state as of the last offset this commit publishes, named in the
+        # same commit (#202): each published snapshot then records the state
+        # that describes exactly the rows it holds.
+        state = self._write_state(published, last.end - 1)
+        checkpoint(lease.renew)
 
-        if not published.register(
+        registered = published.register(
             [published.uri(rel_path) for _, rel_path in uploaded],
             end=last.end,
             # The low end too, so the published table can refuse a range that
@@ -3809,8 +3859,14 @@ class WriteHandle(LocalReadHandle):
             start=uploaded[0][0].start,
             # What the log has issued, recorded with the rows that land, so a
             # restore with no replica knows what not to issue again (#144).
-            properties={ISSUED_PROPERTY: str(self._buffer.next_offset() - 1)},
-        ):
+            properties={
+                ISSUED_PROPERTY: str(self._buffer.next_offset() - 1),
+                **state,
+            },
+        )
+        # Whether or not it landed: a file the table does not name is queued.
+        self._settle_state(published, previous)
+        if not registered:
             return
 
         # After the register, never before: the watermark is a promise that the
@@ -3913,12 +3969,26 @@ class WriteHandle(LocalReadHandle):
                 superseded, int(datetime.now(UTC).timestamp())
             )
             checkpoint(lease.renew)
+            previous = published.state_location
+            # A swap that reaches past the published end publishes new offsets,
+            # so it records the state as of its end, as a push does (#202). One
+            # inside the end publishes nothing new and leaves the record be.
+            state = (
+                self._write_state(published, merged.end - 1)
+                if merged.end > floor
+                else {}
+            )
+            checkpoint(lease.renew)
             published.replace_range(
                 merged.start,
                 merged.end,
                 [uri],
-                properties={ISSUED_PROPERTY: str(self._buffer.next_offset() - 1)},
+                properties={
+                    ISSUED_PROPERTY: str(self._buffer.next_offset() - 1),
+                    **state,
+                },
             )
+            self._settle_state(published, previous)
             self._buffer.restamp_deletions(
                 superseded, int(datetime.now(UTC).timestamp())
             )
@@ -3927,6 +3997,42 @@ class WriteHandle(LocalReadHandle):
             floor = max(floor, merged.end)
 
         return floor
+
+    def _write_state(self, published: LogTable, through: int) -> dict[str, str]:
+        """Upload the state as of `through` and return the property naming it,
+        or nothing for a log with no state at or below `through` (#202).
+
+        Ordered as every published object is (I2): the name is recorded before
+        the object exists, so a crash before the commit names it leaves a name
+        `_settle_state` queues for deletion rather than an object nothing can
+        find. The caller holds the publish claim, so no other commit can name a
+        state file between this upload and its own.
+        """
+        state = self._buffer.state_as_of(through)
+        if not state:
+            return {}
+
+        rel_path = self._layout.state_path(through, uuid.uuid4().hex[:8])
+        self._buffer.intend_state_file(published.uri(rel_path))
+        published.put_bytes(encode_state(state, through), rel_path)
+
+        return {STATE_PROPERTY: rel_path}
+
+    def _settle_state(self, published: LogTable, previous: str | None) -> None:
+        """Queue every state file the published table no longer names, after a
+        commit that may have changed which one it names (#202).
+
+        `previous` is the file named before the commit, which this log may not
+        have written itself — a restore brings the table back, not the record
+        of the file. Stamped now, the moment the commit stopped naming them, so
+        the drain gives a reader of the previous metadata its full grace (I6);
+        the drain's veto keeps whatever the table names now regardless.
+        """
+        self._buffer.supersede_state_files(
+            published.state_location,
+            [] if previous is None else [previous],
+            int(datetime.now(UTC).timestamp()),
+        )
 
     def _store_staging_statistics(self) -> None:
         """Store the rollup of the staging table's current version, for everyone.

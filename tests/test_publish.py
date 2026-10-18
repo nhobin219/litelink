@@ -2363,6 +2363,9 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         "sort_by",
         "schema",
         "published",
+        # state (#202)
+        "state",
+        "states",
         # lifecycle
         "close",
     }

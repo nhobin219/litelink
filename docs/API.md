@@ -100,6 +100,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`LogHandle`** — read | `scan` · `sql` |
 | **`LogHandle`** — observe | `end_offset` · `buffered_rows` · `staging_rows` · `staging_files` · `staging_extent` · `published_through` · `published_files` · `coverage` · `column_statistics` |
 | **`LogHandle`** — identity | `root` · `name` · `config` · `schema` · `sort_by` · `published` |
+| **`LogHandle`** — state | `state` · `states` |
 | **`LogHandle`** — lifecycle | `close` · context manager |
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
 | **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
@@ -247,7 +248,7 @@ owns no thread. `WriteHandle` is a context manager, and `with` is the same thing
 
 ```python
 log.append(row: Row) -> int               # Row = Mapping[str, object]
-log.extend(rows: Iterable[Row]) -> list[int]
+log.extend(rows: Iterable[Row], *, state: Mapping[str, bytes] | None = None) -> list[int]
 ```
 
 Both return the assigned offsets, and **the rows are durable when the call returns** — one
@@ -260,6 +261,31 @@ choice: no `LogConfig` setting tunes it. `append(row)` is `extend([row])`.
 An append does no work beyond its own insert. It does not measure the buffer, decide whether
 to seal, or delete anything — it records where the next file should be cut, in the same
 transaction, and returns.
+
+### State committed with the rows: `extend(..., state=)`
+
+```python
+log.extend(rows, state={"producer:a": b"..."})   # rows and state, one transaction
+log.extend([], state={"producer:a": b"..."})     # state alone, no offset consumed
+log.state("producer:a") -> bytes | None          # the newest value; any handle
+log.states(prefix="producer:") -> dict[str, bytes]
+```
+
+`state` is keyed values the log treats as opaque bytes, committed in the transaction that
+inserts the rows — both or neither — for a caller whose next append depends on facts about
+the last, such as a producer's last sequence number. A bad entry (an empty or non-`str` key, a
+non-bytes value) refuses the whole call before anything commits, as a bad row does. There is
+no delete: a key keeps its newest value. A retired log refuses a state write with
+`RetiredError`.
+
+Each published commit that adds offsets records the state **as of its last offset** — not the
+buffer's newest, which may describe rows not yet published — in a file the table property
+`litelink.state` names. A `restore` from the published table alone brings that state back with
+the rows it describes; one from a WAL replica keeps the replica's, taking the published value
+for any key where it is newer. A batch carrying state is never split by a seal, so its file
+can exceed `target_seal_size` by up to the batch (SPEC §3, §5).
+
+A log that never passes `state=` writes nothing new: no file, no property.
 
 ### Checking a row without appending it: `validate_row`
 

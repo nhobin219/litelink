@@ -23,6 +23,7 @@ from litelink._config import LogConfig
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
+from litelink import _state
 from litelink._claim import DEFAULT_TTL_MS, Claim
 from litelink._types import (
     NON_FINITE,
@@ -850,6 +851,52 @@ class Buffer:
             WHEN EXISTS (SELECT 1 FROM tier_offsets WHERE tier = 'buffer')
             BEGIN SELECT RAISE(ABORT, '{RETIRED_REFUSAL}'); END
         """)
+        # The caller's keyed state (#202), committed by `append` in the
+        # transaction that inserts the rows it describes. A row per VERSION,
+        # not per key: a push records the state as of the last offset it
+        # publishes, which can be behind the newest value, so the versions a
+        # push may still ask for are kept until the watermark passes them
+        # (`confirm_published` prunes them).
+        #
+        # `version` is a plain rowid, not AUTOINCREMENT. The only order read
+        # from it is "newer", and a new rowid is above every row present; the
+        # one rowid that can be reused is a deleted top row's, and nothing
+        # deletes a key's newest version except `append` replacing it with the
+        # row that takes the number.
+        #
+        # `through` is the last offset issued when the version committed: the
+        # batch's last row, or with no rows the last offset issued so far.
+        # Versions of a key rise in it as they rise in `version`.
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS state (
+              version INTEGER PRIMARY KEY,
+              key     TEXT NOT NULL,
+              through INTEGER NOT NULL,
+              value   BLOB NOT NULL
+            )
+        """)
+        self._con.execute(
+            "CREATE INDEX IF NOT EXISTS state_key ON state (key, version)"
+        )
+        # A retired log takes no state either, for `refuse_retired`'s reason:
+        # an `extend([], state=…)` inserts no row for that trigger to see.
+        self._con.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS refuse_retired_state BEFORE INSERT ON state
+            WHEN EXISTS (SELECT 1 FROM tier_offsets WHERE tier = 'buffer')
+            BEGIN SELECT RAISE(ABORT, '{RETIRED_REFUSAL}'); END
+        """)
+        # Published state files this log wrote and has not yet queued for
+        # deletion (#202): the name goes here before the object exists (I2),
+        # and moves to `pending_delete` once a later commit names a newer file.
+        #
+        # A table of its own rather than rows in `pending_delete`, for
+        # `extent_intent`'s reason. A build that predates it drains
+        # `pending_delete` against a reference set that does not count the
+        # current state file, so queuing the live file there — vetoed by this
+        # build — would let an older one delete it.
+        self._con.execute(
+            "CREATE TABLE IF NOT EXISTS state_published (uri TEXT PRIMARY KEY)"
+        )
         # Who owns which operation, across processes (§13.6). A Python lock
         # cannot say anything about a process that is no longer running, and
         # recovery has to know whether an interrupted operation was ours.
@@ -981,12 +1028,18 @@ class Buffer:
 
     # -- write ------------------------------------------------------------
 
-    def append(self, rows: Iterable[Mapping[str, object]]) -> list[int]:
+    def append(
+        self,
+        rows: Iterable[Mapping[str, object]],
+        state: Mapping[str, bytes] | None = None,
+    ) -> list[int]:
         """Insert rows in one transaction. Returns the assigned offsets.
 
         One transaction means one fsync amortised across the batch, which is
-        the whole of §3's throughput story.
+        the whole of §3's throughput story. `state`'s entries commit in it too
+        (#202): with the rows, or alone when there are none.
         """
+        entries = _state.entries(state)
         with self._lock:
             # ONE read, inside the lock, and handed down. Read here and again
             # in `_insert` and the two can disagree: a schema change landing
@@ -999,10 +1052,14 @@ class Buffer:
             names = ", ".join(f'"{c}"' for c in shape.columns)
             sql = f"INSERT INTO buffer ({names}) VALUES ({placeholders})"
 
-            return self._insert(rows, sql, shape)
+            return self._insert(rows, sql, shape, entries)
 
     def _insert(
-        self, rows: Iterable[Mapping[str, object]], sql: str, shape: Shape
+        self,
+        rows: Iterable[Mapping[str, object]],
+        sql: str,
+        shape: Shape,
+        entries: Mapping[str, bytes],
     ) -> list[int]:
         """The append's transaction, with the lock already held."""
         offsets: list[int] = []
@@ -1010,6 +1067,17 @@ class Buffer:
         cursor.execute(_BEGIN)
         try:
             group = self._read_group(cursor)
+            # Where the open group began when this transaction did. No cut lies
+            # at or above it, so a version of a key written since is one no
+            # publish can ask for once this batch's replaces it (`_put_state`).
+            floor = group.start_offset
+            # A batch carrying state is cut at its END, never on the row that
+            # crosses (#202). A publish point inside it would put some of its
+            # rows in the published table and none of its state, and a restore
+            # from there would have the caller resend rows the table already
+            # holds. The file overshoots by at most this batch; a batch without
+            # state is cut exactly as before.
+            crossed = False
             # Bound once, and the accounting inlined below, because this loop
             # runs per row: routing it through a method cost 19 points of
             # overhead against raw SQLite at 1,000-row batches.
@@ -1094,9 +1162,18 @@ class Buffer:
                     group.bytes >= target
                     or offset - (group.start_offset or offset) + 1 >= target_rows
                 ):
-                    group = self._cut(cursor, group, offset)
+                    if entries:
+                        crossed = True
+                    else:
+                        group = self._cut(cursor, group, offset)
+
+            if crossed:
+                group = self._cut(cursor, group, offsets[-1])
 
             self._write_group(cursor, group)
+            if entries:
+                self._put_state(cursor, entries, offsets, floor)
+
             cursor.execute("COMMIT")
         except BaseException:
             # Best-effort, and it must not raise over the original. An
@@ -1159,6 +1236,153 @@ class Buffer:
                 group.group_id,
             ),
         )
+
+    def _put_state(
+        self,
+        cursor: sqlite3.Cursor,
+        entries: Mapping[str, bytes],
+        offsets: Sequence[int],
+        floor: int | None,
+    ) -> None:
+        """Write a version of each entry, inside the append's transaction.
+
+        Tagged with the batch's last offset, or with no rows the last offset
+        issued so far: a publish through offset `T` records each key's newest
+        version tagged at or below `T` (`state_as_of`).
+
+        **A key's older versions at or above `floor` are dropped here.** A
+        publish point is the end of a closed group, and every closed group ends
+        at or below `floor`, the open group's start; later cuts land at or
+        above this batch's end. So no publish point falls between such a
+        version and this one, and none can select it again. With no open group
+        started, only a version with this one's tag goes, which a write with no
+        rows can leave. What remains is pruned once publishing passes it.
+        """
+        if offsets:
+            through = offsets[-1]
+        else:
+            row = cursor.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
+            ).fetchone()
+            through = int(row[0]) if row else 0
+
+        lowest = through if floor is None else min(floor, through)
+        for key, value in entries.items():
+            cursor.execute(
+                "DELETE FROM state WHERE key = ? AND through >= ?", (key, lowest)
+            )
+            try:
+                cursor.execute(
+                    "INSERT INTO state (key, through, value) VALUES (?, ?, ?)",
+                    (key, through, value),
+                )
+            except sqlite3.IntegrityError as exc:
+                if RETIRED_REFUSAL in str(exc):
+                    raise self.retired_error() from None
+
+                raise
+
+    # -- state (#202) -----------------------------------------------------
+
+    def state(self, key: str) -> bytes | None:
+        """The newest value of `key`, or None if it was never written."""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT value FROM state WHERE key = ? ORDER BY version DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+
+        return None if row is None else bytes(row[0])
+
+    def states(self, prefix: str = "") -> dict[str, bytes]:
+        """The newest value of every key starting with `prefix`.
+
+        By `substr` rather than `LIKE`, whose `%` and `_` in a caller's prefix
+        would match more than it says.
+        """
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT key, value FROM state WHERE version IN"
+                " (SELECT max(version) FROM state"
+                "  WHERE substr(key, 1, ?) = ? GROUP BY key)",
+                (len(prefix), prefix),
+            ).fetchall()
+
+        return {str(key): bytes(value) for key, value in rows}
+
+    def state_as_of(self, through: int) -> dict[str, bytes]:
+        """Each key's newest value among the versions tagged at or below
+        `through`: the state once every row up to `through` had committed, and
+        nothing after. What a publish through `through` records."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT key, value FROM state WHERE version IN"
+                " (SELECT max(version) FROM state WHERE through <= ? GROUP BY key)",
+                (through,),
+            ).fetchall()
+
+        return {str(key): bytes(value) for key, value in rows}
+
+    def adopt_state(self, state: Mapping[str, bytes], through: int) -> None:
+        """Take a published record of the state as of `through`, key by key,
+        where it is newer than what this buffer holds.
+
+        For a restore. A fresh buffer takes every entry. A WAL replica's own
+        state is consistent with its rows, but a push can land inside the
+        replication lag, leaving the published table ahead of the replica: a
+        key whose newest version here is tagged below `through` then takes the
+        published value, which is at least as new. A key tagged at or above it
+        keeps its own, which is.
+        """
+        with self._transaction():
+            for key, value in state.items():
+                row = self._con.execute(
+                    "SELECT through FROM state WHERE key = ?"
+                    " ORDER BY version DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                if row is None or int(row[0]) < through:
+                    self._con.execute(
+                        "INSERT INTO state (key, through, value) VALUES (?, ?, ?)",
+                        (key, through, value),
+                    )
+
+    def intend_state_file(self, uri: str) -> None:
+        """Record a published state file's name before the object exists (I2)."""
+        with self._transaction():
+            self._con.execute(
+                "INSERT OR IGNORE INTO state_published (uri) VALUES (?)", (uri,)
+            )
+
+    def supersede_state_files(
+        self, current: str | None, previous: Iterable[str], superseded_at: int
+    ) -> None:
+        """Queue for deletion every published state file except `current`.
+
+        Everything `intend_state_file` recorded, plus `previous`: the file the
+        published table named before this commit, which a log restored onto
+        this machine never recorded. Stamped `superseded_at` whether queued now
+        or before, because the grace a reader is owed (I6) runs from the
+        commit that stopped naming the file. One transaction, so a name is
+        always in one of the two tables until the drain deletes it.
+        """
+        with self._transaction():
+            names = {
+                str(row[0])
+                for row in self._con.execute("SELECT uri FROM state_published")
+            } | set(previous)
+            names.discard(current or "")
+            for uri in names:
+                self._con.execute(
+                    "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at)"
+                    " VALUES (?, ?)",
+                    (uri, superseded_at),
+                )
+                self._con.execute(
+                    "UPDATE pending_delete SET superseded_at = ? WHERE rel_path = ?",
+                    (superseded_at, uri),
+                )
+                self._con.execute("DELETE FROM state_published WHERE uri = ?", (uri,))
 
     # -- read -------------------------------------------------------------
 
@@ -1851,6 +2075,16 @@ class Buffer:
             self._con.execute(
                 "DELETE FROM extent WHERE rel_path LIKE '%://%' AND end_offset <= ?",
                 (raised + 1,),
+            )
+            # State versions no publish can ask for again (#202). Every later
+            # push records the state as of an offset above the watermark, so
+            # of the versions at or below it only each key's newest can still
+            # be selected. In this transaction, so the versions and the
+            # watermark that justifies dropping them move together.
+            self._con.execute(
+                "DELETE FROM state WHERE version < (SELECT max(s.version)"
+                " FROM state AS s WHERE s.key = state.key AND s.through <= ?)",
+                (raised,),
             )
 
     def adopt_published_coverage(self, location: str) -> None:

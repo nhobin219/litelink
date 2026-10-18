@@ -309,6 +309,18 @@ class Layout:
         """
         return f"{self.name}/data/{INGESTED}/{start}-{token}.parquet"
 
+    def state_path(self, through: int, token: str) -> str:
+        """Root-relative path for the published record of the log's state as of
+        offset `through` (#202).
+
+        Beside `data/` and `metadata/` rather than in either: it is neither a
+        data file Iceberg lists nor Iceberg's metadata, so the stranded-metadata
+        sweep, which deletes what no snapshot names, must not list it. `token`
+        per attempt, as for every name here: a push that loses its register
+        retries under a fresh one, never over the object it already wrote.
+        """
+        return f"{self.name}/state/{through}-{token}.parquet"
+
     def absolute(self, rel_path: str) -> Path:
         return self.root / rel_path
 

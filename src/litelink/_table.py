@@ -40,6 +40,8 @@ from pyiceberg.typedef import EMPTY_DICT
 from litelink._fs import fsync
 from litelink._predicates import offset_below, offset_in
 from litelink._s3 import S3Options
+from litelink._state import STATE_PROPERTY
+from litelink._state import decode as decode_state
 from litelink._statistics import TierStatistics, rollup
 
 if TYPE_CHECKING:
@@ -715,6 +717,31 @@ def published_issued_through(
     raw = table.properties.get(ISSUED_PROPERTY)
 
     return None if raw is None else int(raw)
+
+
+def published_state(
+    layout: Layout, prefix: str, options: S3Options
+) -> tuple[int, dict[str, bytes]] | None:
+    """The state the published table at `prefix` recorded with its current
+    snapshot, as `(through, state)`, or None when it records none (#202).
+
+    None only when nothing names a state file: no table, or a log that never
+    wrote state. A file the property names and that cannot be read RAISES, as
+    every read of our own metadata does — a restore that carried on without it
+    would bring the rows back with the state that describes them missing.
+    """
+    io = shared_file_io(options.resolved().catalog_properties(), prefix)
+    location = _published_location(io, layout, prefix)
+    if location is None:
+        return None
+
+    table = StaticTable.from_metadata(location, options.resolved().catalog_properties())
+    rel_path = table.properties.get(STATE_PROPERTY)
+    if rel_path is None:
+        return None
+
+    with table.io.new_input(f"{prefix.rstrip('/')}/{rel_path}").open() as source:
+        return decode_state(source.read())
 
 
 class PublishedShape(NamedTuple):
@@ -1514,11 +1541,24 @@ class LogTable:
         return {f.path for f in self.data_files()}
 
     def referenced_paths(self) -> set[str]:
-        """Every file any live snapshot needs — data and Iceberg's own."""
-        return {
-            self._name(path)
-            for path in self._table.inspect.all_files()["file_path"].to_pylist()
-        } | self.metadata_paths(self._table.snapshots())
+        """Every file any live snapshot needs — data and Iceberg's own, and the
+        state file the table names (#202)."""
+        state = self.state_location
+        return (
+            {
+                self._name(path)
+                for path in self._table.inspect.all_files()["file_path"].to_pylist()
+            }
+            | self.metadata_paths(self._table.snapshots())
+            | (set() if state is None else {self._name(state)})
+        )
+
+    @property
+    def state_location(self) -> str | None:
+        """The state file the table's current metadata names, or None (#202)."""
+        rel_path = self._table.properties.get(STATE_PROPERTY)
+
+        return None if rel_path is None else self.uri(rel_path)
 
     def referenced_metadata(self) -> set[str]:
         """Every metadata file a live snapshot or the table itself still needs:
@@ -1828,6 +1868,22 @@ class LogTable:
         output = self._table.io.new_output(destination)
         with output.create(overwrite=True) as writing:
             writing.write(payload)
+
+    def put_bytes(self, payload: bytes, rel_path: str) -> None:
+        """`put`, for an object built in memory rather than on local disk.
+
+        A published state file (#202) is a few hundred kilobytes at most, and
+        writing it locally first would leave a file in the log's directory that
+        no table and no queue names.
+        """
+        output = self._table.io.new_output(self.uri(rel_path))
+        with output.create(overwrite=True) as writing:
+            writing.write(payload)
+
+    def read_bytes(self, uri: str) -> bytes:
+        """A whole object of this table's warehouse, through `put`'s FileIO."""
+        with self._table.io.new_input(uri).open() as reading:
+            return reading.read()
 
     def relative(self, uri: str) -> str | None:
         """The root-relative path of a file in this table's warehouse — the

@@ -364,6 +364,32 @@ is the mistake this section now warns about — `just bench` prints the whole cu
 per batch size, and is the number to trust on target hardware. On local NVMe the fixed
 per-commit cost is a larger fraction.
 
+### State committed with the rows (#202)
+
+`extend(rows, state={key: value})` commits keyed values in the transaction that inserts the
+rows: both or neither. A caller that decides what to append from facts about earlier appends
+— a producer's last sequence number and the offset it landed at, checked before the next
+batch is appended — needs those facts to agree with the rows after any crash, and two commits
+in two databases cannot promise it. Keys are `str`, values opaque `bytes`; `state(key)` reads
+the newest value and `states(prefix)` every key under a prefix. `extend([], state=…)` writes
+state with no rows, for copying a log's state into another before it takes appends. A
+retired log refuses it, by a trigger beside the one that refuses its rows.
+
+**The buffer keeps versions, not values.** The `state` table holds a row per version, tagged
+`through`: the batch's last offset, or with no rows the last offset issued. A publish needs
+the state *as of its own last offset* `T`, which trails the newest: per key, the newest
+version tagged at or below `T`. So versions are kept until the watermark passes them, and
+`confirm_published` drops, in the transaction that raises the watermark, every version older
+than its key's newest at or below it. Between publishes a key's versions inside the open seal
+group collapse into one, because every publish point is a closed group's end: those end at or
+below the open group's start, and later cuts land at or above the writing batch's end.
+
+**A batch carrying state is cut at its end, never mid-batch.** The seal's cut otherwise lands
+on the row that crosses `target_seal_size` (§4), and a publish point inside a batch would put
+some of its rows in the published table and none of its state — a restore from there would
+believe those rows absent and the caller would append them again. So the file a state batch
+closes may overshoot the target by up to that batch; batches without state cut as before.
+
 ---
 
 ## 3a. Optional: WAL replication for RPO
@@ -1099,6 +1125,32 @@ queue and drain as expired metadata, so nothing a live snapshot names is deleted
 
 Publish records how far it has registered in `meta`, as one offset under `published_through`
 (`archive_through` on a log from before 0.6, which a writer's `open` renames).
+
+**A commit that publishes new offsets records the log's state as of its last one** (#202,
+§3). With any state at or below that offset, the push writes it to one Parquet file,
+`<prefix>/<name>/state/<through>-<token>.parquet` (`key`, `value`, and `through` in the file's
+metadata), and names it in the register commit as the table property `litelink.state`; a swap
+that extends the published end does the same. So each published snapshot carries, in its own
+commit, the state that describes exactly the rows it holds, and a restore from the published
+table alone writes it back into the new buffer before the log becomes openable. A restore from
+a WAL replica keeps the replica's state, which is consistent with its rows, except where the
+published record is newer: per key, a value tagged below the record's `through` takes the
+record's.
+
+A file rather than the values inline in the property, because a property is in every
+`metadata.json`, which every reader parses and every commit rewrites — about 9 MB a commit at
+4,096 keys of 1.7 KB. A file costs one PUT per publish and is read only by a restore. It sits
+beside `data/` and `metadata/`, not in them, so the stranded-metadata sweep never lists it.
+Its name goes into `state_published` before the object exists (I2); once a later commit names
+a newer file, the older names move to `pending_delete`, stamped at that commit, and the
+published drain deletes them after `published_snapshot_retention` (I6), its veto counting the
+file the current metadata names. `state_published` is its own table rather than queue rows
+for the reason `extent_intent` is: a build that predates it drains the queue against a
+reference set without the state file, and would delete the live one.
+
+An older build opens a buffer with these tables and ignores them. It neither prunes versions
+nor writes state files, so `litelink.state` keeps naming the record of an earlier `through` —
+still the true state as of that offset — until a newer build publishes again.
 
 **Step 4 is its own routine, `reclaim("published")`, not part of `publish`.** `advance()` runs it
 right after `publish` (§12), and an orchestrator can run it on its own schedule. `publish`
