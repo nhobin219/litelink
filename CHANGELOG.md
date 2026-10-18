@@ -7,6 +7,53 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## 0.13.2 — 2026-10-18
+
+### Added
+
+- **Keyed state committed with `extend`, recorded with each published snapshot** (#202).
+  `extend(rows, state={key: bytes})` commits keyed values in the transaction that inserts the
+  rows, both or neither; `extend([], state=…)` writes state alone. `state(key)` and
+  `states(prefix)` read the newest value on any handle, and a retired log refuses a state
+  write with `RetiredError`. For a caller whose next append depends on facts about the last,
+  such as a producer's last sequence number, which a second database could not keep in step
+  with the rows across a crash.
+- **Each published commit that adds offsets records the state as of its last offset**, in a
+  Parquet file under `<prefix>/<name>/state/` that the table property `litelink.state` names
+  in the same commit. A `restore` from the published table alone brings it back with the rows
+  it describes; one from a WAL replica takes the published value for any key where it is newer
+  than the replica's. Superseded files go through the deletion queue and the published drain,
+  whose veto counts the current one.
+
+### Changed
+
+- **A batch carrying state is never split by a seal**: its group is cut at the batch's end, so
+  its file can exceed `target_seal_size` by up to the batch. A publish point inside it would
+  publish some of its rows and none of its state. Batches without state are cut as before.
+
+### Costs, measured on one 2-vCPU VM in one session
+
+- `extend` without `state=`: no new statement on its path. Medians of nine alternating runs
+  with fsync off, to expose the overhead: 338 µs against 337 µs on 0.13.1 for a one-row
+  commit, 4,681 µs against 4,655 µs for 100 rows.
+- `extend` with one 1.7 KB entry: one DELETE and one INSERT per key in the same transaction,
+  about 30 µs on a one-row commit (368 µs, fsync off). With fsync on, a commit here costs
+  17–37 ms and the difference is inside the noise.
+- A publish with state: one extra PUT (7 instead of 6 on a local S3 endpoint), no extra GET.
+  The file is 143 kB at 4,096 keys of 24 bytes and 7.0 MB at 4,096 keys of 1.7 KB, encoded in
+  about 0.3 s, so a caller keeping large values pays that upload per publish.
+
+### Compatibility
+
+- litelink 0.13.1 opens a buffer this version wrote, appends and publishes; it ignores the new
+  tables, leaves `litelink.state` naming the earlier record (still the true state as of its
+  offset), and its drain does not touch the live state file. This version then resumes
+  recording. Measured by round-tripping one log between the two. A restore from the published
+  table alone after such a publish refuses (`ValueError`) rather than bring rows back with
+  state that does not describe them, so every process publishing a log that carries state
+  should run this version.
+- A log that never passes `state=` writes nothing new: no file, no property.
+
 ## 0.13.1 — 2026-10-16
 
 ### Fixed
