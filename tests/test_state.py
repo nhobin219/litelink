@@ -462,3 +462,42 @@ def test_a_restore_from_an_s3_published_table_brings_the_state_back(
         tmp_path / "b", "s", published=where, s3_options=s3
     ) as restored:
         assert restored.state("k") == b"published"
+
+
+def test_a_restore_refuses_a_state_record_an_older_build_left_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A build without state support publishes without touching the property,
+    so the record trails the rows. Restoring it would bring rows back with
+    state that does not describe them.
+
+    Falsify by removing the check in `_restore_published`: the restore returns
+    `a` beside rows through 4.
+    """
+    first = tmp_path / "a"
+    with local(first, tmp_path / "p") as log:
+        log.extend(rows(2), state={"k": b"a"})
+        log.advance(flush=True)
+        # What a 0.13.1 maintainer's publish does: no state in its commit.
+        monkeypatch.setattr(WriteHandle, "_write_state", lambda *_: {})
+        log.extend(rows(2, start=2), state={"k": b"b"})
+        log.advance(flush=True)
+
+    shutil.rmtree(first)
+    with pytest.raises(ValueError, match="state record is as of 2"):
+        litelink.restore(tmp_path / "b", "s", published=f"file://{tmp_path / 'p'}")
+
+
+def test_a_push_with_nothing_to_upload_queues_a_crashed_state_file(
+    tmp_path: Path,
+) -> None:
+    """Falsify by removing the settle before the early return: the crashed
+    upload's name stays in `state_published` and is never queued."""
+    with local(tmp_path / "a", tmp_path / "p") as log:
+        log.extend(rows(2), state={"k": b"a"})
+        log.advance(flush=True)
+        published = log._published.require()  # noqa: SLF001
+        crashed = log._write_state(published, 2)["litelink.state"]  # noqa: SLF001
+        log.publish(flush=True)
+        queued = log._buffer.queued_deletions()  # noqa: SLF001
+        assert published.uri(crashed) in queued

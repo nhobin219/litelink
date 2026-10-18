@@ -1150,7 +1150,11 @@ reference set without the state file, and would delete the live one.
 
 An older build opens a buffer with these tables and ignores them. It neither prunes versions
 nor writes state files, so `litelink.state` keeps naming the record of an earlier `through` —
-still the true state as of that offset — until a newer build publishes again.
+still the true state as of that offset — until a newer build publishes again. A restore from
+the published table alone can tell: every commit of this version that adds offsets records the
+state as of the table's new end, so a record whose `through` is below the end means a build
+without state published after it, and the restore refuses rather than bring rows back with
+state that does not describe them.
 
 **Step 4 is its own routine, `reclaim("published")`, not part of `publish`.** `advance()` runs it
 right after `publish` (§12), and an orchestrator can run it on its own schedule. `publish`

@@ -287,6 +287,20 @@ can exceed `target_seal_size` by up to the batch (SPEC §3, §5).
 
 A log that never passes `state=` writes nothing new: no file, no property.
 
+Three limits to know:
+
+- **A state write with no rows reaches the published table with the next commit that adds
+  offsets.** Until then a restore from the published table alone does not have it, as it does
+  not have unpublished rows.
+- **Between two writes tagged with the same offset** — a batch, then `extend([], state=…)`
+  before any further row — a WAL restore whose replica holds only the first keeps it even if
+  the published record holds the second. Rows decide the order; state-only writes at one
+  offset are not ordered across machines.
+- **Every process publishing a log that carries state must run a version with state support.**
+  An older build publishes without recording state, and a restore from the published table
+  alone then refuses (`ValueError`) rather than bring back rows with state that does not
+  describe them.
+
 ### Checking a row without appending it: `validate_row`
 
 ```python

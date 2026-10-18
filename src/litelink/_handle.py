@@ -2309,6 +2309,20 @@ class WriteHandle(LocalReadHandle):
         # The state the last published commit recorded, as of its last offset
         # (#202): the state that describes exactly the rows coming back.
         recorded_state = published_state(layout, published, options)
+        if recorded_state is not None and recorded_state[0] != frontier - 1:
+            # Every commit of this version that adds offsets records the state
+            # as of its end, so a record behind the end means a build that
+            # predates state published after it. Its rows would come back with
+            # state that does not describe them, and a caller deduping on it
+            # would append them again: refused, rather than restored wrong.
+            msg = (
+                f"the published table at {published} holds offsets below "
+                f"{frontier}, but its state record is as of {recorded_state[0]}: "
+                f"a litelink build without state support published after it, so "
+                f"the state cannot be recovered from the published table alone"
+            )
+            raise ValueError(msg)
+
         _log.warning(
             "litelink: no WAL replica of %s under %s; rebuilding the log from its "
             "published table, which holds offsets below %d. Rows the old machine "
@@ -3831,6 +3845,9 @@ class WriteHandle(LocalReadHandle):
             uploaded.append((data_file, rel_path))
 
         if not uploaded:
+            # Nothing to commit, but a state file a crashed push uploaded is
+            # still owed its queueing (#202).
+            self._settle_state(published, published.state_location)
             return
 
         # ONE commit for everything uploaded, because the commit is what costs.
