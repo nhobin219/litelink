@@ -296,10 +296,10 @@ Three limits to know:
   before any further row — a WAL restore whose replica holds only the first keeps it even if
   the published record holds the second. Rows decide the order; state-only writes at one
   offset are not ordered across machines.
-- **Every process publishing a log that carries state must run a version with state support.**
-  An older build publishes without recording state, and a restore from the published table
-  alone then refuses (`ValueError`) rather than bring back rows with state that does not
-  describe them.
+- **Every process maintaining a log that carries state — publishing or draining — must run a
+  version with state support.** An older build publishes without recording state, and a
+  restore from the published table alone then refuses (`ValueError`) rather than bring back
+  rows with state that does not describe them; there is no override yet.
 
 ### Checking a row without appending it: `validate_row`
 
