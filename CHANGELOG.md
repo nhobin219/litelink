@@ -7,11 +7,12 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
-## Unreleased
+## 0.14.0 — 2026-10-19
 
 ### Added
 
-- **`log.transaction()`: a caller's statements in the buffer's write transaction** (SPEC §3c).
+- **`log.transaction()`: a caller's statements in the buffer's write transaction** (#204, #205,
+  SPEC §3c).
   `with log.transaction() as tx:` opens one write transaction on `buffer.db`. `append`, `extend`
   and `ingest` take `tx=tx`, and `tx.execute` / `tx.executemany` run the caller's own SQL on
   tables it owns. Everything given `tx` commits when the block ends, or rolls back if it raises.
@@ -33,9 +34,18 @@ minor version carries breaking changes.
     `flush=` raise.
   - **`litelink.Transaction`**, the protocol `tx` satisfies. It has no SQLite in it, so a Postgres
     backend (#201) can implement it over a Postgres transaction.
+  - **A retired log still opens the block.** Every row is refused with `RetiredError`, inside a
+    block as outside one, and the caller's tables stay readable and writable, so a caller can
+    carry its state over to the log that replaces it.
+  - **Older builds leave caller tables alone.** Run against a buffer holding a caller's table and
+    index, 0.13.1 opens, appends, seals, publishes, evicts, vacuums and reopens it, and the
+    caller's rows come through unchanged.
 - The buffer's write lock is now a `WriteLock`, which refuses the transaction's own thread
-  outside calls given `tx`. Calls on the write connection go through it as before. Throughput
-  before and after is in the pull request.
+  outside calls given `tx`. Calls on the write connection go through it as before. Measured:
+  about 1.2–1.4 µs per acquisition against 0.8–0.9 µs for the `RLock`, three per `extend`
+  whatever its batch size, so about 1.5 µs per call against about 2.5 ms of fsync. End-to-end
+  throughput could not tell the two apart on the test disk (41k–81k rows/s at 1000-row batches,
+  either build).
 
 ## 0.13.1 — 2026-10-16
 
