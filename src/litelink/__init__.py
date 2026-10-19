@@ -27,8 +27,8 @@ writer's commits as they land. Another machine reads the published table with an
 Iceberg engine — it is plain Iceberg, published through ``version-hint.text``
 — rather than through litelink (#90).
 
-``Row`` and ``S3Options`` are exported because both appear in public
-signatures, and a type a caller has to name has to be importable. ``S3Options``
+``Row``, ``S3Options`` and ``Transaction`` are exported because each appears in
+public signatures, and a type a caller has to name has to be importable. ``S3Options``
 is deliberately not part of ``LogConfig`` — see ``litelink._s3``, which is
 where the reasoning lives.
 """
@@ -58,6 +58,7 @@ from litelink._read import (
 from litelink._retired import delete, truncate
 from litelink._s3 import S3Options
 from litelink._statistics import ColumnStatistics, Tier, TierStatistics
+from litelink._transaction import Transaction
 
 try:
     __version__ = version("litelink")
@@ -79,6 +80,7 @@ __all__ = [
     "S3Options",
     "Tier",
     "TierStatistics",
+    "Transaction",
     "WriteHandle",
     "__version__",
     "current_metadata",

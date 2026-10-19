@@ -7,6 +7,36 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- **`log.transaction()`: a caller's statements in the buffer's write transaction** (SPEC §3c).
+  `with log.transaction() as tx:` opens one write transaction on `buffer.db`. `append`, `extend`
+  and `ingest` take `tx=tx`, and `tx.execute` / `tx.executemany` run the caller's own SQL on
+  tables it owns. Everything given `tx` commits when the block ends, or rolls back if it raises.
+  litelink keeps no state for the caller and records nothing about its tables in the published
+  table.
+  - **New invariant I18**: maintenance never touches a caller's tables. The one exception is
+    `VACUUM`, which rewrites the file with their contents unchanged. A test runs every pass over
+    a caller's table, index, trigger and view, and records each name litelink's statements reach.
+  - **A caller's statement cannot reach litelink's state.** SQLite's authorizer refuses, with a
+    `PermissionError`, before the statement runs: writes to litelink's tables and
+    `sqlite_sequence`, its names and the `litelink_` prefix, `BEGIN`/`COMMIT`/`ROLLBACK`,
+    savepoints, and PRAGMAs other than schema reads.
+  - **Naming convention**: a library's tables and columns carry its name as a prefix, as
+    litelink's `litelink_offset` does.
+  - **Caller tables replicate with the WAL and are lost on a restore from the published table
+    alone.**
+  - **`ingest(tx=)` loads through the buffer**, because a Parquet load commits outside SQLite.
+    `publish`'s default is now `None`, meaning `True` without `tx`; with `tx`, `publish=` and
+    `flush=` raise.
+  - **`litelink.Transaction`**, the protocol `tx` satisfies. It has no SQLite in it, so a Postgres
+    backend (#201) can implement it over a Postgres transaction.
+- The buffer's write lock is now a `WriteLock`, which refuses the transaction's own thread
+  outside calls given `tx`. Calls on the write connection go through it as before. Throughput
+  before and after is in the pull request.
+
 ## 0.13.1 — 2026-10-16
 
 ### Fixed

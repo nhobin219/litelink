@@ -549,6 +549,114 @@ class of states the primary never meets — a buffer missing rows a seal discard
 metadata swept by later commits, gaps no replica could explain — each with its own refusal.
 Freshness past the last `publish` is the primary's to serve; a WAL replica is for failover (§3a).
 
+## 3c. A caller's tables in the buffer's transaction
+
+**litelink exposes its buffer transaction, and nothing else, to a caller that needs a value
+committed with its rows.** A library above the log that deduplicates its producers needs a
+high-water mark that commits in the same transaction as the rows it describes, or the two can
+disagree after a crash. That is the whole of what it needs from the log: atomicity with the
+append. What the value means, its schema, how it is read and how it is rebuilt are the
+caller's.
+
+```python
+with log.transaction() as tx:
+    offsets = log.extend(rows, tx=tx)
+    tx.execute("INSERT INTO mylib_seen (id, through) VALUES (?, ?)", (batch, offsets[-1]))
+```
+
+Everything given `tx` commits when the block ends and rolls back if it raises: rows from
+`append`, `extend` and `ingest` called with `tx=tx`, and the caller's own statements through
+`tx.execute`. It is one `BEGIN IMMEDIATE` on `buffer.db`, the same write transaction an
+`extend` runs, so it costs one fsync like any other.
+
+**There is no state API and no record of the caller's tables in the published table.** A keyed
+state store committed with `extend` and recorded with each published snapshot was designed and
+rejected: it puts the caller's semantics into the storage engine, gives publish and restore a
+second kind of data to carry and keep consistent with the rows, and still cannot know what the
+values mean. A transaction is the narrowest thing that gives the caller atomicity, and it has
+the same shape on any backend that has transactions.
+
+**Names in a namespace two libraries share carry the owning library's name as a prefix.**
+litelink's own column in every row is `litelink_offset` (I11). Its tables in `buffer.db` are the
+names in `OWNED_TABLES` (`buffer`, `extent`, `meta`, `claim` and the rest), and every name
+beginning `litelink_` is reserved for what it adds next. A library storing state beside a log
+names each table, index, trigger and view it creates `<library>_...`, and each column it adds to
+a log's schema the same way; an application with no library of its own uses its own name.
+Prefixes are what keep two libraries above one log, or a library and a later litelink, from
+taking the same name.
+
+**litelink's maintenance never touches a caller's tables (I18).** No statement it runs on the
+buffer's connections names them: seal, evict, compact, publish, reclaim, sweep, recover,
+truncate, retire, restore's local-state strip, and the schema creation every open runs. The one
+statement that reaches them is `VACUUM` (`reclaim("buffer")`), which rewrites the whole file and
+every table's contents with it, unchanged. `delete` removes the log's directory, and the caller's
+tables are in it.
+
+**A caller's statement cannot reach litelink's state either.** It may read any table, and
+SQLite's authorizer refuses, before the statement runs:
+
+- a write to one of litelink's tables, or to `sqlite_sequence`, which issues offsets (I9);
+- a table, view or index created under one of litelink's names, or a trigger on its tables. A
+  temporary object counts: the temporary schema is searched first, so a `temp.meta` would take
+  every statement litelink runs on that connection;
+- `BEGIN`, `COMMIT` and `ROLLBACK`: the block owns the transaction. Savepoints too: one around
+  an `extend` could roll its rows back inside a block that commits, and the next append would
+  take the same offsets;
+- a PRAGMA other than the schema reads (`table_info` and its kin), since the rest change a
+  setting litelink's durability rests on (`synchronous`, `journal_mode`) or a value every
+  library in the file shares (`user_version`).
+
+The refusal is a `PermissionError` naming the rule, and the transaction stays open.
+
+**The block holds the buffer's write lock to its end.** Another thread's append waits for the
+commit rather than joining it; another process's writes, a maintainer's claims included, wait up
+to SQLite's 30 s busy timeout and then fail. So a block is short: a batch and the statements that
+describe it, never a network call. The block's own thread may use the handle only through calls
+given `tx` and `tx`'s own methods. Any other call would BEGIN inside the open transaction and fail,
+and the ROLLBACK on its way out would end the caller's transaction, leaving every later statement
+to autocommit alone. So it is refused before it reaches the connection. A `tx` is refused after
+its block, on another thread, and on another log. On a retired log the block opens and every row
+is refused (`RetiredError`), as outside one; the caller's tables stay readable and writable, so a
+caller can carry its state from a retired log to its successor.
+
+**Offsets returned inside a block name rows only once it commits.** A rollback rolls back the
+offset counter with the rows (AUTOINCREMENT), and the next append takes the same offsets. No
+reader can have seen them, since readers see committed rows only, so I9 holds as long as the
+caller does not hand them on before the commit.
+
+**`ingest` in a transaction loads through the buffer.** `ingest`'s own path commits in the staging
+table's metadata, not in SQLite, so it cannot commit with the caller's statements: rolling the
+transaction back after its files registered would leave those files holding offsets the
+counter issues again (I9), under names no SQLite table holds (I2). Given `tx`, the source is
+appended as one batch inside the transaction and seals and publishes with ordinary maintenance.
+That costs the buffer's throughput and holds the write lock for the load, so it suits a batch
+from a producer, not a corpus; `publish=` and `flush=` are refused with it, having nothing of the
+load's own to push.
+
+**A caller's tables replicate with the buffer's WAL and are lost on a restore from published tables
+alone.** They live in `buffer.db`, committed at `synchronous=FULL` with the rows. With
+`wal_replication` the replica is the whole file, so a restore from it (§3a) brings them back,
+consistent with the rows: anything inside the replication lag is lost from both, because they
+committed together. The published table holds the log's rows and nothing else, so a restore from
+it alone (no replica, or a local published table) rebuilds a buffer with none of the caller's
+tables. A caller whose guarantees must survive that rebuilds its state from the rows it wrote,
+or keeps it somewhere else; anything stronger than best-effort across a lost buffer is a
+backend that outlives the machine (#201).
+
+**An older build leaves a caller's tables alone too.** Nothing in litelink lists the tables in
+`buffer.db`; `_create` makes its own with `IF NOT EXISTS` and looks for one other name,
+`lease`, which is litelink's. Run against a buffer holding a caller's table and index, 0.13.1
+opens it, appends, seals, publishes, evicts, vacuums and reopens it, and the caller's rows and
+index come through unchanged. An older build ignores the transaction API rather than refusing
+the file.
+
+**Shaped for a backend other than SQLite.** `Transaction` is a protocol with no SQLite in it:
+statements go in as text and parameters, results come back as tuples, and no cursor, connection
+or row id escapes. `tx.dialect` names the SQL the backend speaks, `"sqlite"` today with `?` and
+`:name` parameters, and a caller writes each statement for it; litelink translates nothing. A
+Postgres backend for the buffer (#201) implements the same protocol over a Postgres transaction,
+with the same lifetime and the same refusals, and a caller's code keeps its shape.
+
 ## 4. Seal
 
 Triggered on `min(target_seal_size, target_seal_rows)`, evaluated by the writer at commit
@@ -1748,6 +1856,7 @@ Each needs a test.
 | **I10** | *Retired with schema changes (#93).* Drops and renames were to go through an explicit versioned operation. | A log's schema is fixed (§9); a changed schema is a new log. |
 | **I8** | Monotonic visibility: once readable, a row stays readable until intentionally retired. | Point-in-time code depends on `t1 < t2 ⇒ read(t1) ⊆ read(t2)`. |
 | **I16** | Every operation spanning Iceberg and local state records its intent in SQLite before acting, and is complete only once SQLite records completion. | Iceberg's atomicity stops at one table, so nothing spanning two systems can be committed at once. Without the intent record a crash leaves work half-applied and unattributable; without the completion record the library cannot tell a finished operation from an interrupted one. |
+| **I18** | litelink's statements name only the objects it owns: the tables in `OWNED_TABLES` and names beginning `litelink_`. A caller's objects in `buffer.db` change only through the caller's own statements. The one exception is `VACUUM`, which rewrites the file with every table's contents unchanged. | A caller commits its own state in the buffer's transaction, with the rows it describes (§3c). Maintenance that changed it would break the atomicity it was committed under, and nothing in litelink could notice, since it does not know what the state means. |
 
 ---
 
