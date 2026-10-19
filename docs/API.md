@@ -102,7 +102,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 | **`LogHandle`** — identity | `root` · `name` · `config` · `schema` · `sort_by` · `published` |
 | **`LogHandle`** — lifecycle | `close` · context manager |
 | **`+ LocalReadHandle`** | `databases` · `replication_config` · `write_replication_config` |
-| **`+ WriteHandle`** — write | `append` · `extend` · `ingest` |
+| **`+ WriteHandle`** — write | `append` · `extend` · `ingest` · `transaction` |
 | **`+ WriteHandle`** — seal | `seal` · `await_seal` |
 | **`+ WriteHandle`** — maintain | `advance` · `seal` · `compact` · `publish` · `evict` · `reclaim` · `sweep` |
 | **`+ WriteHandle`** — published table | `publish` · `truncate` · `retire` |
@@ -246,8 +246,8 @@ owns no thread. `WriteHandle` is a context manager, and `with` is the same thing
 ## Writing
 
 ```python
-log.append(row: Row) -> int               # Row = Mapping[str, object]
-log.extend(rows: Iterable[Row]) -> list[int]
+log.append(row: Row, *, tx: Transaction | None = None) -> int     # Row = Mapping[str, object]
+log.extend(rows: Iterable[Row], *, tx: Transaction | None = None) -> list[int]
 ```
 
 Both return the assigned offsets, and **the rows are durable when the call returns** — one
@@ -260,6 +260,50 @@ choice: no `LogConfig` setting tunes it. `append(row)` is `extend([row])`.
 An append does no work beyond its own insert. It does not measure the buffer, decide whether
 to seal, or delete anything — it records where the next file should be cut, in the same
 transaction, and returns.
+
+### Committing your own statements with the rows: `transaction`
+
+```python
+with log.transaction() as tx:                  # tx: litelink.Transaction
+    offsets = log.extend(rows, tx=tx)          # append, extend and ingest all take tx=
+    tx.execute("INSERT INTO mylib_seen (id, through) VALUES (?, ?)", (batch, offsets[-1]))
+```
+
+One write transaction on the log's buffer, committed when the block ends and rolled back if it
+raises. Everything given `tx` is in it: the rows, and your statements on **tables you own,
+named with your library's prefix** (`mylib_...`; SPEC §3c). `tx` offers nothing else:
+
+| | |
+|---|---|
+| `tx.execute(sql, parameters=()) -> list[tuple]` | one statement; the rows it produced, or `[]` |
+| `tx.executemany(sql, parameters) -> None` | one statement per parameter set |
+| `tx.dialect` | the SQL to write: `"sqlite"`, with `?` or `:name` parameters |
+
+litelink keeps no state of its own for you, and records nothing about your tables in the
+published table. What it promises instead:
+
+- **Its maintenance never touches your tables** (I18). The one statement that reaches them is
+  `reclaim("buffer")`'s `VACUUM`, which rewrites the whole file and leaves every table's contents
+  as they were.
+- **Your statements cannot touch its tables.** A write to one of litelink's tables (or
+  `sqlite_sequence`), a name it owns or reserves (`litelink_...`), `BEGIN`/`COMMIT`/`ROLLBACK`, and
+  any PRAGMA but the schema reads raise `PermissionError` before they run, and the transaction
+  carries on. Your own savepoints are fine.
+- **Your tables replicate with the buffer's WAL**, so a restore from a replica brings them back
+  with the rows they were committed with. **A restore from the published table alone loses
+  them**: it holds the log's rows and nothing else. Rebuild what you need from the rows you wrote,
+  or keep it elsewhere.
+
+**Keep the block short.** It holds the buffer's write lock: other threads' appends wait for it,
+and another process's writes wait up to SQLite's 30 s busy timeout, then fail. Inside it, use
+the handle only through calls given `tx` — any other call from that thread raises
+`RuntimeError` rather than joining or ending the transaction. A `tx` is refused after its block,
+from another thread and on another log; a retired log refuses the block itself.
+
+**Offsets returned inside the block are real only once it commits.** A rollback returns them to
+the counter and the next append takes them again, so do not hand them on before the block ends.
+
+A refused row rejects its whole batch, as ever, and the transaction stays open without it.
 
 ### Checking a row without appending it: `validate_row`
 
@@ -334,7 +378,8 @@ top-level column, where it prunes.
 
 ```python
 log.ingest(source: pa.Table | pa.RecordBatchReader, *,
-           publish: bool = True, flush: bool | None = None) -> tuple[int, int] | None
+           publish: bool | None = None, flush: bool | None = None,
+           tx: Transaction | None = None) -> tuple[int, int] | None
 ```
 
 Writes Parquet directly and never puts the rows through SQLite. Returns the offsets it
@@ -385,6 +430,13 @@ failed — compare `published_through()` against the `end - 1` this returns; unt
 corpus you loaded from is the range's second copy. An unflushed tail settles once roughly
 another `target_compact_size` of rows sits above it, whether from capture or from the next
 `ingest`.
+
+**With `tx=`, the load goes through the buffer instead**, as one batch inside the transaction,
+and none of the above about Parquet, claims or pushing applies: the rows commit with your
+statements and seal and publish with ordinary maintenance. Writing straight to Parquet commits
+in the table's metadata, which no SQLite transaction can roll back. It runs at the buffer's
+throughput and holds the write lock for the load, so it is for a batch, not a corpus;
+`publish=` and `flush=` raise with it. Leaving `publish` unset means `True` without `tx`.
 
 **A load that fails costs its reservation.** The offsets of the file being written are gone,
 leaving a gap. Files stay non-overlapping and adjacent in offset order, which is what §6

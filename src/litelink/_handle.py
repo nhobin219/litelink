@@ -89,6 +89,7 @@ from litelink._tiers import STAGING as STAGING_TIER
 from litelink._tiers import UNKNOWN as UNKNOWN_TIER
 from litelink._tiers import PublishedTier, StoredTiers, empty
 from litelink._tiers import encode as encode_tier
+from litelink._transaction import Transaction
 from litelink._types import NON_FINITE, column_type, validate_schema
 
 if TYPE_CHECKING:
@@ -2525,7 +2526,32 @@ class WriteHandle(LocalReadHandle):
         """
         return self._buffer.next_offset()
 
-    def append(self, row: Row) -> int:
+    def transaction(self) -> contextlib.AbstractContextManager[Transaction]:
+        """A write transaction on this log's buffer, for a `with` block (§3c).
+
+        Everything given the `tx` it yields commits together when the block
+        ends, or not at all if it raises: rows from `append`, `extend` and
+        `ingest` called with `tx=tx`, and the caller's own statements through
+        `tx.execute`, on tables the caller owns.
+
+        ```python
+        with log.transaction() as tx:
+            offsets = log.extend(rows, tx=tx)
+            tx.execute(
+                "INSERT INTO mylib_seen (id, through) VALUES (?, ?)",
+                (batch_id, offsets[-1]),
+            )
+        ```
+
+        The buffer's write lock is held for the whole block, so keep it short:
+        other threads' appends wait for it, and another process's writes wait
+        up to SQLite's 30 s busy timeout before failing. Inside the block, this
+        thread may use the handle only through calls given `tx`; anything else
+        raises rather than joining or ending the transaction.
+        """
+        return self._buffer.transaction()
+
+    def append(self, row: Row, *, tx: Transaction | None = None) -> int:
         """Append one row. Returns the assigned offset.
 
         Durable when this returns — one SQLite transaction, `synchronous=FULL`
@@ -2536,10 +2562,14 @@ class WriteHandle(LocalReadHandle):
         log does not have: the insert is built from the SCHEMA's columns, so an
         unknown key would otherwise be dropped before any SQL exists and this
         would return an offset for a row it had silently truncated.
-        """
-        return self.extend([row])[0]
 
-    def extend(self, rows: Iterable[Row]) -> list[int]:
+        With `tx`, the row joins that open transaction instead, as `extend`.
+        """
+        return self.extend([row], tx=tx)[0]
+
+    def extend(
+        self, rows: Iterable[Row], *, tx: Transaction | None = None
+    ) -> list[int]:
         """Append many rows in ONE transaction. Returns the assigned offsets.
 
         The batch is the durability unit: one fsync amortised across the batch,
@@ -2551,6 +2581,11 @@ class WriteHandle(LocalReadHandle):
         anything commits, and no offset is consumed. Partial acceptance would
         be worse than refusal — it would hand back offsets for some rows while
         the caller learns nothing about the rest.
+
+        **With `tx`, the rows join that open transaction** (`transaction`) and
+        are durable only when it commits; the offsets returned name them only
+        if it does. A refused row still rejects the whole batch, and leaves the
+        transaction open with none of the batch in it.
         """
 
         # No lock. `Buffer` serialises its own connection, which is the only
@@ -2559,7 +2594,7 @@ class WriteHandle(LocalReadHandle):
         # compare, signal, or start anything: a maintainer calls `seal` and
         # finds the work waiting, exactly as it calls `advance` and finds
         # files to compact.
-        return self._buffer.append(rows)
+        return self._buffer.append(rows, tx)
 
     # -- bulk ingest ---------------------------------------------------------
 
@@ -2567,8 +2602,9 @@ class WriteHandle(LocalReadHandle):
         self,
         source: pa.Table | pa.RecordBatchReader,
         *,
-        publish: bool = True,
+        publish: bool | None = None,
         flush: bool | None = None,
+        tx: Transaction | None = None,
     ) -> tuple[int, int] | None:
         """Write Arrow straight into the immutable tier (§13.4). Returns the
         offsets it took as `[start, end)` — half-open, like every range
@@ -2687,7 +2723,33 @@ class WriteHandle(LocalReadHandle):
 
         Returns None for a source with no rows, which is the one answer a range
         cannot express.
+
+        **With `tx`, the load goes through the buffer, inside that open
+        transaction** (`transaction`), and everything above about Parquet,
+        claims and pushing does not apply. A load written straight to Parquet
+        commits in the table's metadata, not in SQLite, so it cannot commit
+        with the caller's statements: rolling the transaction back after the
+        files had registered would hand their offsets out again (I9), and
+        their names would be in no table SQLite holds (I2). In the buffer the
+        rows commit with the transaction like an `extend` of the whole source,
+        and seal and publish with ordinary maintenance. That costs the
+        buffer's throughput and holds the write lock for the load, so it suits
+        a batch, not a corpus. `publish` and `flush` are refused with `tx`:
+        there is no output of the load's own to push.
         """
+        if tx is not None:
+            if publish is not None or flush is not None:
+                msg = (
+                    "ingest(tx=) loads through the buffer, which publishes with "
+                    "ordinary maintenance: publish= and flush= do not apply"
+                )
+                raise ValueError(msg)
+
+            return self._ingest_buffered(source, tx)
+
+        if publish is None:
+            publish = True
+
         # Asked here as well as by the buffer's trigger: a load writes Parquet
         # straight into the table and never inserts a buffer row.
         if self._buffer.retired() is not None:
@@ -2754,6 +2816,31 @@ class WriteHandle(LocalReadHandle):
                 raise RuntimeError(msg) from exc
 
         return loaded
+
+    def _ingest_buffered(
+        self, source: pa.Table | pa.RecordBatchReader, tx: Transaction
+    ) -> tuple[int, int] | None:
+        """`ingest(tx=)`: the source's rows, appended inside `tx`, as one batch.
+
+        The schema is checked whole and the floats a batch at a time, as the
+        Parquet path checks them, so a refusal names the same thing either
+        way; the buffer's own checks then run on every row.
+        """
+        with self._buffer.joined(tx):
+            shape = self._buffer.shape()
+            reader = source.to_reader() if isinstance(source, pa.Table) else source
+            _refuse_foreign_schema(reader.schema, shape.schema)
+
+            def rows() -> Iterator[Mapping[str, object]]:
+                for batch in reader:
+                    table = pa.Table.from_batches([batch]).select(shape.columns)
+                    table = table.cast(shape.schema)
+                    _refuse_non_finite(table)
+                    yield from table.to_pylist()
+
+            offsets = self._buffer.append(rows(), tx)
+
+        return (offsets[0], offsets[-1] + 1) if offsets else None
 
     def _refuse_unfiled_rows(self) -> None:
         """Refuse an ingest while any acknowledged row is still owed a file.

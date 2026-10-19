@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 from litelink._claim import DEFAULT_TTL_MS, Claim
+from litelink._transaction import SqliteTransaction, Transaction, WriteLock
 from litelink._types import (
     NON_FINITE,
     Nested,
@@ -196,6 +197,11 @@ _CONTAINS = frozenset.__contains__
 # as three processes: the writer died the moment the other two started.
 _BEGIN = "BEGIN IMMEDIATE"
 
+# An append inside a caller's transaction (`Buffer.append` given `tx`).
+_SAVEPOINT = "SAVEPOINT litelink_append"
+_RELEASE = "RELEASE litelink_append"
+_ROLLBACK_TO = "ROLLBACK TO litelink_append"
+
 # Dead space below this is not worth an exclusive lock, whatever the ratio
 # says: a young log crosses any ratio on its first publish pass, and reclaiming
 # a few hundred KB there costs a write stall to save a rounding error on the
@@ -207,6 +213,43 @@ _VACUUM_FLOOR_BYTES = 8 * 1024 * 1024
 # Long enough to outlast a seal's brief write steps and a maintenance pass's
 # commits, since those are what an append now queues behind across processes.
 _BUSY_TIMEOUT_MS = 30_000
+
+# Every name litelink gives an object in `buffer.db`, and the one its offsets
+# live in. A caller's statement may not write these, nor create a table, view or
+# index under one of them (`SqliteTransaction`), and litelink's own statements
+# name nothing else (I18). `lease` is a name an older build used: `_create`
+# still looks for it, so a caller table called that would make the log refuse
+# to open. A table `_create` adds goes here in the same change;
+# `test_transaction` compares this with what a fresh buffer holds.
+#
+# Callers name their objects `<library>_...` (§3c), and litelink takes
+# `litelink_` for itself, so a name outside this set that starts with it is
+# refused as well: it is reserved for what litelink adds next.
+OWNED_TABLES = frozenset(
+    {
+        "awaiting_swap",
+        "buffer",
+        "claim",
+        "compacting",
+        "extent",
+        "extent_intent",
+        "lease",
+        "meta",
+        "pending_delete",
+        "sealing",
+        "sqlite_sequence",
+        "tier_offsets",
+        "tier_statistics",
+    }
+)
+
+
+def owned(name: str) -> bool:
+    """Whether `name` is litelink's, compared as SQLite compares names:
+    without regard to case."""
+    folded = name.lower()
+
+    return folded in OWNED_TABLES or folded.startswith("litelink_")
 
 
 @dataclass(slots=True)
@@ -548,7 +591,17 @@ class Buffer:
         # What actually keeps `_reader` safe is that its one caller,
         # `rows_from`, holds `_tail_lock` across the fetch; the seal reads on
         # `_sealer` for the same reason. See `_sealer`.
-        self._lock = threading.RLock()
+        #
+        # A caller's transaction (`transaction`) holds it for its whole block,
+        # which is why it is a `WriteLock` rather than a bare `RLock`: the
+        # thread holding the block may re-enter only through a call given its
+        # `tx`, and anything else from that thread is refused rather than
+        # joining the caller's transaction or rolling it back.
+        self._lock = WriteLock()
+        # The caller's transaction while one is open, compared by identity by
+        # every call given a `tx`: one of another log, or one whose block has
+        # ended, is not this.
+        self._tx: SqliteTransaction | None = None
         # The read cache — see `rows_from`. Its own lock rather than the one
         # above, which appends hold: a read must not wait behind a write to
         # look at a table the write cannot invalidate.
@@ -609,6 +662,66 @@ class Buffer:
                     self._con.execute("ROLLBACK")
 
                 raise
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[Transaction]:
+        """A caller's write transaction on this buffer, for a `with` block.
+
+        `BEGIN IMMEDIATE` as every write here, so a writer in another process
+        waits at the start rather than failing at the first write. The write
+        lock is held to the end of the block: another thread's append waits for
+        the commit, and the block's own thread reaches the connection only
+        through `joined`.
+
+        **Refused on a retired log, under the lock.** `refuse_retired` stops a
+        buffer row, but a block that writes only the caller's tables inserts
+        none for it to see. Read after the BEGIN, so a `retire` cannot land
+        between the check and the caller's writes.
+        """
+        with self._lock.hold():
+            self._con.execute(_BEGIN)
+            tx = SqliteTransaction(self._con, owned)
+            try:
+                if self._con.execute(
+                    "SELECT 1 FROM tier_offsets WHERE tier = 'buffer'"
+                ).fetchone():
+                    with self._lock.admit():
+                        refusal = self.retired_error()
+
+                    raise refusal
+
+                self._tx = tx
+                yield tx
+                # Checked, not assumed: SQLite may have rolled the transaction
+                # back after an error the caller caught, and a COMMIT then
+                # would fail with a message that hides why.
+                tx.check()
+                self._con.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.OperationalError):
+                    self._con.execute("ROLLBACK")
+
+                raise
+            finally:
+                tx.close()
+                self._tx = None
+
+    @contextlib.contextmanager
+    def joined(self, tx: Transaction) -> Iterator[None]:
+        """Run litelink's own statements inside the caller's open `tx`.
+
+        Refuses a `tx` that is not this buffer's open one: another log's, one
+        whose block has ended, or one used from another thread.
+        """
+        if tx is not self._tx or self._tx is None:
+            msg = "tx is not an open transaction of this log"
+            raise ValueError(msg)
+
+        self._tx.check()
+        with self._lock.admit(), self._lock:
+            yield
+
+        self._tx.check()
 
     @classmethod
     def open(
@@ -981,13 +1094,21 @@ class Buffer:
 
     # -- write ------------------------------------------------------------
 
-    def append(self, rows: Iterable[Mapping[str, object]]) -> list[int]:
+    def append(
+        self, rows: Iterable[Mapping[str, object]], tx: Transaction | None = None
+    ) -> list[int]:
         """Insert rows in one transaction. Returns the assigned offsets.
 
         One transaction means one fsync amortised across the batch, which is
         the whole of §3's throughput story.
+
+        Given a caller's `tx`, the rows go into it under a savepoint instead:
+        a refused row undoes this call's rows and leaves the caller's
+        transaction open, and nothing is durable until that transaction
+        commits. The offsets returned name rows only if it does.
         """
-        with self._lock:
+        lock = self._lock if tx is None else self.joined(tx)
+        with lock:
             # ONE read, inside the lock, and handed down. Read here and again
             # in `_insert` and the two can disagree: a schema change landing
             # between them builds the statement from one column list and the
@@ -999,15 +1120,27 @@ class Buffer:
             names = ", ".join(f'"{c}"' for c in shape.columns)
             sql = f"INSERT INTO buffer ({names}) VALUES ({placeholders})"
 
-            return self._insert(rows, sql, shape)
+            return self._insert(rows, sql, shape, joined=tx is not None)
 
     def _insert(
-        self, rows: Iterable[Mapping[str, object]], sql: str, shape: Shape
+        self,
+        rows: Iterable[Mapping[str, object]],
+        sql: str,
+        shape: Shape,
+        *,
+        joined: bool = False,
     ) -> list[int]:
-        """The append's transaction, with the lock already held."""
+        """The append's transaction, with the lock already held.
+
+        `joined` runs it as a savepoint inside the caller's open transaction:
+        the same statements, nested, so a refused row undoes only this call.
+        SAVEPOINT rather than a flag that skips the BEGIN, because a batch half
+        inserted when a row is refused must not stay in a transaction the
+        caller may still commit.
+        """
         offsets: list[int] = []
         cursor = self._con.cursor()
-        cursor.execute(_BEGIN)
+        cursor.execute(_SAVEPOINT if joined else _BEGIN)
         try:
             group = self._read_group(cursor)
             # Bound once, and the accounting inlined below, because this loop
@@ -1097,7 +1230,7 @@ class Buffer:
                     group = self._cut(cursor, group, offset)
 
             self._write_group(cursor, group)
-            cursor.execute("COMMIT")
+            cursor.execute(_RELEASE if joined else "COMMIT")
         except BaseException:
             # Best-effort, and it must not raise over the original. An
             # interrupt landing inside COMMIT leaves no transaction to roll
@@ -1111,7 +1244,11 @@ class Buffer:
             # believing a durable append failed costs only a redundant retry
             # that AUTOINCREMENT will assign fresh offsets to.
             with contextlib.suppress(sqlite3.OperationalError):
-                cursor.execute("ROLLBACK")
+                if joined:
+                    cursor.execute(_ROLLBACK_TO)
+                    cursor.execute(_RELEASE)
+                else:
+                    cursor.execute("ROLLBACK")
 
             raise
 

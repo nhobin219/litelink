@@ -411,6 +411,11 @@ calls:
 - `seal` / `advance`
 - `await_seal`, `staging_rows`, `staging_files`, `staging_extent`, `end_offset`
 
+A `transaction()` block holds the buffer's write lock until it ends, so every other thread's
+write waits for its commit instead of joining it, and so do other processes' writes, up to the
+30 s busy timeout. Its `tx` belongs to the thread that opened it; inside the block that thread
+reaches the handle only through calls given `tx` (SPEC §3c).
+
 **Not** concurrency-safe — call them when nothing else is using the log:
 
 - `set_config`

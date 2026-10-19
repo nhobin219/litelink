@@ -6,7 +6,7 @@ import inspect
 import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,6 +16,9 @@ import litelink
 from litelink import OFFSET, LogConfig, WriteHandle, _table
 from litelink._buffer import Buffer
 from litelink._layout import Layout
+
+if TYPE_CHECKING:
+    from litelink._transaction import WriteLock
 
 SCHEMA = pa.schema(
     [
@@ -306,7 +309,7 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
             probe()
 
         monkeypatch.setattr(_handle, "write_parquet", write_parquet)
-        log._buffer._lock = cast("threading.RLock", Counted())
+        log._buffer._lock = cast("WriteLock", Counted())
         try:
             log.seal(flush=True)
         finally:

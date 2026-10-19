@@ -199,6 +199,15 @@ log.advance()                                        # seal, compact, publish, e
 rather than one per row, and that call size is the write-throughput lever. Loading history is
 `ingest()`, which writes Arrow straight to Parquet.
 
+A library that keeps its own state beside the rows (a producer's high-water mark, say)
+commits it in the same transaction, in a table it owns and names with its prefix:
+
+```python
+with log.transaction() as tx:
+    offsets = log.extend(group_of_rows, tx=tx)
+    tx.execute("INSERT INTO mylib_seen VALUES (?, ?)", (batch_id, offsets[-1]))
+```
+
 ## Reading
 
 `sql` exposes the log as `log`; `scan(where=…, columns=…)` is the typed equivalent, and both

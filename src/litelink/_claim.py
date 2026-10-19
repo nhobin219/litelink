@@ -43,6 +43,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
 
 # Long enough that a slow seal does not lose its own lease mid-operation — a
 # compaction over a large table is seconds — and short enough that a killed
@@ -91,7 +95,7 @@ class Claim:
     """
 
     connection: sqlite3.Connection
-    lock: threading.RLock
+    lock: AbstractContextManager[object]
     kind: str
     # The claimed offsets, `[start, end)`.
     start: int
