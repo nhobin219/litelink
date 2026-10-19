@@ -339,21 +339,34 @@ def test_another_thread_waits_for_the_commit_rather_than_joining(
         assert offsets(log) == [1]
 
 
-def test_a_retired_log_refuses_a_transaction(tmp_path: Path) -> None:
-    """Even one that writes only the caller's tables, which `refuse_retired`
-    would never see.
+def test_a_retired_log_refuses_rows_in_a_transaction_not_the_callers_tables(
+    tmp_path: Path,
+) -> None:
+    """Retirement ends the log's rows, in a block as outside one. The
+    caller's tables stay readable and writable, so a caller can carry its
+    state from a retired log to the next.
 
-    Falsify by removing the `tier_offsets` read from `Buffer.transaction`: the
-    block opens and its caller row commits.
+    Falsify by dropping the `refuse_retired` trigger from `Buffer._create`:
+    the extend inside the block lands on the retired log.
     """
     where = f"file://{tmp_path / 'published'}"
     with litelink.new(tmp_path, "s", schema=SCHEMA, published=where) as log:
-        log.extend(rows(4))
-        log.retire()
-        with pytest.raises(RetiredError), log.transaction() as tx:
+        with log.transaction() as tx:
+            log.extend(rows(4), tx=tx)
             tx.execute(CREATE_SEEN)
+            tx.execute("INSERT INTO mylib_seen VALUES ('a', 4)")
 
-    assert caller_rows(tmp_path) == []
+        log.retire()
+        with log.transaction() as tx:
+            assert tx.execute("SELECT * FROM mylib_seen") == [("a", 4)]
+            with pytest.raises(RetiredError):
+                log.extend(rows(1), tx=tx)
+
+            tx.execute("INSERT INTO mylib_seen VALUES ('b', 4)")
+
+        assert offsets(log) == [1, 2, 3, 4]
+
+    assert caller_rows(tmp_path) == [("a", 4), ("b", 4)]
 
 
 # -- what a caller's statement may do ---------------------------------------

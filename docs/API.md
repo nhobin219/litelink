@@ -298,7 +298,8 @@ published table. What it promises instead:
 and another process's writes wait up to SQLite's 30 s busy timeout, then fail. Inside it, use
 the handle only through calls given `tx` — any other call from that thread raises
 `RuntimeError` rather than joining or ending the transaction. A `tx` is refused after its block,
-from another thread and on another log; a retired log refuses the block itself.
+from another thread and on another log. A retired log still opens the block and refuses its rows
+with `RetiredError`; your tables stay readable and writable there.
 
 **Offsets returned inside the block are real only once it commits.** A rollback returns them to
 the counter and the next append takes them again, so do not hand them on before the block ends.

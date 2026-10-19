@@ -681,23 +681,16 @@ class Buffer:
         the commit, and the block's own thread reaches the connection only
         through `joined`.
 
-        **Refused on a retired log, under the lock.** `refuse_retired` stops a
-        buffer row, but a block that writes only the caller's tables inserts
-        none for it to see. Read after the BEGIN, so a `retire` cannot land
-        between the check and the caller's writes.
+        **Opened on a retired log too.** Retirement ends the log's rows, and
+        `refuse_retired` refuses every one, inside a block as outside it. The
+        caller's tables are not rows of the log: a caller moving its state from
+        a retired log to its successor reads them here, and nothing litelink
+        guarantees about a retired log depends on them.
         """
         with self._lock.hold():
             self._con.execute(_BEGIN)
             tx = SqliteTransaction(self._con, owned)
             try:
-                if self._con.execute(
-                    "SELECT 1 FROM tier_offsets WHERE tier = 'buffer'"
-                ).fetchone():
-                    with self._lock.admit():
-                        refusal = self.retired_error()
-
-                    raise refusal
-
                 self._tx = tx
                 yield tx
                 # Checked, not assumed: SQLite may have rolled the transaction

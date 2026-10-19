@@ -615,8 +615,9 @@ describe it, never a network call. The block's own thread may use the handle onl
 given `tx` and `tx`'s own methods. Any other call would BEGIN inside the open transaction and fail,
 and the ROLLBACK on its way out would end the caller's transaction, leaving every later statement
 to autocommit alone. So it is refused before it reaches the connection. A `tx` is refused after
-its block, on another thread, and on another log, and a block on a retired log is refused at its
-start, even one that writes only the caller's tables.
+its block, on another thread, and on another log. On a retired log the block opens and every row
+is refused (`RetiredError`), as outside one; the caller's tables stay readable and writable, so a
+caller can carry its state from a retired log to its successor.
 
 **Offsets returned inside a block name rows only once it commits.** A rollback rolls back the
 offset counter with the rows (AUTOINCREMENT), and the next append takes the same offsets. No
@@ -641,6 +642,13 @@ it alone (no replica, or a local published table) rebuilds a buffer with none of
 tables. A caller whose guarantees must survive that rebuilds its state from the rows it wrote,
 or keeps it somewhere else; anything stronger than best-effort across a lost buffer is a
 backend that outlives the machine (#201).
+
+**An older build leaves a caller's tables alone too.** Nothing in litelink lists the tables in
+`buffer.db`; `_create` makes its own with `IF NOT EXISTS` and looks for one other name,
+`lease`, which is litelink's. Run against a buffer holding a caller's table and index, 0.13.1
+opens it, appends, seals, publishes, evicts, vacuums and reopens it, and the caller's rows and
+index come through unchanged. An older build ignores the transaction API rather than refusing
+the file.
 
 **Shaped for a backend other than SQLite.** `Transaction` is a protocol with no SQLite in it:
 statements go in as text and parameters, results come back as tuples, and no cursor, connection
