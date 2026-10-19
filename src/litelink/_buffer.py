@@ -602,6 +602,14 @@ class Buffer:
         # every call given a `tx`: one of another log, or one whose block has
         # ended, is not this.
         self._tx: SqliteTransaction | None = None
+        # True while `_insert` iterates the caller's rows. The rows may be a
+        # generator, and one that appends again from inside would cut the open
+        # group under the outer call's in-memory copy of it, which then writes
+        # back over the cut: two open groups, rows served twice, and a seal
+        # that fails on every retry. Outside a transaction the inner BEGIN
+        # fails and rolls everything back; inside one, the savepoint nests and
+        # nothing does, so the flag refuses it.
+        self._inserting = False
         # The read cache — see `rows_from`. Its own lock rather than the one
         # above, which appends hold: a read must not wait behind a write to
         # look at a table the write cannot invalidate.
@@ -1109,6 +1117,10 @@ class Buffer:
         """
         lock = self._lock if tx is None else self.joined(tx)
         with lock:
+            if self._inserting:
+                msg = "append was called from inside the rows of another append"
+                raise RuntimeError(msg)
+
             # ONE read, inside the lock, and handed down. Read here and again
             # in `_insert` and the two can disagree: a schema change landing
             # between them builds the statement from one column list and the
@@ -1141,6 +1153,7 @@ class Buffer:
         offsets: list[int] = []
         cursor = self._con.cursor()
         cursor.execute(_SAVEPOINT if joined else _BEGIN)
+        self._inserting = True
         try:
             group = self._read_group(cursor)
             # Bound once, and the accounting inlined below, because this loop
@@ -1251,6 +1264,8 @@ class Buffer:
                     cursor.execute("ROLLBACK")
 
             raise
+        finally:
+            self._inserting = False
 
         return offsets
 

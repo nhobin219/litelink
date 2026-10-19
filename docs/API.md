@@ -286,9 +286,9 @@ published table. What it promises instead:
   `reclaim("buffer")`'s `VACUUM`, which rewrites the whole file and leaves every table's contents
   as they were.
 - **Your statements cannot touch its tables.** A write to one of litelink's tables (or
-  `sqlite_sequence`), a name it owns or reserves (`litelink_...`), `BEGIN`/`COMMIT`/`ROLLBACK`, and
-  any PRAGMA but the schema reads raise `PermissionError` before they run, and the transaction
-  carries on. Your own savepoints are fine.
+  `sqlite_sequence`), a name it owns or reserves (`litelink_...`), `BEGIN`/`COMMIT`/`ROLLBACK`,
+  savepoints, and any PRAGMA but the schema reads raise `PermissionError` before they run, and the
+  transaction carries on. To undo part of a block, raise and redo the block.
 - **Your tables replicate with the buffer's WAL**, so a restore from a replica brings them back
   with the rows they were committed with. **A restore from the published table alone loses
   them**: it holds the log's rows and nothing else. Rebuild what you need from the rows you wrote,

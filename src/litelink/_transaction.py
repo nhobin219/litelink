@@ -29,7 +29,7 @@ Postgres transaction, and a caller's code would not change shape.
   caller's statements autocommit one by one) or silently join it.
 - The authorizer. A caller's statement may read any table, but may not write
   one of litelink's, create a table under one of litelink's names, end the
-  transaction itself, or change a connection setting. SQLite refuses it before
+  transaction or a savepoint of it, or change a connection setting. SQLite refuses it before
   the statement runs.
 """
 
@@ -299,6 +299,15 @@ class SqliteTransaction:
 
     def _denial(self, action: int, arg1: str | None, arg2: str | None) -> str | None:
         """Why a caller's statement may not take this action, or None."""
+        if action == sqlite3.SQLITE_SAVEPOINT:
+            # A savepoint around an `extend` can roll its rows back while the
+            # block goes on to commit, and the next append takes the same
+            # offsets: the caller would hold offsets that name other rows.
+            return (
+                f"{arg1} {arg2}: savepoints would let rows given `tx` roll back "
+                "inside a block that commits; raise to roll the block back"
+            )
+
         if action == sqlite3.SQLITE_TRANSACTION:
             return (
                 f"{arg1}: the transaction is the `with` block's to begin and "

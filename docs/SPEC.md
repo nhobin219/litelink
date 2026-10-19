@@ -599,8 +599,9 @@ SQLite's authorizer refuses, before the statement runs:
 - a table, view or index created under one of litelink's names, or a trigger on its tables. A
   temporary object counts: the temporary schema is searched first, so a `temp.meta` would take
   every statement litelink runs on that connection;
-- `BEGIN`, `COMMIT` and `ROLLBACK`: the block owns the transaction. Savepoints of the caller's
-  own are allowed;
+- `BEGIN`, `COMMIT` and `ROLLBACK`: the block owns the transaction. Savepoints too: one around
+  an `extend` could roll its rows back inside a block that commits, and the next append would
+  take the same offsets;
 - a PRAGMA other than the schema reads (`table_info` and its kin), since the rest change a
   setting litelink's durability rests on (`synchronous`, `journal_mode`) or a value every
   library in the file shares (`user_version`).

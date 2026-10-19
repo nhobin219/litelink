@@ -154,6 +154,42 @@ def test_a_refused_batch_undoes_only_itself(tmp_path: Path) -> None:
     assert caller_rows(tmp_path) == [("a", 2)]
 
 
+@pytest.mark.parametrize("call", ["append", "extend", "ingest"])
+def test_an_append_from_inside_another_appends_rows_is_refused(
+    tmp_path: Path, call: str
+) -> None:
+    """A generator of rows that appends again would cut the open group under
+    the outer call, leaving two open groups, rows served twice and a seal
+    that fails for ever. Refused, and the outer batch with it.
+
+    Falsify by removing the `_inserting` test from `Buffer.append`: the inner
+    call succeeds and the outer one returns offsets around it.
+    """
+    config = LogConfig(target_seal_rows=3)
+    with open_log(tmp_path, config) as log:
+        with log.transaction() as tx:
+
+            def batch() -> object:
+                yield from rows(2)
+                inner = rows(4, start=2)
+                if call == "append":
+                    log.append(inner[0], tx=tx)
+                elif call == "extend":
+                    log.extend(inner, tx=tx)
+                else:
+                    log.ingest(pa.Table.from_pylist(inner, SCHEMA), tx=tx)
+
+                yield from rows(2, start=6)
+
+            with pytest.raises(RuntimeError, match="inside the rows"):
+                log.extend(batch(), tx=tx)  # ty: ignore[invalid-argument-type]
+
+            assert log.extend(rows(4), tx=tx) == [1, 2, 3, 4]
+
+        log.seal(flush=True)
+        assert offsets(log) == [1, 2, 3, 4]
+
+
 def test_sqlite_ending_the_transaction_is_never_autocommitted_past(
     tmp_path: Path,
 ) -> None:
@@ -339,6 +375,9 @@ REFUSED = [
     ("COMMIT", "block's"),
     ("ROLLBACK", "block's"),
     ("BEGIN", "block's"),
+    ("SAVEPOINT mine", "savepoints"),
+    ("RELEASE litelink_append", "savepoints"),
+    ("ROLLBACK TO litelink_append", "savepoints"),
     ("PRAGMA synchronous = OFF", "PRAGMA"),
     ("PRAGMA user_version = 3", "PRAGMA"),
     ("PRAGMA journal_mode", "PRAGMA"),
@@ -384,8 +423,8 @@ def test_a_caller_trigger_cannot_write_litelinks_tables_either(
 
 
 def test_what_a_caller_may_do(tmp_path: Path) -> None:
-    """Read litelink's tables, introspect, create its own objects, and use
-    savepoints of its own."""
+    """Read litelink's tables, introspect, and create and write its own
+    objects."""
     with open_log(tmp_path) as log:
         with log.transaction() as tx:
             log.extend(rows(2), tx=tx)
@@ -396,10 +435,8 @@ def test_what_a_caller_may_do(tmp_path: Path) -> None:
                 "CREATE TABLE mylib_auto (n INTEGER PRIMARY KEY AUTOINCREMENT, v)"
             )
             tx.execute("CREATE INDEX mylib_auto_v ON mylib_auto (v)")
-            tx.execute("SAVEPOINT mylib_sp")
             tx.executemany("INSERT INTO mylib_auto (v) VALUES (?)", [(1,), (2,)])
-            tx.execute("ROLLBACK TO mylib_sp")
-            tx.execute("RELEASE mylib_sp")
+            tx.execute("DELETE FROM mylib_auto")
             tx.executemany("INSERT INTO mylib_auto (v) VALUES (:v)", [{"v": 9}])
             assert tx.execute("SELECT v FROM mylib_auto") == [(9,)]
 

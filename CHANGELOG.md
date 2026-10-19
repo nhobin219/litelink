@@ -22,8 +22,8 @@ minor version carries breaking changes.
     a caller's table, index, trigger and view, and records each name litelink's statements reach.
   - **A caller's statement cannot reach litelink's state.** SQLite's authorizer refuses, with a
     `PermissionError`, before the statement runs: writes to litelink's tables and
-    `sqlite_sequence`, its names and the `litelink_` prefix, `BEGIN`/`COMMIT`/`ROLLBACK`, and
-    PRAGMAs other than schema reads.
+    `sqlite_sequence`, its names and the `litelink_` prefix, `BEGIN`/`COMMIT`/`ROLLBACK`,
+    savepoints, and PRAGMAs other than schema reads.
   - **Naming convention**: a library's tables and columns carry its name as a prefix, as
     litelink's `litelink_offset` does.
   - **Caller tables replicate with the WAL and are lost on a restore from the published table
