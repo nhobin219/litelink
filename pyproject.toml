@@ -22,6 +22,9 @@ classifiers = [
 # real import path rather than a declared intention.
 #   sql-sqlite: SqlCatalog on SQLite (§1). pyarrow: the seal path (§15.4).
 dependencies = [
+    # PutObject IfMatch and IfNoneMatch are present at this floor; pyarrow
+    # exposes neither, so the optional lease uses the SDK directly.
+    "boto3>=1.40.0",
     # Pinned to ONE PATCH, and that is not excess caution. The wheel bundles
     # DuckDB extensions built for an exact version — they are looked up under
     # `.bin/<duckdb.__version__>/<platform>/`, and DuckDB refuses a
@@ -135,6 +138,11 @@ select = ["E", "W", "F", "I", "B", "C4", "UP"]
 ignore = ["E501"]
 
 [tool.ruff.format]
+
+# These scripts import siblings when executed directly; make that runtime
+# search path explicit for the type checker too.
+[tool.ty.environment]
+extra-paths = ["benchmarks", "examples/adsb"]
 
 # `pyarrow.compute` builds its kernels from a registry when it is imported, so
 # no static checker can see `pc.is_finite` or `pc.all`. Typed as Any here, once,

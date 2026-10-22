@@ -48,6 +48,8 @@ from litelink._handle import (
     WriteHandle,
     validate_row,
 )
+from litelink._lease import Held, Lease, Leased, LeaseLost, lease
+from litelink._lease_store import ConditionalWritesUnsupported
 from litelink._preflight import Check, Report, preflight
 from litelink._read import (
     ExtensionMissing,
@@ -69,8 +71,13 @@ __all__ = [
     "OFFSET",
     "Check",
     "ColumnStatistics",
+    "ConditionalWritesUnsupported",
     "Coverage",
     "ExtensionMissing",
+    "Held",
+    "Lease",
+    "Leased",
+    "LeaseLost",
     "LocalReadHandle",
     "LogConfig",
     "LogHandle",
@@ -87,6 +94,7 @@ __all__ = [
     "delete",
     "duckdb_connection",
     "install_s3_secret",
+    "lease",
     "manifest",
     "new",
     "open",
