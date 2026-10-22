@@ -27,6 +27,39 @@ non-AWS endpoint or an explicit key. It is deliberately not part of `LogConfig`,
 `LogConfig` is persisted into the log directory and a secret must not travel with something
 that gets copied and attached elsewhere.
 
+## Published-location leases
+
+```python
+litelink.lease(published, name, *, owner, ttl_s=60, skew_s=0,
+               s3_options=None) -> Lease
+lease.acquire() -> Held
+lease.renew()   -> Held
+lease.release() -> None
+lease.state()   -> Held | None
+```
+
+`published` and `name` identify the same location as `new`/`restore`. `Held` is a frozen
+record of `owner`, `token` and `expires_at` (Unix seconds); every write changes the token.
+`Leased.holder` is the observed `Held`, and `Leased.expires_at` its deadline. An expired
+record remains visible to `state()`; an absent or released record returns `None`.
+`LeaseLost` means renewal or release has no current authority. Calling `acquire` twice
+on a held handle raises `RuntimeError`; after loss or release it may acquire afresh.
+The classes `Lease`, `Held`, `Leased`, `LeaseLost` and `ConditionalWritesUnsupported` are
+also exported from `litelink`.
+
+Acquisition waits out `expires_at + skew_s`; renewal and release require a local time
+before `expires_at - skew_s`. `ttl_s` is finite and positive and `0 <= skew_s < ttl_s`.
+The caller owns clock synchronisation, renewal scheduling and stopping its writer before
+expiry. Existing log operations do not enforce this optional lease. Reading `state()`
+does not confer ownership or update the handle's authority.
+
+S3 construction verifies conditional writes using a disposable sibling object and refuses
+unsupported backends, including ones that ignore conditions. Pass `s3_options` as for
+`new`; credentials remain process-local. File construction does no I/O and requires POSIX
+locks and atomic rename. Requests can fail after committing: an exception grants no
+ownership and a failed acquisition may remain until expiry. See [SPEC §5a](SPEC.md#5a-optional-published-location-lease)
+for crash states, permissions and the consumer's fencing duty.
+
 ## Handles, not logs
 
 The log is the directory and the objects in the bucket. These classes are **handles** to it —

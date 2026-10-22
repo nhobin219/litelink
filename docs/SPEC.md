@@ -1220,6 +1220,72 @@ it** — the one ordering in publishing that is correctness, not optimisation.
 
 ---
 
+## 5a. Optional published-location lease
+
+`litelink.lease(published, name, owner=..., ttl_s=60, skew_s=0)` arbitrates ownership
+at `<published>/<name>/_lease.json`. The location is the same prefix and name accepted
+by `new` and `restore`; no local log or catalog is needed. The record is
+`{owner, token, expires_at}`, with a fresh random token on every mutation and a Unix
+wall-clock deadline. The handle caches only the version it successfully wrote as its
+compare-and-swap authority; `state()` reads storage and never adopts another writer's
+version. Owners are descriptive, not unique identities: equal owner strings do not confer
+authority on two handles.
+
+`acquire()` creates an absent record or replaces an expired one against its observed
+version. A deadline remains live until `expires_at + skew_s`; a live record raises
+`Leased` with the observed `Held` value. `renew()` and `release()` require the handle's
+last successful version and a local time strictly before `expires_at - skew_s`, otherwise
+raise `LeaseLost`. An already-acquired handle must renew or release before acquiring again.
+Each mutation is conditional, including takeover. Release writes a tombstone with empty
+owner and deadline zero; it never deletes the record, because a stale delete could remove
+a successor. `state()` returns `Held` even for an expired record, or `None` for absence or
+a released tombstone. Corrupt records and storage failures propagate as errors.
+
+For `s3://`, boto3 sends `PutObject` with `If-None-Match: *` for creation and
+`If-Match: <etag>` for replacement. GET returns the bytes and ETag together. Construction
+checks a unique disposable sibling object: create, reject an existing-key creation, reject
+a mismatching ETag, then accept a matching ETag. An unsupported or silently ignored
+condition raises `ConditionalWritesUnsupported` before the lease is touched; there is no
+read-then-write fallback. The caller needs GET, PUT and DELETE access to that sibling probe
+prefix as well as GET and PUT on the lease. No bucket listing is needed. SDK retries are
+disabled: a failed request can have committed, and its exception grants no authority.
+The endpoint comes only from resolved `S3Options`, as in the table I/O; SDK-only
+endpoint environment variables and profile overrides are ignored so they cannot redirect
+ownership independently of the table.
+A failed acquisition can therefore leave a record until expiry. A crash during probing
+can leave a uniquely named probe; it never affects a lease or a table.
+
+[AWS S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+and [Cloudflare R2](https://developers.cloudflare.com/r2/api/s3/api/) document both
+conditions as atomic writes. Local S3 runs the same behavioural suite as `file://`;
+production endpoint verification requires running that suite with the relevant credentials.
+The construction probe rejects endpoints that do not implement those conditions, but
+cannot prove the store's distributed consistency contract.
+
+For `file://`, ancestor directory entries are fsynced before use, including a newly
+created published prefix. Every read and mutation takes `flock(LOCK_EX)` on a persistent sibling
+`_lease.lock`. Creation uses `O_CREAT | O_EXCL`, writes and fsyncs the record, then fsyncs
+the directory. Replacement compares the entire observed record's digest under the lock,
+writes and fsyncs a unique temporary file, atomically renames it, then fsyncs the directory.
+The lock file is never unlinked, so replacement cannot split the lock domain. This requires
+a filesystem with working POSIX locks, exclusive creation, atomic rename and fsync; a
+`file://` path on a filesystem without those guarantees is unsupported. A crash partway
+through initial creation can leave an incomplete record; it fails closed with an error
+and requires the operator to inspect it after stopping writers. No table file is changed.
+
+The lease is optional coordination for a consumer's writer, **not fencing of log writes**.
+Existing append, recovery and maintenance paths do not inspect it; I2/I4/I6/I9 still depend
+on the caller admitting only one writer. The caller synchronises clocks within its skew
+budget, schedules renewal, and stops or fences its writer before its local deadline.
+A process suspended beyond expiry must not resume writing merely because a previous
+acquisition succeeded. A returned `Held` describes the written record, not a promise that
+the deadline remains in the future when a slow request returns. The library owns no
+renewal thread, timer or writer policy. Retired-log deletion requires the caller to stop
+all lease users first, just as it stops readers; deleting a live lease or its lock file
+would invalidate its arbitration. Normal metadata sweeps do not reach these sibling files.
+
+---
+
 ## 6. Compaction
 
 Runs on the happy path, and has real work to do there. Not because seals come out

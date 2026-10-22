@@ -7,6 +7,19 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- `litelink.lease(published, name, owner=..., ttl_s=60, skew_s=0)` (#207, SPEC §5a):
+  optional published-location ownership using S3 conditional PUTs or local exclusive
+  creation and locked atomic replacement. Acquire, renew, release and observed state
+  share one contract; stale renewals and releases cannot overwrite a successor.
+  Unsupported or ignored S3 write conditions are refused by a disposable probe.
+  Release writes an expired tombstone rather than deleting. No renewal loop or fencing
+  is implicit: consumers must stop their writer before expiry. Existing log operations
+  remain independent of the lease. boto3 >=1.40.0 is a new runtime dependency.
+
 ## 0.14.0 — 2026-10-19
 
 ### Added
