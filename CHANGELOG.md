@@ -7,6 +7,22 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Changed
+
+- Separate the buffer coordinator from its SQLite sessions and published catalog
+  (#215, revision 5b). SQLite keeps the same public API and on-disk schema. A
+  production write guard rejects statements that bypass the backend's write
+  context, including after caller SQL and failed transactions. In a same-session
+  quick benchmark (2,000 rows, 400 B, synchronous=FULL), batches of 1/10/50/200
+  measured 54/408/1,544/3,328 rows/s before and 88/588/1,426/3,991 after. Reads
+  of 20,000 sealed plus 1,000/5,000 buffered rows measured 205.4/204.3 ms
+  before and 198.6/301.7 ms after; these short runs do not establish a general
+  performance improvement. A focused follow-up (12 reads of 25,000 rows)
+  reverses the read result: minimum/median 297.0/593.7 ms before versus
+  109.2/203.5 ms after, demonstrating that the quick read comparison is unstable.
+
 ## 0.14.1 — 2026-10-22
 
 ### Added

@@ -15,7 +15,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from litelink import WriteHandle
+from litelink._buffer import Buffer
 from litelink._s3 import S3Options
+from litelink._sqlite import SqliteBackend
 
 # Names a bucket to share across the run, instead of creating one per test.
 _BUCKET = "LITELINK_TEST_BUCKET"
@@ -166,3 +169,15 @@ def keep_newest_rows(log: WriteHandle, rows: int) -> None:
         replace(log.config, staging_retention=None, staging_max_bytes=max(1, held))
     )
     log.evict("staging")
+
+
+def sqlite_backend(log_or_buffer: WriteHandle | Buffer) -> SqliteBackend:
+    """Reach the SQLite owner for mechanisms that cannot run on other stores."""
+    buffer = (
+        log_or_buffer._buffer
+        if isinstance(log_or_buffer, WriteHandle)
+        else log_or_buffer
+    )
+    backend = buffer._backend
+    assert isinstance(backend, SqliteBackend)
+    return backend

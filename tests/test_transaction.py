@@ -24,6 +24,7 @@ from litelink import LogConfig, RetiredError, WriteHandle
 from litelink._buffer import OWNED_TABLES
 from litelink._layout import Layout
 from litelink._replication import litestream_binary
+from tests.conftest import sqlite_backend
 from tests.test_log import SCHEMA, open_log, rows
 
 if TYPE_CHECKING:
@@ -203,12 +204,12 @@ def test_sqlite_ending_the_transaction_is_never_autocommitted_past(
     with open_log(tmp_path) as log:
         with pytest.raises(RuntimeError, match="rolled"), log.transaction() as tx:
             tx.execute(CREATE_SEEN)
-            log._buffer._con.execute("ROLLBACK")  # noqa: SLF001
+            sqlite_backend(log)._writer.execute("ROLLBACK")  # noqa: SLF001
             tx.execute(CREATE_SEEN)
 
         with pytest.raises(RuntimeError, match="rolled"), log.transaction() as tx:
             log.extend(rows(1), tx=tx)
-            log._buffer._con.execute("ROLLBACK")  # noqa: SLF001
+            sqlite_backend(log)._writer.execute("ROLLBACK")  # noqa: SLF001
             log.extend(rows(1), tx=tx)
 
         assert offsets(log) == []
@@ -310,7 +311,7 @@ def test_another_thread_waits_for_the_commit_rather_than_joining(
     with it, or fails beginning inside it.
     """
     with open_log(tmp_path) as log:
-        lock = log._buffer._lock  # noqa: SLF001
+        lock = sqlite_backend(log)._lock  # noqa: SLF001
         arrived = threading.Event()
         real = type(lock).__enter__
         done: list[object] = []
@@ -516,7 +517,11 @@ def record_tables(log: WriteHandle) -> list[tuple[str, str | None]]:
         return sqlite3.SQLITE_OK
 
     buffer = log._buffer  # noqa: SLF001
-    connections = (buffer._con, buffer._reader, buffer._sealer)  # noqa: SLF001
+    connections = (
+        sqlite_backend(buffer)._writer,
+        sqlite_backend(buffer)._tail,
+        sqlite_backend(buffer)._sealer,
+    )  # noqa: SLF001
     for con in {id(c): c for c in connections}.values():
         con.set_authorizer(authorize)
 
@@ -544,7 +549,7 @@ def test_maintenance_never_touches_a_callers_tables(
     """
     # Small files, nothing retained past a publish, and a VACUUM whatever the
     # file's size: every pass has something to do on a few hundred rows.
-    monkeypatch.setattr("litelink._buffer._VACUUM_FLOOR_BYTES", 0)
+    monkeypatch.setattr("litelink._sqlite._VACUUM_FLOOR_BYTES", 0)
     config = replace(
         LogConfig(),
         target_seal_size=1 << 30,
@@ -583,7 +588,7 @@ def test_maintenance_never_touches_a_callers_tables(
                 log.seal(flush=True)
 
         statements: list[str] = []
-        log._buffer._con.set_trace_callback(statements.append)  # noqa: SLF001
+        sqlite_backend(log)._writer.set_trace_callback(statements.append)  # noqa: SLF001
         fill(40)
         log.publish(flush=True)
         log.evict()

@@ -40,13 +40,15 @@ from litelink._layout import Layout
 from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import secret_sql
 from litelink._s3 import S3Options
+from litelink._sqlite import SqliteBackend
 from litelink._table import (
     VERSION_HINT,
     LogTable,
+    SqlitePublishedCatalog,
     _recorded_location,
     forget_published_entry,
 )
-from tests.conftest import filesystem, keep_newest_rows
+from tests.conftest import filesystem, keep_newest_rows, sqlite_backend
 
 pytestmark = pytest.mark.s3
 
@@ -269,7 +271,11 @@ def test_a_transient_failure_does_not_replace_the_published_table(
     unreadable = replace(s3, access_key="wrong", secret_key="wrong")
     with pytest.raises(Exception, match=r".+"):
         LogTable.open_published(
-            Layout(tmp_path, "s"), where, unreadable, table_schema(SCHEMA)
+            Layout(tmp_path, "s"),
+            where,
+            unreadable,
+            table_schema(SCHEMA),
+            published_catalog=SqlitePublishedCatalog(Layout(tmp_path, "s")),
         )
 
     assert len(fs.find(where.removeprefix("s3://"))) == before, (
@@ -307,13 +313,17 @@ def test_an_unreadable_catalog_schema_falls_back_rather_than_rebuilds(
         expected = _recorded_location(log._layout)
         assert expected is not None
 
-    def unanswerable(_: Layout) -> str | None:
+    def unanswerable(_: Layout, *, table_id: str | None = None) -> str | None:
         msg = "cannot read the published catalog's own table"
         raise LookupError(msg)
 
     monkeypatch.setattr("litelink._table._recorded_location", unanswerable)
     table = LogTable.open_published(
-        Layout(tmp_path, "s"), where, s3, table_schema(SCHEMA)
+        Layout(tmp_path, "s"),
+        where,
+        s3,
+        table_schema(SCHEMA),
+        published_catalog=SqlitePublishedCatalog(Layout(tmp_path, "s")),
     )
 
     assert table.metadata_location == expected, (
@@ -420,7 +430,12 @@ def test_a_failed_repoint_puts_the_old_catalog_entry_back(
     missing = "s3://litelink-no-such-bucket-3f9a2/elsewhere"
     with pytest.raises(Exception, match=r".+"):
         LogTable.open_published(
-            Layout(tmp_path, "s"), missing, s3, table_schema(SCHEMA), repair=True
+            Layout(tmp_path, "s"),
+            missing,
+            s3,
+            table_schema(SCHEMA),
+            published_catalog=SqlitePublishedCatalog(Layout(tmp_path, "s")),
+            repair=True,
         )
 
     assert _recorded_location(Layout(tmp_path, "s")) == original, (
@@ -553,9 +568,8 @@ def test_a_register_whose_rows_never_landed_is_recovered_from_the_manifest(
         assert settled > 0
 
         # The register landed; the rows recording it did not.
-        with log._buffer._lock:
-            log._buffer._con.execute("DELETE FROM meta WHERE k = 'published_through'")
-            log._buffer._con.commit()
+        with sqlite_backend(log._buffer).write() as cur:
+            cur.execute("DELETE FROM meta WHERE k = 'published_through'")
 
         assert log._maintenance.published_prefix(local, include_intents=False) == 0, (
             "the setup must actually reproduce the crash"
@@ -598,11 +612,8 @@ def test_the_backfill_sees_copies_another_process_pushed(
                 writer._table.data_files(), include_intents=False
             )
 
-            with other._buffer._lock:
-                other._buffer._con.execute(
-                    "DELETE FROM meta WHERE k = 'published_through'"
-                )
-                other._buffer._con.commit()
+            with sqlite_backend(other._buffer).write() as cur:
+                cur.execute("DELETE FROM meta WHERE k = 'published_through'")
 
             other.publish()
 
@@ -1491,7 +1502,9 @@ def test_a_restore_over_an_interrupted_seal_does_not_duplicate_rows(
     source.close()
     copy.close()
 
-    buffer = Buffer.open(Layout(second, "s").buffer_db, SCHEMA)
+    buffer = Buffer.open(
+        SqliteBackend.open(Layout(second, "s").buffer_db), SCHEMA, name="s"
+    )
     try:
         buffer.strip_local_state(1 << 20)
     finally:
@@ -1676,7 +1689,7 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
         log.publish()
         ahead = log.published_through()
 
-    stale = Buffer.peek_meta(Layout(second, "s").buffer_db, "published_through")
+    stale = SqliteBackend.peek_meta(Layout(second, "s").buffer_db, "published_through")
 
     assert stale is not None and int(stale) < ahead, (
         "the published table did not outrun the snapshot, so the case is not set up"
@@ -1689,10 +1702,11 @@ def test_a_restore_from_a_replica_the_published_table_has_outrun(
         # empties this buffer — every row in the snapshot is below the frontier
         # the published table reached — so a group still naming the replica's start
         # would be one with no rows behind it.
-        group = revived._buffer._con.execute(  # noqa: SLF001
-            "SELECT start_offset FROM extent"
-            " WHERE end_offset IS NULL AND rel_path IS NULL"
-        ).fetchone()
+        with sqlite_backend(revived._buffer).read() as cur:
+            group = cur.execute(  # noqa: SLF001
+                "SELECT start_offset FROM extent"
+                " WHERE end_offset IS NULL AND rel_path IS NULL"
+            ).fetchone()
 
         assert group is not None, "the log came back with no open group at all"
         assert (group[0] is None) == (revived.buffered_rows() == 0), (
@@ -3300,11 +3314,10 @@ def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
         assert log.buffered_rows() == 0, "retained rows are already sealed"
 
         # What a sealer dying with the open group closed leaves behind.
-        with log._buffer._lock:  # noqa: SLF001
-            log._buffer._con.execute(  # noqa: SLF001
+        with sqlite_backend(log._buffer).write() as cur:  # noqa: SLF001
+            cur.execute(  # noqa: SLF001
                 "DELETE FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
             )
-            log._buffer._con.commit()  # noqa: SLF001
 
     with litelink.open(tmp_path, "s", s3_options=s3) as reopened:
         # Everything is sealed and published, so there is nothing to seal. A

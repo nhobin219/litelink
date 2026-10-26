@@ -18,6 +18,7 @@ from litelink import OFFSET, LogConfig, WriteHandle
 from litelink._claim import EVERYTHING, new_owner
 from litelink._layout import Layout
 from litelink._s3 import S3Options
+from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -96,15 +97,17 @@ def test_a_reserve_leaves_the_other_sequences_alone(tmp_path: Path) -> None:
     has to be keyed on the buffer's row."""
     with open_log(tmp_path) as log:
         log.extend(rows(3))
-        before = dict(
-            log._buffer._con.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
-        )
+        with sqlite_backend(log._buffer).read() as cur:
+            before = dict(
+                cur.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+            )
 
         log._buffer.reserve(1000)
 
-        after = dict(
-            log._buffer._con.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
-        )
+        with sqlite_backend(log._buffer).read() as cur:
+            after = dict(
+                cur.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+            )
 
     assert before["buffer"] == 3
     assert after["buffer"] == 1003
@@ -118,7 +121,8 @@ def test_a_reserve_never_lands_on_a_buffered_row(tmp_path: Path) -> None:
     rows present must not hand back offsets those rows already hold."""
     with open_log(tmp_path) as log:
         log.extend(rows(50))
-        log._buffer._con.execute("UPDATE sqlite_sequence SET seq = 10")
+        with sqlite_backend(log._buffer).write() as cur:
+            cur.execute("UPDATE sqlite_sequence SET seq = 10")
 
         start, end = log._buffer.reserve(5)
 
@@ -132,7 +136,8 @@ def test_a_reserve_never_lands_on_a_buffered_row(tmp_path: Path) -> None:
 def buffered(log: WriteHandle) -> int:
     """Rows the buffer actually holds — not `buffered_rows`, which reports the
     unsealed tail and so reads 0 for rows a seal deliberately retained."""
-    return int(log._buffer._con.execute("SELECT count(*) FROM buffer").fetchone()[0])
+    with sqlite_backend(log._buffer).read() as cur:
+        return int(cur.execute("SELECT count(*) FROM buffer").fetchone()[0])
 
 
 def table(n: int, *, start: int = 0) -> pa.Table:

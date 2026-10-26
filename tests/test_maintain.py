@@ -23,6 +23,7 @@ from litelink._handle import LogConfig, WriteHandle, validate
 from litelink._layout import Layout
 from litelink._maintenance import _covered, merges, stable_prefix, stretches
 from litelink._table import DataFile
+from tests.conftest import sqlite_backend
 from tests.test_log import SCHEMA, open_log, read_all, rows
 
 
@@ -1312,14 +1313,13 @@ def test_eviction_will_not_commit_after_its_claim_has_lapsed(tmp_path: Path) -> 
             if self.kind != "evict":
                 return True
 
-            with self.lock:
-                self.connection.execute(
+            with self.store.write() as cur:
+                cur.execute(
                     "UPDATE claim SET expires_at = 1 WHERE id = ?", (self.row_id,)
                 )
 
             taker = Claim(
-                self.connection,
-                self.lock,
+                self.store,
                 "compact",
                 self.start,
                 (self.end - 1),
@@ -1374,9 +1374,7 @@ def test_drain_needs_no_claim_and_still_keeps_what_is_referenced(
         ]
         assert superseded, "expected superseded files awaiting deletion"
 
-        other = Claim(
-            log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
-        )
+        other = log._buffer.claim("maintain", 0, EVERYTHING, new_owner())
         assert other.acquire()
         try:
             # Expires the snapshot that still named them, then drains.
@@ -1604,12 +1602,9 @@ def test_the_published_prefix_is_always_a_file_boundary(tmp_path: Path) -> None:
         assert len(files) == 5
 
         for trial in range(40):
-            with log._buffer._lock:
-                log._buffer._con.execute("DELETE FROM extent_intent")
-                log._buffer._con.execute(
-                    "DELETE FROM meta WHERE k = 'published_through'"
-                )
-                log._buffer._con.commit()
+            with sqlite_backend(log._buffer).write() as cur:
+                cur.execute("DELETE FROM extent_intent")
+                cur.execute("DELETE FROM meta WHERE k = 'published_through'")
 
             # A watermark anywhere, mid-file included, and in-flight copies of
             # a random subset of the files.
@@ -1663,12 +1658,12 @@ def test_coverage_is_read_in_one_statement(tmp_path: Path) -> None:
 
         # SQLite's own hook: `Connection.execute` is read-only and cannot be
         # wrapped.
-        log._buffer._con.set_trace_callback(watching)
+        sqlite_backend(log)._writer.set_trace_callback(watching)
         try:
             log._buffer.published_ranges(0, include_intents=True)
 
         finally:
-            log._buffer._con.set_trace_callback(None)
+            sqlite_backend(log)._writer.set_trace_callback(None)
 
         assert len(statements) == 1, (
             f"coverage read in {len(statements)} statements; two snapshots can "
@@ -1777,11 +1772,8 @@ def test_expiry_restamps_the_metadata_it_supersedes(tmp_path: Path) -> None:
         stale = int(datetime.now(UTC).timestamp()) - 86_400
 
         maintenance._enqueue([absolute])
-        with log._buffer._lock:
-            log._buffer._con.execute(
-                "UPDATE pending_delete SET superseded_at = ?", (stale,)
-            )
-            log._buffer._con.commit()
+        with sqlite_backend(log._buffer).write() as cur:
+            cur.execute("UPDATE pending_delete SET superseded_at = ?", (stale,))
 
         assert log._buffer.due_deletions(stale + 1), "the setup must look overdue"
 

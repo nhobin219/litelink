@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import litelink
+from tests.conftest import sqlite_backend
 from tests.test_types import OTEL, otel_row
 
 if TYPE_CHECKING:
@@ -108,9 +109,11 @@ def test_the_estimate_is_never_below_arrow_and_close_to_it(
     with litelink.new(tmp_path, "s", schema=schema) as log:
         log.extend([make(i) for i in range(1, 2001)])
 
-        (estimate,) = log._buffer._con.execute(
-            "SELECT bytes FROM extent WHERE end_offset IS NULL"
-        ).fetchone()
+        with sqlite_backend(log._buffer).read() as cur:
+            (estimate,) = cur.execute(
+                "SELECT bytes FROM extent WHERE end_offset IS NULL"
+            ).fetchone()
+
         actual = log._buffer.rows_from(None).nbytes
 
         assert 1.0 <= estimate / actual <= 1.25, f"{estimate} for {actual}"
@@ -132,8 +135,9 @@ def test_the_recount_on_open_agrees_with_the_appender(
     with litelink.new(tmp_path, "s", schema=schema) as log:
         log.extend([make(i) for i in range(1, 301)])
 
-        (running,) = log._buffer._con.execute(
-            "SELECT bytes FROM extent WHERE end_offset IS NULL"
-        ).fetchone()
+        with sqlite_backend(log._buffer).read() as cur:
+            (running,) = cur.execute(
+                "SELECT bytes FROM extent WHERE end_offset IS NULL"
+            ).fetchone()
 
         assert log._buffer._measure_from(0) == running

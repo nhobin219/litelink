@@ -25,9 +25,9 @@ from pyarrow.fs import FileSelector, FileType
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import StaticTable
 
-from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._s3 import S3Options
+from litelink._sqlite import SqliteBackend
 from litelink._table import (
     PUBLISHED_CATALOG,
     RETIRED_PROPERTY,
@@ -199,7 +199,7 @@ def delete(
     options = s3_options or S3Options()
     local = None if root is None else Layout(Path(root), name)
     if local is not None and local.buffer_db.exists():
-        marker = Buffer.peek_retired(local.buffer_db)
+        marker = SqliteBackend.peek_retired(local.buffer_db)
         if marker is None or marker.get("state") != "retired":
             msg = (
                 f"{local.directory} is not a retired log; only a retired log is deleted"

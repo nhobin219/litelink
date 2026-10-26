@@ -38,15 +38,17 @@ from __future__ import annotations
 
 import contextlib
 import os
-import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from contextlib import AbstractContextManager
+
+    from litelink._backend import BackendErrors, Cursor
 
 # Long enough that a slow seal does not lose its own lease mid-operation — a
 # compaction over a large table is seconds — and short enough that a killed
@@ -80,22 +82,34 @@ def new_owner() -> str:
     return f"{uuid.uuid4()}:pid={os.getpid()}:thread={threading.get_ident()}"
 
 
+class ClaimStore(Protocol):
+    """The four capabilities a durable range claim needs from one store."""
+
+    def write(self) -> AbstractContextManager[Cursor]: ...
+    def read(self) -> AbstractContextManager[Cursor]: ...
+    def insert_id(self, cursor: Cursor, sql: str, params: Sequence[object]) -> int: ...
+    @property
+    def errors(self) -> BackendErrors: ...
+
+
 @dataclass(slots=True)
 class Claim:
-    """One operation's claim on one offset range, held in SQLite.
+    """One operation's durable range claim.
 
-    `lock` is the mutex guarding `connection`, and holding it is what makes
-    these statements atomic rather than merely single. Without it a claim write
-    can land inside a transaction another thread has open on the same
-    connection — an append's `BEGIN IMMEDIATE` — and then it commits or rolls
-    back with that transaction rather than on its own. A rolled-back append took
-    the claim row with it, leaving its holder believing it held work the table
-    no longer recorded: observed as two sealers writing the same file, and
-    pyiceberg refusing the second with "already referenced by table".
+    The store serializes the overlap check and insert in one write. Without
+    its mutex a claim write can land inside a transaction another thread has
+    open on the same connection — an append's `BEGIN IMMEDIATE` — and then it
+    commits or rolls back with that transaction rather than on its own. A
+    rolled-back append took the claim row with it, leaving its holder believing
+    it held work the table no longer recorded: observed as two sealers writing
+    the same file, and pyiceberg refusing the second with "already referenced
+    by table".
+
+    Cleanup runs in a separate write after a failed commit acknowledgement,
+    so an orphan cannot strand the range until expiry (I16).
     """
 
-    connection: sqlite3.Connection
-    lock: AbstractContextManager[object]
+    store: ClaimStore
     kind: str
     # The claimed offsets, `[start, end)`.
     start: int
@@ -114,19 +128,16 @@ class Claim:
         is no interval in which both believe they own the range.
         """
         now = _now_ms()
-        with self.lock:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
+        try:
+            with self.store.write() as cursor:
                 # Ranges are half-open, so [a, b) and [c, d) overlap exactly
                 # when a < d and b > c.
-                clash = self.connection.execute(
+                clash = cursor.execute(
                     "SELECT 1 FROM claim WHERE expires_at > ? AND owner <> ? "
                     "AND start_offset < ? AND end_offset > ? LIMIT 1",
                     (now, self.owner, self.end, self.start),
                 ).fetchone()
                 if clash is not None:
-                    self.connection.execute("ROLLBACK")
-
                     return False
 
                 # Expired overlapping rows go, in the same transaction. One
@@ -134,12 +145,13 @@ class Claim:
                 # per-role row did, so without this the table grows for ever —
                 # and a lapsed holder would still find its own row and renew
                 # itself back to life over the range someone else now owns.
-                self.connection.execute(
+                cursor.execute(
                     "DELETE FROM claim WHERE expires_at <= ?"
                     " AND start_offset < ? AND end_offset > ?",
                     (now, self.end, self.start),
                 )
-                cursor = self.connection.execute(
+                self.row_id = self.store.insert_id(
+                    cursor,
                     "INSERT INTO claim"
                     " (owner, expires_at, kind, start_offset, end_offset, rel_path) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
@@ -152,33 +164,23 @@ class Claim:
                         self.rel_path,
                     ),
                 )
-                self.row_id = cursor.lastrowid
-                self.connection.execute("COMMIT")
-            except BaseException:
-                # Best-effort, and never over the original error (#187). One
-                # landing inside COMMIT leaves no transaction to roll back, and
-                # the bare ROLLBACK raised "cannot rollback - no transaction is
-                # active" in its place, turning a KeyboardInterrupt into an
-                # OperationalError that a per-pass `except Exception` swallowed.
-                with contextlib.suppress(sqlite3.Error):
-                    self.connection.execute("ROLLBACK")
-
-                # And that COMMIT may have landed: the row is in the table while
-                # this raises, so nobody would release it, and every overlapping
-                # pass would be refused until the TTL lapsed. The owner is this
-                # attempt's alone, so the delete matches that row or nothing — a
-                # rollback that worked already took it.
-                with contextlib.suppress(sqlite3.Error):
-                    self.connection.execute(
+        except BaseException:
+            # Clear the volatile identity before cleanup: a stop signal there
+            # must propagate without leaving this object claiming ownership.
+            self.row_id = None
+            # COMMIT may have landed. Only this attempt's owner is removed;
+            # database errors are best-effort, while stop signals propagate.
+            with contextlib.suppress(self.store.errors.any):
+                with self.store.write() as cursor:
+                    cursor.execute(
                         "DELETE FROM claim"
                         " WHERE owner = ? AND start_offset = ? AND end_offset = ?",
                         (self.owner, self.start, self.end),
                     )
 
-                self.row_id = None
-                raise
+            raise
 
-            return True
+        return True
 
     def renew(self) -> bool:
         """Extend the claim. False means we no longer hold it.
@@ -205,8 +207,8 @@ class Claim:
             return False
 
         now = _now_ms()
-        with self.lock:
-            cursor = self.connection.execute(
+        with self.store.write() as cursor:
+            cursor = cursor.execute(
                 "UPDATE claim SET expires_at = ? WHERE id = ? AND owner = ?",
                 (now + self.ttl_ms, self.row_id, self.owner),
             )
@@ -218,8 +220,8 @@ class Claim:
         if self.row_id is None:
             return False
 
-        with self.lock:
-            row = self.connection.execute(
+        with self.store.read() as cursor:
+            row = cursor.execute(
                 "SELECT owner, expires_at FROM claim WHERE id = ?", (self.row_id,)
             ).fetchone()
 
@@ -230,8 +232,8 @@ class Claim:
         if self.row_id is None:
             return
 
-        with self.lock:
-            self.connection.execute(
+        with self.store.write() as cursor:
+            cursor.execute(
                 "DELETE FROM claim WHERE id = ? AND owner = ?",
                 (self.row_id, self.owner),
             )

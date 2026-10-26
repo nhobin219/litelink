@@ -59,6 +59,7 @@ from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import Reader, duckdb_connection
 from litelink._replication import flush, litestream_config, restore_database
 from litelink._s3 import S3Options
+from litelink._sqlite import SqliteBackend
 from litelink._statistics import (
     Tier,
     TierStatistics,
@@ -1446,9 +1447,11 @@ class WriteHandle(LocalReadHandle):
         log from its published table, once each has decided what to create."""
         layout.create()
         table = LogTable.create(layout, table_schema(schema), order)
+        backend = SqliteBackend.open(layout.buffer_db)
         buffer = Buffer.open(
-            layout.buffer_db,
+            backend,
             schema,
+            name=layout.name,
         )
         # Arrow is the interchange type at every edge — SQLite to Parquet,
         # Iceberg to Arrow — so the declared Arrow schema is what those edges
@@ -1485,7 +1488,9 @@ class WriteHandle(LocalReadHandle):
         # Built here and handed to all three, so each is given its published
         # table at construction rather than having one pushed into it
         # afterwards.
-        remote = Published(layout, buffer, s3_options)
+        remote = Published(
+            layout, buffer, s3_options, catalog=backend.published_catalog()
+        )
 
         log = cls(
             layout=layout,
@@ -1574,13 +1579,14 @@ class WriteHandle(LocalReadHandle):
         # always writes it, so its absence is a damaged log rather than an
         # older one, and quietly substituting defaults would change how a log
         # seals and what it retains without saying so.
-        encoded = Buffer.peek_meta(layout.buffer_db, _CONFIG_KEY)
+        encoded = SqliteBackend.peek_meta(layout.buffer_db, _CONFIG_KEY)
         if encoded is None:
             msg = f"log at {layout.root}/{name} has no stored config; it is corrupt"
             raise ValueError(msg)
 
         config = LogConfig.from_json(encoded)
-        buffer = Buffer.open(layout.buffer_db, schema)
+        backend = SqliteBackend.open(layout.buffer_db)
+        buffer = Buffer.open(backend, schema, name=layout.name)
         # From `meta`, not from the table. Required like the config and for
         # the same reason: `new` always writes it, so its absence is a damaged
         # log, and defaulting to no order would silently de-cluster every file
@@ -1595,7 +1601,9 @@ class WriteHandle(LocalReadHandle):
             msg = f"log at {layout.root}/{name} has no stored sort order; it is corrupt"
             raise ValueError(msg) from exc
 
-        remote = Published(layout, buffer, s3_options)
+        remote = Published(
+            layout, buffer, s3_options, catalog=backend.published_catalog()
+        )
         log = cls(
             layout=layout,
             table=table,
@@ -1908,7 +1916,7 @@ class WriteHandle(LocalReadHandle):
         # `restore` itself will not retry because both databases exist.
         # Refusing up here turns that into the same early, retryable failure
         # as the conflict case.
-        recorded = Buffer.peek_meta(layout.buffer_db, _PUBLISHED_KEY)
+        recorded = SqliteBackend.peek_meta(layout.buffer_db, _PUBLISHED_KEY)
         if (recorded or "").rstrip("/") != published.rstrip("/"):
             found = (
                 f"records published={recorded!r}"
@@ -1944,7 +1952,7 @@ class WriteHandle(LocalReadHandle):
         # can be missing where the other is not: the replica's closed buffer
         # ships only when the sidecar does, and a log retired before the
         # published table property existed has only the marker.
-        marker = Buffer.peek_retired(layout.buffer_db)
+        marker = SqliteBackend.peek_retired(layout.buffer_db)
         if marker is not None:
             raise RetiredError.of(marker, name)
 
@@ -1960,9 +1968,9 @@ class WriteHandle(LocalReadHandle):
         # The shape comes from `meta`, which the restored buffer carries: the
         # declared Arrow schema, the policy, and the sort order. Read before
         # the table is built, because the table is built FROM them.
-        encoded = Buffer.peek_meta(layout.buffer_db, _CONFIG_KEY)
-        raw_schema = Buffer.peek_meta(layout.buffer_db, _SCHEMA_KEY)
-        raw_sort = Buffer.peek_meta(layout.buffer_db, _SORT_KEY)
+        encoded = SqliteBackend.peek_meta(layout.buffer_db, _CONFIG_KEY)
+        raw_schema = SqliteBackend.peek_meta(layout.buffer_db, _SCHEMA_KEY)
+        raw_sort = SqliteBackend.peek_meta(layout.buffer_db, _SORT_KEY)
         if encoded is None or raw_schema is None or raw_sort is None:
             msg = (
                 f"the restored {layout.buffer_db.name} carries no stored shape; it "
@@ -1996,7 +2004,8 @@ class WriteHandle(LocalReadHandle):
         # PUBLISHED table and the buffer; neither reads the staging table. So it
         # becomes the commit point: everything ahead of it is repeatable, and a
         # root without it cannot be opened by anything.
-        buffer = Buffer.open(layout.buffer_db, schema)
+        backend = SqliteBackend.open(layout.buffer_db)
+        buffer = Buffer.open(backend, schema, name=layout.name)
         try:
             released, resumed = buffer.strip_local_state(replica_reserve)
             # The first offset past what the replica records the log issued.
@@ -2015,7 +2024,9 @@ class WriteHandle(LocalReadHandle):
             # of doing it here. It reads the published table's location from the
             # restored `meta`, so it adopts the published table THIS log wrote,
             # not whatever prefix the caller named for the WAL.
-            remote = Published(layout, buffer, options)
+            remote = Published(
+                layout, buffer, options, catalog=backend.published_catalog()
+            )
             where = remote.uri
             if remote.table(repair=True) is None and where is not None:
                 # Not best-effort. A restore that cannot reach the published
@@ -4566,7 +4577,7 @@ def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
     operation is gone, so a log left mid-change by an older release is refused
     with the way to finish it.
     """
-    encoded = Buffer.peek_meta(layout.buffer_db, _SCHEMA_KEY)
+    encoded = SqliteBackend.peek_meta(layout.buffer_db, _SCHEMA_KEY)
     if encoded is None:
         msg = (
             f"log at {layout.root}/{layout.name} has no stored Arrow schema; "
@@ -4574,7 +4585,7 @@ def _declared_schema(layout: Layout, from_table: pa.Schema) -> pa.Schema:
         )
         raise ValueError(msg)
 
-    if Buffer.peek_meta(layout.buffer_db, _LEGACY_INTENT_KEY):
+    if SqliteBackend.peek_meta(layout.buffer_db, _LEGACY_INTENT_KEY):
         msg = (
             f"log at {layout.root}/{layout.name} has an `add_column` that an "
             f"older release started and did not finish. This release has no "
