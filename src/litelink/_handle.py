@@ -684,9 +684,9 @@ class LogHandle:
         authoritative, and this is where a replica-restored reader once bit.
         `next_offset` reads a sequence its own docstring calls "the highest
         value ever assigned and never lowers", so it keeps counting rows the
-        replica no longer carries: without replication, `evict("buffer")` drops
-        rows once STAGING holds them, and they reach the published table only
-        at the next `publish`. In between they are in neither tier.
+        replica no longer carries. Older builds without replication could evict
+        buffer rows once staging held them, before publication. A restored
+        reader of such a replica has neither those staging files nor their rows.
 
         Measured on such a reader in that window: it served 864 rows and
         reported 1,501, and a caller using this as a resume cursor skipped 636
@@ -704,11 +704,12 @@ class LogHandle:
     def buffered_rows(self) -> int:
         """Rows durable in the buffer but not yet sealed.
 
-        Counted against the staging table's boundary rather than by asking the
-        buffer how many rows it holds, because a seal LEAVES its rows there
-        when `wal_replication` is on (§3a) — the buffer is the off-box copy
-        until the published table has the range, so its row count is not the
-        unsealed tail.
+        Counted above both the staging end and the confirmed published end,
+        rather than from the buffer's row count: every seal retains its rows
+        until buffer eviction (§8), regardless of WAL replication. Staging may
+        already have been evicted while published rows remain in the buffer;
+        those rows are sealed too. The published watermark is inclusive, so
+        its exclusive end is one offset higher (§4a).
 
         **It reloads first.** `LogTable.span` compares
         against this handle's in-memory `metadata_location` and resolves
@@ -727,7 +728,9 @@ class LogHandle:
         self._table.reload()
         span = self._table.span()
 
-        return self._buffer.count_from(0 if span is None else span[1])
+        end = max(0 if span is None else span[1], self.published_through() + 1)
+
+        return self._buffer.count_from(end)
 
     def staging_rows(self) -> int:
         """Rows in the staging table, from the manifests."""
@@ -1667,9 +1670,9 @@ class WriteHandle(LocalReadHandle):
         - **The published table**, in full. It names its own current metadata
           in `version-hint.text`, so it is adopted rather than rebuilt.
         - **The unsealed tail and everything the published table lacks**, from
-          `buffer.db`. A seal keeps its rows until the published table has them
-          when `wal_replication` is on, so the band between the two frontiers
-          comes back too — that is what keeping them makes possible.
+          `buffer.db`. Every seal keeps its rows until the published table has
+          them, so the band between the two frontiers comes back too — that is
+          what keeping them makes possible.
         - **The staging table**, rebuilt EMPTY. Its Parquet is on the dead
           machine and its metadata was never replicated.
         - **NOT** rows appended inside the replication lag. They were served to
@@ -3299,10 +3302,9 @@ class WriteHandle(LocalReadHandle):
         file that may not survive the crash.
 
         `start` as well as `end`, because the buffer's floor is no longer the
-        group's floor: with WAL replication on, sealed rows stay until the
-        published table has them (§3a), so a read bounded only above would sweep
-        every earlier row into this file. `Buffer.rows_between` records what
-        that costs.
+        group's floor: on every log, sealed rows stay until the published table
+        has them (§8), so a read bounded only above would sweep every earlier
+        row into this file. `Buffer.rows_between` records what that costs.
         """
         # The rows come from the buffer, whose schema is read per call — so
         # they may carry a column this handle's TABLE does not know about yet.
@@ -4416,13 +4418,13 @@ class WriteHandle(LocalReadHandle):
            (the buffer's trigger keys on that end), so nothing can arrive after
            the final push;
         2. seal everything buffered;
-        3. `publish(flush=True)`, which also releases the rows a
-           `wal_replication` seal was holding; then `compact(flush=True)`, which
+        3. `publish(flush=True)`; then `compact(flush=True)`, which
            folds every file not yet at the target into the in-progress file,
            and a last push that swaps it in although it is unfinished (#162).
            A retired log compacts no more, so without this its tail would stay
            in the published table as the seals a flush pushed early;
-        4. evict the whole staging table, and check nothing is left local;
+        4. evict published buffer rows, then the whole staging table, and check
+           nothing is left local;
         5. record the retirement on the published table (`litelink.retired`),
            so `restore` refuses whatever a replica says;
         6. `reclaim` both tables, as `advance` does — expire their snapshots
@@ -4458,9 +4460,20 @@ class WriteHandle(LocalReadHandle):
         self._buffer.close_buffer(encode_tier(schema, UNKNOWN_TIER))
         self._flush_replica()
 
-        while self.buffered_rows():
+        remaining = self.buffered_rows()
+        while remaining:
             self.seal(flush=True)
             self.await_seal()
+            after = self.buffered_rows()
+            if after >= remaining:
+                msg = (
+                    "retire() seal made no progress: "
+                    f"{after} unsealed rows remain. It stays retiring and takes "
+                    "no rows; retry once sealing can make progress"
+                )
+                raise RuntimeError(msg)
+
+            remaining = after
 
         self.publish(flush=True)
         # Everything is published now, so compaction may fold all of it into

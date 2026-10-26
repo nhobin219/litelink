@@ -1842,7 +1842,11 @@ There is no SQLite retention knob.
 Evict the buffer before staging, as `advance` and `retire` do: the files prove that prefix.
 If standalone staging eviction removes every file first, the boundary is 0 and the buffer
 keeps already-published rows until the next file is sealed and published. This delays cleanup
-without losing rows. Existing logs retain rows from the first pass using this rule; rows an
+without losing rows. `buffered_rows()` counts only rows at or above the greater of the staging
+end and `published_through + 1`: retained published rows are not an unsealed tail. `retire()`
+raises if sealing fails to reduce that tail. With empty staging and retained published buffer
+rows, its local-empty check refuses cleanup rather than spinning or widening buffer eviction.
+Existing logs retain rows from the first pass using this rule; rows an
 older build already evicted remain in staging until publication. An older build can reopen
 the same format safely, but resumes staging-based eviction while it runs.
 

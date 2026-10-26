@@ -2157,10 +2157,9 @@ def test_buffered_rows_sees_another_process_seal(
 ) -> None:
     """The §7 boundary has to be re-read, or the two tiers double-count.
 
-    A seal LEAVES its rows in the buffer when `wal_replication` is on — the
-    buffer is the off-box copy until the published table has the range (§3a) — so
+    Every seal leaves its rows in the buffer until eviction (§8), so
     `buffered_rows` cannot ask the buffer how many rows it holds. It counts
-    above the staging table's frontier instead.
+    above both the staging and confirmed published ends instead.
 
     That frontier moves when ANOTHER process seals, and `LogTable.extent`
     resolves nothing: it compares against this handle's in-memory
@@ -3273,9 +3272,9 @@ def test_restore_rebuilds_from_a_local_published_table(tmp_path: Path) -> None:
 def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """With the WAL replicated, the buffer keeps rows until the published table
-    has them, and eviction can empty staging while it still does. An open group
-    rebuilt then must start above the published end, or it adopts rows already
+    """Every log keeps sealed buffer rows until eviction, and staging eviction
+    can run first. An open group rebuilt then must start above the published
+    end, or it adopts rows already
     sealed and published and seals them a second time — a file the seal's
     register declines, since the published table holds the range, but a whole
     rewrite of the band for nothing.
@@ -3297,7 +3296,8 @@ def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
         log.reclaim("staging")
 
         assert log.staging_rows() == 0, "the setup must evict staging to nothing"
-        assert log.buffered_rows() > 0, "and keep the published rows buffered"
+        assert log._buffer.span() == (1, ROWS + 1), "keep published rows"  # noqa: SLF001
+        assert log.buffered_rows() == 0, "retained rows are already sealed"
 
         # What a sealer dying with the open group closed leaves behind.
         with log._buffer._lock:  # noqa: SLF001

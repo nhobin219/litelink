@@ -1852,9 +1852,8 @@ class Buffer:
         Dropping them is `evict("buffer")`'s, not the seal's (#122): a seal only
         moves data, and every deletion belongs to the cleanup half of the
         pipeline. Leaving them is safe in both directions — the read boundary
-        in §7 excludes these rows the moment the Iceberg commit lands — and it
-        is what `wal_replication` always needed anyway: the buffer is the
-        off-box copy until the published table has the range (§3a).
+        in §7 excludes these rows the moment the Iceberg commit lands. Every
+        log retains this copy until the published table has the range (§8).
 
         Returns whether this caller's claim was the live one. False means it
         was superseded while it worked, and finishing belongs to whoever holds
