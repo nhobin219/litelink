@@ -374,7 +374,7 @@ def _buffer_ddl(shape: Shape) -> str:
         column_ddl(shape.schema.field(name)) for name in shape.columns
     )
     # AUTOINCREMENT, not a bare INTEGER PRIMARY KEY: buffer rows are deleted
-    # at every seal, and a rowid alias would reissue offsets already
+    # after confirmed publication, and a rowid alias would reissue offsets already
     # committed to Iceberg once the table empties, silently corrupting every
     # tier boundary in §7 (I9, §2).
     # STRICT is what makes `ANY` mean "store this value exactly as
@@ -513,8 +513,9 @@ class Buffer:
         # a stepping statement pins that CONNECTION's read snapshot. Sharing
         # one between a scan and a seal therefore hands the seal whatever
         # snapshot the scan pinned — it writes its Parquet file from a stale
-        # view, and `finish_seal` then deletes every buffered row through the
-        # group's end, including rows that never reached the file. Measured:
+        # view, and coverage-based eviction can then delete buffered rows through
+        # the group's end, including rows that never reached the file. Measured
+        # with the former seal-time deletion:
         # 1,000 acknowledged offsets in neither tier, from a scan and a seal
         # running concurrently through the public API.
         #
@@ -1608,7 +1609,7 @@ class Buffer:
             self._tail = table
             # Taken from the DATA, never from `start`. They are not the same
             # number: `start` is the table's boundary, and the first buffered
-            # row at or above it can be higher still if a seal deleted the rows
+            # row at or above it can be higher still if eviction deleted the rows
             # between while this was being read. Recording `start` as though it
             # were the first cached row made the slice arithmetic below count
             # from a row that no longer existed, and the miscount hid buffered
@@ -1852,9 +1853,8 @@ class Buffer:
         Dropping them is `evict("buffer")`'s, not the seal's (#122): a seal only
         moves data, and every deletion belongs to the cleanup half of the
         pipeline. Leaving them is safe in both directions — the read boundary
-        in §7 excludes these rows the moment the Iceberg commit lands — and it
-        is what `wal_replication` always needed anyway: the buffer is the
-        off-box copy until the published table has the range (§3a).
+        in §7 excludes these rows the moment the Iceberg commit lands. Every
+        log retains this copy until the published table has the range (§8).
 
         Returns whether this caller's claim was the live one. False means it
         was superseded while it worked, and finishing belongs to whoever holds

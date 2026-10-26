@@ -19,6 +19,7 @@ import pytest
 
 import litelink
 from litelink import OFFSET, LogHandle
+from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._prune import terms
 from litelink._read import Reader
@@ -794,12 +795,11 @@ def test_a_gap_above_staging_lets_a_scan_inside_it_skip_the_buffer(
     Falsify by using only the staging boundary as the floor: the scan inside
     the gap reads the buffer.
     """
-    from litelink._buffer import Buffer
-
     schema = pa.schema([pa.field("x", pa.int64())])
     with litelink.new(tmp_path, "s", schema=schema) as log:
         log.extend({"x": i} for i in range(100))
         log.seal(flush=True)
+        log.publish(flush=True)
         log.evict("buffer")
         log._buffer.reserve(50)  # noqa: SLF001 — offsets 101-150, never filled
         log.extend({"x": i} for i in range(20))  # offsets 151-170

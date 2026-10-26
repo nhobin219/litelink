@@ -210,9 +210,8 @@ class LogConfig:
     # that the seal has no timer: a stream that goes quiet holds its last
     # partial file's worth of rows indefinitely.
     #
-    # A declaration rather than a supervisor. It is read — `evict("buffer")`
-    # consults it on every eviction, and validation refuses it without a remote
-    # published table to replicate to — but litelink never starts the sidecar.
+    # A declaration rather than a supervisor. Validation refuses it without a
+    # remote published table to replicate to, but litelink never starts the sidecar.
     # That is a separate process reading the WAL, which is exactly why
     # replication does not put the network in the write path, and litestream is
     # explicit that two instances must never replicate one database. Supervising

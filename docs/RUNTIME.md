@@ -149,11 +149,10 @@ streams.
 
 Two different things get called "eviction". They happen in different roles:
 
-- **Buffer rows** are deleted by `evict("buffer")`, never by a seal or a publish (#122), and
-  WHEN depends on one setting. Without `wal_replication` they go once a seal has committed
-  them to staging. With it, they stay until the published table holds the range — a seal
-  moves rows into a Parquet file no sidecar replicates, so deleting them earlier removes the
-  only off-box copy (§3a). `Maintenance.evict_buffer` is the one place that decides. The
+- **Buffer rows** are deleted by `evict("buffer")`, never by a seal or a publish (#122),
+  only once the published table holds the range, regardless of WAL replication. Sealed
+  rows stay buffered until then (§3a); staging alone never permits their eviction.
+  `Maintenance.evict_buffer` is the one place that decides. The
   delete is one statement under the write lock, so a concurrent append waits for it; its
   `start_offset` / `end_offset` bounds are how a caller keeps each wait short.
 - **Parquet files** are removed from the table by the **maintainer** under

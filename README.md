@@ -47,7 +47,7 @@ move them along, then steps 4–10 to clean up what they left behind:
   └───────────────────────────┘
 
   then cleanup:
-     4. evict("buffer")        rows staging holds (published, with wal_replication)
+     4. evict("buffer")        rows published holds
      5. evict("staging")       files published holds, never before (I4)
      6. reclaim("buffer")      VACUUM buffer.db         only with vacuum_free_ratio
      7. reclaim("staging")     expire old snapshots, then delete files past their grace
@@ -60,7 +60,7 @@ One set of verbs for every table, each taking the table as an argument:
 
 | | `evict`: drop what the next copy holds | `reclaim`: turn that into free disk | `sweep` |
 |---|---|---|---|
-| `"buffer"` | rows staging holds, or published with `wal_replication` | `VACUUM` | — |
+| `"buffer"` | rows published holds | `VACUUM` | — |
 | `"staging"` | files published holds (I4) | expire snapshots, then delete | stranded metadata |
 | `"published"` | — (it is the durable copy) | expire snapshots, then delete | stranded metadata |
 

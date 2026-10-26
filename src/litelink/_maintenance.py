@@ -893,26 +893,21 @@ class Maintenance:
     def evict_buffer(
         self, start_offset: int | None = None, end_offset: int | None = None
     ) -> int:
-        """Drop buffer rows the next durable copy already holds (#122). Returns
+        """Drop buffer rows the published table already holds (#122). Returns
         how many.
 
-        The rule is eviction's, one tier up: never drop data until the next
-        durable copy has it.
-
-        - **Without `wal_replication`**, that copy is staging: every row below
-          the staging table's committed end is in a file there. The buffer and
-          the Parquet share a disk, so holding them longer buys nothing.
-        - **With it**, the buffer is the off-box copy until the published table
-          has the range (§3a), so the copy that counts is the published one —
-          read from the log's own record of what landed there
-          (`published_prefix`, without intents), the same authority staging
-          eviction acts on for I4. Local, so this never needs the network.
+        I4 one tier up: every log keeps its unpublished rows in the buffer,
+        including sealed rows, regardless of WAL replication. The proof is
+        the log's own record of what landed in the published table
+        (`published_prefix`, without intents), the same authority staging
+        eviction acts on. Local, so this never needs the network.
 
         Rows below the staging table's first file were evicted from it, which
         I4 allowed only once the published table held them, so the boundary is
         the end of the longest prefix of staging files the copy holds. Run
         before `evict("staging")` — as `advance` does — so the files that prove
-        it are still there.
+        it are still there. With no staging files left the boundary is 0;
+        held rows leave once the next file is sealed and published.
 
         `[start_offset, end_offset)` narrows what is eligible; it never widens
         it. Unbounded, this is one `DELETE` under SQLite's write lock and
@@ -920,11 +915,7 @@ class Maintenance:
         """
         self._table.reload()
         files = self._table.data_files()
-        if self.config.wal_replication and self._published.remote():
-            boundary = self.published_prefix(files, include_intents=False)
-        else:
-            boundary = max((f.end for f in files), default=0)
-
+        boundary = self.published_prefix(files, include_intents=False)
         if end_offset is not None:
             boundary = min(boundary, end_offset)
 

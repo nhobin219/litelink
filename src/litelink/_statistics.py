@@ -289,7 +289,7 @@ def whole_log(
     buffer.
 
     The tiers overlap by design (I3) — the published table keeps what staging
-    still holds, and with `wal_replication` a seal keeps its rows in the buffer
+    still holds, and every seal keeps its rows in the buffer until eviction
     — so this takes each row from one place, as a read does, and the three
     parts are exactly what `column_statistics` reports for `"staging"`,
     `"published"` and `"buffer"`:

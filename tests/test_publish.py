@@ -1060,19 +1060,13 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         assert log.scan().read_all().num_rows == 1200
 
 
-def test_without_replication_eviction_does_not_wait_for_the_published_table(
+def test_without_replication_eviction_waits_for_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A published table alone is not the trigger.
+    """Every log holds its unpublished rows, independent of WAL replication.
 
-    Without a sidecar the buffer and the Parquet share a disk and die together,
-    so holding buys nothing and costs SQLite growth. The gate is
-    `wal_replication`, and this is the half that proves a published table by
-    itself does not flip it: `evict("buffer")` drops what a seal committed to
-    staging, with nothing published yet (#122).
-
-    Falsify by having `evict_buffer` use the published table's coverage
-    whenever one is remote: nothing is published, so nothing is dropped.
+    Falsify by restoring staging-based eviction without `wal_replication`:
+    the first eviction drops sealed rows before publication.
     """
     config = replace(
         LogConfig(),
@@ -1090,17 +1084,56 @@ def test_without_replication_eviction_does_not_wait_for_the_published_table(
     ) as log:
         log.extend(rows(1200))
         log.seal()
+        before = log._buffer.span()  # noqa: SLF001
         log.evict("buffer")
 
         sealed = log.staging_extent()
 
         assert sealed is not None
         buffered = log._buffer.span()  # noqa: SLF001
-        # Either the buffer is empty, or what is in it is strictly the unsealed
-        # tail — never a row the seal already wrote to Parquet.
-        assert buffered is None or buffered[0] >= sealed[1], (
-            "rows were held with no sidecar to replicate them"
-        )
+        assert buffered == before
+        assert buffered is not None and buffered[0] < sealed[1]
+
+        log.publish(flush=True)
+        log.evict("buffer")
+        buffered = log._buffer.span()  # noqa: SLF001
+        assert buffered is None or buffered[0] >= sealed[1]
+        assert log.scan().read_all().num_rows == 1200
+
+
+def test_a_failed_remote_publish_keeps_buffer_rows(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upload intent is not a confirmed published copy (I4).
+
+    Falsify by restoring staging-based eviction without `wal_replication`:
+    `advance` drops the buffer despite the failed registration.
+    """
+    with published_log(tmp_path, bucket, s3) as log:
+        assert not log.config.wal_replication
+        log.extend(rows(4))
+        log.seal(flush=True)
+        before = log._buffer.span()  # noqa: SLF001
+        assert before == (1, 5)
+
+        def fail_register(*_: object, **__: object) -> bool:
+            raise OSError("published registration unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(LogTable, "register", fail_register)
+            with pytest.raises(OSError, match="registration unavailable"):
+                log.advance(flush=True)
+
+        assert log.published_through() == 0
+        assert log._buffer.published_ranges(1, include_intents=True)  # noqa: SLF001
+        assert not log._buffer.published_ranges(1, include_intents=False)  # noqa: SLF001
+        assert log._buffer.span() == before  # noqa: SLF001
+        assert log.scan().read_all().num_rows == 4
+
+        log.advance(flush=True)
+        assert log.published_through() == 4
+        assert log._buffer.span() is None  # noqa: SLF001
+        assert log.scan().read_all().num_rows == 4
 
 
 def test_a_held_seal_does_not_widen_the_next_file(
@@ -2124,10 +2157,9 @@ def test_buffered_rows_sees_another_process_seal(
 ) -> None:
     """The §7 boundary has to be re-read, or the two tiers double-count.
 
-    A seal LEAVES its rows in the buffer when `wal_replication` is on — the
-    buffer is the off-box copy until the published table has the range (§3a) — so
+    Every seal leaves its rows in the buffer until eviction (§8), so
     `buffered_rows` cannot ask the buffer how many rows it holds. It counts
-    above the staging table's frontier instead.
+    above both the staging and confirmed published ends instead.
 
     That frontier moves when ANOTHER process seals, and `LogTable.extent`
     resolves nothing: it compares against this handle's in-memory
@@ -3240,9 +3272,9 @@ def test_restore_rebuilds_from_a_local_published_table(tmp_path: Path) -> None:
 def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """With the WAL replicated, the buffer keeps rows until the published table
-    has them, and eviction can empty staging while it still does. An open group
-    rebuilt then must start above the published end, or it adopts rows already
+    """Every log keeps sealed buffer rows until eviction, and staging eviction
+    can run first. An open group rebuilt then must start above the published
+    end, or it adopts rows already
     sealed and published and seals them a second time — a file the seal's
     register declines, since the published table holds the range, but a whole
     rewrite of the band for nothing.
@@ -3264,7 +3296,8 @@ def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
         log.reclaim("staging")
 
         assert log.staging_rows() == 0, "the setup must evict staging to nothing"
-        assert log.buffered_rows() > 0, "and keep the published rows buffered"
+        assert log._buffer.span() == (1, ROWS + 1), "keep published rows"  # noqa: SLF001
+        assert log.buffered_rows() == 0, "retained rows are already sealed"
 
         # What a sealer dying with the open group closed leaves behind.
         with log._buffer._lock:  # noqa: SLF001

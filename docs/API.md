@@ -455,9 +455,8 @@ its own process; concurrent `append` is excluded by §1, not by a lock.
 
 **WAL shipping does not carry a loaded range**, because these rows never enter the buffer.
 That is a fact about scope, and it is stated rather than enforced: `ingest` runs with
-`wal_replication` on, and turning it off to load would be worse, since `evict("buffer")`
-reads the same flag and the next eviction would drop the buffer's copy of everything already
-captured.
+`wal_replication` on. Buffer eviction keeps captured rows until publication regardless of
+that flag; a load's rows, which bypass the buffer, depend on their source or published copy.
 
 **When the push did not cover the load** — `publish=False`, an unflushed tail, or a push that
 failed — compare `published_through()` against the `end - 1` this returns; until they meet, the
@@ -726,8 +725,7 @@ rows from the buffer to the published table, and steps 4–10 clean up what they
 1. `seal()`: buffer → staging.
 2. `compact()`: merges a run once it has `compact_min_files` files that fit the target.
 3. `publish()`: staging → published, only what compaction is finished with.
-4. `evict("buffer")`: rows the next durable copy holds — staging, or the published table
-   with `wal_replication`.
+4. `evict("buffer")`: rows the published table holds, regardless of WAL replication.
 5. `evict("staging")`: files the published table now holds, in the same pass (I4).
 6. `reclaim("buffer")`: `VACUUM`, only when `vacuum_free_ratio` is set.
 7. `reclaim("staging")`: expire snapshots past `staging_snapshot_retention`, then delete the
@@ -742,6 +740,11 @@ boundary is the staging table's committed end. **`evict` takes optional half-ope
 `[start_offset, end_offset)` bounds**, and chunking is the caller's: unbounded, a buffer
 eviction is one `DELETE` under SQLite's write lock and stalls appends while it runs. Staging
 eviction always removes a prefix, so a `start_offset` above the table's first offset raises.
+
+Evict the buffer before staging, as `advance()` does. The buffer boundary is proved by the
+longest prefix of staging files with confirmed published coverage. If staging eviction leaves
+no files, buffer eviction keeps already-published rows until the next file is sealed and
+published.
 
 **`reclaim` on staging or published does not delete a file in the call that frees it.** Iceberg's
 expiry is metadata only; what it frees, and what compaction and eviction supersede, is queued
@@ -939,8 +942,8 @@ manifests, so no data file is opened and nothing extra is written or published.
 | `None` | the whole log | all three |
 
 The tiers overlap in storage by design — the published table keeps a copy of the staging window, and a
-`wal_replication` seal keeps its rows in the buffer — so each row is counted from one place, as
-a read takes it. The one layout whose rows can't be separated is a published file straddling
+seal keeps its rows in the buffer until confirmed publication permits eviction — so each row
+is counted from one place, as a read takes it. The one layout whose rows can't be separated is a published file straddling
 the local boundary, which only a re-cut by an earlier version produces; its bounds still hold, and every
 count in `"published"` and `None` comes back `None` rather than doubled.
 
@@ -1116,7 +1119,7 @@ staging_max_bytes     int | None      = 4 GiB    staging limit by SIZE ON DISK (
 staging_snapshot_retention    timedelta = 15 min   how long the staging table's expired snapshots survive
 published_snapshot_retention  timedelta = 1 hour   how long the published table's expired snapshots survive
 compact_min_files     int             = 4        minimum adjacent files to merge
-wal_replication       bool            = False    needs an s3:// published table; also makes a seal KEEP its rows
+wal_replication       bool            = False    needs an s3:// published table
 wal_retention         timedelta|None  = None     how far back a restore may go
 vacuum_free_ratio     float | None    = None     reclaim buffer dead space at this free share
 compression           str             = "zstd"   Parquet codec: none | snappy | gzip | zstd
