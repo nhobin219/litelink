@@ -2004,8 +2004,7 @@ staging_snapshot_retention    staging snapshot expiry floor    (> longest local 
 published_snapshot_retention  published snapshot expiry floor  (> longest remote scan; default 1 hour)
 compact_min_files      minimum adjacent files to compact  (default 4; below 2 is refused —
                                                           every run would look mergeable)
-wal_replication        ship the WAL with a sidecar        (needs an s3:// published table; also decides
-                                                          whether a seal keeps its rows)
+wal_replication        ship the WAL with a sidecar        (needs an s3:// published table)
 wal_retention          how far back a restore may go      (None = litestream's own default)
 ```
 
@@ -2259,9 +2258,9 @@ The consequence worth planning for is that local disk holds roughly
    the sort, the Parquet write, the fsync and the Iceberg commit.
 
    That second fact is what makes the first worth solving, and it also unsettles who should
-   seal at all. §4 assigns it to the writer and step 3 justifies that — the seal deletes
-   buffer rows. But only step 3 writes the buffer, and it is explicitly garbage collection
-   rather than correctness; the expensive step *reads*, which WAL permits alongside a writer.
+   seal at all. The former writer-only assignment relied on step 3 deleting buffer rows.
+   Buffer deletion now belongs to eviction (§8); sealing reads the buffer, which WAL permits
+   alongside a writer.
 
    **A claim per operation is built** (§4a; this paragraph described the role-lease era), and the seal is the operation that uses it. `sealing`
    belongs to whoever holds the `seal` role and `compacting` to whoever holds `maintain`, so

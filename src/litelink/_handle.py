@@ -833,9 +833,9 @@ class LogHandle:
             return found
 
         # The order a read resolves its legs in, and for the same reason. The
-        # buffer FIRST: a seal lands its file and then deletes the rows, so a
-        # row it moves afterwards is in the staging snapshot taken next. The
-        # published table LAST: eviction follows registration (I4), so a
+        # buffer FIRST: eviction deletes only rows already published, so a row
+        # removed afterwards is in a table snapshot taken next. The published
+        # table LAST: eviction follows registration (I4), so a
         # published snapshot taken after the staging one holds everything the
         # staging one has already given up.
         buffered = self._buffer.rows_from(None)
@@ -1302,7 +1302,7 @@ class WriteHandle(LocalReadHandle):
 
         It is creation-only, and there is deliberately no way to re-seed a log
         afterwards. `Buffer.seed_offsets`' guard reads the offsets currently
-        BUFFERED, which is empty once a seal has deleted them, so it would not
+        BUFFERED, which is empty once eviction has deleted them, so it would not
         refuse a re-seed onto already-issued offsets: the next appends would
         reuse committed offsets, `_union` would hide them behind the table's
         span and the seal's `register` would decline the file and queue it

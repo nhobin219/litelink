@@ -711,11 +711,11 @@ class Reader:
         caller has asked for the staging table and the buffer only.
         """
         # Buffer first, table second, and the order is the correctness
-        # argument. A seal commits its file and THEN deletes the rows it
-        # covered, so between those two moments a row is in both tiers and
-        # after them it is only in the table. Reading the buffer first means
-        # anything a seal removes afterwards is already in the snapshot
-        # resolved below; reading it second would let a seal land in between
+        # argument. Eviction deletes buffered rows only after publication, so
+        # between publication and eviction a row is in both tiers and after
+        # them it is only in the tables. Reading the buffer first means
+        # anything eviction removes afterwards is already in the snapshots
+        # resolved below; reading it second would let eviction land in between
         # and leave those rows in neither leg.
         #
         # The floor here only bounds how much is read — §7's point about a

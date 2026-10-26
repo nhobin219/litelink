@@ -942,8 +942,8 @@ manifests, so no data file is opened and nothing extra is written or published.
 | `None` | the whole log | all three |
 
 The tiers overlap in storage by design — the published table keeps a copy of the staging window, and a
-`wal_replication` seal keeps its rows in the buffer — so each row is counted from one place, as
-a read takes it. The one layout whose rows can't be separated is a published file straddling
+seal keeps its rows in the buffer until confirmed publication permits eviction — so each row
+is counted from one place, as a read takes it. The one layout whose rows can't be separated is a published file straddling
 the local boundary, which only a re-cut by an earlier version produces; its bounds still hold, and every
 count in `"published"` and `None` comes back `None` rather than doubled.
 
@@ -1119,7 +1119,7 @@ staging_max_bytes     int | None      = 4 GiB    staging limit by SIZE ON DISK (
 staging_snapshot_retention    timedelta = 15 min   how long the staging table's expired snapshots survive
 published_snapshot_retention  timedelta = 1 hour   how long the published table's expired snapshots survive
 compact_min_files     int             = 4        minimum adjacent files to merge
-wal_replication       bool            = False    needs an s3:// published table; also makes a seal KEEP its rows
+wal_replication       bool            = False    needs an s3:// published table
 wal_retention         timedelta|None  = None     how far back a restore may go
 vacuum_free_ratio     float | None    = None     reclaim buffer dead space at this free share
 compression           str             = "zstd"   Parquet codec: none | snappy | gzip | zstd
