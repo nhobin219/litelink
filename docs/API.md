@@ -455,9 +455,8 @@ its own process; concurrent `append` is excluded by §1, not by a lock.
 
 **WAL shipping does not carry a loaded range**, because these rows never enter the buffer.
 That is a fact about scope, and it is stated rather than enforced: `ingest` runs with
-`wal_replication` on, and turning it off to load would be worse, since `evict("buffer")`
-reads the same flag and the next eviction would drop the buffer's copy of everything already
-captured.
+`wal_replication` on. Buffer eviction keeps captured rows until publication regardless of
+that flag; a load's rows, which bypass the buffer, depend on their source or published copy.
 
 **When the push did not cover the load** — `publish=False`, an unflushed tail, or a push that
 failed — compare `published_through()` against the `end - 1` this returns; until they meet, the
@@ -726,8 +725,7 @@ rows from the buffer to the published table, and steps 4–10 clean up what they
 1. `seal()`: buffer → staging.
 2. `compact()`: merges a run once it has `compact_min_files` files that fit the target.
 3. `publish()`: staging → published, only what compaction is finished with.
-4. `evict("buffer")`: rows the next durable copy holds — staging, or the published table
-   with `wal_replication`.
+4. `evict("buffer")`: rows the published table holds, regardless of WAL replication.
 5. `evict("staging")`: files the published table now holds, in the same pass (I4).
 6. `reclaim("buffer")`: `VACUUM`, only when `vacuum_free_ratio` is set.
 7. `reclaim("staging")`: expire snapshots past `staging_snapshot_retention`, then delete the
@@ -742,6 +740,11 @@ boundary is the staging table's committed end. **`evict` takes optional half-ope
 `[start_offset, end_offset)` bounds**, and chunking is the caller's: unbounded, a buffer
 eviction is one `DELETE` under SQLite's write lock and stalls appends while it runs. Staging
 eviction always removes a prefix, so a `start_offset` above the table's first offset raises.
+
+Evict the buffer before staging, as `advance()` does. The buffer boundary is proved by the
+longest prefix of staging files with confirmed published coverage. If staging eviction leaves
+no files, buffer eviction keeps already-published rows until the next file is sealed and
+published.
 
 **`reclaim` on staging or published does not delete a file in the call that frees it.** Iceberg's
 expiry is metadata only; what it frees, and what compaction and eviction supersede, is queued

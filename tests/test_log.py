@@ -105,7 +105,7 @@ def test_seal_then_read_returns_every_row_once(tmp_path: Path) -> None:
 
 
 def test_a_seal_keeps_its_rows_until_the_buffer_is_evicted(tmp_path: Path) -> None:
-    """A seal only moves data; `evict("buffer")` drops what staging holds
+    """A seal only moves data; `evict("buffer")` drops what is published
     (#122). Reads see each row exactly once either side of it, because the
     read boundary is the staging table's committed end, not the buffer's
     contents.
@@ -119,6 +119,7 @@ def test_a_seal_keeps_its_rows_until_the_buffer_is_evicted(tmp_path: Path) -> No
         assert log._buffer.span() is not None, "the seal must not delete"
         assert len(read_all(log)) == 4
 
+        log.publish(flush=True)
         log.evict("buffer")
         assert log._buffer.span() is None
         assert len(read_all(log)) == 4
@@ -129,6 +130,7 @@ def test_offsets_never_reused_after_the_buffer_empties(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         log.extend(rows(3))
         log.seal(flush=True)
+        log.publish(flush=True)
         log.evict("buffer")
         assert log._buffer.span() is None
         assert log.extend(rows(1, start=3)) == [4]
@@ -185,6 +187,7 @@ def test_recovery_completes_an_interrupted_seal(tmp_path: Path) -> None:
         assert len(read_all(recovered)) == 4
         assert recovered.staging_files() == 1, "recovery sealed it twice"
 
+        recovered.publish(flush=True)
         recovered.evict("buffer")
         assert recovered._buffer.span() is None
         assert len(read_all(recovered)) == 4

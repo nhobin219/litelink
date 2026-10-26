@@ -1060,19 +1060,13 @@ def test_replication_holds_sealed_rows_until_the_published_table_has_them(
         assert log.scan().read_all().num_rows == 1200
 
 
-def test_without_replication_eviction_does_not_wait_for_the_published_table(
+def test_without_replication_eviction_waits_for_the_published_table(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """A published table alone is not the trigger.
+    """Every log holds its unpublished rows, independent of WAL replication.
 
-    Without a sidecar the buffer and the Parquet share a disk and die together,
-    so holding buys nothing and costs SQLite growth. The gate is
-    `wal_replication`, and this is the half that proves a published table by
-    itself does not flip it: `evict("buffer")` drops what a seal committed to
-    staging, with nothing published yet (#122).
-
-    Falsify by having `evict_buffer` use the published table's coverage
-    whenever one is remote: nothing is published, so nothing is dropped.
+    Falsify by restoring staging-based eviction without `wal_replication`:
+    the first eviction drops sealed rows before publication.
     """
     config = replace(
         LogConfig(),
@@ -1090,17 +1084,56 @@ def test_without_replication_eviction_does_not_wait_for_the_published_table(
     ) as log:
         log.extend(rows(1200))
         log.seal()
+        before = log._buffer.span()  # noqa: SLF001
         log.evict("buffer")
 
         sealed = log.staging_extent()
 
         assert sealed is not None
         buffered = log._buffer.span()  # noqa: SLF001
-        # Either the buffer is empty, or what is in it is strictly the unsealed
-        # tail — never a row the seal already wrote to Parquet.
-        assert buffered is None or buffered[0] >= sealed[1], (
-            "rows were held with no sidecar to replicate them"
-        )
+        assert buffered == before
+        assert buffered is not None and buffered[0] < sealed[1]
+
+        log.publish(flush=True)
+        log.evict("buffer")
+        buffered = log._buffer.span()  # noqa: SLF001
+        assert buffered is None or buffered[0] >= sealed[1]
+        assert log.scan().read_all().num_rows == 1200
+
+
+def test_a_failed_remote_publish_keeps_buffer_rows(
+    tmp_path: Path, bucket: str, s3: S3Options, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upload intent is not a confirmed published copy (I4).
+
+    Falsify by restoring staging-based eviction without `wal_replication`:
+    `advance` drops the buffer despite the failed registration.
+    """
+    with published_log(tmp_path, bucket, s3) as log:
+        assert not log.config.wal_replication
+        log.extend(rows(4))
+        log.seal(flush=True)
+        before = log._buffer.span()  # noqa: SLF001
+        assert before == (1, 5)
+
+        def fail_register(*_: object, **__: object) -> bool:
+            raise OSError("published registration unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(LogTable, "register", fail_register)
+            with pytest.raises(OSError, match="registration unavailable"):
+                log.advance(flush=True)
+
+        assert log.published_through() == 0
+        assert log._buffer.published_ranges(1, include_intents=True)  # noqa: SLF001
+        assert not log._buffer.published_ranges(1, include_intents=False)  # noqa: SLF001
+        assert log._buffer.span() == before  # noqa: SLF001
+        assert log.scan().read_all().num_rows == 4
+
+        log.advance(flush=True)
+        assert log.published_through() == 4
+        assert log._buffer.span() is None  # noqa: SLF001
+        assert log.scan().read_all().num_rows == 4
 
 
 def test_a_held_seal_does_not_widen_the_next_file(

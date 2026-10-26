@@ -58,6 +58,58 @@ def offsets(log: litelink.LogHandle) -> list[int]:
     return sorted(log.scan(columns=[OFFSET]).read_all().column(0).to_pylist())
 
 
+def test_without_replication_sealed_rows_wait_for_publication(tmp_path: Path) -> None:
+    """Staging alone never authorizes buffer eviction (I4 one tier up).
+
+    Falsify by restoring staging-based eviction without `wal_replication`:
+    the first eviction drops all four unpublished rows.
+    """
+    with local_log(tmp_path) as log:
+        assert not log.config.wal_replication
+        log.extend(rows(4))
+        log.seal(flush=True)
+        buffer = log._buffer  # noqa: SLF001
+        assert log.staging_extent() == (1, 5)
+        assert log.published_through() == 0
+
+        log.evict("buffer")
+        assert buffer.span() == (1, 5), "unpublished rows must stay buffered"
+        assert offsets(log) == [1, 2, 3, 4]
+
+        log.publish(flush=True)
+        assert log.published_through() == 4
+        assert buffer.span() == (1, 5), "publishing itself must not evict"
+        log.evict("buffer")
+        assert buffer.span() is None
+        assert offsets(log) == [1, 2, 3, 4]
+
+
+def test_staging_evicted_first_releases_buffer_at_the_next_publish(
+    tmp_path: Path,
+) -> None:
+    """With no staging files left, the prefix proof is empty. The next sealed
+    and published file proves the older rows can leave too (§8).
+
+    Falsify by omitting buffer eviction: the final span still holds rows.
+    """
+    with local_log(tmp_path, staging_retention=timedelta(0)) as log:
+        log.extend(rows(4))
+        log.seal(flush=True)
+        log.publish(flush=True)
+
+        log.evict("staging")
+        assert log.staging_files() == 0
+        log.evict("buffer")
+        assert log._buffer.span() == (1, 5)  # noqa: SLF001
+
+        assert log.extend(rows(2)) == [5, 6]
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.evict("buffer")
+        assert log._buffer.span() is None  # noqa: SLF001
+        assert offsets(log) == list(range(1, 7))
+
+
 def test_a_log_given_no_published_table_publishes_under_its_own_directory(
     tmp_path: Path,
 ) -> None:
@@ -446,6 +498,8 @@ def test_maintain_seals_publishes_and_evicts_in_one_pass(tmp_path: Path) -> None
             f.start > through
             for f in log._table.data_files()  # noqa: SLF001
         ), "a published file survived the pass that published it"
+        buffered = log._buffer.span()  # noqa: SLF001
+        assert buffered is None or buffered[0] > through
         assert log.scan().read_all().num_rows == ROWS
 
 
@@ -579,6 +633,10 @@ def test_evict_bounds_narrow_what_is_dropped(tmp_path: Path) -> None:
         log.seal(flush=True)
         buffer = log._buffer  # noqa: SLF001
         assert buffer.span() == (1, ROWS + 1)
+
+        log.evict("buffer", end_offset=101)
+        assert buffer.span() == (1, ROWS + 1), "bounds cannot authorize eviction"
+        log.publish(flush=True)
 
         log.evict("buffer", end_offset=101)
         assert buffer.span() == (101, ROWS + 1)

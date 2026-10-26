@@ -2651,15 +2651,9 @@ class WriteHandle(LocalReadHandle):
         buffer. Reproduced against a zero-lag replica: 920 rows acknowledged,
         420 restored, `recovery()` reporting plain success.
 
-        Refusing — load with replication off, turn it on afterwards — would be
-        strictly worse, because `evict("buffer")` reads the same flag: turn
-        replication off and the next eviction stops retaining its rows, so the
-        buffer's copy of everything ALREADY captured is dropped. Measured on a
-        replicated log with a published table: 300 sealed rows retained in the
-        buffer, `set_config(wal_replication=False)`, one more seal, and all 300
-        are gone from it with the published table holding none. The range is
-        uncovered until `publish` either way; what closes it is the push below,
-        flushed by default on a replicated log.
+        Buffer eviction keeps captured rows until publication regardless of
+        this flag. Loaded rows bypass the buffer, so their range needs the
+        push below, flushed by default on a replicated log.
 
         **This pushes its own output to the published table**, and
         `publish=False` opts out. The push runs after the load is durable, so a
@@ -4113,7 +4107,7 @@ class WriteHandle(LocalReadHandle):
         2. `compact` — grows the in-progress file a step at a time, and merges
            a closed stretch of `compact_min_files` files;
         3. `publish` — staging to published, the files compaction is done with;
-        4. `evict("buffer")` — rows the next durable copy holds;
+        4. `evict("buffer")` — rows the published table holds;
         5. `evict("staging")` — files the published table holds, in the same
            pass (I4);
         6. `reclaim("buffer")`, only when `vacuum_free_ratio` is set — the one
@@ -4218,17 +4212,21 @@ class WriteHandle(LocalReadHandle):
         start_offset: int | None = None,
         end_offset: int | None = None,
     ) -> None:
-        """Drop data the next durable copy already holds (§8, #122). `table` is
+        """Drop data the published table already holds (§8, #122). `table` is
         `"buffer"`, `"staging"`, or None for both, buffer first.
 
-        One rule for both: never drop data until the next durable copy has it.
+        One rule for both: never drop data until the published table has it.
 
-        - **`"buffer"`**: rows staging holds — or, with `wal_replication`, rows
-          the published table holds, since until then the buffer is their
-          off-box copy (§3a). A seal never deletes its own rows; this does.
+        - **`"buffer"`**: rows the published table holds, regardless of WAL
+          replication. A seal never deletes its own rows; this does.
         - **`"staging"`**: files past `staging_retention` / `staging_max_bytes` that
           the published table holds (I4). Never past what it holds, so a
           publish that is behind delays this rather than losing data.
+
+        Evict the buffer before staging, as `advance` does: staging files
+        prove the published prefix. If staging is empty, buffer eviction
+        keeps already-published rows until the next file is sealed and
+        published.
 
         `[start_offset, end_offset)` — half-open, like `scan` — narrows what is
         eligible; it never widens it. **Chunking is the caller's.** Unbounded,

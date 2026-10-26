@@ -277,16 +277,9 @@ def test_ingest_is_refused_while_a_seal_is_in_flight(tmp_path: Path) -> None:
 def test_ingest_runs_under_wal_replication_and_says_what_it_does_not_cover(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """It used to refuse this, and refusing was strictly worse.
+    """WAL shipping cannot carry a bulk range: its rows bypass the buffer.
 
-    WAL shipping genuinely cannot carry a bulk range — those rows never enter
-    the buffer. But `evict("buffer")` reads the same flag, so the prescribed
-    workaround of turning replication off to load would drop the buffer's copy
-    of everything already captured: to protect rows that cannot be replicated,
-    it stripped the off-box copy from rows that were.
-
-    The load now pushes its own output, so the scope statement is narrower than
-    it was: WAL still cannot carry a bulk range, but the published table has it before
+    The load pushes its own output, so the published table has it before
     `ingest` returns. Note the knock-on asserted below — the push is a PREFIX,
     so it takes the captured rows as well, and `evict("buffer")` then drops
     what the published table holds. The rows move from buffer to bucket; they are never

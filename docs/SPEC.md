@@ -59,7 +59,7 @@ along, and steps 4–10 clean up what they left behind.
   └───────────────────────────┘
 
   then cleanup:
-     4. evict("buffer")        rows staging holds (published, with wal_replication)
+     4. evict("buffer")        rows published holds
      5. evict("staging")       files published holds, never before (I4)
      6. reclaim("buffer")      VACUUM buffer.db         only with vacuum_free_ratio
      7. reclaim("staging")     expire old snapshots, then delete files past their grace
@@ -200,8 +200,8 @@ The writer assigns `litelink_offset`; Iceberg then computes its min/max as ordin
 statistics, which is what §7 reads.
 
 A bare `INTEGER PRIMARY KEY` is a rowid alias assigned as `max(rowid)+1` — and buffer rows
-are **deleted once something off-box holds them** — at the seal, or by `publish` with
-`wal_replication` (§3a). Once the table empties, the next insert reuses offsets
+are **deleted once the published table holds them**, by `evict("buffer")` (§8).
+Once the table empties, the next insert reuses offsets
 already committed to Iceberg, silently destroying monotonicity and corrupting every
 boundary read.
 
@@ -392,16 +392,11 @@ an operator's concern, which is why the platform wheels ship it: leaving it to `
 discovery of a missing binary inside a failover. A `litelink replicate` that daemonised would
 be the real crossing, and there is deliberately none.
 
-**`wal_replication` is a declaration, not a supervisor.** This paragraph used to say the
-opposite — that replication is not configured in `LogConfig`, because a boolean claiming a
-sidecar was running would be a setting nothing reads. The flag exists now, and it is read:
-`evict("buffer")` consults it to decide whether rows stay in SQLite until the published table
-has them, and `validate` refuses it without a remote (`s3://`) published
-table to ship to and refuses `wal_retention` without it. What it still does not do is assert
-that a sidecar is running, which the library cannot know. So it states an intent the deployment has to honour, and
-stating it falsely costs the growth without buying the durability that growth was traded
-for: the buffer holds its rows, nothing ships them, and `evict("buffer")` releases them only
-once `publish` has reached the range.
+**`wal_replication` is a declaration, not a supervisor.** `validate` refuses it without a
+remote (`s3://`) published table to ship to and refuses `wal_retention` without it.
+It states an intent the deployment has to honour, never that a sidecar is running, which
+the library cannot know. Buffer eviction waits for publication on every log, regardless
+of this flag; without the sidecar, retained buffer rows have no WAL replica off the machine.
 
 **The sidecar needs a monotonic clock that does not run backwards.** litestream reports a
 measured interval through a Prometheus counter, which panics on a negative value, so one
@@ -455,16 +450,18 @@ of a range the published table did not hold yet — and the machine dying in tha
 from the MIDDLE of the offset space: below the seal frontier so the buffer no longer had
 them, above the published frontier so the bucket did not either.
 
-**So a seal never deletes its rows; `evict("buffer")` does** (#122), and with `wal_replication`
-on it waits until the published table holds the range. It is I4 one tier up: never drop data
-until the next durable copy has it. Reads are unaffected — the buffer leg is bounded by the
+**A seal never deletes its rows; `evict("buffer")` does** (#122), and on every log
+it waits until the published table holds the range. It is I4 one tier up: never drop data
+until the published copy has it. Reads are unaffected — the buffer leg is bounded by the
 staging table's committed extent (§7), so held rows never reach the engine, and a scan that
 ends below that extent skips the buffer entirely — and the cost is that `buffer.db` grows with
 publish lag, which a stalled publish makes unbounded, like a stalled eviction (§11).
 
-The gate is `wal_replication`, not "a published table is configured": with no sidecar the buffer
-and the Parquet share a disk and die together, so the next durable copy is staging, and
-`evict("buffer")` drops rows as soon as a seal has committed them there.
+The rule also applies without WAL replication and with a local-default published table.
+Sealed rows stay buffered until publication, usually in the same `advance` pass; the trailing
+run held back for compaction stays longer. A failing remote publish grows the buffer as well
+as staging. Direct `ingest()` and `restore` ranges are the exception: their rows bypass the
+buffer, so staging holds their only copy until publication.
 
 ```
 RPO = WAL replication lag        (with wal_replication)
@@ -1836,8 +1833,18 @@ Raising it applies to data captured afterwards. Reading older data often is the 
 disk cache's job (#118), not the staging table's: it keeps what is read from the published
 table, across restarts, without writing to either table.
 
-Buffer rows are deleted by `evict("buffer")` once the next durable copy holds them — staging,
-or the published table with `wal_replication` (§3a). There is no SQLite retention knob.
+Buffer rows are deleted by `evict("buffer")` only once the published table holds them,
+regardless of WAL replication (§3a). Its boundary is the end of the longest prefix of staging
+files with confirmed published coverage; upload intents do not count. This uses the buffer's
+own publication record and needs no network read. Half-open offset bounds only narrow it.
+There is no SQLite retention knob.
+
+Evict the buffer before staging, as `advance` and `retire` do: the files prove that prefix.
+If standalone staging eviction removes every file first, the boundary is 0 and the buffer
+keeps already-published rows until the next file is sealed and published. This delays cleanup
+without losing rows. Existing logs retain rows from the first pass using this rule; rows an
+older build already evicted remain in staging until publication. An older build can reopen
+the same format safely, but resumes staging-based eviction while it runs.
 
 ---
 
