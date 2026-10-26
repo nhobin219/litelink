@@ -27,7 +27,9 @@ from litelink._published import Published
 from litelink._read import Reader, duckdb_connection, secret_sql
 from litelink._replication import WAL_PREFIX
 from litelink._s3 import S3Options
-from litelink._table import LogTable
+from litelink._sqlite import SqliteBackend
+from litelink._table import LogTable, SqlitePublishedCatalog
+from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
     import json
@@ -67,14 +69,16 @@ def test_init_does_no_io(tmp_path: Path) -> None:
     layout = Layout(tmp_path / "does-not-exist", "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = Buffer.open(layout.buffer_db, SCHEMA)
+    buffer = Buffer.open(SqliteBackend.open(layout.buffer_db), SCHEMA, name="s")
 
     config = LogConfig()
     # Local-only, and still a real object: the reader, the maintainer and the
     # WriteHandle are handed the same one. It stores no location — it reads the log's,
     # which is fixed when the log is created.
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    published = Published(layout, buffer, S3Options())
+    published = Published(
+        layout, buffer, S3Options(), catalog=SqlitePublishedCatalog(layout)
+    )
     log = WriteHandle(
         layout=layout,
         table=table,
@@ -105,10 +109,12 @@ def test_a_stub_buffer_can_be_injected(tmp_path: Path) -> None:
     layout = Layout(tmp_path, "s")
     layout.create()
     table = LogTable.create(layout, table_schema(SCHEMA), ("event_ts",))
-    buffer = StubBuffer.open(layout.buffer_db, SCHEMA)
+    buffer = StubBuffer.open(SqliteBackend.open(layout.buffer_db), SCHEMA, name="s")
     config = LogConfig()
     buffer.set_meta(SORT_KEY, json.dumps(["event_ts"]))
-    published = Published(layout, buffer, S3Options())
+    published = Published(
+        layout, buffer, S3Options(), catalog=SqlitePublishedCatalog(layout)
+    )
 
     log = WriteHandle(
         layout=layout,
@@ -244,7 +250,9 @@ def test_a_log_with_no_stored_config_refuses_to_open(tmp_path: Path) -> None:
     litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)).close()
 
     log = litelink.open(tmp_path, "s")
-    log._buffer._con.execute("DELETE FROM meta WHERE k = 'config'")
+    with sqlite_backend(log._buffer).write() as cur:
+        cur.execute("DELETE FROM meta WHERE k = 'config'")
+
     log.close()
 
     with pytest.raises(ValueError, match="no stored config"):
@@ -346,9 +354,10 @@ def test_a_log_buffer_fsyncs_on_every_commit(tmp_path: Path) -> None:
     — the exact loss this library exists to prevent. 2 is SQLite's code for
     FULL.
     """
-    buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
+    buffer = Buffer.open(SqliteBackend.open(tmp_path / "b.db"), SCHEMA, name="s")
     try:
-        assert buffer._con.execute("PRAGMA synchronous").fetchone()[0] == 2
+        with sqlite_backend(buffer).read() as cur:
+            assert cur.execute("PRAGMA synchronous").fetchone()[0] == 2
     finally:
         buffer.close()
 
@@ -699,8 +708,8 @@ def test_a_log_from_the_lease_era_refuses_to_open(tmp_path: Path) -> None:
     """
     log = litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",))
     with log:
-        with log._buffer._lock:
-            log._buffer._con.execute(
+        with sqlite_backend(log._buffer).write() as cur:
+            cur.execute(
                 "CREATE TABLE lease (role TEXT PRIMARY KEY, owner TEXT, expires_at INT)"
             )
 
@@ -826,9 +835,12 @@ def test_a_log_with_no_stored_sort_order_is_refused(tmp_path: Path) -> None:
     with litelink.new(tmp_path, "s", schema=SCHEMA, sort_by=("event_ts",)):
         pass
 
-    buffer = Buffer.open(Layout(tmp_path, "s").buffer_db, SCHEMA)
+    buffer = Buffer.open(
+        SqliteBackend.open(Layout(tmp_path, "s").buffer_db), SCHEMA, name="s"
+    )
     try:
-        buffer._con.execute("DELETE FROM meta WHERE k = 'sort_by'")  # noqa: SLF001
+        with sqlite_backend(buffer).write() as cur:
+            cur.execute("DELETE FROM meta WHERE k = 'sort_by'")  # noqa: SLF001
     finally:
         buffer.close()
 
@@ -850,7 +862,7 @@ def test_seeding_the_sequence_forward_is_allowed_backward_is_not(
     ignored, every following row lands on an offset belonging to different
     data, and nothing downstream can detect it.
     """
-    buffer = Buffer.open(tmp_path / "b.db", SCHEMA)
+    buffer = Buffer.open(SqliteBackend.open(tmp_path / "b.db"), SCHEMA, name="s")
     try:
         buffer.append([{"event_ts": i, "key": "k"} for i in range(2)])
         highest = buffer.next_offset() - 1
@@ -1017,7 +1029,7 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
     ratio assertion fails with most of the file on the free list.
     """
     payload = "k" * 400
-    buffer = Buffer.open(tmp_path / "buffer.db", SCHEMA)
+    buffer = Buffer.open(SqliteBackend.open(tmp_path / "buffer.db"), SCHEMA, name="s")
     try:
         issued: list[int] = []
         for _ in range(12):
@@ -1031,10 +1043,11 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
         # Then punch holes in what is left, so a renumbering rewrite would show
         # up as closed gaps rather than having to be inferred.
         survivors = [o for o in issued if o > boundary and o % 3 == 0]
-        buffer._con.executemany(  # noqa: SLF001
-            'DELETE FROM buffer WHERE "litelink_offset" = ?',
-            [(o,) for o in issued if o > boundary and o % 3 != 0],
-        )
+        with sqlite_backend(buffer).write() as cur:
+            cur.executemany(  # noqa: SLF001
+                'DELETE FROM buffer WHERE "litelink_offset" = ?',
+                [(o,) for o in issued if o > boundary and o % 3 != 0],
+            )
 
         before = _page_stats(buffer)
 
@@ -1050,12 +1063,13 @@ def test_reclaiming_the_buffer_frees_pages_and_keeps_every_offset(
             f"the buffer kept {free}/{pages} pages free after a reclaim"
         )
 
-        live = [
-            int(row[0])
-            for row in buffer._con.execute(  # noqa: SLF001
-                'SELECT "litelink_offset" FROM buffer ORDER BY "litelink_offset"'
-            )
-        ]
+        with sqlite_backend(buffer).read() as cur:
+            live = [
+                int(row[0])
+                for row in cur.execute(  # noqa: SLF001
+                    'SELECT "litelink_offset" FROM buffer ORDER BY "litelink_offset"'
+                )
+            ]
 
         assert live == survivors, "offsets were renumbered or gaps were closed"
         assert buffer.append([{"event_ts": 1, "key": "after"}]) == [max(issued) + 1], (
@@ -1075,14 +1089,15 @@ def test_reclaiming_a_small_buffer_does_nothing(tmp_path: Path) -> None:
     Falsify by removing the `_VACUUM_FLOOR_BYTES` term: this reclaims, and every
     log pays a write stall from its first pass onward.
     """
-    buffer = Buffer.open(tmp_path / "buffer.db", SCHEMA)
+    buffer = Buffer.open(SqliteBackend.open(tmp_path / "buffer.db"), SCHEMA, name="s")
     try:
         # Enough to leave a free list that is most of the file, and far enough
         # under the floor that reclaiming it would be pure cost.
         issued = buffer.append({"event_ts": i, "key": "k" * 400} for i in range(4000))
         buffer.evict_rows(0, issued[-1] + 1)
         pages, free = _page_stats(buffer)
-        page_size = int(buffer._con.execute("PRAGMA page_size").fetchone()[0])  # noqa: SLF001
+        with sqlite_backend(buffer).read() as cur:
+            page_size = int(cur.execute("PRAGMA page_size").fetchone()[0])  # noqa: SLF001
 
         assert free / pages >= 0.5, "the premise is a mostly-empty file"
         assert free * page_size < 8 * 1024 * 1024, "the premise is that it is SMALL"
@@ -1093,12 +1108,11 @@ def test_reclaiming_a_small_buffer_does_nothing(tmp_path: Path) -> None:
 
 def _page_stats(buffer: Buffer) -> tuple[int, int]:
     """`(page_count, freelist_count)` for the buffer's own connection."""
-    con = buffer._con  # noqa: SLF001
-
-    return (
-        int(con.execute("PRAGMA page_count").fetchone()[0]),
-        int(con.execute("PRAGMA freelist_count").fetchone()[0]),
-    )
+    with sqlite_backend(buffer).read() as cur:
+        return (
+            int(cur.execute("PRAGMA page_count").fetchone()[0]),
+            int(cur.execute("PRAGMA freelist_count").fetchone()[0]),
+        )
 
 
 def test_vacuum_free_ratio_survives_the_round_trip_and_is_bounded() -> None:

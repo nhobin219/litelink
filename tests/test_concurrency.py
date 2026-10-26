@@ -22,6 +22,7 @@ import pytest
 
 import litelink
 from litelink import LogConfig, WriteHandle
+from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -120,7 +121,8 @@ def test_appends_and_reads_interleave_without_loss(tmp_path: Path) -> None:
         # Monotonic: a count may lag, but must never go backwards.
         assert seen == sorted(seen), f"rows disappeared mid-flight: {seen}"
 
-        check = log._buffer._con.execute("PRAGMA integrity_check").fetchall()
+        with sqlite_backend(log._buffer).read() as cur:
+            check = cur.execute("PRAGMA integrity_check").fetchall()
 
         assert check == [("ok",)], f"buffer database damaged: {check}"
 
@@ -231,7 +233,7 @@ def test_a_seal_does_not_read_a_scan_s_pinned_snapshot(tmp_path: Path) -> None:
 
         buffer = log._buffer
         # Pin a snapshot on the shared read connection, as a scan's fetch does.
-        pinned = buffer._reader.execute("SELECT * FROM buffer")
+        pinned = sqlite_backend(buffer)._tail.execute("SELECT * FROM buffer")
         pinned.fetchone()
         try:
             log.extend([{"event_ts": i, "key": "k"} for i in range(10, 20)])

@@ -23,6 +23,7 @@ from litelink import OFFSET, LogConfig, RetiredError, WriteHandle
 from litelink._buffer import Buffer
 from litelink._layout import Layout
 from litelink._replication import control_socket, litestream_binary
+from litelink._sqlite import SqliteBackend
 from litelink._table import RETIRED_PROPERTY
 from tests.conftest import keep_newest_rows
 from tests.test_publish import ROWS, published_log, rows
@@ -276,7 +277,7 @@ def test_restore_refuses_on_the_published_table_alone(
         backup(Layout(primary, "s").buffer_db, Layout(second, "s").buffer_db)
         log.retire()
 
-    assert Buffer.peek_retired(Layout(second, "s").buffer_db) is None
+    assert SqliteBackend.peek_retired(Layout(second, "s").buffer_db) is None
     with pytest.raises(RetiredError, match="retired"):
         litelink.restore(second, "s", published=where, s3_options=s3)
 
@@ -399,7 +400,7 @@ def test_retire_flushes_the_replica_through_the_running_sidecar(
             sidecar.terminate()
             sidecar.wait(timeout=10)
 
-    marker = Buffer.peek_retired(restored)
+    marker = SqliteBackend.peek_retired(restored)
     assert marker is not None
     assert marker["state"] == "retired"
 

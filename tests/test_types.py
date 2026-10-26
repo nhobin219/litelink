@@ -16,6 +16,7 @@ import pytest
 import litelink
 from litelink import LogConfig
 from litelink._types import column_type, validate_schema
+from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -184,7 +185,9 @@ def test_a_log_with_no_stored_schema_refuses_to_open(tmp_path: Path) -> None:
     litelink.new(tmp_path, "s", schema=schema, sort_by=("event_ts",)).close()
 
     log = litelink.open(tmp_path, "s")
-    log._buffer._con.execute("DELETE FROM meta WHERE k = 'arrow_schema'")
+    with sqlite_backend(log._buffer).write() as cur:
+        cur.execute("DELETE FROM meta WHERE k = 'arrow_schema'")
+
     log.close()
 
     with pytest.raises(ValueError, match="no stored Arrow schema"):

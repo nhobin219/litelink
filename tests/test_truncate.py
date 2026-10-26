@@ -13,8 +13,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import litelink
+import litelink._handle as handle
 from litelink import LogConfig, WriteHandle
 from litelink._handle import MAINTAIN_ROLE
+from tests.conftest import sqlite_backend
 from tests.test_log import open_log, rows
 
 if TYPE_CHECKING:
@@ -210,8 +213,6 @@ def test_a_lapsed_claim_never_narrows_over_an_eviction(
     Falsify by dropping that `checkpoint` from `_record_published_row`: rows
     5-8 are missing from the scan.
     """
-    import litelink
-    import litelink._handle as handle
 
     config = LogConfig(
         target_seal_size=1 << 30,
@@ -228,8 +229,9 @@ def test_a_lapsed_claim_never_narrows_over_an_eviction(
             if not stalled:
                 stalled.append(True)
                 # The walk outran the TTL, and a maintainer got in.
-                log._buffer._con.execute("UPDATE claim SET expires_at = 0")
-                log._buffer._con.commit()
+                with sqlite_backend(log._buffer).write() as cur:
+                    cur.execute("UPDATE claim SET expires_at = 0")
+
                 maintainer.evict("staging", end_offset=9)
 
             real(renew)

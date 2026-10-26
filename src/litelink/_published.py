@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 
 from litelink._layout import is_remote
 from litelink._s3 import S3Options
-from litelink._table import HintedTable, LogTable, PublishedAbsent
+from litelink._table import HintedTable, LogTable, PublishedAbsent, PublishedCatalog
 
 if TYPE_CHECKING:
     from litelink._buffer import Buffer
@@ -67,7 +67,10 @@ class Published:
         layout: Layout,
         buffer: Buffer,
         s3: S3Options | None = None,
+        *,
+        catalog: PublishedCatalog,
     ) -> None:
+        self._catalog = catalog
         self._layout = layout
         self._buffer = buffer
         self._s3 = s3 or S3Options()
@@ -155,6 +158,7 @@ class Published:
                             self._s3,
                             self._buffer.shape().table,
                             self._buffer.sort_by(),
+                            published_catalog=self._catalog,
                             repair=repair,
                         )
                 except PublishedAbsent:

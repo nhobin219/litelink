@@ -24,6 +24,9 @@ from litelink import LogConfig, WriteHandle
 from litelink._claim import Claim, new_owner
 from litelink._handle import EVERYTHING
 from litelink._layout import Layout
+from litelink._sqlite import SqliteBackend
+from litelink._transaction import WriteLock
+from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -64,14 +67,16 @@ def test_a_lease_is_never_a_passenger_in_another_transaction(tmp_path: Path) -> 
             taken.append(lease.acquire())
             acquired.set()
 
-        with buffer._lock:
-            buffer._con.execute("BEGIN IMMEDIATE")
+        with (
+            pytest.raises(RuntimeError, match="roll back"),
+            sqlite_backend(buffer).write(),
+        ):
             grabber = threading.Thread(target=take)
             grabber.start()
             # Without the lock on the lease, this lands inside the transaction
             # below and is undone by it.
             acquired.wait(0.5)
-            buffer._con.execute("ROLLBACK")
+            raise RuntimeError("roll back")
 
         grabber.join(5)
 
@@ -82,9 +87,7 @@ def test_a_lease_is_never_a_passenger_in_another_transaction(tmp_path: Path) -> 
 def test_a_second_owner_is_refused(tmp_path: Path) -> None:
     with open_log(tmp_path) as log:
         ours = log._lease("seal")
-        theirs = Claim(
-            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
-        )
+        theirs = log._buffer.claim("seal", 0, EVERYTHING, new_owner())
 
         assert ours.acquire()
         assert not theirs.acquire(), "two owners held the same role"
@@ -117,9 +120,7 @@ def test_an_expired_lease_can_be_taken_over(tmp_path: Path) -> None:
     same file to the same name.
     """
     with open_log(tmp_path) as log:
-        dying = Claim(
-            log._buffer._con,
-            log._buffer._lock,
+        dying = log._buffer.claim(
             "seal",
             0,
             EVERYTHING,
@@ -146,9 +147,7 @@ def test_recovery_leaves_another_owners_seal_alone(tmp_path: Path) -> None:
 
     # Someone else holds the seal role and is still working. Taken on the
     # holder's own connection so it outlives the WriteHandle opened below.
-    other = Claim(
-        holder._buffer._con, holder._buffer._lock, "seal", 0, EVERYTHING, new_owner()
-    )
+    other = holder._buffer.claim("seal", 0, EVERYTHING, new_owner())
     assert other.acquire()
 
     with open_log(tmp_path) as reopened:
@@ -188,9 +187,7 @@ def test_maintain_does_nothing_while_another_owner_holds_the_range(
 
         assert before >= 2
 
-        other = Claim(
-            log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
-        )
+        other = log._buffer.claim("maintain", 0, EVERYTHING, new_owner())
 
         assert other.acquire()
 
@@ -218,9 +215,7 @@ def test_a_rejected_maintain_does_not_strand_the_lease(tmp_path: Path) -> None:
     with pytest.raises(Exception):  # noqa: B017, PT011 - any refusal will do
         log.publish()
 
-    other = Claim(
-        log._buffer._con, log._buffer._lock, "maintain", 0, EVERYTHING, new_owner()
-    )
+    other = log._buffer.claim("maintain", 0, EVERYTHING, new_owner())
 
     assert other.acquire(), "the refused call kept the lease"
 
@@ -315,9 +310,7 @@ def test_a_writer_defers_to_a_sealer_in_another_process(tmp_path: Path) -> None:
     with open_log(tmp_path, config=config) as log:
         log.extend(rows(400))
 
-        elsewhere = Claim(
-            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
-        )
+        elsewhere = log._buffer.claim("seal", 0, EVERYTHING, new_owner())
         assert elsewhere.acquire(), "could not simulate another sealer"
 
         # The cut is recorded either way — that is `seal`'s promise and it does
@@ -355,9 +348,7 @@ def test_a_replayed_seal_hands_the_lease_back(tmp_path: Path) -> None:
         assert log.seal() == end, "the replay did not finish the seal"
 
         # The role must be free again immediately, not in thirty seconds.
-        taker = Claim(
-            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
-        )
+        taker = log._buffer.claim("seal", 0, EVERYTHING, new_owner())
 
         assert taker.acquire(), "the replay path kept the seal lease"
 
@@ -394,9 +385,7 @@ def test_a_lapsed_writer_cannot_commit_or_clear_a_successors_claim(
 
         assert lapsed.acquire()
         time.sleep(0.05)
-        stolen = Claim(
-            log._buffer._con, log._buffer._lock, "seal", 0, EVERYTHING, new_owner()
-        )
+        stolen = log._buffer.claim("seal", 0, EVERYTHING, new_owner())
 
         assert stolen.acquire(), "could not simulate the takeover"
 
@@ -432,8 +421,8 @@ def test_a_lapsed_claim_renews_only_while_nobody_has_taken_it(
         assert stalled.acquire()
 
         # Expired in place, and nobody wants the range.
-        with log._buffer._lock:
-            log._buffer._con.execute(
+        with sqlite_backend(log._buffer).write() as cur:
+            cur.execute(
                 "UPDATE claim SET expires_at = 1 WHERE id = ?", (stalled.row_id,)
             )
 
@@ -442,8 +431,8 @@ def test_a_lapsed_claim_renews_only_while_nobody_has_taken_it(
         assert stalled.held()
 
         # Now expire it again and let another owner take the range.
-        with log._buffer._lock:
-            log._buffer._con.execute(
+        with sqlite_backend(log._buffer).write() as cur:
+            cur.execute(
                 "UPDATE claim SET expires_at = 1 WHERE id = ?", (stalled.row_id,)
             )
 
@@ -466,7 +455,6 @@ def test_a_buffer_with_the_inclusive_column_names_is_renamed_on_open(
     Falsify by dropping `_rename_range_columns` from `Buffer._create`: the
     claim insert names a column the old table does not have.
     """
-    import sqlite3
 
     open_log(tmp_path).close()
     db = Layout(tmp_path, "s").buffer_db
@@ -479,10 +467,9 @@ def test_a_buffer_with_the_inclusive_column_names_is_renamed_on_open(
 
     with litelink.open(tmp_path, "s") as log:
         for table in ("claim", "compacting"):
-            columns = {
-                row[1]
-                for row in log._buffer._con.execute(f"PRAGMA table_info({table})")
-            }
+            with sqlite_backend(log._buffer).read() as cur:
+                columns = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
+
             assert {"start_offset", "end_offset"} <= columns
             assert not {"lo", "hi"} & columns
 
@@ -503,9 +490,18 @@ class _CommitThenRaise:
     """A connection whose COMMIT lands and then raises — an error, or a
     signal, arriving inside it (#187)."""
 
-    def __init__(self, connection: sqlite3.Connection, error: BaseException) -> None:
+    def __init__(
+        self, connection: sqlite3.Connection | sqlite3.Cursor, error: BaseException
+    ) -> None:
         self._connection = connection
         self._error = error
+
+    def cursor(self) -> _CommitThenRaise:
+        assert isinstance(self._connection, sqlite3.Connection)
+        return _CommitThenRaise(self._connection.cursor(), self._error)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
 
     def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
         result = self._connection.execute(sql, parameters)
@@ -534,9 +530,14 @@ def test_a_failure_inside_commit_raises_itself_and_orphans_no_claim(
     open_log(tmp_path).close()
     connection = sqlite3.connect(Layout(tmp_path, "s").buffer_db, isolation_level=None)
     try:
-        claim = Claim(
+        backend = SqliteBackend(
             _CommitThenRaise(connection, error),  # ty: ignore[invalid-argument-type]
-            threading.RLock(),
+            connection,
+            connection,
+            WriteLock(),
+        )
+        claim = Claim(
+            backend,
             "publish",
             1,
             10,
@@ -549,7 +550,48 @@ def test_a_failure_inside_commit_raises_itself_and_orphans_no_claim(
         assert connection.execute("SELECT COUNT(*) FROM claim").fetchone() == (0,)
         assert claim.row_id is None
 
-        other = Claim(connection, threading.RLock(), "publish", 1, 10, new_owner())
+        other = Claim(
+            SqliteBackend(connection, connection, connection, WriteLock()),
+            "publish",
+            1,
+            10,
+            new_owner(),
+        )
         assert other.acquire()
     finally:
         connection.close()
+
+
+def test_a_stop_signal_during_failed_claim_cleanup_propagates(tmp_path: Path) -> None:
+    """Falsify by suppressing BaseException around acquire's cleanup: the
+    first OperationalError replaces the KeyboardInterrupt that follows it.
+    """
+    errors = [sqlite3.OperationalError("first commit"), KeyboardInterrupt()]
+
+    class InterruptedCleanup(_CommitThenRaise):
+        def cursor(self) -> InterruptedCleanup:
+            assert isinstance(self._connection, sqlite3.Connection)
+            return InterruptedCleanup(self._connection.cursor(), errors[0])
+
+        def execute(
+            self, sql: str, parameters: tuple[object, ...] = ()
+        ) -> sqlite3.Cursor:
+            result = self._connection.execute(sql, parameters)
+            if sql == "COMMIT":
+                raise errors.pop(0)
+
+            return result
+
+    with open_log(tmp_path) as log:
+        backend = sqlite_backend(log)
+        real = backend._writer
+        backend._writer = InterruptedCleanup(real, errors[0])  # ty: ignore[invalid-assignment]
+        claim = log._buffer.claim("publish", 1, 10, new_owner())
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                claim.acquire()
+
+            assert claim.row_id is None
+            assert errors == []
+        finally:
+            backend._writer = real

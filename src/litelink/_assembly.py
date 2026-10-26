@@ -36,6 +36,7 @@ from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._published import PUBLISHED_KEY, Published
 from litelink._read import Reader, duckdb_connection
+from litelink._sqlite import SqliteBackend
 from litelink._table import LogTable
 
 if TYPE_CHECKING:
@@ -103,7 +104,8 @@ def open(  # noqa: A001
     """
     layout = Layout(Path(root), name)
     table, schema = _existing(layout, name, readonly=read_only)
-    buffer = Buffer.open(layout.buffer_db, schema, readonly=read_only)
+    backend = SqliteBackend.open(layout.buffer_db, readonly=read_only)
+    buffer = Buffer.open(backend, schema, name=layout.name)
     try:
         # A retired log opens for reading only. One still RETIRING opens as a
         # writer, so `retire()` can be called again to finish it — its buffer
@@ -113,7 +115,9 @@ def open(  # noqa: A001
             raise buffer.retired_error()
 
         config = _validated_shape(layout, buffer, name)
-        remote = Published(layout, buffer, s3_options)
+        remote = Published(
+            layout, buffer, s3_options, catalog=backend.published_catalog()
+        )
         reader = Reader(layout, table, buffer, duckdb_connection, published=remote)
         if read_only:
             return LocalReadHandle(
@@ -197,7 +201,7 @@ def _validated_shape(layout: Layout, buffer: Buffer, name: str) -> LogConfig:
     change how a log seals and what it retains without saying so, and would
     de-cluster every file the next compaction rewrote.
     """
-    encoded = Buffer.peek_meta(layout.buffer_db, CONFIG_KEY)
+    encoded = SqliteBackend.peek_meta(layout.buffer_db, CONFIG_KEY)
     if encoded is None:
         msg = f"log at {layout.root}/{name} has no stored config; it is corrupt"
         raise ValueError(msg)

@@ -687,9 +687,7 @@ def test_a_local_log_never_loads_the_read_cache(
 def _claim(log: WriteHandle, start: int, end: int) -> Claim:
     """A claim held by another owner, as a concurrent seal or compaction holds
     one."""
-    other = Claim(
-        log._buffer._con,  # noqa: SLF001
-        log._buffer._lock,  # noqa: SLF001
+    other = log._buffer.claim(
         "other",
         start,
         end,

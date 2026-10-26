@@ -20,6 +20,7 @@ import pyarrow.parquet as pq
 
 import litelink
 from litelink import LogConfig, WriteHandle
+from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,13 +61,14 @@ def groups(log: WriteHandle) -> list[tuple[int, int | None, int | None, int]]:
     the file's name and stops being queue — so the queue is the extents that
     have no file yet.
     """
-    return [
-        (int(g), s, e, int(b))
-        for g, s, e, b in log._buffer._con.execute(
-            "SELECT group_id, start_offset, end_offset, bytes FROM extent"
-            " WHERE rel_path IS NULL ORDER BY group_id"
-        ).fetchall()
-    ]
+    with sqlite_backend(log._buffer).read() as cur:
+        return [
+            (int(g), s, e, int(b))
+            for g, s, e, b in cur.execute(
+                "SELECT group_id, start_offset, end_offset, bytes FROM extent"
+                " WHERE rel_path IS NULL ORDER BY group_id"
+            ).fetchall()
+        ]
 
 
 def quiet(**kwargs: object) -> LogConfig:
@@ -412,7 +414,8 @@ def test_reading_while_writing_does_not_corrupt_the_buffer(tmp_path: Path) -> No
 
         assert not failures, failures
 
-        check = log._buffer._con.execute("PRAGMA integrity_check").fetchall()
+        with sqlite_backend(log._buffer).read() as cur:
+            check = cur.execute("PRAGMA integrity_check").fetchall()
 
         assert check == [("ok",)], f"buffer database damaged: {check}"
 

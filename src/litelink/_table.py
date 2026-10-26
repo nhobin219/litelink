@@ -19,7 +19,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 from pyarrow.fs import FileSelector, FileSystem, FileType
 from pyiceberg.catalog import METADATA_LOCATION, Catalog
@@ -434,6 +434,35 @@ def catalog_name(database: Path, name: str) -> str:
     return legacy if legacy in names and name not in names else name
 
 
+class PublishedCatalog(Protocol):
+    @property
+    def name(self) -> str: ...
+    def catalog(self, warehouse: str, properties: Mapping[str, str]) -> _Catalog: ...
+    def recorded_location(self, table_id: str) -> str | None: ...
+
+
+class SqlitePublishedCatalog:
+    """The file-backed published catalog, including its legacy names."""
+
+    def __init__(self, layout: Layout) -> None:
+        self._layout = layout
+
+    @property
+    def name(self) -> str:
+        return catalog_name(self._layout.published_db, PUBLISHED_CATALOG)
+
+    def catalog(self, warehouse: str, properties: Mapping[str, str]) -> _Catalog:
+        return _Catalog(
+            self.name,
+            uri=self._layout.published_catalog_uri,
+            warehouse=warehouse,
+            **properties,
+        )
+
+    def recorded_location(self, table_id: str) -> str | None:
+        return _recorded_location(self._layout, table_id=table_id)
+
+
 class PublishedAbsent(LookupError):
     """No published table exists at the prefix yet.
 
@@ -445,7 +474,7 @@ class PublishedAbsent(LookupError):
     """
 
 
-def _recorded_location(layout: Layout) -> str | None:
+def _recorded_location(layout: Layout, *, table_id: str | None = None) -> str | None:
     """Where the published table's catalog entry says its metadata is, without
     a read.
 
@@ -473,7 +502,9 @@ def _recorded_location(layout: Layout) -> str | None:
     if not layout.published_db.exists():
         return None
 
-    namespace, _, name = layout.table_id.rpartition(".")
+    namespace, _, name = (layout.table_id if table_id is None else table_id).rpartition(
+        "."
+    )
     connection = sqlite3.connect(f"file:{layout.published_db}?mode=ro", uri=True)
     try:
         row = connection.execute(
@@ -934,6 +965,7 @@ class LogTable:
         schema: pa.Schema,
         sort_by: Sequence[str] = (),
         *,
+        published_catalog: PublishedCatalog,
         repair: bool = False,
     ) -> LogTable:
         """The published table, created on first use (§5).
@@ -984,7 +1016,7 @@ class LogTable:
         boundary = prefix.rstrip("/") + "/"
         if not repair:
             try:
-                known = _recorded_location(layout)
+                known = published_catalog.recorded_location(layout.table_id)
             except LookupError:
                 # Could not tell offline. Fall through and let pyiceberg
                 # answer, accepting the local writes that costs.
@@ -994,11 +1026,8 @@ class LogTable:
                 msg = f"no published table at {prefix!r} yet"
                 raise PublishedAbsent(msg)
 
-        catalog = _Catalog(
-            catalog_name(layout.published_db, PUBLISHED_CATALOG),
-            uri=layout.published_catalog_uri,
-            warehouse=prefix,
-            **options.resolved().catalog_properties(),
+        catalog = published_catalog.catalog(
+            prefix, options.resolved().catalog_properties()
         )
         catalog.create_namespace_if_not_exists(layout.table_id.split(".")[0])
 
@@ -1012,7 +1041,7 @@ class LogTable:
         # SIBLING published table's entry as this one's, and the log then reads
         # and writes into the neighbour it was pointed away from.
         try:
-            recorded = _recorded_location(layout)
+            recorded = published_catalog.recorded_location(layout.table_id)
         except LookupError:
             # Could not tell. Let pyiceberg answer: it either loads the table
             # or says there is none. Slower than the offline read, and it must

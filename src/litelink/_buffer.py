@@ -12,9 +12,9 @@ import json
 import math
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pyarrow as pa
 
@@ -23,8 +23,9 @@ from litelink._config import LogConfig
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
+from litelink._backend import BufferBackend, Cursor, PreparedRow
 from litelink._claim import DEFAULT_TTL_MS, Claim
-from litelink._transaction import SqliteTransaction, Transaction, WriteLock
+from litelink._transaction import CallerTransaction, Transaction
 from litelink._types import (
     NON_FINITE,
     Nested,
@@ -112,25 +113,29 @@ LEGACY_TIERS = {"staging": "local", "published": "archive"}
 _CURRENT_TIER = {old: new for new, old in LEGACY_TIERS.items()}
 
 
-def _meta_value(con: sqlite3.Connection, key: str) -> str | None:
+def _meta_value(con: Cursor, sql: Callable[[str], str], key: str) -> str | None:
     """`meta[key]`, or the value under its pre-#98 name."""
-    row = con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+    row = con.execute(sql("SELECT v FROM meta WHERE k = ?"), (key,)).fetchone()
     legacy = LEGACY_META.get(key)
     if row is None and legacy is not None:
-        row = con.execute("SELECT v FROM meta WHERE k = ?", (legacy,)).fetchone()
+        row = con.execute(sql("SELECT v FROM meta WHERE k = ?"), (legacy,)).fetchone()
 
     return None if row is None else str(row[0])
 
 
-def _write_meta(con: sqlite3.Connection, pairs: Mapping[str, str]) -> None:
+def _write_meta(
+    con: Cursor, sql: Callable[[str], str], pairs: Mapping[str, str]
+) -> None:
     """Upsert `pairs` under their current names, dropping any old-named row."""
     con.executemany(
-        "INSERT INTO meta (k, v) VALUES (?, ?) "
-        "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        sql(
+            "INSERT INTO meta (k, v) VALUES (?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v"
+        ),
         list(pairs.items()),
     )
     con.executemany(
-        "DELETE FROM meta WHERE k = ?",
+        sql("DELETE FROM meta WHERE k = ?"),
         [(LEGACY_META[k],) for k in pairs if k in LEGACY_META],
     )
 
@@ -184,35 +189,6 @@ _MAX_TAIL_CHUNKS = 32
 # per-column scan in C.
 _CONTAINS = frozenset.__contains__
 
-
-# IMMEDIATE, never a bare BEGIN. Every transaction here writes, and several read
-# first — an append reads the open `extent` row before inserting anything.
-# A deferred transaction that reads first takes a read snapshot, and if another
-# process has written since, SQLite refuses to upgrade it to a writer and
-# returns "database is locked" IMMEDIATELY: `busy_timeout` does not apply,
-# because waiting could not help a snapshot that is already stale.
-#
-# Taking the write lock up front makes the wait a lock wait, which the timeout
-# below does cover. Found by running the writer, the sealer and the maintainer
-# as three processes: the writer died the moment the other two started.
-_BEGIN = "BEGIN IMMEDIATE"
-
-# An append inside a caller's transaction (`Buffer.append` given `tx`).
-_SAVEPOINT = "SAVEPOINT litelink_append"
-_RELEASE = "RELEASE litelink_append"
-_ROLLBACK_TO = "ROLLBACK TO litelink_append"
-
-# Dead space below this is not worth an exclusive lock, whatever the ratio
-# says: a young log crosses any ratio on its first publish pass, and reclaiming
-# a few hundred KB there costs a write stall to save a rounding error on the
-# wire. Not configurable, because it is not a policy — it is the point below
-# which the policy cannot pay for itself. Sized to stay invisible against the
-# ~21 MB an ordinary restore already fetches.
-_VACUUM_FLOOR_BYTES = 8 * 1024 * 1024
-
-# Long enough to outlast a seal's brief write steps and a maintenance pass's
-# commits, since those are what an append now queues behind across processes.
-_BUSY_TIMEOUT_MS = 30_000
 
 # Every name litelink gives an object in `buffer.db`, and the one its offsets
 # live in. A caller's statement may not write these, nor create a table, view or
@@ -481,80 +457,10 @@ class Shape:
 class Buffer:
     """The unsealed tail of a log."""
 
-    def __init__(
-        self,
-        writer: sqlite3.Connection,
-        reader: sqlite3.Connection,
-        sealer: sqlite3.Connection,
-        schema: pa.Schema,
-    ) -> None:
-        """Take built collaborators. `open` is what builds and validates them.
-
-        `writer` is the connection every transaction here runs on; `reader` is
-        a second, read-only handle for the rows a seal is about to write out.
-        That read is the expensive half of a seal, and on the write connection
-        it would serialise against the appends a seal exists to stay out of the
-        way of. WAL allows it: one writer, any number of readers.
-
-        `schema` is the application's columns, without `offset`. Its names
-        used to be passed alongside it; they are derived in `Shape.of` now, so
-        the two cannot be handed in disagreeing — the positions in
-        `Shape.required` index the values tuple, and a caller that passed a
-        different order would have aimed them at the wrong columns.
-        `target_seal_size` is here rather than only on the seal because the cut
-        it describes is made on the append path — see `extent`.
-        """
-        self._con = writer
-        self._reader = reader
-        # A THIRD connection, for the seal alone, and it exists because
-        # `_reader` cannot be shared with it.
-        #
-        # `_rows` steps a statement for the whole of its `fetchall`, and in WAL
-        # a stepping statement pins that CONNECTION's read snapshot. Sharing
-        # one between a scan and a seal therefore hands the seal whatever
-        # snapshot the scan pinned — it writes its Parquet file from a stale
-        # view, and coverage-based eviction can then delete buffered rows through
-        # the group's end, including rows that never reached the file. Measured
-        # with the former seal-time deletion:
-        # 1,000 acknowledged offsets in neither tier, from a scan and a seal
-        # running concurrently through the public API.
-        #
-        # Readers do not need this among themselves: `rows_from` holds
-        # `_tail_lock` across its fetch, so only one steps at a time. A stale
-        # view would be self-correcting there anyway, and structurally so —
-        # offsets come from AUTOINCREMENT under one serialised writer and
-        # deletions are prefix-only, so what a stale snapshot lacks is always a
-        # SUFFIX, and `_rows(">= _tail_end")` cannot skip it.
-        #
-        # **This isolates the seal from READERS.** What keeps seals off each
-        # other is the CLAIM: `Claim.acquire` filters on range overlap and
-        # owner, not on kind, so it is a global range mutex. `_seal_queued`'s
-        # re-read of the queue head closes the one hole in that — a sealer
-        # whose claim succeeds because the range went free while it blocked,
-        # and which would otherwise read a group that is gone. Measured across
-        # 2.5M rows under four concurrent sealers: 0 overlapping reads here.
-        #
-        # Not an absolute, and the residual is the claim's TTL. Two overlapping
-        # claims can coexist only if one expired, so a read would have to run
-        # the full 30 s — about 15M rows at the measured 261 ms/150k, which
-        # needs `target_seal_size` far above its 8 MiB default. Both would then
-        # read the SAME range, whose rows were all committed before the group
-        # closed, so the joiner still sees them.
-        #
-        # **That re-read is load-bearing, and the cost of removing it is
-        # measured, not theoretical.** Without it a stale sealer reaches
-        # `rows_between` and pins this connection for the length of a full
-        # group read — 314 ms over 150k rows, against 8.5 ms for everything a
-        # victim must do inside that window. Same probe without the re-read:
-        # 49 stale pins and 48 overlapping reads over the same 2.5M rows, and
-        # a gated run loses 100 acknowledged offsets, written into a file whose
-        # recorded range is three times the rows it holds.
-        #
-        # An earlier version of this comment argued the overlap was harmless
-        # because the fsyncs cost more than the pin lasts. That is backwards by
-        # a factor of about 37, and it is recorded here so nobody restores the
-        # shortcut on the strength of it.
-        self._sealer = sealer
+    def __init__(self, backend: BufferBackend, schema: pa.Schema, *, name: str) -> None:
+        """Take built collaborators; the backend owns connections and their locks."""
+        self._backend = backend
+        self._log_name = name
         # What `shape()` falls back to when `meta` has no schema row yet:
         # `_create` runs inside `Buffer.open` BEFORE `litelink.new` writes the
         # row, and would otherwise fail at construction.
@@ -566,43 +472,8 @@ class Buffer:
         self._shape_cache: tuple[str, Shape] | None = None
         self._config_cache: tuple[str, LogConfig] | None = None
         self._sort_cache: tuple[str, tuple[str, ...]] | None = None
-        # The buffer serialises its own writes rather than leaving callers to
-        # agree on a lock. One write connection is reached by several threads —
-        # an append, a seal claiming and clearing its range, a maintenance pass
-        # queuing deletions — and two BEGINs at once is "cannot start a
-        # transaction within a transaction". Worse than the error: with
-        # autocommit suspended by someone else's BEGIN, an unrelated statement
-        # joins their transaction and commits or rolls back with it, which is
-        # how a lease once evaporated under its own holder.
-        #
-        # Assigned unconditionally, including for a readonly buffer. It used to
-        # be skipped there, which left `lease()` raising AttributeError on a
-        # handle that had every right to ask.
-        #
-        # The rule is every statement on `_con`, reads included — not just the
-        # transactions. A bare SELECT issued while another thread has a
-        # transaction open joins it and sees uncommitted rows, which a rollback
-        # then unmakes; that is the same mechanism that once let a lease
-        # evaporate under its holder.
-        #
-        # This used to say `_reader` needed none of it "precisely because
-        # nothing ever opens a transaction on it". **A stepping statement IS an
-        # open read transaction**, and `_rows` steps one for the whole of its
-        # `fetchall` — so that premise was false and cost acknowledged rows.
-        # What actually keeps `_reader` safe is that its one caller,
-        # `rows_from`, holds `_tail_lock` across the fetch; the seal reads on
-        # `_sealer` for the same reason. See `_sealer`.
-        #
-        # A caller's transaction (`transaction`) holds it for its whole block,
-        # which is why it is a `WriteLock` rather than a bare `RLock`: the
-        # thread holding the block may re-enter only through a call given its
-        # `tx`, and anything else from that thread is refused rather than
-        # joining the caller's transaction or rolling it back.
-        self._lock = WriteLock()
-        # The caller's transaction while one is open, compared by identity by
-        # every call given a `tx`: one of another log, or one whose block has
-        # ended, is not this.
-        self._tx: SqliteTransaction | None = None
+        # Identity and lifetime are shared by every call given tx, across backends.
+        self._tx: CallerTransaction | None = None
         # True while `_insert` iterates the caller's rows. The rows may be a
         # generator, and one that appends again from inside would cut the open
         # group under the outer call's in-memory copy of it, which then writes
@@ -646,33 +517,6 @@ class Buffer:
         self._tail_complete_from = 0
 
     @contextlib.contextmanager
-    def _transaction(self) -> Iterator[None]:
-        """One write transaction, rolled back if the body raises.
-
-        Every multi-statement write here goes through this. Four of them used
-        to open a transaction and commit with no rollback, which is worse than
-        it sounds: an error between BEGIN and COMMIT leaves the connection
-        inside a transaction with the lock released, and the next statement any
-        thread issues joins it — the mechanism that once erased a lease from
-        under its holder.
-        """
-        with self._lock:
-            self._con.execute(_BEGIN)
-            try:
-                yield
-                # Inside the guard, not after it. A COMMIT can fail on its own
-                # — a full disk, an I/O error — and leaving that unguarded put
-                # the connection back in the state this helper exists to
-                # prevent, with the lock released and the next statement any
-                # thread issues joining a transaction nobody owns.
-                self._con.execute("COMMIT")
-            except BaseException:
-                with contextlib.suppress(sqlite3.OperationalError):
-                    self._con.execute("ROLLBACK")
-
-                raise
-
-    @contextlib.contextmanager
     def transaction(self) -> Iterator[Transaction]:
         """A caller's write transaction on this buffer, for a `with` block.
 
@@ -688,25 +532,18 @@ class Buffer:
         a retired log to its successor reads them here, and nothing litelink
         guarantees about a retired log depends on them.
         """
-        with self._lock.hold():
-            self._con.execute(_BEGIN)
-            tx = SqliteTransaction(self._con, owned)
-            try:
+        tx = None
+        try:
+            with self._backend.write() as cursor:
+                tx = self._backend.caller_transaction(cursor)
                 self._tx = tx
                 yield tx
-                # Checked, not assumed: SQLite may have rolled the transaction
-                # back after an error the caller caught, and a COMMIT then
-                # would fail with a message that hides why.
                 tx.check()
-                self._con.execute("COMMIT")
-            except BaseException:
-                with contextlib.suppress(sqlite3.OperationalError):
-                    self._con.execute("ROLLBACK")
-
-                raise
-            finally:
+        finally:
+            if tx is not None:
                 tx.close()
-                self._tx = None
+
+            self._tx = None
 
     @contextlib.contextmanager
     def joined(self, tx: Transaction) -> Iterator[None]:
@@ -720,295 +557,20 @@ class Buffer:
             raise ValueError(msg)
 
         self._tx.check()
-        with self._lock.admit(), self._lock:
+        with self._backend.savepoint(self._tx):
             yield
 
         self._tx.check()
 
     @classmethod
-    def open(
-        cls,
-        path: Path,
-        schema: pa.Schema,
-        *,
-        readonly: bool = False,
-    ) -> Buffer:
-        """Connect, configure, and create the tables. Then hand them to `cls`.
-
-        The I/O half, kept out of `__init__` for the same reason `litelink.open`
-        is kept out of `WriteHandle.__init__`: a constructor that opens files
-        cannot be handed a substitute, and a test that wants one should not have
-        to monkeypatch its way in.
-
-        A readonly buffer opens the same file through SQLite's `mode=ro` URI so
-        the handle cannot write even by mistake, and creates nothing. WAL allows
-        any number of these alongside the single writer (§1).
-
-        """
-        if readonly:
-            con = cls._connect_readonly(path)
-
-            # A readonly buffer never seals, so it needs no third connection —
-            # `rows_between` is unreachable without a claim, which needs a
-            # writer.
-            return cls(
-                con,
-                con,
-                con,
-                schema,
-            )
-
-        # check_same_thread=False because scheduling maintenance on a background
-        # thread is the ordinary operational shape, and Python's guard would
-        # otherwise forbid it. The C library is built serialized here
-        # (`sqlite3.threadsafety == 3`), so the connection itself is safe; the
-        # lock is for the multi-statement sequences SQLite cannot know about.
-        writer = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        # WAL either way, and not for durability: the reader below is a second
-        # connection to the same file, which is what WAL exists to allow.
-        writer.execute("PRAGMA journal_mode=WAL")
-        writer.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        # §3's durability claim rests on this line. WAL alone fsyncs at
-        # checkpoint, not at commit, which would put committed rows back in the
-        # OS page cache — the exact loss this library exists to prevent.
-        writer.execute("PRAGMA synchronous=FULL")
-
-        buffer = cls(
-            writer,
-            cls._connect_readonly(path),
-            cls._connect_readonly(path),
-            schema,
-        )
-        buffer._create()
-        buffer._seed_group()
+    def open(cls, backend: BufferBackend, schema: pa.Schema, *, name: str) -> Buffer:
+        """Create the backend's tables and seed the coordinator before sharing it."""
+        buffer = cls(backend, schema, name=name)
+        if not backend.readonly:
+            backend.create(schema)
+            buffer._seed_group()
 
         return buffer
-
-    def _rename_range_columns(self, table: str) -> None:
-        """`lo`/`hi` → `start_offset`/`end_offset` on `table`, once."""
-        columns = {
-            str(row[1]) for row in self._con.execute(f"PRAGMA table_info({table})")
-        }
-        if "lo" in columns:
-            self._con.execute(f"ALTER TABLE {table} RENAME COLUMN lo TO start_offset")
-
-        if "hi" in columns:
-            self._con.execute(f"ALTER TABLE {table} RENAME COLUMN hi TO end_offset")
-
-    @staticmethod
-    def _connect_readonly(path: Path) -> sqlite3.Connection:
-        return sqlite3.connect(
-            f"file:{path}?mode=ro",
-            uri=True,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-
-    def _create(self) -> None:
-        """The schema. Unlocked, and the only place that is right.
-
-        This and `_seed_group` run inside `open`, before the buffer has been
-        handed to anyone, so there is no second thread to exclude. Every method
-        reachable afterwards takes the lock.
-        """
-        # `_fallback`, not `shape()`: this runs before the `meta` table it
-        # would read exists, and the schema handed to the constructor is the
-        # right source anyway — this call is what brings the table into being.
-        self._con.execute(_buffer_ddl(self._fallback))
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS sealing (
-              start_offset INTEGER, end_offset INTEGER, rel_path TEXT
-            )
-        """)
-        # The same intent record as `sealing`, for the other operation that
-        # creates a data file. Both exist so that no file is ever written whose
-        # path this database does not already hold — see `pending_delete`.
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS compacting (
-              start_offset INTEGER, end_offset INTEGER, rel_path TEXT
-            )
-        """)
-        # The deletion queue. A file leaves the current snapshot long before it
-        # may be deleted (I6), so the interval has to be remembered somewhere;
-        # remembering it here is what makes reclamation a keyed read of this
-        # table rather than a directory walk looking for things nobody claimed.
-        #
-        # `superseded_at`, not a precomputed deadline: the grace period is the
-        # owning table's snapshot retention, and freezing it at enqueue time
-        # would mean a lowered setting never applied to anything already queued.
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS pending_delete (
-              rel_path TEXT PRIMARY KEY, superseded_at INTEGER NOT NULL
-            )
-        """)
-        # The seal queue, and the reason `target_seal_size` means anything.
-        #
-        # A single running byte counter cannot keep that promise. It says a
-        # threshold was crossed, never WHERE — so a sealer that polls one cuts
-        # wherever the buffer has reached by the time it looks, swallowing
-        # everything that arrived during the poll gap and during the seal
-        # itself. File size would then track how far behind the sealer was.
-        #
-        # So the cut is made by the appender, in the transaction that crosses
-        # it, and written down here. A closed row is a file that ought to
-        # exist; the sealer reads one row to learn both that there is work and
-        # exactly which offsets it covers. Falling behind costs latency rather
-        # than file size, because every queued group is already the right size.
-        #
-        # The same shape as `pending_delete`: work that must not be rediscovered
-        # by scanning is recorded when it is created.
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS extent (
-              group_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-              start_offset INTEGER,
-              end_offset   INTEGER,
-              bytes        INTEGER NOT NULL DEFAULT 0,
-              rel_path     TEXT UNIQUE,
-              named_at     INTEGER
-            )
-        """)
-        # The two states that are still work, which is what every hot query
-        # wants and what stays small however many files the log accumulates.
-        # Without it `_read_group` — once per append transaction — degrades
-        # into a scan of one row per file ever written.
-        self._con.execute("""
-            CREATE INDEX IF NOT EXISTS extent_unsealed ON extent (group_id)
-            WHERE rel_path IS NULL
-        """)
-        # I4 per segment (§4a) reads the published copies covering what the
-        # staging table still holds. Without this the lookup is a scan of one
-        # row per file ever published, which grows without limit — the staging
-        # file count does not.
-        self._con.execute("""
-            CREATE INDEX IF NOT EXISTS extent_published ON extent (start_offset)
-            WHERE rel_path IS NOT NULL
-        """)
-        # Its pre-#98 name, which an old log carries: one index, not two.
-        self._con.execute("DROP INDEX IF EXISTS extent_archived")
-        # A copy that was INTENDED, beside `extent`'s copies that exist. The two
-        # are read by collaborators whose safe directions are opposite:
-        # compaction must not merge across a range some published table may
-        # hold, so it is safe when coverage is OVERSTATED; eviction must not
-        # delete the only copy, so it is safe only when coverage is UNDERSTATED.
-        # One record cannot be both, and collapsing them into one is what left a
-        # crash between a register and the rows recording it able to wedge the
-        # log.
-        #
-        # A separate table rather than a column on `extent`, because a build
-        # that predates this has no idea it exists — so its eviction query is
-        # unchanged and reads only landed copies, which is the safe polarity by
-        # construction. A column would have read to it as coverage, and no
-        # check in a new build can stop an old one.
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS extent_intent (
-              rel_path     TEXT PRIMARY KEY,
-              start_offset INTEGER NOT NULL,
-              end_offset   INTEGER NOT NULL,
-              bytes        INTEGER NOT NULL
-            )
-        """)
-        # Merged staging files that still have to replace published copies of
-        # their inputs (#160). A merge whose inputs were published early — by
-        # a flushed publish, before compaction was done with them — writes a
-        # file the published table does not hold yet, under a watermark that
-        # already covers it: `publish` swaps it in for those copies. Nothing
-        # local could tell that file from one already swapped, so it is
-        # recorded, from the merge's commit until the swap's.
-        #
-        # A table of its own, not a column on `extent`, for `extent_intent`'s
-        # reason: a build that predates it ignores it, and evicts such a file
-        # as published, which costs only the swap.
-        self._con.execute(
-            "CREATE TABLE IF NOT EXISTS awaiting_swap (rel_path TEXT PRIMARY KEY)"
-        )
-        self._con.execute(
-            "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
-        )
-        # A stored tier's offset range and its column statistics (#90), in two
-        # tables rather than one: `litelink_offset` is the log's own sequence,
-        # dense and monotonic across every tier, so a tier's `[start, end)` is
-        # a fact about where it sits in the log rather than a statistic — and
-        # it prunes on its own, as streamcast prunes whole logs by offset
-        # (streamcast#32). Three tiers can have a row: the published table's,
-        # which is what lets a read skip it (`_tiers`); the staging table's, a
-        # cache of one version's rollup; and the buffer's, written only when
-        # `retire()` closes it (see `close_buffer`).
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS tier_offsets (
-              tier         TEXT PRIMARY KEY,
-              start_offset INTEGER NOT NULL,
-              end_offset   INTEGER NOT NULL
-            )
-        """)
-        # `version` is which version of the table a row describes — the path of
-        # its Iceberg metadata file — and only the STAGING row has one: it is a
-        # cache of one version's rollup, valid for exactly that version. The
-        # published table's row has none, because it is kept a superset of what
-        # the published table holds below the staging table at every moment
-        # (eviction widens it before its commit), whatever version the
-        # published table is at.
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS tier_statistics (
-              tier       TEXT PRIMARY KEY,
-              statistics TEXT NOT NULL,
-              version    TEXT
-            )
-        """)
-        # A retired log takes no rows, from any process — including a writer
-        # that opened before `retire()` ran and never looks again. In SQLite
-        # rather than in `append`, so it costs the write path nothing it would
-        # notice and no handle can be stale about it. What it checks is the
-        # buffer's closed range (see `close_buffer`): a buffer with an end is
-        # a log that takes no more rows, one fact recorded once.
-        self._con.execute(f"""
-            CREATE TRIGGER IF NOT EXISTS refuse_retired BEFORE INSERT ON buffer
-            WHEN EXISTS (SELECT 1 FROM tier_offsets WHERE tier = 'buffer')
-            BEGIN SELECT RAISE(ABORT, '{RETIRED_REFUSAL}'); END
-        """)
-        # Who owns which operation, across processes (§13.6). A Python lock
-        # cannot say anything about a process that is no longer running, and
-        # recovery has to know whether an interrupted operation was ours.
-        self._con.execute("""
-            CREATE TABLE IF NOT EXISTS claim (
-              id         INTEGER PRIMARY KEY AUTOINCREMENT,
-              owner      TEXT NOT NULL,
-              expires_at INTEGER NOT NULL,
-              kind         TEXT NOT NULL,
-              start_offset INTEGER NOT NULL,
-              end_offset   INTEGER NOT NULL,
-              rel_path     TEXT
-            )
-        """)
-        # Both tables named their range `lo`/`hi` before every range became
-        # half-open, and those names read as inclusive. Renamed in place, as
-        # every other table names a range; SQLite carries `claim_live` along.
-        # The values need no conversion: a claim lives 30 s, and recovery
-        # reads only the path from a `compacting` row.
-        self._rename_range_columns("claim")
-        self._rename_range_columns("compacting")
-        # Every acquisition asks the same question — is a live claim covering
-        # this range — and asks it inside a write transaction, so it is the one
-        # query that must not degrade into a scan as claims accumulate.
-        self._con.execute("""
-            CREATE INDEX IF NOT EXISTS claim_live
-            ON claim (expires_at, start_offset, end_offset)
-        """)
-        # A buffer carrying the old `lease` table was last written by a build
-        # that coordinated through it, and this one coordinates through
-        # `claim`. Neither sees the other, so two sealers could claim the same
-        # queued group — the torn file the claim mechanism exists to prevent.
-        # Nothing here can make an OLD binary respect the new table, so the
-        # rename is an offline upgrade: refuse rather than run alongside one.
-        if self._con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lease'"
-        ).fetchone():
-            msg = (
-                "this log was last opened by a build that coordinated through a "
-                "`lease` table; ranged claims replaced it and the two do not "
-                "exclude each other. Stop every process using this log, then "
-                "run `DROP TABLE lease` on its buffer.db to complete the upgrade"
-            )
-            raise RuntimeError(msg)
 
     # -- size accounting --------------------------------------------------
     #
@@ -1040,9 +602,11 @@ class Buffer:
         and every retry, recovery included, failing the same way. The seal
         queue wedges permanently and the buffer stops draining.
         """
-        with self._transaction():
-            if self._con.execute(
-                "SELECT 1 FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+        with self._backend.write() as cursor:
+            if cursor.execute(
+                self._backend.sql(
+                    "SELECT 1 FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+                )
             ).fetchone():
                 return
 
@@ -1051,21 +615,25 @@ class Buffer:
             # published table holds — kept for the WAL replica — and an open
             # group adopting them would seal them again.
             filed = int(
-                self._con.execute(
-                    "SELECT coalesce(max(end_offset), 0) FROM extent"
+                cursor.execute(
+                    self._backend.sql("SELECT coalesce(max(end_offset), 0) FROM extent")
                 ).fetchone()[0]
             )
-            published = _meta_value(self._con, PUBLISHED_THROUGH_KEY)
+            published = _meta_value(cursor, self._backend.sql, PUBLISHED_THROUGH_KEY)
             covered = max(filed, 0 if published is None else int(published) + 1)
-            start = self._con.execute(
-                'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?',
+            start = cursor.execute(
+                self._backend.sql(
+                    'SELECT min("litelink_offset") FROM buffer WHERE "litelink_offset" >= ?'
+                ),
                 (covered,),
             ).fetchone()[0]
             # Adopting whatever is buffered, rather than starting a fresh group
             # above it: those rows still have to become a file, and a group
             # that skipped them would leave them unsealed for ever.
-            self._con.execute(
-                "INSERT INTO extent (start_offset, bytes) VALUES (?, ?)",
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO extent (start_offset, bytes) VALUES (?, ?)"
+                ),
                 (start, self._measure_from(covered)),
             )
 
@@ -1081,16 +649,20 @@ class Buffer:
         shape = self.shape()
         names = ", ".join(f'"{c}"' for c in shape.columns)
         total = 0
-        for values in self._con.execute(
-            f'SELECT {names} FROM buffer WHERE "litelink_offset" >= ?', (floor,)
-        ):
-            total += shape.measure(values)
-            bits = 0
-            for i, _, codec in shape.nested:
-                if values[i] is not None:
-                    bits += codec.variable_bits(codec.decode(values[i]))
+        with self._backend.read() as cursor:
+            for values in cursor.execute(
+                self._backend.sql(
+                    f'SELECT {names} FROM buffer WHERE "litelink_offset" >= ?'
+                ),
+                (floor,),
+            ):
+                total += shape.measure(values)
+                bits = 0
+                for i, _, codec in shape.nested:
+                    if values[i] is not None:
+                        bits += codec.variable_bits(codec.decode(values[i]))
 
-            total += -(-bits // 8)
+                total += -(-bits // 8)
 
         return total
 
@@ -1109,7 +681,7 @@ class Buffer:
         transaction open, and nothing is durable until that transaction
         commits. The offsets returned name rows only if it does.
         """
-        lock = self._lock if tx is None else self.joined(tx)
+        lock = self._backend.read() if tx is None else self.joined(tx)
         with lock:
             if self._inserting:
                 msg = "append was called from inside the rows of another append"
@@ -1145,134 +717,114 @@ class Buffer:
         caller may still commit.
         """
         offsets: list[int] = []
-        cursor = self._con.cursor()
-        cursor.execute(_SAVEPOINT if joined else _BEGIN)
         self._inserting = True
         try:
-            group = self._read_group(cursor)
-            # Bound once, and the accounting inlined below, because this loop
-            # runs per row: routing it through a method cost 19 points of
-            # overhead against raw SQLite at 1,000-row batches.
-            config = self.config()
-            target = config.target_seal_size
-            # `_insert` runs per row, so both limits are bound once out here.
-            # A row cap of None becomes one nothing reaches, which keeps the
-            # inner test a comparison rather than a branch on None.
-            target_rows = config.target_seal_rows or _NO_ROW_LIMIT
-            measure = shape.measure
-            columns = shape.columns
-            nested = shape.nested
-            # Bound out here like `row_bytes` above, for the same reason: this
-            # runs per row.
-            # The ONE question SQLite cannot be asked. The insert names the
-            # schema's columns, so a key the log does not have is dropped
-            # before any SQL exists — no constraint can see what is not in the
-            # statement. Everything else I17 promises is in the DDL now.
-            declared = shape.known.issuperset
-            width = len(columns)
-            for row in rows:
-                # I11 FIRST, so a row that is wrong twice gets the message
-                # about the thing that is specifically forbidden rather than
-                # the generic one. `litelink_offset` is in `_known`, so the
-                # subset test passes it through to here either way; the order
-                # is what decides which error the caller reads.
-                _reject_offset(row)
+            with (
+                self._backend.savepoint(self._tx)
+                if joined
+                else self._backend.write() as cursor
+            ):
+                group = self._read_group(cursor)
+                # Bound once, and the accounting inlined below, because this loop
+                # runs per row: routing it through a method cost 19 points of
+                # overhead against raw SQLite at 1,000-row batches.
+                config = self.config()
+                target = config.target_seal_size
+                # `_insert` runs per row, so both limits are bound once out here.
+                # A row cap of None becomes one nothing reaches, which keeps the
+                # inner test a comparison rather than a branch on None.
+                target_rows = config.target_seal_rows or _NO_ROW_LIMIT
+                measure = shape.measure
+                columns = shape.columns
+                nested = shape.nested
+                # Bound out here like `row_bytes` above, for the same reason: this
+                # runs per row.
+                # The ONE question SQLite cannot be asked. The insert names the
+                # schema's columns, so a key the log does not have is dropped
+                # before any SQL exists — no constraint can see what is not in the
+                # statement. Everything else I17 promises is in the DDL now.
+                declared = shape.known.issuperset
+                width = len(columns)
 
-                values = tuple(row.get(c) for c in columns)
-                # The unknown-column test, skipped when the row proves it
-                # cannot have one. If every declared column came back
-                # non-None then every declared column is PRESENT, so a row
-                # of exactly `width` keys holds those columns and nothing
-                # else — there is no room for an extra.
-                #
-                # Both halves are needed and neither alone is sound. A row
-                # that omits a nullable column has the wrong width and is
-                # perfectly legal, so width alone cannot refuse. And a row of
-                # the right width can still hide an unknown key behind an
-                # absent one — `ky` for `key` — which is why a single None
-                # sends it to the full test. That pairing is the bug an
-                # earlier draft shipped as `len(row) != width and not
-                # declared(row)`: it short-circuited the wrong way round.
-                #
-                # `None in values` is one C-level pass, against a set test
-                # that hashes every key in the row.
-                if (len(row) != width or None in values) and not declared(row):
-                    _reject_unknown(row, shape)
+                def prepared() -> Iterator[PreparedRow]:
+                    for row in rows:
+                        # I11 FIRST, so a row that is wrong twice gets the message
+                        # about the thing that is specifically forbidden rather than
+                        # the generic one. `litelink_offset` is in `_known`, so the
+                        # subset test passes it through to here either way; the order
+                        # is what decides which error the caller reads.
+                        _reject_offset(row)
 
-                extra = 0
-                if nested:
-                    values, extra = _encode_nested(values, nested)
+                        values = tuple(row.get(c) for c in columns)
+                        # The unknown-column test, skipped when the row proves it
+                        # cannot have one. If every declared column came back
+                        # non-None then every declared column is PRESENT, so a row
+                        # of exactly `width` keys holds those columns and nothing
+                        # else — there is no room for an extra.
+                        #
+                        # Both halves are needed and neither alone is sound. A row
+                        # that omits a nullable column has the wrong width and is
+                        # perfectly legal, so width alone cannot refuse. And a row of
+                        # the right width can still hide an unknown key behind an
+                        # absent one — `ky` for `key` — which is why a single None
+                        # sends it to the full test. That pairing is the bug an
+                        # earlier draft shipped as `len(row) != width and not
+                        # declared(row)`: it short-circuited the wrong way round.
+                        #
+                        # `None in values` is one C-level pass, against a set test
+                        # that hashes every key in the row.
+                        if (len(row) != width or None in values) and not declared(row):
+                            _reject_unknown(row, shape)
 
-                try:
-                    cursor.execute(sql, values)
-                except sqlite3.IntegrityError as exc:
+                        extra = 0
+                        if nested:
+                            values, extra = _encode_nested(values, nested)
+
+                        yield row, values, extra
+
+                def refused(item: PreparedRow, exc: BaseException) -> NoReturn:
+                    row, values, _ = item
                     if RETIRED_REFUSAL in str(exc):
                         raise self.retired_error() from None
 
-                    # SQLite is the gate; this only turns its answer into one
-                    # a caller can act on. `CHECK constraint failed: key` does
-                    # not say what was wrong with the value, or which value.
-                    #
-                    # Reached only on the way to raising, so it costs nothing
-                    # in the ordinary case — and the `try` itself is free,
-                    # CPython having zero-cost exceptions since 3.11.
                     _explain(row, values, shape, exc)
 
-                # lastrowid is the assigned offset, available inside the open
-                # transaction and before the row is visible to anyone else.
-                offset = int(cursor.lastrowid or 0)
-                offsets.append(offset)
-
-                if group.start_offset is None:
-                    group.start_offset = offset
-
-                group.bytes += measure(values) + extra
-                # Whichever is reached FIRST. Both are ceilings on one file —
-                # bytes bound memory, rows bound the read latency §7 sizes for
-                # — so the tighter one wins.
-                if (
-                    group.bytes >= target
-                    or offset - (group.start_offset or offset) + 1 >= target_rows
+                for (_, values, extra), offset in self._backend.insert_rows(
+                    cursor, self._backend.sql(sql), prepared(), refused
                 ):
-                    group = self._cut(cursor, group, offset)
+                    offsets.append(offset)
 
-            self._write_group(cursor, group)
-            cursor.execute(_RELEASE if joined else "COMMIT")
-        except BaseException:
-            # Best-effort, and it must not raise over the original. An
-            # interrupt landing inside COMMIT leaves no transaction to roll
-            # back, and the bare version turned a Ctrl-C into
-            # "cannot rollback - no transaction is active" with the real cause
-            # buried underneath it.
-            #
-            # Note what that case means: the COMMIT had already succeeded, so
-            # the rows ARE durable while this reports failure. That direction is
-            # the safe one — the caller retrying would duplicate rows, whereas
-            # believing a durable append failed costs only a redundant retry
-            # that AUTOINCREMENT will assign fresh offsets to.
-            with contextlib.suppress(sqlite3.OperationalError):
-                if joined:
-                    cursor.execute(_ROLLBACK_TO)
-                    cursor.execute(_RELEASE)
-                else:
-                    cursor.execute("ROLLBACK")
+                    if group.start_offset is None:
+                        group.start_offset = offset
 
-            raise
+                    group.bytes += measure(values) + extra
+                    # Whichever is reached FIRST. Both are ceilings on one file —
+                    # bytes bound memory, rows bound the read latency §7 sizes for
+                    # — so the tighter one wins.
+                    if (
+                        group.bytes >= target
+                        or offset - (group.start_offset or offset) + 1 >= target_rows
+                    ):
+                        group = self._cut(cursor, group, offset)
+
+                self._write_group(cursor, group)
         finally:
             self._inserting = False
 
         return offsets
 
-    def _read_group(self, cursor: sqlite3.Cursor) -> _Group:
+    def _read_group(self, cursor: Cursor) -> _Group:
         """The open group, once per transaction rather than once per row."""
         row = cursor.execute(
-            "SELECT group_id, start_offset, bytes FROM extent"
-            " WHERE end_offset IS NULL AND rel_path IS NULL"
+            self._backend.sql(
+                "SELECT group_id, start_offset, bytes FROM extent"
+                " WHERE end_offset IS NULL AND rel_path IS NULL"
+            )
         ).fetchone()
 
         return _Group(int(row[0]), row[1], int(row[2]))
 
-    def _cut(self, cursor: sqlite3.Cursor, group: _Group, offset: int) -> _Group:
+    def _cut(self, cursor: Cursor, group: _Group, offset: int) -> _Group:
         """Close the group at `offset` and open the next. Once per FILE.
 
         The cut lands on the row that crossed, not at the end of the batch:
@@ -1283,12 +835,14 @@ class Buffer:
         time.
         """
         self._write_group(cursor, group, end_offset=offset + 1)
-        cursor.execute("INSERT INTO extent (bytes) VALUES (0)")
+        group_id = self._backend.insert_id(
+            cursor, self._backend.sql("INSERT INTO extent (bytes) VALUES (0)"), ()
+        )
 
-        return _Group(int(cursor.lastrowid or 0), None, 0)
+        return _Group(group_id, None, 0)
 
     def _write_group(
-        self, cursor: sqlite3.Cursor, group: _Group, end_offset: int | None = None
+        self, cursor: Cursor, group: _Group, end_offset: int | None = None
     ) -> None:
         """Write the accumulated group back. Once per cut, once per batch.
 
@@ -1296,8 +850,10 @@ class Buffer:
         just the running total being persisted for other processes to read.
         """
         cursor.execute(
-            "UPDATE extent SET start_offset = ?, bytes = ?,"
-            " end_offset = ? WHERE group_id = ?",
+            self._backend.sql(
+                "UPDATE extent SET start_offset = ?, bytes = ?,"
+                " end_offset = ? WHERE group_id = ?"
+            ),
             (
                 group.start_offset,
                 group.bytes,
@@ -1309,19 +865,9 @@ class Buffer:
     # -- read -------------------------------------------------------------
 
     def next_offset(self) -> int:
-        """The offset the next append will receive.
-
-        Read from `sqlite_sequence`, which AUTOINCREMENT maintains as the
-        highest value ever assigned and never lowers — not from `max(offset)`,
-        which drops back to null every time a seal empties the table. No
-        catalog resolve is needed: the sequence already outlives the rows.
-        """
-        with self._lock:
-            row = self._con.execute(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
-            ).fetchone()
-
-        return (row[0] if row else 0) + 1
+        """The next offset, from the backend's durable counter (I9)."""
+        with self._backend.read() as cursor:
+            return self._backend.next(cursor)
 
     def span(self) -> tuple[int, int] | None:
         """The buffered offsets as `[start, end)`, or None if empty.
@@ -1332,15 +878,15 @@ class Buffer:
         to a full SCAN of the table. Measured on a 20,000-row buffer:
         2.465 ms together, 0.006 ms apart. Do not tidy these back into one.
         """
-        with self._lock:
-            lo = self._con.execute(
-                'SELECT min("litelink_offset") FROM buffer'
+        with self._backend.read() as cursor:
+            lo = cursor.execute(
+                self._backend.sql('SELECT min("litelink_offset") FROM buffer')
             ).fetchone()[0]
             if lo is None:
                 return None
 
-            hi = self._con.execute(
-                'SELECT max("litelink_offset") FROM buffer'
+            hi = cursor.execute(
+                self._backend.sql('SELECT max("litelink_offset") FROM buffer')
             ).fetchone()[0]
 
         return (int(lo), int(hi) + 1)
@@ -1352,9 +898,12 @@ class Buffer:
         with a rowid range rather than a scan, and rows already sealed but not
         yet deleted cost nothing.
         """
-        with self._lock:
-            row = self._con.execute(
-                'SELECT count(*) FROM buffer WHERE "litelink_offset" >= ?', (start,)
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    'SELECT count(*) FROM buffer WHERE "litelink_offset" >= ?'
+                ),
+                (start,),
             ).fetchone()
 
         return int(row[0])
@@ -1373,48 +922,8 @@ class Buffer:
         ordinary path and I11 still holds: nothing hands an offset to `extend`,
         the counter simply starts elsewhere.
         """
-        # `sqlite_sequence` is SQLite's own, and documented as writable — but
-        # it carries no unique constraint, so this is an UPDATE with an INSERT
-        # behind it rather than an upsert. The row appears only after the first
-        # AUTOINCREMENT insert, which for a buffer opened seconds ago has not
-        # happened yet.
-        with self._lock, self._con:
-            # Loud, because the silent version is unrecoverable. SQLite assigns
-            # `max(largest existing rowid, seq) + 1`, so seeding DOWN past
-            # existing rows does nothing at all and every following row lands
-            # at an offset belonging to different data — which a rewrite then
-            # commits. Nothing downstream can detect it: the row counts match,
-            # the ranges look contiguous, and the payloads are simply attached
-            # to the wrong offsets.
-            # The hazard is DOWNWARD only, and this used to refuse any
-            # non-empty buffer. Raising the sequence past the rows present is
-            # safe — SQLite assigns `max(max(rowid), seq) + 1` either way — and
-            # it is what a restore needs: reserving an offset range (§3a) has
-            # to work on a buffer holding the recovered tail, which is exactly
-            # a buffer with rows in it.
-            #
-            # Narrowed rather than bypassed. A second writer of this sequence
-            # would be a second place to get the direction wrong, and the
-            # direction is the whole of the danger.
-            highest = self._con.execute(
-                'SELECT max("litelink_offset") FROM buffer'
-            ).fetchone()[0]
-            if highest is not None and first - 1 < highest:
-                msg = (
-                    f"cannot seed offsets to {first} on a buffer holding rows up "
-                    f"to {highest}: SQLite ignores a sequence lowered past them"
-                )
-                raise ValueError(msg)
-
-            updated = self._con.execute(
-                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
-                (first - 1,),
-            )
-            if not updated.rowcount:
-                self._con.execute(
-                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
-                    (first - 1,),
-                )
+        with self._backend.write() as cursor:
+            self._backend.seed(cursor, first)
 
     def reserve(self, n: int) -> tuple[int, int]:
         """Take `n` offsets without writing a row. Returns `[start, end)`.
@@ -1455,42 +964,8 @@ class Buffer:
             msg = f"cannot reserve {n} offsets: a reservation is at least one"
             raise ValueError(msg)
 
-        with self._transaction():
-            seq = self._con.execute(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
-            ).fetchone()
-            highest = self._con.execute(
-                'SELECT max("litelink_offset") FROM buffer'
-            ).fetchone()[0]
-            floor = max(int(seq[0]) if seq else 0, int(highest or 0))
-            ceiling = floor + n
-            # An UPDATE with an INSERT behind it rather than an upsert:
-            # `sqlite_sequence` carries no unique constraint, and its row
-            # appears only after the first AUTOINCREMENT insert — which for a
-            # log whose whole load arrives through this path never happens.
-            updated = self._con.execute(
-                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
-                (ceiling,),
-            )
-            if not updated.rowcount:
-                self._con.execute(
-                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
-                    (ceiling,),
-                )
-
-            landed = int(
-                self._con.execute(
-                    "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
-                ).fetchone()[0]
-            )
-            if landed != ceiling:
-                msg = (
-                    f"reserving {n} offsets from {floor} left the sequence at "
-                    f"{landed} rather than {ceiling}; nothing has been issued"
-                )
-                raise RuntimeError(msg)
-
-        return floor + 1, ceiling + 1
+        with self._backend.write() as cursor:
+            return self._backend.advance(cursor, n)
 
     def open_group_started(self) -> bool:
         """Whether the open group has taken rows — bulk ingest's third read.
@@ -1506,10 +981,12 @@ class Buffer:
         the cost of being wrong the other way is a file registered over rows
         that are still in the buffer.
         """
-        with self._lock:
-            row = self._con.execute(
-                "SELECT start_offset FROM extent"
-                " WHERE end_offset IS NULL AND rel_path IS NULL"
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    "SELECT start_offset FROM extent"
+                    " WHERE end_offset IS NULL AND rel_path IS NULL"
+                )
             ).fetchone()
 
         return row is None or row[0] is not None
@@ -1538,7 +1015,7 @@ class Buffer:
         # On the seal's OWN connection. See `_sealer`: sharing `_reader` with a
         # concurrent scan means reading that scan's pinned snapshot and then
         # deleting rows this never saw.
-        return self._rows("BETWEEN ? AND ?", (start, end - 1), self._sealer)
+        return self._rows("BETWEEN ? AND ?", (start, end - 1), self._backend.sealer())
 
     def rows_from(self, start: int | None) -> pa.Table:
         """Buffered rows with `offset >= start`, as Arrow. The read's input.
@@ -1668,7 +1145,7 @@ class Buffer:
         self,
         predicate: str,
         params: tuple[object, ...],
-        con: sqlite3.Connection | None = None,
+        cursor: Cursor | None = None,
     ) -> pa.Table:
         """Buffered rows matching `offset <predicate>`, in offset order.
 
@@ -1679,12 +1156,20 @@ class Buffer:
         """
         shape = self.shape()
         names = ", ".join(f'"{c}"' for c in (OFFSET, *shape.columns))
-        cursor = (con or self._reader).execute(
-            f'SELECT {names} FROM buffer WHERE "litelink_offset" {predicate}'
-            ' ORDER BY "litelink_offset"',
-            params,
-        )
-        columns = list(zip(*cursor.fetchall(), strict=True)) or [
+        cursor = cursor or self._backend.tail()
+        try:
+            cursor.execute(
+                self._backend.sql(
+                    f'SELECT {names} FROM buffer WHERE "litelink_offset" {predicate}'
+                    ' ORDER BY "litelink_offset"'
+                ),
+                params,
+            )
+            fetched = cursor.fetchall()
+        finally:
+            cursor.close()
+
+        columns = list(zip(*fetched, strict=True)) or [
             () for _ in range(len(shape.columns) + 1)
         ]
         schema = pa.schema(
@@ -1734,7 +1219,7 @@ class Buffer:
 
         Handed the connection AND the lock that guards it — see `Claim`.
         """
-        return Claim(self._con, self._lock, kind, start, end, owner, rel_path, ttl_ms)
+        return Claim(self._backend, kind, start, end, owner, rel_path, ttl_ms)
 
     # -- the seal queue ---------------------------------------------------
 
@@ -1746,11 +1231,13 @@ class Buffer:
         per queued file plus the open one — never a scan of the buffer, and
         never a question about where to cut, because that was decided already.
         """
-        with self._lock:
-            row = self._con.execute(
-                "SELECT start_offset, end_offset FROM extent"
-                " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
-                " ORDER BY group_id LIMIT 1"
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    "SELECT start_offset, end_offset FROM extent"
+                    " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
+                    " ORDER BY group_id LIMIT 1"
+                )
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]))
@@ -1761,10 +1248,12 @@ class Buffer:
         What an explicit `seal()` must drain to. Taken under the same lock that
         made the cut, so it cannot miss one that call just recorded.
         """
-        with self._lock:
-            row = self._con.execute(
-                "SELECT max(end_offset) FROM extent"
-                " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    "SELECT max(end_offset) FROM extent"
+                    " WHERE end_offset IS NOT NULL AND rel_path IS NULL"
+                )
             ).fetchone()
 
         return None if row[0] is None else int(row[0])
@@ -1797,29 +1286,35 @@ class Buffer:
         # the answer is almost always "nothing to close" — issuing a write
         # transaction to discover that would put a commit and an fsync on a
         # timer, for every log, forever. The read is a single row.
-        with self._lock:
-            if not self._con.execute(
-                "SELECT 1 FROM extent WHERE end_offset IS NULL"
-                " AND rel_path IS NULL AND start_offset IS NOT NULL"
-                " AND EXISTS (SELECT 1 FROM buffer"
-                '             WHERE "litelink_offset" >= extent.start_offset)',
+        with self._backend.write() as cursor:
+            if not cursor.execute(
+                self._backend.sql(
+                    "SELECT 1 FROM extent WHERE end_offset IS NULL"
+                    " AND rel_path IS NULL AND start_offset IS NOT NULL"
+                    " AND EXISTS (SELECT 1 FROM buffer"
+                    '             WHERE "litelink_offset" >= extent.start_offset)'
+                ),
                 (),
             ).fetchone():
                 return False
 
-        with self._transaction():
-            cursor = self._con.execute(
-                "UPDATE extent SET end_offset ="
-                ' (SELECT max("litelink_offset") + 1 FROM buffer)'
-                " WHERE end_offset IS NULL AND rel_path IS NULL"
-                " AND start_offset IS NOT NULL"
-                " AND EXISTS (SELECT 1 FROM buffer"
-                '             WHERE "litelink_offset" >= extent.start_offset)',
+        with self._backend.write() as cursor:
+            cursor = cursor.execute(
+                self._backend.sql(
+                    "UPDATE extent SET end_offset ="
+                    ' (SELECT max("litelink_offset") + 1 FROM buffer)'
+                    " WHERE end_offset IS NULL AND rel_path IS NULL"
+                    " AND start_offset IS NOT NULL"
+                    " AND EXISTS (SELECT 1 FROM buffer"
+                    '             WHERE "litelink_offset" >= extent.start_offset)'
+                ),
                 (),
             )
             closed = bool(cursor.rowcount)
             if closed:
-                self._con.execute("INSERT INTO extent (bytes) VALUES (0)")
+                cursor.execute(
+                    self._backend.sql("INSERT INTO extent (bytes) VALUES (0)")
+                )
 
         return closed
 
@@ -1831,18 +1326,22 @@ class Buffer:
         The path is persisted, not recomputed: a retry that recomputed it could
         land on a different date directory and strand the first file.
         """
-        with self._transaction():
-            self._con.execute("DELETE FROM sealing")
-            self._con.execute(
-                "INSERT INTO sealing (start_offset, end_offset, rel_path) VALUES (?, ?, ?)",
+        with self._backend.write() as cursor:
+            cursor.execute(self._backend.sql("DELETE FROM sealing"))
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO sealing (start_offset, end_offset, rel_path) VALUES (?, ?, ?)"
+                ),
                 (start, end, rel_path),
             )
 
     def pending_seal(self) -> tuple[int, int, str] | None:
         """The in-flight seal, if a crash left one."""
-        with self._lock:
-            row = self._con.execute(
-                "SELECT start_offset, end_offset, rel_path FROM sealing"
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    "SELECT start_offset, end_offset, rel_path FROM sealing"
+                )
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
@@ -1865,14 +1364,14 @@ class Buffer:
         identifies exactly one — which also means a recovered seal retires its
         group without `sealing` having had to remember which one it was.
         """
-        with self._transaction():
+        with self._backend.write() as cursor:
             # Only OUR claim, and only if it is still the one recorded. A
             # writer stalled past its lease wakes up believing it owns this
             # seal; clearing unconditionally let it wipe the claim of the
             # owner that took over, stranding that owner's half-written file
             # under a name nothing recorded any more.
-            cursor = self._con.execute(
-                "DELETE FROM sealing WHERE rel_path = ?", (rel_path,)
+            cursor = cursor.execute(
+                self._backend.sql("DELETE FROM sealing WHERE rel_path = ?"), (rel_path,)
             )
             if not cursor.rowcount:
                 return False
@@ -1883,10 +1382,12 @@ class Buffer:
             # half of this one reinvented, and left the two able to disagree.
             # Same transaction as the rows it retires, so a file can never be
             # committed with the count of what it holds lost.
-            self._con.execute(
-                "UPDATE extent SET rel_path = ?, named_at = unixepoch()"
-                " WHERE end_offset = ? AND rel_path IS NULL",
-                (rel_path, end),
+            cursor.execute(
+                self._backend.sql(
+                    "UPDATE extent SET rel_path = ?, named_at = ?"
+                    " WHERE end_offset = ? AND rel_path IS NULL"
+                ),
+                (rel_path, int(time.time()), end),
             )
 
         return True
@@ -1910,9 +1411,11 @@ class Buffer:
         callers treat an unknown size as "full", so an unmeasured file is never
         merged on a guess about what it holds.
         """
-        with self._lock:
-            rows = self._con.execute(
-                "SELECT rel_path, bytes FROM extent WHERE rel_path IS NOT NULL"
+        with self._backend.read() as cursor:
+            rows = cursor.execute(
+                self._backend.sql(
+                    "SELECT rel_path, bytes FROM extent WHERE rel_path IS NOT NULL"
+                )
             ).fetchall()
 
         return {str(row[0]): int(row[1]) for row in rows}
@@ -1932,10 +1435,12 @@ class Buffer:
         the second is longer than the first — which is the ordinary one — has
         every file losing its Iceberg age before it is old enough to evict.
         """
-        with self._lock:
-            rows = self._con.execute(
-                "SELECT rel_path, named_at FROM extent"
-                " WHERE rel_path IS NOT NULL AND named_at IS NOT NULL"
+        with self._backend.read() as cursor:
+            rows = cursor.execute(
+                self._backend.sql(
+                    "SELECT rel_path, named_at FROM extent"
+                    " WHERE rel_path IS NOT NULL AND named_at IS NOT NULL"
+                )
             ).fetchall()
 
         return {str(row[0]): int(row[1]) for row in rows}
@@ -1955,13 +1460,15 @@ class Buffer:
         moves; a row per pushed file would only grow with the published history
         and describe what a restore cannot rebuild.
         """
-        with self._lock:
-            self._con.execute(
-                "INSERT INTO extent"
-                " (start_offset, end_offset, bytes, rel_path, named_at)"
-                " VALUES (?, ?, ?, ?, unixepoch())"
-                " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
-                (start, end, held, rel_path),
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO extent"
+                    " (start_offset, end_offset, bytes, rel_path, named_at)"
+                    " VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes"
+                ),
+                (start, end, held, rel_path, int(time.time())),
             )
 
     def confirm_published(self, through: int, landed: Iterable[str] = ()) -> None:
@@ -1980,21 +1487,26 @@ class Buffer:
         have recorded a higher one while this push was registering (#118).
         """
         paths = list(landed)
-        with self._transaction():
-            current = _meta_value(self._con, PUBLISHED_THROUGH_KEY)
+        with self._backend.write() as cursor:
+            current = _meta_value(cursor, self._backend.sql, PUBLISHED_THROUGH_KEY)
             raised = max(through, -1 if current is None else int(current))
             if raised >= 0:
-                _write_meta(self._con, {PUBLISHED_THROUGH_KEY: str(raised)})
+                _write_meta(
+                    cursor, self._backend.sql, {PUBLISHED_THROUGH_KEY: str(raised)}
+                )
 
             for path in paths:
-                self._con.execute(
-                    "DELETE FROM extent_intent WHERE rel_path = ?", (path,)
+                cursor.execute(
+                    self._backend.sql("DELETE FROM extent_intent WHERE rel_path = ?"),
+                    (path,),
                 )
 
             # Rows naming published copies were written by 0.9 and earlier.
             # Below the watermark they say nothing it does not.
-            self._con.execute(
-                "DELETE FROM extent WHERE rel_path LIKE '%://%' AND end_offset <= ?",
+            cursor.execute(
+                self._backend.sql(
+                    "DELETE FROM extent WHERE rel_path LIKE '%://%' AND end_offset <= ?"
+                ),
                 (raised + 1,),
             )
 
@@ -2015,9 +1527,11 @@ class Buffer:
         the meantime.
         """
         boundary = location.rstrip("/") + "/"
-        with self._transaction():
-            rows = self._con.execute(
-                "SELECT rel_path, start_offset FROM extent WHERE rel_path LIKE '%://%'"
+        with self._backend.write() as cursor:
+            rows = cursor.execute(
+                self._backend.sql(
+                    "SELECT rel_path, start_offset FROM extent WHERE rel_path LIKE '%://%'"
+                )
             ).fetchall()
             if not rows:
                 return
@@ -2026,14 +1540,22 @@ class Buffer:
                 int(start) for path, start in rows if str(path).startswith(boundary)
             ]
             foreign = len(ours) < len(rows)
-            if foreign and ours and _meta_value(self._con, PUBLISHED_FROM_KEY) is None:
-                _write_meta(self._con, {PUBLISHED_FROM_KEY: str(min(ours))})
+            if (
+                foreign
+                and ours
+                and _meta_value(cursor, self._backend.sql, PUBLISHED_FROM_KEY) is None
+            ):
+                _write_meta(
+                    cursor, self._backend.sql, {PUBLISHED_FROM_KEY: str(min(ours))}
+                )
 
-            current = _meta_value(self._con, PUBLISHED_THROUGH_KEY)
+            current = _meta_value(cursor, self._backend.sql, PUBLISHED_THROUGH_KEY)
             if current is not None:
-                self._con.execute(
-                    "DELETE FROM extent"
-                    " WHERE rel_path LIKE '%://%' AND end_offset <= ?",
+                cursor.execute(
+                    self._backend.sql(
+                        "DELETE FROM extent"
+                        " WHERE rel_path LIKE '%://%' AND end_offset <= ?"
+                    ),
                     (int(current) + 1,),
                 )
 
@@ -2053,14 +1575,16 @@ class Buffer:
         maintainer catches neither that nor anything like it — so the takeover
         race would kill the LAWFUL holder's pass rather than the stale one's.
         """
-        with self._lock:
-            self._con.execute(
-                "INSERT INTO extent_intent"
-                " (rel_path, start_offset, end_offset, bytes) VALUES (?, ?, ?, ?)"
-                " ON CONFLICT(rel_path) DO UPDATE SET"
-                " start_offset = excluded.start_offset,"
-                " end_offset = excluded.end_offset,"
-                " bytes = excluded.bytes",
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO extent_intent"
+                    " (rel_path, start_offset, end_offset, bytes) VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(rel_path) DO UPDATE SET"
+                    " start_offset = excluded.start_offset,"
+                    " end_offset = excluded.end_offset,"
+                    " bytes = excluded.bytes"
+                ),
                 (rel_path, start, end, held),
             )
 
@@ -2073,9 +1597,11 @@ class Buffer:
         leave those rows beyond judgement for ever.
         """
         boundary = prefix.rstrip("/") + "/"
-        with self._lock:
-            rows = self._con.execute(
-                "SELECT rel_path, start_offset, end_offset, bytes FROM extent_intent"
+        with self._backend.read() as cursor:
+            rows = cursor.execute(
+                self._backend.sql(
+                    "SELECT rel_path, start_offset, end_offset, bytes FROM extent_intent"
+                )
             ).fetchall()
 
         return [
@@ -2086,9 +1612,10 @@ class Buffer:
 
     def forget_intent(self, rel_path: str) -> None:
         """Drop an intent, whether it became a copy or never will."""
-        with self._lock:
-            self._con.execute(
-                "DELETE FROM extent_intent WHERE rel_path = ?", (rel_path,)
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql("DELETE FROM extent_intent WHERE rel_path = ?"),
+                (rel_path,),
             )
 
     def record_merge(
@@ -2105,48 +1632,59 @@ class Buffer:
         """
         paths = list(sources)
         owed = list(swap)
-        with self._transaction():
+        with self._backend.write() as cursor:
             for rel_path, start, end, held in outputs:
-                self._con.execute(
-                    "INSERT INTO extent"
-                    " (start_offset, end_offset, bytes, rel_path, named_at)"
-                    " VALUES (?, ?, ?, ?, unixepoch())"
-                    " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes",
-                    (start, end, held, rel_path),
+                cursor.execute(
+                    self._backend.sql(
+                        "INSERT INTO extent"
+                        " (start_offset, end_offset, bytes, rel_path, named_at)"
+                        " VALUES (?, ?, ?, ?, ?)"
+                        " ON CONFLICT(rel_path) DO UPDATE SET bytes = excluded.bytes"
+                    ),
+                    (start, end, held, rel_path, int(time.time())),
                 )
 
             if paths:
                 placeholders = ",".join("?" * len(paths))
-                self._con.execute(
-                    f"DELETE FROM extent WHERE rel_path IN ({placeholders})",  # noqa: S608
+                cursor.execute(
+                    self._backend.sql(
+                        f"DELETE FROM extent WHERE rel_path IN ({placeholders})"
+                    ),  # noqa: S608
                     paths,
                 )
                 # A source that was itself owed a swap is owed nothing now: the
                 # merge's output carries the debt.
-                self._con.execute(
-                    f"DELETE FROM awaiting_swap WHERE rel_path IN ({placeholders})",  # noqa: S608
+                cursor.execute(
+                    self._backend.sql(
+                        f"DELETE FROM awaiting_swap WHERE rel_path IN ({placeholders})"
+                    ),  # noqa: S608
                     paths,
                 )
 
             for rel_path in owed:
-                self._con.execute(
-                    "INSERT OR IGNORE INTO awaiting_swap (rel_path) VALUES (?)",
+                cursor.execute(
+                    self._backend.sql(
+                        "INSERT INTO awaiting_swap (rel_path) VALUES (?) ON CONFLICT DO NOTHING"
+                    ),
                     (rel_path,),
                 )
 
     def awaiting_swaps(self) -> set[str]:
         """The merged staging files still to be swapped into the published
         table, root-relative."""
-        with self._lock:
-            rows = self._con.execute("SELECT rel_path FROM awaiting_swap").fetchall()
+        with self._backend.read() as cursor:
+            rows = cursor.execute(
+                self._backend.sql("SELECT rel_path FROM awaiting_swap")
+            ).fetchall()
 
         return {str(row[0]) for row in rows}
 
     def clear_swap(self, rel_path: str) -> None:
         """The swap landed, or never can: the file is no longer owed."""
-        with self._lock:
-            self._con.execute(
-                "DELETE FROM awaiting_swap WHERE rel_path = ?", (rel_path,)
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql("DELETE FROM awaiting_swap WHERE rel_path = ?"),
+                (rel_path,),
             )
 
     # -- meta ---------------------------------------------------------------
@@ -2156,25 +1694,9 @@ class Buffer:
     # can reconstruct a log from what it actually is instead of asking the
     # caller to restate it and hoping they match.
 
-    @staticmethod
-    def peek_meta(path: Path, key: str) -> str | None:
-        """Read one `meta` value without opening a full buffer.
-
-        Opening a log has a chicken-and-egg shape: the declared Arrow schema
-        lives in a table only an open buffer can read, and the buffer needs
-        that schema to cast what it reads back. One read-only connection
-        resolves it, which is cheaper than constructing a buffer twice and
-        leaves the schema immutable for the buffer's whole life.
-        """
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            return _meta_value(connection, key)
-        finally:
-            connection.close()
-
     def get_meta(self, key: str) -> str | None:
-        with self._lock:
-            return _meta_value(self._con, key)
+        with self._backend.read() as cursor:
+            return _meta_value(cursor, self._backend.sql, key)
 
     def published_ranges(
         self, floor: int, *, include_intents: bool
@@ -2230,8 +1752,8 @@ class Buffer:
             )
             args = (*args, floor, floor)
 
-        with self._lock:
-            rows = self._con.execute(sql, args).fetchall()
+        with self._backend.read() as cursor:
+            rows = cursor.execute(self._backend.sql(sql), args).fetchall()
 
         return sorted((int(start), int(end)) for start, end in rows if end > start)
 
@@ -2253,10 +1775,14 @@ class Buffer:
 
         Returns whether it was a move.
         """
-        with self._transaction():
-            current = _meta_value(self._con, key) or None
+        with self._backend.write() as cursor:
+            current = _meta_value(cursor, self._backend.sql, key) or None
             moved = current != (value or None)
-            _write_meta(self._con, {key: value, **(dict(reset) if moved else {})})
+            _write_meta(
+                cursor,
+                self._backend.sql,
+                {key: value, **(dict(reset) if moved else {})},
+            )
             return moved
 
     def raise_meta(self, values: Mapping[str, int]) -> None:
@@ -2267,11 +1793,17 @@ class Buffer:
         finish out of order (#118), and a read-then-write max would let the
         slower one lower what the faster recorded.
         """
-        with self._transaction():
+        with self._backend.write() as cursor:
             _write_meta(
-                self._con,
+                cursor,
+                self._backend.sql,
                 {
-                    name: str(max(value, int(_meta_value(self._con, name) or 0)))
+                    name: str(
+                        max(
+                            value,
+                            int(_meta_value(cursor, self._backend.sql, name) or 0),
+                        )
+                    )
                     for name, value in values.items()
                 },
             )
@@ -2384,12 +1916,12 @@ class Buffer:
         between them: either order leaves a log whose parts disagree, and both
         disagreements have cost a defect. One transaction has no between.
         """
-        with self._transaction():
-            _write_meta(self._con, pairs)
+        with self._backend.write() as cursor:
+            _write_meta(cursor, self._backend.sql, pairs)
 
     def set_meta(self, key: str, value: str) -> None:
-        with self._transaction():
-            _write_meta(self._con, {key: value})
+        with self._backend.write() as cursor:
+            _write_meta(cursor, self._backend.sql, {key: value})
 
     # -- stored tiers (#90) ------------------------------------------------
 
@@ -2405,15 +1937,17 @@ class Buffer:
         has none.
         """
         try:
-            with self._lock:
-                rows = self._con.execute(
-                    "SELECT (SELECT v FROM meta WHERE k = ?), s.tier,"
-                    " o.start_offset, o.end_offset, s.statistics, s.version"
-                    " FROM (SELECT 1) LEFT JOIN tier_statistics s"
-                    " LEFT JOIN tier_offsets o ON o.tier = s.tier",
+            with self._backend.read() as cursor:
+                rows = cursor.execute(
+                    self._backend.sql(
+                        "SELECT (SELECT v FROM meta WHERE k = ?), s.tier,"
+                        " o.start_offset, o.end_offset, s.statistics, s.version"
+                        " FROM (SELECT 1 AS one) AS one LEFT JOIN tier_statistics s ON 1 = 1"
+                        " LEFT JOIN tier_offsets o ON o.tier = s.tier"
+                    ),
                     (TIER_GENERATION,),
                 ).fetchall()
-        except sqlite3.OperationalError:
+        except self._backend.errors.absent:
             return None, {}
 
         generation = None if rows[0][0] is None else str(rows[0][0])
@@ -2446,32 +1980,42 @@ class Buffer:
         other's change. None removes the row. The generation moves on every
         call.
         """
-        with self._transaction():
-            stored = self._tier_row(tier)
+        with self._backend.write() as cursor:
+            stored = self._tier_row(cursor, tier)
             updated = change(
                 None if stored is None else stored[0],
                 None if stored is None else stored[1],
             )
-            self._drop_legacy_tier(tier)
+            self._drop_legacy_tier(cursor, tier)
             if updated is None:
-                self._con.execute("DELETE FROM tier_offsets WHERE tier = ?", (tier,))
-                self._con.execute("DELETE FROM tier_statistics WHERE tier = ?", (tier,))
+                cursor.execute(
+                    self._backend.sql("DELETE FROM tier_offsets WHERE tier = ?"),
+                    (tier,),
+                )
+                cursor.execute(
+                    self._backend.sql("DELETE FROM tier_statistics WHERE tier = ?"),
+                    (tier,),
+                )
             else:
                 (start, end), encoded = updated
-                self._con.execute(
-                    "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
-                    " VALUES (?, ?, ?) ON CONFLICT(tier) DO UPDATE SET"
-                    " start_offset = excluded.start_offset,"
-                    " end_offset = excluded.end_offset",
+                cursor.execute(
+                    self._backend.sql(
+                        "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
+                        " VALUES (?, ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                        " start_offset = excluded.start_offset,"
+                        " end_offset = excluded.end_offset"
+                    ),
                     (tier, start, end),
                 )
-                self._con.execute(
-                    "INSERT INTO tier_statistics (tier, statistics) VALUES (?, ?)"
-                    " ON CONFLICT(tier) DO UPDATE SET statistics = excluded.statistics",
+                cursor.execute(
+                    self._backend.sql(
+                        "INSERT INTO tier_statistics (tier, statistics) VALUES (?, ?)"
+                        " ON CONFLICT(tier) DO UPDATE SET statistics = excluded.statistics"
+                    ),
                     (tier, encoded),
                 )
 
-            self._bump_tiers()
+            self._bump_tiers(cursor)
 
     def store_staging_statistics(
         self, version: str, offsets: tuple[int, int], statistics: str
@@ -2501,8 +2045,8 @@ class Buffer:
 
         Returns whether it wrote.
         """
-        with self._transaction():
-            stored = self._tier_row("staging")
+        with self._backend.write() as cursor:
+            stored = self._tier_row(cursor, "staging")
             if (
                 stored is not None
                 and stored[2] is not None
@@ -2510,21 +2054,25 @@ class Buffer:
             ):
                 return False
 
-            self._drop_legacy_tier("staging")
-            self._con.execute(
-                "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
-                " VALUES ('staging', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
-                " start_offset = excluded.start_offset,"
-                " end_offset = excluded.end_offset",
+            self._drop_legacy_tier(cursor, "staging")
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
+                    " VALUES ('staging', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                    " start_offset = excluded.start_offset,"
+                    " end_offset = excluded.end_offset"
+                ),
                 offsets,
             )
-            self._con.execute(
-                "INSERT INTO tier_statistics (tier, statistics, version)"
-                " VALUES ('staging', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
-                " statistics = excluded.statistics, version = excluded.version",
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO tier_statistics (tier, statistics, version)"
+                    " VALUES ('staging', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                    " statistics = excluded.statistics, version = excluded.version"
+                ),
                 (statistics, version),
             )
-            self._bump_tiers()
+            self._bump_tiers(cursor)
 
             return True
 
@@ -2536,51 +2084,61 @@ class Buffer:
         and the values are untouched: the fences compare values, so a process
         that read a location before this sees the same one after.
         """
-        with self._transaction():
+        with self._backend.write() as cursor:
             for new, old in LEGACY_META.items():
-                value = self._con.execute(
-                    "SELECT v FROM meta WHERE k = ?", (old,)
+                value = cursor.execute(
+                    self._backend.sql("SELECT v FROM meta WHERE k = ?"), (old,)
                 ).fetchone()
                 if value is not None:
-                    self._con.execute(
-                        "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING",
+                    cursor.execute(
+                        self._backend.sql(
+                            "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO NOTHING"
+                        ),
                         (new, value[0]),
                     )
-                    self._con.execute("DELETE FROM meta WHERE k = ?", (old,))
+                    cursor.execute(
+                        self._backend.sql("DELETE FROM meta WHERE k = ?"), (old,)
+                    )
 
             moved = False
             for new, old in LEGACY_TIERS.items():
                 for table in ("tier_offsets", "tier_statistics"):
-                    held = self._con.execute(
-                        f"SELECT 1 FROM {table} WHERE tier = ?",  # noqa: S608
+                    held = cursor.execute(
+                        self._backend.sql(f"SELECT 1 FROM {table} WHERE tier = ?"),  # noqa: S608
                         (new,),
                     ).fetchone()
                     if held is None:
-                        cursor = self._con.execute(
-                            f"UPDATE {table} SET tier = ? WHERE tier = ?",  # noqa: S608
+                        cursor = cursor.execute(
+                            self._backend.sql(
+                                f"UPDATE {table} SET tier = ? WHERE tier = ?"
+                            ),  # noqa: S608
                             (new, old),
                         )
                     else:
-                        cursor = self._con.execute(
-                            f"DELETE FROM {table} WHERE tier = ?",  # noqa: S608
+                        cursor = cursor.execute(
+                            self._backend.sql(f"DELETE FROM {table} WHERE tier = ?"),  # noqa: S608
                             (old,),
                         )
 
                     moved = moved or cursor.rowcount > 0
 
             if moved:
-                self._bump_tiers()
+                self._bump_tiers(cursor)
 
-    def _tier_row(self, tier: str) -> tuple[tuple[int, int], str, str | None] | None:
+    def _tier_row(
+        self, cursor: Cursor, tier: str
+    ) -> tuple[tuple[int, int], str, str | None] | None:
         """Inside the caller's transaction: `tier`'s row, or its pre-#98 one."""
         for name in (tier, LEGACY_TIERS.get(tier)):
             if name is None:
                 continue
 
-            row = self._con.execute(
-                "SELECT o.start_offset, o.end_offset, s.statistics, s.version"
-                " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
-                " WHERE o.tier = ?",
+            row = cursor.execute(
+                self._backend.sql(
+                    "SELECT o.start_offset, o.end_offset, s.statistics, s.version"
+                    " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
+                    " WHERE o.tier = ?"
+                ),
                 (name,),
             ).fetchone()
             if row is not None:
@@ -2589,18 +2147,25 @@ class Buffer:
 
         return None
 
-    def _drop_legacy_tier(self, tier: str) -> None:
+    def _drop_legacy_tier(self, cursor: Cursor, tier: str) -> None:
         """Inside the caller's transaction: remove `tier`'s pre-#98 row."""
         legacy = LEGACY_TIERS.get(tier)
         if legacy is not None:
-            self._con.execute("DELETE FROM tier_offsets WHERE tier = ?", (legacy,))
-            self._con.execute("DELETE FROM tier_statistics WHERE tier = ?", (legacy,))
+            cursor.execute(
+                self._backend.sql("DELETE FROM tier_offsets WHERE tier = ?"), (legacy,)
+            )
+            cursor.execute(
+                self._backend.sql("DELETE FROM tier_statistics WHERE tier = ?"),
+                (legacy,),
+            )
 
-    def _bump_tiers(self) -> None:
+    def _bump_tiers(self, cursor: Cursor) -> None:
         """Inside the caller's transaction: a new generation for readers' caches."""
-        self._con.execute(
-            "INSERT INTO meta (k, v) VALUES (?, '1')"
-            " ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
+        cursor.execute(
+            self._backend.sql(
+                "INSERT INTO meta (k, v) VALUES (?, '1')"
+                " ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1"
+            ),
             (TIER_GENERATION,),
         )
 
@@ -2611,9 +2176,9 @@ class Buffer:
         value read a moment early is still a lower bound on every row a later
         read can find here. One B-tree edge seek; see `span`.
         """
-        with self._lock:
-            row = self._con.execute(
-                'SELECT min("litelink_offset") FROM buffer'
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql('SELECT min("litelink_offset") FROM buffer')
             ).fetchone()
 
         return None if row is None or row[0] is None else int(row[0])
@@ -2644,21 +2209,18 @@ class Buffer:
         caches routing can rebuild. Only `retire()` writes it and nothing drops
         or recomputes it. A no-op when the buffer is already closed.
         """
-        with self._transaction():
-            if self._con.execute(
-                "SELECT 1 FROM tier_offsets WHERE tier = 'buffer'"
+        with self._backend.write() as cursor:
+            if cursor.execute(
+                self._backend.sql("SELECT 1 FROM tier_offsets WHERE tier = 'buffer'")
             ).fetchone():
                 return
 
-            seq = self._con.execute(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
-            ).fetchone()
-            end = (seq[0] if seq else 0) + 1
-            lowest = self._con.execute(
-                'SELECT min("litelink_offset") FROM buffer'
+            end = self._backend.next(cursor)
+            lowest = cursor.execute(
+                self._backend.sql('SELECT min("litelink_offset") FROM buffer')
             ).fetchone()[0]
             start = end if lowest is None else int(lowest)
-            self._write_buffer_row(start, end, statistics)
+            self._write_buffer_row(cursor, start, end, statistics)
 
     def empty_buffer_range(self, statistics: str) -> None:
         """Narrow the closed range to `[end, end)`, empty: `retire()` is done.
@@ -2666,32 +2228,40 @@ class Buffer:
         Only once the buffer holds nothing; the record count in `statistics`
         (0) is what tells a retired log from one still retiring.
         """
-        with self._transaction():
-            row = self._con.execute(
-                "SELECT end_offset FROM tier_offsets WHERE tier = 'buffer'"
+        with self._backend.write() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    "SELECT end_offset FROM tier_offsets WHERE tier = 'buffer'"
+                )
             ).fetchone()
             if row is None:
                 msg = "the buffer has no end to narrow to; close it first"
                 raise RuntimeError(msg)
 
             end = int(row[0])
-            self._write_buffer_row(end, end, statistics)
+            self._write_buffer_row(cursor, end, end, statistics)
 
-    def _write_buffer_row(self, start: int, end: int, statistics: str) -> None:
+    def _write_buffer_row(
+        self, cursor: Cursor, start: int, end: int, statistics: str
+    ) -> None:
         """Inside the caller's transaction."""
-        self._con.execute(
-            "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
-            " VALUES ('buffer', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
-            " start_offset = excluded.start_offset,"
-            " end_offset = excluded.end_offset",
+        cursor.execute(
+            self._backend.sql(
+                "INSERT INTO tier_offsets (tier, start_offset, end_offset)"
+                " VALUES ('buffer', ?, ?) ON CONFLICT(tier) DO UPDATE SET"
+                " start_offset = excluded.start_offset,"
+                " end_offset = excluded.end_offset"
+            ),
             (start, end),
         )
-        self._con.execute(
-            "INSERT INTO tier_statistics (tier, statistics) VALUES ('buffer', ?)"
-            " ON CONFLICT(tier) DO UPDATE SET statistics = excluded.statistics",
+        cursor.execute(
+            self._backend.sql(
+                "INSERT INTO tier_statistics (tier, statistics) VALUES ('buffer', ?)"
+                " ON CONFLICT(tier) DO UPDATE SET statistics = excluded.statistics"
+            ),
             (statistics,),
         )
-        self._bump_tiers()
+        self._bump_tiers(cursor)
 
     def retired(self) -> dict[str, object] | None:
         """The log's retirement, read from the buffer's closed range, or None.
@@ -2700,13 +2270,15 @@ class Buffer:
         not known to be 0), `retired` once `retire()` has emptied it.
         """
         try:
-            with self._lock:
-                row = self._con.execute(
-                    "SELECT o.start_offset, o.end_offset, s.statistics"
-                    " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
-                    " WHERE o.tier = 'buffer'"
+            with self._backend.read() as cursor:
+                row = cursor.execute(
+                    self._backend.sql(
+                        "SELECT o.start_offset, o.end_offset, s.statistics"
+                        " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
+                        " WHERE o.tier = 'buffer'"
+                    )
                 ).fetchone()
-        except sqlite3.OperationalError:
+        except self._backend.errors.absent:
             return None
 
         if row is None:
@@ -2714,36 +2286,12 @@ class Buffer:
 
         return _retirement(int(row[1]), str(row[2]), self.get_meta(PUBLISHED_META_KEY))
 
-    @classmethod
-    def peek_retired(cls, path: Path) -> dict[str, object] | None:
-        """`retired()` for a database file no handle holds open — a replica."""
-        con = cls._connect_readonly(path)
-        try:
-            row = con.execute(
-                "SELECT o.end_offset, s.statistics"
-                " FROM tier_offsets o JOIN tier_statistics s USING (tier)"
-                " WHERE o.tier = 'buffer'"
-            ).fetchone()
-            published = _meta_value(con, PUBLISHED_META_KEY)
-        except sqlite3.OperationalError:
-            return None
-        finally:
-            con.close()
-
-        if row is None:
-            return None
-
-        return _retirement(int(row[0]), str(row[1]), published)
-
     def retired_error(self) -> RetiredError:
         """The refusal for anything that would add rows to a retired log."""
         return RetiredError.of(self.retired() or {"state": "retired"}, self._name())
 
     def _name(self) -> str:
-        """The log's name, for messages: the directory `buffer.db` sits in."""
-        row = self._con.execute("PRAGMA database_list").fetchone()
-
-        return Path(str(row[2])).parent.name if row is not None else "this log"
+        return self._log_name
 
     # -- compaction bookkeeping -------------------------------------------
 
@@ -2761,10 +2309,12 @@ class Buffer:
         # `open`, so a long-lived maintainer starting its next merge wiped them
         # and left those objects referenced by nothing. Each operation clears
         # its own.
-        with self._lock:
-            self._con.execute(
-                "INSERT INTO compacting (start_offset, end_offset, rel_path)"
-                " VALUES (?, ?, ?)",
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO compacting (start_offset, end_offset, rel_path)"
+                    " VALUES (?, ?, ?)"
+                ),
                 (start, end, rel_path),
             )
 
@@ -2776,27 +2326,30 @@ class Buffer:
         log written by an earlier version can hold several from one interrupted
         operation, each named before it existed (I2).
         """
-        with self._lock:
-            self._con.execute(
-                "INSERT INTO compacting (start_offset, end_offset, rel_path)"
-                " VALUES (?, ?, ?)",
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql(
+                    "INSERT INTO compacting (start_offset, end_offset, rel_path)"
+                    " VALUES (?, ?, ?)"
+                ),
                 (start, end, rel_path),
             )
 
     def pending_compaction(self) -> tuple[int, int, str] | None:
-        with self._lock:
-            row = self._con.execute(
-                "SELECT start_offset, end_offset, rel_path FROM compacting"
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    "SELECT start_offset, end_offset, rel_path FROM compacting"
+                )
             ).fetchone()
 
         return None if row is None else (int(row[0]), int(row[1]), str(row[2]))
 
     def pending_outputs(self) -> list[tuple[int, int, str]]:
         """Every claimed output, for recovery."""
-        with self._lock:
-            rows = self._con.execute(
-                "SELECT start_offset, end_offset, rel_path FROM compacting"
-                " ORDER BY rowid"
+        with self._backend.read() as cursor:
+            rows = cursor.execute(
+                self._backend.sql(self._backend.compacting_outputs)
             ).fetchall()
 
         return [(int(start), int(end), str(path)) for start, end, path in rows]
@@ -2813,12 +2366,13 @@ class Buffer:
         The whole-table form is left for a caller that has genuinely resolved
         every row, and nothing does today.
         """
-        with self._lock:
+        with self._backend.write() as cursor:
             if rel_path is None:
-                self._con.execute("DELETE FROM compacting")
+                cursor.execute(self._backend.sql("DELETE FROM compacting"))
             else:
-                self._con.execute(
-                    "DELETE FROM compacting WHERE rel_path = ?", (rel_path,)
+                cursor.execute(
+                    self._backend.sql("DELETE FROM compacting WHERE rel_path = ?"),
+                    (rel_path,),
                 )
 
     # -- deletion queue ---------------------------------------------------
@@ -2829,9 +2383,11 @@ class Buffer:
         Enqueued in the same breath as the commit that superseded them, which
         is the only moment their paths are known without going to look.
         """
-        with self._transaction():
-            self._con.executemany(
-                "INSERT OR IGNORE INTO pending_delete (rel_path, superseded_at) VALUES (?, ?)",
+        with self._backend.write() as cursor:
+            cursor.executemany(
+                self._backend.sql(
+                    "INSERT INTO pending_delete (rel_path, superseded_at) VALUES (?, ?) ON CONFLICT DO NOTHING"
+                ),
                 [(p, superseded_at) for p in rel_paths],
             )
 
@@ -2852,22 +2408,26 @@ class Buffer:
         scan failed mid-read with a 404. An attempt that ABORTS and is retried
         later is worse — it commits against a stamp burned days ago.
 
-        `INSERT OR IGNORE` deliberately keeps the first stamp on re-enqueue, so
+        `ON CONFLICT DO NOTHING` keeps the first stamp on re-enqueue, so
         this is an explicit update rather than a second insert.
         """
-        with self._transaction():
-            self._con.executemany(
-                "UPDATE pending_delete SET superseded_at = ? WHERE rel_path = ?",
+        with self._backend.write() as cursor:
+            cursor.executemany(
+                self._backend.sql(
+                    "UPDATE pending_delete SET superseded_at = ? WHERE rel_path = ?"
+                ),
                 [(superseded_at, p) for p in rel_paths],
             )
 
     def due_deletions(self, cutoff: int) -> list[str]:
         """Files superseded at or before `cutoff` — now minus the grace period."""
-        with self._lock:
+        with self._backend.read() as cursor:
             return [
                 str(row[0])
-                for row in self._con.execute(
-                    "SELECT rel_path FROM pending_delete WHERE superseded_at <= ?",
+                for row in cursor.execute(
+                    self._backend.sql(
+                        "SELECT rel_path FROM pending_delete WHERE superseded_at <= ?"
+                    ),
                     (cutoff,),
                 ).fetchall()
             ]
@@ -2879,9 +2439,10 @@ class Buffer:
         row and the next drain retries an unlink that is already a no-op. The
         reverse order loses the path and leaks the file permanently.
         """
-        with self._lock:
-            self._con.execute(
-                "DELETE FROM pending_delete WHERE rel_path = ?", (rel_path,)
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql("DELETE FROM pending_delete WHERE rel_path = ?"),
+                (rel_path,),
             )
             # The file is gone from disk, so what it held is no longer a fact
             # about anything. Dropped here rather than when the table stopped
@@ -2889,7 +2450,9 @@ class Buffer:
             # still be reading it (I6).
             # The extent goes with the file. It described where those rows
             # live, and they no longer live anywhere by that name.
-            self._con.execute("DELETE FROM extent WHERE rel_path = ?", (rel_path,))
+            cursor.execute(
+                self._backend.sql("DELETE FROM extent WHERE rel_path = ?"), (rel_path,)
+            )
 
     def strip_local_state(self, reserve: int) -> tuple[int, int]:
         """Drop everything that describes the machine this came FROM (§3a).
@@ -2949,34 +2512,22 @@ class Buffer:
 
         Finally the offset sequence is raised by `reserve`. See `litelink.restore`.
         """
-        with self._transaction():
-            self._con.execute("DELETE FROM extent")
+        with self._backend.write() as cursor:
+            cursor.execute(self._backend.sql("DELETE FROM extent"))
             # The staging files they name are not restored, so no swap is owed.
-            self._con.execute("DELETE FROM awaiting_swap")
-            self._con.execute(
-                "DELETE FROM pending_delete WHERE rel_path NOT LIKE '%://%'"
-            )
-            self._con.execute("DELETE FROM claim")
-            self._con.execute("DELETE FROM sealing")
-            released = self._con.execute("SELECT count(*) FROM buffer").fetchone()[0]
-            highest = self._con.execute(
-                'SELECT max("litelink_offset") FROM buffer'
-            ).fetchone()[0]
-            seq = self._con.execute(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'buffer'"
-            ).fetchone()
-            ceiling = max(int(seq[0]) if seq else 0, int(highest or 0)) + reserve
-            self._con.execute(
-                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'buffer'",
-                (ceiling,),
-            )
-            if not self._con.execute(
-                "SELECT 1 FROM sqlite_sequence WHERE name = 'buffer'"
-            ).fetchone():
-                self._con.execute(
-                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('buffer', ?)",
-                    (ceiling,),
+            cursor.execute(self._backend.sql("DELETE FROM awaiting_swap"))
+            cursor.execute(
+                self._backend.sql(
+                    "DELETE FROM pending_delete WHERE rel_path NOT LIKE '%://%'"
                 )
+            )
+            cursor.execute(self._backend.sql("DELETE FROM claim"))
+            cursor.execute(self._backend.sql("DELETE FROM sealing"))
+            released = cursor.execute(
+                self._backend.sql("SELECT count(*) FROM buffer")
+            ).fetchone()[0]
+            _, end = self._backend.advance(cursor, reserve)
+            ceiling = end - 1
 
         self._seed_group()
 
@@ -2993,9 +2544,11 @@ class Buffer:
         of the published table and the published table has since moved on: see
         `litelink.restore`.
         """
-        with self._transaction():
-            self._con.execute(
-                "DELETE FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+        with self._backend.write() as cursor:
+            cursor.execute(
+                self._backend.sql(
+                    "DELETE FROM extent WHERE end_offset IS NULL AND rel_path IS NULL"
+                )
             )
 
         self._seed_group()
@@ -3010,80 +2563,27 @@ class Buffer:
 
         Idempotent: rows already gone are simply not there to delete.
         """
-        with self._lock, self._con:
-            cursor = self._con.execute(
-                'DELETE FROM buffer WHERE "litelink_offset" >= ?'
-                ' AND "litelink_offset" < ?',
+        with self._backend.write() as cursor:
+            cursor = cursor.execute(
+                self._backend.sql(
+                    'DELETE FROM buffer WHERE "litelink_offset" >= ?'
+                    ' AND "litelink_offset" < ?'
+                ),
                 (start, end),
             )
 
         return cursor.rowcount
 
     def reclaim_free_pages(self, min_free_ratio: float = 0.0) -> int:
-        """Return the file's dead space to the OS. Bytes reclaimed, or 0 (§3a).
-
-        Reclaims when the free list is at least `min_free_ratio` of the file.
-        The default reclaims whenever there is anything worth reclaiming, which
-        is what an explicit `reclaim("buffer")` asks for; `advance` passes the
-        log's `vacuum_free_ratio` instead.
-
-        SQLite puts pages freed by a DELETE on a free list and never shrinks the
-        file, so a buffer that seals and publishes for months keeps every page it
-        has ever needed. That is invisible locally — the free list is reused —
-        and expensive off-box, because litestream replicates the FILE: a
-        `restore` downloads and applies the dead space. Measured
-        on a 1-day-old capture: 457 MB holding 20,658 live rows, 92% of its pages
-        free, restoring in 12.5 s against 0.8 s for the same content vacuumed.
-
-        **The obvious objection is that `VACUUM` rewrites everything, so it must
-        cost more in shipped WAL than it saves. Measured, it does not.** Two
-        sidecars, same workload, six insert/delete cycles: 3.1 MB shipped
-        without, 0.3 MB with. litestream ships LTX deltas of a SMALLER database,
-        so the steady state is cheaper, and the one-time rewrite of an already
-        bloated file measured 0.06 MB on the wire.
-
-        **Not automatic, and not on the delete path.** `VACUUM` takes an
-        exclusive lock and rebuilds the file, so its cost is the LIVE data and it
-        stalls appends for that long — 0.3 s at 35 MB. Running it wherever rows
-        happen to leave would put a background cost on the write path and take
-        the decision away from the deployment that knows its append rate. It is
-        a maintenance operation: `WriteHandle.reclaim("buffer")` calls it, and
-        `advance` does too when `vacuum_free_ratio` is set.
-
-        **Offsets are untouched, which is the property that matters (I9).**
-        `litelink_offset` is an explicit `INTEGER PRIMARY KEY`, so it is column
-        data rather than an implicit rowid SQLite may renumber: values keep
-        their gaps and are never rewritten. `sqlite_sequence` survives too,
-        including across a VACUUM of a FULLY DRAINED buffer — the ordinary state
-        after `evict("buffer")` on a log the published table has caught up with,
-        and the case that would matter: were that counter lost, AUTOINCREMENT
-        would restart at 1 and reissue offsets the published table already
-        holds. Verified both directly.
-
-        Not in `_transaction`: SQLite refuses `VACUUM` inside one. The lock is
-        still held, so no append interleaves.
-        """
-        with self._lock:
-            page_size = int(self._con.execute("PRAGMA page_size").fetchone()[0])
-            page_count = int(self._con.execute("PRAGMA page_count").fetchone()[0])
-            free = int(self._con.execute("PRAGMA freelist_count").fetchone()[0])
-            if (
-                not page_count
-                or free * page_size < _VACUUM_FLOOR_BYTES
-                or free < page_count * min_free_ratio
-            ):
-                return 0
-
-            self._con.execute("VACUUM")
-
-            return free * page_size
+        """Return the backend's dead space to its storage owner (§3a)."""
+        return self._backend.reclaim(min_free_ratio)
 
     def queued_deletions(self) -> list[str]:
-        with self._lock:
+        with self._backend.read() as cursor:
             return [
                 str(row[0])
-                for row in self._con.execute(
-                    "SELECT rel_path FROM pending_delete"
+                for row in cursor.execute(
+                    self._backend.sql("SELECT rel_path FROM pending_delete")
                 ).fetchall()
             ]
 
@@ -3099,12 +2599,7 @@ class Buffer:
         # nothing once that is sealed, but a closed buffer holds no tail at
         # all, and a caller keeping the object alive should not keep the rows.
         self._drop_tail()
-        self._con.close()
-        # Identity-checked, because a readonly buffer passes one connection
-        # three times.
-        for extra in (self._reader, self._sealer):
-            if extra is not self._con:
-                extra.close()
+        self._backend.close()
 
 
 def _measurer(schema: pa.Schema) -> Callable[[tuple[object, ...]], int]:
@@ -3264,8 +2759,8 @@ def _explain(
     row: Mapping[str, object],
     values: tuple[object, ...],
     shape: Shape,
-    exc: sqlite3.IntegrityError,
-) -> None:
+    exc: BaseException,
+) -> NoReturn:
     """Turn a constraint failure into the refusal a caller can act on.
 
     The checks below used to run per row, ahead of the insert, and cost
@@ -3435,7 +2930,7 @@ class RowProbe:
             values, _ = _encode_nested(values, shape.nested)
 
         with self._lock:
-            self._con.execute(_BEGIN)
+            self._con.execute("BEGIN IMMEDIATE")
             try:
                 try:
                     self._con.execute(self._sql, values)

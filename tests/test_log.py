@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
+import threading
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -13,9 +14,10 @@ import pyarrow.parquet as pq
 import pytest
 
 import litelink
-from litelink import OFFSET, LogConfig, WriteHandle, _table
+from litelink import OFFSET, LogConfig, WriteHandle, _handle, _table
 from litelink._buffer import Buffer
 from litelink._layout import Layout
+from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
     from litelink._transaction import WriteLock
@@ -270,14 +272,11 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
     ratio instead depends on how the fsyncs under the lock compare with the
     Parquet write, which is a property of the disk, not of the seal.
     """
-    import threading
-
-    from litelink import _handle
 
     config = LogConfig(target_seal_size=1 << 30)
     with open_log(tmp_path, config) as log:
         log.extend(rows(400))
-        real_lock = log._buffer._lock
+        real_lock = sqlite_backend(log)._lock
         taken: list[bool] = []
         probes: list[bool] = []
 
@@ -312,11 +311,11 @@ def test_a_seal_holds_the_buffer_lock_only_to_claim_and_clean_up(
             probe()
 
         monkeypatch.setattr(_handle, "write_parquet", write_parquet)
-        log._buffer._lock = cast("WriteLock", Counted())
+        sqlite_backend(log)._lock = cast("WriteLock", Counted())
         try:
             log.seal(flush=True)
         finally:
-            log._buffer._lock = real_lock
+            sqlite_backend(log)._lock = real_lock
 
     assert taken, "the seal never took the buffer lock, so this probed nothing"
     assert probes, "the seal never wrote a file, so this probed nothing"
@@ -416,7 +415,6 @@ def test_maintenance_runs_on_a_background_thread(tmp_path: Path) -> None:
     connection flag and the lock, every background advance() raises and the
     log grows forever while looking healthy.
     """
-    import threading
 
     config = LogConfig(target_seal_size=2048, compact_min_files=2)
     failures: list[BaseException] = []
@@ -487,13 +485,15 @@ def test_an_interrupt_inside_commit_is_not_masked(tmp_path: Path) -> None:
             return getattr(self._connection, name)
 
     with open_log(tmp_path) as log:
-        real = log._buffer._con
-        log._buffer._con = cast("sqlite3.Connection", InterruptingConnection(real))
+        real = sqlite_backend(log)._writer
+        sqlite_backend(log)._writer = cast(
+            "sqlite3.Connection", InterruptingConnection(real)
+        )
         try:
             with pytest.raises(KeyboardInterrupt):
                 log.append(rows(1)[0])
         finally:
-            log._buffer._con = real
+            sqlite_backend(log)._writer = real
 
         # The COMMIT did land, so the row is durable despite the raise.
         assert len(read_all(log)) == 1

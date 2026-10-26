@@ -126,6 +126,13 @@ class Transaction(Protocol):
         ...
 
 
+class CallerTransaction(Transaction, Protocol):
+    """Internal lifetime checks shared by the backend implementations."""
+
+    def check(self) -> None: ...
+    def close(self) -> None: ...
+
+
 class WriteLock:
     """The buffer's write-connection mutex, aware of a caller's transaction.
 
@@ -202,8 +209,13 @@ class SqliteTransaction:
     dialect = "sqlite"
 
     def __init__(
-        self, connection: sqlite3.Connection, owned: Callable[[str], bool]
+        self,
+        connection: sqlite3.Connection,
+        owned: Callable[[str], bool],
+        *,
+        close: Callable[[], None],
     ) -> None:
+        self._close = close
         self._con = connection
         self._owned = owned
         self._thread = threading.get_ident()
@@ -252,6 +264,7 @@ class SqliteTransaction:
     def close(self) -> None:
         """Mark the transaction ended, once its COMMIT or ROLLBACK has run."""
         self._open = False
+        self._close()
 
     @contextlib.contextmanager
     def _guarded(self) -> Iterator[None]:
