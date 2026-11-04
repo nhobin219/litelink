@@ -22,6 +22,14 @@ minor version carries breaking changes.
 
 - Staging eviction stops at the buffer's confirmed eviction point, preserving
   the evidence for buffer eviction when staging is asked to evict first.
+- Append reads both occupancy counters in one statement, updates both in one
+  statement, and sums incoming bytes while preparing rows. The disposable
+  counters-off benchmark streams preparation. In a same-session Python 3.11
+  preparation-only profile of 12,288 rows, its peak traced bytes fall from
+  1,780,576 to 146,304 for narrow rows (base: 146,096), and from 2,175,397 to
+  147,973 for 2 KB rows (base: 147,661). Generation-0/1 collections fall from
+  33/2 to 2/0, matching base. Enabled admission still materializes the batch
+  before insertion; this profile does not establish the append-throughput gate.
 
 
 ### Changed

@@ -646,11 +646,12 @@ class Buffer:
 
     def _change_usage(self, cursor: Cursor, size: int, rows: int) -> None:
         if _BUFFER_USAGE_ENABLED:
-            cursor.executemany(
+            cursor.execute(
                 self._backend.sql(
-                    "UPDATE meta SET v = CAST(v AS INTEGER) + ? WHERE k = ?"
+                    "UPDATE meta SET v = CAST(v AS INTEGER)"
+                    " + CASE k WHEN ? THEN ? ELSE ? END WHERE k IN (?, ?)"
                 ),
-                [(size, BUFFER_BYTES_KEY), (rows, BUFFER_ROWS_KEY)],
+                (BUFFER_BYTES_KEY, size, rows, BUFFER_BYTES_KEY, BUFFER_ROWS_KEY),
             )
 
     def buffer_usage(self) -> BufferUsage:
@@ -841,8 +842,11 @@ class Buffer:
                 # statement. Everything else I17 promises is in the DDL now.
                 declared = shape.known.issuperset
                 width = len(columns)
+                usage_enabled = _BUFFER_USAGE_ENABLED
+                size = 0
 
                 def prepared() -> Iterator[PreparedRow]:
+                    nonlocal size
                     for row in rows:
                         # I11 FIRST, so a row that is wrong twice gets the message
                         # about the thing that is specifically forbidden rather than
@@ -877,11 +881,14 @@ class Buffer:
                             values, extra = _encode_nested(values, nested)
 
                         try:
-                            size = measure(values) + extra
+                            row_bytes = measure(values) + extra
                         except (AttributeError, TypeError) as exc:
                             _explain(row, values, shape, exc)
 
-                        yield row, values, size
+                        if usage_enabled:
+                            size += row_bytes
+
+                        yield row, values, row_bytes
 
                 def refused(item: PreparedRow, exc: BaseException) -> NoReturn:
                     row, values, _ = item
@@ -890,22 +897,25 @@ class Buffer:
 
                     _explain(row, values, shape, exc)
 
-                batch = list(prepared())
-                size = sum(item[2] for item in batch)
-                if _BUFFER_USAGE_ENABLED and batch:
-                    current_bytes = int(
-                        _meta_value(cursor, self._backend.sql, BUFFER_BYTES_KEY) or 0
-                    )
-                    current_rows = int(
-                        _meta_value(cursor, self._backend.sql, BUFFER_ROWS_KEY) or 0
-                    )
+                batch: Iterable[PreparedRow] = prepared()
+                # Admission needs the complete measured batch before its first
+                # insert. The disposable benchmark's OFF path streams, as the
+                # uncapped writer does, rather than retaining per-row tuples.
+                if usage_enabled and (batch := list(batch)):
+                    current_bytes, current_rows = cursor.execute(
+                        self._backend.sql(
+                            "SELECT (SELECT v FROM meta WHERE k = ?),"
+                            " (SELECT v FROM meta WHERE k = ?)"
+                        ),
+                        (BUFFER_BYTES_KEY, BUFFER_ROWS_KEY),
+                    ).fetchone()
                     # Revisit: one buffer cap bounds every maintainer stall,
                     # because the buffer holds every unpublished row. Staging
                     # stays an eviction target. These rows are uncompressed;
                     # this bounds row bytes, not SQLite files or physical disk.
-                    if current_bytes + size > config.buffer_max_bytes or (
+                    if int(current_bytes or 0) + size > config.buffer_max_bytes or (
                         config.buffer_max_rows is not None
-                        and current_rows + len(batch) > config.buffer_max_rows
+                        and int(current_rows or 0) + len(batch) > config.buffer_max_rows
                     ):
                         raise LogFull(
                             "append would exceed the buffer write limit; retry after eviction"
@@ -930,7 +940,7 @@ class Buffer:
                         group = self._cut(cursor, group, offset)
 
                 self._write_group(cursor, group)
-                self._change_usage(cursor, size, len(batch))
+                self._change_usage(cursor, size, len(offsets))
         finally:
             self._inserting = False
 

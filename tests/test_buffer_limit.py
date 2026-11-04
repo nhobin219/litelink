@@ -21,7 +21,7 @@ from litelink._sqlite import SqliteBackend
 from tests.conftest import sqlite_backend
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterator, Mapping
     from pathlib import Path
 
     from litelink._backend import Cursor
@@ -113,6 +113,56 @@ def test_batch_is_checked_before_first_insert(
         monkeypatch.setattr(backend, "insert_rows", forbidden)
         with pytest.raises(LogFull):
             log.extend([ROW, ROW])
+
+
+def test_append_reads_and_updates_both_counters_once(tmp_path: Path) -> None:
+    with create(tmp_path) as log:
+        backend = sqlite_backend(log)
+        statements: list[str] = []
+        backend._writer.set_trace_callback(statements.append)
+        try:
+            assert log.extend(iter([ROW, ROW, ROW])) == [1, 2, 3]
+        finally:
+            backend._writer.set_trace_callback(None)
+
+        counter_sql = [
+            s for s in statements if "'buffer_bytes'" in s or "'buffer_rows'" in s
+        ]
+        assert len(counter_sql) == 2
+        assert counter_sql[0].startswith("SELECT ")
+        assert counter_sql[1].startswith("UPDATE meta ")
+        assert all("'buffer_rows'" in s for s in counter_sql)
+        assert log.buffer_usage().rows == 3
+        assert log.buffer_usage().bytes == 3 * ROW_BYTES
+
+
+def test_benchmark_off_streams_preparation_without_counter_sql(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_buffer, "_BUFFER_USAGE_ENABLED", False)
+    with create(tmp_path) as log:
+        backend = sqlite_backend(log)
+        statements: list[str] = []
+
+        def rows() -> Iterator[Mapping[str, object]]:
+            yield ROW
+            # A streaming append inserts the first row before asking for the
+            # next. Materializing preparation retains the whole batch instead.
+            with backend.read() as cursor:
+                assert cursor.execute("SELECT count(*) FROM buffer").fetchone()[0] == 1
+
+            yield ROW
+
+        backend._writer.set_trace_callback(statements.append)
+        try:
+            assert log.extend(rows()) == [1, 2]
+        finally:
+            backend._writer.set_trace_callback(None)
+
+        assert not any(
+            "'buffer_bytes'" in s or "'buffer_rows'" in s for s in statements
+        )
+        assert log.buffered_rows() == 2
 
 
 def test_savepoint_rollback_and_outer_rollback_include_counters(tmp_path: Path) -> None:
