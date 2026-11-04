@@ -7,6 +7,23 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## Unreleased
+
+### Added
+
+- Transactional retained-buffer byte and row counters, `buffer_usage()`, and
+  `LogFull` admission refusal (#221). The default byte cap is 8 GiB; the optional
+  row cap is disabled. A batch is refused before any insert and can retry after
+  buffer eviction. The first writable open migrates older logs with one atomic
+  counted scan. Stop all older writers before upgrading; they cannot maintain
+  the new counters.
+
+### Fixed
+
+- Staging eviction stops at the buffer's confirmed eviction point, preserving
+  the evidence for buffer eviction when staging is asked to evict first.
+
+
 ## 0.14.3 — 2026-11-24
 
 ### Fixed

@@ -741,10 +741,11 @@ boundary is the staging table's committed end. **`evict` takes optional half-ope
 eviction is one `DELETE` under SQLite's write lock and stalls appends while it runs. Staging
 eviction always removes a prefix, so a `start_offset` above the table's first offset raises.
 
-Evict the buffer before staging, as `advance()` does. The buffer boundary is proved by the
-longest prefix of staging files with confirmed published coverage. If staging eviction leaves
-no files, buffer eviction keeps already-published rows until the next file is sealed and
-published.
+Evict the buffer before staging for progress in one pass, as `advance()` does. The buffer
+boundary is proved by the longest prefix of staging files with confirmed published coverage.
+Staging eviction stops at the buffer's confirmed eviction point, snapped down to a whole file.
+A staging-first call therefore retains the evidence for the next buffer eviction; partial
+buffer deletion never permits removing a file still covering a retained buffer row.
 
 **`reclaim` on staging or published does not delete a file in the call that frees it.** Iceberg's
 expiry is metadata only; what it frees, and what compaction and eviction supersede, is queued
@@ -883,6 +884,7 @@ which lands them at the same offsets.
 ```python
 log.end_offset() -> int                      # EXCLUSIVE upper bound: what the next append gets
 log.buffered_rows() -> int                   # durable, not yet sealed
+log.buffer_usage() -> BufferUsage             # all retained buffer rows, including sealed rows
 log.staging_rows() -> int
 log.staging_files() -> int                     # what compaction is bringing down
 log.staging_extent() -> tuple[int, int] | None # [start, end) from manifest statistics
@@ -890,6 +892,27 @@ log.published_through() -> int                # highest offset the published tab
 log.published_files() -> int
 log.coverage(*, published=True) -> Coverage    # each tier's [start, end)
 ```
+
+`buffer_usage()` returns a frozen `BufferUsage` with `bytes`, `rows`, `buffer_max_bytes`,
+`buffer_max_rows` and `refusing`, read from one metadata snapshot. It counts **all** rows still
+in SQLite, including sealed and published rows awaiting buffer eviction. Bytes use the same
+uncompressed row measurement as sealing; they are neither database pages nor physical disk
+usage. `refusing` means occupancy has reached either enabled cap. A batch can also be refused
+below a cap when its entire size would exceed it. Refusal does not latch: eviction or raising
+a cap immediately changes the reported state. This is the counter source for a consumer's
+`/stats` response.
+
+An `append` or `extend` that would exceed either cap raises `litelink.LogFull` (a
+`RuntimeError`) before inserting any row from that call; equality is allowed. Retry after
+`evict("buffer")` makes room. A refused append inside a caller transaction rolls back only
+its savepoint. Direct `ingest` does not put rows in the buffer and bypasses these caps.
+
+On the first writable open of an older log, one counted scan initializes both counters and
+the migration marker in one SQLite write transaction. Competing openers serialize before
+checking the marker. A crash before commit retries the scan; after commit the marker prevents
+another scan. Read-only handles need that writable migration before `buffer_usage()` is
+available. Stop all older writers before upgrading: versions before 0.15 do not maintain
+these counters and must never write concurrently with 0.15.
 
 `coverage()` says where each tier sits in the log: `published` (what only the published table holds,
 below the staging table), `staging` and `buffer` (the rows above every file), each a half-open
@@ -1110,6 +1133,8 @@ stay dense across the two, and any engine reads both as one sequence.
 ```python
 target_seal_size      int             = 8 MiB    uncompressed (Arrow) bytes per SEAL
 target_seal_rows      int | None      = None     the other ceiling; whichever is hit FIRST
+buffer_max_bytes     int             = 8 GiB    maximum uncompressed buffered row bytes (>= target_seal_size)
+buffer_max_rows      int | None      = None     maximum retained buffer rows (None = no row cap)
 target_compact_size   int | None      = None     bytes ON DISK per compacted FILE (None = 512 MiB)
 target_compact_step_size int | None = None     new sealed bytes on disk per in-progress rewrite (None = target/8)
 target_row_group_size int             = 64 MiB   Arrow bytes compaction sorts and holds at once

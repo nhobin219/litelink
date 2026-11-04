@@ -31,7 +31,8 @@ def test_buffered_rows_excludes_published_rows_after_staging_eviction(
         assert log.buffered_rows() == 0
         log.evict("buffer")
         log.publish(flush=True)
-        log.evict("staging")
+        # Recreate a pre-0.15 stranded state; normal staging eviction prevents it.
+        log._table.evict_below(log.end_offset())
         assert log.staging_extent() is None
         assert log.published_through() == 4
         assert log._buffer.span() == (1, 5)  # noqa: SLF001
@@ -55,7 +56,8 @@ def test_retire_does_not_reseal_published_rows_without_staging(
         log.seal(flush=True)
         log.evict("buffer")
         log.publish(flush=True)
-        log.evict("staging")
+        # Recreate a pre-0.15 stranded state; normal staging eviction prevents it.
+        log._table.evict_below(log.end_offset())
         assert log.staging_extent() is None
         assert log._buffer.span() == (1, 5)  # noqa: SLF001
         real_seal = log.seal

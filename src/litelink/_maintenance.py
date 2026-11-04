@@ -905,9 +905,9 @@ class Maintenance:
         Rows below the staging table's first file were evicted from it, which
         I4 allowed only once the published table held them, so the boundary is
         the end of the longest prefix of staging files the copy holds. Run
-        before `evict("staging")` — as `advance` does — so the files that prove
-        it are still there. With no staging files left the boundary is 0;
-        held rows leave once the next file is sealed and published.
+        before `evict("staging")` for progress in one pass, as `advance` does.
+        A staging-first call stops at the buffer's confirmed eviction point,
+        preserving the files that prove the remaining buffer deletions.
 
         `[start_offset, end_offset)` narrows what is eligible; it never widens
         it. Unbounded, this is one `DELETE` under SQLite's write lock and
@@ -1006,6 +1006,7 @@ class Maintenance:
             # excluded: deleting the only staging copy on the strength of an
             # intended one is the loss this whole record exists to prevent.
             self.published_prefix(files, include_intents=False),
+            self._buffer.confirmed_eviction_point(),
         )
         if not everything:
             # Nor a file the published table holds only for now (#160): a
