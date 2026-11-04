@@ -33,10 +33,19 @@ from litelink._types import (
     column_type,
     slot_bits,
 )
+from litelink._usage import BufferUsage, LogFull
 
 # Where the log records its settings. It lives here because this object owns
 # `meta`, and `meta` is the one place the policy exists.
 CONFIG_KEY = "config"
+BUFFER_BYTES_KEY = "buffer_bytes"
+BUFFER_ROWS_KEY = "buffer_rows"
+BUFFER_USAGE_VERSION_KEY = "buffer_usage_version"
+
+# Private benchmark switch; use only with isolated, disposable logs and no
+# other processes. A disabled open invalidates the migration marker so a
+# subsequent normal open recounts instead of trusting stale counters.
+_BUFFER_USAGE_ENABLED: bool = True
 
 # §4's declared clustering. Here for the same reason `CONFIG_KEY` is: `meta` is
 # the one place it exists, so this object owns the read.
@@ -568,6 +577,7 @@ class Buffer:
         buffer = cls(backend, schema, name=name)
         if not backend.readonly:
             backend.create(schema)
+            buffer._initialize_usage()
             buffer._seed_group()
 
         return buffer
@@ -585,10 +595,113 @@ class Buffer:
     # trigger and compaction's sense of how full a file is, so an undercount
     # is the harmful direction: it seals files past the target.
 
+    def _initialize_usage(self) -> None:
+        # BEGIN IMMEDIATE precedes the marker read, serializing competing opens.
+        # Counts and marker commit together: a crash before commit leaves neither
+        # visible and retries the scan; a crash after commit never repeats it.
+        with self._backend.write() as cursor:
+            if not _BUFFER_USAGE_ENABLED:
+                cursor.execute(
+                    self._backend.sql("DELETE FROM meta WHERE k = ?"),
+                    (BUFFER_USAGE_VERSION_KEY,),
+                )
+
+                return
+
+            if _meta_value(cursor, self._backend.sql, BUFFER_USAGE_VERSION_KEY):
+                return
+
+            size, rows = self._count_rows(cursor, 0, None)
+            _write_meta(
+                cursor,
+                self._backend.sql,
+                {
+                    BUFFER_BYTES_KEY: str(size),
+                    BUFFER_ROWS_KEY: str(rows),
+                    BUFFER_USAGE_VERSION_KEY: "1",
+                },
+            )
+
+    def _count_rows(
+        self, cursor: Cursor, start: int, end: int | None
+    ) -> tuple[int, int]:
+        shape = self.shape()
+        names = ", ".join(f'"{c}"' for c in shape.columns)
+        query = f'SELECT {names} FROM buffer WHERE "litelink_offset" >= ?'
+        params = (start,) if end is None else (start, end)
+        if end is not None:
+            query += ' AND "litelink_offset" < ?'
+
+        size = rows = 0
+        for values in cursor.execute(self._backend.sql(query), params):
+            bits = sum(
+                codec.variable_bits(codec.decode(values[i]))
+                for i, _, codec in shape.nested
+                if values[i] is not None
+            )
+            size += shape.measure(values) + -(-bits // 8)
+            rows += 1
+
+        return size, rows
+
+    def _change_usage(self, cursor: Cursor, size: int, rows: int) -> None:
+        if _BUFFER_USAGE_ENABLED:
+            cursor.executemany(
+                self._backend.sql(
+                    "UPDATE meta SET v = CAST(v AS INTEGER) + ? WHERE k = ?"
+                ),
+                [(size, BUFFER_BYTES_KEY), (rows, BUFFER_ROWS_KEY)],
+            )
+
+    def buffer_usage(self) -> BufferUsage:
+        with self._backend.read() as cursor:
+            # One statement: counters and configuration from the same snapshot,
+            # even when another process commits an append or changes the caps.
+            values = dict(
+                cursor.execute(
+                    self._backend.sql("SELECT k, v FROM meta WHERE k IN (?, ?, ?, ?)"),
+                    (
+                        BUFFER_BYTES_KEY,
+                        BUFFER_ROWS_KEY,
+                        CONFIG_KEY,
+                        BUFFER_USAGE_VERSION_KEY,
+                    ),
+                )
+            )
+
+        if not _BUFFER_USAGE_ENABLED or BUFFER_USAGE_VERSION_KEY not in values:
+            raise RuntimeError(
+                "buffer usage requires opening the log for writing with counters enabled"
+            )
+
+        config = self._parse_config(values.get(CONFIG_KEY))
+        size, rows = int(values[BUFFER_BYTES_KEY]), int(values[BUFFER_ROWS_KEY])
+        return BufferUsage(
+            size,
+            rows,
+            config.buffer_max_bytes,
+            config.buffer_max_rows,
+            size >= config.buffer_max_bytes
+            or (config.buffer_max_rows is not None and rows >= config.buffer_max_rows),
+        )
+
+    def confirmed_eviction_point(self) -> int:
+        # Committed absence, never a proposed deletion. One statement prevents
+        # an append between observing an empty buffer and reading its sequence.
+        with self._backend.read() as cursor:
+            row = cursor.execute(
+                self._backend.sql(
+                    'SELECT coalesce(min("litelink_offset"), '
+                    "coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'buffer'), 0) + 1) FROM buffer"
+                )
+            ).fetchone()
+
+        return int(row[0])
+
     def _seed_group(self) -> None:
         """Ensure exactly one open group, seeded from whatever is buffered.
 
-        The only SUM() left, and it runs once per open rather than per append.
+        This group scan runs only when an open group is missing.
         It fires for a log created before this table existed, and for one whose
         open group was closed by a sealer just before the process died.
 
@@ -646,25 +759,8 @@ class Buffer:
         matters. A nested value is stored as JSON and measured as its decoded
         value, the same shape `append` measured.
         """
-        shape = self.shape()
-        names = ", ".join(f'"{c}"' for c in shape.columns)
-        total = 0
         with self._backend.read() as cursor:
-            for values in cursor.execute(
-                self._backend.sql(
-                    f'SELECT {names} FROM buffer WHERE "litelink_offset" >= ?'
-                ),
-                (floor,),
-            ):
-                total += shape.measure(values)
-                bits = 0
-                for i, _, codec in shape.nested:
-                    if values[i] is not None:
-                        bits += codec.variable_bits(codec.decode(values[i]))
-
-                total += -(-bits // 8)
-
-        return total
+            return self._count_rows(cursor, floor, None)[0]
 
     # -- write ------------------------------------------------------------
 
@@ -780,7 +876,12 @@ class Buffer:
                         if nested:
                             values, extra = _encode_nested(values, nested)
 
-                        yield row, values, extra
+                        try:
+                            size = measure(values) + extra
+                        except (AttributeError, TypeError) as exc:
+                            _explain(row, values, shape, exc)
+
+                        yield row, values, size
 
                 def refused(item: PreparedRow, exc: BaseException) -> NoReturn:
                     row, values, _ = item
@@ -789,15 +890,36 @@ class Buffer:
 
                     _explain(row, values, shape, exc)
 
-                for (_, values, extra), offset in self._backend.insert_rows(
-                    cursor, self._backend.sql(sql), prepared(), refused
+                batch = list(prepared())
+                size = sum(item[2] for item in batch)
+                if _BUFFER_USAGE_ENABLED and batch:
+                    current_bytes = int(
+                        _meta_value(cursor, self._backend.sql, BUFFER_BYTES_KEY) or 0
+                    )
+                    current_rows = int(
+                        _meta_value(cursor, self._backend.sql, BUFFER_ROWS_KEY) or 0
+                    )
+                    # Revisit: one buffer cap bounds every maintainer stall,
+                    # because the buffer holds every unpublished row. Staging
+                    # stays an eviction target. These rows are uncompressed;
+                    # this bounds row bytes, not SQLite files or physical disk.
+                    if current_bytes + size > config.buffer_max_bytes or (
+                        config.buffer_max_rows is not None
+                        and current_rows + len(batch) > config.buffer_max_rows
+                    ):
+                        raise LogFull(
+                            "append would exceed the buffer write limit; retry after eviction"
+                        )
+
+                for (_, _values, row_bytes), offset in self._backend.insert_rows(
+                    cursor, self._backend.sql(sql), batch, refused
                 ):
                     offsets.append(offset)
 
                     if group.start_offset is None:
                         group.start_offset = offset
 
-                    group.bytes += measure(values) + extra
+                    group.bytes += row_bytes
                     # Whichever is reached FIRST. Both are ceilings on one file —
                     # bytes bound memory, rows bound the read latency §7 sizes for
                     # — so the tighter one wins.
@@ -808,6 +930,7 @@ class Buffer:
                         group = self._cut(cursor, group, offset)
 
                 self._write_group(cursor, group)
+                self._change_usage(cursor, size, len(batch))
         finally:
             self._inserting = False
 
@@ -1859,7 +1982,9 @@ class Buffer:
         affordable — and keying it on the durable value is what stops it being
         another stale copy: when the row changes, the key changes.
         """
-        raw = self.get_meta(CONFIG_KEY)
+        return self._parse_config(self.get_meta(CONFIG_KEY))
+
+    def _parse_config(self, raw: str | None) -> LogConfig:
         if raw is None:
             return LogConfig()
 
@@ -2557,13 +2682,18 @@ class Buffer:
         """Drop buffer rows in `[start, end)`. Returns how many.
 
         `evict("buffer")`'s delete. The caller decides `end` from what the next
-        durable copy holds; this only deletes. One statement under the write
+        durable copy holds; this counts and deletes in the same transaction under the write
         lock, so a wide range stalls appends for its duration — bounding the
         range is how a caller chunks it.
 
         Idempotent: rows already gone are simply not there to delete.
         """
         with self._backend.write() as cursor:
+            size, rows = (
+                self._count_rows(cursor, start, end)
+                if _BUFFER_USAGE_ENABLED
+                else (0, 0)
+            )
             cursor = cursor.execute(
                 self._backend.sql(
                     'DELETE FROM buffer WHERE "litelink_offset" >= ?'
@@ -2572,7 +2702,10 @@ class Buffer:
                 (start, end),
             )
 
-        return cursor.rowcount
+            removed = cursor.rowcount
+            self._change_usage(cursor, -size, -rows)
+
+        return removed
 
     def reclaim_free_pages(self, min_free_ratio: float = 0.0) -> int:
         """Return the backend's dead space to its storage owner (§3a)."""

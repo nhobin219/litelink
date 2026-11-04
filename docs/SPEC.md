@@ -654,6 +654,29 @@ or row id escapes. `tx.dialect` names the SQL the backend speaks, `"sqlite"` tod
 Postgres backend for the buffer (#201) implements the same protocol over a Postgres transaction,
 with the same lifetime and the same refusals, and a caller's code keeps its shape.
 
+### Buffer admission and occupancy (0.15)
+
+`meta.buffer_bytes` and `meta.buffer_rows` count every row still in the buffer, including
+sealed or published rows awaiting eviction. The byte unit is sealing's uncompressed row
+measurement. Inserts and actual buffer deletions change both counters in their own SQLite
+transaction; failed batches, savepoints and process crashes cannot leave counts apart from
+rows. Initializing a pre-0.15 log takes one counted scan under a write transaction, checking
+the migration marker after acquiring the write lock. Counters and marker commit together;
+an interrupted migration retries, a committed one never rescans. All writers must upgrade
+together; read-only observation requires the writable migration first.
+
+A whole append is measured before any row is inserted. It raises `LogFull` if the resulting
+bytes exceed `buffer_max_bytes` (8 GiB by default, at least `target_seal_size`) or rows exceed
+`buffer_max_rows` (None by default). Equality is admitted. Eviction makes room without a
+separate reset. `LogHandle.buffer_usage()` reads counts and caps from one metadata snapshot;
+`refusing` means occupancy has reached either cap. Direct-to-Parquet ingest bypasses this
+buffer limit. This bounds row bytes rather than database files or total disk use.
+
+Staging eviction, even retirement's `everything=True`, never passes the buffer's confirmed
+eviction point: the first still-buffered offset, or its committed sequence end if empty,
+then snapped down to a file boundary. Thus staging-first eviction preserves the evidence
+needed to evict the buffer, including partial deletion ranges.
+
 ## 4. Seal
 
 Triggered on `min(target_seal_size, target_seal_rows)`, evaluated by the writer at commit
@@ -1980,6 +2003,8 @@ of them is chosen.
 ## 12. Configuration
 
 ```
+buffer_max_bytes      uncompressed buffered row cap     (8 GiB; >= target_seal_size)
+buffer_max_rows       retained buffer row cap           (None = no row cap)
 target_seal_rows       max rows per SEAL                  (the other ceiling; the seal cuts at
                                                           whichever is reached FIRST. None =
                                                           no row limit)

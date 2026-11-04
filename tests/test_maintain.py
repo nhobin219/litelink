@@ -564,6 +564,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
     config = LogConfig(
         target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 40,
+        buffer_max_bytes=1 << 40,
         compact_min_files=2,
         staging_retention=timedelta(microseconds=1),
     )
@@ -592,6 +593,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
         agrees("seal after compaction")
 
         log.publish(flush=True)
+        log.evict("buffer")
         log._maintenance.evict()
         agrees("after eviction")
 
@@ -748,6 +750,7 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         # the rest out with it — which is why the fault only appears once a log
         # has been running a while, and never in a test that just seals.
         # Eviction itself is the commit that does it in practice.
+        log.evict("buffer")
         log._table.evict_below(files[0].end)
         log._maintenance.expire()
 
