@@ -897,32 +897,8 @@ class Buffer:
 
                     _explain(row, values, shape, exc)
 
-                batch: Iterable[PreparedRow] = prepared()
-                # Admission needs the complete measured batch before its first
-                # insert. The disposable benchmark's OFF path streams, as the
-                # uncapped writer does, rather than retaining per-row tuples.
-                if usage_enabled and (batch := list(batch)):
-                    current_bytes, current_rows = cursor.execute(
-                        self._backend.sql(
-                            "SELECT (SELECT v FROM meta WHERE k = ?),"
-                            " (SELECT v FROM meta WHERE k = ?)"
-                        ),
-                        (BUFFER_BYTES_KEY, BUFFER_ROWS_KEY),
-                    ).fetchone()
-                    # Revisit: one buffer cap bounds every maintainer stall,
-                    # because the buffer holds every unpublished row. Staging
-                    # stays an eviction target. These rows are uncompressed;
-                    # this bounds row bytes, not SQLite files or physical disk.
-                    if int(current_bytes or 0) + size > config.buffer_max_bytes or (
-                        config.buffer_max_rows is not None
-                        and int(current_rows or 0) + len(batch) > config.buffer_max_rows
-                    ):
-                        raise LogFull(
-                            "append would exceed the buffer write limit; retry after eviction"
-                        )
-
                 for (_, _values, row_bytes), offset in self._backend.insert_rows(
-                    cursor, self._backend.sql(sql), batch, refused
+                    cursor, self._backend.sql(sql), prepared(), refused
                 ):
                     offsets.append(offset)
 
@@ -938,6 +914,31 @@ class Buffer:
                         or offset - (group.start_offset or offset) + 1 >= target_rows
                     ):
                         group = self._cut(cursor, group, offset)
+
+                # Preparation streams into provisional inserts. Check the full
+                # batch before releasing this transaction/savepoint: refusal
+                # rolls back rows, group cuts and offsets together. Retaining
+                # only the returned offsets avoids holding prepared row tuples.
+                if usage_enabled and offsets:
+                    current_bytes, current_rows = cursor.execute(
+                        self._backend.sql(
+                            "SELECT (SELECT v FROM meta WHERE k = ?),"
+                            " (SELECT v FROM meta WHERE k = ?)"
+                        ),
+                        (BUFFER_BYTES_KEY, BUFFER_ROWS_KEY),
+                    ).fetchone()
+                    # Revisit: one buffer cap bounds every maintainer stall,
+                    # because the buffer holds every unpublished row. Staging
+                    # stays an eviction target. These rows are uncompressed;
+                    # this bounds row bytes, not SQLite files or physical disk.
+                    if int(current_bytes or 0) + size > config.buffer_max_bytes or (
+                        config.buffer_max_rows is not None
+                        and int(current_rows or 0) + len(offsets)
+                        > config.buffer_max_rows
+                    ):
+                        raise LogFull(
+                            "append would exceed the buffer write limit; retry after eviction"
+                        )
 
                 self._write_group(cursor, group)
                 self._change_usage(cursor, size, len(offsets))

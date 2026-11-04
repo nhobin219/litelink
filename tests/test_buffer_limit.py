@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import sqlite3
 import threading
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -101,18 +102,74 @@ def test_refuses_whole_batch_at_either_cap_and_readmits(
         assert log.append(ROW) == 3
 
 
-def test_batch_is_checked_before_first_insert(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("cap", ["bytes", "rows"])
+@pytest.mark.parametrize("joined", [False, True])
+def test_refused_stream_rolls_back_rows_groups_and_offsets(
+    tmp_path: Path, cap: str, joined: bool
 ) -> None:
-    with create(tmp_path, buffer_max_rows=1) as log:
+    limits = {
+        "buffer_max_bytes": 2 * ROW_BYTES,
+        "target_seal_size": 1,
+        "target_seal_rows": 1,
+    }
+    if cap == "rows":
+        limits.update(buffer_max_bytes=1024, buffer_max_rows=2)
+
+    with create(tmp_path, **limits) as log:
         backend = sqlite_backend(log)
+        assert log.append(ROW) == 1
 
-        def forbidden(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
-            pytest.fail("backend insert reached before refusal")
+        def state() -> dict[str, object]:
+            tables = ("buffer", "extent", "meta", "sqlite_sequence")
+            if tx is not None:
+                return {
+                    table: tx.execute(f"SELECT * FROM {table} ORDER BY rowid")
+                    for table in tables
+                }
 
-        monkeypatch.setattr(backend, "insert_rows", forbidden)
-        with pytest.raises(LogFull):
-            log.extend([ROW, ROW])
+            with backend.read() as cursor:
+                return {
+                    table: cursor.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ).fetchall()
+                    for table in tables
+                }
+
+        with log.transaction() if joined else nullcontext() as tx:
+            if tx is not None:
+                tx.execute("CREATE TABLE caller_state (n INTEGER)")
+                tx.execute("INSERT INTO caller_state VALUES (1)")
+
+            before = state()
+
+            def rows() -> Iterator[Mapping[str, object]]:
+                yield ROW
+                with backend.read() as cursor:
+                    assert (
+                        cursor.execute("SELECT count(*) FROM buffer").fetchone()[0] == 2
+                    )
+
+                # Another connection sees only committed rows even while the
+                # refused batch provisionally reaches beyond the cap.
+                yield ROW
+                with sqlite3.connect(Layout(tmp_path, "s").buffer_db) as other:
+                    assert (
+                        other.execute("SELECT count(*) FROM buffer").fetchone()[0] == 1
+                    )
+
+            with pytest.raises(LogFull):
+                log.extend(rows(), tx=tx)
+
+            assert state() == before
+            if tx is not None:
+                assert tx.execute("SELECT n FROM caller_state") == [(1,)]
+                tx.execute("INSERT INTO caller_state VALUES (2)")
+
+            # The failed append neither consumes offsets nor poisons its caller.
+            assert log.append(ROW, tx=tx) == 2
+
+        assert log.buffer_usage().rows == 2
+        assert log.buffer_usage().bytes == 2 * ROW_BYTES
 
 
 def test_append_reads_and_updates_both_counters_once(tmp_path: Path) -> None:
@@ -136,10 +193,11 @@ def test_append_reads_and_updates_both_counters_once(tmp_path: Path) -> None:
         assert log.buffer_usage().bytes == 3 * ROW_BYTES
 
 
-def test_benchmark_off_streams_preparation_without_counter_sql(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("enabled", [False, True])
+def test_preparation_streams_with_counters_enabled_or_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
-    monkeypatch.setattr(_buffer, "_BUFFER_USAGE_ENABLED", False)
+    monkeypatch.setattr(_buffer, "_BUFFER_USAGE_ENABLED", enabled)
     with create(tmp_path) as log:
         backend = sqlite_backend(log)
         statements: list[str] = []
@@ -159,9 +217,10 @@ def test_benchmark_off_streams_preparation_without_counter_sql(
         finally:
             backend._writer.set_trace_callback(None)
 
-        assert not any(
-            "'buffer_bytes'" in s or "'buffer_rows'" in s for s in statements
-        )
+        counter_sql = [
+            s for s in statements if "'buffer_bytes'" in s or "'buffer_rows'" in s
+        ]
+        assert len(counter_sql) == (2 if enabled else 0)
         assert log.buffered_rows() == 2
 
 
