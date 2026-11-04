@@ -2396,6 +2396,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         "coverage",
         "end_offset",
         "buffered_rows",
+        "buffer_usage",
         "staging_rows",
         "staging_files",
         "staging_extent",
