@@ -170,7 +170,7 @@ missing-argument = "ignore"
 too-many-positional-arguments = "ignore"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "benchmarks/test_append_cap.py"]
 # Must be the ini form, not `addopts = ["--strict-markers"]`: on pytest 9 the
 # flag only appends to `override_ini`, and `Config.parse` builds `_inicfg` from
 # the command line before injecting `addopts` and never recomputes it — so the

@@ -23,7 +23,7 @@ from _append_cap_disk import remove_trial
 pa = importlib.import_module("pyarrow")
 streamcast = importlib.import_module("streamcast")
 uvicorn = importlib.import_module("uvicorn")
-litelink = importlib.import_module("litelink")
+litelink: Any = importlib.import_module("litelink")
 _buffer = importlib.import_module("litelink._buffer")
 
 VARIANT = sys.argv[1] if __name__ == "__main__" else "BASE"
@@ -114,6 +114,16 @@ def verify(log: Any, root: Path, expected: int, row_bytes: int) -> dict:
     }
 
 
+def log_config(request: dict) -> Any:
+    # BASE predates buffer_max_bytes. OFF and ON share the explicit experiment
+    # cap; OFF disables admission via the counter switch, not by changing config.
+    options: dict[str, Any] = {"target_seal_size": 8 << 30}
+    if VARIANT != "BASE":
+        options["buffer_max_bytes"] = request["buffer_max_bytes"]
+
+    return litelink.LogConfig(**options)
+
+
 def direct(request: dict) -> dict:
     cell = request["cell"]
     root = Path(request["root"])
@@ -132,7 +142,7 @@ def direct(request: dict) -> dict:
         "bench",
         schema=SCHEMA,
         sort_by=("event_ts",),
-        config=litelink.LogConfig(target_seal_size=8 << 30),
+        config=log_config(request),
     )
     try:
         written = 0
@@ -244,9 +254,7 @@ async def e2e(request: dict) -> dict:
                 group_commit=request["cell"]["group"],
                 max_inbound=65536,
             ),
-            storage=streamcast.Storage(
-                root=root, config=litelink.LogConfig(target_seal_size=8 << 30)
-            ),
+            storage=streamcast.Storage(root=root, config=log_config(request)),
         ),
         initialization="create_if_absent",
     )
@@ -324,6 +332,7 @@ def main() -> None:
     for line in sys.stdin:
         request = json.loads(line)
         root = Path(request["root"])
+        result: dict[str, Any]
         try:
             if root.exists():
                 raise RuntimeError("trial directory already exists")
@@ -339,9 +348,22 @@ def main() -> None:
                 litelink_source=litelink.__file__,
                 consumer_source=streamcast.__file__,
             )
-        except Exception:
+        except Exception as exc:
             result = {"error": traceback.format_exc()}
+            if VARIANT == "ON" and isinstance(exc, litelink.LogFull):
+                result["error_type"] = "harness_config"
+                result["error"] = (
+                    "Window exhausted --buffer-max-bytes="
+                    f"{request['buffer_max_bytes']}; warmup and timed rows are retained "
+                    "without eviction. Increase the cap and use fresh output; "
+                    "do not pool this aborted run.\n" + result["error"]
+                )
+
         finally:
+            result.update(
+                buffer_max_bytes=request["buffer_max_bytes"],
+                buffer_limit_enforced=VARIANT == "ON",
+            )
             remove_trial(root, result)
 
         print(json.dumps(result), flush=True)

@@ -36,7 +36,8 @@ git fetch origin pull/222/head:refs/remotes/origin/pr222
   --repo . --base b1b4e3506e157507f1fc3a72e586451a954fcaed \
   --off origin/pr222 --on origin/pr222 \
   --consumer-repo "$BENCH_SCRATCH/streamcast" \
-  --output "$BENCH_SCRATCH/results" --repetitions 15 --seconds 30
+  --output "$BENCH_SCRATCH/results" --repetitions 15 --seconds 30 \
+  --buffer-max-bytes 17179869184
 ```
 
 This command runs the full matrix; it is intentionally **not a smoke command**.
@@ -71,12 +72,29 @@ for each run; the harness refuses to overwrite or append to an earlier result.
 Exit zero means execution completed, including a FAIL decision; read
 `summary.json` for the statistical verdict. Worker/setup failures exit nonzero.
 
+`--buffer-max-bytes` sets the OFF/ON logical byte cap (default 8,589,934,592,
+8 GiB), independently of the fixed 8 GiB seal target. It must be at least that
+target. BASE predates the option and receives no cap keyword; OFF receives the
+same cap as ON but disables admission through the counter switch. The requested
+cap is recorded in invocation settings, every trial and the summary; each worker
+trial also records whether enforcement is enabled. Never pool runs with different
+caps. Use 17,179,869,184 (16 GiB) for the 60-second relaunch below. This is a logical
+row-byte limit, not a disk reservation or a guarantee that every window fits.
+
+Warmup and timed rows accumulate without eviction. A refused ON append is a
+harness configuration error: the worker returns the cap and original `LogFull`
+traceback with instructions to increase the cap and use fresh output. The
+controller retains that failed trial in `runs.jsonl`, exits nonzero and produces
+no summary. Do not resume or pool an aborted run.
+
 ### Disk reserve and supervision
 
 Reserve **3 GiB plus the largest per-window transient**, as well as space for the
-environment, source snapshots and evidence. The large direct cells can temporarily
-use roughly **4.5 GB per window** at 60-second windows; this is an estimate, not a
-quota, and faster storage or longer windows can require more. Allow additional
+environment, source snapshots and evidence. A local 60-second
+`direct/2000/4096/0` OFF diagnostic retained 9,222,328,320 logical bytes and used
+9,269,317,632 allocated bytes after close; the earlier 4.5 GB estimate is
+insufficient for that cell. This is an observation, not a quota or peak bound;
+faster storage or longer windows can require more. Allow additional
 headroom on a shared filesystem. Only one trial directory exists at a time; it is
 removed after each window. Retained logical row bytes are not on-disk allocation.
 
@@ -89,7 +107,8 @@ scope (CPU, memory, tasks and runtime). Supply the same controller arguments aft
   --output "$BENCH_SCRATCH/results" --status "$BENCH_SCRATCH/status.json" -- \
   --repo . --base b1b4e3506e157507f1fc3a72e586451a954fcaed \
   --off origin/pr222 --on origin/pr222 \
-  --consumer-repo "$BENCH_SCRATCH/streamcast" --repetitions 15 --seconds 60
+  --consumer-repo "$BENCH_SCRATCH/streamcast" --repetitions 15 --seconds 60 \
+  --buffer-max-bytes 17179869184
 ```
 
 The output and status paths must be fresh, their parents must exist, and status
@@ -117,6 +136,12 @@ its old supervisor's disk guard stopped it. Those results **must not be pooled**
 with a fresh run. They do not form complete paired repetitions or a gate result;
 retain them only as diagnostic evidence. Restart with fresh output and status paths.
 
+The later 60-second run with the corrected disk accounting exhausted the inherited
+8 GiB logical cap in `direct/2000/4096/0`. At 8,585,728,000 retained bytes, its next
+8,376,320-byte append correctly exceeds 8,589,934,592. A 16 GiB control admits that
+append. Its partial results also **must not be pooled** with the fresh run,
+including with a different cap; retain them only as aborted diagnostic evidence.
+
 ## Matrix and measurement
 
 The 18 default cells are direct batches 1/16/256/4096 × empty/2,000-ASCII-byte
@@ -137,8 +162,9 @@ object-store publication. There are no subscribers, publisher deduplication,
 compression, maintainer, eviction, remote store, replication or stats sampler.
 
 Each trial creates a fresh log in WAL at synchronous=FULL, verified on the writer
-connection. The seal target and default byte cap are 8 GiB; no seal/maintenance
-runs. A run that reaches a cap aborts rather than relaxing it. Input generation,
+connection. The seal target is 8 GiB; the OFF/ON byte cap is explicit and defaults
+to 8 GiB. No seal/maintenance runs. A run that reaches a cap aborts rather than
+relaxing it. Input generation,
 log/server setup, warmup, explicit GC, post-run verification and teardown are
 outside timing. Normal Python GC and SQLite checkpoints remain enabled. Stored
 rows must match all warmup and measured ACKs; ON counters must match the exact
@@ -174,7 +200,7 @@ prints its verdict, absolute throughput/p99 intervals and ratio intervals; the
 full matrix passes only if every required cell passes.
 
 - `environment.json`: source commits/digests, harness hashes, interpreter, platform,
-  CPU affinity and invocation settings.
+  CPU affinity and invocation settings, including `buffer_max_bytes`.
 - `runs.jsonl`: all ordered trials, repetition/reference/ABBA position, raw
   latencies, rates/p50/p99, row/byte verification, package versions and SQLite
   version; **before/after aggregate `/proc/stat` tick vectors and steal counts**
@@ -182,11 +208,15 @@ full matrix passes only if every required cell passes.
   already counted in user/nice. Steal delta/total and percentage are system-wide,
   not process CPU time; a window with no tick delta records a null percentage.
   `trial_du_bytes` records the trial directory's allocated disk size before deletion.
+  `buffer_max_bytes` identifies the requested experiment cap and
+  `buffer_limit_enforced` is true only for ON. A failed trial retains its error,
+  cap and cell context before the controller exits nonzero.
 - `summary.json`: per-cell estimates/CIs, paired ratio CIs, window completion,
-  cell and overall decisions. No summary is produced for an aborted experiment.
+  cell and overall decisions, and `buffer_max_bytes`. No summary is produced for an aborted experiment.
 - Variant stderr files and exported source snapshots remain for diagnosis. Remove
   the output directory when its evidence has been archived. Data copies and sample
-  retention are bounded by selected cells, repetitions, calls and the 8 GiB cap.
+  retention are bounded by selected cells, repetitions and calls; ON additionally
+  enforces the configured logical byte cap.
 
 Only tiny smoke settings are used to validate this rebuild. The full matrix and
 its gate are a separate measurement task. Statistical unit checks can run with

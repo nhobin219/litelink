@@ -250,6 +250,7 @@ def run(args: argparse.Namespace) -> None:
                             "seconds": args.seconds,
                             "warmup": args.warmup,
                             "max_calls": args.max_calls,
+                            "buffer_max_bytes": args.buffer_max_bytes,
                             "root": str(out / "trial"),
                         }
                         worker = workers[variant]
@@ -263,9 +264,6 @@ def run(args: argparse.Namespace) -> None:
                             )
 
                         result = json.loads(line)
-                        if "error" in result:
-                            raise RuntimeError(f"{variant}: {result['error']}")
-
                         result.update(
                             cell=cell,
                             variant=variant,
@@ -275,6 +273,12 @@ def run(args: argparse.Namespace) -> None:
                         )
                         raw.write(json.dumps(result) + "\n")
                         raw.flush()
+                        if "error" in result:
+                            raise RuntimeError(
+                                f"{variant} {cell_name(cell)} "
+                                f"buffer_max_bytes={args.buffer_max_bytes}: {result['error']}"
+                            )
+
                         all_rows.append(
                             {k: v for k, v in result.items() if k != "latencies_ns"}
                         )
@@ -323,7 +327,15 @@ def run(args: argparse.Namespace) -> None:
         else "FAIL"
     )
     (out / "summary.json").write_text(
-        json.dumps({"overall": overall, "full_matrix": full, "cells": report}, indent=2)
+        json.dumps(
+            {
+                "overall": overall,
+                "full_matrix": full,
+                "buffer_max_bytes": args.buffer_max_bytes,
+                "cells": report,
+            },
+            indent=2,
+        )
     )
     print(f"OVERALL {overall}" + (" (partial matrix)" if not full else ""))
 
@@ -359,6 +371,12 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=15)
     parser.add_argument("--seconds", type=float, default=30)
     parser.add_argument(
+        "--buffer-max-bytes",
+        type=int,
+        default=8 << 30,
+        help="OFF/ON logical byte cap, at least the 8 GiB seal target; BASE is uncapped",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=16,
@@ -383,6 +401,9 @@ def main() -> None:
         help="also record pip freeze when pip is installed",
     )
     args = parser.parse_args()
+    if args.buffer_max_bytes < 8 << 30:
+        parser.error("--buffer-max-bytes must be >=8589934592 (the 8 GiB seal target)")
+
     if (
         not math.isfinite(args.seconds)
         or args.seconds <= 0

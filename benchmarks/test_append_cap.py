@@ -2,14 +2,289 @@
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import io
 import json
 import subprocess
 import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import _append_cap_disk as disk
+import append_cap as controller
 import append_cap_supervise as supervisor
 import pytest
 from append_cap import abba, bootstrap, cell_name, gate, matrix
+
+
+def test_cap_cli_reaches_workers_and_all_result_metadata(tmp_path, monkeypatch):
+    cap = 17179869184
+    requests = []
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            self.stdin = io.StringIO()
+            self.stdout = self
+
+        def readline(self):
+            request = json.loads(self.stdin.getvalue().splitlines()[-1])
+            requests.append(request)
+            return json.dumps(
+                {
+                    "buffer_max_bytes": request.get("buffer_max_bytes"),
+                    "rows_s": 1,
+                    "p99_us": 1,
+                    "window_complete": True,
+                }
+            )
+
+        def wait(self, timeout):
+            return 0
+
+    output = tmp_path / "results"
+    monkeypatch.setattr(
+        controller, "source", lambda *args: (tmp_path, {"source_sha256": "same"})
+    )
+    monkeypatch.setattr(
+        controller,
+        "subprocess",
+        SimpleNamespace(
+            Popen=Worker, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "append_cap.py",
+            "--off",
+            "OFF",
+            "--on",
+            "ON",
+            "--consumer-repo",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--buffer-max-bytes",
+            str(cap),
+            "--smoke",
+            "--repetitions",
+            "1",
+            "--bootstrap",
+            "10",
+            "--cells",
+            "direct/0/16/0",
+        ],
+    )
+    controller.main()
+    assert len(requests) == 8
+    assert all(request["buffer_max_bytes"] == cap for request in requests)
+    environment = json.loads((output / "environment.json").read_text())
+    assert environment["options"]["buffer_max_bytes"] == cap
+    rows = [
+        json.loads(line) for line in (output / "runs.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 8
+    assert all(row["buffer_max_bytes"] == cap for row in rows)
+    assert json.loads((output / "summary.json").read_text())["buffer_max_bytes"] == cap
+
+
+@pytest.mark.parametrize("cap", [0, (8 << 30) - 1])
+def test_cap_below_seal_target_is_rejected_before_setup(
+    tmp_path, monkeypatch, capsys, cap
+):
+    output = tmp_path / "results"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "append_cap.py",
+            "--off",
+            "OFF",
+            "--on",
+            "ON",
+            "--consumer-repo",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--buffer-max-bytes",
+            str(cap),
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        controller.main()
+
+    assert error.value.code == 2
+    assert "--buffer-max-bytes must be >=8589934592" in capsys.readouterr().err
+    assert not output.exists()
+
+
+@pytest.fixture
+def worker_module(monkeypatch):
+    # These tests exercise harness construction/protocol without installing the
+    # optional broker stack or writing gigabytes to reach the real cap.
+    class LogFull(Exception):
+        pass
+
+    library = SimpleNamespace(
+        LogConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        LogFull=LogFull,
+        __file__="library.py",
+    )
+    modules = {
+        "pyarrow": MagicMock(),
+        "streamcast": MagicMock(__file__="consumer.py"),
+        "uvicorn": MagicMock(),
+        "litelink": library,
+        "litelink._buffer": SimpleNamespace(_BUFFER_USAGE_ENABLED=False),
+    }
+    original = importlib.import_module
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: modules[name] if name in modules else original(name),
+    )
+    spec = importlib.util.spec_from_file_location(
+        "cap_worker", Path(__file__).with_name("_append_cap_worker.py")
+    )
+    assert spec is not None and spec.loader is not None
+    worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker)
+    return worker
+
+
+@pytest.mark.parametrize("variant", ["BASE", "OFF", "ON"])
+@pytest.mark.parametrize("kind", ["direct", "e2e"])
+def test_worker_configures_cap_in_both_paths(
+    worker_module, monkeypatch, tmp_path, variant, kind
+):
+    worker = worker_module
+    worker.VARIANT = variant
+    cap = 17179869184
+    configs = []
+
+    def created(*args, **kwargs):
+        configs.append(kwargs["config"] if kind == "direct" else args[0].storage.config)
+        raise RuntimeError("construction observed")
+
+    monkeypatch.setattr(worker.litelink, "new", created, raising=False)
+    worker.streamcast.Stream = lambda **kwargs: SimpleNamespace(**kwargs)
+    worker.streamcast.Storage = lambda **kwargs: SimpleNamespace(**kwargs)
+    worker.streamcast.StreamHandle.open = created
+    request = {
+        "root": str(tmp_path / "trial"),
+        "cell": {"kind": kind, "payload": 0, "batch": 16, "group": False},
+        "buffer_max_bytes": cap,
+    }
+    with pytest.raises(RuntimeError, match="construction observed"):
+        if kind == "direct":
+            worker.direct(request)
+        else:
+            asyncio.run(worker.e2e(request))
+
+    assert len(configs) == 1
+    assert configs[0].target_seal_size == 8 << 30
+    if variant == "BASE":
+        assert not hasattr(configs[0], "buffer_max_bytes")
+    else:
+        assert configs[0].buffer_max_bytes == cap
+
+
+def test_worker_cap_refusal_is_actionable_and_retained(
+    worker_module, monkeypatch, tmp_path
+):
+    worker = worker_module
+    worker.VARIANT = "ON"
+    request = {
+        "root": str(tmp_path / "trial"),
+        "cell": {"kind": "direct", "payload": 2000, "batch": 4096, "group": False},
+        "buffer_max_bytes": 8 << 30,
+    }
+
+    def full(request):
+        raise worker.litelink.LogFull("append would exceed the buffer write limit")
+
+    monkeypatch.setattr(worker, "direct", full)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+    worker.main()
+    result = json.loads(output.getvalue())
+    assert result["error_type"] == "harness_config"
+    assert result["buffer_max_bytes"] == 8589934592
+    assert "--buffer-max-bytes" in result["error"]
+    assert "fresh output" in result["error"]
+    assert "LogFull" in result["error"]
+
+
+def test_controller_saves_worker_failure_before_nonzero_exit(tmp_path, monkeypatch):
+    cap = 8 << 30
+    output = tmp_path / "results"
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO(
+                json.dumps(
+                    {
+                        "error": "buffer cap exhausted; use --buffer-max-bytes",
+                        "error_type": "harness_config",
+                        "buffer_max_bytes": cap,
+                    }
+                )
+                + "\n"
+            )
+
+        def wait(self, timeout):
+            return 0
+
+    monkeypatch.setattr(
+        controller, "source", lambda *args: (tmp_path, {"source_sha256": "same"})
+    )
+    monkeypatch.setattr(
+        controller,
+        "subprocess",
+        SimpleNamespace(
+            Popen=Worker, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "append_cap.py",
+            "--off",
+            "OFF",
+            "--on",
+            "ON",
+            "--consumer-repo",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--smoke",
+            "--repetitions",
+            "1",
+            "--bootstrap",
+            "10",
+            "--cells",
+            "direct/2000/4096/0",
+        ],
+    )
+    with pytest.raises(
+        RuntimeError, match="OFF direct/2000/4096/0.*buffer cap exhausted"
+    ):
+        controller.main()
+
+    rows = [
+        json.loads(line) for line in (output / "runs.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["error_type"] == "harness_config"
+    assert rows[0]["buffer_max_bytes"] == cap
+    assert rows[0]["cell"]["batch"] == 4096
+    assert not (output / "summary.json").exists()
 
 
 def observations(rate_ratio: float, tail_ratio: float) -> list[dict]:
