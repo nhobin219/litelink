@@ -8,7 +8,6 @@ import importlib
 import importlib.metadata
 import json
 import math
-import shutil
 import socket
 import sqlite3
 import sys
@@ -16,6 +15,8 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any
+
+from _append_cap_disk import remove_trial
 
 # The controller selects these source trees before this worker starts. Dynamic
 # imports keep the optional broker stack out of the library's lint/type environment.
@@ -341,7 +342,7 @@ def main() -> None:
         except Exception:
             result = {"error": traceback.format_exc()}
         finally:
-            shutil.rmtree(root, ignore_errors=True)
+            remove_trial(root, result)
 
         print(json.dumps(result), flush=True)
 

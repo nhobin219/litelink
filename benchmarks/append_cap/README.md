@@ -14,7 +14,7 @@ claim until the complete matrix has run on the chosen machine.
 
 ## Setup and invocation
 
-Linux `/proc/stat`, git, uv and CPython 3.11 are required. Run from the repository
+Linux `/proc/stat`, GNU `du`/`df`, git, uv and CPython 3.11 are required. Run from the repository
 root. Use scratch on the same local filesystem as the logs you intend to measure;
 setup resolves dependencies over the network, measurement uses loopback only.
 The consumer checkout is the published source revision, overriding its declared
@@ -70,6 +70,52 @@ an incomplete matrix never receives an overall PASS. Use a fresh output path
 for each run; the harness refuses to overwrite or append to an earlier result.
 Exit zero means execution completed, including a FAIL decision; read
 `summary.json` for the statistical verdict. Worker/setup failures exit nonzero.
+
+### Disk reserve and supervision
+
+Reserve **3 GiB plus the largest per-window transient**, as well as space for the
+environment, source snapshots and evidence. The large direct cells can temporarily
+use roughly **4.5 GB per window** at 60-second windows; this is an estimate, not a
+quota, and faster storage or longer windows can require more. Allow additional
+headroom on a shared filesystem. Only one trial directory exists at a time; it is
+removed after each window. Retained logical row bytes are not on-disk allocation.
+
+Use the portable supervisor for a long run, inside an externally capped process
+scope (CPU, memory, tasks and runtime). Supply the same controller arguments after
+`--`, with `--output` supplied only to the supervisor:
+
+```bash
+"$BENCH_SCRATCH/venv/bin/python" benchmarks/append_cap_supervise.py \
+  --output "$BENCH_SCRATCH/results" --status "$BENCH_SCRATCH/status.json" -- \
+  --repo . --base b1b4e3506e157507f1fc3a72e586451a954fcaed \
+  --off origin/pr222 --on origin/pr222 \
+  --consumer-repo "$BENCH_SCRATCH/streamcast" --repetitions 15 --seconds 60
+```
+
+The output and status paths must be fresh, their parents must exist, and status
+must be outside output. The supervisor records `df` free bytes and percent used at
+launch, every 30 seconds (configurable), and completion. Its status file is
+atomically replaced, retaining launch and latest samples. An abort additionally
+retains the triggering sample in `disk_at_abort`, before terminating the controller
+and workers. The internal deadline defaults to 46 hours. Archive this status file
+with the results; no upload or machine resource caps are installed by the wrapper.
+
+The guard compares **free bytes + live trial allocated bytes** with the 3 GiB
+reserve: subtracting the reclaimable trial from used space distinguishes external
+pressure from the run's own transient. Actual free space and live trial size remain
+visible separately. `du` is sampled before `df`; these are non-atomic diagnostic
+samples, so a concurrent trial cleanup can over-credit one sample. The guard does
+not guarantee space for an unbounded window; provision the reserve and transient
+above. A failed live `du` aborts with an explicit accounting-error reason, retaining
+`df` and the error, rather than claiming external pressure. Worker `trial_du_bytes`
+records allocated bytes with GNU `du -s -B1`, after
+verification/close and before removal, outside timing; this is a final size, not a
+peak sampler. Periodic live samples can include open WAL files.
+
+The aborted partial 60-second run recorded **112 windows, repetition 0 only** before
+its old supervisor's disk guard stopped it. Those results **must not be pooled**
+with a fresh run. They do not form complete paired repetitions or a gate result;
+retain them only as diagnostic evidence. Restart with fresh output and status paths.
 
 ## Matrix and measurement
 
@@ -135,6 +181,7 @@ full matrix passes only if every required cell passes.
   immediately surround each timed window. Total ticks exclude guest fields
   already counted in user/nice. Steal delta/total and percentage are system-wide,
   not process CPU time; a window with no tick delta records a null percentage.
+  `trial_du_bytes` records the trial directory's allocated disk size before deletion.
 - `summary.json`: per-cell estimates/CIs, paired ratio CIs, window completion,
   cell and overall decisions. No summary is produced for an aborted experiment.
 - Variant stderr files and exported source snapshots remain for diagnosis. Remove
