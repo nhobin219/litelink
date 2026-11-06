@@ -617,9 +617,9 @@ is refused (`RetiredError`), as outside one; the caller's tables stay readable a
 caller can carry its state from a retired log to its successor.
 
 **Offsets returned inside a block name rows only once it commits.** A rollback rolls back the
-offset counter with the rows (AUTOINCREMENT), and the next append takes the same offsets. No
-reader can have seen them, since readers see committed rows only, so I9 holds as long as the
-caller does not hand them on before the commit.
+offset counter with the rows (AUTOINCREMENT), and the next append takes the same offsets.
+Readers on other connections see committed rows only, so I9 holds as long as the caller does
+not hand them on before the commit.
 
 **`ingest` in a transaction loads through the buffer.** `ingest`'s own path commits in the staging
 table's metadata, not in SQLite, so it cannot commit with the caller's statements: rolling the
@@ -653,6 +653,43 @@ or row id escapes. `tx.dialect` names the SQL the backend speaks, `"sqlite"` tod
 `:name` parameters, and a caller writes each statement for it; litelink translates nothing. A
 Postgres backend for the buffer (#201) implements the same protocol over a Postgres transaction,
 with the same lifetime and the same refusals, and a caller's code keeps its shape.
+
+### Buffer admission and occupancy (0.15)
+
+`meta.buffer_bytes` and `meta.buffer_rows` count every row still in the buffer, including
+sealed or published rows awaiting eviction. The byte unit is sealing's uncompressed row
+measurement. Inserts and actual buffer deletions change both counters in their own SQLite
+transaction; failed batches, savepoints and process crashes cannot leave counts apart from
+rows. Initializing a pre-0.15 log takes one counted scan under a write transaction, checking
+the migration marker after acquiring the write lock. Counters and marker commit together;
+an interrupted migration retries, a committed one never rescans. All writers must upgrade
+together; read-only observation requires the writable migration first.
+
+Rows are prepared and inserted as they stream. The incoming byte sum accumulates during
+preparation, and the row count grows with the assigned offsets; the prepared batch is not
+retained. After a nonempty append's provisional inserts and group cuts, it reads both running
+counters in one SELECT and checks the projected totals under the same write lock, before
+committing its transaction or releasing its savepoint inside a caller transaction. It raises
+`LogFull` if the resulting bytes exceed `buffer_max_bytes` (8 GiB by default, at least
+`target_seal_size`) or rows exceed `buffer_max_rows` (None by default). Equality is admitted.
+A refused append rolls back its rows, group cuts, offsets and counter state together,
+preserving earlier work in the caller's transaction. A successful nonempty append updates
+both counters in one statement in that same transaction; its committed state exceeds
+neither cap.
+
+Iterator callbacks using the caller's transaction can see provisional rows on the writer
+connection; other connections see only committed rows. Validation and SQL errors can precede
+cap refusal. A refused batch can incur SQLite and WAL writes before rollback: the caps bound
+committed row bytes and row count rather than database files or total disk use.
+
+Eviction makes room without a separate reset. `LogHandle.buffer_usage()` reads counts and
+caps from one metadata snapshot; `refusing` means occupancy has reached either cap.
+Direct-to-Parquet ingest bypasses this buffer limit.
+
+Staging eviction, even retirement's `everything=True`, never passes the buffer's confirmed
+eviction point: the first still-buffered offset, or its committed sequence end if empty,
+then snapped down to a file boundary. Thus staging-first eviction preserves the evidence
+needed to evict the buffer, including partial deletion ranges.
 
 ## 4. Seal
 
@@ -1980,6 +2017,8 @@ of them is chosen.
 ## 12. Configuration
 
 ```
+buffer_max_bytes      uncompressed buffered row cap     (8 GiB; >= target_seal_size)
+buffer_max_rows       retained buffer row cap           (None = no row cap)
 target_seal_rows       max rows per SEAL                  (the other ceiling; the seal cuts at
                                                           whichever is reached FIRST. None =
                                                           no row limit)

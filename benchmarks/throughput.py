@@ -29,6 +29,8 @@ from pathlib import Path
 
 from _bench import best_of, fresh_log, observations
 
+from litelink import _buffer
+
 
 def bench_writes(root: Path, payload: int, batches: list[int], rows_each: int) -> None:
     print("\nWRITE  how fast rows land durably, by how many rows one extend()")
@@ -168,7 +170,13 @@ def main() -> None:
         "--payload", type=int, default=400, help="payload bytes per row"
     )
     parser.add_argument("--quick", action="store_true", help="smaller runs")
+    parser.add_argument(
+        "--no-buffer-usage",
+        action="store_true",
+        help="benchmark only: disable counters and caps on disposable logs",
+    )
     args = parser.parse_args()
+    _buffer._BUFFER_USAGE_ENABLED = not args.no_buffer_usage
 
     batches = [1, 10, 50, 200] if args.quick else [1, 10, 50, 200, 1000]
     rows_each = 2_000 if args.quick else 20_000

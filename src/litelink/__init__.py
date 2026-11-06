@@ -61,6 +61,7 @@ from litelink._retired import delete, truncate
 from litelink._s3 import S3Options
 from litelink._statistics import ColumnStatistics, Tier, TierStatistics
 from litelink._transaction import Transaction
+from litelink._usage import BufferUsage, LogFull
 
 try:
     __version__ = version("litelink")
@@ -69,6 +70,7 @@ except PackageNotFoundError:  # a source tree that was never installed
 
 __all__ = [
     "OFFSET",
+    "BufferUsage",
     "Check",
     "ColumnStatistics",
     "ConditionalWritesUnsupported",
@@ -81,6 +83,7 @@ __all__ = [
     "LocalReadHandle",
     "LogConfig",
     "LogHandle",
+    "LogFull",
     "Report",
     "RetiredError",
     "Row",

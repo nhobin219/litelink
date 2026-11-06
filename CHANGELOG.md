@@ -7,7 +7,32 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
-## Unreleased
+## 0.15.0 — Unreleased
+
+### Added
+
+- Transactional retained-buffer byte and row counters, `buffer_usage()`, and
+  `LogFull` admission refusal (#221). The default byte cap is 8 GiB; the optional
+  row cap is disabled. A batch is refused before commit and can retry after
+  buffer eviction. The first writable open migrates older logs with one atomic
+  counted scan. Stop all older writers before upgrading; they cannot maintain
+  the new counters.
+
+### Fixed
+
+- Staging eviction stops at the buffer's confirmed eviction point, preserving
+  the evidence for buffer eviction when staging is asked to evict first.
+- Append reads both occupancy counters in one statement, updates both in one
+  statement, and streams preparation with counters enabled or disabled. The
+  full-batch cap check follows provisional inserts inside the transaction or
+  savepoint; refusal rolls back rows, group cuts, offsets and counters together.
+  SQL validation can therefore fail before cap refusal. In a same-session
+  Python 3.11 preparation-only profile of 12,288 rows, enabled peak traced bytes
+  fall from 1,780,720 to 146,648 for narrow rows (disabled: 146,680; base:
+  146,568), and from 2,175,541 to 148,109 for 2 KB rows (disabled: 148,125;
+  base: 147,925). Generation-0/1 collections fall from 33/2 to 2/0, matching
+  disabled and base. This profile does not establish the append-throughput gate.
+
 
 ### Changed
 

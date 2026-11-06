@@ -2396,6 +2396,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         "coverage",
         "end_offset",
         "buffered_rows",
+        "buffer_usage",
         "staging_rows",
         "staging_files",
         "staging_extent",
@@ -3286,9 +3287,9 @@ def test_restore_rebuilds_from_a_local_published_table(tmp_path: Path) -> None:
 def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
     tmp_path: Path, bucket: str, s3: S3Options
 ) -> None:
-    """Every log keeps sealed buffer rows until eviction, and staging eviction
-    can run first. An open group rebuilt then must start above the published
-    end, or it adopts rows already
+    """A pre-0.15 log may retain published buffer rows after staging eviction.
+    An open group rebuilt then must start above the published end,
+    or it adopts rows already
     sealed and published and seals them a second time — a file the seal's
     register declines, since the published table holds the range, but a whole
     rewrite of the band for nothing.
@@ -3306,7 +3307,8 @@ def test_an_open_group_reseeds_above_what_is_published_not_only_staging(
         log.extend(rows(ROWS))
         log.seal(flush=True)
         log.publish(flush=True)
-        log.evict("staging")
+        # Recreate the legacy stranded state that current eviction prevents.
+        log._table.evict_below(ROWS + 1)
         log.reclaim("staging")
 
         assert log.staging_rows() == 0, "the setup must evict staging to nothing"
