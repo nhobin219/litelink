@@ -9,10 +9,12 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+## 0.14.2 — 2026-11-19
+
 ### Fixed
 
 - Collect the deletion veto's referenced paths from each unique manifest, without
-  materializing whole-history Arrow file statistics (#224). Retained snapshots'
+  materializing whole-history Arrow file statistics (#224, #225). Retained snapshots'
   data files, delete files, manifest lists and manifests keep the same protection.
   In a same-session loopback S3 benchmark of five tables, each with 100 snapshots
   and 2,000 Parquet files, three complete cleanup cycles peak at 563.086 MiB RSS
