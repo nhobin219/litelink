@@ -1423,6 +1423,13 @@ than their table's snapshot retention — staging rows by `advance`, the publish
 forgetting the row: a crash between the unlink and the forget retries a no-op, whereas the
 reverse order loses the path with the file still on disk.
 
+The reference veto walks every retained snapshot's manifest list and each unique manifest
+once, using the table's FileIO. It retains path strings across manifests rather than Arrow
+file-inspection tables and decoded column metrics for the whole history. Added and existing
+entries protect their data or delete files; deleted entries do not, unless an older retained
+snapshot still has a live entry for that path. Manifest lists and manifests themselves are
+protected too (I6). A failed manifest read aborts the drain before it deletes anything.
+
 Store when a file was superseded, not a precomputed deadline. The grace period is the owning
 table's snapshot retention, and freezing it at enqueue time means a lowered setting never applies to
 anything already queued.
