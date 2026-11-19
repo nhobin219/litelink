@@ -1543,11 +1543,34 @@ class LogTable:
         return {f.path for f in self.data_files()}
 
     def referenced_paths(self) -> set[str]:
-        """Every file any live snapshot needs — data and Iceberg's own."""
-        return {
-            self._name(path)
-            for path in self._table.inspect.all_files()["file_path"].to_pylist()
-        } | self.metadata_paths(self._table.snapshots())
+        """Every file any live snapshot needs — data and Iceberg's own.
+
+        I6's deletion veto covers historical snapshots too. Walk each immutable
+        manifest once, retaining only names across manifests: file inspection
+        also builds Arrow tables of every column's metrics for the whole
+        history, while the veto needs no metrics. Deleted entries are excluded
+        just as in `inspect.all_files()`; a file still live in an older snapshot
+        is found in that snapshot's manifest.
+        """
+        paths: set[str] = set()
+        seen: set[str] = set()
+        table = self._table
+        for snapshot in table.snapshots():
+            paths.add(self._name(snapshot.manifest_list))
+            for manifest in snapshot.manifests(table.io):
+                paths.add(self._name(manifest.manifest_path))
+                if manifest.manifest_path in seen:
+                    continue
+
+                seen.add(manifest.manifest_path)
+                paths.update(
+                    self._name(entry.data_file.file_path)
+                    for entry in manifest.fetch_manifest_entry(
+                        table.io, discard_deleted=True
+                    )
+                )
+
+        return paths
 
     def referenced_metadata(self) -> set[str]:
         """Every metadata file a live snapshot or the table itself still needs:
@@ -1555,10 +1578,9 @@ class LogTable:
         `metadata.json` files the table names.
 
         What the sweep compares its listing against (#152). It deletes only
-        metadata, so data-file paths are no part of its decision — and reading
-        them is `inspect.all_files()`, every entry of every snapshot's
-        manifests, which on a table carrying thousands of snapshots outgrows
-        the machine. This reads manifest lists only.
+        metadata, so data-file paths are no part of its decision. It reads
+        manifest lists only, avoiding every snapshot's data-file entries even
+        on a table carrying thousands of snapshots.
         """
         return self.metadata_paths(self._table.snapshots()) | self.live_metadata()
 
