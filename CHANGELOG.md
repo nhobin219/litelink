@@ -9,6 +9,18 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+### Fixed
+
+- Collect the deletion veto's referenced paths from each unique manifest, without
+  materializing whole-history Arrow file statistics (#224). Retained snapshots'
+  data files, delete files, manifest lists and manifests keep the same protection.
+  In a same-session loopback S3 benchmark of five tables, each with 100 snapshots
+  and 2,000 Parquet files, three complete cleanup cycles peak at 563.086 MiB RSS
+  before and 257.855 MiB after (54.2% lower). Cycle times are 97.259–97.516 s
+  before and 33.340–33.837 s after; sampled Arrow allocation peaks fall from
+  161.085 MiB to zero. These synthetic measurements do not establish production
+  RSS or long-idle allocator behavior.
+
 ### Changed
 
 - Separate the buffer coordinator from its SQLite sessions and published catalog
