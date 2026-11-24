@@ -903,9 +903,21 @@ a cap immediately changes the reported state. This is the counter source for a c
 `/stats` response.
 
 An `append` or `extend` that would exceed either cap raises `litelink.LogFull` (a
-`RuntimeError`) before inserting any row from that call; equality is allowed. Retry after
-`evict("buffer")` makes room. A refused append inside a caller transaction rolls back only
-its savepoint. Direct `ingest` does not put rows in the buffer and bypasses these caps.
+`RuntimeError`); equality is allowed. Rows stream through provisional inserts, then the
+whole batch is checked before commit or savepoint release. Refusal commits no row,
+offset, group cut or counter change. Inside a caller transaction it rolls back only
+that append's savepoint, preserving earlier caller work. Iterator callbacks reading
+the writer connection can see provisional rows; other connections cannot. Validation
+and SQL errors can precede cap refusal, and refused batches can incur SQLite/WAL work.
+Direct `ingest` does not put rows in the buffer and bypasses these caps.
+
+`LogFull` exposes `batch_rows`, `batch_bytes`, `buffer_max_rows`, `buffer_max_bytes`
+and `fits_empty`. These describe the complete refused batch and the caps selected
+for that append. If `fits_empty` is true, retry after `evict("buffer")` makes room.
+Otherwise even an empty buffer cannot admit the batch: shrink it or raise the cap.
+An older publisher that retries an oversized frame unchanged can remain pending
+indefinitely without losing it. Upgrade publishers for batch shrinking and keep the
+byte cap comfortably above expected raw frame/append-group sizes.
 
 On the first writable open of an older log, one counted scan initializes both counters and
 the migration marker in one SQLite write transaction. Competing openers serialize before
@@ -1153,6 +1165,70 @@ compression           str             = "zstd"   Parquet codec: none | snappy | 
 Frozen dataclass, with `to_json`/`from_json` and one derived property, `compact_size`.
 `sort_by` is deliberately not in here — everything above governs future work only, so
 `set_config` needs no rewrite.
+
+#### Sizing the retained buffer
+
+`LogConfig` validates buffer caps on construction and JSON decoding. The byte cap
+is a positive integer, excluding bool, float and `None`, and must be at least
+`target_seal_size`. An optional row cap is also a positive integer, excluding bool
+and float. Missing JSON keys retain 8 GiB and no row cap. **8 GiB is a default,
+not a minimum**: lower the seal target as needed to choose a smaller valid cap.
+Lowering a cap below current occupancy preserves existing rows and refuses new
+appends until eviction drains them or the cap is raised. Caps are per log.
+
+For a trial with one durable stream:
+
+```python
+config = litelink.LogConfig(
+    buffer_max_bytes=128 * 1024**2,
+    buffer_max_rows=None,
+)
+log.set_config(config)  # the default 8 MiB seal target fits this 128 MiB cap
+assert litelink.LogConfig.from_json(config.to_json()) == config
+```
+
+A deployment's storage profile carries the same values inside `storage.config`:
+
+```json
+{"storage": {"config": {"buffer_max_bytes": 134217728, "buffer_max_rows": null}}}
+```
+
+The embedding application owns that profile envelope; litelink's `from_json`
+accepts the inner configuration object. An embedding application can pass the
+decoded policy through its existing `Storage.config = LogConfig(...)` surface.
+
+1. With eviction controlled, measure raw bytes per row and incoming raw bytes/s
+   from `buffer_usage()` deltas. Include the largest individual row and expected
+   frame/append-group size; JSON wire size and compressed file size are different
+   units. Leave room for normal batches. Eviction cannot make a row that exceeds
+   an empty-buffer cap fit.
+2. Measure peak whole-pod/cgroup memory and each role's RSS during steady load,
+   publication/cleanup outage and catch-up/eviction. Include all streams and child
+   processes, queues, seal/compact batches, transient history reads and file/page
+   caches. Reserve explicit headroom below the pod limit. Sum per-stream caps;
+   each stream cannot consume the entire deployment budget.
+3. Measure SQLite/WAL, staging and other local-copy disk use separately against
+   raw buffer bytes, including provisional refused work and recovery. Raw cap
+   divided by measured raw ingress estimates outage coverage without drainage,
+   not guaranteed recovery time. Published retention and O(history) per-pass work
+   need their own budgets.
+4. Trial a lower cap and verify outage-and-recovery peaks against both memory and
+   disk budgets. No universal raw-byte-to-RSS multiplier exists. Reducing the cap
+   does not promise to resolve allocator fragmentation; raising it requires
+   repeating these measurements.
+
+**Illustrative example, not benchmark evidence or a universal recommendation:**
+one durable stream has a 2.8 GiB pod limit, a measured 1.6 GiB baseline and a
+0.6 GiB reserve, leaving 0.6 GiB for workload peaks. Start a trial with the
+128 MiB configuration above, valid when `target_seal_size <= 128 MiB`. At
+1 MiB/s of measured raw ingress it covers about 128 seconds from an empty buffer
+without eviction. If a representative outage-and-catch-up trial peaks at 2.1 GiB
+for the whole pod and local disk fits its separately measured budget, that trial
+leaves 0.7 GiB below the pod limit. Otherwise lower the cap, reduce other memory
+settings or increase the pod budget and repeat. For multiple streams, repeat
+with all streams active. A raw retained-row cap bounds committed buffer
+occupancy; provisional batches, queues, maintenance and allocator retention
+still consume resources. It is not a pod-memory guarantee or an RSS-bound claim.
 
 Sizing is two targets, not one, and §7 and §12 are where that argument lives. Validation is at
 construction: `compact_min_files` below 2, neither `staging_retention` nor `staging_max_bytes` set (staging must be bounded), a `target_compact_step_size` outside

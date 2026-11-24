@@ -4,7 +4,34 @@ from dataclasses import dataclass
 
 
 class LogFull(RuntimeError):
-    """The entire append would exceed a buffer cap; retry after eviction."""
+    """The whole append exceeds a cap; eviction helps only if ``fits_empty``."""
+
+    def __init__(
+        self,
+        *,
+        batch_rows: int,
+        batch_bytes: int,
+        buffer_max_rows: int | None,
+        buffer_max_bytes: int,
+    ) -> None:
+        self.batch_rows = batch_rows
+        self.batch_bytes = batch_bytes
+        self.buffer_max_rows = buffer_max_rows
+        self.buffer_max_bytes = buffer_max_bytes
+        self.fits_empty = batch_bytes <= buffer_max_bytes and (
+            buffer_max_rows is None or batch_rows <= buffer_max_rows
+        )
+        super().__init__(
+            "append would exceed the buffer write limit: "
+            f"batch_rows={batch_rows}, batch_bytes={batch_bytes}, "
+            f"buffer_max_rows={buffer_max_rows}, buffer_max_bytes={buffer_max_bytes}, "
+            f"fits_empty={self.fits_empty}; "
+            + (
+                "retry after eviction"
+                if self.fits_empty
+                else "shrink the batch or raise the cap before retrying"
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)

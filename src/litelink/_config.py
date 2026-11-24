@@ -318,6 +318,26 @@ class LogConfig:
     # a new codec applies to what is written from then on.
     compression: str = "zstd"
 
+    def __post_init__(self) -> None:
+        # Validate here so Python construction and decoded deployment policies
+        # reject the same invalid caps before a log can admit any rows.
+        if (
+            not isinstance(self.buffer_max_bytes, int)
+            or isinstance(self.buffer_max_bytes, bool)
+            or self.buffer_max_bytes <= 0
+        ):
+            raise ValueError("buffer_max_bytes must be a positive integer")
+
+        if self.buffer_max_bytes < self.target_seal_size:
+            raise ValueError("buffer_max_bytes must be at least target_seal_size")
+
+        if self.buffer_max_rows is not None and (
+            not isinstance(self.buffer_max_rows, int)
+            or isinstance(self.buffer_max_rows, bool)
+            or self.buffer_max_rows <= 0
+        ):
+            raise ValueError("buffer_max_rows must be a positive integer or None")
+
     def to_json(self) -> str:
         """Serialised for the `meta` table, so `open` recovers the policy.
 

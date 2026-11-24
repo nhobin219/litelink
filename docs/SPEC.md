@@ -677,7 +677,7 @@ preserving earlier work in the caller's transaction. A successful nonempty appen
 both counters in one statement in that same transaction; its committed state exceeds
 neither cap.
 
-Iterator callbacks using the caller's transaction can see provisional rows on the writer
+Iterator callbacks, including standalone append callbacks, can see provisional rows on the writer
 connection; other connections see only committed rows. Validation and SQL errors can precede
 cap refusal. A refused batch can incur SQLite and WAL writes before rollback: the caps bound
 committed row bytes and row count rather than database files or total disk use.
@@ -685,6 +685,23 @@ committed row bytes and row count rather than database files or total disk use.
 Eviction makes room without a separate reset. `LogHandle.buffer_usage()` reads counts and
 caps from one metadata snapshot; `refusing` means occupancy has reached either cap.
 Direct-to-Parquet ingest bypasses this buffer limit.
+
+`LogConfig` validates the selected caps during construction and JSON decoding:
+bytes must be a positive integer (not bool, float or None) and at least the seal
+target; an optional row cap must be a positive integer (not bool or float).
+Missing keys retain 8 GiB and None. The default is not a deployment minimum:
+smaller caps are valid with a suitably small seal target and survive JSON and
+reopen. Lowering a cap below retained occupancy preserves rows and refuses new
+appends until eviction drains it or the cap is raised.
+
+`LogFull` carries the full `batch_rows`, `batch_bytes`, selected `buffer_max_rows`
+and `buffer_max_bytes`, plus `fits_empty`. The latter checks both batch totals
+against an empty buffer at those caps. Eviction alone cannot recover a batch
+with `fits_empty=False`; the publisher must shrink it or the cap must rise.
+An unchanged oversized frame may remain pending indefinitely and losslessly.
+Publishers need batch-shrinking support and caps comfortably above expected raw
+frames. See API's sizing procedure and worked 2.8 GiB pod example: raw caps
+bound committed occupancy, not RSS, SQLite/WAL allocation or total pod memory.
 
 Staging eviction, even retirement's `everything=True`, never passes the buffer's confirmed
 eviction point: the first still-buffered offset, or its committed sequence end if empty,

@@ -157,6 +157,7 @@ def test_dead_intent_below_staging_is_retired(
     with new_log(tmp_path) as log:
         seal(log)
         log.publish(flush=True)
+        log.evict("buffer")
         log.evict("staging")
         seal(log)
         dead = log._published.require().uri("data/never-registered.parquet")

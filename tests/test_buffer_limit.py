@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
 import sqlite3
@@ -24,6 +25,7 @@ from tests.conftest import sqlite_backend
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
     from pathlib import Path
+    from typing import Any
 
     from litelink._backend import Cursor
 
@@ -34,6 +36,9 @@ ROW = {"n": 1, "text": "é"}
 # Offset (8), int64 (8), string slot (4), validity bits rounded up (1),
 # plus UTF-8 payload (2).
 ROW_BYTES = 23
+
+SMALL_SEAL = 16 * 1024
+SMALL_ROW = {"n": 1, "text": "x" * (SMALL_SEAL - (ROW_BYTES - 2))}
 
 
 def create(root: Path, **kwargs: object) -> litelink.WriteHandle:
@@ -421,6 +426,127 @@ def test_configuration_and_live_usage(tmp_path: Path) -> None:
 
         with pytest.raises(ValueError, match="buffer_max_rows"):
             log.set_config(replace(log.config, buffer_max_rows=0))
+
+
+def test_buffer_cap_is_configurable_below_default(tmp_path: Path) -> None:
+    for cap in (64 * 1024, 128 * 1024):
+        config = LogConfig(
+            target_seal_size=SMALL_SEAL,
+            buffer_max_bytes=cap,
+            buffer_max_rows=None,
+        )
+        assert LogConfig.from_json(config.to_json()) == config
+        root = tmp_path / str(cap)
+        with litelink.new(root, "s", schema=SCHEMA, config=config) as log:
+            count = cap // SMALL_SEAL
+            assert log.extend([SMALL_ROW] * count) == list(range(1, count + 1))
+
+    # Both policies survive independent reopen, without one deployment's cap
+    # falling back to the default or replacing the other's selected value.
+    for cap in (64 * 1024, 128 * 1024):
+        with litelink.open(tmp_path / str(cap), "s") as log:
+            usage = log.buffer_usage()
+            count = cap // SMALL_SEAL
+            assert usage == BufferUsage(cap, count, cap, None, True)
+            assert log.config.buffer_max_bytes == cap
+            end = log.end_offset()
+            with pytest.raises(LogFull) as refused:
+                log.append(ROW)
+
+            assert refused.value.fits_empty
+            assert log.buffered_rows() == count
+            assert log.end_offset() == end
+            assert log.buffer_usage() == usage
+            log.seal(flush=True)
+            log.publish(flush=True)
+            log.evict("buffer")
+            assert log.buffer_usage() == BufferUsage(0, 0, cap, None, False)
+            assert log.append(SMALL_ROW) == end
+            assert log.buffer_usage().bytes == SMALL_SEAL
+
+
+def test_buffer_cap_defaults_and_validation() -> None:
+    assert LogConfig.from_json("{}").buffer_max_bytes == 8 * 1024**3
+    assert LogConfig.from_json("{}").buffer_max_rows is None
+    invalid = {
+        "buffer_max_bytes": (0, -1, True, False, 128.0, None, "65536", []),
+        "buffer_max_rows": (0, -1, True, False, 1.5, "1", []),
+    }
+    for field, values in invalid.items():
+        for value in values:
+            settings: dict[str, Any] = {"target_seal_size": SMALL_SEAL, field: value}
+            with pytest.raises(ValueError, match=field):
+                LogConfig(**settings)
+
+            with pytest.raises(ValueError, match=field):
+                LogConfig.from_json(json.dumps(settings))
+
+    with pytest.raises(ValueError, match="target_seal_size"):
+        LogConfig(target_seal_size=SMALL_SEAL, buffer_max_bytes=SMALL_SEAL - 1)
+
+    config = LogConfig(target_seal_size=SMALL_SEAL, buffer_max_bytes=SMALL_SEAL)
+    assert LogConfig.from_json(config.to_json()) == config
+    config = replace(config, buffer_max_rows=1)
+    assert LogConfig.from_json(config.to_json()) == config
+
+
+def test_lowered_buffer_cap_preserves_rows_then_drains(tmp_path: Path) -> None:
+    with create(
+        tmp_path, target_seal_size=SMALL_SEAL, buffer_max_bytes=128 * 1024
+    ) as log:
+        log.extend([SMALL_ROW] * 8)
+        log.seal(flush=True)
+        log.publish(flush=True)
+        log.set_config(replace(log.config, buffer_max_bytes=64 * 1024))
+
+    with litelink.open(tmp_path, "s") as log:
+        usage = log.buffer_usage()
+        assert usage == BufferUsage(128 * 1024, 8, 64 * 1024, None, True)
+        with pytest.raises(LogFull):
+            log.append(ROW)
+
+        assert log.buffer_usage() == usage
+        assert log._buffer.count_from(0) == 8
+        assert log.end_offset() == 9
+        log.evict("buffer", end_offset=5)
+        assert log.buffer_usage() == BufferUsage(64 * 1024, 4, 64 * 1024, None, True)
+        with pytest.raises(LogFull):
+            log.append(ROW)
+
+        log.evict("buffer")
+        assert log.buffer_usage() == BufferUsage(0, 0, 64 * 1024, None, False)
+        assert log.append(ROW) == 9
+
+
+@pytest.mark.parametrize("cap", ["bytes", "rows", "both"])
+@pytest.mark.parametrize("batch_rows", [1, 3])
+def test_log_full_describes_batch_and_empty_buffer_fit(
+    tmp_path: Path, cap: str, batch_rows: int
+) -> None:
+    byte_cap = 2 * ROW_BYTES if cap in ("bytes", "both") else 1024
+    row_cap = 2 if cap in ("rows", "both") else None
+    with create(
+        tmp_path,
+        target_seal_size=1,
+        buffer_max_bytes=byte_cap,
+        buffer_max_rows=row_cap,
+    ) as log:
+        log.extend([ROW, ROW])
+        usage = log.buffer_usage()
+        with pytest.raises(LogFull) as refused:
+            log.extend([ROW] * batch_rows)
+
+        error = refused.value
+        assert isinstance(error, RuntimeError)
+        assert error.batch_rows == batch_rows
+        assert error.batch_bytes == batch_rows * ROW_BYTES
+        assert error.buffer_max_rows == row_cap
+        assert error.buffer_max_bytes == byte_cap
+        assert error.fits_empty is (batch_rows == 1)
+        assert f"fits_empty={error.fits_empty}" in str(error)
+        assert log.buffer_usage() == usage
+        assert log.buffered_rows() == 2
+        assert log.end_offset() == 3
 
 
 def test_benchmark_switch_forces_recount_on_normal_reopen(

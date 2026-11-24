@@ -927,17 +927,24 @@ class Buffer:
                         ),
                         (BUFFER_BYTES_KEY, BUFFER_ROWS_KEY),
                     ).fetchone()
-                    # Revisit: one buffer cap bounds every maintainer stall,
-                    # because the buffer holds every unpublished row. Staging
-                    # stays an eviction target. These rows are uncompressed;
-                    # this bounds row bytes, not SQLite files or physical disk.
+                    # One buffer cap bounds every maintainer stall because the
+                    # buffer holds every unpublished row until publication is
+                    # confirmed and buffer eviction releases it. Staging eviction
+                    # never advances past that confirmed release; staging remains
+                    # an eviction target. Buffer rows are uncompressed, so the
+                    # byte cap budgets raw rows, with compressed staging copies
+                    # and the staging cache requiring additional disk. Revisit
+                    # this trade-off.
                     if int(current_bytes or 0) + size > config.buffer_max_bytes or (
                         config.buffer_max_rows is not None
                         and int(current_rows or 0) + len(offsets)
                         > config.buffer_max_rows
                     ):
                         raise LogFull(
-                            "append would exceed the buffer write limit; retry after eviction"
+                            batch_rows=len(offsets),
+                            batch_bytes=size,
+                            buffer_max_rows=config.buffer_max_rows,
+                            buffer_max_bytes=config.buffer_max_bytes,
                         )
 
                 self._write_group(cursor, group)

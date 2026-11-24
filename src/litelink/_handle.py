@@ -4694,12 +4694,6 @@ def validate(
             msg = f"{name} must not be negative: {retention}"
             raise ValueError(msg)
 
-    if config.buffer_max_bytes < config.target_seal_size:
-        raise ValueError("buffer_max_bytes must be at least target_seal_size")
-
-    if config.buffer_max_rows is not None and config.buffer_max_rows < 1:
-        raise ValueError("buffer_max_rows must be at least 1 or None")
-
     if config.staging_max_bytes is not None and config.staging_max_bytes < 1:
         msg = f"staging_max_bytes must be at least 1: {config.staging_max_bytes}"
         raise ValueError(msg)

@@ -17,6 +17,14 @@ minor version carries breaking changes.
   buffer eviction. The first writable open migrates older logs with one atomic
   counted scan. Stop all older writers before upgrading; they cannot maintain
   the new counters.
+- Deployment-selected caps round-trip through configuration JSON and reopen,
+  including values below the 8 GiB default when the seal target fits. Invalid
+  byte/row cap types and nonpositive values fail at `LogConfig` construction.
+  `LogFull` reports batch rows/bytes, selected caps and whether the batch fits
+  an empty buffer. Upgrade publishers for batch shrinking; an oversized frame
+  can remain pending indefinitely on an older publisher. Keep the raw byte cap
+  comfortably above expected frames. The API includes a worked 2.8 GiB pod
+  sizing example; the cap does not guarantee pod memory or an RSS plateau.
 
 ### Fixed
 
@@ -32,7 +40,6 @@ minor version carries breaking changes.
   146,568), and from 2,175,541 to 148,109 for 2 KB rows (disabled: 148,125;
   base: 147,925). Generation-0/1 collections fall from 33/2 to 2/0, matching
   disabled and base. This profile does not establish the append-throughput gate.
-
 
 ## 0.14.3 — 2026-11-24
 
