@@ -15,8 +15,10 @@ import sqlite3
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
@@ -111,7 +113,8 @@ class DataFile:
 
 # The FileIOs this process has built, by the properties and scheme they were
 # built for. Bounded, because explicit credentials that rotate make new keys;
-# what falls out is freed like any other unreferenced FileIO.
+# _SinglePutFileIO avoids the filesystem-cache cycle, so eviction releases
+# unreferenced clients without waiting for cyclic collection.
 _FILE_IOS: OrderedDict[tuple[tuple[tuple[str, str], ...], str], FileIO] = OrderedDict()
 _FILE_IOS_LIMIT = 64
 _FILE_IOS_LOCK = threading.Lock()
@@ -122,7 +125,7 @@ def shared_file_io(properties: Mapping[str, str], location: str | None) -> FileI
 
     pyiceberg builds a new FileIO on every `load_table` and every commit, and
     each brings its own `S3FileSystem` — credentials, client, connection pool.
-    Its `PyArrowFileIO` also sits in a reference cycle (`fs_by_scheme` is an
+    Upstream `PyArrowFileIO` also sits in a reference cycle (`fs_by_scheme` is an
     `lru_cache` of a bound method), so reference counting never frees one: its
     connections close only when the cycle collector runs. Python 3.14's
     collector is incremental and falls behind a reader that reloads every few
@@ -133,6 +136,8 @@ def shared_file_io(properties: Mapping[str, str], location: str | None) -> FileI
     FileIO, and so one connection pool. The scheme is part of the key because
     pyiceberg picks the implementation from it. Safe to share across threads:
     pyarrow's filesystems are thread-safe, and a FileIO holds nothing else.
+    Our Arrow FileIO also breaks that cycle so the entry bound releases
+    evicted clients even when cyclic collection has not run.
     """
     scheme = location.partition("://")[0] if location and "://" in location else ""
     key = (tuple(sorted(properties.items())), scheme)
@@ -282,6 +287,22 @@ class _SinglePutFileIO(PyArrowFileIO):
     from its own options with the one changed. The option is pyarrow 21's,
     hence litelink's floor there.
     """
+
+    def __init__(self, properties: Properties = EMPTY_DICT) -> None:
+        super().__init__(properties)
+        # A cached bound method owns this FileIO, which owns the cache. A
+        # weak reference keeps the same per-instance filesystem reuse without
+        # retaining evicted clients until the cycle collector catches up.
+        owner = weakref.ref(self)
+
+        def initialize(scheme: str, netloc: str | None = None) -> FileSystem:
+            io = owner()
+            if io is None:
+                raise ReferenceError("FileIO has been released")
+
+            return io._initialize_fs(scheme, netloc)
+
+        self.fs_by_scheme = lru_cache(initialize)
 
     def _initialize_s3_fs(self, netloc: str | None) -> FileSystem:
         built = super()._initialize_s3_fs(netloc)
