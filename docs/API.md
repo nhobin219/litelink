@@ -9,7 +9,8 @@ from litelink import LogConfig, LogHandle, Row, S3Options, WriteHandle, __versio
 ```
 
 Those are the names most code takes; `litelink` also exports `new`, `open`, `restore`,
-`validate_row`, `preflight`, `duckdb_connection`, `current_metadata`, `install_s3_secret`,
+`validate_row`, `preflight`, `DuckDBPolicy`, `Spill`, `bound_default_connection`,
+`duckdb_connection`, `current_metadata`, `install_s3_secret`,
 `LocalReadHandle`, `Coverage`, `RetiredError`, `ExtensionMissing`, `OFFSET`, the statistics types
 (`ColumnStatistics`, `TierStatistics`, `Tier`), the preflight report types (`Check`, `Report`)
 and the `manifest` module. The handles are the whole object model — there
@@ -81,12 +82,12 @@ raised; a `read_only` flag did the same to thirteen methods.
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, published=None,
-             s3_options=None, start_offset=1)              -> WriteHandle
-litelink.open(root, name, *, s3_options=None)              -> WriteHandle
-litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
+             s3_options=None, duckdb=None, start_offset=1) -> WriteHandle
+litelink.open(root, name, *, s3_options=None, duckdb=None) -> WriteHandle
+litelink.open(root, name, *, read_only=True, s3_options=None, duckdb=None) -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, binary=None,
                  schema=None, sort_by=None, config=None,
-                 replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
+                 replica_reserve=2**20, published_reserve=2**40, duckdb=None) -> WriteHandle
 ```
 
 **`open` is overloaded on the `read_only` literal**, so the type you get is static:
@@ -130,7 +131,7 @@ Each row is what that class **adds** to the one above it. A test pins the `LogHa
 
 | | |
 |---|---|
-| **`LogHandle`** — read | `scan` · `sql` |
+| **`LogHandle`** — read | `scan` · `sql` · `query_once` |
 | **`LogHandle`** — observe | `end_offset` · `buffered_rows` · `staging_rows` · `staging_files` · `staging_extent` · `published_through` · `published_files` · `coverage` · `column_statistics` |
 | **`LogHandle`** — identity | `root` · `name` · `config` · `schema` · `sort_by` · `published` |
 | **`LogHandle`** — lifecycle | `close` · context manager |
@@ -167,12 +168,12 @@ the range contains.
 
 ```python
 litelink.new(root, name, *, schema, sort_by=None, config=None, published=None, s3_options=None,
-             start_offset=1) -> WriteHandle
-litelink.open(root, name, *, s3_options=None) -> WriteHandle
-litelink.open(root, name, *, read_only=True, s3_options=None) -> LocalReadHandle
+             duckdb=None, start_offset=1) -> WriteHandle
+litelink.open(root, name, *, s3_options=None, duckdb=None) -> WriteHandle
+litelink.open(root, name, *, read_only=True, s3_options=None, duckdb=None) -> LocalReadHandle
 litelink.restore(root, name, *, published, s3_options=None, binary=None,
                  schema=None, sort_by=None, config=None,
-                 replica_reserve=2**20, published_reserve=2**40) -> WriteHandle
+                 replica_reserve=2**20, published_reserve=2**40, duckdb=None) -> WriteHandle
 
 # A retired log, from its published table alone (see "Retiring a log")
 litelink.truncate(published, name, *, below, s3_options=None) -> int
@@ -482,6 +483,7 @@ keeps that file as written.
 log.scan(*, columns=None, where=None, start_offset=None,
          end_offset=None, published=True) -> pa.RecordBatchReader
 log.sql(query, *, published=True) -> pa.RecordBatchReader
+log.query_once(sql, *, duckdb: DuckDBPolicy, published=True) -> pa.Table
 ```
 
 `scan` unions the tiers and bounds each by its neighbour's committed offset extent, resolved
@@ -534,9 +536,14 @@ before its commit. `publish` leaves it alone. It is recomputed from the
 published table's manifests at the first `publish`, at `restore`, and at `open` for a log
 written before it existed. With no row, the published table is read.
 
-`sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. Both return a
-streaming reader rather than a table: a full-window read with a 400-byte payload column is
+`sql` is the same relation under arbitrary DuckDB SQL, exposed as `log`. `scan` and `sql`
+return a streaming reader rather than a table: a full-window read with a 400-byte payload column is
 611 ms and proportional to the data, so materialising it is the caller's choice.
+
+`query_once` uses the same union but opens a separate root with the required policy,
+materializes the whole result, and closes the root on success or error. It never opens
+the handle's cached Reader. The returned table remains usable after close; its Arrow
+allocation is outside DuckDB's buffer-pool cap.
 
 **Always bound on a leading column of `sort_by`.** §7 measures a non-leading predicate at
 119 ms against 13 ms for the same predicate with a leading bound.
@@ -574,12 +581,36 @@ extensions litelink's platform wheels bundle, so the first read is not a network
 litelink.duckdb_connection(
     *,
     s3_options: S3Options | None = None,      # given: this connection reads S3
+    duckdb: DuckDBPolicy | None = None,
     memory_cache: bool = True,
     disk_cache: bool = False,
     cache_key: str | PathLike | None = None,   # under ~/.cache/litelink; None: "default"
     disk_cache_volume_limit: float = 0.8,
 ) -> duckdb.DuckDBPyConnection
 ```
+
+`DuckDBPolicy(memory_limit_mib, threads, spill=None, memory_cache=True)` and
+`Spill(directory: Path, max_mib)` are frozen, serializable definitions with no I/O.
+Memory is an integer ≥16 MiB, threads an integer ≥1, spill size an integer ≥1 MiB,
+and cache a bool. `policy.config()` returns DuckDB's connect settings, including
+`max_temp_directory_size`. The memory cap is per database (shared by its cursors),
+not a whole-process RSS bound.
+
+Pass `duckdb=policy` to `duckdb_connection`, `new`, `open` or `restore`; roots are
+capped at creation before extensions load. A handle opens its root lazily and caches
+it until close. The policy's cache flag overrides `memory_cache` when both are given.
+Without a policy DuckDB defaults and the existing cache flags are unchanged.
+`spill=None` disables spilling (`temp_directory=''`, size cap zero). Otherwise the
+owner creates the spill directory and its parents before spilling; litelink creates
+neither. DuckDB can recreate a leaf under an existing parent. Missing parents and
+unwritable/full directories raise at first spill; hitting the memory or spill cap
+raises a DuckDB error. Spill files live until the database closes.
+
+`litelink.bound_default_connection(policy) -> None` replaces DuckDB's module default
+with a root built from `policy.config()`. Closing the old default alone permits
+uncapped recreation. Replacement releases the holder's ownership without closing
+caller aliases; those aliases can keep the old database alive. Call at application
+startup before using module-level SQL. It loads no extensions.
 
 It loads `avro` and `iceberg`. **`s3_options` is what makes a connection read S3**: given, it
 also loads `httpfs` and creates the S3 secret from those options, and an empty `S3Options()`

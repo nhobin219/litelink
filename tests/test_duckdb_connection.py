@@ -14,6 +14,7 @@ import duckdb
 import pytest
 
 import litelink
+import litelink._read as read
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -235,8 +236,6 @@ def test_an_unprovisioned_machine_gets_the_message_that_fixes_it(
     Falsify by catching `ExtensionMissing` around the `iceberg` load: the
     caller gets a connection that fails at its first `iceberg_scan` instead.
     """
-    import litelink._read as read
-
     empty = tmp_path / "extensions"
     empty.mkdir()
     real = duckdb.connect
@@ -251,7 +250,7 @@ def test_an_unprovisioned_machine_gets_the_message_that_fixes_it(
         )
 
     monkeypatch.setattr(read, "_bundled_extension", lambda *_: None)
-    monkeypatch.setattr(read.duckdb, "connect", offline)
+    monkeypatch.setattr(read._duckdb, "connect", offline)
 
     with pytest.raises(litelink.ExtensionMissing) as caught:
         litelink.duckdb_connection()

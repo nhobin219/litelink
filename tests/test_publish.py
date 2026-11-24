@@ -2365,7 +2365,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
 
     # Every handle inherits ONE read path, so drift is impossible rather than
     # merely detectable.
-    for shared in ("scan", "sql", "coverage"):
+    for shared in ("scan", "sql", "query_once", "coverage"):
         assert getattr(WriteHandle, shared) is getattr(LogHandle, shared), (
             f"{shared} is reimplemented rather than inherited"
         )
@@ -2392,6 +2392,7 @@ def test_the_handle_surface_is_exactly_what_the_docs_print() -> None:
         # read
         "scan",
         "sql",
+        "query_once",
         # observe
         "coverage",
         "end_offset",

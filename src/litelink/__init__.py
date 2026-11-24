@@ -52,7 +52,10 @@ from litelink._lease import Held, Lease, Leased, LeaseLost, lease
 from litelink._lease_store import ConditionalWritesUnsupported
 from litelink._preflight import Check, Report, preflight
 from litelink._read import (
+    DuckDBPolicy,
     ExtensionMissing,
+    Spill,
+    bound_default_connection,
     current_metadata,
     duckdb_connection,
     install_s3_secret,
@@ -73,6 +76,7 @@ __all__ = [
     "ColumnStatistics",
     "ConditionalWritesUnsupported",
     "Coverage",
+    "DuckDBPolicy",
     "ExtensionMissing",
     "Held",
     "Lease",
@@ -85,11 +89,13 @@ __all__ = [
     "RetiredError",
     "Row",
     "S3Options",
+    "Spill",
     "Tier",
     "TierStatistics",
     "Transaction",
     "WriteHandle",
     "__version__",
+    "bound_default_connection",
     "current_metadata",
     "delete",
     "duckdb_connection",
