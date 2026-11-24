@@ -1443,6 +1443,21 @@ never inbound.
 
 ## 7. Read path
 
+### Per-database resource policy
+
+`DuckDBPolicy` applies memory (MiB), threads, spill directory and size cap, and
+external file cache settings at `duckdb.connect`, before extension loading. The
+frozen definition does no I/O. `new`, `open` and `restore` inject the configured
+factory into their lazy Reader; no policy preserves DuckDB defaults. A spill
+owner creates its directory and parents; litelink never creates them. Spill files
+are bounded by `max_temp_directory_size` and live until database close.
+
+`query_once` uses a separate Reader with the same three-way union and I3 offset
+bounds, materializes one query, and closes its root even on failure. It leaves the
+handle's cached Reader unopened. Arrow results are outside the buffer-pool cap.
+`bound_default_connection` replaces the module default with a capped database;
+retained aliases still own their old database, which the helper does not close.
+
 ### Resolving the table for a reader
 
 pyiceberg owns the catalog; the query engine does not attach to it. Verified against

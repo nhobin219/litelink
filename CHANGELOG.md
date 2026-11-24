@@ -7,6 +7,23 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
+## 0.15.0 — 2026-11-24
+
+### Added
+
+- `DuckDBPolicy` and `Spill` set per-database memory, threads, spill size and
+  external file cache policy at connection creation, before extensions load.
+  `duckdb_connection`, `new`, `open` and `restore` accept `duckdb=`; no policy
+  preserves DuckDB defaults. Spill owners create their directories and parents.
+- `LogHandle.query_once` materializes a query with a separate policy root and
+  closes it on success or error without opening the handle's cached Reader.
+- `bound_default_connection` replaces DuckDB's module default with a capped
+  database, releasing the holder's old ownership while leaving caller aliases usable.
+
+No on-disk or protocol change. The minor version introduces the resource-policy
+API; consumers capped to 0.14 must move their pin to adopt it. Memory caps cover
+DuckDB's buffer pool, not Python/Arrow allocations or whole-process RSS.
+
 ## 0.14.3 — 2026-11-24
 
 ### Fixed

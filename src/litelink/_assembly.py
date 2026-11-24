@@ -12,6 +12,7 @@ table, not something litelink assembles (#90).
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -35,7 +36,7 @@ from litelink._handle import (
 from litelink._layout import Layout
 from litelink._maintenance import Maintenance
 from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import Reader, duckdb_connection
+from litelink._read import DuckDBPolicy, Reader, duckdb_connection
 from litelink._sqlite import SqliteBackend
 from litelink._table import LogTable
 
@@ -53,6 +54,7 @@ def open(  # noqa: A001
     *,
     read_only: Literal[False] = False,
     s3_options: S3Options | None = None,
+    duckdb: DuckDBPolicy | None = None,
 ) -> WriteHandle: ...
 
 
@@ -63,6 +65,7 @@ def open(  # noqa: A001
     *,
     read_only: Literal[True],
     s3_options: S3Options | None = None,
+    duckdb: DuckDBPolicy | None = None,
 ) -> LocalReadHandle: ...
 
 
@@ -72,6 +75,7 @@ def open(  # noqa: A001
     *,
     read_only: bool = False,
     s3_options: S3Options | None = None,
+    duckdb: DuckDBPolicy | None = None,
 ) -> LogHandle:
     """Open an existing log, for writing or for reading beside its writer.
 
@@ -118,7 +122,13 @@ def open(  # noqa: A001
         remote = Published(
             layout, buffer, s3_options, catalog=backend.published_catalog()
         )
-        reader = Reader(layout, table, buffer, duckdb_connection, published=remote)
+        reader = Reader(
+            layout,
+            table,
+            buffer,
+            partial(duckdb_connection, duckdb=duckdb),
+            published=remote,
+        )
         if read_only:
             return LocalReadHandle(
                 layout=layout,
@@ -224,6 +234,7 @@ def new(
     config: LogConfig | None = None,
     published: str | None = None,
     s3_options: S3Options | None = None,
+    duckdb: DuckDBPolicy | None = None,
     start_offset: int = 1,
 ) -> WriteHandle:
     """Create a log. See `litelink.new` for the shape it fixes and why."""
@@ -235,6 +246,7 @@ def new(
         config=config,
         published=published,
         s3_options=s3_options,
+        duckdb=duckdb,
         start_offset=start_offset,
     )
 
@@ -245,6 +257,7 @@ def restore(
     *,
     published: str,
     s3_options: S3Options | None = None,
+    duckdb: DuckDBPolicy | None = None,
     binary: str | None = None,
     schema: pa.Schema | None = None,
     sort_by: Sequence[str] | None = None,
@@ -259,6 +272,7 @@ def restore(
         name,
         published=published,
         s3_options=s3_options,
+        duckdb=duckdb,
         binary=binary,
         schema=schema,
         sort_by=sort_by,

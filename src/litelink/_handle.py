@@ -56,7 +56,7 @@ from litelink._maintenance import (
     chunks,
 )
 from litelink._published import PUBLISHED_KEY, Published
-from litelink._read import Reader, duckdb_connection
+from litelink._read import DuckDBPolicy, Reader, duckdb_connection
 from litelink._replication import flush, litestream_config, restore_database
 from litelink._s3 import S3Options
 from litelink._sqlite import SqliteBackend
@@ -669,6 +669,29 @@ class LogHandle:
             #
             # Three earlier versions of this comment claimed otherwise.
             raise self._swept(exc) from exc
+
+    def query_once(
+        self, sql: str, *, duckdb: DuckDBPolicy, published: bool = True
+    ) -> pa.Table:
+        """Materialize one query with a fresh capped root, then close it.
+
+        The union is the same as `sql` (SPEC §7, I3). A separate Reader keeps
+        registrations independent and never initializes this handle's cached
+        root. Arrow materialization is outside DuckDB's buffer-pool cap.
+        """
+        reader = Reader(
+            self._layout,
+            self._table,
+            self._buffer,
+            functools.partial(duckdb_connection, duckdb=duckdb),
+            published=self._published,
+        )
+        try:
+            return reader.query(sql, published=published).read_all()
+        except FileNotFoundError as exc:
+            raise self._swept(exc) from exc
+        finally:
+            reader.close()
 
     # -- observe -----------------------------------------------------------
 
@@ -1289,6 +1312,7 @@ class WriteHandle(LocalReadHandle):
         config: LogConfig | None = None,
         published: str | None = None,
         s3_options: S3Options | None = None,
+        duckdb: DuckDBPolicy | None = None,
         start_offset: int = 1,
     ) -> Self:
         """Create a log. Raises if one already exists at `root/name`.
@@ -1421,6 +1445,7 @@ class WriteHandle(LocalReadHandle):
             settings=settings,
             published=published,
             s3_options=s3_options,
+            duckdb=duckdb,
             first_offset=start_offset,
             # Recorded only when there IS a reserve. Absent means "started at
             # 1", which a backfill must read as "no reserve" rather than "a
@@ -1439,6 +1464,7 @@ class WriteHandle(LocalReadHandle):
         settings: LogConfig,
         published: str | None,
         s3_options: S3Options | None,
+        duckdb: DuckDBPolicy | None,
         first_offset: int,
         meta: Mapping[str, str],
     ) -> Self:
@@ -1500,7 +1526,7 @@ class WriteHandle(LocalReadHandle):
                 layout,
                 table,
                 buffer,
-                duckdb_connection,
+                functools.partial(duckdb_connection, duckdb=duckdb),
                 published=remote,
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
@@ -1524,6 +1550,7 @@ class WriteHandle(LocalReadHandle):
         name: str,
         *,
         s3_options: S3Options | None = None,
+        duckdb: DuckDBPolicy | None = None,
     ) -> Self:
         """Open an existing log, and recover it.
 
@@ -1612,7 +1639,7 @@ class WriteHandle(LocalReadHandle):
                 layout,
                 table,
                 buffer,
-                duckdb_connection,
+                functools.partial(duckdb_connection, duckdb=duckdb),
                 published=remote,
             ),
             maintenance=Maintenance(table, buffer, layout, remote),
@@ -1655,6 +1682,7 @@ class WriteHandle(LocalReadHandle):
         *,
         published: str,
         s3_options: S3Options | None = None,
+        duckdb: DuckDBPolicy | None = None,
         binary: str | None = None,
         schema: pa.Schema | None = None,
         sort_by: Sequence[str] | None = None,
@@ -1841,6 +1869,7 @@ class WriteHandle(LocalReadHandle):
                 published,
                 options,
                 published_reserve,
+                duckdb=duckdb,
                 schema=schema,
                 sort_by=sort_by,
                 config=config,
@@ -1873,6 +1902,7 @@ class WriteHandle(LocalReadHandle):
                 published,
                 options,
                 published_reserve,
+                duckdb=duckdb,
                 schema=schema,
                 sort_by=sort_by,
                 config=config,
@@ -2153,7 +2183,7 @@ class WriteHandle(LocalReadHandle):
 
             raise
 
-        log = cls.open(layout.root, name, s3_options=options)
+        log = cls.open(layout.root, name, s3_options=options, duckdb=duckdb)
         if config is not None:
             log.set_config(config)
 
@@ -2220,6 +2250,7 @@ class WriteHandle(LocalReadHandle):
         options: S3Options,
         reserve: int = PUBLISHED_RESTORE_RESERVE,
         *,
+        duckdb: DuckDBPolicy | None,
         schema: pa.Schema | None = None,
         sort_by: Sequence[str] | None = None,
         config: LogConfig | None = None,
@@ -2307,6 +2338,7 @@ class WriteHandle(LocalReadHandle):
             settings=settings,
             published=published,
             s3_options=options,
+            duckdb=duckdb,
             first_offset=first,
             meta={PUBLISHED_THROUGH_KEY: str(frontier - 1)},
         )

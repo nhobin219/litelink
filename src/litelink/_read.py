@@ -13,9 +13,9 @@ import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-import duckdb
+import duckdb as _duckdb
 import pyarrow as pa
 
 from litelink._prune import terms
@@ -115,10 +115,12 @@ def _duckdb_library_version() -> str:
     degrades to a network fetch online and to an unreadable log offline. One
     `getattr` removes the whole question.
     """
-    return str(getattr(duckdb, "__duckdb_version__", duckdb.__version__)).lstrip("v")
+    return str(getattr(_duckdb, "__duckdb_version__", _duckdb.__version__)).lstrip("v")
 
 
-def _bundled_extension(connection: duckdb.DuckDBPyConnection, name: str) -> Path | None:
+def _bundled_extension(
+    connection: _duckdb.DuckDBPyConnection, name: str
+) -> Path | None:
     """The copy shipped in the wheel, if there is one this DuckDB can load.
 
     **Checked against the RUNNING version and platform, never assumed.** DuckDB
@@ -149,7 +151,7 @@ def _bundled_extension(connection: duckdb.DuckDBPyConnection, name: str) -> Path
 
 
 def load_extension(
-    connection: duckdb.DuckDBPyConnection, name: str, *, remote: bool
+    connection: _duckdb.DuckDBPyConnection, name: str, *, remote: bool
 ) -> None:
     """`LOAD name`, with an error that says what to do about it.
 
@@ -185,7 +187,7 @@ def load_extension(
     if bundled is not None:
         try:
             connection.execute(f"LOAD '{bundled}'")
-        except duckdb.Error:
+        except _duckdb.Error:
             # The bundle is a fast path, not a trapdoor. A copy that arrived
             # wrong — a mangling proxy, a partial install, a corrupt download —
             # would otherwise break a machine that has a perfectly good
@@ -202,7 +204,7 @@ def load_extension(
 
     try:
         connection.execute(f"LOAD {name}")
-    except duckdb.IOException as exc:
+    except _duckdb.IOException as exc:
         flag = " --remote" if remote else ""
         source = " FROM community" if name in _COMMUNITY else ""
         tier = (
@@ -218,7 +220,7 @@ def load_extension(
             f"\n"
             f"litelink's platform wheels ship it, built for the DuckDB they "
             f"pin — so either this is a pure-Python wheel, or duckdb "
-            f"{duckdb.__version__} is not the version those extensions were "
+            f"{_duckdb.__version__} is not the version those extensions were "
             f"built for.\n"
             f"\n"
             f"Fetch it into this machine's DuckDB home, which needs network:\n"
@@ -245,7 +247,7 @@ def uses_credential_chain(options: S3Options) -> bool:
 
 
 def load_s3_extensions(
-    connection: duckdb.DuckDBPyConnection, options: S3Options
+    connection: _duckdb.DuckDBPyConnection, options: S3Options
 ) -> None:
     """`httpfs`, and `aws` when the secret will use the credential chain.
 
@@ -259,7 +261,7 @@ def load_s3_extensions(
         load_extension(connection, "aws", remote=True)
 
 
-def create_secret(target: duckdb.DuckDBPyConnection, options: S3Options) -> None:
+def create_secret(target: _duckdb.DuckDBPyConnection, options: S3Options) -> None:
     """Create or replace the S3 secret on `target`, from resolved `options`.
 
     A credential chain that finds nothing is refused by DuckDB at creation, with
@@ -270,7 +272,7 @@ def create_secret(target: duckdb.DuckDBPyConnection, options: S3Options) -> None
     """
     try:
         target.execute(secret_sql(options))
-    except duckdb.Error as exc:
+    except _duckdb.Error as exc:
         if options.access_key is not None and options.secret_key is not None:
             raise
 
@@ -284,7 +286,7 @@ def create_secret(target: duckdb.DuckDBPyConnection, options: S3Options) -> None
 
 
 def install_s3_secret(
-    connection: duckdb.DuckDBPyConnection, s3_options: S3Options | None = None
+    connection: _duckdb.DuckDBPyConnection, s3_options: S3Options | None = None
 ) -> None:
     """Load `httpfs` (and `aws` for a credential chain) and create or replace
     the S3 secret on `connection`.
@@ -368,7 +370,9 @@ class ReadCache:
 _HINT_EXCLUSION = r".*/metadata/version-hint\.text$"
 
 
-def install_read_cache(connection: duckdb.DuckDBPyConnection, cache: ReadCache) -> None:
+def install_read_cache(
+    connection: _duckdb.DuckDBPyConnection, cache: ReadCache
+) -> None:
     """Configure `connection`'s read caches as `cache` says (#118).
 
     Two layers, because `cache_httpfs` runs ONE mode at a time:
@@ -491,6 +495,74 @@ def current_metadata(location: str, *, s3_options: S3Options | None = None) -> s
     return f"{base}/metadata/{version}.metadata.json"
 
 
+@dataclass(frozen=True)
+class Spill:
+    """A root's spill directory and hard size cap, in MiB.
+
+    The owner creates the directory and its parents. This definition does no
+    I/O; DuckDB can recreate a missing leaf, but cannot create its parents.
+    """
+
+    directory: Path
+    max_mib: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.directory, Path):
+            raise ValueError("spill directory must be a Path")
+
+        if type(self.max_mib) is not int or self.max_mib < 1:
+            raise ValueError("spill max_mib must be an integer of at least 1")
+
+
+@dataclass(frozen=True)
+class DuckDBPolicy:
+    """Limits for one DuckDB database, shared by its root and cursors.
+
+    These bound DuckDB's buffer pool, not whole-process RSS: materialized
+    Arrow results, Python allocations and thread stacks live outside it.
+    """
+
+    memory_limit_mib: int
+    threads: int
+    spill: Spill | None = None
+    memory_cache: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.memory_limit_mib) is not int or self.memory_limit_mib < 16:
+            raise ValueError("memory_limit_mib must be an integer of at least 16")
+
+        if type(self.threads) is not int or self.threads < 1:
+            raise ValueError("threads must be an integer of at least 1")
+
+        if self.spill is not None and not isinstance(self.spill, Spill):
+            raise ValueError("spill must be a Spill or None")
+
+        if type(self.memory_cache) is not bool:
+            raise ValueError("memory_cache must be a bool")
+
+    def config(self) -> dict[str, Any]:
+        """Settings applied at connect, before extensions or queries run."""
+        return {
+            "memory_limit": f"{self.memory_limit_mib}MiB",
+            "threads": self.threads,
+            "temp_directory": "" if self.spill is None else str(self.spill.directory),
+            "max_temp_directory_size": (
+                "0MiB" if self.spill is None else f"{self.spill.max_mib}MiB"
+            ),
+            "enable_external_file_cache": self.memory_cache,
+        }
+
+
+def bound_default_connection(policy: DuckDBPolicy) -> None:
+    """Replace DuckDB's module default with a capped database.
+
+    Closing alone lets module SQL recreate an uncapped database. Replacement
+    releases the holder's ownership; retained aliases to the old root remain
+    usable and keep that database alive until their owners release them.
+    """
+    _duckdb.set_default_connection(_duckdb.connect(config=policy.config()))
+
+
 def duckdb_connection(
     *,
     s3_options: S3Options | None = None,
@@ -498,7 +570,8 @@ def duckdb_connection(
     disk_cache: bool = False,
     cache_key: str | PathLike[str] | None = None,
     disk_cache_volume_limit: float = 0.8,
-) -> duckdb.DuckDBPyConnection:
+    duckdb: DuckDBPolicy | None = None,
+) -> _duckdb.DuckDBPyConnection:
     """A DuckDB connection provisioned to read a published table (#108).
 
     `avro` and `iceberg` are loaded from the extensions litelink's platform
@@ -548,6 +621,11 @@ def duckdb_connection(
     returns the old hint. Resolve the table with `current_metadata` and scan
     the path it returns.
 
+    `duckdb` applies a DuckDBPolicy at connect, before extension loading.
+    Its memory_cache overrides the separate cache flag. Without it DuckDB
+    defaults and the existing cache flags are unchanged. No spill directory
+    or parent is created here; the owner provisions it before spilling.
+
     A new connection per call, which the caller owns. Building one costs about
     a quarter of a second, nearly all of it `LOAD iceberg` (#102), so hold on
     to it. It is also the factory every log's reader is built with.
@@ -559,28 +637,35 @@ def duckdb_connection(
         raise ValueError(msg)
 
     cache = ReadCache(
-        memory_cache=memory_cache,
+        memory_cache=memory_cache if duckdb is None else duckdb.memory_cache,
         disk_cache=disk_cache,
         cache_key=cache_key,
         disk_cache_volume_limit=disk_cache_volume_limit,
     )
 
-    connection = duckdb.connect()
-    # `avro` BEFORE `iceberg`, and quietly: `iceberg`'s init auto-installs it
-    # otherwise, which needs the network and defeats the point of bundling.
-    # Missing is not fatal here — a machine-provisioned `iceberg` may resolve
-    # it however it already does — so the failure to report is `iceberg`'s.
-    with contextlib.suppress(ExtensionMissing, duckdb.Error):
-        load_extension(connection, "avro", remote=False)
+    connection = (
+        _duckdb.connect() if duckdb is None else _duckdb.connect(config=duckdb.config())
+    )
+    try:
+        # `avro` BEFORE `iceberg`, and quietly: `iceberg`'s init auto-installs it
+        # otherwise, which needs the network and defeats the point of bundling.
+        # Missing is not fatal here — a machine-provisioned `iceberg` may resolve
+        # it however it already does — so the failure to report is `iceberg`'s.
+        with contextlib.suppress(ExtensionMissing, _duckdb.Error):
+            load_extension(connection, "avro", remote=False)
 
-    load_extension(connection, "iceberg", remote=False)
-    # No ATTACH of the buffer database. `Buffer.rows_from` records what that
-    # cost: two SQLite libraries in one process is silent corruption, not a
-    # slow path.
-    if s3_options is not None:
-        install_s3_secret(connection, s3_options)
+        load_extension(connection, "iceberg", remote=False)
+        # No ATTACH of the buffer database. `Buffer.rows_from` records what that
+        # cost: two SQLite libraries in one process is silent corruption, not a
+        # slow path.
+        if s3_options is not None:
+            install_s3_secret(connection, s3_options)
 
-    install_read_cache(connection, cache)
+        install_read_cache(connection, cache)
+    except BaseException:
+        connection.close()
+
+        raise
 
     return connection
 
@@ -594,7 +679,7 @@ class Reader:
         layout: Layout,
         table: LogTable,
         buffer: Buffer,
-        connect: Callable[[], duckdb.DuckDBPyConnection],
+        connect: Callable[[], _duckdb.DuckDBPyConnection],
         published: Published,
     ) -> None:
         self._layout = layout
@@ -610,7 +695,7 @@ class Reader:
         # Which tiers a query needs, per tier (#90). Read from disk per query;
         # it re-decodes only when a write has bumped the tier rows' generation.
         self._stored = StoredTiers(buffer)
-        self._connection: duckdb.DuckDBPyConnection | None = None
+        self._connection: _duckdb.DuckDBPyConnection | None = None
         # This reader's own, guarding the DuckDB connection and the view built
         # on it. Its own rather than the handle's, because a query must not wait
         # behind a maintenance pass — one waited 21.5 s behind a compaction
@@ -630,7 +715,7 @@ class Reader:
         return self._buffer.shape().table
 
     def _prepare_remote(
-        self, cursor: duckdb.DuckDBPyConnection
+        self, cursor: _duckdb.DuckDBPyConnection
     ) -> tuple[str, tuple[int, int]] | None:
         """Load httpfs, install the credentials, return the published table's
         pointer and the offset range it covers.
@@ -957,7 +1042,7 @@ class Reader:
 
         return " UNION ALL ".join(legs)
 
-    def _connect(self) -> duckdb.DuckDBPyConnection:
+    def _connect(self) -> _duckdb.DuckDBPyConnection:
         """The connection, built on first read and kept.
 
         Lazily, so a log that only ever appends never pays for one.
