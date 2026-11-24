@@ -84,13 +84,10 @@ def test_without_replication_sealed_rows_wait_for_publication(tmp_path: Path) ->
         assert offsets(log) == [1, 2, 3, 4]
 
 
-def test_staging_evicted_first_releases_buffer_at_the_next_publish(
-    tmp_path: Path,
-) -> None:
-    """With no staging files left, the prefix proof is empty. The next sealed
-    and published file proves the older rows can leave too (§8).
+def test_staging_first_preserves_buffer_eviction_evidence(tmp_path: Path) -> None:
+    """A full published staging prefix stays until its buffer rows leave.
 
-    Falsify by omitting buffer eviction: the final span still holds rows.
+    Falsify by removing the confirmed buffer-eviction clamp.
     """
     with local_log(tmp_path, staging_retention=timedelta(0)) as log:
         log.extend(rows(4))
@@ -98,16 +95,13 @@ def test_staging_evicted_first_releases_buffer_at_the_next_publish(
         log.publish(flush=True)
 
         log.evict("staging")
-        assert log.staging_files() == 0
-        log.evict("buffer")
+        assert log.staging_files() > 0
         assert log._buffer.span() == (1, 5)  # noqa: SLF001
-
-        assert log.extend(rows(2)) == [5, 6]
-        log.seal(flush=True)
-        log.publish(flush=True)
         log.evict("buffer")
         assert log._buffer.span() is None  # noqa: SLF001
-        assert offsets(log) == list(range(1, 7))
+        log.evict("staging")
+        assert log.staging_files() == 0
+        assert offsets(log) == list(range(1, 5))
 
 
 def test_a_log_given_no_published_table_publishes_under_its_own_directory(

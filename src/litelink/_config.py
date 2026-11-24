@@ -124,6 +124,10 @@ class LogConfig:
     # is the case that needs this and a library cannot guess the row width.
     target_seal_rows: int | None = None
 
+    # Uncompressed buffered row bytes, independent of file compression.
+    buffer_max_bytes: int = 8 * 1024 * 1024 * 1024
+    buffer_max_rows: int | None = None
+
     # §6. How big a file should END UP, ON DISK, which is not the same
     # question as how much may sit in the buffer, and the two pull in opposite
     # directions.
@@ -314,6 +318,26 @@ class LogConfig:
     # a new codec applies to what is written from then on.
     compression: str = "zstd"
 
+    def __post_init__(self) -> None:
+        # Validate here so Python construction and decoded deployment policies
+        # reject the same invalid caps before a log can admit any rows.
+        if (
+            not isinstance(self.buffer_max_bytes, int)
+            or isinstance(self.buffer_max_bytes, bool)
+            or self.buffer_max_bytes <= 0
+        ):
+            raise ValueError("buffer_max_bytes must be a positive integer")
+
+        if self.buffer_max_bytes < self.target_seal_size:
+            raise ValueError("buffer_max_bytes must be at least target_seal_size")
+
+        if self.buffer_max_rows is not None and (
+            not isinstance(self.buffer_max_rows, int)
+            or isinstance(self.buffer_max_rows, bool)
+            or self.buffer_max_rows <= 0
+        ):
+            raise ValueError("buffer_max_rows must be a positive integer or None")
+
     def to_json(self) -> str:
         """Serialised for the `meta` table, so `open` recovers the policy.
 
@@ -324,6 +348,8 @@ class LogConfig:
         return json.dumps(
             {
                 "target_seal_size": self.target_seal_size,
+                "buffer_max_bytes": self.buffer_max_bytes,
+                "buffer_max_rows": self.buffer_max_rows,
                 "target_compact_size": self.target_compact_size,
                 "target_compact_step_size": self.target_compact_step_size,
                 "target_seal_rows": self.target_seal_rows,
@@ -385,6 +411,8 @@ class LogConfig:
 
         return cls(
             target_seal_size=raw.get("target_seal_size", defaults.target_seal_size),
+            buffer_max_bytes=raw.get("buffer_max_bytes", defaults.buffer_max_bytes),
+            buffer_max_rows=raw.get("buffer_max_rows", defaults.buffer_max_rows),
             target_compact_size=raw.get(
                 "target_compact_size", defaults.target_compact_size
             ),

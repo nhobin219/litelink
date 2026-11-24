@@ -40,3 +40,8 @@ Two regressions this has already caught:
   against the floor for a fact an O(1) counter already had
 - constructing the `Log` inside the timed region, which charges Iceberg catalog and table
   creation to write throughput and reports ~100% overhead that is not real
+
+`throughput.py --no-buffer-usage` disables the buffer counters and admission check
+only for its disposable benchmark logs; shipped defaults remain enabled. Never
+use the private switch with concurrent processes or retained logs. A normal writable
+reopen recounts a log opened with the switch disabled before trusting its usage.

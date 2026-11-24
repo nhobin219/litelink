@@ -46,7 +46,9 @@ COLUMNS = ("event_ts", "ingest_ts", "icao24", "altitude_ft", "speed_kt", "note")
 
 # Large enough that nothing seals underneath a measurement by accident.
 NEVER_SEAL = LogConfig(
-    target_seal_size=1 << 40, staging_snapshot_retention=timedelta(days=1)
+    target_seal_size=1 << 40,
+    buffer_max_bytes=1 << 40,
+    staging_snapshot_retention=timedelta(days=1),
 )
 
 

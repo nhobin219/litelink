@@ -92,6 +92,7 @@ from litelink._tiers import PublishedTier, StoredTiers, empty
 from litelink._tiers import encode as encode_tier
 from litelink._transaction import Transaction
 from litelink._types import NON_FINITE, column_type, validate_schema
+from litelink._usage import BufferUsage
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -548,6 +549,10 @@ class LogHandle:
     def config(self) -> LogConfig:
         """The policy in force, read through to the log on every access."""
         return self._buffer.config()
+
+    def buffer_usage(self) -> BufferUsage:
+        """Return committed uncompressed bytes, rows, caps and refusal state."""
+        return self._buffer.buffer_usage()
 
     @property
     def sort_by(self) -> tuple[str, ...]:
@@ -4233,10 +4238,9 @@ class WriteHandle(LocalReadHandle):
           the published table holds (I4). Never past what it holds, so a
           publish that is behind delays this rather than losing data.
 
-        Evict the buffer before staging, as `advance` does: staging files
-        prove the published prefix. If staging is empty, buffer eviction
-        keeps already-published rows until the next file is sealed and
-        published.
+        Staging eviction stops at the buffer's confirmed eviction point,
+        including partial deletions: a staging-first call retains every file
+        needed to prove the next buffer eviction. `advance` runs buffer first.
 
         `[start_offset, end_offset)` — half-open, like `scan` — narrows what is
         eligible; it never widens it. **Chunking is the caller's.** Unbounded,

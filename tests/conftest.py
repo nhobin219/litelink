@@ -168,6 +168,7 @@ def keep_newest_rows(log: WriteHandle, rows: int) -> None:
     log.set_config(
         replace(log.config, staging_retention=None, staging_max_bytes=max(1, held))
     )
+    log.evict("buffer")
     log.evict("staging")
 
 

@@ -564,6 +564,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
     config = LogConfig(
         target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 40,
+        buffer_max_bytes=1 << 40,
         compact_min_files=2,
         staging_retention=timedelta(microseconds=1),
     )
@@ -592,6 +593,7 @@ def test_counts_from_the_manifest_list_match_the_files(tmp_path: Path) -> None:
         agrees("seal after compaction")
 
         log.publish(flush=True)
+        log.evict("buffer")
         log._maintenance.evict()
         agrees("after eviction")
 
@@ -748,6 +750,7 @@ def test_eviction_outlives_the_snapshot_that_added_the_file(tmp_path: Path) -> N
         # the rest out with it — which is why the fault only appears once a log
         # has been running a while, and never in a test that just seals.
         # Eviction itself is the commit that does it in practice.
+        log.evict("buffer")
         log._table.evict_below(files[0].end)
         log._maintenance.expire()
 
@@ -920,8 +923,8 @@ def test_a_step_outside_the_target_is_refused() -> None:
 
 
 def test_the_tighter_staging_limit_wins(tmp_path: Path) -> None:
-    """Both limits are ceilings: a day's window would keep every file here,
-    and the cap keeps only the newest that fit."""
+    """After buffer release, a day's window would keep every file here,
+    and the byte target keeps only the newest that fit."""
     config = LogConfig(
         target_compact_size=1,  # every file final: eviction, not candidates
         target_seal_size=1 << 30,
@@ -931,6 +934,9 @@ def test_the_tighter_staging_limit_wins(tmp_path: Path) -> None:
     with open_log(tmp_path, config) as log:
         seal_files(log, 6)
         log.publish(flush=True)
+        assert log.buffer_usage().rows == 24
+        log.evict("buffer")
+        assert log.buffer_usage().rows == 0
         files = log._table.data_files()
         cap = files[-1].size + files[-2].size
         log.set_config(replace(config, staging_max_bytes=cap))

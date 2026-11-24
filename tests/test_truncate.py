@@ -93,6 +93,9 @@ def test_truncate_narrows_the_published_tier_row(tmp_path: Path) -> None:
     Falsify by skipping `_record_published_row`: coverage still starts at 1.
     """
     with published_log(tmp_path) as log:
+        assert log.buffer_usage().rows == PER_SEAL * SEALS
+        log.evict("buffer")
+        assert log.buffer_usage().rows == 0
         log._maintenance.evict(everything=True)
         assert log.coverage().published == (1, 21)
 
