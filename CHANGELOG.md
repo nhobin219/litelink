@@ -9,8 +9,15 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+## 0.14.3 — 2026-11-24
+
 ### Fixed
 
+- Release evicted FileIO instances and their native clients without waiting for
+  cyclic garbage collection (#227). Active files retain filesystem ownership;
+  the shared cache's 64-entry limit and configuration-specific reuse stay intact.
+  Current cached clients and process-global resources remain live; this fix does
+  not establish an RSS or descriptor plateau.
 - Bound published-file summaries to in-flight publish intents and merged-file
   candidates; rare whole-history reads no longer cache their file list (#228).
   No public API or on-disk change. In a same-session local benchmark of five
