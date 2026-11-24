@@ -351,6 +351,8 @@ def test_two_openers_migrate_once(
 def test_staging_first_does_not_strand_a_full_buffer(
     tmp_path: Path, everything: bool
 ) -> None:
+    expected = [{litelink.OFFSET: n, "n": n, "text": "é"} for n in range(1, 5)]
+    query = f'SELECT * FROM log ORDER BY "{litelink.OFFSET}"'
     with create(
         tmp_path,
         target_seal_size=4 * ROW_BYTES,
@@ -359,31 +361,89 @@ def test_staging_first_does_not_strand_a_full_buffer(
         buffer_max_bytes=4 * ROW_BYTES,
         staging_retention=timedelta(0),
     ) as log:
-        log.extend([ROW] * 4)
+        assert log.extend([{"n": n, "text": "é"} for n in range(1, 5)]) == [
+            1,
+            2,
+            3,
+            4,
+        ]
         log.seal(flush=True)
         log.publish(flush=True)
         assert log.buffer_usage().refusing
         files = log._table.data_files()
         assert len(files) == 2
-        with pytest.raises(LogFull):
-            log.append(ROW)
-
         log._maintenance.evict(everything=everything)
         assert log._table.data_files() == files
-        log.evict("buffer", end_offset=2)
-        log._maintenance.evict(everything=everything)
+        original_backend = sqlite_backend(log)
+
+    # Recovery must use durable publication evidence, not the first handle's
+    # cached view. Closing does not run maintenance or publish anything.
+    with litelink.open(tmp_path, "s") as reopened:
+        assert reopened is not log
+        backend = sqlite_backend(reopened)
+        assert backend is not original_backend
+        assert reopened._table.data_files() == files
+        assert reopened.sql(query).read_all().to_pylist() == expected
+        usage = reopened.buffer_usage()
+        assert usage.bytes == 4 * ROW_BYTES
+        assert usage.rows == 4
+        assert usage.refusing
+        assert reopened.end_offset() == 5
+        with backend.read() as cursor:
+            before = {
+                table: cursor.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid"
+                ).fetchall()
+                for table in ("buffer", "extent", "meta", "sqlite_sequence")
+            }
+
+        with pytest.raises(LogFull):
+            reopened.append({"n": 5, "text": "é"})
+
+        with backend.read() as cursor:
+            assert {
+                table: cursor.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid"
+                ).fetchall()
+                for table in before
+            } == before
+
+        assert reopened.buffer_usage() == usage
+        assert reopened.end_offset() == 5
+        assert reopened.sql(query).read_all().to_pylist() == expected
+        reopened.evict("buffer", end_offset=2)
+        reopened._maintenance.evict(everything=everything)
         assert (
-            log._table.data_files() == files
+            reopened._table.data_files() == files
         )  # The first file still straddles the point.
-        log.evict("buffer", end_offset=3)
-        log._maintenance.evict(everything=everything)
-        assert min(f.start for f in log._table.data_files()) == 3
-        assert log.buffer_usage().rows == 2
-        log.evict("buffer")
-        log._maintenance.evict(everything=everything)
-        assert log._table.data_files() == []
-        assert not log.buffer_usage().refusing
-        assert log.append(ROW) == 5
+        partial = reopened.buffer_usage()
+        assert partial.bytes == 3 * ROW_BYTES
+        assert partial.rows == 3
+
+    # The partial release point must also survive a fresh buffer connection.
+    with litelink.open(tmp_path, "s") as recovered:
+        assert recovered is not reopened
+        assert sqlite_backend(recovered) is not backend
+        assert recovered.buffer_usage() == partial
+        assert recovered._buffer.span() == (2, 5)
+        assert recovered._table.data_files() == files
+        assert recovered.sql(query).read_all().to_pylist() == expected
+        recovered.evict("buffer", end_offset=3)
+        recovered._maintenance.evict(everything=everything)
+        assert min(f.start for f in recovered._table.data_files()) == 3
+        assert recovered.buffer_usage().bytes == 2 * ROW_BYTES
+        assert recovered.buffer_usage().rows == 2
+        recovered.evict("buffer")
+        recovered._maintenance.evict(everything=everything)
+        assert recovered._table.data_files() == []
+        assert recovered.buffer_usage().bytes == recovered.buffer_usage().rows == 0
+        assert not recovered.buffer_usage().refusing
+        assert recovered.sql(query).read_all().to_pylist() == expected
+        assert recovered.append({"n": 5, "text": "é"}) == 5
+        expected.append({litelink.OFFSET: 5, "n": 5, "text": "é"})
+        assert recovered.sql(query).read_all().to_pylist() == expected
+        assert recovered.buffer_usage().bytes == ROW_BYTES
+        assert recovered.buffer_usage().rows == 1
 
 
 def test_nested_and_null_measurement_survives_migration(tmp_path: Path) -> None:
