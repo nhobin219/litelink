@@ -3801,23 +3801,18 @@ class WriteHandle(LocalReadHandle):
         # another file already covers, so a crashed push's dead intents would be
         # confirmed rather than dropped.
         #
-        # Bounds differ between the two reads and must. The manifest walk is
-        # bounded by the staging window, or it grows with the published table
-        # and runs on every publish pass. The intent read is unbounded, because
-        # an intent below the window has to be reachable to be dropped.
-        local = self._table.data_files()
-        base = min((f.start for f in local), default=0)
-        held_paths = {f.path for f in published.data_files() if f.end > base}
+        # Read every intent, including those below the staging window, but
+        # retain only its path if the current manifest holds it. Published
+        # history is unbounded; the reconciliation result is bounded by intents.
         intended = [path for path, _, _, _ in self._buffer.intents(pinned or "")]
+        held_paths = published.paths_among(intended)
         self._buffer.confirm_published(
             floor - 1, [path for path in intended if path in held_paths]
         )
         for path in intended:
             if path not in held_paths:
                 # Nothing in the manifest holds that path, so the register
-                # never landed and the intent is dead. Below the staging window
-                # this also drops intents whose register DID land — the manifest
-                # walk is bounded — and the watermark covers those already.
+                # never landed and the intent is dead, even below staging.
                 self._buffer.forget_intent(path)
 
         memory = self._maintenance.memory()
@@ -3972,7 +3967,9 @@ class WriteHandle(LocalReadHandle):
         if not candidates:
             return floor
 
-        held = sorted(published.data_files(), key=lambda f: f.start)
+        held = published.files_overlapping(
+            min(f.start for f in candidates), max(f.end for f in candidates)
+        )
         for merged in candidates:
             rel_path = self._layout.relative(merged.path)
             uri = published.uri(rel_path)

@@ -45,7 +45,7 @@ from litelink._s3 import S3Options
 from litelink._statistics import TierStatistics, rollup
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
     from datetime import datetime
 
     import pyarrow as pa
@@ -889,11 +889,10 @@ class LogTable:
         # layout; the published table is told, because its prefix is the
         # caller's.
         self._warehouse = warehouse or layout.warehouse_uri
-        # Which of the two this is, and the only thing that turns on it: the
-        # PUBLISHED table writes a pointer to its own metadata, because it is
-        # the one whose catalog can be lost or pointed away from. The staging
-        # table's catalog sits in the same directory as its warehouse — lose
-        # one and you have lost the other, so a hint beside it would answer a
+        # Which of the two this is. The PUBLISHED table writes a pointer to its
+        # own metadata, because its catalog can be lost or pointed away from.
+        # The staging table's catalog sits in the same directory as its warehouse —
+        # lose one and you have lost the other, so a hint beside it would answer a
         # question nobody can be in a position to ask.
         self._is_published = warehouse is not None
         # Snapshot-derived facts, cached against the metadata pointer. See
@@ -907,7 +906,7 @@ class LogTable:
         self._span_at: str | None = None
         self._span: tuple[int, int] | None = None
         self._counts_at: str | None = None
-        # The entry walk, cached against the same pointer. Manifest MERGING
+        # The staging entry walk, cached against the same pointer. Manifest MERGING
         # already collapses one manifest per commit into one for the table —
         # measured at 216 data files in a single manifest — but that is the
         # wrong axis: the cost is decoding one entry per data FILE, each
@@ -1354,6 +1353,11 @@ class LogTable:
         derive it on every read.
         """
         with self._lock:
+            # Staging is a bounded window; published history is not. Rare
+            # whole-history callers may read it, but must not pin it here.
+            if self._is_published:
+                return self._read_files()
+
             location = self.metadata_location
             if location == self._files_at:
                 return self._files
@@ -1364,7 +1368,7 @@ class LogTable:
             return self._files
 
     def _read_files(self) -> list[DataFile]:
-        """The entry walk itself. Cached by `data_files`."""
+        """The entry walk itself. Cached only on staging by `data_files`."""
         if self.is_empty():
             return []
 
@@ -1390,6 +1394,70 @@ class LogTable:
         ]
 
         return sorted(found, key=lambda f: f.start)
+
+    def paths_among(self, candidates: Collection[str]) -> set[str]:
+        """Candidate paths held by the current snapshot, without retaining history.
+
+        Publish reconciliation asks only about in-flight intents. Path identity
+        proves that their register landed; matching offset ranges cannot (I4).
+        A failed walk propagates before the caller retires any intent.
+        """
+        if not candidates:
+            return set()
+
+        with self._lock:
+            snapshot = self._table.current_snapshot()
+            if snapshot is None:
+                return set()
+
+            wanted = set(candidates)
+            return {
+                path
+                for manifest in snapshot.manifests(self._table.io)
+                for entry in manifest.fetch_manifest_entry(
+                    self._table.io, discard_deleted=True
+                )
+                if (path := self._name(entry.data_file.file_path)) in wanted
+            }
+
+    def files_overlapping(self, start: int, end: int) -> list[DataFile]:
+        """Uncached current files overlapping `[start, end)`, ordered by offset.
+
+        A swap needs only the files touching its staging candidates. Manifests
+        still decode history transiently, but only overlaps become summaries;
+        no whole-history Arrow metrics table or retained list is needed.
+        """
+        with self._lock:
+            snapshot = self._table.current_snapshot()
+            if snapshot is None:
+                return []
+
+            field = self._table.schema().find_field("litelink_offset")
+            found = []
+            for manifest in snapshot.manifests(self._table.io):
+                for entry in manifest.fetch_manifest_entry(
+                    self._table.io, discard_deleted=True
+                ):
+                    file = entry.data_file
+                    low = from_bytes(
+                        field.field_type, file.lower_bounds[field.field_id]
+                    )
+                    high = (
+                        from_bytes(field.field_type, file.upper_bounds[field.field_id])
+                        + 1
+                    )
+                    if high > start and low < end:
+                        found.append(
+                            DataFile(
+                                path=self._name(file.file_path),
+                                size=file.file_size_in_bytes,
+                                rows=file.record_count,
+                                start=low,
+                                end=high,
+                            )
+                        )
+
+            return sorted(found, key=lambda f: f.start)
 
     def span(self) -> tuple[int, int] | None:
         """`[start, end)` over the current snapshot — §7's tier boundary.

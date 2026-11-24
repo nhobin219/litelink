@@ -9,6 +9,18 @@ minor version carries breaking changes.
 
 ## Unreleased
 
+### Fixed
+
+- Bound published-file summaries to in-flight publish intents and merged-file
+  candidates; rare whole-history reads no longer cache their file list (#228).
+  No public API or on-disk change. In a same-session local benchmark of five
+  tables over 360 cycles (1,800 published files, empty staging and intents),
+  retained summaries fall from 1,800 to zero. Publisher RSS grows from
+  151.570 to 168.094 MiB before and 151.559 to 157.059 MiB after; traced bytes
+  grow from 0.222 to 1.160 MiB before and 0.222 to 0.681 MiB after. Open file
+  descriptors stay at 45 in both runs. Manifest decoding remains transiently
+  proportional to history; these measurements do not establish an RSS plateau.
+
 ## 0.14.2 — 2026-11-19
 
 ### Fixed
