@@ -735,7 +735,7 @@ wheels = [
 
 [[package]]
 name = "litelink"
-version = "0.14.2"
+version = "0.14.3"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },

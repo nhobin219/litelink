@@ -7,10 +7,13 @@ rather than restates it.
 This project follows [Semantic Versioning](https://semver.org/). Before 1.0 the
 minor version carries breaking changes.
 
-## Unreleased
+## 0.14.3 — 2026-11-24
 
 ### Fixed
 
+- Break the ownership cycle between a cached `FileIO` and its S3 client, so evicting
+  a cached client releases the client and its eventfds without waiting for a
+  garbage-collection pass (#227). No public API change.
 - Bound published-file summaries to in-flight publish intents and merged-file
   candidates; rare whole-history reads no longer cache their file list (#228).
   No public API or on-disk change. In a same-session local benchmark of five
