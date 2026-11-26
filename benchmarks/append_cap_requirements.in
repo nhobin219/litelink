@@ -1,0 +1,12 @@
+# Shared runtime; source trees are selected with PYTHONPATH, never installed.
+boto3==1.43.56
+duckdb==1.5.5
+pyarrow==25.0.1
+pyiceberg[pyarrow,sql-sqlite]==0.12.0
+xxhash==4.0.1
+fastapi==0.141.1
+msgspec==0.21.1
+opentelemetry-api==1.45.0
+pydantic==2.13.5
+uvicorn==0.54.0
+websockets==17.1
