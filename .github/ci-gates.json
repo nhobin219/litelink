@@ -4,7 +4,7 @@
   "exempt": [],
   "retry": [],
   "stages": {
-    "push": {
+    "review": {
       "start": "push",
       "contexts": [
         {
