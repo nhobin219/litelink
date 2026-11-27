@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "all": "report",
+  "exempt": [],
+  "retry": [],
+  "stages": {
+    "push": {
+      "start": "push",
+      "contexts": [
+        {
+          "kind": "job",
+          "workflow": ".github/workflows/ci.yml",
+          "job": "CI success"
+        }
+      ]
+    }
+  }
+}
