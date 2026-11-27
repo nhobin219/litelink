@@ -13,6 +13,7 @@ import os
 import sqlite3
 import subprocess
 import threading
+from collections import Counter
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -499,20 +500,20 @@ def caller_state(path: Path) -> tuple[list[tuple[object, ...]], ...]:
         con.close()
 
 
-def record_tables(log: WriteHandle) -> list[tuple[str, str | None]]:
+def record_tables(log: WriteHandle) -> list[tuple[int, str, str | None]]:
     """Every name litelink's statements reach from now on, with the schema it
     is in, on each of the buffer's connections, read from SQLite's
     authorizer."""
-    seen: list[tuple[str, str | None]] = []
+    seen: list[tuple[int, str, str | None]] = []
 
     def authorize(
-        _action: int,
+        action: int,
         arg1: str | None,
         arg2: str | None,
         database: str | None,
         _trigger: str | None,
     ) -> int:
-        seen.extend((name, database) for name in (arg1, arg2) if name)
+        seen.extend((action, name, database) for name in (arg1, arg2) if name)
 
         return sqlite3.SQLITE_OK
 
@@ -526,6 +527,48 @@ def record_tables(log: WriteHandle) -> list[tuple[str, str | None]]:
         con.set_authorizer(authorize)
 
     return seen
+
+
+def caller_accesses(
+    seen: list[tuple[int, str, str | None]],
+) -> Counter[tuple[int, str, str | None]]:
+    """Keep actions and multiplicity; only VACUUM's random schema name varies."""
+    return Counter(
+        (action, name, "vacuum" if (database or "").startswith("vacuum_") else database)
+        for action, name, database in seen
+        if name.lower().startswith("mylib")
+    )
+
+
+@pytest.mark.parametrize(
+    "sql", ["SELECT * FROM mylib_seen", "DELETE FROM mylib_seen WHERE 0"]
+)
+@pytest.mark.parametrize("before_vacuum", [True, False])
+def test_maintenance_recorder_detects_extra_caller_access(
+    tmp_path: Path, sql: str, before_vacuum: bool
+) -> None:
+    """Even state-preserving SQL adjacent to VACUUM exceeds its access budget."""
+    with open_log(tmp_path) as log:
+        with log.transaction() as tx:
+            tx.execute(CREATE_SEEN)
+            tx.execute("INSERT INTO mylib_seen VALUES ('a', 1)")
+
+        before = caller_state(log.databases[0])
+        seen = record_tables(log)
+        with sqlite_backend(log)._writable() as cursor:  # noqa: SLF001
+            cursor.execute("VACUUM")
+            vacuum_accesses = caller_accesses(seen)
+            assert vacuum_accesses
+            seen.clear()
+            if before_vacuum:
+                cursor.execute(sql).fetchall()
+
+            cursor.execute("VACUUM")
+            if not before_vacuum:
+                cursor.execute(sql).fetchall()
+
+        assert caller_accesses(seen) != vacuum_accesses
+        assert caller_state(log.databases[0]) == before
 
 
 def test_maintenance_never_touches_a_callers_tables(
@@ -579,6 +622,15 @@ def test_maintenance_never_touches_a_callers_tables(
 
         before = caller_state(database)
         seen = record_tables(log)
+        # Measure SQLite's own VACUUM, independently of reclaim's SQL. Some
+        # builds also authorize source reads in main; the temporary schema
+        # alone cannot identify the permitted whole-file copy.
+        with sqlite_backend(log)._writable() as cursor:  # noqa: SLF001
+            cursor.execute("VACUUM")
+
+        vacuum_accesses = caller_accesses(seen)
+        assert {name for _, name, _ in vacuum_accesses} >= {"mylib_seen", "mylib_audit"}
+        seen.clear()
 
         def fill(first: int) -> None:
             """Ten sealed files of 40 rows from offset `first`: small enough
@@ -609,19 +661,15 @@ def test_maintenance_never_touches_a_callers_tables(
         assert min(offsets(log)) == 161
         assert log.staging_files() == 0
 
-    # The VACUUM copies every table into a schema SQLite names `vacuum_db`,
-    # or `vacuum_<random>` in newer releases, and swaps the
-    # file: the one statement that reaches a caller's table, by rewriting the
-    # whole file with its contents unchanged (I18). It is also the proof that
-    # the recorder sees a caller's names when something does reach them.
-    reached = {name for name, database in seen if name.lower().startswith("mylib")}
-    assert reached >= {"mylib_seen", "mylib_audit"}
-    assert not [
-        (name, database)
-        for name, database in seen
-        if name.lower().startswith("mylib")
-        and not (database or "").startswith("vacuum_")
-    ]
+    # Each observed VACUUM must account for exactly the independently measured
+    # accesses, including source reads, by action, object, schema and count.
+    # An extra read or even a no-op write to a caller object is not exempt.
+    assert caller_accesses(seen) == Counter(
+        {
+            access: count * statements.count("VACUUM")
+            for access, count in vacuum_accesses.items()
+        }
+    )
 
     # A reopen runs `_create` and recovery again; `retire` empties the buffer
     # and writes its closing range.
@@ -632,7 +680,7 @@ def test_maintenance_never_touches_a_callers_tables(
         assert log._buffer.retired() is not None  # noqa: SLF001
 
     assert seen
-    assert not [name for name, _ in seen if name.lower().startswith("mylib")]
+    assert not caller_accesses(seen)
     assert caller_state(database) == before
 
 
